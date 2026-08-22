@@ -49,6 +49,44 @@ final class ContactSyncTests: XCTestCase {
         )
     }
 
+    func testContactSyncRecoveryPresentationKeepsRoutineStatesSilent() {
+        let routineStates: [AutomaticContactSyncState] = [
+            .idle,
+            .requestingPermission,
+            .syncing(
+                ContactSyncProgress(
+                    phase: .uploading,
+                    completedUnitCount: 1,
+                    totalUnitCount: 2
+                )
+            ),
+            .synced(uploaded: 12, matched: 4, limitedAccess: false),
+            .synced(uploaded: 3, matched: 1, limitedAccess: true),
+        ]
+
+        for state in routineStates {
+            XCTAssertNil(ContactSyncRecoveryPresentation.presentation(for: state))
+        }
+    }
+
+    func testContactSyncRecoveryPresentationExposesOnlyActionableFailures() {
+        let settings = ContactSyncRecoveryPresentation.presentation(for: .denied)
+        XCTAssertEqual(settings, .openSettings)
+        XCTAssertEqual(
+            settings?.accessibilityIdentifier,
+            "contact-sync-recovery.open-settings"
+        )
+
+        let retry = ContactSyncRecoveryPresentation.presentation(
+            for: .failed("The server is temporarily unavailable.")
+        )
+        XCTAssertEqual(
+            retry,
+            .retry(message: "The server is temporarily unavailable.")
+        )
+        XCTAssertEqual(retry?.accessibilityIdentifier, "contact-sync-recovery.retry")
+    }
+
     func testLimitedContactAccessSyncsSelectedRowsWithoutReprompting() async throws {
         let source = ContactsSourceSpy(
             state: .limited,

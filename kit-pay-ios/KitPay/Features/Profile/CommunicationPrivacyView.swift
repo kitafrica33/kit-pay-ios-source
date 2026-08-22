@@ -368,6 +368,9 @@ private struct CommunicationBlockPickerView: View {
                 }
             }
             .background(KitColor.canvas.ignoresSafeArea())
+            .safeAreaInset(edge: .top, spacing: 0) {
+                ContactSyncRecoveryView(horizontalPadding: 16, verticalPadding: 8)
+            }
             .navigationTitle("Block an account")
             .navigationBarTitleDisplayMode(.inline)
             .searchable(text: $query, prompt: "Name, phone or @tag")

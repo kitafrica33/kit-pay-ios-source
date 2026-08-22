@@ -8,6 +8,10 @@ final class LegalURLPolicyTests: XCTestCase {
 
         XCTAssertEqual(presentation.title, "Privacy policy")
         XCTAssertEqual(
+            KitLegalConstants.privacyNoticeVersion,
+            "kit-privacy-2026-08-20"
+        )
+        XCTAssertEqual(
             presentation.url.absoluteString,
             "https://pay.kit.africa/privacy"
         )

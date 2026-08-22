@@ -1549,6 +1549,8 @@ private struct ActiveCallParticipantSheet: View {
                         .autocorrectionDisabled()
                 }
 
+                ContactSyncRecoveryView()
+
                 if isSearching && contacts.isEmpty {
                     Section {
                         HStack(spacing: 10) {

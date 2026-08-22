@@ -361,6 +361,8 @@ struct SendMoneyView: View {
 
     private var recipientPicker: some View {
         VStack(spacing: 12) {
+            ContactSyncRecoveryView(horizontalPadding: 16)
+
             Group {
                 if eligibleContacts.isEmpty {
                     ContentUnavailableView(
@@ -693,6 +695,8 @@ struct RequestMoneyView: View {
                         .kitGlass(cornerRadius: 18)
                         .disabled(secureShareNeedsRetry)
                 }
+
+                ContactSyncRecoveryView()
 
                 if eligibleContacts.isEmpty {
                     ContentUnavailableView(

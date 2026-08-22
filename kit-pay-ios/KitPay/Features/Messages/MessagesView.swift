@@ -2562,6 +2562,8 @@ private struct NewMessageSheet: View {
                         .font(.footnote)
                     }
                 } else {
+                    ContactSyncRecoveryView()
+
                     if isSearchingDirectory && sections.kitPay.isEmpty {
                         Section {
                             HStack(spacing: 10) {

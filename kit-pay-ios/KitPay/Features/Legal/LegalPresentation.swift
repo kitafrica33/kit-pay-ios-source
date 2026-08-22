@@ -3,6 +3,7 @@ import Foundation
 enum KitLegalConstants {
     static let agplLicenceIdentifier = "AGPL-3.0-only"
     static let privacyPolicyURLString = "https://pay.kit.africa/privacy"
+    static let privacyNoticeVersion = "kit-privacy-2026-08-20"
     static let approvedSourceRepositoryPath = "/kitafrica33/kit-pay-ios-source"
     static let correspondingSourceInfoKey = "KitCorrespondingSourceURL"
     static let fullLicenceResourceName = "AGPL-3.0-only"

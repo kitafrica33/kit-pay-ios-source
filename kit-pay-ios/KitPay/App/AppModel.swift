@@ -10066,7 +10066,7 @@ final class AppModel: ObservableObject {
         do {
             let status = try await api.createKYCSession(
                 consent: true,
-                privacyNoticeVersion: "kit-privacy-2026-07"
+                privacyNoticeVersion: KitLegalConstants.privacyNoticeVersion
             )
             guard await kycRequestIsCurrent(
                 generation: expectedGeneration,

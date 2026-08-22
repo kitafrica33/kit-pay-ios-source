@@ -13,6 +13,10 @@ import re
 
 
 SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
+SOURCE_RELEASE_URL = (
+    "https://github.com/kitafrica33/kit-pay-ios-source/releases/tag/"
+    "v{version}-build{build_number}"
+)
 
 
 def fail(message: str) -> "NoReturn":
@@ -54,6 +58,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--team-id", required=True)
     parser.add_argument("--version", required=True)
     parser.add_argument("--build-number", required=True)
+    parser.add_argument("--corresponding-source-url", required=True)
     parser.add_argument("--ipa", type=pathlib.Path, required=True)
     parser.add_argument("--archive-zip", type=pathlib.Path, required=True)
     parser.add_argument("--dsym-zip", type=pathlib.Path, required=True)
@@ -68,6 +73,12 @@ def main() -> None:
     args = arguments()
     if not SHA_PATTERN.fullmatch(args.source_commit):
         fail("The source commit must be a full lowercase Git SHA")
+    expected_source_url = SOURCE_RELEASE_URL.format(
+        version=args.version,
+        build_number=args.build_number,
+    )
+    if args.corresponding_source_url != expected_source_url:
+        fail("The corresponding-source URL does not match the release identity")
 
     info = load_plist(args.app / "Info.plist", "Signed app Info.plist")
     privacy = load_plist(
@@ -110,6 +121,10 @@ def main() -> None:
         (info.get("CFBundleIdentifier") == args.bundle_id, "Unexpected signed bundle identifier"),
         (info.get("CFBundleShortVersionString") == args.version, "Unexpected marketing version"),
         (info.get("CFBundleVersion") == args.build_number, "Unexpected build number"),
+        (
+            info.get("KitCorrespondingSourceURL") == expected_source_url,
+            "Unexpected signed corresponding-source URL",
+        ),
         (profile.get("UUID") == args.expected_profile_uuid, "Unexpected embedded profile UUID"),
         (args.team_id in profile.get("TeamIdentifier", []), "Unexpected embedded profile team"),
         (
@@ -161,6 +176,7 @@ def main() -> None:
             "bundleId": args.bundle_id,
             "version": args.version,
             "buildNumber": args.build_number,
+            "correspondingSourceURL": expected_source_url,
             "usesNonExemptEncryption": False,
         },
         "workflow": {

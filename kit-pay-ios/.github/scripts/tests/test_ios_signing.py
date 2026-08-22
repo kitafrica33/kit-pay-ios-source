@@ -17,6 +17,10 @@ TEAM = "A1B2C3D4E5"
 BUNDLE = "africa.kit.pay.ios"
 PROFILE_UUID = "11111111-2222-3333-4444-555555555555"
 CERTIFICATE_DER = b"synthetic-distribution-certificate"
+SOURCE_URL = (
+    "https://github.com/kitafrica33/kit-pay-ios-source/releases/tag/"
+    "v1.2.3-build42"
+)
 
 
 def write_plist(path: pathlib.Path, value: dict) -> None:
@@ -183,6 +187,29 @@ class SigningConfigurationTests(unittest.TestCase):
         self.assertNotIn("ITSEncryptionExportComplianceCode", info)
         self.assertNotIn("export_compliance_code", workflow)
 
+    def test_archive_requires_public_source_release_for_exact_build(self) -> None:
+        workflow = (ROOT / ".github/workflows/ios-app-store-archive.yml").read_text()
+        source_input = workflow.split("      corresponding_source_url:\n", 1)[1].split(
+            "\n\n",
+            1,
+        )[0]
+
+        self.assertIn("required: true", source_input)
+        self.assertNotIn("default:", source_input)
+        self.assertIn(
+            'expected_source_url="https://github.com/kitafrica33/'
+            'kit-pay-ios-source/releases/tag/v${MARKETING_VERSION}-build${BUILD_NUMBER}"',
+            workflow,
+        )
+        self.assertIn(
+            'test "$CORRESPONDING_SOURCE_URL" = "$expected_source_url"',
+            workflow,
+        )
+        self.assertIn("env -u GITHUB_TOKEN -u GH_TOKEN", workflow)
+        self.assertIn("curl --disable", workflow)
+        self.assertIn("--header 'Authorization:'", workflow)
+        self.assertIn('--corresponding-source-url "$CORRESPONDING_SOURCE_URL"', workflow)
+
 
 class VerifyIOSArchiveTests(unittest.TestCase):
     def test_verifies_identity_and_records_artifact_hashes(self) -> None:
@@ -196,6 +223,7 @@ class VerifyIOSArchiveTests(unittest.TestCase):
                     "CFBundleIdentifier": BUNDLE,
                     "CFBundleShortVersionString": "1.2.3",
                     "CFBundleVersion": "42",
+                    "KitCorrespondingSourceURL": SOURCE_URL,
                     "ITSAppUsesNonExemptEncryption": False,
                 },
             )
@@ -253,6 +281,8 @@ class VerifyIOSArchiveTests(unittest.TestCase):
                 "1.2.3",
                 "--build-number",
                 "42",
+                "--corresponding-source-url",
+                SOURCE_URL,
                 "--ipa",
                 str(artifacts[0]),
                 "--archive-zip",
@@ -277,6 +307,7 @@ class VerifyIOSArchiveTests(unittest.TestCase):
 
             result = json.loads(evidence.read_text(encoding="utf-8"))
             self.assertEqual(result["target"]["bundleId"], BUNDLE)
+            self.assertEqual(result["target"]["correspondingSourceURL"], SOURCE_URL)
             self.assertIs(result["target"]["usesNonExemptEncryption"], False)
             self.assertEqual(
                 result["artifacts"]["ipa"]["sha256"],
@@ -289,6 +320,7 @@ class VerifyIOSArchiveTests(unittest.TestCase):
                     "CFBundleIdentifier": BUNDLE,
                     "CFBundleShortVersionString": "1.2.3",
                     "CFBundleVersion": "42",
+                    "KitCorrespondingSourceURL": SOURCE_URL,
                     "ITSAppUsesNonExemptEncryption": True,
                 },
             )
@@ -307,6 +339,7 @@ class VerifyIOSArchiveTests(unittest.TestCase):
                     "CFBundleIdentifier": BUNDLE,
                     "CFBundleShortVersionString": "1.2.3",
                     "CFBundleVersion": "42",
+                    "KitCorrespondingSourceURL": SOURCE_URL,
                     "ITSAppUsesNonExemptEncryption": False,
                     "UIBackgroundModes": ["processing"],
                 },
@@ -329,9 +362,47 @@ class VerifyIOSArchiveTests(unittest.TestCase):
                     "CFBundleIdentifier": BUNDLE,
                     "CFBundleShortVersionString": "1.2.3",
                     "CFBundleVersion": "42",
+                    "KitCorrespondingSourceURL": SOURCE_URL,
                     "ITSAppUsesNonExemptEncryption": False,
                 },
             )
+
+            mismatched_source_argument = command.copy()
+            source_argument = mismatched_source_argument.index(
+                "--corresponding-source-url"
+            ) + 1
+            mismatched_source_argument[source_argument] = SOURCE_URL + "/"
+            wrong_argument = subprocess.run(
+                mismatched_source_argument,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(wrong_argument.returncode, 0)
+            self.assertIn("does not match the release identity", wrong_argument.stderr)
+
+            info = {
+                "CFBundleIdentifier": BUNDLE,
+                "CFBundleShortVersionString": "1.2.3",
+                "CFBundleVersion": "42",
+                "KitCorrespondingSourceURL": SOURCE_URL + "/",
+                "ITSAppUsesNonExemptEncryption": False,
+            }
+            write_plist(app / "Info.plist", info)
+            wrong_signed_url = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(wrong_signed_url.returncode, 0)
+            self.assertIn(
+                "Unexpected signed corresponding-source URL",
+                wrong_signed_url.stderr,
+            )
+
+            info["KitCorrespondingSourceURL"] = SOURCE_URL
+            write_plist(app / "Info.plist", info)
 
             write_plist(
                 signed,

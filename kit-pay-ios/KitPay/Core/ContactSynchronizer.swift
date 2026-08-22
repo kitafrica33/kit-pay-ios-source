@@ -51,6 +51,34 @@ enum AutomaticContactSyncState: Equatable, Sendable {
     }
 }
 
+/// The only contact-sync states that need to interrupt a recipient picker.
+/// Permission prompts, progress, and successful refreshes stay silent because
+/// contact discovery is automatic.
+enum ContactSyncRecoveryPresentation: Equatable, Sendable {
+    case openSettings
+    case retry(message: String)
+
+    static func presentation(
+        for state: AutomaticContactSyncState
+    ) -> ContactSyncRecoveryPresentation? {
+        switch state {
+        case .denied:
+            .openSettings
+        case .failed(let message):
+            .retry(message: message)
+        case .idle, .requestingPermission, .syncing, .synced:
+            nil
+        }
+    }
+
+    var accessibilityIdentifier: String {
+        switch self {
+        case .openSettings: "contact-sync-recovery.open-settings"
+        case .retry: "contact-sync-recovery.retry"
+        }
+    }
+}
+
 @MainActor
 final class ContactBackgroundRefreshScheduler {
     static let shared = ContactBackgroundRefreshScheduler()

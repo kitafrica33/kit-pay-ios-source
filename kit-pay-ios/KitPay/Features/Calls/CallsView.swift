@@ -187,6 +187,8 @@ private struct NewCallSheet: View {
                         .textInputAutocapitalization(.never)
                 }
 
+                ContactSyncRecoveryView()
+
                 if isSearchingDirectory && kitContacts.isEmpty {
                     Section {
                         HStack(spacing: 10) {

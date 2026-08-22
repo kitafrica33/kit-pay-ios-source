@@ -19,12 +19,10 @@ on:
         type: string
       corresponding_source_url:
         description: >-
-          AGPL corresponding-source release URL for this exact build, for example
-          https://github.com/kitafrica33/kit-pay-ios-source/releases/tag/v0.2.5-build13 .
-          Leave empty until that tagged source release is actually published; the app then
-          states that the source is not yet available rather than linking nowhere.
-        required: false
-        default: ''
+          Exact public AGPL corresponding-source release URL for this build, for example
+          https://github.com/kitafrica33/kit-pay-ios-source/releases/tag/v0.2.5-build14 .
+          The archive is rejected unless this tagged release is already publicly available.
+        required: true
         type: string
 
 permissions:
@@ -41,6 +39,7 @@ jobs:
     timeout-minutes: 45
     outputs:
       source_sha: ${{ steps.source.outputs.sha }}
+      corresponding_source_url: ${{ steps.source.outputs.corresponding_source_url }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -52,6 +51,7 @@ jobs:
           CONFIRMATION: ${{ inputs.confirmation }}
           MARKETING_VERSION: ${{ inputs.marketing_version }}
           BUILD_NUMBER: ${{ inputs.build_number }}
+          CORRESPONDING_SOURCE_URL: ${{ inputs.corresponding_source_url }}
         run: |
           set -euo pipefail
           test "$GITHUB_REF" = 'refs/heads/main'
@@ -60,8 +60,31 @@ jobs:
           [[ "$BUILD_NUMBER" =~ ^[1-9][0-9]*$ ]]
           (( ${#MARKETING_VERSION} <= 64 ))
           (( ${#BUILD_NUMBER} <= 18 ))
+          expected_source_url="https://github.com/kitafrica33/kit-pay-ios-source/releases/tag/v${MARKETING_VERSION}-build${BUILD_NUMBER}"
+          test "$CORRESPONDING_SOURCE_URL" = "$expected_source_url"
           test "$(git rev-parse HEAD)" = "$(git rev-parse refs/remotes/origin/main)"
           echo "sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          echo "corresponding_source_url=$expected_source_url" >> "$GITHUB_OUTPUT"
+      - name: Verify corresponding source is publicly available
+        env:
+          CORRESPONDING_SOURCE_URL: ${{ steps.source.outputs.corresponding_source_url }}
+        run: |
+          set -euo pipefail
+          env -u GITHUB_TOKEN -u GH_TOKEN \
+            curl --disable \
+              --fail \
+              --silent \
+              --show-error \
+              --location \
+              --proto '=https' \
+              --proto-redir '=https' \
+              --connect-timeout 10 \
+              --max-time 60 \
+              --retry 2 \
+              --header 'Authorization:' \
+              --header 'Cookie:' \
+              --output /dev/null \
+              "$CORRESPONDING_SOURCE_URL"
       - name: Select current Xcode
         run: sudo xcode-select --switch /Applications/Xcode.app
       - name: Install pinned native dependencies
@@ -98,7 +121,7 @@ jobs:
       IOS_BUNDLE_ID: africa.kit.pay.ios
       MARKETING_VERSION: ${{ inputs.marketing_version }}
       BUILD_NUMBER: ${{ inputs.build_number }}
-      CORRESPONDING_SOURCE_URL: ${{ inputs.corresponding_source_url }}
+      CORRESPONDING_SOURCE_URL: ${{ needs.quality.outputs.corresponding_source_url }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -113,6 +136,8 @@ jobs:
           test "$GITHUB_SHA" = "$EXPECTED_SHA"
           test "$GITHUB_REF" = 'refs/heads/main'
           test "$(git rev-parse HEAD)" = "$(git rev-parse refs/remotes/origin/main)"
+          expected_source_url="https://github.com/kitafrica33/kit-pay-ios-source/releases/tag/v${MARKETING_VERSION}-build${BUILD_NUMBER}"
+          test "$CORRESPONDING_SOURCE_URL" = "$expected_source_url"
       - name: Select current Xcode
         run: sudo xcode-select --switch /Applications/Xcode.app
       - name: Install pinned native dependencies
@@ -298,6 +323,7 @@ jobs:
             --team-id "$APPLE_TEAM_ID" \
             --version "$MARKETING_VERSION" \
             --build-number "$BUILD_NUMBER" \
+            --corresponding-source-url "$CORRESPONDING_SOURCE_URL" \
             --ipa "$export_path/KitPay.ipa" \
             --archive-zip "$export_path/KitPay.xcarchive.zip" \
             --dsym-zip "$export_path/KitPay.dSYMs.zip" \

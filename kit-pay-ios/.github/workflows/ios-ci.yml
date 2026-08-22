@@ -21,6 +21,8 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       - name: Test release validators
         run: python3 -m unittest discover -s .github/scripts/tests -p 'test_ios_signing.py'
+      - name: Test contact-sync recovery source contract
+        run: python3 -m unittest discover -s .github/scripts/tests -p 'test_contact_sync_recovery.py'
       - name: Select current Xcode
         run: sudo xcode-select --switch /Applications/Xcode.app
       - name: Install pinned native dependencies
