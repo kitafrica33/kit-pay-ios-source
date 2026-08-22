@@ -797,7 +797,6 @@ actor SecureMessagingExchangeCoordinator {
               conversation.participantUserIds.count == 2,
               Set(conversation.participantUserIds) == Set([local, recipient])
         else { throw SecureMessagingExchangeError.invalidConversation }
-
         if let clientMessageID,
            let existing = try Self.existingDeferredTextResult(
                in: snapshot,
@@ -942,7 +941,7 @@ actor SecureMessagingExchangeCoordinator {
         )
     }
 
-    /// Persists an offline photo and its caption inside SecureLocalStore's account-bound encrypted
+    /// Persists a small attachment and its caption inside SecureLocalStore's account-bound encrypted
     /// state. Reconnect uploads only ciphertext, checkpoints the canonical media descriptor, then
     /// advances the ordinary Signal outbox without exposing the plaintext to another store.
     func queueDeferredImage(
@@ -950,7 +949,7 @@ actor SecureMessagingExchangeCoordinator {
         conversationID: String,
         expectedRecipientUserID: String,
         title: String,
-        imageData: Data,
+        mediaData: Data,
         mediaType: String,
         caption: String?,
         submittedDraftBody: String? = nil,
@@ -969,19 +968,30 @@ actor SecureMessagingExchangeCoordinator {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let normalizedCaption = trimmedCaption?.isEmpty == false ? trimmedCaption : nil
         guard SecureMessagingWire.allowedAttachmentMediaTypes.contains(mediaType),
-              !imageData.isEmpty,
-              imageData.count <= SecureMediaAttachmentCipher.maximumPlaintextBytes,
+              !mediaData.isEmpty,
+              mediaData.count <= KitChatMediaLimits.maximumInlineCacheBytes,
               KitMediaMessageDescriptor.canEncodeCaption(normalizedCaption)
-        else { throw SecureMediaAttachmentError.invalidImage }
+        else { throw SecureMediaAttachmentError.invalidMedia }
         let snapshot = await store.snapshot()
         guard snapshot.profile?.id == local,
-              snapshot.secureMessaging?.enrollment?.userID == local,
+              let enrollment = snapshot.secureMessaging?.enrollment,
+              enrollment.userID == local,
               let conversation = snapshot.conversations.first(where: {
                   $0.id == conversationID
               }),
               conversation.participantUserIds.count == 2,
               Set(conversation.participantUserIds) == Set([local, recipient])
         else { throw SecureMessagingExchangeError.invalidConversation }
+        if KitChatMediaKind(mediaType: mediaType) != .image {
+            let roster = try await transport.messagingDeviceRoster(conversationId: conversationID)
+            guard MessagingRichMediaCapabilityPolicy.supports(
+                mediaType: mediaType,
+                roster: roster,
+                conversationID: conversationID,
+                currentDeviceID: enrollment.serverDeviceID,
+                recipientUserID: recipient
+            ) else { throw SecureMediaAttachmentError.incompatibleRecipient }
+        }
 
         let messageID = UUID()
         let commandID = UUID()
@@ -991,13 +1001,13 @@ actor SecureMessagingExchangeCoordinator {
             id: messageID,
             conversationId: conversationID,
             senderId: local,
-            body: normalizedCaption ?? "Photo",
+            body: normalizedCaption ?? KitChatMediaKind(mediaType: mediaType).previewLabel,
             createdAt: createdAt,
             sentAt: nil,
             state: .queued,
             failureReason: nil,
             isOutgoing: true,
-            attachmentData: imageData,
+            attachmentData: mediaData,
             pendingAttachment: LocalPendingAttachment(
                 mediaType: mediaType,
                 caption: normalizedCaption
@@ -1082,13 +1092,28 @@ actor SecureMessagingExchangeCoordinator {
             )
             var preparedMessage = message
             if let pending = message.pendingAttachment {
-                guard let imageData = message.attachmentData,
-                      !imageData.isEmpty,
-                      imageData.count <= SecureMediaAttachmentCipher.maximumPlaintextBytes
-                else { throw SecureMediaAttachmentError.invalidImage }
+                guard let mediaData = message.attachmentData,
+                      !mediaData.isEmpty,
+                      mediaData.count <= SecureMediaAttachmentCipher.maximumPlaintextBytes
+                else { throw SecureMediaAttachmentError.invalidMedia }
+                if KitChatMediaKind(mediaType: pending.mediaType) != .image {
+                    guard let enrollment = snapshot.secureMessaging?.enrollment else {
+                        throw SecureMessagingExchangeError.invalidAccount
+                    }
+                    let roster = try await transport.messagingDeviceRoster(
+                        conversationId: conversationID
+                    )
+                    guard MessagingRichMediaCapabilityPolicy.supports(
+                        mediaType: pending.mediaType,
+                        roster: roster,
+                        conversationID: conversationID,
+                        currentDeviceID: enrollment.serverDeviceID,
+                        recipientUserID: recipient
+                    ) else { throw SecureMediaAttachmentError.incompatibleRecipient }
+                }
                 _ = try await activation.activate(forUserID: local)
-                let descriptor = try await uploadImageDescriptor(
-                    imageData: imageData,
+                let descriptor = try await uploadMediaDescriptor(
+                    mediaData: mediaData,
                     mediaType: pending.mediaType,
                     caption: pending.caption
                 )
@@ -1100,11 +1125,11 @@ actor SecureMessagingExchangeCoordinator {
                 )
                 ownedMessage = preparedMessage
             } else if let descriptor = KitMediaMessageDescriptor.parse(message.body) {
-                guard let imageData = message.attachmentData,
+                guard let mediaData = message.attachmentData,
                       SecureMessagingWire.allowedAttachmentMediaTypes.contains(
                           descriptor.mediaType
                       ),
-                      descriptor.plaintextByteSize == imageData.count
+                      descriptor.plaintextByteSize == mediaData.count
                 else { throw SecureMediaAttachmentError.invalidDescriptor }
             } else if message.attachmentData != nil {
                 throw SecureMediaAttachmentError.invalidDescriptor
@@ -1117,7 +1142,9 @@ actor SecureMessagingExchangeCoordinator {
                 existingCommandID: commandID,
                 existingMessageID: messageID,
                 expectedExistingCommand: command,
-                expectedExistingMessage: preparedMessage
+                expectedExistingMessage: preparedMessage,
+                requiredRichMediaType: preparedMessage.pendingAttachment?.mediaType
+                    ?? KitMediaMessageDescriptor.parse(preparedMessage.body)?.mediaType
             )
         } catch {
             // A transport, validation, activation, roster, or crypto failure belongs only to the
@@ -1142,6 +1169,37 @@ actor SecureMessagingExchangeCoordinator {
         mediaType: String,
         caption: String?
     ) async throws -> SecureMessagingQueueResult {
+        try await queueMediaAttachment(
+            forUserID: userID,
+            conversationID: conversationID,
+            expectedRecipientUserID: expectedRecipientUserID,
+            title: title,
+            mediaData: imageData,
+            mediaType: mediaType,
+            caption: caption,
+            storesInlineAttachment: true
+        )
+    }
+
+    /// Encrypts, uploads, and queues any allowed media kind (image, voice note, video, document).
+    /// `storesInlineAttachment` keeps small plaintext blobs in the encrypted state file for
+    /// instant offline history; large blobs must be cached by the caller in the media file cache
+    /// so routine state writes never rewrite multi-megabyte blobs.
+    func queueMediaAttachment(
+        forUserID userID: String,
+        conversationID: String,
+        expectedRecipientUserID: String,
+        title: String,
+        mediaData: Data,
+        mediaType: String,
+        caption: String?,
+        storesInlineAttachment: Bool,
+        submittedDraftBody: String? = nil,
+        draftClearVersion: ConversationDraftWriteVersion? = nil
+    ) async throws -> SecureMessagingQueueResult {
+        guard (submittedDraftBody == nil) == (draftClearVersion == nil) else {
+            throw SecureMessagingCryptoError.invalidContent
+        }
         let local = try canonicalUUID(userID, error: .invalidAccount)
         let conversationID = try canonicalUUID(conversationID, error: .invalidConversation)
         let recipient = try canonicalUUID(
@@ -1149,10 +1207,10 @@ actor SecureMessagingExchangeCoordinator {
             error: .invalidRecipient
         )
         guard SecureMessagingWire.allowedAttachmentMediaTypes.contains(mediaType),
-              !imageData.isEmpty,
-              imageData.count <= SecureMediaAttachmentCipher.maximumPlaintextBytes,
+              !mediaData.isEmpty,
+              mediaData.count <= SecureMediaAttachmentCipher.maximumPlaintextBytes,
               KitMediaMessageDescriptor.canEncodeCaption(caption)
-        else { throw SecureMediaAttachmentError.invalidImage }
+        else { throw SecureMediaAttachmentError.invalidMedia }
         let dto = try await transport.messagingConversation(id: conversationID)
         let validated = try validateConversation(
             dto,
@@ -1161,8 +1219,23 @@ actor SecureMessagingExchangeCoordinator {
             fallbackTitle: title
         )
         _ = try await activation.activate(forUserID: local)
-        let descriptor = try await uploadImageDescriptor(
-            imageData: imageData,
+        if KitChatMediaKind(mediaType: mediaType) != .image {
+            let snapshot = await store.snapshot()
+            guard snapshot.profile?.id == local,
+                  let enrollment = snapshot.secureMessaging?.enrollment,
+                  enrollment.userID == local
+            else { throw SecureMessagingExchangeError.invalidAccount }
+            let roster = try await transport.messagingDeviceRoster(conversationId: conversationID)
+            guard MessagingRichMediaCapabilityPolicy.supports(
+                mediaType: mediaType,
+                roster: roster,
+                conversationID: conversationID,
+                currentDeviceID: enrollment.serverDeviceID,
+                recipientUserID: recipient
+            ) else { throw SecureMediaAttachmentError.incompatibleRecipient }
+        }
+        let descriptor = try await uploadMediaDescriptor(
+            mediaData: mediaData,
             mediaType: mediaType,
             caption: caption
         )
@@ -1170,22 +1243,25 @@ actor SecureMessagingExchangeCoordinator {
             forUserID: local,
             conversation: validated,
             text: descriptor.encoded,
-            attachmentData: imageData
+            attachmentData: storesInlineAttachment ? mediaData : nil,
+            submittedDraftBody: submittedDraftBody,
+            draftClearVersion: draftClearVersion,
+            requiredRichMediaType: mediaType
         )
     }
 
-    private func uploadImageDescriptor(
-        imageData: Data,
+    private func uploadMediaDescriptor(
+        mediaData: Data,
         mediaType: String,
         caption: String?
     ) async throws -> KitMediaMessageDescriptor {
         guard SecureMessagingWire.allowedAttachmentMediaTypes.contains(mediaType),
-              !imageData.isEmpty,
-              imageData.count <= SecureMediaAttachmentCipher.maximumPlaintextBytes,
+              !mediaData.isEmpty,
+              mediaData.count <= SecureMediaAttachmentCipher.maximumPlaintextBytes,
               KitMediaMessageDescriptor.canEncodeCaption(caption)
-        else { throw SecureMediaAttachmentError.invalidImage }
+        else { throw SecureMediaAttachmentError.invalidMedia }
         let encrypted = try await Task.detached(priority: .userInitiated) {
-            try SecureMediaAttachmentCipher.encrypt(imageData)
+            try SecureMediaAttachmentCipher.encrypt(mediaData)
         }.value
         let upload = try await transport.uploadMessagingAttachment(
             mediaType: mediaType,
@@ -1273,7 +1349,10 @@ actor SecureMessagingExchangeCoordinator {
         existingCommandID: UUID? = nil,
         existingMessageID: UUID? = nil,
         expectedExistingCommand: OfflineCommand? = nil,
-        expectedExistingMessage: LocalMessage? = nil
+        expectedExistingMessage: LocalMessage? = nil,
+        submittedDraftBody: String? = nil,
+        draftClearVersion: ConversationDraftWriteVersion? = nil,
+        requiredRichMediaType: String? = nil
     ) async throws -> SecureMessagingQueueResult {
         let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !body.isEmpty else { throw SecureMessagingCryptoError.invalidContent }
@@ -1283,7 +1362,9 @@ actor SecureMessagingExchangeCoordinator {
               (expectedExistingMessage == nil) == (existingMessageID == nil),
               expectedExistingCommand?.id == existingCommandID,
               expectedExistingCommand?.messageId == existingMessageID,
-              expectedExistingMessage?.id == existingMessageID
+              expectedExistingMessage?.id == existingMessageID,
+              (submittedDraftBody == nil) == (draftClearVersion == nil),
+              submittedDraftBody == nil || existingMessageID == nil
         else {
             throw SecureMessagingExchangeError.invalidConversation
         }
@@ -1321,6 +1402,17 @@ actor SecureMessagingExchangeCoordinator {
             let rosterDTO = try await transport.messagingDeviceRoster(
                 conversationId: conversation.id
             )
+            if let requiredRichMediaType,
+               KitChatMediaKind(mediaType: requiredRichMediaType) != .image,
+               !MessagingRichMediaCapabilityPolicy.supports(
+                   mediaType: requiredRichMediaType,
+                   roster: rosterDTO,
+                   conversationID: conversation.id,
+                   currentDeviceID: enrollment.serverDeviceID,
+                   recipientUserID: conversation.recipientUserID
+               ) {
+                throw SecureMediaAttachmentError.incompatibleRecipient
+            }
             let roster = try SecureMessagingMapper.roster(
                 from: rosterDTO,
                 use: .current,
@@ -1445,6 +1537,15 @@ actor SecureMessagingExchangeCoordinator {
                         else { throw SecureMessagingCryptoError.staleState }
                         state.messages.append(localMessage)
                         state.outbox.append(command)
+                    }
+                    if let submittedDraftBody, let draftClearVersion {
+                        _ = ConversationDraftPolicy.clearAfterSuccessfulQueue(
+                            submittedBody: submittedDraftBody,
+                            conversationID: conversation.id,
+                            ownerUserID: userID,
+                            writeVersion: draftClearVersion,
+                            in: &state
+                        )
                     }
                 }
                 return SecureMessagingQueueResult(

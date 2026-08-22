@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import base64
 import datetime as dt
 import hashlib
+import importlib.util
 import json
+import os
 import pathlib
 import plistlib
+import re
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -13,7 +18,11 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 PREPARE = ROOT / ".github/scripts/prepare_ios_signing.py"
 VERIFY = ROOT / ".github/scripts/verify_ios_archive.py"
+PROFILE_GENERATOR_PATH = ROOT / ".github/scripts/create_ios_app_store_profile.py"
+CLOUDKIT_HELPER = ROOT / ".github/scripts/prepare_cloudkit_schema.py"
+CLOUDKIT_SCHEMA = ROOT / ".github/cloudkit/KitMessageBackup.ckdb"
 TEAM = "A1B2C3D4E5"
+CLOUDKIT_TEAM = "AU55CKVJ55"
 BUNDLE = "africa.kit.pay.ios"
 PROFILE_UUID = "11111111-2222-3333-4444-555555555555"
 CERTIFICATE_DER = b"synthetic-distribution-certificate"
@@ -21,6 +30,18 @@ SOURCE_URL = (
     "https://github.com/kitafrica33/kit-pay-ios-source/releases/tag/"
     "v1.2.3-build42"
 )
+ICLOUD_CONTAINER = f"iCloud.{BUNDLE}"
+ICLOUD_ENVIRONMENT_KEY = "com.apple.developer.icloud-container-environment"
+
+PROFILE_GENERATOR_SPEC = importlib.util.spec_from_file_location(
+    "kitpay_create_ios_app_store_profile",
+    PROFILE_GENERATOR_PATH,
+)
+if PROFILE_GENERATOR_SPEC is None or PROFILE_GENERATOR_SPEC.loader is None:
+    raise RuntimeError("Could not load create_ios_app_store_profile.py")
+PROFILE_GENERATOR = importlib.util.module_from_spec(PROFILE_GENERATOR_SPEC)
+sys.modules[PROFILE_GENERATOR_SPEC.name] = PROFILE_GENERATOR
+PROFILE_GENERATOR_SPEC.loader.exec_module(PROFILE_GENERATOR)
 
 
 def write_plist(path: pathlib.Path, value: dict) -> None:
@@ -40,6 +61,70 @@ def profile(aps_environment: str = "production") -> dict:
             "com.apple.developer.team-identifier": TEAM,
             "aps-environment": aps_environment,
             "get-task-allow": False,
+            "com.apple.developer.icloud-container-identifiers": [ICLOUD_CONTAINER],
+            "com.apple.developer.icloud-services": ["CloudKit"],
+            ICLOUD_ENVIRONMENT_KEY: "Production",
+        },
+    }
+
+
+class FakeAppStoreConnectClient:
+    def __init__(self, responses: list[object]) -> None:
+        self.responses = list(responses)
+        self.calls: list[dict[str, object]] = []
+
+    def request(self, method: str, path: str, **kwargs: object) -> object:
+        self.calls.append({"method": method, "path": path, **kwargs})
+        if not self.responses:
+            raise AssertionError("Unexpected App Store Connect request")
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+def api_collection(resources: list[dict[str, object]]) -> dict[str, object]:
+    return {"data": resources, "links": {"next": None}}
+
+
+def capability_resource(
+    version: str,
+    *,
+    resource_id: str = "icloud-capability",
+) -> dict[str, object]:
+    return {
+        "type": "bundleIdCapabilities",
+        "id": resource_id,
+        "attributes": {
+            "capabilityType": "ICLOUD",
+            "settings": [
+                {
+                    "key": "ICLOUD_VERSION",
+                    "options": [{"key": version}],
+                }
+            ],
+        },
+    }
+
+
+def certificate_resource(
+    content: bytes,
+    *,
+    resource_id: str = "distribution-certificate",
+    activated: bool = True,
+    expiration: str = "2999-01-01T00:00:00Z",
+    platform: str = "IOS",
+    certificate_type: str = "DISTRIBUTION",
+) -> dict[str, object]:
+    return {
+        "type": "certificates",
+        "id": resource_id,
+        "attributes": {
+            "certificateType": certificate_type,
+            "certificateContent": base64.b64encode(content).decode("ascii"),
+            "expirationDate": expiration,
+            "platform": platform,
+            "activated": activated,
         },
     }
 
@@ -116,6 +201,66 @@ class PrepareIOSSigningTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("aps-environment=production", result.stderr)
 
+    def test_rejects_profile_without_exact_cloudkit_entitlements(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = pathlib.Path(raw)
+            profile_path = root / "profile.plist"
+            certificate_path = root / "distribution.der"
+            invalid = profile()
+            invalid["Entitlements"].pop(
+                "com.apple.developer.icloud-container-identifiers"
+            )
+            write_plist(profile_path, invalid)
+            certificate_path.write_bytes(CERTIFICATE_DER)
+            command = [
+                "python3",
+                str(PREPARE),
+                "--profile-plist",
+                str(profile_path),
+                "--certificate-der",
+                str(certificate_path),
+                "--bundle-id",
+                BUNDLE,
+                "--team-id",
+                TEAM,
+                "--export-options",
+                str(root / "ExportOptions.plist"),
+                "--profile-uuid-output",
+                str(root / "uuid"),
+            ]
+            missing_container = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(missing_container.returncode, 0)
+            self.assertIn("exact Kit Pay iCloud container", missing_container.stderr)
+
+            invalid = profile()
+            invalid["Entitlements"]["com.apple.developer.icloud-services"] = []
+            write_plist(profile_path, invalid)
+            missing_service = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(missing_service.returncode, 0)
+            self.assertIn("CloudKit service", missing_service.stderr)
+
+            invalid = profile()
+            invalid["Entitlements"].pop(ICLOUD_ENVIRONMENT_KEY)
+            write_plist(profile_path, invalid)
+            missing_environment = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(missing_environment.returncode, 0)
+            self.assertIn("Production iCloud environment", missing_environment.stderr)
+
     def test_rejects_wrong_platform_or_distribution_certificate(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = pathlib.Path(raw)
@@ -148,6 +293,504 @@ class PrepareIOSSigningTests(unittest.TestCase):
             write_plist(profile_path, invalid)
             certificate_result = subprocess.run(common, check=False, capture_output=True, text=True)
             self.assertIn("not authorized by the provisioning profile", certificate_result.stderr)
+
+
+class AppStoreProfileGeneratorTests(unittest.TestCase):
+    def test_existing_xcode6_capability_is_verified_without_mutation(self) -> None:
+        existing = capability_resource("XCODE_6")
+        client = FakeAppStoreConnectClient([api_collection([existing])])
+
+        PROFILE_GENERATOR._ensure_icloud_xcode6(client, "bundle-resource")
+
+        self.assertEqual([call["method"] for call in client.calls], ["GET"])
+        self.assertTrue(
+            all("/bundleIdCapabilities" in str(call["path"]) for call in client.calls)
+        )
+
+    def test_missing_capability_uses_exact_creation_body(self) -> None:
+        client = FakeAppStoreConnectClient(
+            [
+                api_collection([]),
+                {"data": capability_resource("XCODE_6")},
+                api_collection([capability_resource("XCODE_6")]),
+            ]
+        )
+
+        PROFILE_GENERATOR._ensure_icloud_xcode6(client, "bundle-resource")
+
+        mutation = client.calls[1]
+        self.assertEqual(mutation["method"], "POST")
+        self.assertEqual(mutation["path"], "/v1/bundleIdCapabilities")
+        self.assertEqual(mutation["expected_status"], 201)
+        self.assertEqual(
+            mutation["body"],
+            {
+                "data": {
+                    "type": "bundleIdCapabilities",
+                    "attributes": {
+                        "capabilityType": "ICLOUD",
+                        "settings": [
+                            {
+                                "key": "ICLOUD_VERSION",
+                                "options": [{"key": "XCODE_6"}],
+                            }
+                        ],
+                    },
+                    "relationships": {
+                        "bundleId": {
+                            "data": {
+                                "type": "bundleIds",
+                                "id": "bundle-resource",
+                            }
+                        }
+                    },
+                }
+            },
+        )
+
+    def test_xcode5_capability_uses_exact_update_body(self) -> None:
+        client = FakeAppStoreConnectClient(
+            [
+                api_collection([capability_resource("XCODE_5")]),
+                {"data": capability_resource("XCODE_6")},
+                api_collection([capability_resource("XCODE_6")]),
+            ]
+        )
+
+        PROFILE_GENERATOR._ensure_icloud_xcode6(client, "bundle-resource")
+
+        mutation = client.calls[1]
+        self.assertEqual(mutation["method"], "PATCH")
+        self.assertEqual(
+            mutation["path"],
+            "/v1/bundleIdCapabilities/icloud-capability",
+        )
+        self.assertEqual(mutation["expected_status"], 200)
+        self.assertEqual(
+            mutation["body"],
+            {
+                "data": {
+                    "type": "bundleIdCapabilities",
+                    "id": "icloud-capability",
+                    "attributes": {
+                        "capabilityType": "ICLOUD",
+                        "settings": [
+                            {
+                                "key": "ICLOUD_VERSION",
+                                "options": [{"key": "XCODE_6"}],
+                            }
+                        ],
+                    },
+                }
+            },
+        )
+
+    def test_capability_propagation_poll_uses_bounded_exponential_delays(self) -> None:
+        stale = api_collection([capability_resource("XCODE_5")])
+        ready = api_collection([capability_resource("XCODE_6")])
+        client = FakeAppStoreConnectClient(
+            [
+                api_collection([]),
+                {"data": capability_resource("XCODE_6")},
+                stale,
+                stale,
+                ready,
+            ]
+        )
+        sleeps: list[float] = []
+
+        PROFILE_GENERATOR._ensure_icloud_xcode6(
+            client,
+            "bundle-resource",
+            sleep=sleeps.append,
+        )
+
+        self.assertEqual(sleeps, [1.0, 2.0])
+        self.assertEqual(
+            [call["method"] for call in client.calls],
+            ["GET", "POST", "GET", "GET", "GET"],
+        )
+
+    def test_capability_propagation_exhaustion_fails_closed(self) -> None:
+        stale = api_collection([capability_resource("XCODE_5")])
+        client = FakeAppStoreConnectClient(
+            [
+                api_collection([]),
+                {"data": capability_resource("XCODE_6")},
+                *(
+                    stale
+                    for _ in range(
+                        len(
+                            PROFILE_GENERATOR._CAPABILITY_PROPAGATION_DELAYS_SECONDS
+                        )
+                        + 1
+                    )
+                ),
+            ]
+        )
+        sleeps: list[float] = []
+
+        with self.assertRaisesRegex(
+            PROFILE_GENERATOR.ProvisioningError,
+            "verified ICLOUD XCODE_6",
+        ):
+            PROFILE_GENERATOR._ensure_icloud_xcode6(
+                client,
+                "bundle-resource",
+                sleep=sleeps.append,
+            )
+
+        self.assertEqual(
+            sleeps,
+            list(PROFILE_GENERATOR._CAPABILITY_PROPAGATION_DELAYS_SECONDS),
+        )
+
+    def test_capability_poll_retries_only_transient_http_statuses(self) -> None:
+        mutation_response = {"data": capability_resource("XCODE_6")}
+        for status in sorted(PROFILE_GENERATOR._TRANSIENT_HTTP_STATUSES):
+            with self.subTest(status=status):
+                client = FakeAppStoreConnectClient(
+                    [
+                        api_collection([]),
+                        mutation_response,
+                        PROFILE_GENERATOR.AppStoreConnectHTTPError(
+                            status,
+                            "bundle capability lookup",
+                        ),
+                        api_collection([capability_resource("XCODE_6")]),
+                    ]
+                )
+                sleeps: list[float] = []
+
+                PROFILE_GENERATOR._ensure_icloud_xcode6(
+                    client,
+                    "bundle-resource",
+                    sleep=sleeps.append,
+                )
+
+                self.assertEqual(sleeps, [1.0])
+
+        client = FakeAppStoreConnectClient(
+            [
+                api_collection([]),
+                mutation_response,
+                PROFILE_GENERATOR.AppStoreConnectHTTPError(
+                    403,
+                    "bundle capability lookup",
+                ),
+            ]
+        )
+        sleeps = []
+        with self.assertRaises(PROFILE_GENERATOR.AppStoreConnectHTTPError):
+            PROFILE_GENERATOR._ensure_icloud_xcode6(
+                client,
+                "bundle-resource",
+                sleep=sleeps.append,
+            )
+        self.assertEqual(sleeps, [])
+
+    def test_distribution_certificate_matches_exact_der(self) -> None:
+        client = FakeAppStoreConnectClient(
+            [
+                api_collection(
+                    [
+                        certificate_resource(b"unrelated", resource_id="other"),
+                        certificate_resource(CERTIFICATE_DER),
+                    ]
+                )
+            ]
+        )
+
+        result = PROFILE_GENERATOR._find_distribution_certificate(
+            client,
+            CERTIFICATE_DER,
+        )
+
+        self.assertEqual(result, "distribution-certificate")
+        self.assertEqual(
+            client.calls[0]["query"],
+            {
+                "filter[certificateType]": "DISTRIBUTION,IOS_DISTRIBUTION",
+                "fields[certificates]": (
+                    "certificateType,certificateContent,expirationDate,platform,activated"
+                ),
+                "limit": "200",
+            },
+        )
+
+    def test_distribution_certificate_rejects_invalid_matches(self) -> None:
+        cases = (
+            (
+                "missing",
+                [certificate_resource(b"unrelated")],
+                "not found uniquely",
+            ),
+            (
+                "ambiguous",
+                [
+                    certificate_resource(CERTIFICATE_DER, resource_id="first"),
+                    certificate_resource(CERTIFICATE_DER, resource_id="second"),
+                ],
+                "not found uniquely",
+            ),
+            (
+                "inactive",
+                [certificate_resource(CERTIFICATE_DER, activated=False)],
+                "not active",
+            ),
+            (
+                "expired",
+                [
+                    certificate_resource(
+                        CERTIFICATE_DER,
+                        expiration="2000-01-01T00:00:00Z",
+                    )
+                ],
+                "expired",
+            ),
+            (
+                "wrong-platform",
+                [certificate_resource(CERTIFICATE_DER, platform="MAC_OS")],
+                "not valid for iOS",
+            ),
+        )
+        for label, resources, message in cases:
+            with self.subTest(label=label):
+                client = FakeAppStoreConnectClient([api_collection(resources)])
+                with self.assertRaisesRegex(
+                    PROFILE_GENERATOR.ProvisioningError,
+                    message,
+                ):
+                    PROFILE_GENERATOR._find_distribution_certificate(
+                        client,
+                        CERTIFICATE_DER,
+                    )
+
+    def test_profile_creation_uses_exact_app_store_request(self) -> None:
+        profile_bytes = b"\x30" + (b"p" * 255)
+        client = FakeAppStoreConnectClient(
+            [
+                {
+                    "data": {
+                        "type": "profiles",
+                        "id": "profile-resource",
+                        "attributes": {
+                            "name": "Kit Pay App Store 123-1",
+                            "platform": "IOS",
+                            "profileType": "IOS_APP_STORE",
+                            "profileState": "ACTIVE",
+                            "uuid": PROFILE_UUID,
+                            "expirationDate": "2999-01-01T00:00:00Z",
+                            "profileContent": base64.b64encode(profile_bytes).decode(
+                                "ascii"
+                            ),
+                        },
+                    }
+                }
+            ]
+        )
+
+        result = PROFILE_GENERATOR._create_profile(
+            client,
+            "bundle-resource",
+            "certificate-resource",
+            "Kit Pay App Store 123-1",
+        )
+
+        self.assertEqual(result, profile_bytes)
+        self.assertEqual(client.calls[0]["method"], "POST")
+        self.assertEqual(client.calls[0]["path"], "/v1/profiles")
+        self.assertEqual(client.calls[0]["expected_status"], 201)
+        self.assertEqual(
+            client.calls[0]["body"],
+            {
+                "data": {
+                    "type": "profiles",
+                    "attributes": {
+                        "name": "Kit Pay App Store 123-1",
+                        "profileType": "IOS_APP_STORE",
+                    },
+                    "relationships": {
+                        "bundleId": {
+                            "data": {
+                                "type": "bundleIds",
+                                "id": "bundle-resource",
+                            }
+                        },
+                        "certificates": {
+                            "data": [
+                                {
+                                    "type": "certificates",
+                                    "id": "certificate-resource",
+                                }
+                            ]
+                        },
+                    },
+                }
+            },
+        )
+
+    def test_profile_creation_retries_only_propagation_and_transient_statuses(self) -> None:
+        profile_bytes = b"\x30" + (b"p" * 255)
+        success = {
+            "data": {
+                "type": "profiles",
+                "id": "profile-resource",
+                "attributes": {
+                    "name": "Kit Pay App Store 123-1",
+                    "platform": "IOS",
+                    "profileType": "IOS_APP_STORE",
+                    "profileState": "ACTIVE",
+                    "uuid": PROFILE_UUID,
+                    "expirationDate": "2999-01-01T00:00:00Z",
+                    "profileContent": base64.b64encode(profile_bytes).decode("ascii"),
+                },
+            }
+        }
+        for status in sorted(
+            PROFILE_GENERATOR._PROFILE_CREATION_RETRYABLE_HTTP_STATUSES
+        ):
+            with self.subTest(status=status):
+                client = FakeAppStoreConnectClient(
+                    [
+                        PROFILE_GENERATOR.AppStoreConnectHTTPError(
+                            status,
+                            "App Store profile creation",
+                        ),
+                        success,
+                    ]
+                )
+                sleeps: list[float] = []
+
+                result = PROFILE_GENERATOR._create_profile(
+                    client,
+                    "bundle-resource",
+                    "certificate-resource",
+                    "Kit Pay App Store 123-1",
+                    sleep=sleeps.append,
+                )
+
+                self.assertEqual(result, profile_bytes)
+                self.assertEqual(sleeps, [1.0])
+                self.assertEqual(len(client.calls), 2)
+
+        for status in (400, 401, 403, 404, 422):
+            with self.subTest(nonretryable_status=status):
+                client = FakeAppStoreConnectClient(
+                    [
+                        PROFILE_GENERATOR.AppStoreConnectHTTPError(
+                            status,
+                            "App Store profile creation",
+                        )
+                    ]
+                )
+                sleeps = []
+                with self.assertRaises(PROFILE_GENERATOR.AppStoreConnectHTTPError):
+                    PROFILE_GENERATOR._create_profile(
+                        client,
+                        "bundle-resource",
+                        "certificate-resource",
+                        "Kit Pay App Store 123-1",
+                        sleep=sleeps.append,
+                    )
+                self.assertEqual(sleeps, [])
+                self.assertEqual(len(client.calls), 1)
+
+    def test_profile_creation_retry_exhaustion_fails_closed(self) -> None:
+        status = 409
+        client = FakeAppStoreConnectClient(
+            [
+                PROFILE_GENERATOR.AppStoreConnectHTTPError(
+                    status,
+                    "App Store profile creation",
+                )
+                for _ in range(
+                    len(PROFILE_GENERATOR._PROFILE_CREATION_RETRY_DELAYS_SECONDS)
+                    + 1
+                )
+            ]
+        )
+        sleeps: list[float] = []
+
+        with self.assertRaises(PROFILE_GENERATOR.AppStoreConnectHTTPError) as raised:
+            PROFILE_GENERATOR._create_profile(
+                client,
+                "bundle-resource",
+                "certificate-resource",
+                "Kit Pay App Store 123-1",
+                sleep=sleeps.append,
+            )
+
+        self.assertEqual(raised.exception.status, status)
+        self.assertEqual(
+            sleeps,
+            list(PROFILE_GENERATOR._PROFILE_CREATION_RETRY_DELAYS_SECONDS),
+        )
+        self.assertEqual(
+            len(client.calls),
+            len(PROFILE_GENERATOR._PROFILE_CREATION_RETRY_DELAYS_SECONDS) + 1,
+        )
+
+    def test_profile_response_and_output_are_fail_closed(self) -> None:
+        malformed_client = FakeAppStoreConnectClient([{"data": []}])
+        with self.assertRaisesRegex(
+            PROFILE_GENERATOR.ProvisioningError,
+            "invalid profile resource",
+        ):
+            PROFILE_GENERATOR._create_profile(
+                malformed_client,
+                "bundle-resource",
+                "certificate-resource",
+                "Kit Pay App Store 123-1",
+            )
+
+        invalid_content_client = FakeAppStoreConnectClient(
+            [
+                {
+                    "data": {
+                        "type": "profiles",
+                        "id": "profile-resource",
+                        "attributes": {
+                            "name": "Kit Pay App Store 123-1",
+                            "platform": "IOS",
+                            "profileType": "IOS_APP_STORE",
+                            "profileState": "ACTIVE",
+                            "uuid": PROFILE_UUID,
+                            "expirationDate": "2999-01-01T00:00:00Z",
+                            "profileContent": base64.b64encode(b"not-cms").decode(
+                                "ascii"
+                            ),
+                        },
+                    }
+                }
+            ]
+        )
+        with self.assertRaisesRegex(
+            PROFILE_GENERATOR.ProvisioningError,
+            "invalid provisioning profile content",
+        ):
+            PROFILE_GENERATOR._create_profile(
+                invalid_content_client,
+                "bundle-resource",
+                "certificate-resource",
+                "Kit Pay App Store 123-1",
+            )
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = pathlib.Path(raw)
+            fresh_output = root / "fresh.mobileprovision"
+            PROFILE_GENERATOR._write_private_file(fresh_output, b"profile")
+            self.assertEqual(fresh_output.read_bytes(), b"profile")
+            self.assertEqual(fresh_output.stat().st_mode & 0o777, 0o600)
+
+            output = root / "profile.mobileprovision"
+            output.write_bytes(b"existing")
+            with self.assertRaisesRegex(
+                PROFILE_GENERATOR.ProvisioningError,
+                "Refusing to overwrite",
+            ):
+                PROFILE_GENERATOR._write_private_file(output, b"replacement")
+            self.assertEqual(output.read_bytes(), b"existing")
 
 
 class SigningConfigurationTests(unittest.TestCase):
@@ -210,6 +853,309 @@ class SigningConfigurationTests(unittest.TestCase):
         self.assertIn("--header 'Authorization:'", workflow)
         self.assertIn('--corresponding-source-url "$CORRESPONDING_SOURCE_URL"', workflow)
 
+    def test_workflow_generates_ephemeral_profile_with_scoped_credentials(self) -> None:
+        workflow = (ROOT / ".github/workflows/ios-app-store-archive.yml").read_text()
+
+        self.assertNotIn("IOS_APP_STORE_PROVISIONING_PROFILE_BASE64", workflow)
+        self.assertIn("IOS_DISTRIBUTION_CERTIFICATE_BASE64", workflow)
+        generation_start = workflow.index(
+            "      - name: Generate fresh App Store provisioning profile"
+        )
+        generation_end = workflow.index("\n      - name:", generation_start + 1)
+        generation_step = workflow[generation_start:generation_end]
+        for secret in (
+            "APP_STORE_CONNECT_ISSUER_ID",
+            "APP_STORE_CONNECT_KEY_ID",
+            "APP_STORE_CONNECT_PRIVATE_KEY",
+        ):
+            reference = "${{ secrets." + secret + " }}"
+            self.assertEqual(workflow.count(reference), 1)
+            self.assertIn(reference, generation_step)
+        self.assertIn("create_ios_app_store_profile.py", generation_step)
+        self.assertIn(
+            '--profile-output "$RUNNER_TEMP/kitpay-app-store.mobileprovision"',
+            generation_step,
+        )
+        self.assertIn(
+            'security cms -D \\\n            -i "$RUNNER_TEMP/kitpay-app-store.mobileprovision"',
+            workflow,
+        )
+        self.assertIn(
+            'rm -f \\\n            "$RUNNER_TEMP/kitpay-distribution.p12"',
+            workflow,
+        )
+        self.assertIn('"$RUNNER_TEMP/kitpay-app-store.mobileprovision"', workflow)
+        self.assertIn("distinct CloudKit management token", workflow)
+
+    def test_source_entitlements_leave_icloud_environment_to_signing(self) -> None:
+        with (ROOT / "KitPay/KitPay.entitlements").open("rb") as source:
+            entitlements = plistlib.load(source)
+
+        self.assertNotIn(ICLOUD_ENVIRONMENT_KEY, entitlements)
+
+
+class CloudKitSchemaTests(unittest.TestCase):
+    def test_schema_has_exact_fields_and_least_privilege_grants(self) -> None:
+        schema = CLOUDKIT_SCHEMA.read_text(encoding="utf-8")
+        self.assertEqual(
+            schema,
+            """DEFINE SCHEMA
+  RECORD TYPE KitMessageBackup (
+    payload ASSET,
+    createdAt TIMESTAMP,
+    newestMessageAt TIMESTAMP,
+    byteSize INT64,
+    messageCount INT64,
+    schemaVersion INT64,
+    generation INT64,
+    deviceName STRING,
+    contentDigest STRING,
+    GRANT WRITE TO \"_creator\",
+    GRANT CREATE TO \"_icloud\",
+    GRANT READ TO \"_creator\"
+  );
+""",
+        )
+        self.assertNotIn('"_world"', schema)
+        self.assertNotIn('GRANT READ TO "_icloud"', schema)
+        self.assertNotIn('GRANT WRITE TO "_icloud"', schema)
+        self.assertNotIn("ENCRYPTED", schema)
+
+        manager = (ROOT / "KitPay/Core/MessageBackupManager.swift").read_text(
+            encoding="utf-8"
+        )
+        field_block = manager.split("private enum Field {", 1)[1].split("}", 1)[0]
+        manager_fields = dict(
+            re.findall(r'static let ([A-Za-z0-9_]+) = "([A-Za-z0-9_]+)"', field_block)
+        )
+        expected_fields = {
+            "payload",
+            "createdAt",
+            "newestMessageAt",
+            "byteSize",
+            "messageCount",
+            "schemaVersion",
+            "generation",
+            "deviceName",
+            "contentDigest",
+        }
+        self.assertEqual(set(manager_fields), expected_fields)
+        self.assertEqual(set(manager_fields.values()), expected_fields)
+
+    def test_default_helper_is_local_validation_only(self) -> None:
+        result = subprocess.run(
+            [sys.executable, str(CLOUDKIT_HELPER)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("no remote action was taken", result.stdout)
+
+    def test_explicit_development_import_validates_then_imports(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = pathlib.Path(raw)
+            capture = root / "cktool-arguments"
+            fake_xcrun = root / "xcrun"
+            fake_xcrun.write_text(
+                "#!/bin/sh\n"
+                "printf 'CALL\\n' >> \"$CKTOOL_CAPTURE\"\n"
+                "printf '%s\\n' \"$@\" >> \"$CKTOOL_CAPTURE\"\n",
+                encoding="utf-8",
+            )
+            fake_xcrun.chmod(0o700)
+            environment = os.environ.copy()
+            environment["PATH"] = str(root)
+            environment["CKTOOL_CAPTURE"] = str(capture)
+            environment.pop("CLOUDKIT_MANAGEMENT_TOKEN", None)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(CLOUDKIT_HELPER),
+                    "--import-development",
+                    "--team-id",
+                    CLOUDKIT_TEAM,
+                    "--container-id",
+                    ICLOUD_CONTAINER,
+                    "--environment",
+                    "development",
+                    "--confirmation",
+                    "IMPORT_KIT_PAY_CLOUDKIT_DEVELOPMENT",
+                    "--use-saved-management-token",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("promote it to production from CloudKit Console", result.stdout)
+            calls = [
+                section.strip().splitlines()
+                for section in capture.read_text(encoding="utf-8").split("CALL\n")
+                if section.strip()
+            ]
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(
+                [call[:2] for call in calls],
+                [["cktool", "validate-schema"], ["cktool", "import-schema"]],
+            )
+            for call in calls:
+                self.assertIn("--team-id", call)
+                self.assertIn(CLOUDKIT_TEAM, call)
+                self.assertIn("--container-id", call)
+                self.assertIn(ICLOUD_CONTAINER, call)
+                self.assertIn("--environment", call)
+                self.assertIn("development", call)
+                self.assertNotIn("production", call)
+                self.assertNotIn("reset-schema", call)
+
+    def test_remote_import_rejects_wrong_environment_or_confirmation(self) -> None:
+        helper_source = CLOUDKIT_HELPER.read_text(encoding="utf-8")
+        self.assertNotIn('"reset-schema"', helper_source)
+        self.assertNotIn('"deploy-schema"', helper_source)
+        self.assertNotIn("--import-production", helper_source)
+        self.assertNotIn("IMPORT_KIT_PAY_CLOUDKIT_PRODUCTION", helper_source)
+
+        common = [
+            sys.executable,
+            str(CLOUDKIT_HELPER),
+            "--team-id",
+            CLOUDKIT_TEAM,
+            "--container-id",
+            ICLOUD_CONTAINER,
+            "--use-saved-management-token",
+        ]
+        cases = (
+            (
+                [
+                    "--import-development",
+                    "--environment",
+                    "production",
+                    "--confirmation",
+                    "IMPORT_KIT_PAY_CLOUDKIT_DEVELOPMENT",
+                ],
+                "must exactly match",
+            ),
+            (
+                [
+                    "--import-development",
+                    "--environment",
+                    "development",
+                    "--confirmation",
+                    "UNCONFIRMED_CLOUDKIT_IMPORT",
+                ],
+                "IMPORT_KIT_PAY_CLOUDKIT_DEVELOPMENT",
+            ),
+            (
+                [
+                    "--import-development",
+                    "--environment",
+                    "development",
+                    "--confirmation",
+                    "IMPORT_KIT_PAY_CLOUDKIT_DEVELOPMENT",
+                    "--team-id",
+                    TEAM,
+                ],
+                f"--team-id must be exactly {CLOUDKIT_TEAM}",
+            ),
+            (
+                [
+                    "--import-development",
+                    "--environment",
+                    "development",
+                    "--confirmation",
+                    "IMPORT_KIT_PAY_CLOUDKIT_DEVELOPMENT",
+                    "--container-id",
+                    "iCloud.invalid.example",
+                ],
+                f"--container-id must be exactly {ICLOUD_CONTAINER}",
+            ),
+        )
+        for arguments, message in cases:
+            with self.subTest(arguments=arguments):
+                result = subprocess.run(
+                    [*common, *arguments],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+
+        no_token = subprocess.run(
+            [
+                sys.executable,
+                str(CLOUDKIT_HELPER),
+                "--import-development",
+                "--team-id",
+                CLOUDKIT_TEAM,
+                "--container-id",
+                ICLOUD_CONTAINER,
+                "--environment",
+                "development",
+                "--confirmation",
+                "IMPORT_KIT_PAY_CLOUDKIT_DEVELOPMENT",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            env={key: value for key, value in os.environ.items() if key != "CLOUDKIT_MANAGEMENT_TOKEN"},
+        )
+        self.assertNotEqual(no_token.returncode, 0)
+        self.assertIn("CLOUDKIT_MANAGEMENT_TOKEN", no_token.stderr)
+
+    def test_production_import_is_not_an_available_operation(self) -> None:
+        result = subprocess.run(
+            [sys.executable, str(CLOUDKIT_HELPER), "--import-production"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unrecognized arguments: --import-production", result.stderr)
+
+    def test_cloudkit_management_token_is_not_logged_on_cktool_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = pathlib.Path(raw)
+            fake_xcrun = root / "xcrun"
+            fake_xcrun.write_text(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >&2\nexit 1\n",
+                encoding="utf-8",
+            )
+            fake_xcrun.chmod(0o700)
+            token = "synthetic-secret-cloudkit-management-token"
+            environment = os.environ.copy()
+            environment["PATH"] = str(root)
+            environment["CLOUDKIT_MANAGEMENT_TOKEN"] = token
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(CLOUDKIT_HELPER),
+                    "--import-development",
+                    "--team-id",
+                    CLOUDKIT_TEAM,
+                    "--container-id",
+                    ICLOUD_CONTAINER,
+                    "--environment",
+                    "development",
+                    "--confirmation",
+                    "IMPORT_KIT_PAY_CLOUDKIT_DEVELOPMENT",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn(token, result.stdout)
+            self.assertNotIn(token, result.stderr)
+            self.assertIn("no command output or token was logged", result.stderr)
+
 
 class VerifyIOSArchiveTests(unittest.TestCase):
     def test_verifies_identity_and_records_artifact_hashes(self) -> None:
@@ -249,6 +1195,11 @@ class VerifyIOSArchiveTests(unittest.TestCase):
                     "com.apple.developer.team-identifier": TEAM,
                     "aps-environment": "production",
                     "get-task-allow": False,
+                    "com.apple.developer.icloud-container-identifiers": [
+                        ICLOUD_CONTAINER
+                    ],
+                    "com.apple.developer.icloud-services": ["CloudKit"],
+                    ICLOUD_ENVIRONMENT_KEY: "Production",
                 },
             )
             artifacts = []
@@ -309,10 +1260,45 @@ class VerifyIOSArchiveTests(unittest.TestCase):
             self.assertEqual(result["target"]["bundleId"], BUNDLE)
             self.assertEqual(result["target"]["correspondingSourceURL"], SOURCE_URL)
             self.assertIs(result["target"]["usesNonExemptEncryption"], False)
+            self.assertEqual(result["target"]["iCloudContainer"], ICLOUD_CONTAINER)
             self.assertEqual(
                 result["artifacts"]["ipa"]["sha256"],
                 hashlib.sha256(b"ipa").hexdigest(),
             )
+
+            invalid_profile = profile()
+            invalid_profile["Entitlements"][ICLOUD_ENVIRONMENT_KEY] = "Development"
+            write_plist(embedded, invalid_profile)
+            wrong_profile_environment = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(wrong_profile_environment.returncode, 0)
+            self.assertIn(
+                "Embedded profile does not authorize the Production iCloud environment",
+                wrong_profile_environment.stderr,
+            )
+            write_plist(embedded, profile())
+
+            with signed.open("rb") as source:
+                signed_entitlements = plistlib.load(source)
+            signed_entitlements[ICLOUD_ENVIRONMENT_KEY] = "Development"
+            write_plist(signed, signed_entitlements)
+            wrong_signed_environment = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(wrong_signed_environment.returncode, 0)
+            self.assertIn(
+                "Signed app iCloud environment entitlement is not Production",
+                wrong_signed_environment.stderr,
+            )
+            signed_entitlements[ICLOUD_ENVIRONMENT_KEY] = "Production"
+            write_plist(signed, signed_entitlements)
 
             write_plist(
                 app / "Info.plist",
@@ -410,6 +1396,11 @@ class VerifyIOSArchiveTests(unittest.TestCase):
                     "application-identifier": f"{TEAM}.{BUNDLE}",
                     "com.apple.developer.team-identifier": TEAM,
                     "aps-environment": "production",
+                    "com.apple.developer.icloud-container-identifiers": [
+                        ICLOUD_CONTAINER
+                    ],
+                    "com.apple.developer.icloud-services": ["CloudKit"],
+                    ICLOUD_ENVIRONMENT_KEY: "Production",
                 },
             )
             missing_debug_restriction = subprocess.run(

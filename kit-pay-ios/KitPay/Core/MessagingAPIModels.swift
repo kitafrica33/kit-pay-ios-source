@@ -30,33 +30,59 @@ enum SecureMessagingWire {
     static let minimumAttachmentCiphertextBytes: Int64 = 64
     static let maximumAttachmentCiphertextBytes: Int64 = 10 * 1_024 * 1_024 + 64
 
+    /// Every allowed type must be mirrored by the server's attachment upload validation and by
+    /// the Android client before it ships; unknown types fail closed on both ends.
     static let allowedAttachmentMediaTypes: Set<String> = [
         "image/jpeg",
         "image/png",
         "image/webp",
         "image/gif",
+        "audio/mp4",
+        "audio/aac",
+        "audio/mpeg",
+        "audio/ogg",
+        "video/mp4",
+        "video/quicktime",
+        "video/webm",
+        "application/pdf",
+        "application/zip",
+        "application/msword",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/vnd.ms-excel",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.ms-powerpoint",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "text/plain",
+        "text/csv",
+        "application/octet-stream",
     ]
 }
 
 enum SecureMediaAttachmentError: LocalizedError, Equatable {
     case invalidImage
+    case invalidMedia
     case invalidDescriptor
     case invalidCiphertext
     case cryptographyFailed
     case serverMetadataMismatch
+    case incompatibleRecipient
 
     var errorDescription: String? {
         switch self {
         case .invalidImage:
             "Choose a JPEG, PNG, WebP, or GIF image up to 10 MB."
+        case .invalidMedia:
+            "Choose a supported file up to 10 MB."
         case .invalidDescriptor:
-            "This encrypted photo has invalid authenticated metadata."
+            "This encrypted attachment has invalid authenticated metadata."
         case .invalidCiphertext:
-            "This encrypted photo failed its integrity check."
+            "This encrypted attachment failed its integrity check."
         case .cryptographyFailed:
-            "The photo could not be encrypted securely."
+            "The attachment could not be encrypted securely."
         case .serverMetadataMismatch:
-            "Kit returned photo metadata that does not match the encrypted message."
+            "Kit returned attachment metadata that does not match the encrypted message."
+        case .incompatibleRecipient:
+            "Voice notes, videos, and documents require the recipient to update Kit Pay on every iPhone."
         }
     }
 }
@@ -66,6 +92,8 @@ enum SecureMediaAttachmentError: LocalizedError, Equatable {
 /// The server receives only the framed ciphertext and its digest. The 64-byte key material is
 /// carried solely inside the per-device Signal envelope as part of `KitMediaMessageDescriptor`.
 enum SecureMediaAttachmentCipher {
+    /// The multipart transport currently materializes its body. Keep the bound conservative until
+    /// authenticated streaming upload and download are available end to end.
     static let maximumPlaintextBytes = 10 * 1_024 * 1_024
     static let keyMaterialBytes = 64
     private static let aesKeyBytes = 32
@@ -85,7 +113,7 @@ enum SecureMediaAttachmentCipher {
         randomBytes: ((Int) throws -> Data)? = nil
     ) throws -> Encrypted {
         guard !plaintext.isEmpty, plaintext.count <= maximumPlaintextBytes else {
-            throw SecureMediaAttachmentError.invalidImage
+            throw SecureMediaAttachmentError.invalidMedia
         }
         let random = randomBytes ?? secureRandomBytes
         let keyMaterial = try random(keyMaterialBytes)
@@ -111,7 +139,7 @@ enum SecureMediaAttachmentCipher {
         ciphertext.append(contentsOf: mac)
         guard Int64(ciphertext.count) >= SecureMessagingWire.minimumAttachmentCiphertextBytes,
               Int64(ciphertext.count) <= SecureMessagingWire.maximumAttachmentCiphertextBytes
-        else { throw SecureMediaAttachmentError.invalidImage }
+        else { throw SecureMediaAttachmentError.invalidMedia }
         return Encrypted(
             ciphertext: ciphertext,
             keyMaterial: keyMaterial,
@@ -806,6 +834,13 @@ struct MessagingSignedPrekeyDTO: Decodable, Equatable, Sendable {
     }
 }
 
+struct MessagingDeviceClientDTO: Decodable, Equatable, Sendable {
+    let platform: String?
+    let version: String?
+    let build: Int?
+    let capabilities: [String: Bool?]?
+}
+
 struct MessagingDeviceRosterEntryDTO: Decodable, Equatable, Sendable {
     let deviceId: String?
     let enrollmentEpoch: Int64?
@@ -821,6 +856,9 @@ struct MessagingDeviceRosterEntryDTO: Decodable, Equatable, Sendable {
     let rotatedAt: String?
     let identityKeyChangedAt: String?
     let bundleVersionChangedAt: String?
+    /// Server-attested client metadata is advisory for text/image messages and fail-closed for
+    /// richer media that older iOS or Android clients cannot safely render yet.
+    let client: MessagingDeviceClientDTO?
 
     enum CodingKeys: String, CodingKey {
         case deviceId = "device_id"
@@ -837,6 +875,7 @@ struct MessagingDeviceRosterEntryDTO: Decodable, Equatable, Sendable {
         case rotatedAt = "rotated_at"
         case identityKeyChangedAt = "identity_key_changed_at"
         case bundleVersionChangedAt = "bundle_version_changed_at"
+        case client
     }
 }
 
@@ -853,6 +892,56 @@ struct MessagingDeviceRosterDTO: Decodable, Equatable, Sendable {
         case rosterRevision = "roster_revision"
         case rosterHash = "roster_hash"
         case hashAlgorithm = "hash_algorithm"
+    }
+}
+
+enum MessagingRichMediaCapabilityPolicy {
+    static let profile = "kit-media-v1"
+    static let deviceCapabilityKey = "messaging_rich_media_v1"
+    static let minimumIOSVersion = [0, 2, 5]
+    static let minimumIOSBuild = 16
+    static let minimumIOSRelease = "0.2.5-r16"
+
+    static func supports(
+        mediaType: String,
+        roster: MessagingDeviceRosterDTO,
+        conversationID: String,
+        currentDeviceID: String,
+        recipientUserID: String
+    ) -> Bool {
+        guard KitChatMediaKind(mediaType: mediaType) != .image else { return true }
+        guard roster.conversationId == conversationID,
+              SecureMessagingWirePolicy.isCanonicalUUID(conversationID),
+              SecureMessagingWirePolicy.isCanonicalUUID(currentDeviceID),
+              SecureMessagingWirePolicy.isCanonicalUUID(recipientUserID),
+              let devices = roster.devices?.compactMap({ $0 })
+        else { return false }
+        let recipientDevices = devices.filter { $0.userId == recipientUserID }
+        guard !recipientDevices.isEmpty else { return false }
+        return recipientDevices.allSatisfy { device in
+            guard device.deviceId != currentDeviceID,
+                  let client = device.client,
+                  client.platform?.lowercased() == "ios",
+                  let version = client.version,
+                  versionAtLeastMinimum(version, build: client.build),
+                  client.capabilities?[deviceCapabilityKey] == true
+            else { return false }
+            return true
+        }
+    }
+
+    private static func versionAtLeastMinimum(_ value: String, build: Int?) -> Bool {
+        let components = value.split(separator: ".", omittingEmptySubsequences: false)
+        guard components.count == 3,
+              let major = Int(components[0]),
+              let minor = Int(components[1]),
+              let patch = Int(components[2]),
+              [major, minor, patch].allSatisfy({ $0 >= 0 })
+        else { return false }
+        let version = [major, minor, patch]
+        if minimumIOSVersion.lexicographicallyPrecedes(version) { return true }
+        guard version == minimumIOSVersion, let build else { return false }
+        return build >= minimumIOSBuild
     }
 }
 

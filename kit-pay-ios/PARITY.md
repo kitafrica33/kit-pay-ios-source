@@ -13,7 +13,7 @@ Reference audited on 2026-08-20 at Android revision
 | Providers | Bills, airtime, mobile-money, and bank UI/API contracts implemented behind server capabilities | Keep disabled until each rail has reviewed authorization, webhook, settlement, reconciliation, and compliance evidence |
 | KYC | Didit hosted collection and status refresh implemented | Final approval remains pending sanctions/compliance screening |
 | Offline data | AES-GCM local state, Keychain key, protected file, durable idempotent command outbox | Exercise restore, low-storage, and interrupted-replay cases on device |
-| Messaging | Conversation UI, account-bound encrypted drafts/history, image attachments, payment-request timeline cards, recipient/tag search, Signal v2 PQXDH/Double Ratchet delivery, fail-closed offline outbox, versioned privacy choices and directional blocking | Validate two-device delivery, draft recovery, privacy changes, block/unblock races, and notification handling on TestFlight devices |
+| Messaging | Conversation UI, account-bound encrypted drafts/history, payment-request timeline cards, recipient/tag search, Signal v2 PQXDH/Double Ratchet delivery, fail-closed offline outbox, versioned privacy choices and directional blocking; compatible iPhone users also have 10 MiB voice/video/document media, pinned/muted filters, multi-select, and encrypted iCloud backup/restore/delete | Deploy the bounded rich-media server gate; provision and validate production CloudKit, privacy disclosures, and two-device backup/restore/delete before physical acceptance |
 | Calls | API lifecycle, capability gate, complete cursor-backed offline history, chronological in-chat call cards, process-only offline call attempts, PushKit/CallKit answer/decline/end, authenticated single-waiter Merge, Uganda-standard waiting tone, termination replay, Android-parity progress sounds, LiveKit audio/video media, live audio-route reporting, CallKit video promotion on camera toggle, a call surface that survives every sheet and cover, and video-call Picture in Picture | Deploy and validate the `client_call_id` cancellation/idempotency contract, then validate audio/video/reconnect/Bluetooth, call waiting, inline callback, Picture in Picture hand-off, and background transitions on physical devices |
 | Notifications | APNs/PushKit registration, provider-specific invalidation, opaque message wakes, locally derived private alerts, account-bound tap-to-chat routing, and encrypted offline-first inline reply | Validate sandbox/production tokens, cold-launch routing/reply, and notification cleanup on two physical devices |
 | Store release | App icon, privacy manifest, signed App Store archive, App Store Connect record, and first processed TestFlight build | Complete privacy labels, screenshots, review notes, and physical beta acceptance |
@@ -49,10 +49,10 @@ Prioritize observed user friction and crash/reliability evidence before adding b
 
 ### Messaging and contact quality
 
-- Add archived, pinned, muted, and unread conversation filters; in-thread search; reply, reaction,
-  edit/delete, star, and forward actions with clear audit semantics.
-- Add safe link previews, documents, photos/video, resumable media compression, and hold-to-record
-  voice notes without weakening end-to-end encryption.
+- Complete archive, reply, reaction, edit/delete, star, forward, report, and spam controls with clear
+  audit semantics; harden the existing pinned/muted filters and multi-select behavior.
+- Add safe link previews and resumable media compression, and validate the existing document,
+  photo/video, and voice-note paths without weakening end-to-end encryption.
 - Add configurable read receipts, typing/presence privacy, disappearing messages, block/report,
   spam-rate controls, and unknown-sender boundaries.
 - Preserve device contact names locally, refresh Kit membership predictably, make invitations use
@@ -69,8 +69,8 @@ Prioritize observed user friction and crash/reliability evidence before adding b
 
 ### Trust, recovery, and polish
 
-- Add linked-device management, device-change notices, safety-number/QR verification, key
-  transparency, app/chat lock, encrypted backup/recovery, and explicit session revocation.
+- Add device-change notices, safety-number/QR verification, and key transparency; harden the
+  existing linked-device management, app locks, encrypted backup/recovery, and session revocation.
 - Add offline/poor-network progress that distinguishes queued, sending, delivered, read, failed,
   and retrying states.
 - Refine one-handed reachability, swipe actions, haptics, contextual menus, keyboard behavior,

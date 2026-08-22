@@ -181,6 +181,13 @@ actor SecureLocalStore {
         candidate.conversationDrafts = conversationDrafts
         candidate.calls = calls
         candidate.callHistoryBackfillReceipt = callHistoryBackfillReceipt
+        if preserveCommunicationHistory {
+            // Pins, mutes, and backup schedules describe the preserved chats; losing them on a
+            // routine session-expiry sign-out would silently stop scheduled iCloud backups.
+            candidate.pinnedConversationIds = state.pinnedConversationIds
+            candidate.mutedConversationIds = state.mutedConversationIds
+            candidate.messageBackupPreferences = state.messageBackupPreferences
+        }
         // Signal identity, prekeys, sessions, and replay markers are account-bound. Never carry
         // them through logout into a later account activation, even though display history stays.
         try persist(candidate)

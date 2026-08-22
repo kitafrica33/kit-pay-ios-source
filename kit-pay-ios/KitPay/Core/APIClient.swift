@@ -1136,7 +1136,13 @@ enum APIClientIdentity {
     private static let fallbackVersion = "0.2.5"
 
     static var currentHeader: String {
-        header(
+        "ios/\(currentAppVersion)"
+    }
+
+    /// The backend stores this value on the authenticated Device row and uses its revision for
+    /// rich-media compatibility. Keep it identical to the version portion of the request header.
+    static var currentAppVersion: String {
+        appVersion(
             marketingVersion: Bundle.main.object(
                 forInfoDictionaryKey: "CFBundleShortVersionString"
             ) as? String,
@@ -1145,6 +1151,10 @@ enum APIClientIdentity {
     }
 
     static func header(marketingVersion: String?, buildNumber: String?) -> String {
+        "ios/\(appVersion(marketingVersion: marketingVersion, buildNumber: buildNumber))"
+    }
+
+    static func appVersion(marketingVersion: String?, buildNumber: String?) -> String {
         let rawVersion = marketingVersion?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let version = rawVersion.range(
             of: #"\A(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\z"#,
@@ -1156,7 +1166,7 @@ enum APIClientIdentity {
             of: #"\A(?:0|[1-9][0-9]*)\z"#,
             options: .regularExpression
         ) != nil
-        return validBuild ? "ios/\(version)-r\(rawBuild)" : "ios/\(version)"
+        return validBuild ? "\(version)-r\(rawBuild)" : version
     }
 }
 

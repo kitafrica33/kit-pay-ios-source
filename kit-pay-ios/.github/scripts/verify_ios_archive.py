@@ -117,6 +117,8 @@ def main() -> None:
                     user_defaults_reasons.extend(reasons)
 
     expected_application_id = f"{args.team_id}.{args.bundle_id}"
+    expected_icloud_container = f"iCloud.{args.bundle_id}"
+    expected_icloud_containers = [expected_icloud_container]
     checks = (
         (info.get("CFBundleIdentifier") == args.bundle_id, "Unexpected signed bundle identifier"),
         (info.get("CFBundleShortVersionString") == args.version, "Unexpected marketing version"),
@@ -136,6 +138,24 @@ def main() -> None:
             "Embedded profile does not authorize production APNs",
         ),
         (
+            profile_entitlements.get(
+                "com.apple.developer.icloud-container-identifiers"
+            ) == expected_icloud_containers,
+            "Embedded profile does not authorize the exact iCloud container",
+        ),
+        (
+            "CloudKit" in profile_entitlements.get(
+                "com.apple.developer.icloud-services", []
+            ),
+            "Embedded profile does not authorize CloudKit",
+        ),
+        (
+            profile_entitlements.get(
+                "com.apple.developer.icloud-container-environment"
+            ) == "Production",
+            "Embedded profile does not authorize the Production iCloud environment",
+        ),
+        (
             signed.get("application-identifier") == expected_application_id,
             "Signed app identifier entitlement is incorrect",
         ),
@@ -144,6 +164,20 @@ def main() -> None:
             "Signed app team entitlement is incorrect",
         ),
         (signed.get("aps-environment") == "production", "Signed app APNs entitlement is not production"),
+        (
+            signed.get("com.apple.developer.icloud-container-identifiers")
+            == expected_icloud_containers,
+            "Signed app iCloud container entitlement is incorrect",
+        ),
+        (
+            "CloudKit" in signed.get("com.apple.developer.icloud-services", []),
+            "Signed app CloudKit service entitlement is missing",
+        ),
+        (
+            signed.get("com.apple.developer.icloud-container-environment")
+            == "Production",
+            "Signed app iCloud environment entitlement is not Production",
+        ),
         (signed.get("get-task-allow") is False, "Signed app must explicitly prohibit debugging"),
         (
             valid_processing_metadata,
@@ -178,6 +212,7 @@ def main() -> None:
             "buildNumber": args.build_number,
             "correspondingSourceURL": expected_source_url,
             "usesNonExemptEncryption": False,
+            "iCloudContainer": expected_icloud_container,
         },
         "workflow": {
             "runId": args.run_id,

@@ -225,9 +225,12 @@ private struct PaymentPinSetupView: View {
 private struct LoginUnlockView: View {
     @EnvironmentObject private var model: AppModel
     @State private var pin = ""
-    @State private var showPIN = false
     @State private var validationError: String?
+    @State private var didAttemptAutomaticBiometric = false
 
+    // While a working biometric enrollment exists, biometrics are the only unlock offered here —
+    // the PIN is never requested. Terminal biometric failures disable the enrollment in AppModel,
+    // which flips `loginUnlockSupportsBiometrics` and legitimately reveals the PIN path.
     var body: some View {
         NavigationStack {
             ScrollView {
@@ -245,16 +248,13 @@ private struct LoginUnlockView: View {
                     Text("Confirm it is you to finish this sign-in.")
                         .foregroundStyle(KitColor.secondaryText)
 
-                    if let biometricError = model.biometricErrorMessage {
-                        Label(
-                            "\(biometricError) Use your PIN instead.",
-                            systemImage: "exclamationmark.triangle.fill"
-                        )
-                        .font(.footnote)
-                        .foregroundStyle(.red)
-                    }
+                    if model.loginUnlockSupportsBiometrics {
+                        if let biometricError = model.biometricErrorMessage {
+                            Label(biometricError, systemImage: "exclamationmark.triangle.fill")
+                                .font(.footnote)
+                                .foregroundStyle(.red)
+                        }
 
-                    if model.loginUnlockSupportsBiometrics && !showPIN {
                         Button {
                             Task { await model.unlockSessionWithBiometrics() }
                         } label: {
@@ -276,11 +276,12 @@ private struct LoginUnlockView: View {
                         .tint(KitColor.green)
                         .disabled(model.isCompletingAccountSetup || !model.isOnline)
 
-                        Button("Use my PIN instead") {
-                            showPIN = true
-                        }
-                        .frame(maxWidth: .infinity)
-                        .disabled(model.isCompletingAccountSetup)
+                        Label(
+                            "\(model.biometricDisplayName) replaces your PIN on this iPhone.",
+                            systemImage: "lock"
+                        )
+                        .font(.footnote)
+                        .foregroundStyle(KitColor.secondaryText)
                     } else {
                         SecureField("Four-digit PIN", text: $pin)
                             .keyboardType(.numberPad)
@@ -318,23 +319,26 @@ private struct LoginUnlockView: View {
                         .buttonBorderShape(.roundedRectangle(radius: 18))
                         .tint(KitColor.green)
                         .disabled(model.isCompletingAccountSetup || pin.count != 4)
-                    }
 
-                    Label(
-                        "Your PIN is verified by Kit and is never stored in this app.",
-                        systemImage: "lock"
-                    )
-                    .font(.footnote)
-                    .foregroundStyle(KitColor.secondaryText)
+                        Label(
+                            "Your PIN is verified by Kit and is never stored in this app.",
+                            systemImage: "lock"
+                        )
+                        .font(.footnote)
+                        .foregroundStyle(KitColor.secondaryText)
+                    }
                 }
                 .padding(24)
             }
             .background(KitColor.canvas)
-            .onAppear {
-                if !model.loginUnlockSupportsBiometrics { showPIN = true }
-            }
-            .onChange(of: model.loginUnlockSupportsBiometrics) { _, supported in
-                if !supported { showPIN = true }
+            .task {
+                // Lead with the enrolled biometric so returning users never reach for a PIN.
+                guard model.loginUnlockSupportsBiometrics,
+                      model.isOnline,
+                      !didAttemptAutomaticBiometric
+                else { return }
+                didAttemptAutomaticBiometric = true
+                await model.unlockSessionWithBiometrics()
             }
         }
     }

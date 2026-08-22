@@ -97,7 +97,7 @@ struct OnboardingView: View {
                     .foregroundStyle(KitColor.primaryText)
 
                     HStack(spacing: 14) {
-                        Label("Encrypted", systemImage: "lock.shield.fill")
+                        Label("End-to-end encrypted", systemImage: "lock.shield.fill")
                         Label("Offline ready", systemImage: "icloud.and.arrow.up")
                     }
                     .font(.caption.weight(.semibold))
@@ -106,6 +106,7 @@ struct OnboardingView: View {
                 }
                 .padding(.horizontal, 22)
             }
+            .scrollDismissesKeyboard(.interactively)
             .accessibilityHidden(concealSensitiveContent)
         }
         .onAppear {
@@ -226,7 +227,7 @@ struct OnboardingView: View {
             Text("Enter your phone number to receive a secure one-time code.")
                 .foregroundStyle(.secondary)
             HStack(spacing: 8) {
-                Text("+256")
+                Text("🇺🇬 +256")
                     .font(.title3.weight(.semibold).monospacedDigit())
                     .foregroundStyle(.secondary)
                 TextField("7XX XXX XXX", text: Binding(
@@ -252,6 +253,10 @@ struct OnboardingView: View {
             .buttonBorderShape(.roundedRectangle(radius: 18))
             .tint(KitColor.green)
             .disabled(UgandaMobileMoneyPhone.apiValue(from: phone) == nil || model.isLoading)
+
+            Text("Kit sends one SMS to verify this number. Carrier rates may apply.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 

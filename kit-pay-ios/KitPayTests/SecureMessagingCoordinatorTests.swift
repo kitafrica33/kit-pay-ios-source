@@ -1169,7 +1169,7 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
             conversationID: conversationID,
             expectedRecipientUserID: recipientUserID,
             title: "ExampleContact",
-            imageData: jpeg,
+            mediaData: jpeg,
             mediaType: "image/jpeg",
             caption: "  Offline receipt  "
         )
@@ -1302,7 +1302,7 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
             conversationID: conversationID,
             expectedRecipientUserID: recipientUserID,
             title: "ExampleContact",
-            imageData: image,
+            mediaData: image,
             mediaType: "image/jpeg",
             caption: "Receipt"
         )
@@ -1400,12 +1400,12 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
                 conversationID: conversationID,
                 expectedRecipientUserID: recipientUserID,
                 title: "ExampleContact",
-                imageData: Data([1]),
+                mediaData: Data([1]),
                 mediaType: "image/jpeg",
                 caption: String(repeating: "x", count: 2_049)
             )
             XCTFail("An oversized caption must not enter the durable outbox")
-        } catch SecureMediaAttachmentError.invalidImage {
+        } catch SecureMediaAttachmentError.invalidMedia {
             // Expected.
         }
 
@@ -1420,12 +1420,12 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
                 conversationID: conversationID,
                 expectedRecipientUserID: recipientUserID,
                 title: "ExampleContact",
-                imageData: Data([1]),
+                mediaData: Data([1]),
                 mediaType: "image/jpeg",
                 caption: expandingCaption
             )
             XCTFail("A caption that cannot fit the canonical descriptor must fail before upload")
-        } catch SecureMediaAttachmentError.invalidImage {
+        } catch SecureMediaAttachmentError.invalidMedia {
             // Expected.
         }
 

@@ -509,14 +509,24 @@ struct ActiveCallView: View {
                 if media.remoteVideoTrack == nil,
                    !hasRemoteParticipantGrid,
                    let call = coordinator.activeCall {
+                    let avatarSize = CallFloatingSurfaceLayoutPolicy.activeCallAvatarSize(
+                        container: geometry.size
+                    )
                     VStack(spacing: compactLandscape ? 0 : 16) {
-                        CallParticipantAvatarView(
-                            name: call.participantName,
-                            avatarURL: call.participantAvatarURL,
-                            size: CallFloatingSurfaceLayoutPolicy.activeCallAvatarSize(
-                                container: geometry.size
+                        ZStack {
+                            KitVoicePulseRings(
+                                avatarSize: avatarSize,
+                                remoteLevel: media.remoteVoiceLevel,
+                                localLevel: media.localVoiceLevel,
+                                isConnected: coordinator.state == .connected,
+                                reduceMotion: reduceMotion
                             )
-                        )
+                            CallParticipantAvatarView(
+                                name: call.participantName,
+                                avatarURL: call.participantAvatarURL,
+                                size: avatarSize
+                            )
+                        }
                         if !compactLandscape {
                             Text(call.participantName)
                                 .font(.title2.bold())
@@ -876,7 +886,7 @@ struct ActiveCallView: View {
             }
 
             callControl(
-                icon: media.isMicrophoneEnabled ? "mic.slash.fill" : "mic.fill",
+                icon: media.isMicrophoneEnabled ? "mic.fill" : "mic.slash.fill",
                 label: media.isMicrophoneEnabled ? "Mute" : "Unmute",
                 selected: !media.isMicrophoneEnabled,
                 isToggle: true,
@@ -1103,24 +1113,20 @@ struct ActiveCallView: View {
             "Reconnecting…"
         case .connected:
             if media.hasRemoteParticipant {
-                duration(from: media.remoteParticipantConnectedAt ?? date, to: date)
+                CallDurationFormatter.string(
+                    from: media.remoteParticipantConnectedAt ?? date,
+                    to: date
+                )
+            } else if media.remoteParticipantConnectedAt != nil {
+                // The other side was connected before; don't regress to "Ringing…" while the
+                // remote-absence grace period waits for them to come back.
+                "Waiting for them to reconnect…"
             } else {
                 coordinator.activeCall?.direction == "outgoing" ? "Ringing…" : "Connecting…"
             }
         case .ending:
             "Ending…"
         }
-    }
-
-    private func duration(from start: Date, to end: Date) -> String {
-        let seconds = max(0, Int(end.timeIntervalSince(start)))
-        let hours = seconds / 3_600
-        let minutes = (seconds % 3_600) / 60
-        let remainingSeconds = seconds % 60
-        if hours > 0 {
-            return String(format: "%d:%02d:%02d", hours, minutes, remainingSeconds)
-        }
-        return String(format: "%02d:%02d", minutes, remainingSeconds)
     }
 
     private var hasVideoBackdrop: Bool {
@@ -1902,10 +1908,13 @@ struct MinimizedCallView: View {
                             Circle()
                                 .fill(KitColor.green)
                                 .frame(width: 7, height: 7)
-                            Text(compactStatus(for: call))
-                                .font(.caption2.weight(.semibold))
-                                .foregroundStyle(.white.opacity(0.88))
-                                .lineLimit(1)
+                            TimelineView(.periodic(from: .now, by: 1)) { timeline in
+                                Text(compactStatus(for: call, at: timeline.date))
+                                    .font(.caption2.weight(.semibold))
+                                    .foregroundStyle(.white.opacity(0.88))
+                                    .monospacedDigit()
+                                    .lineLimit(1)
+                            }
                         }
                     }
                     .padding(12)
@@ -1939,9 +1948,12 @@ struct MinimizedCallView: View {
                                 Circle()
                                     .fill(KitColor.green)
                                     .frame(width: 7, height: 7)
-                                Text(compactStatus(for: call))
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
+                                TimelineView(.periodic(from: .now, by: 1)) { timeline in
+                                    Text(compactStatus(for: call, at: timeline.date))
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .monospacedDigit()
+                                }
                             }
                         }
                         Spacer(minLength: 0)
@@ -2090,9 +2102,109 @@ struct MinimizedCallView: View {
         }
     }
 
-    private func compactStatus(for call: ActiveCallPresentation) -> String {
-        if media.hasRemoteParticipant { return "Ongoing call" }
+    private func compactStatus(
+        for call: ActiveCallPresentation,
+        at date: Date = Date()
+    ) -> String {
+        if media.hasRemoteParticipant {
+            return CallDurationFormatter.string(
+                from: media.remoteParticipantConnectedAt ?? date,
+                to: date
+            )
+        }
+        if media.remoteParticipantConnectedAt != nil { return "Waiting to reconnect" }
         return call.direction == "outgoing" ? "Ringing" : "Connecting"
+    }
+}
+
+/// Shared by the full-call header and the minimized surface so both render the same duration.
+private enum CallDurationFormatter {
+    static func string(from start: Date, to end: Date) -> String {
+        let seconds = max(0, Int(end.timeIntervalSince(start)))
+        let hours = seconds / 3_600
+        let minutes = (seconds % 3_600) / 60
+        let remainingSeconds = seconds % 60
+        if hours > 0 {
+            return String(format: "%d:%02d:%02d", hours, minutes, remainingSeconds)
+        }
+        return String(format: "%02d:%02d", minutes, remainingSeconds)
+    }
+}
+
+/// Kit-branded voice pulse around the audio-call avatar: two outer rings breathe with the
+/// remote voice level, one inner ring with the local level, and a gentle heartbeat idles when
+/// the call is connected but silent. Static when not connected or when Reduce Motion is on.
+private struct KitVoicePulseRings: View {
+    let avatarSize: CGFloat
+    let remoteLevel: Float
+    let localLevel: Float
+    let isConnected: Bool
+    let reduceMotion: Bool
+
+    @State private var idleBeat = false
+
+    var body: some View {
+        ZStack {
+            ring(
+                level: remoteLevel,
+                diameter: avatarSize * 1.24,
+                lineWidth: 1.2,
+                baseOpacity: 0.20,
+                levelBoost: 0.11
+            )
+            ring(
+                level: remoteLevel,
+                diameter: avatarSize * 1.13,
+                lineWidth: 1.6,
+                baseOpacity: 0.30,
+                levelBoost: 0.06
+            )
+            ring(
+                level: localLevel,
+                diameter: avatarSize * 1.05,
+                lineWidth: 1,
+                baseOpacity: 0.16,
+                levelBoost: 0.04
+            )
+        }
+        .scaleEffect(heartbeatScale)
+        .onAppear(perform: updateIdleBeat)
+        .onChange(of: isConnected) { _, _ in updateIdleBeat() }
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+
+    private var heartbeatScale: CGFloat {
+        guard isConnected, !reduceMotion else { return 1 }
+        return idleBeat ? 1.015 : 0.995
+    }
+
+    private func ring(
+        level: Float,
+        diameter: CGFloat,
+        lineWidth: CGFloat,
+        baseOpacity: Double,
+        levelBoost: CGFloat
+    ) -> some View {
+        let clamped = Double(min(max(level, 0), 1))
+        let opacity = isConnected ? baseOpacity + clamped * 0.26 : baseOpacity * 0.55
+        let scale = isConnected && !reduceMotion ? 1 + CGFloat(clamped) * levelBoost : 1
+        return Circle()
+            .stroke(KitColor.green.opacity(opacity), lineWidth: lineWidth)
+            .frame(width: diameter, height: diameter)
+            .scaleEffect(scale)
+            .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: clamped)
+    }
+
+    private func updateIdleBeat() {
+        guard isConnected, !reduceMotion else {
+            idleBeat = false
+            return
+        }
+        guard !idleBeat else { return }
+        withAnimation(.easeInOut(duration: 1.5).repeatForever(autoreverses: true)) {
+            idleBeat = true
+        }
     }
 }
 

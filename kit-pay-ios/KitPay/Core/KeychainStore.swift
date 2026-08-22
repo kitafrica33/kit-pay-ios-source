@@ -133,6 +133,63 @@ enum KeychainStore {
             throw KeychainError(status: status)
         }
     }
+
+    // MARK: - iCloud Keychain (synchronizable) items
+
+    /// Synchronizable items ride iCloud Keychain, which Apple end-to-end encrypts across the
+    /// user's devices. Kit uses this only for the message-backup key so an encrypted backup can
+    /// be restored after reinstalling or on a new iPhone; the key never reaches Kit's servers.
+    static func synchronizableData(for account: String) throws -> Data? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecAttrSynchronizable as String: true,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        if status == errSecItemNotFound { return nil }
+        guard status == errSecSuccess else { throw KeychainError(status: status) }
+        return item as? Data
+    }
+
+    static func setSynchronizable(_ data: Data, for account: String) throws {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecAttrSynchronizable as String: true
+        ]
+        // Synchronizable items cannot use a ThisDeviceOnly accessibility class.
+        let attributes: [String: Any] = [
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock
+        ]
+        let update = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+        if update == errSecItemNotFound {
+            var inserted = query
+            attributes.forEach { inserted[$0.key] = $0.value }
+            let status = SecItemAdd(inserted as CFDictionary, nil)
+            guard status == errSecSuccess else { throw KeychainError(status: status) }
+        } else if update != errSecSuccess {
+            throw KeychainError(status: update)
+        }
+    }
+
+    static func removeSynchronizable(_ account: String) throws {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecAttrSynchronizable as String: true
+        ]
+        let status = SecItemDelete(query as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw KeychainError(status: status)
+        }
+    }
 }
 
 struct KeychainError: LocalizedError {

@@ -65,12 +65,15 @@ final class PaymentRequestsViewModel: ObservableObject {
         return nil
     }
 
+    /// Approval routes through `AppModel.authorizeFinancialStepUp`, which signs with the
+    /// Secure Enclave when biometrics are available and otherwise verifies the wallet PIN.
     func pay(
         _ request: PaymentRequestDTO,
         from wallet: Wallet,
         pin: String,
         policy: PaymentRequestPolicy,
-        isOnline: Bool
+        isOnline: Bool,
+        authorize: KitFinancialStepUpAuthorization
     ) async -> Bool {
         guard actionRequestId == nil else { return false }
         guard isOnline else {
@@ -79,10 +82,6 @@ final class PaymentRequestsViewModel: ObservableObject {
         }
         guard policy.canPay(request, from: wallet) else {
             errorMessage = "This request is not eligible for payment from this account."
-            return false
-        }
-        guard PaymentRequestPolicy.isValidPIN(pin) else {
-            errorMessage = "Enter your exact four-digit wallet PIN."
             return false
         }
 
@@ -95,20 +94,12 @@ final class PaymentRequestsViewModel: ObservableObject {
         payIdempotencyKeys[operationId] = key
 
         do {
-            let challenge = try await api.createStepUp(
-                purpose: "payment_request",
-                intent: PaymentRequestPolicy.payIntent(for: request, sourceWalletId: wallet.id)
+            let verification = try await authorize(
+                "payment_request",
+                PaymentRequestPolicy.payIntent(for: request, sourceWalletId: wallet.id),
+                pin,
+                "Approve paying this request"
             )
-            guard challenge.purpose == "payment_request",
-                  !challenge.intentHash.isEmpty,
-                  challenge.methods?.contains(where: { $0.caseInsensitiveCompare("pin") == .orderedSame }) == true
-            else { throw PaymentRequestFlowError.invalidStepUpChallenge }
-
-            let verification = try await api.verifyStepUp(challengeId: challenge.id, pin: pin)
-            guard verification.method.caseInsensitiveCompare("pin") == .orderedSame,
-                  !verification.stepUpToken.isEmpty
-            else { throw PaymentRequestFlowError.invalidStepUpVerification }
-
             let paid = try await api.payPaymentRequest(
                 requestId: request.id,
                 sourceWalletId: wallet.id,
@@ -180,17 +171,11 @@ final class PaymentRequestsViewModel: ObservableObject {
 }
 
 private enum PaymentRequestFlowError: LocalizedError {
-    case invalidStepUpChallenge
-    case invalidStepUpVerification
     case unconfirmedPayment
     case unconfirmedCancellation
 
     var errorDescription: String? {
         switch self {
-        case .invalidStepUpChallenge:
-            "Kit could not bind PIN approval to this exact payment request. Nothing was paid."
-        case .invalidStepUpVerification:
-            "Kit did not return a valid PIN authorization. Nothing was paid."
         case .unconfirmedPayment:
             "Kit did not confirm this payment with a transaction. Check the request before trying again."
         case .unconfirmedCancellation:
@@ -294,10 +279,16 @@ struct PaymentRequestsView: View {
                     from: wallet,
                     pin: pin,
                     policy: policy,
-                    isOnline: model.isOnline
+                    isOnline: model.isOnline,
+                    authorize: model.authorizeFinancialStepUp
                 )
                 if paid { await model.refresh() }
                 return paid
+            }
+            .environmentObject(model)
+            .onAppear {
+                // A stale load error must not surface inside "Confirm payment".
+                requests.errorMessage = nil
             }
             .presentationBackground(.ultraThinMaterial)
         }
@@ -324,9 +315,13 @@ struct PaymentRequestsView: View {
                 .background(KitColor.green.gradient, in: Circle())
             VStack(alignment: .leading, spacing: 3) {
                 Text("Request and pay securely").font(.headline).foregroundStyle(KitColor.primaryText)
-                Text("PIN approval is bound to the exact request amount.")
-                    .font(.caption)
-                    .foregroundStyle(KitColor.secondaryText)
+                Text(
+                    model.financialApprovalUsesBiometrics
+                        ? "\(model.biometricDisplayName) approval is bound to the exact request amount."
+                        : "PIN approval is bound to the exact request amount."
+                )
+                .font(.caption)
+                .foregroundStyle(KitColor.secondaryText)
             }
             Spacer()
         }
@@ -448,6 +443,7 @@ private enum RequestListSelection: Hashable {
 }
 
 struct PaymentRequestPINView: View {
+    @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
     let request: PaymentRequestDTO
     let isSubmitting: Bool
@@ -471,23 +467,37 @@ struct PaymentRequestPINView: View {
                     if let note = request.note?.trimmedNonempty {
                         Text(note).foregroundStyle(KitColor.secondaryText)
                     }
-                    SecureField("4-digit wallet PIN", text: $pin)
-                        .keyboardType(.numberPad)
-                        .textContentType(.password)
-                        .multilineTextAlignment(.center)
-                        .font(.title2.monospacedDigit())
-                        .padding(17)
-                        .kitGlass(cornerRadius: 18)
-                        .onChange(of: pin) { _, value in
-                            pin = String(value.filter(\.isNumber).prefix(4))
+                    if model.financialApprovalUsesBiometrics {
+                        Label {
+                            Text("Approve with \(model.biometricDisplayName). Your approval covers only this request, source wallet, amount and currency.")
+                                .font(.footnote)
+                                .foregroundStyle(KitColor.secondaryText)
+                        } icon: {
+                            Image(systemName: model.biometricSymbolName)
+                                .foregroundStyle(KitColor.green)
                         }
+                        .padding(17)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .kitGlass(cornerRadius: 18, tint: KitColor.paleGreen, shadow: false)
+                    } else {
+                        SecureField("4-digit wallet PIN", text: $pin)
+                            .keyboardType(.numberPad)
+                            .textContentType(.password)
+                            .multilineTextAlignment(.center)
+                            .font(.title2.monospacedDigit())
+                            .padding(17)
+                            .kitGlass(cornerRadius: 18)
+                            .onChange(of: pin) { _, value in
+                                pin = String(value.filter(\.isNumber).prefix(4))
+                            }
+                        Text("Your PIN authorizes only this request, source wallet, amount and currency.")
+                            .font(.caption)
+                            .foregroundStyle(KitColor.secondaryText)
+                            .multilineTextAlignment(.center)
+                    }
                     if let errorMessage {
                         Text(errorMessage).font(.footnote).foregroundStyle(.red).multilineTextAlignment(.center)
                     }
-                    Text("Your PIN authorizes only this request, source wallet, amount and currency.")
-                        .font(.caption)
-                        .foregroundStyle(KitColor.secondaryText)
-                        .multilineTextAlignment(.center)
                     Button {
                         Task {
                             if await submit(pin) {
@@ -499,12 +509,19 @@ struct PaymentRequestPINView: View {
                         if isSubmitting {
                             ProgressView().tint(.white).frame(maxWidth: .infinity)
                         } else {
-                            Label("Pay \(request.currency.code) \(request.amount)", systemImage: "checkmark.shield.fill")
-                                .frame(maxWidth: .infinity)
+                            Label(
+                                "Pay \(request.currency.code) \(request.amount)",
+                                systemImage: model.financialApprovalUsesBiometrics
+                                    ? model.biometricSymbolName
+                                    : "checkmark.shield.fill"
+                            )
+                            .frame(maxWidth: .infinity)
                         }
                     }
                     .buttonStyle(KitPrimaryButtonStyle())
-                    .disabled(pin.count != 4 || isSubmitting)
+                    .disabled(
+                        (!model.financialApprovalUsesBiometrics && pin.count != 4) || isSubmitting
+                    )
                 }
                 .padding(24)
             }
@@ -524,7 +541,7 @@ private extension String {
     }
 
     var paymentRequestDisplayDate: String? {
-        guard let date = ISO8601DateFormatter().date(from: self) else { return nil }
+        guard let date = KitServerDateParser.date(from: self) else { return nil }
         return date.formatted(date: .abbreviated, time: .shortened)
     }
 }

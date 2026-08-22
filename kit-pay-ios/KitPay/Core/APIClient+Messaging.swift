@@ -263,7 +263,7 @@ extension APIClient {
 
     func syncEncryptedMessages(
         cursor: String? = nil,
-        limit: Int = SecureMessagingWire.maximumHistoryPage
+        limit: Int = SecureMessagingWire.maximumSyncPage
     ) async throws -> MessagingSyncDTO {
         let endpoint = try MessagingAPIEndpoint.sync(cursor: cursor, limit: limit)
         return try await send(

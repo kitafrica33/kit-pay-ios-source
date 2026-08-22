@@ -548,8 +548,15 @@ struct AvatarView: View {
         return result.isEmpty ? "K" : result.uppercased()
     }
 
+    /// FNV-1a over the name's unicode scalars: `String.hashValue` is seed-randomized
+    /// per launch, and avatar colors must stay stable across launches and devices.
     private var hue: Double {
-        Double(abs(name.hashValue % 360)) / 360
+        var hash: UInt64 = 0xcbf29ce484222325
+        for scalar in name.unicodeScalars {
+            hash ^= UInt64(scalar.value)
+            hash = hash &* 0x100000001b3
+        }
+        return Double(hash % 360) / 360
     }
 
     /// A near-white disc is right on a light background and a glaring blob on a dark one, so the

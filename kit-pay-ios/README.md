@@ -14,6 +14,15 @@ and Apple Liquid Glass.
   sync, progress reporting, regional phone matching, Kit Pay contacts first, and invites last.
 - Didit hosted identity collection. Final KYC approval remains controlled by backend compliance.
 - Encrypted offline projections, conversation drafts, and outbox state for wallet, messaging, and calls.
+- Voice notes, videos, video notes, and documents up to 10 MiB for compatible iPhone recipients,
+  plus pinned/muted chat filters, multi-select, and local deletion.
+- Client support for encrypted iCloud chat backup and restore. Message content and included inline
+  media are sealed with ChaChaPoly before upload and the key is stored in the user's synchronizable
+  Keychain; the private CloudKit record still exposes operational metadata including its
+  account-derived record name, creation time, encrypted size, message count, device name, and schema
+  version. Customers can explicitly delete both the encrypted record and its backup key.
+- Biometrics are preferred for local unlock and financial approval, with an explicit server-verified
+  wallet PIN recovery path when biometrics are locked or unavailable.
 - APNs and PushKit registration, opaque secure-message wakes, private locally derived message
   alerts, tap-to-chat routing, encrypted offline-first inline reply, CallKit lifecycle,
   incoming-call recovery, authenticated call accept/decline/end, and LiveKit audio/video media.
@@ -35,6 +44,46 @@ and Apple Liquid Glass.
   authorization, webhook, settlement, reconciliation, and compliance controls.
 - APNs/PushKit server support is implemented on backend PR 18, but production credentials and
   deployment are separate operational steps.
+- Rich voice/video/document media is limited to 10 MiB and requires the server's bounded
+  `kit-media-v1` capability plus an all-iOS recipient roster at version 0.2.5 build 16 or later.
+  Android and older iOS devices remain image-only; unknown types fail closed.
+- iCloud chat backups require the `iCloud.africa.kit.pay.ios` CloudKit container to be
+  provisioned in the Apple Developer portal, an App Store profile authorizing the signed CloudKit
+  entitlements, and the `KitMessageBackup` record type deployed to the production schema. Release
+  also requires two-device backup/restore/delete testing and privacy-report/App Store labels
+  covering both encrypted content and
+  the readable operational metadata. The entitlement and client code alone do not establish
+  production readiness.
+
+### CloudKit production-schema release
+
+App Store Connect API credentials cannot manage a CloudKit database schema, and `cktool` supports
+schema import only into the development environment. An Account Holder or Admin with permission to
+edit production must promote the reviewed development schema in CloudKit Console.
+
+For a file-based import, generate a CloudKit **management** token from the user-account Settings in
+CloudKit Console (not a container API token from **Tokens & Keys**). On a Mac with Xcode 13 or later,
+store it in Keychain and import the checked-in schema into development only:
+
+```sh
+xcrun cktool save-token --type management
+python3 .github/scripts/prepare_cloudkit_schema.py \
+  --import-development \
+  --team-id AU55CKVJ55 \
+  --container-id iCloud.africa.kit.pay.ios \
+  --environment development \
+  --confirmation IMPORT_KIT_PAY_CLOUDKIT_DEVELOPMENT \
+  --use-saved-management-token
+```
+
+If no Mac is available, use CloudKit Console's development **Record Types** and **Security Roles**
+editors to reproduce `.github/cloudkit/KitMessageBackup.ckdb`: nine fields, no indexes, Creator
+read/write, Authenticated create, and no World access. Then select **Deploy Schema Changes**, verify
+that the pending production diff contains only the intended `KitMessageBackup` additions, and click
+**Deploy**. Do not deploy if unrelated development changes appear. Finally, switch the Console to
+production and verify the record type and all field types before running the two-device
+backup/restore/delete acceptance test. Production schema changes are additive and cannot be
+reversed by this helper.
 
 Open `KitPay.xcodeproj` in Xcode 26 or later. Select the Apple development team, keep the bundle ID
 aligned with the backend APNs topic, and use a physical device for APNs, PushKit, CallKit, camera,

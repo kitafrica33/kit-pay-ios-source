@@ -454,6 +454,13 @@ extension CapabilitiesDTO {
         }
         return features["media"] == true
     }
+
+    /// Rich chat media is independently deployable from the reviewed Signal text/image wire.
+    /// Missing and null values fail closed until the attachment service and peer-roster metadata
+    /// are available together.
+    var enablesMessagingRichMedia: Bool {
+        protocols?.messaging?.richMedia?.supportsIOSV1 == true
+    }
 }
 
 struct CapabilityProtocolsDTO: Decodable {
@@ -465,10 +472,12 @@ struct MessagingProtocolCapabilityDTO: Decodable {
     let version: String?
     let suite: String?
     let postQuantum: Bool?
+    var richMedia: MessagingRichMediaProtocolCapabilityDTO? = nil
 
     enum CodingKeys: String, CodingKey {
         case ready, version, suite
         case postQuantum = "post_quantum"
+        case richMedia = "rich_media"
     }
 
     var supportsReviewedV2: Bool {
@@ -476,6 +485,42 @@ struct MessagingProtocolCapabilityDTO: Decodable {
             && version == SecureMessagingWire.protocolVersion
             && suite == SecureMessagingWire.protocolSuite
             && postQuantum == true
+    }
+}
+
+struct MessagingRichMediaProtocolCapabilityDTO: Decodable {
+    let ready: Bool?
+    let profile: String?
+    let supportedPlatforms: [String?]?
+    let minimumIOSVersion: String?
+    let minimumCiphertextBytes: Int64?
+    let maximumPlaintextBytes: Int?
+    let maximumCiphertextBytes: Int64?
+    let mediaTypes: [String?]?
+
+    enum CodingKeys: String, CodingKey {
+        case ready, profile
+        case supportedPlatforms = "supported_platforms"
+        case minimumIOSVersion = "minimum_ios_version"
+        case minimumCiphertextBytes = "minimum_ciphertext_bytes"
+        case maximumPlaintextBytes = "maximum_plaintext_bytes"
+        case maximumCiphertextBytes = "maximum_ciphertext_bytes"
+        case mediaTypes = "media_types"
+    }
+
+    var supportsIOSV1: Bool {
+        guard ready == true,
+              profile == MessagingRichMediaCapabilityPolicy.profile,
+              supportedPlatforms?.compactMap({ $0 }).contains("ios") == true,
+              minimumIOSVersion == MessagingRichMediaCapabilityPolicy.minimumIOSRelease,
+              minimumCiphertextBytes == SecureMessagingWire.minimumAttachmentCiphertextBytes,
+              maximumPlaintextBytes == SecureMediaAttachmentCipher.maximumPlaintextBytes,
+              maximumCiphertextBytes == SecureMessagingWire.maximumAttachmentCiphertextBytes,
+              let advertisedMediaTypes = mediaTypes?.compactMap({ $0 })
+        else { return false }
+        return Set(advertisedMediaTypes).isSuperset(
+            of: SecureMessagingWire.allowedAttachmentMediaTypes
+        )
     }
 }
 
@@ -2474,6 +2519,12 @@ struct PersistedState: Codable {
     /// Finalized avatar uploads awaiting a clean scan and profile attachment. The session fence
     /// prevents an app restart or account switch from borrowing another login's media asset.
     var pendingProfileAvatarAttachment: PendingProfileAvatarAttachment?
+    /// Locally pinned/muted chats. Optional keeps state written by older builds decodable —
+    /// non-Optional additions would silently reset the entire protected state on upgrade.
+    var pinnedConversationIds: [String]?
+    var mutedConversationIds: [String]?
+    /// End-to-end encrypted iCloud chat-backup settings and receipts. Optional for the same reason.
+    var messageBackupPreferences: MessageBackupPreferences?
 
     static let empty = PersistedState()
 
@@ -2499,6 +2550,9 @@ struct PersistedState: Codable {
             || !outbox.isEmpty
             || secureMessaging != nil
             || pendingProfileAvatarAttachment != nil
+            || pinnedConversationIds?.isEmpty == false
+            || mutedConversationIds?.isEmpty == false
+            || messageBackupPreferences != nil
 
         if let previousOwner {
             if previousOwner.caseInsensitiveCompare(authenticatedProfile.id) != .orderedSame {

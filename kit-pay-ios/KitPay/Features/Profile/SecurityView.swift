@@ -68,7 +68,7 @@ struct SecurityView: View {
                 mfaControls
 
                 Label(
-                    "Biometrics replace your PIN for returning sign-in and local app locks on this iPhone. Your identity-verification preference applies only to future logins; server-side payment authorization still applies.",
+                    "Biometrics are preferred for returning sign-in and local app locks on this iPhone. Your server-verified wallet PIN remains available if biometrics are locked or unavailable. Your identity-verification preference applies only to future logins; server-side payment authorization still applies.",
                     systemImage: "lock.shield.fill"
                 )
                 .font(.footnote)
@@ -1128,71 +1128,11 @@ struct BiometricSignInView: View {
     @State private var pin = ""
 
     var body: some View {
-        if usePIN {
-            ZStack {
-                LinearGradient(
-                    colors: [KitColor.deepNavy, KitColor.navy, KitColor.green.opacity(0.78)],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                )
-                .ignoresSafeArea()
-
-                VStack(spacing: 18) {
-                    Image(systemName: "lock.shield.fill")
-                        .font(.system(size: 46, weight: .medium))
-                        .foregroundStyle(.white)
-                    Text("Enter your Kit Pay PIN")
-                        .font(.title.bold())
-                        .foregroundStyle(.white)
-                    SecureField("Four-digit PIN", text: $pin)
-                        .keyboardType(.numberPad)
-                        .multilineTextAlignment(.center)
-                        .font(.system(size: 28, weight: .bold, design: .monospaced))
-                        .privacySensitive()
-                        .padding(16)
-                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18))
-                        .onChange(of: pin) { _, value in
-                            let filtered = String(value.filter { $0 >= "0" && $0 <= "9" }.prefix(4))
-                            if filtered != value { pin = filtered }
-                        }
-                    if let error = model.biometricErrorMessage {
-                        Text(error)
-                            .font(.footnote)
-                            .foregroundStyle(.white)
-                            .multilineTextAlignment(.center)
-                    }
-                    Button {
-                        let submitted = pin
-                        pin = ""
-                        Task { _ = await model.retrySignInWithPIN(submitted) }
-                    } label: {
-                        Group {
-                            if model.biometricAccessState == .authorizing {
-                                ProgressView().tint(KitColor.navy)
-                            } else {
-                                Text("Unlock with PIN")
-                            }
-                        }
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 15)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .buttonBorderShape(.roundedRectangle(radius: 18))
-                    .tint(.white)
-                    .foregroundStyle(KitColor.primaryText)
-                    .disabled(pin.count != 4 || model.biometricAccessState == .authorizing)
-
-                    Button("Use \(model.biometricDisplayName)") {
-                        usePIN = false
-                        pin = ""
-                    }
-                    .foregroundStyle(.white.opacity(0.9))
-                }
-                .padding(24)
-                .frame(maxWidth: 460)
-                .kitGlass(cornerRadius: 34)
-                .padding(22)
-            }
+        // A server-verified PIN remains an explicit recovery path after biometric cancellation
+        // or lockout. Terminal enrollment failures stay on PIN until AppModel removes the stale
+        // biometric credential after a successful unlock.
+        if usePIN || model.biometricSignInPermanentlyUnavailable {
+            pinUnlock
         } else {
             KitBiometricGateView(
                 symbolName: model.biometricSymbolName,
@@ -1203,8 +1143,90 @@ struct BiometricSignInView: View {
                 buttonTitle: "Unlock with \(model.biometricDisplayName)",
                 authenticate: { await model.retryBiometricSignIn() },
                 secondaryTitle: "Use my PIN instead",
-                secondaryAction: { usePIN = true }
+                secondaryAction: {
+                    pin = ""
+                    usePIN = true
+                }
             )
+            .task { await model.retryBiometricSignIn() }
+        }
+    }
+
+    private var pinUnlock: some View {
+        ZStack {
+            LinearGradient(
+                colors: [KitColor.deepNavy, KitColor.navy, KitColor.green.opacity(0.78)],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            .ignoresSafeArea()
+
+            VStack(spacing: 18) {
+                Image(systemName: "lock.shield.fill")
+                    .font(.system(size: 46, weight: .medium))
+                    .foregroundStyle(.white)
+                Text("Enter your Kit Pay PIN")
+                    .font(.title.bold())
+                    .foregroundStyle(.white)
+                Text(
+                    model.biometricSignInPermanentlyUnavailable
+                        ? "\(model.biometricDisplayName) is no longer available on this iPhone, so your PIN confirms it is you."
+                        : "Use your wallet PIN if \(model.biometricDisplayName) is locked or unavailable."
+                )
+                    .font(.subheadline)
+                    .foregroundStyle(.white.opacity(0.82))
+                    .multilineTextAlignment(.center)
+                SecureField("Four-digit PIN", text: $pin)
+                    .keyboardType(.numberPad)
+                    .multilineTextAlignment(.center)
+                    .font(.system(size: 28, weight: .bold, design: .monospaced))
+                    .privacySensitive()
+                    .padding(16)
+                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18))
+                    .onChange(of: pin) { _, value in
+                        let filtered = String(value.filter { $0 >= "0" && $0 <= "9" }.prefix(4))
+                        if filtered != value { pin = filtered }
+                    }
+                if let error = model.biometricErrorMessage {
+                    Text(error)
+                        .font(.footnote)
+                        .foregroundStyle(.white)
+                        .multilineTextAlignment(.center)
+                }
+                Button {
+                    let submitted = pin
+                    pin = ""
+                    Task { _ = await model.retrySignInWithPIN(submitted) }
+                } label: {
+                    Group {
+                        if model.biometricAccessState == .authorizing {
+                            ProgressView().tint(KitColor.navy)
+                        } else {
+                            Text("Unlock with PIN")
+                        }
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 15)
+                }
+                .buttonStyle(.borderedProminent)
+                .buttonBorderShape(.roundedRectangle(radius: 18))
+                .tint(.white)
+                .foregroundStyle(KitColor.navy)
+                .disabled(pin.count != 4 || model.biometricAccessState == .authorizing)
+
+                if !model.biometricSignInPermanentlyUnavailable {
+                    Button("Use \(model.biometricDisplayName)") {
+                        pin = ""
+                        usePIN = false
+                    }
+                    .foregroundStyle(.white.opacity(0.9))
+                    .disabled(model.biometricAccessState == .authorizing)
+                }
+            }
+            .padding(24)
+            .frame(maxWidth: 460)
+            .kitGlass(cornerRadius: 34)
+            .padding(22)
         }
     }
 }

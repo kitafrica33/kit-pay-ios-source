@@ -142,15 +142,14 @@ jobs:
         run: sudo xcode-select --switch /Applications/Xcode.app
       - name: Install pinned native dependencies
         run: pod install --repo-update
-      - name: Import and validate existing Apple signing assets
+      - name: Import existing Apple distribution certificate
         env:
           APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
           CERTIFICATE_BASE64: ${{ secrets.IOS_DISTRIBUTION_CERTIFICATE_BASE64 }}
           CERTIFICATE_PASSWORD: ${{ secrets.IOS_DISTRIBUTION_CERTIFICATE_PASSWORD }}
-          PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_APP_STORE_PROVISIONING_PROFILE_BASE64 }}
         run: |
           set -euo pipefail
-          for name in APPLE_TEAM_ID CERTIFICATE_BASE64 CERTIFICATE_PASSWORD PROVISIONING_PROFILE_BASE64; do
+          for name in APPLE_TEAM_ID CERTIFICATE_BASE64 CERTIFICATE_PASSWORD; do
             test -n "${!name:-}"
           done
 
@@ -160,20 +159,17 @@ jobs:
           from pathlib import Path
 
           root = Path(os.environ['RUNNER_TEMP'])
-          for variable, filename in (
-              ('CERTIFICATE_BASE64', 'kitpay-distribution.p12'),
-              ('PROVISIONING_PROFILE_BASE64', 'kitpay-app-store.mobileprovision'),
-          ):
-              encoded = ''.join(os.environ[variable].split())
-              try:
-                  clear = base64.b64decode(encoded, validate=True)
-              except (ValueError, base64.binascii.Error) as error:
-                  raise SystemExit(f'{variable} is not valid base64') from error
-              if not clear:
-                  raise SystemExit(f'{variable} decoded to an empty file')
-              path = root / filename
-              path.write_bytes(clear)
-              path.chmod(0o600)
+          variable = 'CERTIFICATE_BASE64'
+          encoded = ''.join(os.environ[variable].split())
+          try:
+              clear = base64.b64decode(encoded, validate=True)
+          except (ValueError, base64.binascii.Error) as error:
+              raise SystemExit(f'{variable} is not valid base64') from error
+          if not clear:
+              raise SystemExit(f'{variable} decoded to an empty file')
+          path = root / 'kitpay-distribution.p12'
+          path.write_bytes(clear)
+          path.chmod(0o600)
           PY
 
           keychain_path="$RUNNER_TEMP/kitpay-signing.keychain-db"
@@ -230,6 +226,35 @@ jobs:
             -out "$RUNNER_TEMP/kitpay-distribution-certificate.der"
           test -s "$RUNNER_TEMP/kitpay-distribution-certificate.der"
 
+      # This App Store Connect key manages bundle capabilities and profiles only.
+      # It cannot import a CloudKit schema; that requires a separately confirmed
+      # administrator action with a distinct CloudKit management token.
+      - name: Generate fresh App Store provisioning profile
+        env:
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          for name in \
+            APP_STORE_CONNECT_ISSUER_ID \
+            APP_STORE_CONNECT_KEY_ID \
+            APP_STORE_CONNECT_PRIVATE_KEY; do
+            test -n "${!name:-}"
+          done
+          python3 .github/scripts/create_ios_app_store_profile.py \
+            --bundle-id "$IOS_BUNDLE_ID" \
+            --certificate-der "$RUNNER_TEMP/kitpay-distribution-certificate.der" \
+            --profile-name "Kit Pay App Store ${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --profile-output "$RUNNER_TEMP/kitpay-app-store.mobileprovision"
+
+      - name: Validate and install generated App Store profile
+        env:
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          test -n "${APPLE_TEAM_ID:-}"
+          test -s "$RUNNER_TEMP/kitpay-app-store.mobileprovision"
           security cms -D \
             -i "$RUNNER_TEMP/kitpay-app-store.mobileprovision" \
             > "$RUNNER_TEMP/kitpay-profile.plist"

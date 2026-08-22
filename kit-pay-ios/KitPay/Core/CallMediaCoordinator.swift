@@ -513,6 +513,15 @@ enum CallAudioRoutePolicy {
 }
 
 final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTransport, RoomDelegate, @unchecked Sendable {
+    private struct PendingCallKitMicrophoneIntent {
+        let callId: String
+        let enabled: Bool
+
+        func belongs(to callId: String) -> Bool {
+            self.callId.caseInsensitiveCompare(callId) == .orderedSame
+        }
+    }
+
     @Published private(set) var localVideoTrack: VideoTrack?
     @Published private(set) var remoteVideoTrack: VideoTrack?
     @Published private(set) var remoteParticipantSurfaces: [LiveKitRemoteParticipantSurface] = []
@@ -528,6 +537,9 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
     @Published private(set) var microphoneMode: KitMicrophoneMode = .automatic
     @Published private(set) var canSwitchCamera = false
     @Published private(set) var isFrontCamera = true
+    /// 0…1 voice-activity levels for UI pulse effects, fed by LiveKit's active-speaker updates.
+    @Published private(set) var localVoiceLevel: Float = 0
+    @Published private(set) var remoteVoiceLevel: Float = 0
 
     var onUnexpectedDisconnect: (@Sendable (String, CallMediaDisconnectEvent) -> Void)?
     var onSDKReconnectStateChanged: (@Sendable (String, Bool) -> Void)?
@@ -539,6 +551,9 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
     private var mediaIntent = CallMediaIntentState(video: false)
     private var mediaIntentRevision: UInt64 = 0
     private var deferredInitialCameraCallId: String?
+    /// CallKit can deliver mute before the authenticated media handoff creates a room. Bind that
+    /// intent to its backend call so a canceled call can never mute a later replacement call.
+    private var pendingCallKitMicrophoneIntent: PendingCallKitMicrophoneIntent?
     private var localAudioTrack: LocalAudioTrack?
     private var audioInitializationFailed = false
     /// Set while the session is configured for a call, so route changes only publish during one.
@@ -586,8 +601,15 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
 
     @MainActor
     func connect(_ handoff: CallMediaHandoff) async throws {
-        guard !audioInitializationFailed else {
-            throw LiveKitCallMediaError.audioInitializationFailed
+        if audioInitializationFailed {
+            // A one-time transport init failure must not latch every future call into
+            // `audioInitializationFailed`; retry before giving up on this connect.
+            do {
+                try AudioManager.shared.setEngineAvailability(.none)
+                audioInitializationFailed = false
+            } catch {
+                throw LiveKitCallMediaError.audioInitializationFailed
+            }
         }
         connectionGeneration &+= 1
         let expectedGeneration = connectionGeneration
@@ -602,10 +624,15 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
             )
             mediaIntentCallId = callId
             mediaIntent = CallMediaIntentState(video: cameraPlan.enablesCameraImmediately)
+            if let pendingCallKitMicrophoneIntent,
+               pendingCallKitMicrophoneIntent.belongs(to: callId) {
+                mediaIntent.setMicrophoneEnabled(pendingCallKitMicrophoneIntent.enabled)
+            }
             deferredInitialCameraCallId = cameraPlan.defersCameraUntilForeground ? callId : nil
             mediaIntentRevision &+= 1
             remoteParticipantConnectedAt = nil
         }
+        pendingCallKitMicrophoneIntent = nil
         do {
             try await ensurePermissions(video: mediaIntent.cameraEnabled)
         } catch {
@@ -725,6 +752,12 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
 
     @MainActor
     func clearDisconnectedCallIntent(callId: String) {
+        if pendingCallKitMicrophoneIntent?.belongs(to: callId) == true {
+            pendingCallKitMicrophoneIntent = nil
+            if mediaIntentCallId == nil {
+                isMicrophoneEnabled = false
+            }
+        }
         guard room == nil,
               mediaIntentCallId?.caseInsensitiveCompare(callId) == .orderedSame
         else { return }
@@ -795,6 +828,25 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
             }
             throw error
         }
+    }
+
+    /// CallKit mute must never bounce: before the room is connected (pre-connect ring,
+    /// mid-connect, app-level rejoin) the intent is recorded and applied by `connect`.
+    @MainActor
+    func applyCallKitMute(_ muted: Bool, callId: String) async throws {
+        let enabled = !muted
+        guard let mediaIntentCallId else {
+            pendingCallKitMicrophoneIntent = PendingCallKitMicrophoneIntent(
+                callId: callId.lowercased(),
+                enabled: enabled
+            )
+            isMicrophoneEnabled = enabled
+            return
+        }
+        guard mediaIntentCallId.caseInsensitiveCompare(callId) == .orderedSame else {
+            throw LiveKitCallMediaError.mediaUnavailable
+        }
+        try await setMicrophone(enabled: enabled)
     }
 
     @MainActor
@@ -1012,6 +1064,7 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
         mediaIntentCallId = nil
         mediaIntent = CallMediaIntentState(video: false)
         deferredInitialCameraCallId = nil
+        pendingCallKitMicrophoneIntent = nil
         mediaIntentRevision &+= 1
     }
 
@@ -1033,6 +1086,8 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
         }
         hasRemoteParticipant = false
         canSwitchCamera = false
+        localVoiceLevel = 0
+        remoteVoiceLevel = 0
     }
 
     @MainActor
@@ -1255,9 +1310,26 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
         }
     }
 
-    func room(_ room: Room, didUpdateSpeakingParticipants _: [Participant]) {
+    func room(_ room: Room, didUpdateSpeakingParticipants participants: [Participant]) {
+        // Participants absent from the array have stopped speaking, so recomputing from the
+        // array alone naturally decays their level back to 0.
+        var localLevel: Float = 0
+        var remoteLevel: Float = 0
+        for participant in participants {
+            let level = min(max(participant.audioLevel, 0), 1)
+            if participant is LocalParticipant {
+                localLevel = max(localLevel, level)
+            } else {
+                remoteLevel = max(remoteLevel, level)
+            }
+        }
+        let local = localLevel
+        let remote = remoteLevel
         Task { @MainActor [weak self] in
-            self?.refreshRemoteParticipantSurfaces(in: room)
+            guard let self, self.room === room else { return }
+            self.localVoiceLevel = local
+            self.remoteVoiceLevel = remote
+            self.refreshRemoteParticipantSurfaces(in: room)
         }
     }
 
@@ -1333,6 +1405,10 @@ final class CallMediaCoordinator: ObservableObject {
 
     static let shared = CallMediaCoordinator()
 
+    /// How long a connected call waits for the remote participant to return before ending
+    /// cleanly instead of running forever after a hang-up that never tore down the room.
+    static let remoteAbsenceGraceNanoseconds: UInt64 = 20_000_000_000
+
     @Published private(set) var activeCall: ActiveCallPresentation?
     @Published private(set) var state: State = .idle
     @Published private(set) var controlError: String?
@@ -1348,6 +1424,8 @@ final class CallMediaCoordinator: ObservableObject {
     private var reconnectStabilityTask: Task<Void, Never>?
     private var reconnectGeneration: UInt64 = 0
     private var reconnectAttemptsRemaining = CallMediaReconnectPolicy.retryDelaysNanoseconds.count
+    private var remoteAbsenceTask: Task<Void, Never>?
+    private var remotePresenceCancellable: AnyCancellable?
 
     private init() {
         let media = LiveKitCallMediaTransport()
@@ -1374,11 +1452,19 @@ final class CallMediaCoordinator: ObservableObject {
                 )
             }
         }
+        remotePresenceCancellable = media.$hasRemoteParticipant
+            .removeDuplicates()
+            .sink { [weak self] isPresent in
+                Task { @MainActor in
+                    self?.handleRemotePresenceChanged(isPresent)
+                }
+            }
     }
 
     deinit {
         reconnectTask?.cancel()
         reconnectStabilityTask?.cancel()
+        remoteAbsenceTask?.cancel()
     }
 
     var statusText: String {
@@ -1608,10 +1694,14 @@ final class CallMediaCoordinator: ObservableObject {
     func disconnectFromCallKit(callId: String) async {
         let presentationMatches = activeCall?.id.caseInsensitiveCompare(callId) == .orderedSame
         let sessionMatches = session.activeCallId?.caseInsensitiveCompare(callId) == .orderedSame
-        guard presentationMatches || sessionMatches else { return }
+        guard presentationMatches || sessionMatches else {
+            media.clearDisconnectedCallIntent(callId: callId)
+            return
+        }
         invalidateReconnect()
         state = .ending
         await session.disconnect(callId: callId)
+        media.clearDisconnectedCallIntent(callId: callId)
         clearPresentation(callId: callId)
     }
 
@@ -1652,6 +1742,18 @@ final class CallMediaCoordinator: ObservableObject {
     func setMicrophone(enabled: Bool) async throws {
         do {
             try await media.setMicrophone(enabled: enabled)
+            controlError = nil
+        } catch {
+            controlError = error.localizedDescription
+            throw error
+        }
+    }
+
+    /// System-UI (CallKit) mute: succeeds by buffering the intent while the room is not yet
+    /// connected instead of bouncing the toggle back with `.mediaUnavailable`.
+    func applyCallKitMute(_ muted: Bool, callId: String) async throws {
+        do {
+            try await media.applyCallKitMute(muted, callId: callId)
             controlError = nil
         } catch {
             controlError = error.localizedDescription
@@ -1816,6 +1918,9 @@ final class CallMediaCoordinator: ObservableObject {
             if reconnectAttemptsRemaining < CallMediaReconnectPolicy.retryDelaysNanoseconds.count {
                 scheduleReconnectBudgetReset(callId: callId)
             }
+            // If the remote hung up during the outage, re-arm the empty-room grace timer —
+            // the presence publisher won't fire again for a value that never changed.
+            handleRemotePresenceChanged(media.hasRemoteParticipant)
         }
     }
 
@@ -1899,6 +2004,7 @@ final class CallMediaCoordinator: ObservableObject {
                 controlError = nil
                 reconnectTask = nil
                 scheduleReconnectBudgetReset(callId: callId)
+                handleRemotePresenceChanged(media.hasRemoteParticipant)
                 return
             } catch is CancellationError {
                 return
@@ -1926,12 +2032,49 @@ final class CallMediaCoordinator: ObservableObject {
             && activeCall?.id.caseInsensitiveCompare(callId) == .orderedSame
     }
 
+    /// Ends the call after `remoteAbsenceGraceNanoseconds` if the remote participant left a
+    /// still-connected room and never returned — a remote hang-up that skipped room teardown
+    /// must not leave capture running forever.
+    private func handleRemotePresenceChanged(_ isPresent: Bool) {
+        if isPresent {
+            remoteAbsenceTask?.cancel()
+            remoteAbsenceTask = nil
+            return
+        }
+        guard state == .connected,
+              let callID = activeCall?.id,
+              let lease = activeAccountLease,
+              accountLeaseGate.accepts(lease),
+              media.remoteParticipantConnectedAt != nil
+        else { return }
+        remoteAbsenceTask?.cancel()
+        remoteAbsenceTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: Self.remoteAbsenceGraceNanoseconds)
+            } catch {
+                return
+            }
+            guard let self,
+                  !Task.isCancelled,
+                  self.state == .connected,
+                  self.accountLeaseGate.accepts(lease),
+                  self.activeAccountLease == lease,
+                  self.activeCall?.id.caseInsensitiveCompare(callID) == .orderedSame,
+                  !self.media.hasRemoteParticipant
+            else { return }
+            self.remoteAbsenceTask = nil
+            self.requestEnd()
+        }
+    }
+
     private func invalidateReconnect() {
         reconnectGeneration &+= 1
         reconnectTask?.cancel()
         reconnectTask = nil
         reconnectStabilityTask?.cancel()
         reconnectStabilityTask = nil
+        remoteAbsenceTask?.cancel()
+        remoteAbsenceTask = nil
     }
 
     private func resetReconnectBudget() {

@@ -9,6 +9,7 @@ enum ProfileDetailDestination: Hashable {
     case communicationPrivacy
     case identityVerification
     case security
+    case chatBackup
     case legalPrivacy
     case accountDeletion
 }
@@ -83,6 +84,7 @@ struct ProfileView: View {
         case .communicationPrivacy: CommunicationPrivacyView()
         case .identityVerification: KYCView()
         case .security: SecurityView()
+        case .chatBackup: ChatBackupSettingsView()
         case .legalPrivacy: LegalPrivacyView()
         case .accountDeletion: AccountDeletionView()
         }
@@ -154,6 +156,8 @@ struct ProfileView: View {
             settingsRow(row, showsDisclosure: false)
         case .security:
             NavigationLink(value: ProfileDetailDestination.security) { settingsRow(row) }
+        case .chatBackup:
+            NavigationLink(value: ProfileDetailDestination.chatBackup) { settingsRow(row) }
         case .legalPrivacy:
             NavigationLink(value: ProfileDetailDestination.legalPrivacy) { settingsRow(row) }
         case .accountDeletion:
@@ -276,6 +280,12 @@ struct ProfileView: View {
                 subtitle: "Wallet PIN, biometrics, authenticator and devices",
                 icon: "shield.lefthalf.filled",
                 destination: .security
+            ),
+            .init(
+                title: "Chats & backup",
+                subtitle: "Manage iCloud backup and restore",
+                icon: "icloud.and.arrow.up",
+                destination: .chatBackup
             )
         ]
     }
@@ -316,6 +326,7 @@ private struct ProfileEditorView: View {
     @State private var preparedAvatarJPEG: Data?
     @State private var preparedAvatarPreview: UIImage?
     @State private var isPreparingPhoto = false
+    @State private var isSaving = false
     @State private var photoLoadGeneration = 0
 
     private var photoPickerTitle: String {
@@ -427,7 +438,7 @@ private struct ProfileEditorView: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }
-                        .disabled(model.isUpdatingProfile)
+                        .disabled(model.isUpdatingProfile || isSaving)
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button {
@@ -439,15 +450,18 @@ private struct ProfileEditorView: View {
                             Text("Save")
                         }
                     }
-                    .disabled(model.isUpdatingProfile || isPreparingPhoto)
+                    .disabled(model.isUpdatingProfile || isSaving || isPreparingPhoto)
                 }
             }
-            .interactiveDismissDisabled(model.isUpdatingProfile)
+            .interactiveDismissDisabled(model.isUpdatingProfile || isSaving)
             .onAppear(perform: initialize)
             .onChange(of: selectedPhotoItem) { _, item in
                 photoLoadGeneration &+= 1
                 let generation = photoLoadGeneration
-                guard let item else { return }
+                guard let item else {
+                    isPreparingPhoto = false
+                    return
+                }
                 Task { await preparePhoto(item, generation: generation) }
             }
             .onDisappear {
@@ -465,6 +479,7 @@ private struct ProfileEditorView: View {
     }
 
     private func save() {
+        guard !isSaving, !model.isUpdatingProfile else { return }
         let normalizedName = normalizeProfileName(name)
         let normalizedTag = normalizeProfileTag(tag)
         if let error = profileIdentityValidationError(name: normalizedName, tag: normalizedTag) {
@@ -473,7 +488,9 @@ private struct ProfileEditorView: View {
         }
         validationError = nil
         model.lastError = nil
+        isSaving = true
         Task {
+            defer { isSaving = false }
             if await model.updateProfile(
                 name: normalizedName,
                 tag: normalizedTag,
@@ -579,7 +596,7 @@ private enum ProfileAvatarImageError: LocalizedError {
 }
 
 private struct ProfileRow: Identifiable {
-    let id = UUID()
+    var id: String { title }
     let title: String
     let subtitle: String
     let icon: String
@@ -592,6 +609,7 @@ private enum ProfileRowDestination {
     case communicationPrivacy
     case identityVerification
     case security
+    case chatBackup
     case legalPrivacy
     case accountDeletion
 }

@@ -439,7 +439,8 @@ enum VisibleMessageNotificationPolicy {
         previousServerMessageIDs: Set<String>,
         messages: [LocalMessage],
         suppressedConversationID: String?,
-        ownerUserID: String?
+        ownerUserID: String?,
+        mutedConversationIDs: Set<String> = []
     ) -> [VisibleMessageNotificationDescriptor] {
         guard let accountFingerprint = MessageNotificationContract.accountFingerprint(
             for: ownerUserID
@@ -448,6 +449,9 @@ enum VisibleMessageNotificationPolicy {
             MessageNotificationContract.canonicalUUID($0)
         })
         let suppressed = MessageNotificationContract.canonicalUUID(suppressedConversationID)
+        let muted = Set(mutedConversationIDs.compactMap {
+            MessageNotificationContract.canonicalUUID($0)
+        })
         var newestByConversation: [String: MessageNotificationVersion] = [:]
 
         for message in messages where !message.isOutgoing && message.state == .received {
@@ -457,6 +461,7 @@ enum VisibleMessageNotificationPolicy {
                       message.conversationId
                   ),
                   conversationID != suppressed,
+                  !muted.contains(conversationID),
                   let version = MessageNotificationContract.messageVersion(
                       for: serverID,
                       sentAt: message.sentAt ?? message.createdAt
@@ -2627,7 +2632,26 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
         guard type == .voIP else { completion(); return }
         let values = RemoteWakePayload(values: payload.dictionaryPayload)
         guard let incoming = IncomingCallPush(payload: values.values) else {
-            completion()
+            // iOS 13+ requires every VoIP push to report an incoming call. Failing to do so
+            // triggers the watchdog: the process is terminated and further VoIP pushes may be
+            // withheld. Use generic metadata so malformed or wrong-account payloads disclose no
+            // identity before protected-state ownership recovery.
+            let placeholderUUID = UUID()
+            callProvider.reportNewIncomingCall(
+                with: placeholderUUID,
+                update: genericIncomingCallUpdate()
+            ) { error in
+                Task { @MainActor in
+                    if error == nil {
+                        NotificationCoordinator.shared.callProvider.reportCall(
+                            with: placeholderUUID,
+                            endedAt: Date(),
+                            reason: .failed
+                        )
+                    }
+                    completion()
+                }
+            }
             return
         }
         let uuid = incoming.callUUID
@@ -2752,7 +2776,16 @@ extension NotificationCoordinator: CXProviderDelegate {
                         connectedAt: connectedAt
                     )
                 }
+            } catch is CancellationError {
+                // A racing end/replacement action superseded this connect and owns the
+                // CallKit ended report; a duplicate `.failed` here would end the wrong call.
             } catch {
+                // The action was already fulfilled; without an explicit ended report the system
+                // call would stay live with no backing media. A user-initiated end already
+                // cleared this call from tracking, so only report media failures.
+                if self?.backendCallIds[action.callUUID] != nil {
+                    provider.reportCall(with: action.callUUID, endedAt: Date(), reason: .failed)
+                }
                 self?.clearCall(action.callUUID)
             }
         }
@@ -2928,9 +2961,19 @@ extension NotificationCoordinator: CXProviderDelegate {
             action.fail()
             return
         }
+        guard let callId = backendCallIds[action.callUUID] else {
+            action.fail()
+            return
+        }
         Task { @MainActor in
             do {
-                try await CallMediaCoordinator.shared.setMicrophone(enabled: !action.isMuted)
+                // Before the room connects (ringing, app-level reconnect) the room is nil.
+                // System-UI/lock-screen mute must still stick: `applyCallKitMute` buffers the
+                // intent — it is re-applied on (re)connect — instead of bouncing the toggle.
+                try await CallMediaCoordinator.shared.applyCallKitMute(
+                    action.isMuted,
+                    callId: callId
+                )
                 action.fulfill()
             } catch {
                 action.fail()
@@ -3017,6 +3060,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
     ) -> Bool {
         ContactBackgroundRefreshScheduler.shared.register()
         CommunicationBackgroundReplayScheduler.shared.register()
+        MessageBackupRefreshScheduler.shared.register()
         NotificationCoordinator.shared.prepareForProtectedStateRestore()
         return true
     }

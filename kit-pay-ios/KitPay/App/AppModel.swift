@@ -668,6 +668,14 @@ final class AppModel: ObservableObject {
     @Published private(set) var unresolvedAccountDeletionAttemptBlocked = false
     @Published private(set) var messageConversationNavigationRequest:
         MessageConversationNavigationRequest?
+    @Published private(set) var isBackingUpMessages = false
+    @Published private(set) var isRestoringMessages = false
+    @Published private(set) var isDeletingMessageBackup = false
+    /// A decryptable iCloud backup exists and local history is empty; drives the restore prompt.
+    @Published var availableBackupToRestore: MessageBackupSummary?
+    /// True when the sign-in gate should offer PIN recovery because biometrics are locked out,
+    /// unavailable, or the local enrollment can no longer succeed.
+    @Published private(set) var biometricSignInPermanentlyUnavailable = false
 
     private let api: APIClient
     private let sessions: SessionStore
@@ -739,6 +747,9 @@ final class AppModel: ObservableObject {
     private var returningSignInBiometricAuthorizationFence =
         ReturningSignInBiometricAuthorizationFence()
     private var homeBiometricAuthorizationFence = HomeBiometricAuthorizationFence()
+    /// PIN recovery is also offered for a temporary system lockout, but only terminal key or
+    /// enrollment failures should remove the stored biometric credential after PIN verification.
+    private var biometricPINRecoveryRequiresEnrollmentRemoval = false
     private var biometricAuthenticationInProgress: Bool {
         biometricAuthenticationGate.isActive
     }
@@ -802,6 +813,29 @@ final class AppModel: ObservableObject {
         }
         CommunicationBackgroundReplayScheduler.shared.installHandler { [weak self] task in
             Task { @MainActor in await self?.handleBackgroundCommunicationReplay(task) }
+        }
+
+        MessageBackupRefreshScheduler.shared.installHandler { [weak self] task in
+            // `setTaskCompleted` must run exactly once even if expiration races completion.
+            let completion = BackgroundTaskCompletionLatch(task)
+            let work = Task { @MainActor in
+                guard let self else {
+                    completion.finish(success: false)
+                    return
+                }
+                if let restoreTask = self.restoreTask { await restoreTask.value }
+                guard !Task.isCancelled else { return }
+                let result = await self.runAutomaticMessageBackupIfDue()
+                // A backup that simply wasn't due is still a successful check-in; reporting
+                // failure would deflate the scheduler's priority for future runs.
+                completion.finish(
+                    success: !Task.isCancelled && result.backgroundTaskSucceeded
+                )
+            }
+            task.expirationHandler = {
+                work.cancel()
+                completion.finish(success: false)
+            }
         }
 
         connectivity.onChange = { [weak self] online in
@@ -1049,6 +1083,11 @@ final class AppModel: ObservableObject {
     var queuedCount: Int {
         state.outbox.filter { $0.failureDisposition != .requiresUserRetry }.count
     }
+    var pinnedConversationIds: Set<String> { Set(state.pinnedConversationIds ?? []) }
+    var mutedConversationIds: Set<String> { Set(state.mutedConversationIds ?? []) }
+    var messageBackupPreferences: MessageBackupPreferences {
+        state.messageBackupPreferences ?? .default
+    }
     var biometricDisplayName: String { biometricKind.displayName }
     var biometricSymbolName: String { biometricKind.symbolName }
     var financialApprovalUsesBiometrics: Bool {
@@ -1067,9 +1106,13 @@ final class AppModel: ObservableObject {
             || homeBiometricState == .notRequired
             || homeBiometricState == .authorized
     }
+    /// While a working biometric enrollment exists, biometrics are the only unlock method the UI
+    /// offers; a transient failure (cancel, lockout) keeps this true so the PIN is never
+    /// requested behind an enrolled user's back. Terminal enrollment failures disable
+    /// `biometricUnlockEnabled` first, which flips this to false and legitimizes the PIN path.
     var loginUnlockSupportsBiometrics: Bool {
         biometricUnlockEnabled
-            && biometricErrorMessage == nil
+            && !biometricSignInPermanentlyUnavailable
             && sessionAssurance?.loginUnlock.supportsBiometricSignature == true
     }
     /// Secure messaging remains fail-closed unless the server advertises the reviewed wire
@@ -1657,6 +1700,20 @@ final class AppModel: ObservableObject {
         } catch {
             await concealUnresolvedAcceptedAccountDeletionProjection()
             return false
+        }
+
+        do {
+            try await SecureMediaFileCache.shared.purge(forUserID: pending.accountID)
+            try MessageBackupKeyStore.removeKey(forUserID: pending.accountID)
+        } catch {
+            await concealUnresolvedAcceptedAccountDeletionProjection()
+            return false
+        }
+        // Removing the synchronizable key is the cryptographic deletion boundary. CloudKit
+        // record deletion is best-effort because an accepted account deletion must still finish
+        // locally while iCloud is signed out or temporarily unavailable.
+        Task {
+            try? await MessageBackupManager.shared.deleteBackup(forUserID: pending.accountID)
         }
 
         return true
@@ -3161,6 +3218,14 @@ final class AppModel: ObservableObject {
                 projectionCleanupSucceeded = false
             }
         }
+        var mediaCacheCleanupSucceeded = true
+        if !isAcceptedDeletion, let signedOutUserID {
+            do {
+                try await SecureMediaFileCache.shared.purge(forUserID: signedOutUserID)
+            } catch {
+                mediaCacheCleanupSucceeded = false
+            }
+        }
         // Avatars are the one piece of account data that never reaches SecureLocalStore: they are
         // fetched over HTTPS and `URLSession.shared` writes them into the shared URLCache, on disk,
         // in the clear. Every other projection is cleared above, so leaving them behind meant a
@@ -3217,11 +3282,15 @@ final class AppModel: ObservableObject {
         biometricAccessState = .notRequired
         homeBiometricState = .notRequired
         biometricErrorMessage = nil
+        biometricSignInPermanentlyUnavailable = false
+        biometricPINRecoveryRequiresEnrollmentRemoval = false
+        availableBackupToRestore = nil
         acceptedAccountDeletionCleanupBlocked = isAcceptedDeletion
             && !acceptedDeletionLocalCleanupSucceeded
         isLoading = acceptedAccountDeletionCleanupBlocked
         let completed = sessionCleanupSucceeded
             && projectionCleanupSucceeded
+            && mediaCacheCleanupSucceeded
             && (!isAcceptedDeletion || acceptedDeletionLocalCleanupSucceeded)
         if completed {
             // The signed-in projection was cleared before credentials. Repopulate only the public
@@ -3964,6 +4033,8 @@ final class AppModel: ObservableObject {
             }
             sessionAssurance = updatedAssurance
             biometricUnlockEnabled = enabled
+            biometricSignInPermanentlyUnavailable = false
+            biometricPINRecoveryRequiresEnrollmentRemoval = false
             biometricAccessState = enabled ? .authorized : .notRequired
             homeBiometricState = enabled ? .locked : .notRequired
             return true
@@ -4014,6 +4085,19 @@ final class AppModel: ObservableObject {
             sessionAssurance = result.sessionAssurance
             biometricAccessState = .authorized
             if selectedTab == MainTabIndex.home { homeBiometricState = .authorized }
+            if biometricSignInPermanentlyUnavailable {
+                if biometricPINRecoveryRequiresEnrollmentRemoval {
+                    // A changed or missing key can never authenticate again. Remove only those
+                    // terminal enrollments; a system lockout remains enrolled after PIN recovery.
+                    await biometrics.removeAnyEnrollment()
+                    _ = try? await api.removeBiometricKey()
+                    biometricUnlockEnabled = false
+                    homeBiometricState = .notRequired
+                }
+                biometricSignInPermanentlyUnavailable = false
+                biometricPINRecoveryRequiresEnrollmentRemoval = false
+                biometricErrorMessage = nil
+            }
             await resumeAuthenticatedSessionIfNeeded()
             return true
         } catch {
@@ -4355,6 +4439,9 @@ final class AppModel: ObservableObject {
             context,
             requiresSignedIn: requiresSignedIn
         ) else { return false }
+        biometricErrorMessage = nil
+        biometricSignInPermanentlyUnavailable = false
+        biometricPINRecoveryRequiresEnrollmentRemoval = false
         let availability = await biometrics.availability()
         guard await sessionOwnershipContextIsCurrent(
             context,
@@ -4382,14 +4469,17 @@ final class AppModel: ObservableObject {
                 requiresSignedIn: requiresSignedIn
             ) else { return false }
         }
-        let enabled = storedEnrollmentEnabled && availability.isAvailable
         biometricErrorMessage = nil
         biometricKind = availability.kind
-        biometricUnlockEnabled = enabled
-        biometricAccessState = enabled ? .locked : .notRequired
-        homeBiometricState = enabled ? .locked : .notRequired
+        // An enrolled account remains gated even if LocalAuthentication is temporarily
+        // unavailable. The verified PIN path may recover it; treating this as `.notRequired`
+        // would reveal protected account data without either factor.
+        biometricUnlockEnabled = storedEnrollmentEnabled
+        biometricAccessState = storedEnrollmentEnabled ? .locked : .notRequired
+        homeBiometricState = storedEnrollmentEnabled ? .locked : .notRequired
         if storedEnrollmentEnabled, !availability.isAvailable {
             biometricErrorMessage = availability.unavailableMessage
+            biometricSignInPermanentlyUnavailable = true
         }
         return true
     }
@@ -4475,6 +4565,8 @@ final class AppModel: ObservableObject {
                 return false
             }
             biometricKind = kind
+            biometricSignInPermanentlyUnavailable = false
+            biometricPINRecoveryRequiresEnrollmentRemoval = false
             switch purpose {
             case .returningSignIn:
                 biometricAccessState = .authorized
@@ -4510,6 +4602,14 @@ final class AppModel: ObservableObject {
                 return false
             }
             biometricErrorMessage = error.localizedDescription
+            if let biometricError = error as? KitBiometricError,
+               [.lockedOut, .biometricSetChanged, .enrollmentMissing, .keyMissing,
+                .notEnrolled, .unavailable, .passcodeNotSet].contains(biometricError) {
+                // Lockout is recoverable without deleting enrollment. Key/enrollment failures
+                // are terminal and are retired only after the server verifies the user's PIN.
+                biometricSignInPermanentlyUnavailable = true
+                biometricPINRecoveryRequiresEnrollmentRemoval = biometricError != .lockedOut
+            }
             switch purpose {
             case .returningSignIn: biometricAccessState = .locked
             case .home: homeBiometricState = .locked
@@ -4610,6 +4710,10 @@ final class AppModel: ObservableObject {
         ) else { return }
         isLoading = false
         scheduleAutomaticContactSync()
+        Task { [weak self] in
+            await self?.checkForRestorableBackup()
+            await self?.runAutomaticMessageBackupIfDue()
+        }
     }
 
     private func unregisterApplePushProvidersBeforeSignOut(sessionID: String) async {
@@ -4937,7 +5041,8 @@ final class AppModel: ObservableObject {
                     previousServerMessageIDs: previousServerMessageIDs,
                     messages: latestState.messages,
                     suppressedConversationID: suppressedConversationID,
-                    ownerUserID: latestState.communicationOwnerUserID ?? userID
+                    ownerUserID: latestState.communicationOwnerUserID ?? userID,
+                    mutedConversationIDs: Set(latestState.mutedConversationIds ?? [])
                 )
                 await VisibleMessageNotificationCoordinator.shared.schedule(descriptors)
             }
@@ -6343,6 +6448,8 @@ final class AppModel: ObservableObject {
                     sessionAssurance = updatedAssurance
                 }
             }
+            biometricSignInPermanentlyUnavailable = false
+            biometricPINRecoveryRequiresEnrollmentRemoval = false
             await resumeAuthenticatedSessionIfNeeded()
         } catch {
             guard isSignedIn,
@@ -6403,6 +6510,8 @@ final class AppModel: ObservableObject {
             guard accountSetupStep == nil else { throw AccountSetupError.sessionNotUnlocked }
             biometricAccessState = .authorized
             homeBiometricState = .authorized
+            biometricSignInPermanentlyUnavailable = false
+            biometricPINRecoveryRequiresEnrollmentRemoval = false
             await resumeAuthenticatedSessionIfNeeded()
         } catch {
             guard isSignedIn,
@@ -6410,13 +6519,19 @@ final class AppModel: ObservableObject {
                   await sessions.current()?.sessionId == expectedSessionID
             else { return }
             biometricErrorMessage = error.localizedDescription
-            if let biometricError = error as? KitBiometricError,
-               [.biometricSetChanged, .enrollmentMissing, .keyMissing, .notEnrolled,
-                .unavailable, .passcodeNotSet].contains(biometricError) {
-                await biometrics.removeAnyEnrollment()
-                biometricUnlockEnabled = false
-                biometricAccessState = .notRequired
-                homeBiometricState = .notRequired
+            if let biometricError = error as? KitBiometricError {
+                if biometricError == .lockedOut {
+                    biometricSignInPermanentlyUnavailable = true
+                    biometricPINRecoveryRequiresEnrollmentRemoval = false
+                } else if [.biometricSetChanged, .enrollmentMissing, .keyMissing, .notEnrolled,
+                           .unavailable, .passcodeNotSet].contains(biometricError) {
+                    await biometrics.removeAnyEnrollment()
+                    biometricUnlockEnabled = false
+                    biometricAccessState = .notRequired
+                    homeBiometricState = .notRequired
+                    biometricSignInPermanentlyUnavailable = true
+                    biometricPINRecoveryRequiresEnrollmentRemoval = true
+                }
             }
         }
     }
@@ -7166,18 +7281,47 @@ final class AppModel: ObservableObject {
         return true
     }
 
+    /// Sends any allowed media kind (photo, voice note, video, document) end-to-end encrypted.
+    /// Small plaintext is kept inline for offline history; large plaintext is cached in the
+    /// encrypted media file cache keyed by the uploaded storage key.
     @discardableResult
-    func queueImageMessage(
+    func queueMediaMessage(
         conversationId: String,
         title: String,
         recipientId: String?,
-        imageData: Data,
+        mediaData: Data,
         mediaType: String,
         caption: String?,
+        submittedDraftBody: String? = nil,
         draftClearVersion: ConversationDraftWriteVersion? = nil
     ) async -> Bool {
+        guard (submittedDraftBody == nil) == (draftClearVersion == nil) else {
+            lastError = CustomerFacingMessagingCopy.draftSaveFailure
+            return false
+        }
+        let kind = KitChatMediaKind(mediaType: mediaType)
+        let canQueueOffline = kind == .image
+            && KitChatMediaLimits.shouldCacheInline(byteCount: mediaData.count)
+        guard isOnline || canQueueOffline else {
+            lastError = "Connect to the internet to send this encrypted \(kind.previewLabel.lowercased())."
+            return false
+        }
+        if kind != .image, capabilities?.enablesMessagingRichMedia != true {
+            // A server rollout can complete while this process still holds its launch snapshot.
+            // Refresh once at send time before presenting an unavailable result.
+            _ = await reloadCapabilities()
+            guard capabilities?.enablesMessagingRichMedia == true else {
+                lastError =
+                    "Voice notes, videos, and documents are not available on this Kit Pay service yet."
+                return false
+            }
+        }
+        guard KitChatMediaLimits.fits(mediaData.count, kind: kind) else {
+            lastError = "\(kind.previewLabel)s can be up to \(KitChatMediaLimits.maximumTransferLabel)."
+            return false
+        }
         guard let cleanConversationId = OutboxPolicy.canonicalConversationID(conversationId) else {
-            lastError = "This conversation is no longer available. The photo was not sent."
+            lastError = "This conversation is no longer available. Nothing was sent."
             return false
         }
         guard secureMessagingAvailable else {
@@ -7203,28 +7347,54 @@ final class AppModel: ObservableObject {
         let recipientUserID = recipientUUID.uuidString.lowercased()
         if let denial = communicationPrivacyDenialMessage(
             for: recipientUserID,
-            blockedMessage: "Unblock this account before sending a photo."
+            blockedMessage: "Unblock this account before sending this attachment."
         ) {
             lastError = denial
             return false
         }
         do {
-            _ = try await SecureMessagingExchangeCoordinator.shared.queueDeferredImage(
-                forUserID: userID,
-                conversationID: cleanConversationId,
-                expectedRecipientUserID: recipientUserID,
-                title: title,
-                imageData: imageData,
-                mediaType: mediaType,
-                caption: caption,
-                submittedDraftBody: draftClearVersion == nil ? nil : (caption ?? ""),
-                draftClearVersion: draftClearVersion
-            )
+            let queued: SecureMessagingQueueResult
+            if KitChatMediaLimits.shouldCacheInline(byteCount: mediaData.count) {
+                queued = try await SecureMessagingExchangeCoordinator.shared.queueDeferredImage(
+                    forUserID: userID,
+                    conversationID: cleanConversationId,
+                    expectedRecipientUserID: recipientUserID,
+                    title: title,
+                    mediaData: mediaData,
+                    mediaType: mediaType,
+                    caption: caption,
+                    submittedDraftBody: submittedDraftBody,
+                    draftClearVersion: draftClearVersion
+                )
+            } else {
+                queued = try await SecureMessagingExchangeCoordinator.shared.queueMediaAttachment(
+                    forUserID: userID,
+                    conversationID: cleanConversationId,
+                    expectedRecipientUserID: recipientUserID,
+                    title: title,
+                    mediaData: mediaData,
+                    mediaType: mediaType,
+                    caption: caption,
+                    storesInlineAttachment: false,
+                    submittedDraftBody: submittedDraftBody,
+                    draftClearVersion: draftClearVersion
+                )
+            }
             guard await reloadOutboxStateIfCurrent(
                 accountEpoch: expectedAccountEpoch,
                 userID: userID,
                 sessionID: expectedSessionID
             ) else { return false }
+            if !KitChatMediaLimits.shouldCacheInline(byteCount: mediaData.count),
+               let descriptor = state.messages
+                   .first(where: { $0.id == queued.clientMessageID })
+                   .flatMap({ KitMediaMessageDescriptor.parse($0.body) }) {
+                try? await SecureMediaFileCache.shared.store(
+                    mediaData,
+                    forStorageKey: descriptor.storageKey,
+                    userID: userID
+                )
+            }
             // Media bytes, pending attachment metadata and the outbox command are protected by
             // the same local commit. Upload/encryption replay continues independently from here.
             scheduleOutboxWake()
@@ -7240,7 +7410,7 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func loadSecureImage(
+    func loadSecureMedia(
         conversationId: String,
         descriptorText: String
     ) async throws -> Data {
@@ -7250,8 +7420,19 @@ final class AppModel: ObservableObject {
            !cached.isEmpty {
             return cached
         }
+        guard let userID = profile?.id else {
+            throw SecureMessagingExchangeError.invalidAccount
+        }
+        if let descriptor = KitMediaMessageDescriptor.parse(descriptorText),
+           let cached = await SecureMediaFileCache.shared.data(
+               forStorageKey: descriptor.storageKey,
+               userID: userID
+           ),
+           cached.count == descriptor.plaintextByteSize {
+            return cached
+        }
         guard isOnline else { throw URLError(.notConnectedToInternet) }
-        guard secureMessagingAvailable, let userID = profile?.id else {
+        guard secureMessagingAvailable else {
             throw SecureMessagingExchangeError.invalidAccount
         }
         let data = try await SecureMessagingExchangeCoordinator.shared.openImage(
@@ -7259,14 +7440,22 @@ final class AppModel: ObservableObject {
             conversationID: conversationId,
             descriptorText: descriptorText
         )
-        try await store.update { persisted in
-            guard persisted.profile?.id == userID else { throw StoreError.accountChanged }
-            guard let index = persisted.messages.firstIndex(where: {
-                $0.conversationId == conversationId && $0.body == descriptorText
-            }) else { throw SecureMessagingExchangeError.invalidConversation }
-            persisted.messages[index].attachmentData = data
+        if KitChatMediaLimits.shouldCacheInline(byteCount: data.count) {
+            try await store.update { persisted in
+                guard persisted.profile?.id == userID else { throw StoreError.accountChanged }
+                guard let index = persisted.messages.firstIndex(where: {
+                    $0.conversationId == conversationId && $0.body == descriptorText
+                }) else { throw SecureMessagingExchangeError.invalidConversation }
+                persisted.messages[index].attachmentData = data
+            }
+            state = await store.snapshot()
+        } else if let descriptor = KitMediaMessageDescriptor.parse(descriptorText) {
+            try? await SecureMediaFileCache.shared.store(
+                data,
+                forStorageKey: descriptor.storageKey,
+                userID: userID
+            )
         }
-        state = await store.snapshot()
         return data
     }
 
@@ -7380,6 +7569,329 @@ final class AppModel: ObservableObject {
             ) else { return nil }
             lastError = error.localizedDescription
             return nil
+        }
+    }
+
+    func markConversationRead(_ conversationID: String) async {
+        let latestIncomingMessageID = state.messages
+            .filter {
+                $0.conversationId == conversationID
+                    && !$0.isOutgoing
+                    && $0.serverMessageId != nil
+            }
+            .max(by: { $0.createdAt < $1.createdAt })?
+            .serverMessageId
+        guard secureMessagingAvailable,
+              isOnline,
+              let userID = profile?.id,
+              let messageID = latestIncomingMessageID
+        else { return }
+        do {
+            try await SecureMessagingExchangeCoordinator.shared.markConversationRead(
+                conversationID: conversationID,
+                throughServerMessageID: messageID,
+                forUserID: userID
+            )
+            state = await store.snapshot()
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
+    // MARK: - Conversation management (pin, mute, select, delete)
+
+    func togglePinnedConversation(_ conversationID: String) async {
+        do {
+            try await store.update { persisted in
+                persisted.pinnedConversationIds = ConversationListPolicy.togglingMembership(
+                    conversationID,
+                    in: persisted.pinnedConversationIds
+                )
+            }
+            state = await store.snapshot()
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
+    func toggleMutedConversation(_ conversationID: String) async {
+        do {
+            try await store.update { persisted in
+                persisted.mutedConversationIds = ConversationListPolicy.togglingMembership(
+                    conversationID,
+                    in: persisted.mutedConversationIds
+                )
+            }
+            state = await store.snapshot()
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
+    /// Marks chats read locally right away, then sends authenticated read receipts when online.
+    func markConversationsRead(_ conversationIDs: Set<String>) async {
+        guard !conversationIDs.isEmpty else { return }
+        do {
+            try await store.update { persisted in
+                for index in persisted.conversations.indices
+                where conversationIDs.contains(persisted.conversations[index].id) {
+                    persisted.conversations[index].unreadCount = 0
+                }
+            }
+            state = await store.snapshot()
+        } catch {
+            lastError = error.localizedDescription
+            return
+        }
+        guard isOnline, secureMessagingAvailable else { return }
+        for conversationID in conversationIDs {
+            await markConversationRead(conversationID)
+        }
+    }
+
+    /// Deletes chats from this device only. Server copies stay end-to-end encrypted for the
+    /// other participant; queued unsent messages for these chats are dropped from the outbox.
+    func deleteConversationsLocally(_ conversationIDs: Set<String>) async {
+        guard !conversationIDs.isEmpty else { return }
+        let userID = profile?.id
+        let storageKeys = state.messages
+            .filter { conversationIDs.contains($0.conversationId) }
+            .compactMap { KitMediaMessageDescriptor.parse($0.body)?.storageKey }
+        do {
+            try await store.update { persisted in
+                persisted.conversations.removeAll { conversationIDs.contains($0.id) }
+                persisted.messages.removeAll { conversationIDs.contains($0.conversationId) }
+                persisted.outbox.removeAll { command in
+                    command.kind == .secureMessage
+                        && command.conversationId.map(conversationIDs.contains) == true
+                }
+                persisted.pinnedConversationIds = persisted.pinnedConversationIds?
+                    .filter { !conversationIDs.contains($0) }
+                persisted.mutedConversationIds = persisted.mutedConversationIds?
+                    .filter { !conversationIDs.contains($0) }
+            }
+            state = await store.snapshot()
+            if let userID {
+                for storageKey in storageKeys {
+                    await SecureMediaFileCache.shared.remove(
+                        forStorageKey: storageKey,
+                        userID: userID
+                    )
+                }
+            }
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
+    /// Deletes individual messages from this device only ("delete for me").
+    func deleteMessagesLocally(_ messageIDs: Set<UUID>, conversationId: String) async {
+        guard !messageIDs.isEmpty else { return }
+        let userID = profile?.id
+        let storageKeys = state.messages
+            .filter { messageIDs.contains($0.id) && $0.conversationId == conversationId }
+            .compactMap { KitMediaMessageDescriptor.parse($0.body)?.storageKey }
+        do {
+            try await store.update { persisted in
+                persisted.messages.removeAll {
+                    messageIDs.contains($0.id) && $0.conversationId == conversationId
+                }
+                persisted.outbox.removeAll { command in
+                    command.kind == .secureMessage
+                        && command.messageId.map(messageIDs.contains) == true
+                }
+            }
+            state = await store.snapshot()
+            if let userID {
+                for storageKey in storageKeys {
+                    await SecureMediaFileCache.shared.remove(
+                        forStorageKey: storageKey,
+                        userID: userID
+                    )
+                }
+            }
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
+    // MARK: - End-to-end encrypted iCloud chat backups
+
+    func setMessageBackupFrequency(_ frequency: MessageBackupFrequency) async {
+        guard !isDeletingMessageBackup else { return }
+        do {
+            try await store.update { persisted in
+                var preferences = persisted.messageBackupPreferences ?? .default
+                preferences.frequency = frequency
+                persisted.messageBackupPreferences = preferences
+            }
+            state = await store.snapshot()
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
+    func setMessageBackupIncludesMedia(_ includesMedia: Bool) async {
+        guard !isDeletingMessageBackup else { return }
+        do {
+            try await store.update { persisted in
+                var preferences = persisted.messageBackupPreferences ?? .default
+                preferences.includesMedia = includesMedia
+                persisted.messageBackupPreferences = preferences
+            }
+            state = await store.snapshot()
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
+    @discardableResult
+    func backUpMessagesNow() async -> Bool {
+        guard !isBackingUpMessages,
+              !isDeletingMessageBackup,
+              !isRestoringMessages,
+              isSignedIn,
+              accountSetupStep == nil,
+              let userID = profile?.id,
+              let expectedSessionID = await sessions.current()?.sessionId
+        else { return false }
+        let expectedAccountEpoch = accountEpoch
+        isBackingUpMessages = true
+        defer { isBackingUpMessages = false }
+        let payload = MessageBackupPayload.snapshot(
+            of: state,
+            userID: userID,
+            deviceName: UIDevice.current.name,
+            includesMedia: messageBackupPreferences.includesMedia
+        )
+        do {
+            let summary = try await MessageBackupManager.shared.upload(payload)
+            state = try await commitAuthenticatedMutation(
+                accountEpoch: expectedAccountEpoch,
+                userID: userID,
+                sessionID: expectedSessionID
+            ) { persisted in
+                var preferences = persisted.messageBackupPreferences ?? .default
+                preferences.lastBackupAt = summary.createdAt
+                preferences.lastBackupByteSize = summary.byteSize
+                preferences.lastBackupMessageCount = summary.messageCount
+                preferences.lastBackupGeneration = summary.generation
+                preferences.lastBackupContentDigest = summary.contentDigest
+                persisted.messageBackupPreferences = preferences
+            }
+            return true
+        } catch is CancellationError {
+            return false
+        } catch {
+            lastError = error.localizedDescription
+            return false
+        }
+    }
+
+    /// Runs a due automatic backup opportunistically (app background, BG task, foreground sync).
+    @discardableResult
+    func runAutomaticMessageBackupIfDue() async -> MessageBackupAutomaticRunResult {
+        guard isSignedIn,
+              accountSetupStep == nil,
+              isOnline,
+              !state.messages.isEmpty,
+              MessageBackupSchedulePolicy.isBackupDue(
+                  frequency: messageBackupPreferences.frequency,
+                  lastBackupAt: messageBackupPreferences.lastBackupAt
+              )
+        else { return .notDue }
+        return await backUpMessagesNow() ? .succeeded : .failed
+    }
+
+    /// After sign-in on a device with no local history, offer to restore the iCloud backup.
+    func checkForRestorableBackup() async {
+        guard isSignedIn,
+              !isDeletingMessageBackup,
+              accountSetupStep == nil,
+              state.messages.isEmpty,
+              availableBackupToRestore == nil,
+              let userID = profile?.id
+        else { return }
+        guard (try? MessageBackupKeyStore.existingKey(forUserID: userID)) != nil else { return }
+        guard let summary = try? await MessageBackupManager.shared.latestBackupSummary(
+            forUserID: userID
+        ) else { return }
+        guard isSignedIn, !isDeletingMessageBackup, profile?.id == userID else { return }
+        availableBackupToRestore = summary
+    }
+
+    @discardableResult
+    func restoreMessagesFromBackup() async -> Bool {
+        guard !isRestoringMessages,
+              !isDeletingMessageBackup,
+              !isBackingUpMessages,
+              isSignedIn,
+              let userID = profile?.id,
+              let expectedSessionID = await sessions.current()?.sessionId
+        else { return false }
+        let expectedAccountEpoch = accountEpoch
+        isRestoringMessages = true
+        defer { isRestoringMessages = false }
+        do {
+            let payload = try await MessageBackupManager.shared.downloadPayload(forUserID: userID)
+            state = try await commitAuthenticatedMutation(
+                accountEpoch: expectedAccountEpoch,
+                userID: userID,
+                sessionID: expectedSessionID
+            ) { persisted in
+                try MessageBackupRestorePolicy.merge(
+                    payload,
+                    into: &persisted,
+                    currentUserID: userID
+                )
+            }
+            availableBackupToRestore = nil
+            return true
+        } catch is CancellationError {
+            return false
+        } catch {
+            lastError = error.localizedDescription
+            return false
+        }
+    }
+
+    /// Deletes both the private CloudKit ciphertext and its synchronizable decryption key.
+    /// Automatic backups are disabled so the user-controlled deletion is not immediately undone.
+    @discardableResult
+    func deleteMessageBackup() async -> Bool {
+        guard !isDeletingMessageBackup,
+              !isBackingUpMessages,
+              !isRestoringMessages,
+              isSignedIn,
+              isOnline,
+              let userID = profile?.id,
+              let expectedSessionID = await sessions.current()?.sessionId
+        else { return false }
+        let expectedAccountEpoch = accountEpoch
+        isDeletingMessageBackup = true
+        defer { isDeletingMessageBackup = false }
+        do {
+            try await MessageBackupManager.shared.deleteBackup(forUserID: userID)
+            try MessageBackupKeyStore.removeKey(forUserID: userID)
+            guard await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: userID,
+                sessionID: expectedSessionID
+            ) else { return true }
+            state = try await commitAuthenticatedMutation(
+                accountEpoch: expectedAccountEpoch,
+                userID: userID,
+                sessionID: expectedSessionID
+            ) { persisted in
+                persisted.messageBackupPreferences = .default
+            }
+            availableBackupToRestore = nil
+            return true
+        } catch is CancellationError {
+            return false
+        } catch {
+            lastError = error.localizedDescription
+            return false
         }
     }
 
@@ -9110,6 +9622,9 @@ final class AppModel: ObservableObject {
 
     private func handleBackgroundContactRefresh(_ refreshTask: BGAppRefreshTask) async {
         let taskID = ObjectIdentifier(refreshTask)
+        // ObjectIdentifiers can be reused after dealloc; never leave a stale expiry marker
+        // behind or a future refresh task could be treated as already expired.
+        defer { expiredBackgroundContactTasks.remove(taskID) }
         refreshTask.expirationHandler = { [weak self, weak refreshTask] in
             Task { @MainActor in
                 guard let self, let refreshTask else { return }
@@ -10570,7 +11085,10 @@ final class AppModel: ObservableObject {
         return DeviceRegistration(
             installationId: installationID(),
             name: UIDevice.current.name,
-            appVersion: info?["CFBundleShortVersionString"] as? String ?? "0.2.5",
+            appVersion: APIClientIdentity.appVersion(
+                marketingVersion: info?["CFBundleShortVersionString"] as? String,
+                buildNumber: info?["CFBundleVersion"] as? String
+            ),
             osVersion: UIDevice.current.systemVersion,
             model: UIDevice.current.model
         )

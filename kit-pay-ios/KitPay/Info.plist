@@ -36,15 +36,15 @@
 	<key>KitCorrespondingSourceURL</key>
 	<string>$(KIT_CORRESPONDING_SOURCE_URL)</string>
 	<key>NSCameraUsageDescription</key>
-	<string>Scan Kit payment codes and share video during Kit calls.</string>
+	<string>Scan Kit payment codes, capture photos and videos for secure chats, and share video during Kit calls.</string>
 	<key>NSContactsUsageDescription</key>
 	<string>Kit Pay securely syncs contact names and phone numbers to show who is on Kit Pay and keep messaging and calls seamless.</string>
 	<key>NSFaceIDUsageDescription</key>
 	<string>Use Face ID to protect payments and private conversations.</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Speak during secure Kit voice and video calls.</string>
+	<string>Speak during secure Kit voice and video calls and record encrypted voice notes.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
-	<string>Choose photos to share in secure chats or set as your Kit Pay profile photo.</string>
+	<string>Choose photos and videos to share in secure chats or set as your Kit Pay profile photo.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key><false/>
@@ -53,6 +53,7 @@
 	<array>
 		<string>africa.kit.pay.ios.communication-replay</string>
 		<string>africa.kit.pay.ios.contacts-refresh</string>
+		<string>africa.kit.pay.ios.message-backup</string>
 	</array>
 	<key>UIBackgroundModes</key>
 	<array>

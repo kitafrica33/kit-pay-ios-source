@@ -4,10 +4,17 @@ import ImageIO
 import PhotosUI
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
+
+extension Notification.Name {
+    /// Posted by chat surfaces to bring the active-call screen back to the foreground.
+    static let kitReopenActiveCall = Notification.Name("africa.kit.pay.reopen-active-call")
+}
 
 enum ConversationListFilter: String, CaseIterable, Identifiable, Sendable {
     case all
     case unread
+    case pinned
 
     var id: String { rawValue }
 
@@ -15,6 +22,7 @@ enum ConversationListFilter: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .all: "All"
         case .unread: "Unread"
+        case .pinned: "Pinned"
         }
     }
 }
@@ -22,20 +30,24 @@ enum ConversationListFilter: String, CaseIterable, Identifiable, Sendable {
 enum ConversationListFilterPolicy {
     static func apply(
         _ filter: ConversationListFilter,
-        to conversations: [Conversation]
+        to conversations: [Conversation],
+        pinnedIDs: Set<String> = []
     ) -> [Conversation] {
-        conversations.filter { includes($0, in: filter) }
+        conversations.filter { includes($0, in: filter, pinnedIDs: pinnedIDs) }
     }
 
     static func includes(
         _ conversation: Conversation,
-        in filter: ConversationListFilter
+        in filter: ConversationListFilter,
+        pinnedIDs: Set<String> = []
     ) -> Bool {
         switch filter {
         case .all:
             true
         case .unread:
             conversation.unreadCount > 0
+        case .pinned:
+            pinnedIDs.contains(conversation.id)
         }
     }
 }
@@ -54,146 +66,103 @@ struct MessagesView: View {
     @State private var pendingSearchConversation: Conversation?
     @State private var pendingSearchContact: WalletContactDTO?
     @State private var selectedFilter: ConversationListFilter = .all
+    @State private var showBackupSettings = false
+    @State private var isSelectingChats = false
+    @State private var selectedConversationIDs: Set<String> = []
+    @State private var confirmDeleteConversationIDs: Set<String>?
 
     private var allConversations: [Conversation] {
-        model.state.conversations
-            .sorted { $0.updatedAt > $1.updatedAt }
+        ConversationListPolicy.ordered(
+            model.state.conversations,
+            pinnedIds: model.pinnedConversationIds
+        )
     }
 
     private var conversations: [Conversation] {
-        ConversationListFilterPolicy.apply(selectedFilter, to: allConversations)
+        ConversationListFilterPolicy.apply(
+            selectedFilter,
+            to: allConversations,
+            pinnedIDs: model.pinnedConversationIds
+        )
     }
 
     var body: some View {
         NavigationStack(path: $navigationPath) {
-            Group {
-                if allConversations.isEmpty {
-                    ContentUnavailableView {
-                        Label(
-                            "No chats yet",
-                            systemImage: "message"
-                        )
-                    } description: {
-                        Text(CustomerFacingMessagingCopy.encryptionAssurance)
-                    } actions: {
-                        Button("New message") { openNewMessage() }
-                            .buttonStyle(.borderedProminent)
-                    }
-                } else if conversations.isEmpty {
-                    ContentUnavailableView {
-                        Label(emptyFilterTitle, systemImage: emptyFilterSymbol)
-                    } description: {
-                        Text(emptyFilterDescription)
-                    } actions: {
-                        Button("Show all chats") { selectedFilter = .all }
-                            .buttonStyle(.borderedProminent)
-                    }
-                } else {
-                    ScrollView {
-                        LazyVStack(spacing: 8) {
-                            ForEach(conversations) { conversation in
-                                NavigationLink(value: conversation) {
-                                    conversationRow(conversation)
-                                }
-                                .buttonStyle(.plain)
-                            }
-                        }
-                        .padding(.horizontal, 14)
-                        .padding(.bottom, RootTabBarLayoutPolicy.pageBottomPadding)
-                    }
-                    .rootTabBarScrollClearance()
-                }
-            }
-            .background(KitColor.canvas)
-            .safeAreaInset(edge: .top, spacing: 0) {
-                VStack(spacing: 0) {
-                    Button {
-                        showGlobalSearch = true
-                    } label: {
-                        HStack(spacing: 10) {
-                            Image(systemName: "magnifyingglass")
-                                .font(.system(size: 16, weight: .semibold))
-                            Text("Search")
-                                .font(.body)
-                            Spacer()
-                        }
-                        .foregroundStyle(KitColor.secondaryText)
-                        .padding(.horizontal, 15)
-                        .frame(height: 44)
-                        .kitGlass(cornerRadius: 22, shadow: false)
-                        .padding(.horizontal, 14)
-                        .padding(.bottom, 9)
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Search chats, contacts, and messages")
-
-                    ScrollView(.horizontal) {
-                        HStack(spacing: 8) {
-                            ForEach(ConversationListFilter.allCases) { filter in
-                                filterButton(filter)
-                            }
-                        }
-                        .padding(.horizontal, 14)
-                        .padding(.bottom, 10)
-                    }
-                    .scrollIndicators(.hidden)
-                }
+            chatList
                 .background(KitColor.canvas)
-            }
-            .navigationTitle("Chats")
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    ConnectivityPill(
-                        isOnline: model.isOnline,
-                        queuedCount: model.queuedCount,
-                        inBar: true
-                    )
-                }
-                ToolbarItem(placement: .topBarTrailing) {
-                    GlassIconButton(systemName: "square.and.pencil", inBar: true) {
-                        openNewMessage()
+                .safeAreaInset(edge: .top, spacing: 0) { listHeader }
+                .safeAreaInset(edge: .bottom, spacing: 0) {
+                    if isSelectingChats {
+                        chatSelectionActionBar
                     }
                 }
-            }
-            .navigationDestination(for: Conversation.self) { conversation in
-                ConversationView(conversation: conversation)
-                    .id(conversation.id)
-                    .onAppear { isConversationPresented = true }
-                    .onDisappear { isConversationPresented = false }
-            }
-            .sheet(
-                isPresented: $showNewMessage,
-                onDismiss: finishNewMessagePresentation
-            ) {
-                let presentationID = newMessagePresentationID
-                NewMessageSheet(initialContact: newMessageContact) { conversation in
-                    guard showNewMessage,
-                          newMessagePresentationID == presentationID
-                    else { return }
-                    queuedNewMessageConversation = conversation
-                    showNewMessage = false
+                .navigationTitle(isSelectingChats ? "Select chats" : "Chats")
+                .toolbar { listToolbar }
+                .navigationDestination(for: Conversation.self) { conversation in
+                    ConversationView(conversation: conversation)
+                        .id(conversation.id)
+                        .onAppear { isConversationPresented = true }
+                        .onDisappear { isConversationPresented = false }
                 }
-            }
-            .fullScreenCover(
-                isPresented: $showGlobalSearch,
-                onDismiss: finishGlobalSearch
-            ) {
-                MessageGlobalSearchView(
-                    selectConversation: { conversation in
-                        pendingSearchConversation = conversation
-                        showGlobalSearch = false
-                    },
-                    selectContact: { contact in
-                        if let conversation = existingDirectConversation(for: contact) {
+                .sheet(
+                    isPresented: $showNewMessage,
+                    onDismiss: finishNewMessagePresentation
+                ) {
+                    let presentationID = newMessagePresentationID
+                    NewMessageSheet(initialContact: newMessageContact) { conversation in
+                        guard showNewMessage,
+                              newMessagePresentationID == presentationID
+                        else { return }
+                        queuedNewMessageConversation = conversation
+                        showNewMessage = false
+                    }
+                }
+                .sheet(isPresented: $showBackupSettings) {
+                    NavigationStack { ChatBackupSettingsView() }
+                        .environmentObject(model)
+                        .presentationBackground(.ultraThinMaterial)
+                }
+                .fullScreenCover(
+                    isPresented: $showGlobalSearch,
+                    onDismiss: finishGlobalSearch
+                ) {
+                    MessageGlobalSearchView(
+                        selectConversation: { conversation in
                             pendingSearchConversation = conversation
-                        } else {
-                            pendingSearchContact = contact
+                            showGlobalSearch = false
+                        },
+                        selectContact: { contact in
+                            if let conversation = existingDirectConversation(for: contact) {
+                                pendingSearchConversation = conversation
+                            } else {
+                                pendingSearchContact = contact
+                            }
+                            showGlobalSearch = false
                         }
-                        showGlobalSearch = false
+                    )
+                    .environmentObject(model)
+                }
+                .confirmationDialog(
+                    deleteChatsTitle,
+                    isPresented: Binding(
+                        get: { confirmDeleteConversationIDs != nil },
+                        set: { if !$0 { confirmDeleteConversationIDs = nil } }
+                    ),
+                    titleVisibility: .visible
+                ) {
+                    Button("Delete from this iPhone", role: .destructive) {
+                        if let ids = confirmDeleteConversationIDs {
+                            Task {
+                                await model.deleteConversationsLocally(ids)
+                                finishChatSelection()
+                            }
+                        }
+                        confirmDeleteConversationIDs = nil
                     }
-                )
-                .environmentObject(model)
-            }
+                    Button("Cancel", role: .cancel) { confirmDeleteConversationIDs = nil }
+                } message: {
+                    Text("Messages stay end-to-end encrypted for the other person. This only removes them from this iPhone.")
+                }
         }
         .onChange(of: navigationPath) { _, path in
             isConversationPresented = !path.isEmpty
@@ -211,47 +180,580 @@ struct MessagesView: View {
         .onDisappear { isConversationPresented = false }
     }
 
-    private var emptyFilterTitle: String {
-        switch selectedFilter {
-        case .all: "No chats yet"
-        case .unread: "No unread chats"
+    private var deleteChatsTitle: String {
+        let count = confirmDeleteConversationIDs?.count ?? 0
+        return count == 1 ? "Delete this chat?" : "Delete \(count) chats?"
+    }
+
+    // MARK: List content
+
+    @ViewBuilder
+    private var chatList: some View {
+        // One pass over messages/contacts per render instead of per row keeps taps responsive
+        // in long histories (the old per-row scan was the source of the delayed-tap defect).
+        let lastByConversation = latestMessagesByConversation()
+        let visibleConversations = conversations
+
+        if model.state.conversations.isEmpty {
+            // A fresh device with no chats is exactly when the iCloud restore offer matters most.
+            VStack(spacing: 0) {
+                if let backup = model.availableBackupToRestore {
+                    restoreBanner(backup)
+                        .padding(.horizontal, 14)
+                        .padding(.top, 6)
+                }
+                ContentUnavailableView {
+                    Label(
+                        model.secureMessagingAvailable ? "No chats yet" : "Messages temporarily unavailable",
+                        systemImage: model.secureMessagingAvailable ? "message" : "lock.fill"
+                    )
+                } description: {
+                    Text("Messages are end-to-end encrypted.")
+                } actions: {
+                    Button("New message") { openNewMessage() }
+                        .buttonStyle(.borderedProminent)
+                }
+            }
+        } else {
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    if let backup = model.availableBackupToRestore {
+                        restoreBanner(backup)
+                            .padding(.horizontal, 14)
+                            .padding(.top, 6)
+                            .padding(.bottom, 10)
+                    }
+
+                    filterChips
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 7)
+
+                    if visibleConversations.isEmpty {
+                        emptyFilterState
+                            .padding(.top, 40)
+                    } else {
+                        ForEach(visibleConversations) { conversation in
+                            let identity = ConversationContactPresentationPolicy.presentation(
+                                for: conversation,
+                                currentUserID: model.profile?.id,
+                                contacts: model.contactDirectory
+                            )
+                            let context = ChatRowContext(
+                                lastMessage: lastByConversation[conversation.id],
+                                displayName: identity.displayName,
+                                avatarURL: identity.avatarURL,
+                                isPinned: model.pinnedConversationIds.contains(conversation.id),
+                                isMuted: model.mutedConversationIds.contains(conversation.id),
+                                isSelecting: isSelectingChats,
+                                isSelected: selectedConversationIDs.contains(conversation.id),
+                                activeCallLabel: ConversationCallIndicatorPolicy.label(
+                                    for: conversation.id,
+                                    activeCall: callMedia.activeCall,
+                                    isConnected: callMedia.state == .connected,
+                                    hasRemoteParticipant: callTransport.hasRemoteParticipant
+                                ),
+                                isVideoCall: callMedia.activeCall?.video == true
+                            )
+                            chatRow(conversation, context: context)
+                            if conversation.id != visibleConversations.last?.id {
+                                Divider()
+                                    .padding(.leading, 80)
+                                    .opacity(0.45)
+                            }
+                        }
+                    }
+                }
+                .padding(.bottom, RootTabBarLayoutPolicy.pageBottomPadding)
+            }
+            .rootTabBarScrollClearance()
         }
     }
 
-    private var emptyFilterSymbol: String {
-        switch selectedFilter {
-        case .all: "message"
-        case .unread: "checkmark.circle"
+    private var filterChips: some View {
+        HStack(spacing: 8) {
+            ForEach(ConversationListFilter.allCases) { filter in
+                let selected = selectedFilter == filter
+                Button {
+                    withAnimation(.snappy(duration: 0.2)) { selectedFilter = filter }
+                } label: {
+                    HStack(spacing: 5) {
+                        Text(filter.title)
+                        if filter == .unread, totalUnreadConversations > 0 {
+                            Text("\(totalUnreadConversations)")
+                                .font(.caption2.bold())
+                        }
+                    }
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(selected ? KitColor.navy : KitColor.secondaryText)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .background {
+                        if selected {
+                            Capsule().fill(KitColor.paleGreen)
+                        }
+                    }
+                    .background(.ultraThinMaterial, in: Capsule())
+                    .overlay {
+                        Capsule()
+                            .stroke(.white.opacity(selected ? 0.75 : 0.5), lineWidth: 0.7)
+                            .allowsHitTesting(false)
+                    }
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("\(filter.title) chats")
+                .accessibilityAddTraits(selected ? .isSelected : [])
+            }
+            Spacer()
         }
     }
 
-    private var emptyFilterDescription: String {
-        switch selectedFilter {
-        case .all:
-            CustomerFacingMessagingCopy.encryptionAssurance
-        case .unread:
-            "You are caught up. New messages will appear here."
-        }
-    }
-
-    private func filterButton(_ filter: ConversationListFilter) -> some View {
-        let isSelected = selectedFilter == filter
-        return Button {
-            selectedFilter = filter
-        } label: {
-            Text(filter.title)
-                .font(.subheadline.weight(isSelected ? .bold : .semibold))
-                .foregroundStyle(isSelected ? KitColor.green : KitColor.primaryText)
-                .padding(.horizontal, 15)
-                .frame(minHeight: 44)
-                .kitGlass(
-                    cornerRadius: 22,
-                    tint: isSelected ? KitColor.green : .white,
-                    shadow: false
+    private var emptyFilterState: some View {
+        Group {
+            switch selectedFilter {
+            case .all:
+                EmptyView()
+            case .unread:
+                ContentUnavailableView(
+                    "You're all caught up",
+                    systemImage: "checkmark.message",
+                    description: Text("No unread chats right now.")
                 )
+            case .pinned:
+                ContentUnavailableView(
+                    "No pinned chats",
+                    systemImage: "pin",
+                    description: Text("Touch and hold a chat to pin it to the top.")
+                )
+            }
+        }
+    }
+
+    private func restoreBanner(_ backup: MessageBackupSummary) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 9) {
+                Image(systemName: "lock.icloud.fill")
+                    .font(.system(size: 21, weight: .semibold))
+                    .foregroundStyle(KitColor.green)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Restore your chats")
+                        .font(.subheadline.weight(.bold))
+                        .foregroundStyle(KitColor.navy)
+                    Text("Encrypted backup from \(backup.deviceName) · \(backup.messageCount) messages")
+                        .font(.caption)
+                        .foregroundStyle(KitColor.secondaryText)
+                }
+                Spacer(minLength: 6)
+            }
+            HStack(spacing: 10) {
+                Button {
+                    Task { _ = await model.restoreMessagesFromBackup() }
+                } label: {
+                    Group {
+                        if model.isRestoringMessages {
+                            ProgressView().tint(.white)
+                        } else {
+                            Text("Restore")
+                        }
+                    }
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 10)
+                    .background(KitColor.green, in: Capsule())
+                }
+                .buttonStyle(.plain)
+                .disabled(model.isRestoringMessages)
+
+                Button("Not now") {
+                    model.availableBackupToRestore = nil
+                }
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(KitColor.secondaryText)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 10)
+                .background(.ultraThinMaterial, in: Capsule())
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(14)
+        .kitGlass(cornerRadius: 22, tint: KitColor.paleGreen, shadow: false)
+    }
+
+    // MARK: Header (search + live call)
+
+    private var listHeader: some View {
+        VStack(spacing: 8) {
+            Button {
+                showGlobalSearch = true
+            } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.system(size: 16, weight: .semibold))
+                    Text("Search")
+                        .font(.body)
+                    Spacer()
+                }
+                .foregroundStyle(KitColor.secondaryText)
+                .padding(.horizontal, 15)
+                .frame(height: 44)
+                .background(.ultraThinMaterial, in: Capsule())
+                .overlay {
+                    Capsule()
+                        .stroke(.white.opacity(0.68), lineWidth: 0.7)
+                        .allowsHitTesting(false)
+                }
+                .contentShape(Capsule())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Search chats, contacts, and messages")
+
+            if let activeCall = callMedia.activeCall {
+                LiveCallPill(
+                    call: activeCall,
+                    statusText: callMedia.statusText,
+                    isConnected: callMedia.state == .connected,
+                    localLevel: callTransport.localVoiceLevel,
+                    remoteLevel: callTransport.remoteVoiceLevel
+                ) {
+                    NotificationCenter.default.post(name: .kitReopenActiveCall, object: nil)
+                }
+                .transition(.move(edge: .top).combined(with: .opacity))
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.bottom, 9)
+        .background(KitColor.canvas)
+        .animation(.snappy(duration: 0.28), value: callMedia.activeCall != nil)
+    }
+
+    @ToolbarContentBuilder
+    private var listToolbar: some ToolbarContent {
+        if isSelectingChats {
+            ToolbarItem(placement: .topBarLeading) {
+                Text("\(selectedConversationIDs.count) selected")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(KitColor.secondaryText)
+            }
+            ToolbarItem(placement: .topBarTrailing) {
+                Button("Done") { finishChatSelection() }
+                    .font(.body.weight(.semibold))
+            }
+        } else {
+            ToolbarItem(placement: .topBarLeading) {
+                ConnectivityPill(
+                    isOnline: model.isOnline,
+                    queuedCount: model.queuedCount,
+                    inBar: true
+                )
+            }
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                Menu {
+                    Button {
+                        withAnimation(.snappy(duration: 0.22)) { isSelectingChats = true }
+                    } label: {
+                        Label("Select chats", systemImage: "checkmark.circle")
+                    }
+                    Button {
+                        showBackupSettings = true
+                    } label: {
+                        Label("Chats & backup", systemImage: "lock.icloud")
+                    }
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(KitColor.navy)
+                        .frame(width: 44, height: 44)
+                        .contentShape(Circle())
+                }
+                .accessibilityLabel("Chat options")
+                GlassIconButton(systemName: "square.and.pencil", inBar: true) {
+                    openNewMessage()
+                }
+            }
+        }
+    }
+
+    // MARK: Rows
+
+    private struct ChatRowContext {
+        let lastMessage: LocalMessage?
+        let displayName: String
+        let avatarURL: String?
+        let isPinned: Bool
+        let isMuted: Bool
+        let isSelecting: Bool
+        let isSelected: Bool
+        let activeCallLabel: String?
+        let isVideoCall: Bool
+    }
+
+    @ViewBuilder
+    private func chatRow(_ conversation: Conversation, context: ChatRowContext) -> some View {
+        if context.isSelecting {
+            Button {
+                toggleChatSelection(conversation.id)
+            } label: {
+                chatRowContent(conversation, context: context)
+            }
+            .buttonStyle(.plain)
+            .accessibilityAddTraits(context.isSelected ? .isSelected : [])
+        } else {
+            NavigationLink(value: conversation) {
+                chatRowContent(conversation, context: context)
+            }
+            .buttonStyle(.plain)
+            .contextMenu {
+                Button {
+                    Task { await model.togglePinnedConversation(conversation.id) }
+                } label: {
+                    Label(
+                        context.isPinned ? "Unpin" : "Pin",
+                        systemImage: context.isPinned ? "pin.slash" : "pin"
+                    )
+                }
+                if conversation.unreadCount > 0 {
+                    Button {
+                        Task { await model.markConversationsRead([conversation.id]) }
+                    } label: {
+                        Label("Mark as read", systemImage: "checkmark.message")
+                    }
+                }
+                Button {
+                    Task { await model.toggleMutedConversation(conversation.id) }
+                } label: {
+                    Label(
+                        context.isMuted ? "Unmute" : "Mute",
+                        systemImage: context.isMuted ? "bell" : "bell.slash"
+                    )
+                }
+                Button {
+                    withAnimation(.snappy(duration: 0.22)) {
+                        isSelectingChats = true
+                        selectedConversationIDs = [conversation.id]
+                    }
+                } label: {
+                    Label("Select", systemImage: "checkmark.circle")
+                }
+                Divider()
+                Button(role: .destructive) {
+                    confirmDeleteConversationIDs = [conversation.id]
+                } label: {
+                    Label("Delete chat", systemImage: "trash")
+                }
+            }
+        }
+    }
+
+    private func chatRowContent(_ conversation: Conversation, context: ChatRowContext) -> some View {
+        HStack(spacing: 12) {
+            if context.isSelecting {
+                Image(systemName: context.isSelected ? "checkmark.circle.fill" : "circle")
+                    .font(.system(size: 22, weight: .semibold))
+                    .foregroundStyle(context.isSelected ? KitColor.green : KitColor.secondaryText.opacity(0.5))
+                    .accessibilityHidden(true)
+            }
+
+            RemoteAvatarView(
+                name: context.displayName,
+                avatarURL: context.avatarURL,
+                size: 52
+            )
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 5) {
+                    Text(context.displayName)
+                        .font(.body.weight(.semibold))
+                        .foregroundStyle(KitColor.navy)
+                        .lineLimit(1)
+                    if context.isMuted {
+                        Image(systemName: "bell.slash.fill")
+                            .font(.caption2)
+                            .foregroundStyle(KitColor.secondaryText.opacity(0.75))
+                            .accessibilityLabel("Muted")
+                    }
+                    Spacer(minLength: 6)
+                    Text(chatListTimestamp(conversation.updatedAt))
+                        .font(.caption)
+                        .foregroundStyle(
+                            conversation.unreadCount > 0 ? KitColor.green : KitColor.secondaryText
+                        )
+                }
+
+                HStack(spacing: 5) {
+                    if let activeCallLabel = context.activeCallLabel {
+                        Image(systemName: context.isVideoCall ? "video.fill" : "phone.fill")
+                            .font(.caption2)
+                            .foregroundStyle(KitColor.green)
+                        Text(activeCallLabel)
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(KitColor.green)
+                            .lineLimit(1)
+                    } else {
+                        if let last = context.lastMessage, last.isOutgoing {
+                            Image(systemName: deliveryIcon(last.state))
+                                .font(.caption2.bold())
+                                .foregroundStyle(last.state == .failed ? .red : KitColor.green)
+                        }
+                        if let symbol = context.lastMessage.flatMap({
+                            KitChatMessagePreview.symbolName(for: $0.body)
+                        }) {
+                            Image(systemName: symbol)
+                                .font(.caption2)
+                                .foregroundStyle(KitColor.secondaryText)
+                        }
+                        Text(
+                            context.lastMessage.map {
+                                ChatMessagePresentationPolicy.previewText(for: $0)
+                            }
+                                ?? "End-to-end encrypted"
+                        )
+                        .font(.subheadline)
+                        .foregroundStyle(
+                            context.lastMessage?.state == .failed ? .red : KitColor.secondaryText
+                        )
+                        .lineLimit(1)
+                    }
+                    Spacer(minLength: 6)
+                    if context.isPinned {
+                        Image(systemName: "pin.fill")
+                            .font(.caption2)
+                            .foregroundStyle(KitColor.secondaryText.opacity(0.7))
+                            .accessibilityLabel("Pinned")
+                    }
+                    if conversation.unreadCount > 0 {
+                        Text("\(conversation.unreadCount)")
+                            .font(.caption2.bold())
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 6)
+                            .frame(minWidth: 20, minHeight: 20)
+                            .background(KitColor.green, in: Capsule())
+                            .accessibilityLabel("\(conversation.unreadCount) unread")
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
+        .contentShape(Rectangle())
+    }
+
+    private var chatSelectionActionBar: some View {
+        HStack(spacing: 4) {
+            chatSelectionAction(title: "Read", systemImage: "checkmark.message") {
+                let ids = selectedConversationIDs
+                Task {
+                    await model.markConversationsRead(ids)
+                    finishChatSelection()
+                }
+            }
+            chatSelectionAction(title: "Pin", systemImage: "pin") {
+                // Uniform action: pin everything selected; already-pinned chats stay pinned.
+                let ids = selectedConversationIDs.subtracting(model.pinnedConversationIds)
+                Task {
+                    for id in ids { await model.togglePinnedConversation(id) }
+                    finishChatSelection()
+                }
+            }
+            chatSelectionAction(title: "Mute", systemImage: "bell.slash") {
+                let ids = selectedConversationIDs.subtracting(model.mutedConversationIds)
+                Task {
+                    for id in ids { await model.toggleMutedConversation(id) }
+                    finishChatSelection()
+                }
+            }
+            chatSelectionAction(title: "Delete", systemImage: "trash", role: .destructive) {
+                confirmDeleteConversationIDs = selectedConversationIDs
+            }
+        }
+        .padding(6)
+        .background(.ultraThinMaterial, in: Capsule())
+        .overlay {
+            Capsule()
+                .stroke(.white.opacity(0.6), lineWidth: 0.7)
+                .allowsHitTesting(false)
+        }
+        .shadow(color: KitColor.navy.opacity(0.12), radius: 16, y: 6)
+        .padding(.horizontal, 20)
+        .padding(.bottom, 8)
+        .disabled(selectedConversationIDs.isEmpty)
+        .opacity(selectedConversationIDs.isEmpty ? 0.55 : 1)
+    }
+
+    private func chatSelectionAction(
+        title: String,
+        systemImage: String,
+        role: ButtonRole? = nil,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(role: role, action: action) {
+            VStack(spacing: 3) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 17, weight: .semibold))
+                Text(title)
+                    .font(.caption2.weight(.semibold))
+            }
+            .foregroundStyle(role == .destructive ? .red : KitColor.navy)
+            .frame(maxWidth: .infinity, minHeight: 48)
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+
+    // MARK: Helpers
+
+    private var totalUnreadConversations: Int {
+        model.state.conversations.reduce(0) { $0 + ($1.unreadCount > 0 ? 1 : 0) }
+    }
+
+    private func latestMessagesByConversation() -> [String: LocalMessage] {
+        var latest: [String: LocalMessage] = [:]
+        latest.reserveCapacity(model.state.conversations.count)
+        for message in model.state.messages {
+            if let current = latest[message.conversationId],
+               current.createdAt >= message.createdAt {
+                continue
+            }
+            latest[message.conversationId] = message
+        }
+        return latest
+    }
+
+    private func contactsByRecipientID() -> [String: WalletContactDTO] {
+        var byRecipient: [String: WalletContactDTO] = [:]
+        byRecipient.reserveCapacity(model.contactDirectory.count)
+        for contact in model.contactDirectory {
+            guard let recipientID = ContactRecipientDirectory.recipientUserId(for: contact),
+                  byRecipient[recipientID] == nil
+            else { continue }
+            byRecipient[recipientID] = contact
+        }
+        return byRecipient
+    }
+
+    private func remoteContact(
+        for conversation: Conversation,
+        contactsByRecipientID: [String: WalletContactDTO]
+    ) -> WalletContactDTO? {
+        let localUserID = canonicalUserID(model.profile?.id)
+        return conversation.participantUserIds
+            .compactMap { canonicalUserID($0) }
+            .first { $0 != localUserID }
+            .flatMap { contactsByRecipientID[$0] }
+    }
+
+    private func toggleChatSelection(_ conversationID: String) {
+        if selectedConversationIDs.contains(conversationID) {
+            selectedConversationIDs.remove(conversationID)
+        } else {
+            selectedConversationIDs.insert(conversationID)
+        }
+    }
+
+    private func finishChatSelection() {
+        withAnimation(.snappy(duration: 0.22)) {
+            isSelectingChats = false
+            selectedConversationIDs = []
+        }
     }
 
     private func applyMessageNotificationNavigation() {
@@ -312,73 +814,121 @@ struct MessagesView: View {
             }
             .max { $0.updatedAt < $1.updatedAt }
     }
+}
 
-    private func conversationRow(_ conversation: Conversation) -> some View {
-        let identity = ConversationContactPresentationPolicy.presentation(
-            for: conversation,
-            currentUserID: model.profile?.id,
-            contacts: model.contactDirectory
-        )
-        let last = model.state.messages
-            .filter { $0.conversationId == conversation.id }
-            .max { $0.createdAt < $1.createdAt }
-        let activeCallLabel = ConversationCallIndicatorPolicy.label(
-            for: conversation.id,
-            activeCall: callMedia.activeCall,
-            isConnected: callMedia.state == .connected,
-            hasRemoteParticipant: callTransport.hasRemoteParticipant
-        )
-        return HStack(spacing: 13) {
-            RemoteAvatarView(
-                name: identity.displayName,
-                avatarURL: identity.avatarURL,
-                size: 58
-            )
-            VStack(alignment: .leading, spacing: 5) {
-                Text(identity.displayName)
-                    .font(.headline)
-                    .foregroundStyle(KitColor.primaryText)
-                    .lineLimit(1)
-                if let activeCallLabel {
-                    Label(
-                        activeCallLabel,
-                        systemImage: callMedia.activeCall?.video == true ? "video.fill" : "phone.fill"
-                    )
-                        .font(.subheadline.weight(.semibold))
+private func chatListTimestamp(_ date: Date) -> String {
+    let calendar = Calendar.current
+    if calendar.isDateInToday(date) {
+        return date.formatted(date: .omitted, time: .shortened)
+    }
+    if calendar.isDateInYesterday(date) {
+        return "Yesterday"
+    }
+    if let weekAgo = calendar.date(byAdding: .day, value: -6, to: Date()), date >= weekAgo {
+        return date.formatted(.dateTime.weekday(.abbreviated))
+    }
+    return date.formatted(date: .numeric, time: .omitted)
+}
+
+// MARK: - Live call pill
+
+/// A liquid-glass strip above the chats: who you're talking to, live status, and a Kit-green
+/// voice wave that swells with whoever is speaking (heartbeat idle when the line is quiet).
+private struct LiveCallPill: View {
+    let call: ActiveCallPresentation
+    let statusText: String
+    let isConnected: Bool
+    let localLevel: Float
+    let remoteLevel: Float
+    let onTap: () -> Void
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        Button(action: onTap) {
+            HStack(spacing: 11) {
+                RemoteAvatarView(
+                    name: call.participantName,
+                    avatarURL: call.participantAvatarURL,
+                    size: 36
+                )
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(call.participantName)
+                        .font(.subheadline.weight(.bold))
+                        .foregroundStyle(KitColor.navy)
+                        .lineLimit(1)
+                    Text(statusText)
+                        .font(.caption)
                         .foregroundStyle(KitColor.green)
                         .lineLimit(1)
-                } else {
-                    Text(
-                        last.map { ChatMessagePresentationPolicy.previewText(for: $0) }
-                            ?? "End-to-end encrypted"
-                    )
-                        .font(.subheadline)
-                        .foregroundStyle(last?.state == .failed ? .red : KitColor.secondaryText)
-                        .lineLimit(1)
                 }
+                Spacer(minLength: 8)
+                LiveCallVoiceWave(
+                    level: max(localLevel, remoteLevel),
+                    isConnected: isConnected,
+                    animated: !reduceMotion
+                )
+                .frame(width: 54, height: 24)
+                Image(systemName: call.video ? "video.fill" : "phone.fill")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .frame(width: 32, height: 32)
+                    .background(KitColor.green, in: Circle())
             }
-            Spacer()
-            VStack(alignment: .trailing, spacing: 7) {
-                Text(conversation.updatedAt.formatted(date: .omitted, time: .shortened))
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(KitColor.secondaryText)
-                if conversation.unreadCount > 0 {
-                    Text("\(conversation.unreadCount)")
-                        .font(.caption2.bold())
-                        .foregroundStyle(.white)
-                        .frame(minWidth: 22, minHeight: 22)
-                        .background(KitColor.green, in: Circle())
-                } else if let last, last.isOutgoing {
-                    Image(systemName: deliveryIcon(last.state))
-                        .font(.caption.bold())
-                        .foregroundStyle(last.state == .failed ? .red : KitColor.green)
+            .padding(.horizontal, 11)
+            .padding(.vertical, 8)
+            .background(.ultraThinMaterial, in: Capsule())
+            .background(KitColor.paleGreen.opacity(0.35), in: Capsule())
+            .overlay {
+                Capsule()
+                    .stroke(KitColor.green.opacity(0.45), lineWidth: 0.9)
+                    .allowsHitTesting(false)
+            }
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Return to call with \(call.participantName), \(statusText)")
+    }
+}
+
+/// Voice-weighted wave: bar heights follow the live audio level; a soft heart-pulse
+/// breathes through the bars when connected but silent.
+private struct LiveCallVoiceWave: View {
+    let level: Float
+    let isConnected: Bool
+    let animated: Bool
+
+    private static let barShape: [CGFloat] = [0.35, 0.65, 1.0, 0.75, 0.5, 0.85, 0.4]
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 0.12, paused: !animated || !isConnected)) { timeline in
+            let phase = timeline.date.timeIntervalSinceReferenceDate
+            HStack(spacing: 2.6) {
+                ForEach(Self.barShape.indices, id: \.self) { index in
+                    Capsule()
+                        .fill(KitColor.green.opacity(0.55 + 0.45 * Double(level)))
+                        .frame(width: 3, height: barHeight(index: index, phase: phase))
                 }
             }
         }
-        .padding(12)
-        .kitGlass(cornerRadius: 22, shadow: false)
+        .accessibilityHidden(true)
+    }
+
+    private func barHeight(index: Int, phase: TimeInterval) -> CGFloat {
+        let base: CGFloat = 5
+        guard isConnected else { return base }
+        let shape = Self.barShape[index]
+        if level > 0.02 {
+            return base + shape * CGFloat(level) * 17
+        }
+        guard animated else { return base + shape * 3 }
+        // Quiet line: a gentle double-beat heart pulse.
+        let beat = pow(max(0, sin(phase * 2.2 + Double(index) * 0.7)), 6)
+        return base + shape * CGFloat(beat) * 7
     }
 }
+
+// MARK: - Global search
 
 private struct MessageGlobalSearchView: View {
     @EnvironmentObject private var model: AppModel
@@ -817,9 +1367,7 @@ struct ConversationView: View {
     @State private var draft = ""
     @State private var showPhotoPicker = false
     @State private var selectedPhotoItem: PhotosPickerItem?
-    @State private var attachedImage: UIImage?
-    @State private var attachedImageData: Data?
-    @State private var attachedImageMediaType: String?
+    @State private var stagedAttachment: ChatStagedAttachment?
     @State private var isLoadingAttachment = false
     @State private var attachmentLoadGeneration = 0
     @State private var isSending = false
@@ -830,9 +1378,16 @@ struct ConversationView: View {
     @State private var showContactProfile = false
     @State private var chatPaymentApproval: ChatPaymentApproval?
     @State private var resolvingPaymentRequestID: String?
+    @State private var showCameraCapture = false
+    @State private var showVideoNoteCamera = false
+    @State private var showDocumentImporter = false
+    @State private var isSelectingMessages = false
+    @State private var selectedMessageIDs: Set<UUID> = []
+    @State private var showDeleteMessagesConfirmation = false
     @State private var incomingSoundPolicy: VisibleConversationSoundPolicy
     @StateObject private var paymentFlow = WalletFlowModel()
     @StateObject private var chatPaymentRequests = PaymentRequestsViewModel()
+    @StateObject private var voiceRecorder = VoiceNoteRecorder()
     @FocusState private var isComposerFocused: Bool
 
     init(conversation: Conversation) {
@@ -905,18 +1460,26 @@ struct ConversationView: View {
     }
 
     private var showsSendButton: Bool {
-        isLoadingAttachment || !trimmedDraft.isEmpty || attachedImage != nil
+        isLoadingAttachment || !trimmedDraft.isEmpty || stagedAttachment != nil
     }
 
     private var canSendMessage: Bool {
-        let hasPhoto = attachedImage != nil
-            && attachedImageData != nil
-            && attachedImageMediaType != nil
+        let hasAttachment = stagedAttachment != nil
         return model.secureMessagingAvailable
             && recipientCommunicationAllowed
             && !isSending
             && !isLoadingAttachment
-            && (hasPhoto || !trimmedDraft.isEmpty)
+            && (hasAttachment || !trimmedDraft.isEmpty)
+            && stagedAttachmentCanSendWithCurrentConnection
+    }
+
+    private var stagedAttachmentCanSendWithCurrentConnection: Bool {
+        guard let stagedAttachment else { return true }
+        return model.isOnline
+            || (stagedAttachment.kind == .image
+                && KitChatMediaLimits.shouldCacheInline(
+                    byteCount: stagedAttachment.data.count
+                ))
     }
 
     private var paymentRequestPolicy: PaymentRequestPolicy {
@@ -945,13 +1508,10 @@ struct ConversationView: View {
     }
 
     var body: some View {
-        let draftPersistenceTaskKey = ConversationDraftPersistenceTaskKey(
-            conversationID: conversation.id,
-            body: draft,
-            writeVersion: draftWriteVersion,
-            didRestore: didRestoreDraft,
-            isSending: isSending
-        )
+        conversationLifecycle
+    }
+
+    private var conversationLayout: some View {
         VStack(spacing: 0) {
             ScrollViewReader { scrollProxy in
                 ScrollView {
@@ -970,14 +1530,7 @@ struct ConversationView: View {
                             .accessibilityElement(children: .ignore)
                             .accessibilityLabel(CustomerFacingMessagingCopy.encryptionAssurance)
                         if let paymentError = chatPaymentRequests.errorMessage {
-                            Text(paymentError)
-                                .font(.caption.weight(.semibold))
-                                .foregroundStyle(.red)
-                                .multilineTextAlignment(.center)
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 8)
-                                .frame(maxWidth: .infinity)
-                                .background(.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
+                            paymentErrorBanner(paymentError)
                         }
                         ForEach(timelineItems) { item in
                             switch item {
@@ -1003,148 +1556,275 @@ struct ConversationView: View {
                 .onChange(of: timelineItems.last?.id) { _, _ in
                     scrollToBottom(using: scrollProxy)
                 }
+                // Playing a bubble's media would tear the audio session out from under the
+                // live recorder and destroy the in-progress note.
+                .allowsHitTesting(!voiceRecorder.isRecording)
             }
             .background(chatBackground)
 
-            VStack(spacing: 8) {
-                if let attachedImage {
-                    HStack(spacing: 10) {
-                        Image(uiImage: attachedImage)
-                            .resizable()
-                            .scaledToFill()
-                            .frame(width: 68, height: 68)
-                            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text("Photo attached").font(.subheadline.bold())
-                            Text(model.isOnline
-                                ? "End-to-end encrypted before upload."
-                                : "Saved securely. Sends when you reconnect.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                        Button {
-                            attachmentLoadGeneration &+= 1
-                            isLoadingAttachment = false
-                            self.attachedImage = nil
-                            attachedImageData = nil
-                            attachedImageMediaType = nil
-                            selectedPhotoItem = nil
-                        } label: {
-                            Image(systemName: "xmark.circle.fill")
-                                .font(.title3)
-                                .foregroundStyle(.secondary)
-                        }
-                        .accessibilityLabel("Remove attached photo")
-                    }
-                    .padding(10)
-                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 20, style: .continuous)
-                            .stroke(.white.opacity(0.55), lineWidth: 0.7)
-                            .allowsHitTesting(false)
-                    }
-                }
-
-                HStack(alignment: .bottom, spacing: 8) {
-                    Menu {
-                        Button {
-                            isComposerFocused = false
-                            showPhotoPicker = true
-                        } label: {
-                            Label("Photo", systemImage: "photo")
-                        }
-                        Button { openPaymentRequest() } label: {
-                            Label("Payment request", systemImage: "banknote")
-                        }
-                    } label: {
-                        Image(systemName: "plus")
-                            .font(.headline.bold())
-                            .foregroundStyle(KitColor.green)
-                            .frame(width: 42, height: 42)
-                            .background(.ultraThinMaterial, in: Circle())
-                    }
-                    .accessibilityLabel("Attachments and payments")
-                    .disabled(!recipientCommunicationAllowed || isSending)
-
-                    HStack(alignment: .bottom, spacing: 4) {
-                        TextField(
-                            recipientIsBlocked
-                                ? "You blocked this account"
-                                : !model.hasUsableCommunicationPrivacyProjection
-                                    ? "Preparing chat"
-                                    : "Message",
-                            text: $draft,
-                            axis: .vertical
-                        )
-                        .lineLimit(1...5)
-                        .focused($isComposerFocused)
-                        .disabled(
-                            !model.secureMessagingAvailable
-                                || !recipientCommunicationAllowed
-                                || isSending
-                        )
-                        .padding(.leading, 14)
-                        .padding(.vertical, 10)
-
-                        if !showsSendButton {
-                            Button(action: {}) {
-                                Image(systemName: "mic.fill")
-                                    .font(.headline)
-                                    .frame(width: 40, height: 40)
-                            }
-                            .disabled(true)
-                            .foregroundStyle(.secondary.opacity(0.62))
-                            .accessibilityLabel("Voice notes coming soon")
-                            .accessibilityValue("Disabled")
-                            .transition(.opacity.combined(with: .scale(scale: 0.82)))
-                        }
-                    }
-                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 22, style: .continuous)
-                            .stroke(.white.opacity(0.55), lineWidth: 0.7)
-                            .allowsHitTesting(false)
-                    }
-
-                    if showsSendButton {
-                        Button(action: sendDraft) {
-                            Group {
-                                if isLoadingAttachment || isSending {
-                                    ProgressView().tint(.white)
-                                } else {
-                                    Image(systemName: attachedImage == nil ? "paperplane.fill" : "lock.fill")
-                                        .font(.headline.bold())
-                                }
-                            }
-                            .foregroundStyle(.white)
-                            .frame(width: 44, height: 44)
-                            .background(KitColor.green, in: Circle())
-                        }
-                        .disabled(!canSendMessage)
-                        .opacity(canSendMessage ? 1 : 0.55)
-                        .accessibilityLabel(
-                            attachedImage == nil
-                                ? "Send message"
-                                : "Send encrypted photo"
-                        )
-                        .transition(.opacity.combined(with: .scale(scale: 0.82)))
-                    }
-                }
-                .animation(.snappy(duration: 0.22), value: showsSendButton)
-            }
-            .padding(12)
-            .background(.ultraThinMaterial)
-            .overlay(alignment: .top) {
-                Divider()
-                    .opacity(0.35)
-                    .allowsHitTesting(false)
+            if isSelectingMessages {
+                messageSelectionBar
+            } else {
+                composer
             }
         }
         .navigationTitle("")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar(.hidden, for: .tabBar)
-        .toolbar {
+        .toolbar { conversationToolbar }
+    }
+
+    private var conversationMediaPickers: some View {
+        conversationLayout
+        .photosPicker(
+            isPresented: $showPhotoPicker,
+            selection: $selectedPhotoItem,
+            matching: .any(of: [.images, .videos])
+        )
+        .onChange(of: selectedPhotoItem) { _, item in
+            attachmentLoadGeneration &+= 1
+            let generation = attachmentLoadGeneration
+            guard let item else {
+                isLoadingAttachment = false
+                return
+            }
+            Task { await loadPickedLibraryItem(item, generation: generation) }
+        }
+        .fullScreenCover(isPresented: $showCameraCapture) {
+            CameraCaptureView(mode: .photo) { result in
+                showCameraCapture = false
+                if case let .photo(image) = result {
+                    stageCameraPhoto(image)
+                }
+            }
+            .ignoresSafeArea()
+        }
+        .fullScreenCover(isPresented: $showVideoNoteCamera) {
+            CameraCaptureView(mode: .videoNote) { result in
+                showVideoNoteCamera = false
+                if case let .video(url) = result {
+                    stageCapturedVideo(url)
+                }
+            }
+            .ignoresSafeArea()
+        }
+        .fileImporter(
+            isPresented: $showDocumentImporter,
+            allowedContentTypes: [.item],
+            allowsMultipleSelection: false
+        ) { result in
+            if case let .success(urls) = result, let url = urls.first {
+                stageDocument(url)
+            }
+        }
+    }
+
+    private var conversationSheets: some View {
+        conversationMediaPickers
+        .sheet(isPresented: $showPaymentRequest) {
+            NavigationStack {
+                RequestMoneyView(
+                    flow: paymentFlow,
+                    preselectedContact: recipientContact,
+                    preselectedRecipientUserID: paymentRecipientUserID,
+                    locksRecipientSelection: true,
+                    shareCreatedRequest: { request in
+                        guard let paymentRecipientUserID else { return false }
+                        return await model.queuePaymentRequest(
+                            request,
+                            recipientId: paymentRecipientUserID,
+                            title: paymentRecipientName,
+                            conversationId: conversation.id
+                        )
+                    }
+                )
+                .environmentObject(model)
+            }
+            .presentationBackground(.ultraThinMaterial)
+        }
+        .sheet(isPresented: $showContactProfile) {
+            ConversationContactProfileView(
+                name: recipientDisplayName,
+                contact: recipientContact,
+                avatarURL: recipientPresentation.avatarURL,
+                userID: recipientUserID,
+                startAudioCall: { queueCall(video: false) },
+                startVideoCall: { queueCall(video: true) }
+            )
+            .presentationBackground(.ultraThinMaterial)
+        }
+        .sheet(item: $chatPaymentApproval) { approval in
+            PaymentRequestPINView(
+                request: approval.request,
+                isSubmitting: chatPaymentRequests.actionRequestId == approval.request.id,
+                errorMessage: chatPaymentRequests.errorMessage
+            ) { pin in
+                guard let wallet = model.selectedWallet else { return false }
+                let paid = await chatPaymentRequests.pay(
+                    approval.request,
+                    from: wallet,
+                    pin: pin,
+                    policy: paymentRequestPolicy,
+                    isOnline: model.isOnline,
+                    authorize: model.authorizeFinancialStepUp
+                )
+                guard paid else { return false }
+                if let paymentRecipientUserID,
+                   let paidDescriptor = approval.descriptor.changingAction(to: .paid) {
+                    _ = await model.queueMessage(
+                        conversationId: conversation.id,
+                        title: recipientDisplayName,
+                        recipientId: paymentRecipientUserID,
+                        body: paidDescriptor.encoded
+                    )
+                }
+                await model.refresh()
+                await chatPaymentRequests.load(isOnline: model.isOnline)
+                return true
+            }
+            .presentationBackground(.ultraThinMaterial)
+        }
+    }
+
+    private var conversationDeleteConfirmation: some View {
+        conversationSheets
+        .confirmationDialog(
+            selectedMessageIDs.count == 1 ? "Delete this message?" : "Delete \(selectedMessageIDs.count) messages?",
+            isPresented: $showDeleteMessagesConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Delete from this iPhone", role: .destructive) {
+                let ids = selectedMessageIDs
+                Task {
+                    await model.deleteMessagesLocally(ids, conversationId: conversation.id)
+                    finishMessageSelection()
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This removes them from this iPhone only.")
+        }
+    }
+
+    private var conversationTasks: some View {
+        let draftPersistenceTaskKey = ConversationDraftPersistenceTaskKey(
+            conversationID: conversation.id,
+            body: draft,
+            writeVersion: draftWriteVersion,
+            didRestore: didRestoreDraft,
+            isSending: isSending
+        )
+        return conversationDeleteConfirmation
+        .task(id: messages.last?.serverMessageId) {
+            await model.markConversationRead(conversation.id)
+        }
+        .task(id: incomingPaymentRequestLoadID) {
+            guard paymentRecipientUserID != nil,
+                  model.isOnline,
+                  !incomingPaymentEvents.isEmpty
+            else { return }
+            await chatPaymentRequests.load(isOnline: true)
+            validateLoadedChatPaymentRequests()
+        }
+        .task(id: draftPersistenceTaskKey) {
+            guard draftPersistenceTaskKey.didRestore,
+                  !draftPersistenceTaskKey.isSending,
+                  let writeVersion = draftPersistenceTaskKey.writeVersion
+            else { return }
+            do {
+                try await Task.sleep(nanoseconds: 350_000_000)
+                try Task.checkCancellation()
+            } catch {
+                return
+            }
+            _ = await model.persistConversationDraft(
+                draftPersistenceTaskKey.body,
+                conversationId: draftPersistenceTaskKey.conversationID,
+                writeVersion: writeVersion
+            )
+        }
+    }
+
+    private var conversationLifecycle: some View {
+        conversationTasks
+        .onAppear {
+            if !didRestoreDraft {
+                draftWriteVersion = model.nextConversationDraftWriteVersion()
+                draft = model.conversationDraft(for: conversation.id)
+                didRestoreDraft = true
+            }
+            incomingSoundPolicy.beginVisibility(with: messages)
+            model.setConversationVisible(
+                conversation.id,
+                visible: scenePhase == .active
+            )
+        }
+        .onChange(of: messages) { _, updatedMessages in
+            if incomingSoundPolicy.consume(
+                updatedMessages,
+                appIsActive: scenePhase == .active
+            ), !model.mutedConversationIds.contains(conversation.id) {
+                IncomingMessageSoundPlayer.shared.play()
+            }
+        }
+        .onChange(of: draft) { _, value in
+            immediateDraftPersistenceTask?.cancel()
+            immediateDraftPersistenceTask = nil
+            let bounded = ConversationDraftPolicy.boundedBody(value)
+            if bounded != value {
+                draft = bounded
+                return
+            }
+            draftWriteVersion = model.nextConversationDraftWriteVersion()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active {
+                incomingSoundPolicy.beginVisibility(with: messages)
+                model.setConversationVisible(conversation.id, visible: true)
+            } else {
+                incomingSoundPolicy.endVisibility()
+                model.setConversationVisible(conversation.id, visible: false)
+                persistDraftImmediately()
+            }
+        }
+        .onDisappear {
+            incomingSoundPolicy.endVisibility()
+            model.setConversationVisible(conversation.id, visible: false)
+            attachmentLoadGeneration &+= 1
+            isLoadingAttachment = false
+            isComposerFocused = false
+            voiceRecorder.cancel()
+            if !isSending { persistDraftImmediately() }
+        }
+    }
+
+    private func paymentErrorBanner(_ message: String) -> some View {
+        Text(message)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(Color.red)
+            .multilineTextAlignment(.center)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .frame(maxWidth: .infinity)
+            .background(
+                Color.red.opacity(0.08),
+                in: RoundedRectangle(cornerRadius: 14)
+            )
+    }
+
+    @ToolbarContentBuilder
+    private var conversationToolbar: some ToolbarContent {
+        if isSelectingMessages {
+            ToolbarItem(placement: .topBarLeading) {
+                Text("\(selectedMessageIDs.count) selected")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(KitColor.secondaryText)
+            }
+            ToolbarItem(placement: .topBarTrailing) {
+                Button("Done") { finishMessageSelection() }
+                    .font(.body.weight(.semibold))
+            }
+        } else {
             ToolbarItem(placement: .topBarLeading) {
                 Button { showContactProfile = true } label: {
                     // Nothing sits under the photo but the Liquid Glass: no material card, no
@@ -1192,158 +1872,304 @@ struct ConversationView: View {
                 }
             }
         }
-        .photosPicker(
-            isPresented: $showPhotoPicker,
-            selection: $selectedPhotoItem,
-            matching: .images
-        )
-        .onChange(of: selectedPhotoItem) { _, item in
-            attachmentLoadGeneration &+= 1
-            let generation = attachmentLoadGeneration
-            guard let item else {
-                isLoadingAttachment = false
-                attachedImage = nil
-                attachedImageData = nil
-                attachedImageMediaType = nil
-                return
-            }
-            Task { await loadPhoto(item, generation: generation) }
-        }
-        .sheet(isPresented: $showPaymentRequest) {
-            NavigationStack {
-                RequestMoneyView(
-                    flow: paymentFlow,
-                    preselectedContact: recipientContact,
-                    preselectedRecipientUserID: paymentRecipientUserID,
-                    locksRecipientSelection: true,
-                    shareCreatedRequest: { request in
-                        guard let paymentRecipientUserID else { return false }
-                        return await model.queuePaymentRequest(
-                            request,
-                            recipientId: paymentRecipientUserID,
-                            title: paymentRecipientName,
-                            conversationId: conversation.id
-                        )
-                    }
-                )
-                .environmentObject(model)
-            }
-            .presentationBackground(.ultraThinMaterial)
-        }
-        .sheet(isPresented: $showContactProfile) {
-            ConversationContactProfileView(
-                name: recipientDisplayName,
-                contact: recipientContact,
-                avatarURL: recipientPresentation.avatarURL,
-                userID: recipientUserID,
-                startAudioCall: { queueCall(video: false) },
-                startVideoCall: { queueCall(video: true) }
-            )
-            .presentationBackground(.ultraThinMaterial)
-        }
-        .sheet(item: $chatPaymentApproval) { approval in
-            PaymentRequestPINView(
-                request: approval.request,
-                isSubmitting: chatPaymentRequests.actionRequestId == approval.request.id,
-                errorMessage: chatPaymentRequests.errorMessage
-            ) { pin in
-                guard let wallet = model.selectedWallet else { return false }
-                let paid = await chatPaymentRequests.pay(
-                    approval.request,
-                    from: wallet,
-                    pin: pin,
-                    policy: paymentRequestPolicy,
-                    isOnline: model.isOnline
-                )
-                guard paid else { return false }
+    }
 
-                if let paymentRecipientUserID,
-                   let paidDescriptor = approval.descriptor.changingAction(to: .paid) {
-                    _ = await model.queueMessage(
-                        conversationId: conversation.id,
-                        title: recipientDisplayName,
-                        recipientId: paymentRecipientUserID,
-                        body: paidDescriptor.encoded
-                    )
-                }
-                await model.refresh()
-                await chatPaymentRequests.load(isOnline: model.isOnline)
-                return true
+    // MARK: Composer
+
+    @ViewBuilder
+    private var composer: some View {
+        VStack(spacing: 8) {
+            if let stagedAttachment {
+                stagedAttachmentChip(stagedAttachment)
             }
-            .presentationBackground(.ultraThinMaterial)
-        }
-        .task(id: incomingPaymentRequestLoadID) {
-            guard paymentRecipientUserID != nil,
-                  model.isOnline,
-                  !incomingPaymentEvents.isEmpty
-            else { return }
-            await chatPaymentRequests.load(isOnline: true)
-            validateLoadedChatPaymentRequests()
-        }
-        .task(id: draftPersistenceTaskKey) {
-            guard draftPersistenceTaskKey.didRestore,
-                  !draftPersistenceTaskKey.isSending,
-                  let writeVersion = draftPersistenceTaskKey.writeVersion
-            else { return }
-            do {
-                try await Task.sleep(nanoseconds: 350_000_000)
-                try Task.checkCancellation()
-            } catch {
-                return
+            if let recorderError = voiceRecorder.errorMessage {
+                Label(recorderError, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
-            _ = await model.persistConversationDraft(
-                draftPersistenceTaskKey.body,
-                conversationId: draftPersistenceTaskKey.conversationID,
-                writeVersion: writeVersion
-            )
-        }
-        .onAppear {
-            if !didRestoreDraft {
-                draftWriteVersion = model.nextConversationDraftWriteVersion()
-                draft = model.conversationDraft(for: conversation.id)
-                didRestoreDraft = true
-            }
-            incomingSoundPolicy.beginVisibility(with: messages)
-            model.setConversationVisible(
-                conversation.id,
-                visible: scenePhase == .active
-            )
-        }
-        .onChange(of: messages) { _, updatedMessages in
-            if incomingSoundPolicy.consume(
-                updatedMessages,
-                appIsActive: scenePhase == .active
-            ) {
-                IncomingMessageSoundPlayer.shared.play()
-            }
-        }
-        .onChange(of: draft) { _, value in
-            immediateDraftPersistenceTask?.cancel()
-            immediateDraftPersistenceTask = nil
-            let bounded = ConversationDraftPolicy.boundedBody(value)
-            if bounded != value {
-                draft = bounded
-                return
-            }
-            draftWriteVersion = model.nextConversationDraftWriteVersion()
-        }
-        .onChange(of: scenePhase) { _, phase in
-            if phase == .active {
-                incomingSoundPolicy.beginVisibility(with: messages)
-                model.setConversationVisible(conversation.id, visible: true)
+
+            if voiceRecorder.isRecording {
+                recordingBar
             } else {
-                incomingSoundPolicy.endVisibility()
-                model.setConversationVisible(conversation.id, visible: false)
-                persistDraftImmediately()
+                composerRow
             }
         }
-        .onDisappear {
-            incomingSoundPolicy.endVisibility()
-            model.setConversationVisible(conversation.id, visible: false)
-            attachmentLoadGeneration &+= 1
-            isLoadingAttachment = false
-            isComposerFocused = false
-            if !isSending { persistDraftImmediately() }
+        .padding(12)
+        .background(.ultraThinMaterial)
+        .overlay(alignment: .top) {
+            Divider()
+                .opacity(0.35)
+                .allowsHitTesting(false)
+        }
+    }
+
+    private var composerRow: some View {
+        HStack(alignment: .bottom, spacing: 8) {
+            Menu {
+                Button {
+                    isComposerFocused = false
+                    showPhotoPicker = true
+                } label: {
+                    Label("Photo & video library", systemImage: "photo.on.rectangle")
+                }
+                if CameraCaptureView.isCameraAvailable {
+                    Button {
+                        isComposerFocused = false
+                        showCameraCapture = true
+                    } label: {
+                        Label("Camera", systemImage: "camera")
+                    }
+                    Button {
+                        isComposerFocused = false
+                        showVideoNoteCamera = true
+                    } label: {
+                        Label("Video note", systemImage: "video.badge.waveform")
+                    }
+                }
+                Button {
+                    isComposerFocused = false
+                    showDocumentImporter = true
+                } label: {
+                    Label("Document", systemImage: "doc")
+                }
+                Button { openPaymentRequest() } label: {
+                    Label("Payment request", systemImage: "banknote")
+                }
+            } label: {
+                Image(systemName: "plus")
+                    .font(.headline.bold())
+                    .foregroundStyle(KitColor.green)
+                    .frame(width: 42, height: 42)
+                    .background(.ultraThinMaterial, in: Circle())
+            }
+            .accessibilityLabel("Attachments and payments")
+
+            HStack(alignment: .bottom, spacing: 4) {
+                TextField(
+                    model.secureMessagingAvailable ? "Message" : "Messages temporarily unavailable",
+                    text: $draft,
+                    axis: .vertical
+                )
+                .lineLimit(1...5)
+                .focused($isComposerFocused)
+                .disabled(!model.secureMessagingAvailable || isSending)
+                .padding(.leading, 14)
+                .padding(.vertical, 10)
+
+                if !showsSendButton {
+                    Button {
+                        isComposerFocused = false
+                        Task { await voiceRecorder.start() }
+                    } label: {
+                        Image(systemName: "mic.fill")
+                            .font(.headline)
+                            .frame(width: 40, height: 40)
+                            .contentShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(KitColor.green)
+                    .disabled(!model.secureMessagingAvailable || !model.isOnline)
+                    .opacity(model.secureMessagingAvailable && model.isOnline ? 1 : 0.5)
+                    .accessibilityLabel("Record a voice note")
+                    .transition(.opacity.combined(with: .scale(scale: 0.82)))
+                }
+            }
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                    .stroke(.white.opacity(0.55), lineWidth: 0.7)
+                    .allowsHitTesting(false)
+            }
+
+            if showsSendButton {
+                Button(action: sendDraft) {
+                    Group {
+                        if isLoadingAttachment || isSending {
+                            ProgressView().tint(.white)
+                        } else {
+                            Image(systemName: stagedAttachment == nil ? "paperplane.fill" : "lock.fill")
+                                .font(.headline.bold())
+                        }
+                    }
+                    .foregroundStyle(.white)
+                    .frame(width: 44, height: 44)
+                    .background(KitColor.green, in: Circle())
+                }
+                .disabled(!canSendMessage)
+                .opacity(canSendMessage ? 1 : 0.55)
+                .accessibilityLabel(
+                    stagedAttachment == nil
+                        ? "Send message"
+                        : model.isOnline
+                            ? "Send encrypted \(stagedAttachment!.kind.previewLabel.lowercased())"
+                            : stagedAttachmentCanSendWithCurrentConnection
+                                ? "Queue encrypted photo"
+                                : "Connect to send this encrypted file"
+                )
+                .transition(.opacity.combined(with: .scale(scale: 0.82)))
+            }
+        }
+        .animation(.snappy(duration: 0.22), value: showsSendButton)
+    }
+
+    private var recordingBar: some View {
+        HStack(spacing: 12) {
+            Button {
+                voiceRecorder.cancel()
+            } label: {
+                Image(systemName: "trash.fill")
+                    .font(.headline)
+                    .foregroundStyle(.red)
+                    .frame(width: 44, height: 44)
+                    .background(.ultraThinMaterial, in: Circle())
+            }
+            .accessibilityLabel("Discard recording")
+
+            HStack(spacing: 10) {
+                Circle()
+                    .fill(.red)
+                    .frame(width: 9, height: 9)
+                    .opacity(Int(voiceRecorder.elapsed * 2) % 2 == 0 ? 1 : 0.25)
+                Text(recordingTimeLabel)
+                    .font(.subheadline.weight(.semibold).monospacedDigit())
+                    .foregroundStyle(KitColor.navy)
+                RecorderLevelWave(level: voiceRecorder.level)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 24)
+            }
+            .padding(.horizontal, 14)
+            .frame(height: 44)
+            .background(.ultraThinMaterial, in: Capsule())
+            .overlay {
+                Capsule()
+                    .stroke(KitColor.green.opacity(0.4), lineWidth: 0.8)
+                    .allowsHitTesting(false)
+            }
+
+            Button(action: sendVoiceNote) {
+                Group {
+                    if isSending {
+                        ProgressView().tint(.white)
+                    } else {
+                        Image(systemName: "arrow.up")
+                            .font(.headline.bold())
+                    }
+                }
+                .foregroundStyle(.white)
+                .frame(width: 44, height: 44)
+                .background(KitColor.green, in: Circle())
+            }
+            .disabled(isSending)
+            .accessibilityLabel("Send voice note")
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Recording voice note, \(recordingTimeLabel)")
+    }
+
+    private var recordingTimeLabel: String {
+        let seconds = Int(voiceRecorder.elapsed)
+        return String(format: "%d:%02d", seconds / 60, seconds % 60)
+    }
+
+    private func stagedAttachmentChip(_ attachment: ChatStagedAttachment) -> some View {
+        HStack(spacing: 10) {
+            if let preview = attachment.previewImage {
+                Image(uiImage: preview)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: 62, height: 62)
+                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            } else {
+                Image(systemName: attachment.kind.symbolName)
+                    .font(.system(size: 22, weight: .semibold))
+                    .foregroundStyle(KitColor.green)
+                    .frame(width: 62, height: 62)
+                    .background(KitColor.paleGreen.opacity(0.4), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            }
+            VStack(alignment: .leading, spacing: 3) {
+                Text(attachment.displayName)
+                    .font(.subheadline.bold())
+                    .lineLimit(1)
+                Text(model.isOnline
+                    ? "\(attachment.byteLabel) · End-to-end encrypted before upload."
+                    : stagedAttachmentCanSendWithCurrentConnection
+                        ? "\(attachment.byteLabel) · Will send securely when connected."
+                        : "Connect to send this encrypted file.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button {
+                attachmentLoadGeneration &+= 1
+                isLoadingAttachment = false
+                stagedAttachment = nil
+                selectedPhotoItem = nil
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.title3)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 40, height: 40)
+                    .contentShape(Circle())
+            }
+            .accessibilityLabel("Remove attachment")
+        }
+        .padding(10)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .stroke(.white.opacity(0.55), lineWidth: 0.7)
+                .allowsHitTesting(false)
+        }
+    }
+
+    private var messageSelectionBar: some View {
+        HStack(spacing: 4) {
+            Button {
+                copySelectedMessages()
+            } label: {
+                VStack(spacing: 3) {
+                    Image(systemName: "doc.on.doc")
+                        .font(.system(size: 17, weight: .semibold))
+                    Text("Copy")
+                        .font(.caption2.weight(.semibold))
+                }
+                .foregroundStyle(KitColor.navy)
+                .frame(maxWidth: .infinity, minHeight: 48)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(!selectionHasCopyableText)
+
+            Button(role: .destructive) {
+                showDeleteMessagesConfirmation = true
+            } label: {
+                VStack(spacing: 3) {
+                    Image(systemName: "trash")
+                        .font(.system(size: 17, weight: .semibold))
+                    Text("Delete")
+                        .font(.caption2.weight(.semibold))
+                }
+                .foregroundStyle(.red)
+                .frame(maxWidth: .infinity, minHeight: 48)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(8)
+        .background(.ultraThinMaterial)
+        .overlay(alignment: .top) {
+            Divider().opacity(0.35).allowsHitTesting(false)
+        }
+        .disabled(selectedMessageIDs.isEmpty)
+        .opacity(selectedMessageIDs.isEmpty ? 0.55 : 1)
+    }
+
+    private var selectionHasCopyableText: Bool {
+        messages.contains { message in
+            guard selectedMessageIDs.contains(message.id) else { return false }
+            let descriptor = KitMediaMessageDescriptor.parse(message.body)
+            return descriptor == nil || descriptor?.caption?.isEmpty == false
         }
     }
 
@@ -1351,22 +2177,103 @@ struct ConversationView: View {
         KitChatWallpaperView()
     }
 
+    // MARK: Bubbles
+
+    @ViewBuilder
     private func bubble(_ message: LocalMessage) -> some View {
-        HStack {
-            if message.isOutgoing { Spacer(minLength: 52) }
+        let descriptor = KitMediaMessageDescriptor.parse(message.body)
+        let mediaKind = descriptor.map { KitChatMediaKind(mediaType: $0.mediaType) }
+        let isSelected = selectedMessageIDs.contains(message.id)
+
+        HStack(alignment: .center, spacing: 8) {
+            if isSelectingMessages {
+                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                    .font(.system(size: 21, weight: .semibold))
+                    .foregroundStyle(isSelected ? KitColor.green : KitColor.secondaryText.opacity(0.5))
+                    .accessibilityHidden(true)
+            }
+            if message.isOutgoing { Spacer(minLength: 44) }
+            bubbleBody(message, descriptor: descriptor, mediaKind: mediaKind)
+                // While selecting, taps must toggle selection — not open viewers or players.
+                .allowsHitTesting(!isSelectingMessages)
+                .contextMenu {
+                    if !isSelectingMessages {
+                        if let copyText = copyableText(for: message) {
+                            Button {
+                                UIPasteboard.general.string = copyText
+                            } label: {
+                                Label("Copy", systemImage: "doc.on.doc")
+                            }
+                        }
+                        Button {
+                            withAnimation(.snappy(duration: 0.22)) {
+                                isSelectingMessages = true
+                                selectedMessageIDs = [message.id]
+                                isComposerFocused = false
+                            }
+                        } label: {
+                            Label("Select", systemImage: "checkmark.circle")
+                        }
+                        Divider()
+                        Button(role: .destructive) {
+                            selectedMessageIDs = [message.id]
+                            showDeleteMessagesConfirmation = true
+                        } label: {
+                            Label("Delete for me", systemImage: "trash")
+                        }
+                    }
+                }
+            if !message.isOutgoing { Spacer(minLength: 44) }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture {
+            guard isSelectingMessages else { return }
+            toggleMessageSelection(message.id)
+        }
+        .accessibilityAddTraits(isSelectingMessages && isSelected ? .isSelected : [])
+    }
+
+    @ViewBuilder
+    private func bubbleBody(
+        _ message: LocalMessage,
+        descriptor: KitMediaMessageDescriptor?,
+        mediaKind: KitChatMediaKind?
+    ) -> some View {
+        if let descriptor, let mediaKind, mediaKind == .image || mediaKind == .video {
+            // Edge-to-edge media with a very slim frame at the top, left, and right;
+            // the caption/time footer keeps regular padding below.
+            VStack(alignment: message.isOutgoing ? .trailing : .leading, spacing: 0) {
+                SecureMediaMessageView(message: message, descriptor: descriptor)
+                    .padding(.top, 3)
+                    .padding(.horizontal, 3)
+                if mediaKind == .image, let caption = descriptor.caption, !caption.isEmpty {
+                    Text(caption)
+                        .foregroundStyle(message.isOutgoing ? .white : KitColor.navy)
+                        .padding(.horizontal, 12)
+                        .padding(.top, 7)
+                }
+                messageMetadata(message)
+                    .padding(.horizontal, 12)
+                    .padding(.top, 5)
+                    .padding(.bottom, 7)
+            }
+            .background(
+                message.isOutgoing ? AnyShapeStyle(KitColor.navy) : AnyShapeStyle(.ultraThinMaterial),
+                in: RoundedRectangle(cornerRadius: 20, style: .continuous)
+            )
+        } else {
             VStack(alignment: message.isOutgoing ? .trailing : .leading, spacing: 5) {
                 if let pending = message.pendingAttachment {
-                    PendingSecurePhotoMessageView(message: message)
-                    if let caption = pending.caption {
+                    PendingSecureMediaMessageView(message: message, attachment: pending)
+                    if KitChatMediaKind(mediaType: pending.mediaType) != .document,
+                       let caption = pending.caption, !caption.isEmpty {
                         Text(caption)
                             .foregroundStyle(message.isOutgoing ? .white : KitColor.primaryText)
                     }
-                } else if let descriptor = KitMediaMessageDescriptor.parse(message.body) {
-                    SecurePhotoMessageView(
-                        message: message,
-                        descriptor: descriptor
-                    )
-                    if let caption = descriptor.caption {
+                } else if let descriptor {
+                    SecureMediaMessageView(message: message, descriptor: descriptor)
+                    if mediaKind != .document,
+                       let caption = descriptor.caption, !caption.isEmpty {
                         Text(caption)
                             .foregroundStyle(message.isOutgoing ? .white : KitColor.primaryText)
                     }
@@ -1382,7 +2289,46 @@ struct ConversationView: View {
                 message.isOutgoing ? AnyShapeStyle(KitColor.navy) : AnyShapeStyle(.ultraThinMaterial),
                 in: RoundedRectangle(cornerRadius: 20, style: .continuous)
             )
-            if !message.isOutgoing { Spacer(minLength: 52) }
+        }
+    }
+
+    private func bubbleTimeRow(_ message: LocalMessage) -> some View {
+        HStack(spacing: 4) {
+            Text(message.createdAt.formatted(date: .omitted, time: .shortened))
+            if message.isOutgoing { Image(systemName: deliveryIcon(message.state)) }
+        }
+        .font(.caption2)
+        .foregroundStyle(message.isOutgoing ? .white.opacity(0.72) : .secondary)
+    }
+
+    private func copyableText(for message: LocalMessage) -> String? {
+        if let descriptor = KitMediaMessageDescriptor.parse(message.body) {
+            return descriptor.caption?.nilIfBlank
+        }
+        return message.body.nilIfBlank
+    }
+
+    private func copySelectedMessages() {
+        let texts = messages
+            .filter { selectedMessageIDs.contains($0.id) }
+            .compactMap(copyableText(for:))
+        guard !texts.isEmpty else { return }
+        UIPasteboard.general.string = texts.joined(separator: "\n")
+        finishMessageSelection()
+    }
+
+    private func toggleMessageSelection(_ id: UUID) {
+        if selectedMessageIDs.contains(id) {
+            selectedMessageIDs.remove(id)
+        } else {
+            selectedMessageIDs.insert(id)
+        }
+    }
+
+    private func finishMessageSelection() {
+        withAnimation(.snappy(duration: 0.22)) {
+            isSelectingMessages = false
+            selectedMessageIDs = []
         }
     }
 
@@ -1708,11 +2654,13 @@ struct ConversationView: View {
         .accessibilityLabel(video ? "Video call" : "Audio call")
     }
 
+    // MARK: Sending
+
     private func sendDraft() {
         guard canSendMessage else { return }
         let submittedDraft = draft
-        let submittedImageData = attachedImageData
-        let submittedMediaType = attachedImageMediaType
+        let submittedText = submittedDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let submittedAttachment = stagedAttachment
         let persistenceVersion = model.nextConversationDraftWriteVersion()
         immediateDraftPersistenceTask?.cancel()
         immediateDraftPersistenceTask = nil
@@ -1734,19 +2682,53 @@ struct ConversationView: View {
                 return
             }
             let clearVersion = model.nextConversationDraftWriteVersion()
-            let queued: Bool
-            if let submittedImageData, let submittedMediaType {
-                queued = await model.queueImageMessage(
+            var allQueued = false
+            if let submittedAttachment {
+                let caption: String?
+                let followUpText: String?
+                switch submittedAttachment.kind {
+                case .document:
+                    // The wire descriptor has no filename field; the caption carries it so
+                    // both platforms can show a named document. Typed text follows separately.
+                    caption = submittedAttachment.displayName
+                    followUpText = submittedText.nilIfBlank
+                default:
+                    caption = submittedText.nilIfBlank
+                    followUpText = nil
+                }
+                let mediaQueued = await model.queueMediaMessage(
                     conversationId: conversation.id,
                     title: recipientDisplayName,
                     recipientId: recipientUserID,
-                    imageData: submittedImageData,
-                    mediaType: submittedMediaType,
-                    caption: submittedDraft,
-                    draftClearVersion: clearVersion
+                    mediaData: submittedAttachment.data,
+                    mediaType: submittedAttachment.mediaType,
+                    caption: caption,
+                    submittedDraftBody: followUpText == nil ? submittedDraft : nil,
+                    draftClearVersion: followUpText == nil ? clearVersion : nil
                 )
+                if mediaQueued {
+                    // The attachment is already durably queued. Remove it even when the
+                    // document's separate text message fails so a retry cannot duplicate media.
+                    stagedAttachment = nil
+                    selectedPhotoItem = nil
+                }
+                if mediaQueued, let followUpText {
+                    allQueued = await model.queueMessage(
+                        conversationId: conversation.id,
+                        title: recipientDisplayName,
+                        recipientId: recipientUserID,
+                        body: followUpText,
+                        draftClearVersion: clearVersion
+                    )
+                    if !allQueued {
+                        model.lastError =
+                            "The document was queued, but its message text was not. Your draft is still here."
+                    }
+                } else {
+                    allQueued = mediaQueued
+                }
             } else {
-                queued = await model.queueMessage(
+                allQueued = await model.queueMessage(
                     conversationId: conversation.id,
                     title: recipientDisplayName,
                     recipientId: recipientUserID,
@@ -1754,13 +2736,9 @@ struct ConversationView: View {
                     draftClearVersion: clearVersion
                 )
             }
-            if queued {
+            if allQueued {
                 draftWriteVersion = clearVersion
                 if draft == submittedDraft { draft = "" }
-                attachedImage = nil
-                attachedImageData = nil
-                attachedImageMediaType = nil
-                selectedPhotoItem = nil
             }
             isSending = false
         }
@@ -1778,6 +2756,32 @@ struct ConversationView: View {
                 conversationId: conversation.id,
                 writeVersion: writeVersion
             )
+        }
+    }
+
+    private func sendVoiceNote() {
+        guard let recording = voiceRecorder.finish() else { return }
+        isSending = true
+        Task {
+            let queued = await model.queueMediaMessage(
+                conversationId: conversation.id,
+                title: conversation.title,
+                recipientId: recipientUserID,
+                mediaData: recording.data,
+                mediaType: VoiceNoteRecorder.Recording.mediaType,
+                caption: nil
+            )
+            if !queued {
+                // Never drop a recorded note on a failed send — stage it so the user can retry.
+                stagedAttachment = ChatStagedAttachment(
+                    kind: .voice,
+                    data: recording.data,
+                    mediaType: VoiceNoteRecorder.Recording.mediaType,
+                    displayName: "Voice note",
+                    previewImage: nil
+                )
+            }
+            isSending = false
         }
     }
 
@@ -1808,28 +2812,153 @@ struct ConversationView: View {
         showPaymentRequest = true
     }
 
+    // MARK: Attachment staging
+
     @MainActor
-    private func loadPhoto(_ item: PhotosPickerItem, generation: Int) async {
+    private func loadPickedLibraryItem(_ item: PhotosPickerItem, generation: Int) async {
         guard generation == attachmentLoadGeneration else { return }
         isLoadingAttachment = true
+        let isVideo = item.supportedContentTypes.contains { $0.conforms(to: .movie) }
         do {
-            guard let data = try await item.loadTransferable(type: Data.self),
-                  data.count <= 32 * 1_024 * 1_024,
-                  let prepared = AttachmentImageDecoder.secureJPEG(from: data)
-            else { throw AttachmentSelectionError.invalidImage }
+            guard let data = try await item.loadTransferable(type: Data.self) else {
+                throw AttachmentSelectionError.invalidImage
+            }
             guard generation == attachmentLoadGeneration else { return }
-            attachedImage = prepared.preview
-            attachedImageData = prepared.data
-            attachedImageMediaType = "image/jpeg"
+            if isVideo {
+                guard KitChatMediaLimits.fits(data.count, kind: .video) else {
+                    throw AttachmentSelectionError.fileTooLarge
+                }
+                let mediaType = libraryVideoMediaType(for: item)
+                stagedAttachment = ChatStagedAttachment(
+                    kind: .video,
+                    data: data,
+                    mediaType: mediaType,
+                    displayName: "Video",
+                    previewImage: nil
+                )
+            } else {
+                guard data.count <= 64 * 1_024 * 1_024,
+                      let prepared = AttachmentImageDecoder.secureJPEG(from: data)
+                else { throw AttachmentSelectionError.invalidImage }
+                guard generation == attachmentLoadGeneration else { return }
+                stagedAttachment = ChatStagedAttachment(
+                    kind: .image,
+                    data: prepared.data,
+                    mediaType: "image/jpeg",
+                    displayName: "Photo",
+                    previewImage: prepared.preview
+                )
+            }
             isLoadingAttachment = false
         } catch {
             guard generation == attachmentLoadGeneration else { return }
             selectedPhotoItem = nil
-            attachedImage = nil
-            attachedImageData = nil
-            attachedImageMediaType = nil
+            stagedAttachment = nil
             isLoadingAttachment = false
             model.lastError = error.localizedDescription
+        }
+    }
+
+    private func libraryVideoMediaType(for item: PhotosPickerItem) -> String {
+        if item.supportedContentTypes.contains(where: { $0.conforms(to: .quickTimeMovie) }) {
+            return "video/quicktime"
+        }
+        return "video/mp4"
+    }
+
+    private func stageCameraPhoto(_ image: UIImage) {
+        guard let jpeg = image.jpegData(compressionQuality: 0.9),
+              let prepared = AttachmentImageDecoder.secureJPEG(from: jpeg)
+        else {
+            model.lastError = AttachmentSelectionError.invalidImage.localizedDescription
+            return
+        }
+        stagedAttachment = ChatStagedAttachment(
+            kind: .image,
+            data: prepared.data,
+            mediaType: "image/jpeg",
+            displayName: "Photo",
+            previewImage: prepared.preview
+        )
+    }
+
+    private func stageCapturedVideo(_ url: URL) {
+        attachmentLoadGeneration &+= 1
+        let generation = attachmentLoadGeneration
+        isLoadingAttachment = true
+        Task { @MainActor in
+            defer {
+                try? FileManager.default.removeItem(at: url)
+                if generation == attachmentLoadGeneration { isLoadingAttachment = false }
+            }
+            do {
+                let data = try await Task.detached(priority: .userInitiated) {
+                    try Data(contentsOf: url)
+                }.value
+                guard generation == attachmentLoadGeneration else { return }
+                guard KitChatMediaLimits.fits(data.count, kind: .video) else {
+                    throw AttachmentSelectionError.fileTooLarge
+                }
+                let mediaType = url.pathExtension.lowercased() == "mp4"
+                    ? "video/mp4"
+                    : "video/quicktime"
+                stagedAttachment = ChatStagedAttachment(
+                    kind: .video,
+                    data: data,
+                    mediaType: mediaType,
+                    displayName: "Video note",
+                    previewImage: nil
+                )
+            } catch {
+                guard generation == attachmentLoadGeneration else { return }
+                model.lastError = (error as? LocalizedError)?.errorDescription
+                    ?? "The video note could not be read."
+            }
+        }
+    }
+
+    private func stageDocument(_ url: URL) {
+        let secured = url.startAccessingSecurityScopedResource()
+        attachmentLoadGeneration &+= 1
+        let generation = attachmentLoadGeneration
+        isLoadingAttachment = true
+        Task { @MainActor in
+            defer {
+                if secured { url.stopAccessingSecurityScopedResource() }
+                if generation == attachmentLoadGeneration { isLoadingAttachment = false }
+            }
+            do {
+                if let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+                   !KitChatMediaLimits.fits(size, kind: .document) {
+                    throw AttachmentSelectionError.fileTooLarge
+                }
+                let data = try await Task.detached(priority: .userInitiated) {
+                    try Data(contentsOf: url)
+                }.value
+                guard generation == attachmentLoadGeneration else { return }
+                guard KitChatMediaLimits.fits(data.count, kind: .document) else {
+                    throw data.isEmpty
+                        ? AttachmentSelectionError.invalidDocument
+                        : AttachmentSelectionError.fileTooLarge
+                }
+                let declaredType = UTType(filenameExtension: url.pathExtension)?.preferredMIMEType
+                let mediaType = declaredType.flatMap {
+                    SecureMessagingWire.allowedAttachmentMediaTypes.contains($0.lowercased())
+                        ? $0.lowercased()
+                        : nil
+                } ?? "application/octet-stream"
+                stagedAttachment = ChatStagedAttachment(
+                    kind: .document,
+                    data: data,
+                    mediaType: mediaType,
+                    displayName: url.lastPathComponent,
+                    previewImage: nil
+                )
+            } catch {
+                guard generation == attachmentLoadGeneration else { return }
+                model.lastError = (error as? LocalizedError)?.errorDescription
+                    ?? "This document could not be read."
+            }
         }
     }
 
@@ -1840,11 +2969,32 @@ struct ConversationView: View {
     }
 }
 
+/// Live input-level bars for the recording strip.
+private struct RecorderLevelWave: View {
+    let level: Float
+    @State private var history: [Float] = Array(repeating: 0, count: 28)
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 2.4) {
+            ForEach(history.indices, id: \.self) { index in
+                Capsule()
+                    .fill(KitColor.green.opacity(0.75))
+                    .frame(width: 2.6, height: 4 + CGFloat(history[index]) * 18)
+            }
+        }
+        .onChange(of: level) { _, newLevel in
+            history.removeFirst()
+            history.append(newLevel)
+        }
+        .accessibilityHidden(true)
+    }
+}
+
 private enum ConversationScrollAnchor: Hashable {
     case bottom
 }
 
-private enum AttachmentImageDecoder {
+enum AttachmentImageDecoder {
     struct PreparedImage {
         let preview: UIImage
         let data: Data
@@ -1868,7 +3018,7 @@ private enum AttachmentImageDecoder {
             by: CGFloat(-0.1)
         ) {
             guard let encoded = preview.jpegData(compressionQuality: quality) else { continue }
-            if encoded.count <= SecureMediaAttachmentCipher.maximumPlaintextBytes {
+            if encoded.count <= KitChatMediaLimits.imageEncodeTargetBytes {
                 return PreparedImage(preview: preview, data: encoded)
             }
         }
@@ -2206,9 +3356,18 @@ private struct ConversationAvatarView: View {
 
 private enum AttachmentSelectionError: LocalizedError {
     case invalidImage
+    case invalidDocument
+    case fileTooLarge
 
     var errorDescription: String? {
-        "Choose a valid image that can be prepared securely at 10 MB or less."
+        switch self {
+        case .invalidImage:
+            "Choose a valid image that can be prepared securely at 10 MB or less."
+        case .invalidDocument:
+            "This document could not be read."
+        case .fileTooLarge:
+            "Files can be up to \(KitChatMediaLimits.maximumTransferLabel)."
+        }
     }
 }
 
@@ -2216,168 +3375,6 @@ private extension String {
     var nilIfBlank: String? {
         let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
-    }
-}
-
-private struct SecurePhotoMessageView: View {
-    @EnvironmentObject private var model: AppModel
-    let message: LocalMessage
-    let descriptor: KitMediaMessageDescriptor
-    @State private var image: UIImage?
-    @State private var isLoading = false
-    @State private var errorMessage: String?
-    @State private var retryGeneration = 0
-
-    init(message: LocalMessage, descriptor: KitMediaMessageDescriptor) {
-        self.message = message
-        self.descriptor = descriptor
-        _image = State(initialValue: message.attachmentData.flatMap { UIImage(data: $0) })
-    }
-
-    var body: some View {
-        Group {
-            if let image {
-                Image(uiImage: image)
-                    .resizable()
-                    .scaledToFill()
-                    .frame(width: 224, height: 168)
-                    .clipShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
-            } else {
-                Button {
-                    retryGeneration &+= 1
-                } label: {
-                    VStack(spacing: 9) {
-                        if isLoading {
-                            ProgressView()
-                                .tint(message.isOutgoing ? .white : KitColor.green)
-                        } else {
-                            Image(systemName: model.isOnline ? "photo.badge.arrow.down" : "photo.fill")
-                                .font(.title2)
-                        }
-                        Text(errorMessage ?? (model.isOnline
-                            ? "Loading encrypted photo…"
-                            : "Photo available when online"))
-                            .font(.caption)
-                            .multilineTextAlignment(.center)
-                    }
-                    .foregroundStyle(message.isOutgoing ? .white : KitColor.secondaryText)
-                    .frame(width: 224, height: 132)
-                    .background(
-                        (message.isOutgoing ? Color.white.opacity(0.09) : KitColor.paleGreen.opacity(0.24)),
-                        in: RoundedRectangle(cornerRadius: 15, style: .continuous)
-                    )
-                }
-                .buttonStyle(.plain)
-                .disabled(isLoading)
-            }
-        }
-        .overlay {
-            SecurePhotoBubbleTopAndSideBorder(cornerRadius: 15)
-                .stroke(
-                    .white.opacity(message.isOutgoing ? 0.52 : 0.72),
-                    style: StrokeStyle(
-                        lineWidth: SecurePhotoBubbleBorderPolicy.lineWidth,
-                        lineCap: .round,
-                        lineJoin: .round
-                    )
-                )
-                .padding(SecurePhotoBubbleBorderPolicy.lineWidth / 2)
-                .allowsHitTesting(false)
-        }
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("End-to-end encrypted photo")
-        .task(id: "\(descriptor.storageKey):\(model.isOnline):\(retryGeneration)") {
-            await loadIfNeeded()
-        }
-    }
-
-    @MainActor
-    private func loadIfNeeded() async {
-        guard image == nil, !isLoading else { return }
-        isLoading = true
-        errorMessage = nil
-        defer { isLoading = false }
-        do {
-            let data = try await model.loadSecureImage(
-                conversationId: message.conversationId,
-                descriptorText: message.body
-            )
-            guard let decoded = UIImage(data: data) else {
-                throw SecureMediaAttachmentError.invalidImage
-            }
-            image = decoded
-        } catch {
-            if !model.isOnline {
-                errorMessage = "Photo available when online"
-            } else {
-                errorMessage = "Tap to retry"
-            }
-        }
-    }
-}
-
-private struct PendingSecurePhotoMessageView: View {
-    let message: LocalMessage
-
-    var body: some View {
-        Group {
-            if let data = message.attachmentData, let image = UIImage(data: data) {
-                Image(uiImage: image)
-                    .resizable()
-                    .scaledToFill()
-                    .frame(width: 224, height: 168)
-                    .clipShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
-            } else {
-                Label("Photo queued", systemImage: "photo.fill")
-                    .font(.caption.weight(.semibold))
-                    .frame(width: 224, height: 132)
-            }
-        }
-        .overlay {
-            SecurePhotoBubbleTopAndSideBorder(cornerRadius: 15)
-                .stroke(
-                    .white.opacity(message.isOutgoing ? 0.52 : 0.72),
-                    style: StrokeStyle(
-                        lineWidth: SecurePhotoBubbleBorderPolicy.lineWidth,
-                        lineCap: .round,
-                        lineJoin: .round
-                    )
-                )
-                .padding(SecurePhotoBubbleBorderPolicy.lineWidth / 2)
-                .allowsHitTesting(false)
-        }
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("End-to-end encrypted photo queued to send")
-    }
-}
-
-private struct SecurePhotoBubbleTopAndSideBorder: Shape {
-    let cornerRadius: CGFloat
-
-    func path(in rect: CGRect) -> Path {
-        let radius = min(cornerRadius, min(rect.width / 2, rect.height / 2))
-        var path = Path()
-
-        if SecurePhotoBubbleBorderPolicy.edges.contains(.left) {
-            path.move(to: CGPoint(x: rect.minX, y: rect.maxY))
-            path.addLine(to: CGPoint(x: rect.minX, y: rect.minY + radius))
-        }
-        if SecurePhotoBubbleBorderPolicy.edges.contains(.top) {
-            path.addQuadCurve(
-                to: CGPoint(x: rect.minX + radius, y: rect.minY),
-                control: CGPoint(x: rect.minX, y: rect.minY)
-            )
-            path.addLine(to: CGPoint(x: rect.maxX - radius, y: rect.minY))
-        }
-        if SecurePhotoBubbleBorderPolicy.edges.contains(.right) {
-            path.addQuadCurve(
-                to: CGPoint(x: rect.maxX, y: rect.minY + radius),
-                control: CGPoint(x: rect.maxX, y: rect.minY)
-            )
-            path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY))
-        }
-
-        return path
     }
 }
 
@@ -2390,7 +3387,7 @@ enum ChatMessagePresentationPolicy {
     }
 
     /// Text exposed to local global search. Wire descriptors are represented only by friendly,
-    /// provider-neutral labels; photos remain excluded exactly as they were before this policy.
+    /// provider-neutral labels; encrypted media remains excluded from search.
     static func searchableText(for message: LocalMessage) -> String? {
         presentation(for: message).searchableText
     }
@@ -2399,7 +3396,10 @@ enum ChatMessagePresentationPolicy {
         for message: LocalMessage
     ) -> (previewText: String, searchableText: String?) {
         if let pending = message.pendingAttachment {
-            return (photoPreview(caption: pending.caption), nil)
+            return (
+                mediaPreview(mediaType: pending.mediaType, caption: pending.caption),
+                nil
+            )
         }
 
         if let payment = KitPaymentMessage.parse(message.body) {
@@ -2416,7 +3416,7 @@ enum ChatMessagePresentationPolicy {
         }
 
         if let media = KitMediaMessageDescriptor.parse(message.body) {
-            return (photoPreview(caption: media.caption), nil)
+            return (mediaPreview(mediaType: media.mediaType, caption: media.caption), nil)
         }
         // Apply the same fail-closed presentation to unsupported media descriptor versions.
         if SecureMessageReservedPrefixPolicy.beginsWithReservedPrefix(
@@ -2428,9 +3428,10 @@ enum ChatMessagePresentationPolicy {
         return (message.body, message.body)
     }
 
-    private static func photoPreview(caption: String?) -> String {
-        guard let caption else { return "Photo" }
-        return "Photo · \(caption)"
+    private static func mediaPreview(mediaType: String, caption: String?) -> String {
+        let label = KitChatMediaKind(mediaType: mediaType).previewLabel
+        guard let caption, !caption.isEmpty else { return label }
+        return "\(label) · \(caption)"
     }
 }
 
@@ -2644,6 +3645,7 @@ private struct NewMessageSheet: View {
                         }
                         .disabled(
                             submissionGate.isSubmitting
+                                || !model.secureMessagingAvailable
                                 || message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                         )
                     }

@@ -44,7 +44,6 @@ struct CallsView: View {
                             }
                             .pickerStyle(.segmented)
                             .padding(.bottom, 8)
-
                             if calls.isEmpty {
                                 ContentUnavailableView {
                                     Label("No missed calls", systemImage: "checkmark.circle")
@@ -231,6 +230,8 @@ private struct NewCallSheet: View {
                                 Spacer()
                                 ShareLink(item: "Join me on Kit Pay so we can call securely.") {
                                     Image(systemName: "person.badge.plus")
+                                        .frame(width: 44, height: 44)
+                                        .contentShape(Rectangle())
                                 }
                                 .accessibilityLabel("Invite \(contact.name)")
                             }
@@ -280,8 +281,13 @@ private struct NewCallSheet: View {
     private func callButton(_ contact: CallableContact, video: Bool) -> some View {
         Button {
             Task {
+                // Clearing first makes "no new error" unambiguous even when a retry fails
+                // with the same message as before.
+                model.lastError = nil
                 await model.queueCall(recipientId: contact.id, name: contact.name, video: video)
-                dismiss()
+                if model.lastError == nil {
+                    dismiss()
+                }
             }
         } label: {
             Image(systemName: video ? "video" : "phone")

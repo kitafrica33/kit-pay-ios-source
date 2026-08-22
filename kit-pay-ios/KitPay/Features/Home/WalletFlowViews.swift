@@ -41,20 +41,19 @@ final class WalletFlowModel: ObservableObject {
         contacts = updatedContacts
     }
 
+    /// Approval routes through `AppModel.authorizeFinancialStepUp`, which signs with the
+    /// Secure Enclave when biometrics are available and otherwise verifies the wallet PIN.
     func send(
         from wallet: Wallet,
         to contact: WalletContactDTO,
         enteredAmount: String,
         note: String,
-        pin: String
+        pin: String,
+        authorize: KitFinancialStepUpAuthorization
     ) async -> Bool {
         guard !isSubmitting else { return false }
         guard let destinationWalletId = contact.receivingWalletId, !destinationWalletId.isEmpty else {
             errorMessage = "This contact cannot receive Kit Pay transfers yet."
-            return false
-        }
-        guard pin.range(of: #"^[0-9]{4}$"#, options: .regularExpression) != nil else {
-            errorMessage = "Enter your four-digit wallet PIN."
             return false
         }
         guard let amount = WalletMoney.apiAmount(enteredAmount, scale: wallet.currency.decimalScale) else {
@@ -75,11 +74,12 @@ final class WalletFlowModel: ObservableObject {
         ]
 
         do {
-            let challenge = try await api.createStepUp(purpose: "wallet_transfer", intent: intent)
-            guard challenge.methods?.contains(where: { $0.caseInsensitiveCompare("pin") == .orderedSame }) == true else {
-                throw WalletFlowError.pinUnavailable
-            }
-            let verification = try await api.verifyStepUp(challengeId: challenge.id, pin: pin)
+            let verification = try await authorize(
+                "wallet_transfer",
+                intent,
+                pin,
+                "Approve sending \(wallet.currency.code) \(amount) to \(contact.name)"
+            )
             sentTransaction = try await api.transfer(
                 walletId: wallet.id,
                 destinationWalletId: destinationWalletId,
@@ -387,7 +387,10 @@ struct SendMoneyView: View {
                 }
             }
         }
-        .overlay(alignment: .bottom) { inlineError }
+        .overlay(alignment: .bottom) {
+            // Never intercept taps meant for the bottom contact rows underneath.
+            inlineError.allowsHitTesting(false)
+        }
     }
 
     private func contactButton(_ contact: WalletContactDTO) -> some View {
@@ -504,17 +507,31 @@ struct SendMoneyView: View {
                 .padding(17)
                 .kitGlass(cornerRadius: 18)
 
-                SecureField("4-digit wallet PIN", text: $pin)
-                    .keyboardType(.numberPad)
-                    .textContentType(.oneTimeCode)
-                    .padding(17)
-                    .kitGlass(cornerRadius: 18)
-                    .onChange(of: pin) { _, value in
-                        pin = String(value.filter(\.isNumber).prefix(4))
+                if model.financialApprovalUsesBiometrics {
+                    Label {
+                        Text("Approve with \(model.biometricDisplayName). Your approval covers only this exact payment.")
+                            .font(.footnote)
+                            .foregroundStyle(KitColor.secondaryText)
+                    } icon: {
+                        Image(systemName: model.biometricSymbolName)
+                            .foregroundStyle(KitColor.green)
                     }
-                Text("Your PIN authorizes only this exact payment.")
-                    .font(.caption)
-                    .foregroundStyle(KitColor.secondaryText)
+                    .padding(17)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .kitGlass(cornerRadius: 18, tint: KitColor.paleGreen, shadow: false)
+                } else {
+                    SecureField("4-digit wallet PIN", text: $pin)
+                        .keyboardType(.numberPad)
+                        .textContentType(.oneTimeCode)
+                        .padding(17)
+                        .kitGlass(cornerRadius: 18)
+                        .onChange(of: pin) { _, value in
+                            pin = String(value.filter(\.isNumber).prefix(4))
+                        }
+                    Text("Your PIN authorizes only this exact payment.")
+                        .font(.caption)
+                        .foregroundStyle(KitColor.secondaryText)
+                }
 
                 inlineError
 
@@ -526,7 +543,8 @@ struct SendMoneyView: View {
                             to: selectedContact,
                             enteredAmount: amount,
                             note: note,
-                            pin: pin
+                            pin: pin,
+                            authorize: model.authorizeFinancialStepUp
                         ) {
                             showingConfirmation = false
                             step = .success
@@ -537,12 +555,19 @@ struct SendMoneyView: View {
                     if flow.isSubmitting {
                         ProgressView().tint(.white).frame(maxWidth: .infinity)
                     } else {
-                        Label("Send \(displayedAmount)", systemImage: "lock.fill")
-                            .frame(maxWidth: .infinity)
+                        Label(
+                            "Send \(displayedAmount)",
+                            systemImage: model.financialApprovalUsesBiometrics
+                                ? model.biometricSymbolName
+                                : "lock.fill"
+                        )
+                        .frame(maxWidth: .infinity)
                     }
                 }
                 .buttonStyle(KitPrimaryButtonStyle())
-                .disabled(pin.count != 4 || flow.isSubmitting)
+                .disabled(
+                    (!model.financialApprovalUsesBiometrics && pin.count != 4) || flow.isSubmitting
+                )
                 Spacer()
             }
             .padding(24)
@@ -1303,13 +1328,11 @@ private enum WalletShare {
 }
 
 private enum WalletFlowError: LocalizedError {
-    case pinUnavailable
     case pinSetupRejected
     case unconfirmedPaymentRequest
 
     var errorDescription: String? {
         switch self {
-        case .pinUnavailable: "Wallet PIN authorization is not available for this account."
         case .pinSetupRejected: "Kit Pay did not confirm the new wallet PIN. Please try again."
         case .unconfirmedPaymentRequest: "Kit Pay did not confirm the exact payment request. Check your requests before trying again."
         }
@@ -1350,8 +1373,23 @@ private extension String {
     }
 
     var displayDate: String {
-        let formatter = ISO8601DateFormatter()
-        guard let date = formatter.date(from: self) else { return self }
+        guard let date = KitServerDateParser.date(from: self) else { return self }
         return date.formatted(date: .abbreviated, time: .shortened)
+    }
+}
+
+/// The backend emits both plain and fractional-second ISO 8601 timestamps; parsing must accept
+/// both or transaction rows render the raw string. Formatters are cached — allocating an
+/// ISO8601DateFormatter per row is a measurable scroll hitch.
+enum KitServerDateParser {
+    private static let plain = ISO8601DateFormatter()
+    private static let fractional: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
+    static func date(from value: String) -> Date? {
+        plain.date(from: value) ?? fractional.date(from: value)
     }
 }

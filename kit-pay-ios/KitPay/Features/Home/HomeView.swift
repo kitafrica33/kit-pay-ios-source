@@ -240,11 +240,16 @@ struct HomeView: View {
             HStack {
                 Text("Recent activity").font(.title2.bold()).foregroundStyle(KitColor.primaryText)
                 Spacer()
-                Button("See all") {
+                Button {
                     open(.transactions, title: "Transactions", available: canViewWallet, needsInternet: false)
+                } label: {
+                    Text("See all")
+                        .font(.subheadline.bold())
+                        .foregroundStyle(KitColor.green)
+                        .padding(.vertical, 12)
+                        .contentShape(Rectangle())
                 }
-                    .font(.subheadline.bold())
-                    .foregroundStyle(KitColor.green)
+                .buttonStyle(.plain)
             }
             if model.state.transactions.isEmpty {
                 ContentUnavailableView(
