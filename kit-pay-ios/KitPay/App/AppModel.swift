@@ -1,0 +1,10786 @@
+import Combine
+import BackgroundTasks
+import CallKit
+import Contacts
+import Foundation
+import UIKit
+
+struct SecureMessagingSyncErrorOwnership {
+    typealias Attempt = UInt64
+
+    private var latestAttempt: Attempt = 0
+    private var resetFloor: Attempt = 0
+    private var latestSuccessfulAttempt: Attempt = 0
+    private(set) var errorAttempt: Attempt?
+    private(set) var errorMessage: String?
+
+    mutating func begin() -> Attempt {
+        latestAttempt &+= 1
+        return latestAttempt
+    }
+
+    mutating func record(_ message: String, for attempt: Attempt) -> String? {
+        guard attempt > resetFloor,
+              attempt <= latestAttempt,
+              attempt > latestSuccessfulAttempt,
+              errorAttempt.map({ attempt >= $0 }) ?? true
+        else { return nil }
+        errorAttempt = attempt
+        errorMessage = message
+        return message
+    }
+
+    mutating func resolve(
+        _ attempt: Attempt,
+        visibleMessage: String?
+    ) -> String? {
+        guard attempt > resetFloor, attempt <= latestAttempt else { return visibleMessage }
+        latestSuccessfulAttempt = max(latestSuccessfulAttempt, attempt)
+        guard let errorAttempt,
+              errorAttempt <= attempt,
+              let errorMessage
+        else { return visibleMessage }
+        self.errorAttempt = nil
+        self.errorMessage = nil
+        return visibleMessage == errorMessage ? nil : visibleMessage
+    }
+
+    mutating func reset() {
+        resetFloor = latestAttempt
+        latestSuccessfulAttempt = max(latestSuccessfulAttempt, resetFloor)
+        errorAttempt = nil
+        errorMessage = nil
+    }
+}
+
+/// Foreground chat synchronization mirrors Android's bounded two-second cadence. The durable
+/// unread counter is the retry signal: a failed receipt leaves it untouched, while a successful
+/// receipt clears it and prevents redundant POSTs on later ticks.
+enum VisibleConversationMessagingPolicy {
+    static let foregroundSyncInterval: TimeInterval = 2
+
+    static func newestUnreadIncomingServerMessageID(
+        conversationID: String,
+        conversations: [Conversation],
+        messages: [LocalMessage]
+    ) -> String? {
+        guard conversations.contains(where: {
+            $0.id == conversationID && $0.unreadCount > 0
+        }) else { return nil }
+        return messages
+            .filter {
+                $0.conversationId == conversationID
+                    && !$0.isOutgoing
+                    && $0.serverMessageId != nil
+                    && $0.state == .received
+            }
+            .max(by: {
+                let leftDate = $0.sentAt ?? $0.createdAt
+                let rightDate = $1.sentAt ?? $1.createdAt
+                if leftDate != rightDate { return leftDate < rightDate }
+                return ($0.serverMessageId ?? "") < ($1.serverMessageId ?? "")
+            })?
+            .serverMessageId
+    }
+
+    static func shouldPublishAfterSync(
+        attemptedBoundary: String?,
+        currentBoundary: String?
+    ) -> Bool {
+        guard let currentBoundary else { return false }
+        return currentBoundary != attemptedBoundary
+    }
+}
+
+struct ActiveCallInvitationContext: Equatable {
+    let call: CallRecord
+    let callID: String
+    let participantUserIDs: Set<String>
+
+    var canInviteAnotherParticipant: Bool {
+        participantUserIDs.count < ActiveCallInvitationPolicy.maximumParticipantCount
+    }
+}
+
+enum CommunicationPrivacyMutation: Equatable {
+    case preference
+    case block(String)
+    case unblock(String)
+}
+
+private struct CommunicationPrivacyAccountContext {
+    let accountEpoch: UUID
+    let userID: String
+    let sessionID: String
+}
+
+private enum CommunicationPreferenceSaveResult {
+    case updated(CommunicationPreferencesDTO)
+    case refreshedAfterConflict(CommunicationPreferencesDTO)
+}
+
+private struct CommunicationPreferenceConflictRefreshFailure: Error {}
+
+private struct SecurityPreferencesAccountContext {
+    let accountEpoch: UUID
+    let userID: String
+    let sessionID: String
+}
+
+private enum SecurityPreferencesSaveResult {
+    case updated(SecurityPreferencesDTO)
+    case refreshedAfterConflict(SecurityPreferencesDTO)
+}
+
+private struct SecurityPreferencesConflictRefreshFailure: Error {}
+
+private enum CommunicationPrivacyMessageAdmissionFailure: LocalizedError {
+    case blocked
+    case invalidRecipient
+
+    var errorDescription: String? {
+        switch self {
+        case .blocked:
+            return "Unblock this account before retrying this message."
+        case .invalidRecipient:
+            return "This message no longer has one valid Kit Pay recipient."
+        }
+    }
+}
+
+/// Keeps the in-call people picker and its authenticated response handling on the same strict
+/// backend-call identity. A partial, duplicate, bound, terminal, or oversized local projection is
+/// not enough authority to send an invitation.
+enum ActiveCallInvitationPolicy {
+    static let maximumParticipantCount = 21
+
+    static func context(
+        for activeCall: ActiveCallPresentation?,
+        calls: [CallRecord],
+        currentUserID: String?
+    ) -> ActiveCallInvitationContext? {
+        guard let activeCall,
+              activeCall.conversationId == nil,
+              let callID = canonicalUUID(activeCall.id),
+              let currentUserID = canonicalUUID(currentUserID)
+        else { return nil }
+
+        let matches = calls.filter { canonicalUUID($0.id) == callID }
+        guard matches.count == 1,
+              let call = matches.first,
+              call.state == .active,
+              call.conversationId == nil,
+              var participantUserIDs = canonicalRoster(call.participantUserIds)
+        else { return nil }
+
+        participantUserIDs.insert(currentUserID)
+        guard participantUserIDs.count <= maximumParticipantCount else { return nil }
+        return ActiveCallInvitationContext(
+            call: call,
+            callID: callID,
+            participantUserIDs: participantUserIDs
+        )
+    }
+
+    static func canonicalRecipientID(_ value: String) -> String? {
+        canonicalUUID(value.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    static func canInvite(
+        recipientUserID: String,
+        in context: ActiveCallInvitationContext
+    ) -> Bool {
+        guard context.canInviteAnotherParticipant,
+              let recipientUserID = canonicalRecipientID(recipientUserID)
+        else { return false }
+        return !context.participantUserIDs.contains(recipientUserID)
+    }
+
+    static func accepts(
+        response: CallDTO,
+        expectedCallID: String,
+        invitedRecipientID: String,
+        currentUserID: String
+    ) -> Bool {
+        guard let expectedCallID = canonicalUUID(expectedCallID),
+              canonicalUUID(response.id) == expectedCallID,
+              ["ringing", "active"].contains(response.state.lowercased()),
+              response.conversationId == nil,
+              let invitedRecipientID = canonicalRecipientID(invitedRecipientID),
+              let currentUserID = canonicalUUID(currentUserID),
+              let responseParticipantIDs = response.participantUserIds,
+              var participantUserIDs = canonicalRoster(responseParticipantIDs),
+              participantUserIDs.contains(invitedRecipientID)
+        else { return false }
+
+        participantUserIDs.insert(currentUserID)
+        return participantUserIDs.count <= maximumParticipantCount
+    }
+
+    private static func canonicalRoster(_ values: [String]) -> Set<String>? {
+        guard values.count <= maximumParticipantCount else { return nil }
+        var result: Set<String> = []
+        result.reserveCapacity(values.count)
+        for value in values {
+            guard let participantID = canonicalUUID(value),
+                  result.insert(participantID).inserted
+            else { return nil }
+        }
+        return result
+    }
+
+    private static func canonicalUUID(_ value: String?) -> String? {
+        guard let value,
+              value == value.trimmingCharacters(in: .whitespacesAndNewlines),
+              let identifier = UUID(uuidString: value)
+        else { return nil }
+        return identifier.uuidString.lowercased()
+    }
+}
+
+private struct AuthenticatedSecurityContext {
+    let accountEpoch: UUID
+    let userID: String
+    let sessionID: String
+}
+
+private enum AccountSignOutResult {
+    case completed
+    case contextChanged
+    case localCleanupFailed
+}
+
+enum ProfileEmailOperation: Equatable {
+    case requestingCode
+    case verifyingCode
+}
+
+private enum MFAManagementError: LocalizedError {
+    case offline
+    case unavailable
+    case invalidResponse
+    case recoveryCodesUncertain
+
+    var errorDescription: String? {
+        switch self {
+        case .offline:
+            "Connect to the internet to manage two-step verification."
+        case .unavailable:
+            "Finish securing this sign-in before changing two-step verification."
+        case .invalidResponse:
+            "The security change could not be verified. Please try again."
+        case .recoveryCodesUncertain:
+            "Kit may have replaced your recovery codes, but the new set could not be received safely. Use a fresh authenticator code to generate another set."
+        }
+    }
+}
+
+enum PasswordResetSubmissionOutcome: Equatable {
+    case completed
+    case completionUncertain
+    case failed
+}
+
+enum IrreversibleAuthenticationMutationPolicy {
+    static func completionIsUncertain(after error: Error) -> Bool {
+        if let payload = error as? APIErrorPayload {
+            guard let status = payload.httpStatus else { return false }
+            return status == 408 || status >= 500
+        }
+        if let apiError = error as? APIClientError {
+            switch apiError {
+            case .invalidResponse:
+                return true
+            case .invalidPayload(let status):
+                return (200 ... 299).contains(status) || status == 408 || status >= 500
+            case .httpStatus(let status):
+                return status == 408 || status >= 500
+            case .httpResponse(let status, _):
+                return status == 408 || status >= 500
+            case .signedOut, .invalidURL:
+                return false
+            }
+        }
+        if let authError = error as? AuthUIError, case .invalidResponse = authError {
+            return true
+        }
+        return error is URLError || error is CancellationError
+    }
+}
+
+/// Pull-to-refresh is owned by SwiftUI, which may cancel its task when the refresh control is
+/// dismissed, the view changes, or a newer refresh supersedes it. URLSession can surface that
+/// cancellation either as `CancellationError` or as `URLError.cancelled`; neither is a customer
+/// failure and neither should become the app-wide alert.
+enum RefreshCancellationPolicy {
+    static func shouldSuppress(_ error: Error, taskIsCancelled: Bool) -> Bool {
+        if taskIsCancelled || error is CancellationError { return true }
+        if let urlError = error as? URLError, urlError.code == .cancelled { return true }
+        return containsCancellationNSError(error as NSError, depth: 0)
+    }
+
+    private static func containsCancellationNSError(_ error: NSError, depth: Int) -> Bool {
+        guard depth < 4 else { return false }
+        if error.domain == NSURLErrorDomain,
+           error.code == URLError.Code.cancelled.rawValue {
+            return true
+        }
+        if error.domain == NSCocoaErrorDomain,
+           error.code == NSUserCancelledError {
+            return true
+        }
+        guard let underlying = error.userInfo[NSUnderlyingErrorKey] as? NSError else {
+            return false
+        }
+        return containsCancellationNSError(underlying, depth: depth + 1)
+    }
+}
+
+/// Transport failures that mean "the network is not usable right now" rather than "something is
+/// wrong with your account".
+///
+/// A session resumed at launch, or one resumed after the biometric prompt has been sitting on
+/// screen, routinely finishes its first requests after the connection has already gone. Turning
+/// that into a modal "The request timed out." is noise the customer can do nothing about — the
+/// connectivity pill already says the app is offline, and the next refresh recovers on its own.
+/// A refresh the customer explicitly pulled still reports these, because there they asked a
+/// question and deserve an answer.
+enum TransientTransportErrorPolicy {
+    static func isTransient(_ error: Error) -> Bool {
+        containsTransientNSError(error as NSError, depth: 0)
+    }
+
+    /// Whether an automatic, non-user-initiated load should stay silent about this failure.
+    static func shouldSuppressAutomatically(_ error: Error, isUserInitiated: Bool) -> Bool {
+        !isUserInitiated && isTransient(error)
+    }
+
+    private static let transientCodes: Set<Int> = [
+        URLError.Code.timedOut.rawValue,
+        URLError.Code.cannotConnectToHost.rawValue,
+        URLError.Code.cannotFindHost.rawValue,
+        URLError.Code.dnsLookupFailed.rawValue,
+        URLError.Code.networkConnectionLost.rawValue,
+        URLError.Code.notConnectedToInternet.rawValue,
+        URLError.Code.internationalRoamingOff.rawValue,
+        URLError.Code.dataNotAllowed.rawValue,
+        URLError.Code.callIsActive.rawValue,
+        URLError.Code.resourceUnavailable.rawValue,
+    ]
+
+    private static func containsTransientNSError(_ error: NSError, depth: Int) -> Bool {
+        guard depth < 4 else { return false }
+        if error.domain == NSURLErrorDomain, transientCodes.contains(error.code) {
+            return true
+        }
+        guard let underlying = error.userInfo[NSUnderlyingErrorKey] as? NSError else {
+            return false
+        }
+        return containsTransientNSError(underlying, depth: depth + 1)
+    }
+}
+
+/// Which network path updates deserve reconnect work.
+///
+/// `NWPathMonitor` republishes `.satisfied` for changes that are not a reconnection at all — an
+/// interface coming up alongside the one already carrying traffic, a VPN attaching, expensive or
+/// constrained status flipping, a DNS change. The handler used to treat every one of those as a
+/// fresh reconnect, so a phone walking between cells could run capabilities, bootstrap, wallets,
+/// transactions, call history, push-token replay and a contact sync several times over, on
+/// exactly the connection least able to afford it. Only a real transition does that work now.
+enum ConnectivityTransitionPolicy {
+    enum Transition: Equatable {
+        /// Connectivity became usable after being absent or unknown: run reconnect work.
+        case recovered
+        /// Connectivity was lost: suspend anything that needs the network.
+        case lost
+        /// The path changed but the app's reachability did not.
+        case unchanged
+    }
+
+    /// - Parameter previousOnline: the last observed reachability, or `nil` before the first
+    ///   path update. The first `satisfied` update is still a recovery, so a launch that races
+    ///   the monitor keeps bootstrapping.
+    static func transition(previousOnline: Bool?, isOnline: Bool) -> Transition {
+        guard previousOnline != isOnline else { return .unchanged }
+        return isOnline ? .recovered : .lost
+    }
+}
+
+/// A merge invitation is a non-idempotent signalling request whose response can be lost after the
+/// backend has already updated the roster. Only narrowly ambiguous failures justify one read-back;
+/// definitive authorization, validation, and not-found failures remain failures.
+enum WaitingCallMergeInvitationReconciliationPolicy {
+    static func shouldReconcile(after error: Error) -> Bool {
+        if error is CancellationError { return false }
+        if let urlError = error as? URLError {
+            return urlError.code != .cancelled
+        }
+        if let payload = error as? APIErrorPayload {
+            if payload.code.trimmingCharacters(in: .whitespacesAndNewlines)
+                .caseInsensitiveCompare("CALL_PARTICIPANTS_UNCHANGED") == .orderedSame {
+                return true
+            }
+            guard let status = payload.httpStatus else { return false }
+            return isAmbiguousHTTPStatus(status)
+        }
+        if let clientError = error as? APIClientError {
+            switch clientError {
+            case .invalidResponse:
+                return true
+            case .invalidPayload(let status):
+                return (200 ... 299).contains(status) || isAmbiguousHTTPStatus(status)
+            case .httpStatus(let status):
+                return isAmbiguousHTTPStatus(status)
+            case .httpResponse(let status, _):
+                return isAmbiguousHTTPStatus(status)
+            case .signedOut, .invalidURL:
+                return false
+            }
+        }
+        return false
+    }
+
+    static func accepts(
+        response: CallDTO,
+        expectedCallID: String,
+        invitedRecipientID: String,
+        currentUserID: String
+    ) -> Bool {
+        response.state.caseInsensitiveCompare("active") == .orderedSame
+            && ActiveCallInvitationPolicy.accepts(
+                response: response,
+                expectedCallID: expectedCallID,
+                invitedRecipientID: invitedRecipientID,
+                currentUserID: currentUserID
+            )
+    }
+
+    private static func isAmbiguousHTTPStatus(_ status: Int) -> Bool {
+        status == 408 || status == 425 || status == 429 || (500 ... 599).contains(status)
+    }
+}
+
+/// Linearizes cancellation against the synchronous encrypted-store mutation used to publish a
+/// merged roster. AppModel owns the higher-level actor state, while SecureLocalStore executes its
+/// mutation closure on a different executor; this narrow lock prevents a cancelled merge token
+/// from becoming valid again between the final actor check and that closure.
+private final class WaitingCallMergeOperationGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var activeOperationID: UUID?
+
+    func activate(_ operationID: UUID) {
+        lock.lock()
+        activeOperationID = operationID
+        lock.unlock()
+    }
+
+    func isCurrent(_ operationID: UUID) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return activeOperationID == operationID
+    }
+
+    @discardableResult
+    func invalidate(_ operationID: UUID) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard activeOperationID == operationID else { return false }
+        activeOperationID = nil
+        return true
+    }
+
+    /// The mutation is intentionally synchronous and small. Holding the lock gives cancellation
+    /// and commit one deterministic ordering: a cancellation that wins first prevents the write;
+    /// a write that wins first was still authorized at its exact linearization point.
+    func performIfCurrent(
+        _ operationID: UUID,
+        _ mutation: () throws -> Void
+    ) rethrows -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard activeOperationID == operationID else { return false }
+        try mutation()
+        return true
+    }
+}
+
+private struct WaitingCallMergeResultSignal {
+    let operationID: UUID
+    let continuation: AsyncStream<Bool>.Continuation
+}
+
+enum AuthenticationChallengeRecoveryPolicy {
+    static func preservesChallenge(afterResendFailure error: Error) -> Bool {
+        if AuthenticationChallengeErrorPolicy.isTerminal(error) { return false }
+        if let payload = error as? APIErrorPayload {
+            guard let status = payload.httpStatus else { return true }
+            return (400 ... 499).contains(status) && status != 408
+        }
+        if let apiError = error as? APIClientError {
+            switch apiError {
+            case .invalidPayload(let status), .httpStatus(let status),
+                 .httpResponse(let status, _):
+                return (400 ... 499).contains(status) && status != 408
+            case .signedOut, .invalidResponse, .invalidURL:
+                return false
+            }
+        }
+        return false
+    }
+}
+
+/// Main-actor admission shared by local-access and financial biometric prompts. The owner token is
+/// acquired synchronously before an actor hop so reentrant callers cannot pass a stale Bool check.
+struct BiometricAuthenticationOperationGate {
+    private(set) var activeOperationID: UUID?
+
+    var isActive: Bool { activeOperationID != nil }
+
+    mutating func begin() -> UUID? {
+        guard activeOperationID == nil else { return nil }
+        let operationID = UUID()
+        activeOperationID = operationID
+        return operationID
+    }
+
+    func owns(_ operationID: UUID) -> Bool {
+        activeOperationID == operationID
+    }
+
+    @discardableResult
+    mutating func finish(_ operationID: UUID) -> Bool {
+        guard owns(operationID) else { return false }
+        activeOperationID = nil
+        return true
+    }
+}
+
+/// A returning-sign-in response may unlock local account content only while it belongs to the
+/// foreground lifetime that started it. Entering the background invalidates a suspended
+/// LocalAuthentication response even when the framework delivers success afterward.
+struct ReturningSignInBiometricAuthorizationFence {
+    typealias Token = UInt64
+
+    private(set) var generation: Token = 0
+
+    func capture() -> Token { generation }
+
+    mutating func invalidate() {
+        generation &+= 1
+    }
+
+    func authorizes(_ token: Token) -> Bool {
+        token == generation
+    }
+}
+
+/// A successful local-auth response may reveal Home only if it belongs to the currently visible
+/// Home visit. Leaving Home or entering the background invalidates every earlier response.
+struct HomeBiometricAuthorizationFence {
+    typealias Token = UInt64
+
+    private(set) var generation: Token = 0
+
+    func capture() -> Token { generation }
+
+    mutating func invalidate() {
+        generation &+= 1
+    }
+
+    func authorizes(_ token: Token, homeIsSelected: Bool) -> Bool {
+        homeIsSelected && token == generation
+    }
+}
+
+/// Orders overlapping capability requests by completed, authoritative results. Cancellation does
+/// not advance the resolved generation, so an older in-flight request may still supply the last
+/// confirmed value after a newer waiter is cancelled.
+struct CapabilitiesRequestResolutionTracker {
+    typealias Token = UInt64
+
+    private(set) var nextGeneration: Token = 0
+    private(set) var latestResolvedGeneration: Token = 0
+
+    mutating func begin() -> Token {
+        nextGeneration &+= 1
+        return nextGeneration
+    }
+
+    mutating func accepts(_ token: Token, cancelled: Bool) -> Bool {
+        guard !cancelled, token >= latestResolvedGeneration else { return false }
+        latestResolvedGeneration = token
+        return true
+    }
+
+    mutating func invalidate() {
+        nextGeneration &+= 1
+        latestResolvedGeneration = nextGeneration
+    }
+}
+
+@MainActor
+final class AppModel: ObservableObject {
+    @Published private(set) var state: PersistedState = .empty
+    @Published private(set) var capabilities: CapabilitiesDTO?
+    @Published private(set) var isSignedIn = false
+    @Published private(set) var isOnline = false
+    @Published private(set) var isLoading = true
+    @Published private(set) var accountSetupStep: AccountSetupStep?
+    @Published private(set) var isCompletingAccountSetup = false
+    @Published private(set) var isUpdatingProfile = false
+    @Published var lastError: String?
+    /// A validated inbound link waiting for the sign-in screen to act on it.
+    @Published private(set) var pendingDeepLink: KitDeepLink?
+    @Published private(set) var pendingPhone: String?
+    @Published private(set) var pendingChallenge: AuthChallenge?
+    @Published private(set) var pendingChallengeReceivedAt: Date?
+    @Published var selectedTab = 0
+    @Published private(set) var kycStatus: KYCStatus?
+    @Published private(set) var sessionAssurance: SessionAssuranceDTO?
+    @Published private(set) var callContacts: [CallableContact] = []
+    @Published private(set) var callWaitingState = CallWaitingState()
+    @Published private(set) var contactSyncState: AutomaticContactSyncState = .idle
+    @Published private(set) var biometricKind: KitBiometricKind = .biometrics
+    @Published private(set) var biometricUnlockEnabled = false
+    @Published private(set) var biometricAccessState: KitBiometricGateState = .notRequired
+    @Published private(set) var homeBiometricState: KitBiometricGateState = .notRequired
+    @Published private(set) var isConfiguringBiometrics = false
+    @Published private(set) var biometricErrorMessage: String?
+    @Published private(set) var isRefreshingRegisteredDevices = false
+    @Published private(set) var revokingRegisteredDeviceID: String?
+    @Published private(set) var deviceManagementErrorMessage: String?
+    @Published private(set) var securityPreferences: SecurityPreferencesDTO?
+    @Published private(set) var isLoadingSecurityPreferences = false
+    @Published private(set) var isUpdatingSecurityPreferences = false
+    @Published private(set) var securityPreferencesErrorMessage: String?
+    @Published private(set) var communicationPreferences: CommunicationPreferencesDTO?
+    @Published private(set) var communicationBlocks: [CommunicationBlockDTO] = []
+    @Published private(set) var isLoadingCommunicationPrivacy = false
+    @Published private(set) var communicationPrivacyMutation: CommunicationPrivacyMutation?
+    @Published private(set) var communicationPrivacyErrorMessage: String?
+    @Published private(set) var hasLoadedCommunicationPrivacy = false
+    @Published private(set) var profileEmailOperation: ProfileEmailOperation?
+    @Published private(set) var isSubmittingAccountDeletion = false
+    @Published private(set) var acceptedAccountDeletionCleanupBlocked = false
+    @Published private(set) var protectedLocalStateRecoveryBlocked = false
+    @Published private(set) var protectedLocalStateRecoveryRequiresSupport = false
+    @Published private(set) var unresolvedAccountDeletionAttemptBlocked = false
+    @Published private(set) var messageConversationNavigationRequest:
+        MessageConversationNavigationRequest?
+
+    private let api: APIClient
+    private let sessions: SessionStore
+    private let store: SecureLocalStore
+    private let biometrics: KitBiometricAuthenticator
+    private let acceptedAccountDeletionPurges: AcceptedAccountDeletionPurgeStore
+    private let accountDeletionAttempts: AccountDeletionAttemptStore
+    private let contactSource: any DeviceContactsProviding
+    private let pushRegistrations = PushRegistrationManager.shared
+    private let connectivity = ConnectivityMonitor()
+    private var observers: [NSObjectProtocol] = []
+    /// Only one replay drains a given authenticated account at a time. A replacement sign-in may
+    /// start its own drain while an older network request is unwinding; the epoch fence prevents
+    /// that stale task from committing into the replacement account.
+    private var flushingAccountEpoch: UUID?
+    private var locallyTerminatedCallIds: Set<String> = []
+    private var accountEpoch = UUID()
+    private var paymentRequestChatShareLeases: [String: PaymentRequestChatShareLease] = [:]
+    private var capabilitiesRequestTracker = CapabilitiesRequestResolutionTracker()
+    private var kycRequestGeneration: UInt64 = 0
+    private var communicationPrivacyRequestGeneration: UInt64 = 0
+    private var contactDirectoryRevision: UInt64 = 0
+    /// Forces a server-side contact eligibility recheck after a block transition even when an
+    /// older contact sync was already in flight with an unchanged address-book fingerprint.
+    private var contactAuthorizationRevision: UInt64 = 0
+    private var refreshedContactAuthorizationRevision: UInt64 = 0
+    private var contactSyncTask: Task<Bool, Never>?
+    private var contactSyncGeneration: UInt64 = 0
+    private var contactChangeDebounceTask: Task<Void, Never>?
+    private var contactSyncNeedsAnotherPass = false
+    private var didRequestContactsAtLaunch = false
+    private var activeConversationID: String?
+    private var visibleConversationSyncTask: Task<Void, Never>?
+    private var visibleConversationSyncGeneration: UInt64 = 0
+    private var expiredBackgroundContactTasks: Set<ObjectIdentifier> = []
+    private var expiredBackgroundCommunicationTasks: Set<ObjectIdentifier> = []
+    private var restoreTask: Task<Void, Never>?
+    private var profileUpdateTask: Task<Bool, Never>?
+    private var profileUpdateTaskID: UUID?
+    private var profileAvatarResumeTask: Task<Void, Never>?
+    private var profileAvatarResumeTaskID: UUID?
+    private var profileEmailOperationID: UUID?
+    private var accountDeletionSubmissionID: UUID?
+    private var volatileAcceptedAccountDeletion: PendingAcceptedAccountDeletion?
+    private var privacyQuarantineTargetAccountID: String?
+    private var deferredInvalidatedSessionID: String?
+    private var authenticatedRefreshCount = 0
+    private var profileAvatarResumeRequestedAfterRefresh = false
+    private var callEventDrainTask: Task<Void, Never>?
+    private var callHistoryRefreshTask: Task<Void, Never>?
+    private var callHistoryRefreshGeneration: UInt64 = 0
+    private var callHistoryBackfillTask: Task<Void, Never>?
+    private var callHistoryBackfillGeneration: UInt64 = 0
+    private var callHistoryBackfillRetryNotBefore: Date?
+    private var queuedCallEvents: [CallLifecycleEvent] = []
+    private var callSystemEventDrainTask: Task<Void, Never>?
+    private var outboxWakeTask: Task<Void, Never>?
+    private var communicationReplayTask: Task<Bool, Never>?
+    private var queuedCallSystemActions: [CallSystemAction] = []
+    private var receivedCallEventIds: Set<UUID> = []
+    private var receivedCallEventOrder: [UUID] = []
+    private var hasConnectivityStatus = false
+    private var isSigningOut = false
+    /// Invalidates responses from an authentication request whose UI flow was abandoned while the
+    /// network call was suspended. This value is process-local and contains no credential material.
+    private var authenticationAttempt = UUID()
+    private var didResumeAuthenticatedSession = false
+    private var biometricAuthenticationGate = BiometricAuthenticationOperationGate()
+    private var returningSignInBiometricAuthorizationFence =
+        ReturningSignInBiometricAuthorizationFence()
+    private var homeBiometricAuthorizationFence = HomeBiometricAuthorizationFence()
+    private var biometricAuthenticationInProgress: Bool {
+        biometricAuthenticationGate.isActive
+    }
+    private var secureMessagingSyncError = SecureMessagingSyncErrorOwnership()
+    private var callMediaAccountLease: CallMediaAccountLease?
+    private let waitingCallMergeOperationGate = WaitingCallMergeOperationGate()
+    private var waitingCallMergeOperationID: UUID?
+    private var waitingCallMergeAttempt: CallWaitingMergeAttempt?
+    private var waitingCallMergeTask: Task<Bool, Never>?
+    private var waitingCallMergeResultSignal: WaitingCallMergeResultSignal?
+    private var ephemeralOutgoingCallGate = EphemeralOutgoingCallAttemptGate()
+    private var ephemeralOutgoingCallTask: Task<Void, Never>?
+    private var ephemeralOutgoingCallTaskID: UUID?
+    private var ephemeralOutgoingCallResumePending = false
+    private var pendingEphemeralCallCancellations: [String: EphemeralOutgoingCallAttempt] = [:]
+    private var ephemeralCallCancellationTask: Task<Void, Never>?
+    private var conversationDraftWriterID = UUID()
+    private var conversationDraftWriteSequence: UInt64 = 0
+    private var deviceManagementGeneration: UInt64 = 0
+    private var securityPreferencesRequestGeneration: UInt64 = 0
+
+    var phoneOTPAvailable: Bool {
+        capabilities?.supportsPhoneOTP == true
+    }
+
+    var emailPasswordAvailable: Bool {
+        capabilities?.supportsEmailPassword == true
+    }
+
+    var emailRegistrationAvailable: Bool {
+        capabilities?.supportsEmailRegistration == true
+    }
+
+    var emailRecoveryAvailable: Bool {
+        capabilities?.supportsEmailRecovery == true
+    }
+
+    var authenticatorMFAAvailable: Bool {
+        capabilities?.supportsMFA == true
+    }
+
+    init(
+        api: APIClient = .shared,
+        sessions: SessionStore = .shared,
+        store: SecureLocalStore = .shared,
+        biometrics: KitBiometricAuthenticator = .shared,
+        acceptedAccountDeletionPurges: AcceptedAccountDeletionPurgeStore = .shared,
+        accountDeletionAttempts: AccountDeletionAttemptStore = .shared,
+        contactSource: any DeviceContactsProviding = SystemDeviceContactsProvider()
+    ) {
+        self.api = api
+        self.sessions = sessions
+        self.store = store
+        self.biometrics = biometrics
+        self.acceptedAccountDeletionPurges = acceptedAccountDeletionPurges
+        self.accountDeletionAttempts = accountDeletionAttempts
+        self.contactSource = contactSource
+
+        ContactBackgroundRefreshScheduler.shared.installHandler { [weak self] task in
+            Task { @MainActor in await self?.handleBackgroundContactRefresh(task) }
+        }
+        CommunicationBackgroundReplayScheduler.shared.installHandler { [weak self] task in
+            Task { @MainActor in await self?.handleBackgroundCommunicationReplay(task) }
+        }
+
+        connectivity.onChange = { [weak self] online in
+            Task { @MainActor in
+                guard let self else { return }
+                let transition = ConnectivityTransitionPolicy.transition(
+                    previousOnline: self.hasConnectivityStatus ? self.isOnline : nil,
+                    isOnline: online
+                )
+                self.isOnline = online
+                self.hasConnectivityStatus = true
+                switch transition {
+                case .unchanged:
+                    return
+                case .recovered:
+                    // The first path update can arrive while launch restoration is still
+                    // resolving an accepted-account-deletion marker. Capabilities may use an
+                    // available authenticated session, so never let reconnect work read or send
+                    // cached credentials before that privacy barrier has completed.
+                    guard let restoreTask = self.restoreTask else { return }
+                    await restoreTask.value
+                    guard !self.isSigningOut,
+                          !self.isSubmittingAccountDeletion,
+                          !self.acceptedAccountDeletionCleanupBlocked,
+                          !self.protectedLocalStateRecoveryBlocked,
+                          !self.unresolvedAccountDeletionAttemptBlocked
+                    else { return }
+                    self.scheduleEphemeralCallCancellationDrain()
+                    if self.isSignedIn,
+                       self.accountSetupStep == nil,
+                       self.sessionAssurance?.grantsFullAccess == true {
+                        NotificationCoordinator.shared.retryRemoteRegistrationIfNeeded()
+                        NotificationCoordinator.shared.replayCurrentPushTokens()
+                        await self.refresh()
+                        self.resumeEphemeralOutgoingCallIfPossible()
+                        await self.flushOutbox()
+                        self.scheduleAutomaticContactSync()
+                    } else if !self.isSignedIn {
+                        _ = await self.reloadCapabilities()
+                    }
+                case .lost:
+                    self.suspendEphemeralOutgoingCallSubmission()
+                    self.outboxWakeTask?.cancel()
+                    self.outboxWakeTask = nil
+                }
+            }
+        }
+        connectivity.start()
+
+        observers.append(
+            NotificationCenter.default.addObserver(
+                forName: .kitSessionInvalidated,
+                object: nil,
+                queue: .main
+            ) { [weak self] notification in
+                guard let invalidatedSessionID = notification.object as? String else { return }
+                Task { @MainActor in
+                    await self?.handleSessionInvalidation(invalidatedSessionID)
+                }
+            }
+        )
+        observers.append(
+            NotificationCenter.default.addObserver(
+                forName: .CNContactStoreDidChange,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor in self?.contactsDidChange() }
+            }
+        )
+        observers.append(
+            NotificationCenter.default.addObserver(
+                forName: .kitPushTokenReceived,
+                object: nil,
+                queue: .main
+            ) { [weak self] notification in
+                guard let registration = notification.object as? PushTokenRegistration else { return }
+                Task { @MainActor in
+                    await self?.registerPushToken(registration.token, provider: registration.provider)
+                }
+            }
+        )
+        observers.append(
+            NotificationCenter.default.addObserver(
+                forName: .kitCallLifecycleEvent,
+                object: nil,
+                queue: .main
+            ) { [weak self] notification in
+                guard let event = notification.object as? CallLifecycleEvent else { return }
+                // Delivery is explicitly on the main queue. Enter the actor synchronously so the
+                // cache's incoming-before-action order cannot be changed by independent Tasks.
+                MainActor.assumeIsolated {
+                    self?.enqueueCallLifecycleEvent(event)
+                }
+            }
+        )
+        observers.append(
+            NotificationCenter.default.addObserver(
+                forName: .kitCallMediaFailed,
+                object: nil,
+                queue: .main
+            ) { [weak self] notification in
+                guard let failure = notification.object as? CallMediaFailure else { return }
+                Task { @MainActor in await self?.handleCallMediaFailure(failure) }
+            }
+        )
+        observers.append(
+            NotificationCenter.default.addObserver(
+                forName: .kitPendingOutgoingCallEnded,
+                object: nil,
+                queue: .main
+            ) { [weak self] notification in
+                guard let clientCallID = notification.object as? String else { return }
+                Task { @MainActor in
+                    self?.cancelEphemeralOutgoingCall(
+                        clientCallID: clientCallID,
+                        dismissPresentation: false
+                    )
+                }
+            }
+        )
+        observers.append(
+            NotificationCenter.default.addObserver(
+                forName: .kitRemoteWakeReceived,
+                object: nil,
+                queue: .main
+            ) { [weak self] notification in
+                if let remoteEnd = notification.object as? RemoteCallMediaEndedWake {
+                    // CallMediaCoordinator posts this synchronously on MainActor immediately after
+                    // clearing its presentation. Retire the waiter before a newer call can appear.
+                    MainActor.assumeIsolated {
+                        self?.handleRemoteCallMediaEndedWake(remoteEnd)
+                    }
+                    Task { @MainActor in await self?.refresh() }
+                    return
+                }
+                Task { @MainActor in
+                    guard let self else { return }
+                    if SecureMessagingRemoteWake(notification.object) != nil {
+                        await self.syncSecureMessagingIfPermitted(
+                            presentsVisibleMessageNotifications: true
+                        )
+                    } else {
+                        await self.refresh()
+                    }
+                }
+            }
+        )
+        observers.append(
+            NotificationCenter.default.addObserver(
+                forName: .kitPushTokenInvalidated,
+                object: nil,
+                queue: .main
+            ) { [weak self] notification in
+                guard let provider = notification.object as? String else { return }
+                Task { @MainActor in await self?.unregisterPushToken(provider: provider) }
+            }
+        )
+
+        Task { [weak self] in
+            await SecureMessagingWakeDispatcher.shared.install { [weak self] _ in
+                guard let self else { return .failed }
+                return await self.handleSecureMessagingWake()
+            }
+        }
+
+        restoreTask = Task { [weak self] in await self?.restore() }
+        Task { [weak self] in
+            await MessageNotificationActionDispatcher.shared.install { [weak self] action in
+                guard let self else { return false }
+                return await self.handleMessageNotificationAction(action)
+            }
+        }
+        NotificationCoordinator.shared.replayPendingCallEvents()
+    }
+
+    private func handleSecureMessagingWake() async -> UIBackgroundFetchResult {
+        if let restoreTask { await restoreTask.value }
+        let result = await syncSecureMessagingIfPermitted(
+            presentsVisibleMessageNotifications: true
+        )
+        await drainReadyOutbox()
+        return result
+    }
+
+    deinit {
+        contactSyncTask?.cancel()
+        contactChangeDebounceTask?.cancel()
+        restoreTask?.cancel()
+        profileUpdateTask?.cancel()
+        profileAvatarResumeTask?.cancel()
+        callEventDrainTask?.cancel()
+        callHistoryRefreshTask?.cancel()
+        callHistoryBackfillTask?.cancel()
+        callSystemEventDrainTask?.cancel()
+        waitingCallMergeTask?.cancel()
+        visibleConversationSyncTask?.cancel()
+        outboxWakeTask?.cancel()
+        communicationReplayTask?.cancel()
+        ephemeralOutgoingCallTask?.cancel()
+        ephemeralCallCancellationTask?.cancel()
+        observers.forEach(NotificationCenter.default.removeObserver)
+    }
+
+    var profile: UserProfile? { state.profile }
+    var waitingCall: AuthenticatedWaitingCall? { callWaitingState.waitingCall }
+    var isMergingWaitingCall: Bool { callWaitingState.isMerging }
+    var communicationSurfacesConcealed: Bool {
+        isSubmittingAccountDeletion
+            || acceptedAccountDeletionCleanupBlocked
+            || protectedLocalStateRecoveryBlocked
+            || unresolvedAccountDeletionAttemptBlocked
+    }
+    var isManagingProfileEmail: Bool { profileEmailOperation != nil }
+    var contactDirectory: [WalletContactDTO] { state.contacts ?? [] }
+    var registeredDevices: [DeviceDTO] { state.registeredDevices ?? [] }
+    var verifyIdentityOnNewLogin: Bool {
+        securityPreferences?.verifyIdentityOnNewLogin ?? false
+    }
+    var hasLoadedSecurityPreferences: Bool { securityPreferences != nil }
+    var isManagingSecurityPreferences: Bool {
+        isLoadingSecurityPreferences || isUpdatingSecurityPreferences
+    }
+    var communicationContactDirectory: [WalletContactDTO] {
+        contactDirectory.filter { contact in
+            if let userID = ContactRecipientDirectory.recipientUserId(for: contact) {
+                return communicationPrivacyAllowsOutbound(to: userID)
+            }
+            // A malformed row claiming to be a Kit Pay account is not downgraded into an invite.
+            return contact.isKitUser != true
+        }
+    }
+    var phoneIdentityContext: PhoneIdentityContext {
+        PhoneIdentityContext(
+            referencePhone: profile?.phone,
+            countryISOCode: profile?.countryCode ?? Locale.current.region?.identifier
+        )
+    }
+    var selectedWallet: Wallet? {
+        if let id = state.selectedWalletId, let selected = state.wallets.first(where: { $0.id == id }) {
+            return selected
+        }
+        return state.wallets.first(where: { $0.isPrimary == true }) ?? state.wallets.first
+    }
+    var queuedCount: Int {
+        state.outbox.filter { $0.failureDisposition != .requiresUserRetry }.count
+    }
+    var biometricDisplayName: String { biometricKind.displayName }
+    var biometricSymbolName: String { biometricKind.symbolName }
+    var financialApprovalUsesBiometrics: Bool {
+        KitFinancialStepUpApprovalPolicy.method(
+            biometricsEnabled: biometricUnlockEnabled
+        ) == .biometricSignature
+    }
+    var requiresBiometricSignIn: Bool {
+        isSignedIn
+            && accountSetupStep == nil
+            && biometricUnlockEnabled
+            && biometricAccessState != .authorized
+    }
+    var homeAccessGranted: Bool {
+        !biometricUnlockEnabled
+            || homeBiometricState == .notRequired
+            || homeBiometricState == .authorized
+    }
+    var loginUnlockSupportsBiometrics: Bool {
+        biometricUnlockEnabled
+            && biometricErrorMessage == nil
+            && sessionAssurance?.loginUnlock.supportsBiometricSignature == true
+    }
+    /// Secure messaging remains fail-closed unless the server advertises the reviewed wire
+    /// protocol and this device owns the active enrollment. Build 5 enables that reviewed path
+    /// so TestFlight devices can exercise real encrypted delivery and recovery end to end.
+    var secureMessagingAvailable: Bool {
+        secureMessagingReleasePermitted
+            && state.secureMessaging?.enrollment?.userID == profile?.id
+    }
+    private var secureMessagingReleasePermitted: Bool {
+        guard SecureMessagingReleaseGate.enabled else { return false }
+        if let capabilities {
+            return capabilities.features?["messaging"] == true
+                && capabilities.protocols?.messaging?.supportsReviewedV2 == true
+        }
+        // A previously enrolled device may cold-launch without connectivity. Permit only local,
+        // encrypted-at-rest queuing until capabilities are refreshed; transport still rechecks
+        // the server and current roster before any bytes leave the device.
+        return !isOnline && state.secureMessaging?.enrollment?.userID == profile?.id
+    }
+    var messagingSendFailureMessage: String { CustomerFacingMessagingCopy.sendFailure }
+    var callsFeatureEnabled: Bool { CallLifecyclePolicy.featureEnabled(capabilities) }
+    var mayCreateCall: Bool {
+        CallLifecyclePolicy.mayCreateCall(
+            signedIn: isSignedIn,
+            online: isOnline,
+            capabilities: capabilities
+        )
+    }
+
+    private func enqueueCallLifecycleEvent(_ event: CallLifecycleEvent) {
+        guard receivedCallEventIds.insert(event.id).inserted else { return }
+        guard !communicationSurfacesConcealed else {
+            NotificationCoordinator.shared.acknowledgeCallEvent(event.id)
+            return
+        }
+        let requiresAuthenticatedIncomingFirst: Bool
+        if case .systemAction(let action) = event {
+            requiresAuthenticatedIncomingFirst = callSystemActionRequiresAuthenticatedIncomingFirst(
+                action
+            )
+        } else {
+            requiresAuthenticatedIncomingFirst = false
+        }
+        receivedCallEventOrder.append(event.id)
+        while receivedCallEventOrder.count > 128 {
+            receivedCallEventIds.remove(receivedCallEventOrder.removeFirst())
+        }
+        if case .systemAction(let action) = event,
+           action.kind == .decline || action.kind == .end || action.kind == .timedOut {
+            // Cancellation intent must be visible while an earlier answer request is suspended.
+            // Otherwise accepted media could reconnect briefly after the user has hung up.
+            locallyTerminatedCallIds.insert(action.callId.lowercased())
+        }
+        if case .incoming = event {
+            // This client supports one CallKit/media admission at a time. Prioritize the real
+            // incoming call over an offline/provisional outgoing screen and fence any late POST.
+            cancelEphemeralOutgoingCall(dismissPresentation: true)
+        }
+        if case .systemAction(let action) = event,
+           action.kind == .answer,
+           !requiresAuthenticatedIncomingFirst {
+            // The answer event can be restored independently of its incoming notice. Repeat the
+            // cancellation synchronously so a stale pending client ID can never poison media.
+            cancelEphemeralOutgoingCall(dismissPresentation: true)
+        }
+        if case .systemAction(let action) = event,
+           action.kind == .answer,
+           !requiresAuthenticatedIncomingFirst,
+           let lease = callMediaAccountLease {
+            CallMediaCoordinator.shared.presentConnecting(
+                incomingPresentation(for: action),
+                lease: lease
+            )
+        }
+        if case .systemAction(let action) = event,
+           action.kind != .timedOut,
+           !requiresAuthenticatedIncomingFirst {
+            queuedCallSystemActions.append(action)
+            startCallSystemEventDrainIfNeeded()
+            return
+        }
+        queuedCallEvents.append(event)
+        guard callEventDrainTask == nil else { return }
+        callEventDrainTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            if let restoreTask = self.restoreTask { await restoreTask.value }
+            while !Task.isCancelled, !self.queuedCallEvents.isEmpty {
+                let event = self.queuedCallEvents.removeFirst()
+                guard !self.acceptedAccountDeletionCleanupBlocked,
+                      !self.protectedLocalStateRecoveryBlocked,
+                      !self.unresolvedAccountDeletionAttemptBlocked
+                else {
+                    NotificationCoordinator.shared.acknowledgeCallEvent(event.id)
+                    continue
+                }
+                switch event {
+                case .verificationRequested(let request):
+                    await self.verifyIncomingCallOwnership(request)
+                case .incoming(let notice):
+                    await self.recordAuthenticatedIncomingCall(notice.call)
+                case .systemAction(let action):
+                    await self.handleCallSystemAction(action)
+                }
+                NotificationCoordinator.shared.acknowledgeCallEvent(event.id)
+            }
+            self.callEventDrainTask = nil
+        }
+    }
+
+    private func startCallSystemEventDrainIfNeeded() {
+        guard callSystemEventDrainTask == nil else { return }
+        callSystemEventDrainTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            if let restoreTask = self.restoreTask { await restoreTask.value }
+            while !Task.isCancelled, !self.queuedCallSystemActions.isEmpty {
+                let action = self.queuedCallSystemActions.removeFirst()
+                if self.isSubmittingAccountDeletion
+                    || self.acceptedAccountDeletionCleanupBlocked
+                    || self.protectedLocalStateRecoveryBlocked
+                    || self.unresolvedAccountDeletionAttemptBlocked {
+                    await self.retireBlockedCallActionIfOwned(action)
+                } else {
+                    await self.handleCallSystemAction(action)
+                }
+                NotificationCoordinator.shared.acknowledgeCallEvent(action.eventId)
+            }
+            self.callSystemEventDrainTask = nil
+        }
+    }
+
+    private func incomingPresentation(for action: CallSystemAction) -> ActiveCallPresentation {
+        let storedCall = state.calls.first {
+            $0.id.caseInsensitiveCompare(action.callId) == .orderedSame
+        }
+        let avatarURL = callParticipantAvatarURL(for: storedCall?.participantUserIds)
+        if let presentation = action.presentation {
+            return ActiveCallPresentation(
+                id: presentation.id,
+                conversationId: presentation.conversationId,
+                participantName: presentation.participantName,
+                participantAvatarURL: presentation.participantAvatarURL ?? avatarURL,
+                video: presentation.video,
+                direction: presentation.direction
+            )
+        }
+        return ActiveCallPresentation(
+            id: action.callId,
+            participantName: storedCall?.name ?? "Kit Pay contact",
+            participantAvatarURL: avatarURL,
+            video: storedCall?.isVideoCall ?? false,
+            direction: "incoming"
+        )
+    }
+
+    /// Waiting-call actions must stay behind the authenticated incoming notice that authorizes the
+    /// caller identity used by Merge. An Answer action is also moved to that ordered lane whenever
+    /// it targets a different in-memory call, so it can never replace an existing media session.
+    private func callSystemActionRequiresAuthenticatedIncomingFirst(
+        _ action: CallSystemAction
+    ) -> Bool {
+        switch action.kind {
+        case .mergeWaiting:
+            return true
+        case .answer:
+            return callActionTargetsDifferentActiveMediaCall(action)
+        case .decline, .end, .timedOut:
+            return false
+        }
+    }
+
+    private func callActionTargetsDifferentActiveMediaCall(
+        _ action: CallSystemAction
+    ) -> Bool {
+        guard let activeCallID = CallMediaCoordinator.shared.activeCall?.id else { return false }
+        // Once media exists, malformed ownership is contradictory rather than equivalent. Route
+        // it through the different-call rejection path so it can never replace current media.
+        guard let canonicalActiveCallID = canonicalCallID(activeCallID),
+              let canonicalActionCallID = canonicalCallID(action.callId)
+        else { return true }
+        return canonicalActiveCallID != canonicalActionCallID
+    }
+
+    private func canonicalCallID(_ value: String?) -> String? {
+        guard let value,
+              value == value.trimmingCharacters(in: .whitespacesAndNewlines),
+              let identifier = UUID(uuidString: value)
+        else { return nil }
+        return identifier.uuidString.lowercased()
+    }
+
+    private func callOwnsActiveMedia(callID: String) -> Bool {
+        guard let callID = canonicalCallID(callID) else { return false }
+        if let presentedCallID = CallMediaCoordinator.shared.activeCall?.id,
+           let presentedCallID = canonicalCallID(presentedCallID) {
+            return presentedCallID == callID
+        }
+        return state.calls.contains {
+            canonicalCallID($0.id) == callID && $0.state == .active
+        }
+    }
+
+    private func callParticipantAvatarURL(for participantUserIds: [String]?) -> String? {
+        guard let participantUserIds,
+              let remoteUserId = participantUserIds.first(where: {
+                  $0.caseInsensitiveCompare(profile?.id ?? "") != .orderedSame
+              }),
+              let rawValue = contactDirectory.first(where: {
+                  $0.id.caseInsensitiveCompare(remoteUserId) == .orderedSame
+              })?.avatarURL?.trimmingCharacters(in: .whitespacesAndNewlines),
+              let url = URL(string: rawValue),
+              url.scheme?.lowercased() == "https",
+              url.host != nil
+        else { return nil }
+        return url.absoluteString
+    }
+
+    private func resumeAcceptedAccountDeletionCleanupBeforeRestore() async -> Bool {
+        var deletionAttempt: PendingAccountDeletionAttempt?
+        do {
+            deletionAttempt = try await accountDeletionAttempts.pending()
+        } catch {
+            if error as? AccountDeletionPurgeMarkerError == .invalidMarker {
+                await blockUnresolvedAccountDeletionAttempt()
+            } else {
+                await blockProtectedLocalStateRecovery()
+            }
+            return false
+        }
+        if let deletionAttempt {
+            privacyQuarantineTargetAccountID = deletionAttempt.accountID
+            clearAllCallWaitingState()
+            NotificationCoordinator.shared.beginPrivacyQuarantine(
+                targetAccountID: deletionAttempt.accountID
+            )
+        }
+
+        let pending: PendingAcceptedAccountDeletion?
+        let markerIsDurable: Bool
+        do {
+            if let stored = try await acceptedAccountDeletionPurges.pending() {
+                pending = stored
+                markerIsDurable = true
+            } else if let volatileAcceptedAccountDeletion {
+                pending = volatileAcceptedAccountDeletion
+                do {
+                    try await acceptedAccountDeletionPurges.schedule(
+                        volatileAcceptedAccountDeletion
+                    )
+                    markerIsDurable = true
+                } catch {
+                    markerIsDurable = false
+                }
+            } else {
+                pending = nil
+                markerIsDurable = false
+            }
+        } catch {
+            if error as? AccountDeletionPurgeMarkerError == .invalidMarker {
+                await concealUnresolvedAcceptedAccountDeletionProjection()
+                lastError =
+                    "This device could not finish removing data for an accepted account deletion. "
+                    + "Use account deletion support before signing in again."
+            } else {
+                await blockProtectedLocalStateRecovery()
+            }
+            return false
+        }
+
+        if let pending {
+            privacyQuarantineTargetAccountID = pending.accountID
+            clearAllCallWaitingState()
+            NotificationCoordinator.shared.beginPrivacyQuarantine(
+                targetAccountID: pending.accountID
+            )
+            guard markerIsDurable else {
+                await concealUnresolvedAcceptedAccountDeletionProjection()
+                lastError =
+                    "This device could not safely schedule accepted account-deletion cleanup. "
+                    + "Use account deletion support before signing in again."
+                return false
+            }
+        }
+
+        switch await store.prepareForRestore() {
+        case .ready:
+            await store.resolveProtectedStateRecoveryConcealment()
+            protectedLocalStateRecoveryBlocked = false
+            protectedLocalStateRecoveryRequiresSupport = false
+        case .temporarilyUnavailable:
+            if pending != nil || acceptedAccountDeletionCleanupBlocked {
+                await concealUnresolvedAcceptedAccountDeletionProjection()
+                lastError =
+                    "Unlock this device, then retry secure account-deletion cleanup."
+            } else if deletionAttempt != nil {
+                await blockUnresolvedAccountDeletionAttempt()
+            } else {
+                await blockProtectedLocalStateRecovery()
+            }
+            return false
+        case .invalid:
+            if pending != nil || acceptedAccountDeletionCleanupBlocked {
+                await concealUnresolvedAcceptedAccountDeletionProjection()
+                lastError =
+                    "This device could not read protected data required to finish account deletion. "
+                    + "Use account deletion support before signing in again."
+            } else if deletionAttempt != nil {
+                await blockUnresolvedAccountDeletionAttempt()
+            } else {
+                await blockProtectedLocalStateRecovery(requiresSupport: true)
+            }
+            return false
+        }
+
+        guard let pending else {
+            if let deletionAttempt {
+                // Projection/session absence cannot prove that the irreversible request was
+                // accepted. Only a durably verified accepted marker authorizes destructive
+                // cleanup; an attempt-only launch therefore remains support-blocked.
+                privacyQuarantineTargetAccountID = deletionAttempt.accountID
+                await blockUnresolvedAccountDeletionAttempt()
+                return false
+            }
+            if acceptedAccountDeletionCleanupBlocked {
+                do {
+                    guard try await store
+                        .resolveAcceptedDeletionConcealmentAfterVerifiedEmptyState()
+                    else {
+                        await concealUnresolvedAcceptedAccountDeletionProjection()
+                        lastError =
+                            "This device is still finishing an accepted account deletion. "
+                            + "No account data is available until local cleanup completes."
+                        return false
+                    }
+                } catch {
+                    await concealUnresolvedAcceptedAccountDeletionProjection()
+                    lastError =
+                        "This device could not finish removing data for an accepted account deletion. "
+                        + "Use account deletion support before signing in again."
+                    return false
+                }
+            }
+            acceptedAccountDeletionCleanupBlocked = false
+            unresolvedAccountDeletionAttemptBlocked = false
+            return true
+        }
+
+        if let deletionAttempt, !deletionAttempt.matches(pending) {
+            privacyQuarantineTargetAccountID = nil
+            await blockUnresolvedAccountDeletionAttempt()
+            return false
+        }
+
+        await store.concealStateForUnresolvedAcceptedAccountDeletion()
+
+        guard await finishAcceptedAccountDeletionLocalPurge(pending) else {
+            await concealUnresolvedAcceptedAccountDeletionProjection()
+            acceptedAccountDeletionCleanupBlocked = true
+            lastError =
+                "This device is still finishing an accepted account deletion. "
+                + "No account data is available until local cleanup completes."
+            isLoading = true
+            return false
+        }
+        let revokedMediaLease = callMediaAccountLease.flatMap { lease in
+            lease.userID.caseInsensitiveCompare(pending.accountID) == .orderedSame
+                ? lease
+                : nil
+        }
+        if revokedMediaLease != nil {
+            callMediaAccountLease = nil
+            await CallMediaCoordinator.shared.resetForSignOut(revoking: revokedMediaLease)
+        }
+        await pushRegistrations.reset(accountID: pending.accountID)
+        do {
+            _ = try await biometrics.removeEnrollmentForAcceptedAccountDeletion(
+                userID: pending.accountID,
+                installationID: installationID()
+            )
+        } catch {
+            await concealUnresolvedAcceptedAccountDeletionProjection()
+            lastError =
+                "This device is still finishing secure account-deletion cleanup. "
+                + "Unlock it and retry before signing in again."
+            return false
+        }
+        // Successful exact-target cleanup proves that no replacement session or projection owns
+        // this process. Retire Apple delivery as a signed-out device so a deleted account cannot
+        // keep producing generic PushKit calls after its durable markers are removed.
+        NotificationCoordinator.shared.suspendRegistrationAfterSignOut()
+        let targetFingerprint = MessageNotificationContract.accountFingerprint(
+            for: pending.accountID
+        )
+        await NotificationCoordinator.shared.clearMessageNotifications(
+            accountFingerprint: targetFingerprint
+        )
+        // Retire the ambiguity fence first. If the process dies before the accepted marker is
+        // removed, the accepted marker remains sufficient authority to repeat exact-target cleanup.
+        if let deletionAttempt {
+            do {
+                guard try await accountDeletionAttempts.completeIfCurrent(deletionAttempt) else {
+                    throw AccountDeletionPurgeMarkerError.conflictingMarker
+                }
+            } catch {
+                await blockUnresolvedAccountDeletionAttempt()
+                return false
+            }
+        }
+        do {
+            guard try await acceptedAccountDeletionPurges.completeIfCurrent(pending) else {
+                throw AccountDeletionPurgeMarkerError.conflictingMarker
+            }
+        } catch {
+            await concealUnresolvedAcceptedAccountDeletionProjection()
+            acceptedAccountDeletionCleanupBlocked = true
+            lastError =
+                "This device is still finishing an accepted account deletion. "
+                + "No account data is available until local cleanup completes."
+            isLoading = true
+            return false
+        }
+        if volatileAcceptedAccountDeletion == pending {
+            volatileAcceptedAccountDeletion = nil
+        }
+        if volatileAcceptedAccountDeletion != nil {
+            return await resumeAcceptedAccountDeletionCleanupBeforeRestore()
+        }
+        privacyQuarantineTargetAccountID = nil
+        unresolvedAccountDeletionAttemptBlocked = false
+        acceptedAccountDeletionCleanupBlocked = false
+        return true
+    }
+
+    /// Keeps an unresolved accepted-deletion projection inaccessible without erasing a newer,
+    /// conflicting owner's durable state. Recovery may reveal it only after the marker is safely
+    /// resolved; every direct store snapshot remains empty in the meantime.
+    private func concealUnresolvedAcceptedAccountDeletionProjection() async {
+        activeConversationID = nil
+        stopVisibleConversationSync()
+        await store.concealStateForUnresolvedAcceptedAccountDeletion()
+        await enterCommunicationPrivacyQuarantine()
+        state = .empty
+        isSignedIn = false
+        acceptedAccountDeletionCleanupBlocked = true
+        protectedLocalStateRecoveryBlocked = false
+        protectedLocalStateRecoveryRequiresSupport = false
+        unresolvedAccountDeletionAttemptBlocked = false
+        isLoading = true
+    }
+
+    private func blockProtectedLocalStateRecovery(requiresSupport: Bool = false) async {
+        activeConversationID = nil
+        stopVisibleConversationSync()
+        await store.concealStateForProtectedStateRecovery()
+        await enterCommunicationPrivacyQuarantine()
+        state = .empty
+        isSignedIn = false
+        protectedLocalStateRecoveryBlocked = true
+        protectedLocalStateRecoveryRequiresSupport = requiresSupport
+        unresolvedAccountDeletionAttemptBlocked = false
+        isLoading = true
+        lastError = nil
+    }
+
+    private func blockUnresolvedAccountDeletionAttempt() async {
+        activeConversationID = nil
+        stopVisibleConversationSync()
+        await store.concealStateForUnresolvedAcceptedAccountDeletion()
+        await enterCommunicationPrivacyQuarantine()
+        state = .empty
+        isSignedIn = false
+        unresolvedAccountDeletionAttemptBlocked = true
+        acceptedAccountDeletionCleanupBlocked = false
+        protectedLocalStateRecoveryBlocked = false
+        protectedLocalStateRecoveryRequiresSupport = false
+        isLoading = true
+        lastError = nil
+    }
+
+    private func enterCommunicationPrivacyQuarantine() async {
+        let targetAccountID = privacyQuarantineTargetAccountID
+        clearAllCallWaitingState()
+        NotificationCoordinator.shared.beginPrivacyQuarantine(
+            targetAccountID: targetAccountID
+        )
+        if let targetAccountID,
+           let targetLease = callMediaAccountLease,
+           targetLease.userID.caseInsensitiveCompare(targetAccountID) == .orderedSame {
+            callMediaAccountLease = nil
+            didResumeAuthenticatedSession = false
+            await CallMediaCoordinator.shared.resetForSignOut(revoking: targetLease)
+        }
+        let targetFingerprint = MessageNotificationContract.accountFingerprint(
+            for: targetAccountID
+        )
+        await NotificationCoordinator.shared.clearMessageNotifications(
+            accountFingerprint: targetFingerprint
+        )
+        callEventDrainTask?.cancel()
+        callEventDrainTask = nil
+        callSystemEventDrainTask?.cancel()
+        callSystemEventDrainTask = nil
+        for event in queuedCallEvents {
+            NotificationCoordinator.shared.acknowledgeCallEvent(event.id)
+        }
+        for action in queuedCallSystemActions {
+            NotificationCoordinator.shared.acknowledgeCallEvent(action.eventId)
+        }
+        queuedCallEvents.removeAll()
+        queuedCallSystemActions.removeAll()
+    }
+
+    func retryProtectedLocalStateRecovery() async {
+        guard protectedLocalStateRecoveryBlocked else { return }
+        await restore()
+    }
+
+    func retryAcceptedAccountDeletionCleanup() async {
+        guard acceptedAccountDeletionCleanupBlocked else { return }
+        lastError = nil
+        isLoading = true
+        guard await resumeAcceptedAccountDeletionCleanupBeforeRestore() else { return }
+        await restore()
+    }
+
+    /// Finishes one exact accepted-deletion target without touching a replacement account or a
+    /// newer session. A durable marker is retired only after both protected state and the named
+    /// Keychain credential generation are absent.
+    private func finishAcceptedAccountDeletionLocalPurge(
+        _ pending: PendingAcceptedAccountDeletion
+    ) async -> Bool {
+        let initialSessionDisposition: AcceptedAccountDeletionSessionDisposition
+        do {
+            initialSessionDisposition = try await sessions.acceptedDeletionDisposition(
+                accountID: pending.accountID,
+                sessionID: pending.sessionID
+            )
+        } catch {
+            await concealUnresolvedAcceptedAccountDeletionProjection()
+            return false
+        }
+        guard initialSessionDisposition != .conflict else {
+            await concealUnresolvedAcceptedAccountDeletionProjection()
+            return false
+        }
+
+        let projectionResult: AcceptedAccountDeletionProjectionPurgeResult
+        do {
+            projectionResult = try await store.purgeAcceptedAccountDeletion(
+                accountID: pending.accountID
+            )
+        } catch {
+            await concealUnresolvedAcceptedAccountDeletionProjection()
+            return false
+        }
+        guard projectionResult != .ownerConflict else {
+            await concealUnresolvedAcceptedAccountDeletionProjection()
+            return false
+        }
+
+        if initialSessionDisposition == .exactTarget {
+            do {
+                guard try await sessions.clearAcceptedDeletionTarget(
+                    accountID: pending.accountID,
+                    sessionID: pending.sessionID
+                ) == .cleared
+                else {
+                    await concealUnresolvedAcceptedAccountDeletionProjection()
+                    return false
+                }
+            } catch {
+                await concealUnresolvedAcceptedAccountDeletionProjection()
+                return false
+            }
+        }
+        do {
+            guard try await sessions.acceptedDeletionDisposition(
+                accountID: pending.accountID,
+                sessionID: pending.sessionID
+            ) == .alreadyAbsent
+            else {
+                await concealUnresolvedAcceptedAccountDeletionProjection()
+                return false
+            }
+        } catch {
+            await concealUnresolvedAcceptedAccountDeletionProjection()
+            return false
+        }
+
+        return true
+    }
+
+    func restore() async {
+        guard await resumeAcceptedAccountDeletionCleanupBeforeRestore() else { return }
+        let restorationAccountEpoch = accountEpoch
+        var restoredState = await store.snapshot()
+        var migratedState = restoredState
+        let ownerBeforeMigration = migratedState.communicationOwnerUserID
+        if let restoredProfile = migratedState.profile {
+            migratedState.bindAuthenticatedProfile(restoredProfile)
+        }
+        let ownerWasMigrated = migratedState.communicationOwnerUserID != ownerBeforeMigration
+        let removedLegacyCallAttempts = OutboxPolicy.removeLegacyCallAttempts(
+            in: &migratedState
+        )
+        if OutboxPolicy.quarantineMessagesWithoutServerConversation(in: &migratedState) > 0
+            || ownerWasMigrated
+            || removedLegacyCallAttempts > 0 {
+            do {
+                try await store.replace(migratedState)
+            } catch {
+                // Never replace an unreadable protected-state file with an
+                // empty projection merely to perform a legacy migration.
+            }
+            // Even if the best-effort rewrite fails, this process must never replay a legacy
+            // durable call attempt. A later launch repeats the same fail-closed migration.
+            restoredState = migratedState
+        }
+        var restoredSession = await sessions.current()
+        if let session = restoredSession, session.accountId == nil {
+            let expectedProjection = await store.snapshot()
+            let expectedProfileID = expectedProjection.profile?.id
+            let expectedOwnerID = expectedProjection.communicationOwnerUserID
+            // A cached profile cannot authenticate a legacy Keychain record: older app versions
+            // could be interrupted between their independent session/profile writes. Resolve the
+            // account with these exact credentials before binding or exposing any cached work.
+            do {
+                let bootstrap = try await APIClientSessionBinding.$sessionID.withValue(
+                    session.sessionId
+                ) {
+                    try await api.bootstrap()
+                }
+                guard let boundSession = SessionAccountBindingPolicy.bindLegacySession(
+                    session,
+                    authenticatedProfile: bootstrap.user
+                ),
+                    try await sessions.replaceIfCurrent(session, with: boundSession)
+                else { throw StoreError.accountChanged }
+
+                let selectedID = bootstrap.selectedWalletId
+                    ?? bootstrap.wallets.first(where: { $0.isPrimary == true })?.id
+                    ?? bootstrap.wallets.first?.id
+                guard await restoredSessionContextIsCurrent(
+                    accountEpoch: restorationAccountEpoch,
+                    session: boundSession
+                ) else { throw StoreError.accountChanged }
+                try await store.update { persisted in
+                    guard SessionAccountBindingPolicy.restorationProjectionMatches(
+                        persisted,
+                        expectedProfileID: expectedProfileID,
+                        expectedOwnerID: expectedOwnerID
+                    ) else { throw StoreError.accountChanged }
+                    persisted.bindAuthenticatedProfile(bootstrap.user)
+                    persisted.sessionAssurance = bootstrap.sessionAssurance
+                    persisted.wallets = bootstrap.wallets
+                    persisted.selectedWalletId = selectedID
+                }
+                guard await restoredSessionContextIsCurrent(
+                    accountEpoch: restorationAccountEpoch,
+                    session: boundSession
+                ) else { throw StoreError.accountChanged }
+                let authenticatedState = await store.snapshot()
+                guard await restoredSessionContextIsCurrent(
+                    accountEpoch: restorationAccountEpoch,
+                    session: boundSession
+                ) else { throw StoreError.accountChanged }
+                restoredState = authenticatedState
+                restoredSession = boundSession
+            } catch {
+                guard await retireFailedRestoredSession(
+                    session,
+                    accountEpoch: restorationAccountEpoch
+                ) else { return }
+                state = await store.snapshot()
+                _ = await reloadCapabilities()
+                lastError = "Your saved sign-in could not be verified safely. Sign in again."
+                isLoading = false
+                return
+            }
+        }
+
+        if let session = restoredSession,
+           !SessionAccountBindingPolicy.matches(session, profile: restoredState.profile) {
+            let expectedProjection = await store.snapshot()
+            let expectedProfileID = expectedProjection.profile?.id
+            let expectedOwnerID = expectedProjection.communicationOwnerUserID
+            // Authentication persists the account-bound Keychain record before the protected
+            // profile file. If iOS terminates in that narrow window, rebuild only from an
+            // authenticated bootstrap that proves the same account ID.
+            do {
+                guard let expectedAccountID = session.accountId else {
+                    throw StoreError.accountChanged
+                }
+                let bootstrap = try await APIClientSessionBinding.$sessionID.withValue(
+                    session.sessionId
+                ) {
+                    try await api.bootstrap()
+                }
+                let currentSession = await sessions.current()
+                guard bootstrap.user.id.caseInsensitiveCompare(expectedAccountID) == .orderedSame,
+                      let currentSession,
+                      currentSession.sessionId.caseInsensitiveCompare(session.sessionId)
+                        == .orderedSame,
+                      currentSession.accountId?.caseInsensitiveCompare(expectedAccountID)
+                        == .orderedSame
+                else { throw StoreError.accountChanged }
+                let selectedID = bootstrap.selectedWalletId
+                    ?? bootstrap.wallets.first(where: { $0.isPrimary == true })?.id
+                    ?? bootstrap.wallets.first?.id
+                guard await restoredSessionContextIsCurrent(
+                    accountEpoch: restorationAccountEpoch,
+                    session: currentSession
+                ) else { throw StoreError.accountChanged }
+                try await store.update { persisted in
+                    guard SessionAccountBindingPolicy.restorationProjectionMatches(
+                        persisted,
+                        expectedProfileID: expectedProfileID,
+                        expectedOwnerID: expectedOwnerID
+                    ) else { throw StoreError.accountChanged }
+                    persisted.bindAuthenticatedProfile(bootstrap.user)
+                    persisted.sessionAssurance = bootstrap.sessionAssurance
+                    persisted.wallets = bootstrap.wallets
+                    persisted.selectedWalletId = selectedID
+                }
+                guard await restoredSessionContextIsCurrent(
+                    accountEpoch: restorationAccountEpoch,
+                    session: currentSession
+                ) else { throw StoreError.accountChanged }
+                let authenticatedState = await store.snapshot()
+                guard await restoredSessionContextIsCurrent(
+                    accountEpoch: restorationAccountEpoch,
+                    session: currentSession
+                ) else { throw StoreError.accountChanged }
+                restoredState = authenticatedState
+            } catch {
+                guard await retireFailedRestoredSession(
+                    session,
+                    accountEpoch: restorationAccountEpoch
+                ) else { return }
+                state = await store.snapshot()
+                _ = await reloadCapabilities()
+                lastError = "Your saved sign-in could not be restored safely. Sign in again."
+                isLoading = false
+                return
+            }
+        }
+
+        if let restoredSession {
+            guard await restoredSessionContextIsCurrent(
+                accountEpoch: restorationAccountEpoch,
+                session: restoredSession
+            ) else {
+                await failRestoredSession(
+                    restoredSession,
+                    accountEpoch: restorationAccountEpoch,
+                    message: "Your saved sign-in could not be restored safely. Sign in again."
+                )
+                return
+            }
+        } else {
+            guard !Task.isCancelled,
+                  !isSigningOut,
+                  accountEpoch == restorationAccountEpoch
+            else { return }
+        }
+        state = restoredState
+        restoreCommunicationPrivacyCache()
+        locallyTerminatedCallIds.formUnion(
+            state.outbox.compactMap(OutboxPolicy.terminationReplay).map(\.callId)
+        )
+        rebuildCallContacts()
+        if let restoredSession,
+           let restoredUserID = restoredSession.accountId,
+           SessionAccountBindingPolicy.matches(restoredSession, profile: state.profile) {
+            let restorationContext = AuthenticatedSecurityContext(
+                accountEpoch: restorationAccountEpoch,
+                userID: restoredUserID,
+                sessionID: restoredSession.sessionId
+            )
+            // Resolve the local gate before publishing a signed-in state. Otherwise RootView can
+            // render cached account content during the Keychain/LocalAuthentication suspension.
+            guard await loadBiometricConfiguration(
+                context: restorationContext,
+                requiresSignedIn: false
+            ), await restoredSessionContextIsCurrent(
+                accountEpoch: restorationAccountEpoch,
+                session: restoredSession
+            ) else {
+                await failRestoredSession(
+                    restoredSession,
+                    accountEpoch: restorationAccountEpoch,
+                    message: "Your saved sign-in could not be restored safely. Sign in again."
+                )
+                return
+            }
+            let cachedAssurance = restoredState.sessionAssurance
+            sessionAssurance = cachedAssurance
+            accountSetupStep = AccountSetupPolicy.restoredStep(
+                user: state.profile,
+                assurance: cachedAssurance
+            )
+            isSignedIn = true
+            do {
+                let liveAssurance = try await APIClientSessionBinding.$sessionID.withValue(
+                    restoredSession.sessionId
+                ) {
+                    try await api.sessionAssurance()
+                }
+                guard await authenticatedSecurityContextIsCurrent(restorationContext) else {
+                    await failRestoredSession(
+                        restoredSession,
+                        accountEpoch: restorationAccountEpoch,
+                        message: "Your saved sign-in could not be restored safely. Sign in again."
+                    )
+                    return
+                }
+                sessionAssurance = liveAssurance
+                try? await store.update { persisted in
+                    guard persisted.profile?.id.caseInsensitiveCompare(restoredUserID)
+                            == .orderedSame,
+                          persisted.communicationOwnerUserID?.caseInsensitiveCompare(
+                            restoredUserID
+                          ) == .orderedSame
+                    else {
+                        throw StoreError.accountChanged
+                    }
+                    persisted.sessionAssurance = liveAssurance
+                }
+                let updatedState = await store.snapshot()
+                guard updatedState.profile?.id.caseInsensitiveCompare(restoredUserID)
+                        == .orderedSame,
+                      await authenticatedSecurityContextIsCurrent(restorationContext)
+                else { return }
+                state = updatedState
+            } catch {
+                guard await authenticatedSecurityContextIsCurrent(restorationContext) else {
+                    await failRestoredSession(
+                        restoredSession,
+                        accountEpoch: restorationAccountEpoch,
+                        message: "Your saved sign-in could not be restored safely. Sign in again."
+                    )
+                    return
+                }
+                // A previously server-confirmed, encrypted projection may be viewed offline on
+                // this same installation. Live mutations still fail closed and reconnection
+                // refreshes the session before draining the outbox.
+                if let apiError = error as? APIClientError, case .signedOut = apiError {
+                    sessionAssurance = nil
+                } else {
+                    sessionAssurance = cachedAssurance
+                }
+                accountSetupStep = AccountSetupPolicy.restoredStep(
+                    user: state.profile,
+                    assurance: sessionAssurance
+                )
+                if sessionAssurance?.grantsFullAccess != true {
+                    lastError = error.localizedDescription
+                    isLoading = false
+                    return
+                }
+            }
+            guard await authenticatedSecurityContextIsCurrent(restorationContext) else { return }
+            accountSetupStep = AccountSetupPolicy.restoredStep(
+                user: state.profile,
+                assurance: sessionAssurance
+            )
+            if accountSetupStep == nil, biometricUnlockEnabled {
+                biometricAccessState = .locked
+                homeBiometricState = .locked
+                isLoading = false
+                guard await authenticateBiometrically(for: .returningSignIn) else { return }
+                guard await authenticatedSecurityContextIsCurrent(restorationContext) else {
+                    return
+                }
+            }
+            await resumeAuthenticatedSessionIfNeeded()
+        } else if let restoredSession {
+            await failRestoredSession(
+                restoredSession,
+                accountEpoch: restorationAccountEpoch,
+                message: "Your saved sign-in could not be matched to its account. Sign in again."
+            )
+        } else {
+            _ = await reloadCapabilities()
+            isLoading = false
+        }
+    }
+
+    private func restoredSessionContextIsCurrent(
+        accountEpoch expectedAccountEpoch: UUID,
+        session expectedSession: SessionTokens
+    ) async -> Bool {
+        guard !Task.isCancelled,
+              !isSigningOut,
+              accountEpoch == expectedAccountEpoch
+        else { return false }
+        guard let currentSession = await sessions.current() else { return false }
+        return !Task.isCancelled
+            && !isSigningOut
+            && accountEpoch == expectedAccountEpoch
+            && SessionAccountBindingPolicy.identifiesSameAccountSession(
+                currentSession,
+                expectedSession
+            )
+    }
+
+    private func retireFailedRestoredSession(
+        _ failedSession: SessionTokens,
+        accountEpoch expectedAccountEpoch: UUID
+    ) async -> Bool {
+        guard !Task.isCancelled,
+              !isSigningOut,
+              accountEpoch == expectedAccountEpoch
+        else { return false }
+        if let currentSession = await sessions.current() {
+            guard !Task.isCancelled,
+                  !isSigningOut,
+                  accountEpoch == expectedAccountEpoch,
+                  SessionAccountBindingPolicy.sameServerSession(
+                    currentSession,
+                    failedSession
+                  )
+            else { return false }
+            // `SessionStore.clear()` revokes its in-memory authority before removing the
+            // Keychain records. A Keychain deletion error must not strand launch forever after
+            // that revocation, but a replacement session must still survive this stale cleanup.
+            _ = try? await sessions.clearIfCurrent(currentSession)
+            guard !Task.isCancelled,
+                  !isSigningOut,
+                  accountEpoch == expectedAccountEpoch,
+                  await sessions.current() == nil
+            else { return false }
+        }
+        guard !Task.isCancelled,
+              !isSigningOut,
+              accountEpoch == expectedAccountEpoch,
+              await sessions.current() == nil
+        else { return false }
+        try? await store.clearFinancialAndSessionProjections(
+            preserveCommunicationHistory: true
+        )
+        let finalSession = await sessions.current()
+        return !Task.isCancelled
+            && !isSigningOut
+            && accountEpoch == expectedAccountEpoch
+            && finalSession == nil
+    }
+
+    private func failRestoredSession(
+        _ failedSession: SessionTokens,
+        accountEpoch expectedAccountEpoch: UUID,
+        message: String
+    ) async {
+        guard await retireFailedRestoredSession(
+            failedSession,
+            accountEpoch: expectedAccountEpoch
+        ) else { return }
+        activeConversationID = nil
+        stopVisibleConversationSync()
+        isSignedIn = false
+        sessionAssurance = nil
+        accountSetupStep = nil
+        biometricUnlockEnabled = false
+        biometricAccessState = .notRequired
+        homeBiometricState = .notRequired
+        locallyTerminatedCallIds.removeAll()
+        state = await store.snapshot()
+        rebuildCallContacts()
+        _ = await reloadCapabilities()
+        lastError = message
+        isLoading = false
+    }
+
+    func requestOTP(phone: String) async {
+        guard !isSignedIn else {
+            lastError = "Sign out before signing in with another phone number."
+            return
+        }
+        guard phoneOTPAvailable else {
+            lastError = "Phone sign-in is not available right now."
+            return
+        }
+        guard !isLoading else { return }
+        guard let normalized = UgandaMobileMoneyPhone.e164Value(from: phone) else {
+            lastError = "Enter a valid Uganda mobile number."
+            return
+        }
+        let attempt = beginAuthenticationRequest()
+        defer { finishAuthenticationRequest(attempt) }
+        do {
+            let result = try await api.requestPhoneOTP(phone: normalized, device: deviceRegistration())
+            guard authenticationAttempt == attempt else { return }
+            let challenge = try requiredChallenge(from: result, type: "phone_otp")
+            pendingPhone = normalized
+            pendingChallenge = challenge
+            pendingChallengeReceivedAt = Date()
+        } catch {
+            recordAuthenticationError(error, for: attempt)
+        }
+    }
+
+    func verifyOTP(code: String) async {
+        _ = await verifyAuthenticationCode(code)
+    }
+
+    @discardableResult
+    func loginWithEmail(email: String, password: String) async -> Bool {
+        guard !isSignedIn else {
+            lastError = "Sign out before signing in with another account."
+            return false
+        }
+        guard emailPasswordAvailable else {
+            lastError = "Email sign-in is not available right now."
+            return false
+        }
+        guard !isLoading else { return false }
+        let normalizedEmail = EmailAccountValidation.normalizeEmail(email).lowercased()
+        guard EmailAccountValidation.isValidEmail(normalizedEmail) else {
+            lastError = "Enter a valid email address."
+            return false
+        }
+        guard !password.isEmpty else {
+            lastError = "Enter your password."
+            return false
+        }
+        let attempt = beginAuthenticationRequest()
+        defer { finishAuthenticationRequest(attempt) }
+        do {
+            let result = try await api.loginWithEmail(
+                email: normalizedEmail,
+                password: password,
+                device: deviceRegistration()
+            )
+            guard authenticationAttempt == attempt else { return false }
+            try await handleAuthenticationResult(
+                result,
+                allowingChallengeKind: .twoFactor,
+                attempt: attempt
+            )
+            return true
+        } catch {
+            recordAuthenticationError(error, for: attempt)
+            return false
+        }
+    }
+
+    @discardableResult
+    func verifyAuthenticationCode(_ code: String) async -> Bool {
+        guard !isSignedIn else {
+            lastError = "Sign out before signing in with another account."
+            return false
+        }
+        guard !isLoading else { return false }
+        guard let challenge = pendingChallenge else {
+            lastError = "Request a new sign-in code."
+            return false
+        }
+        guard !AuthenticationChallengeTimingPolicy.isExpired(challenge) else {
+            clearPendingAuthentication()
+            lastError = "This sign-in code has expired. Request a new one."
+            return false
+        }
+
+        guard let challengeKind = challenge.kind else {
+            resetPendingAuthentication()
+            lastError = "Kit returned an unsupported sign-in challenge. Start again."
+            return false
+        }
+        guard let submittedCode = AuthenticationCodePolicy.normalizedCode(code, for: challenge) else {
+            lastError = challengeKind == .twoFactor
+                && challenge.method?.caseInsensitiveCompare("totp") == .orderedSame
+                ? "Enter a six-digit authenticator code or a complete recovery code."
+                : "Enter the complete six-digit verification code."
+            return false
+        }
+        switch challengeKind {
+        case .phoneOTP:
+            guard let phone = pendingPhone else {
+                lastError = "Request a new code for your phone number."
+                return false
+            }
+            let attempt = beginAuthenticationRequest(preservingChallenge: true)
+            defer { finishAuthenticationRequest(attempt) }
+            do {
+                let result = try await api.verifyPhoneOTP(
+                    challengeId: challenge.id,
+                    phone: phone,
+                    code: submittedCode,
+                    device: deviceRegistration()
+                )
+                guard authenticationAttempt == attempt else { return false }
+                try await handleAuthenticationResult(
+                    result,
+                    allowingChallengeKind: .twoFactor,
+                    attempt: attempt
+                )
+                return true
+            } catch {
+                recordAuthenticationError(error, for: attempt)
+                return false
+            }
+        case .twoFactor:
+            let attempt = beginAuthenticationRequest(preservingChallenge: true)
+            defer { finishAuthenticationRequest(attempt) }
+            do {
+                let result = try await api.verifyTwoFactor(
+                    challengeId: challenge.id,
+                    code: submittedCode
+                )
+                guard authenticationAttempt == attempt else { return false }
+                try await handleAuthenticationResult(result, attempt: attempt)
+                return true
+            } catch {
+                recordAuthenticationError(error, for: attempt)
+                return false
+            }
+        }
+    }
+
+    func resetPendingAuthentication() {
+        guard !isLoading else { return }
+        authenticationAttempt = UUID()
+        clearPendingAuthentication()
+    }
+
+    func pendingAuthenticationChallengeIsExpired(at date: Date = Date()) -> Bool {
+        guard let pendingChallenge else { return false }
+        return AuthenticationChallengeTimingPolicy.isExpired(pendingChallenge, at: date)
+    }
+
+    func pendingAuthenticationResendDelay(at date: Date = Date()) -> Int? {
+        guard let pendingChallenge,
+              let pendingChallengeReceivedAt
+        else { return nil }
+        return AuthenticationChallengeTimingPolicy.secondsUntilResend(
+            for: pendingChallenge,
+            receivedAt: pendingChallengeReceivedAt,
+            now: date
+        )
+    }
+
+    @discardableResult
+    func resendPhoneAuthenticationCode() async -> Bool {
+        guard !isSignedIn, !isLoading,
+              let challenge = pendingChallenge,
+              challenge.kind == .phoneOTP,
+              let phone = pendingPhone,
+              let receivedAt = pendingChallengeReceivedAt
+        else { return false }
+        guard !AuthenticationChallengeTimingPolicy.isExpired(challenge) else {
+            clearPendingAuthentication()
+            lastError = "This sign-in code has expired. Request a new one."
+            return false
+        }
+        guard let resendDelay = AuthenticationChallengeTimingPolicy.secondsUntilResend(
+            for: challenge,
+            receivedAt: receivedAt
+        ), resendDelay == 0 else { return false }
+
+        let attempt = beginAuthenticationRequest(preservingChallenge: true)
+        defer { finishAuthenticationRequest(attempt) }
+        do {
+            let result = try await api.requestPhoneOTP(
+                phone: phone,
+                device: deviceRegistration()
+            )
+            guard authenticationAttempt == attempt else { return false }
+            let renewed = try requiredChallenge(from: result, type: "phone_otp")
+            let receivedAt = Date()
+            guard AuthenticationChallengeContractPolicy.acceptsPhoneRenewal(
+                from: challenge,
+                to: renewed,
+                at: receivedAt
+            ) else {
+                clearPendingAuthentication()
+                throw AuthUIError.invalidResponse
+            }
+            pendingChallenge = renewed
+            pendingChallengeReceivedAt = receivedAt
+            return true
+        } catch {
+            guard authenticationAttempt == attempt else { return false }
+            if AuthenticationChallengeErrorPolicy.isTerminal(error) {
+                clearPendingAuthentication()
+                lastError = error.localizedDescription
+            } else if AuthenticationChallengeRecoveryPolicy.preservesChallenge(
+                afterResendFailure: error
+            ) {
+                // A structured client/rate-limit rejection proves that no replacement challenge
+                // was issued. Keep the old code usable and preserve the server's retry guidance.
+                lastError = error.localizedDescription
+            } else {
+                // A transport or server failure can occur after renewal. Keeping the old ID would
+                // let a newly delivered code cross an ambiguous challenge boundary.
+                clearPendingAuthentication()
+                lastError = "We couldn't confirm the verification request. Start again and use the latest message."
+            }
+            return false
+        }
+    }
+
+    private func clearPendingAuthentication() {
+        pendingChallenge = nil
+        pendingPhone = nil
+        pendingChallengeReceivedAt = nil
+    }
+
+    func registerWithEmail(
+        name: String,
+        tag: String,
+        email: String,
+        password: String,
+        passwordConfirmation: String
+    ) async -> EmailRegistrationResult? {
+        guard !isSignedIn else {
+            lastError = "Sign out before creating another account."
+            return nil
+        }
+        guard emailRegistrationAvailable else {
+            lastError = "Email registration is not available right now."
+            return nil
+        }
+        guard !isLoading else { return nil }
+        if let validationError = EmailAccountValidation.registrationError(
+            name: name,
+            tag: tag,
+            email: email,
+            password: password,
+            passwordConfirmation: passwordConfirmation
+        ) {
+            lastError = emailAccountValidationMessage(validationError)
+            return nil
+        }
+
+        let attempt = beginAuthenticationRequest()
+        defer { finishAuthenticationRequest(attempt) }
+        do {
+            let result = try await api.registerWithEmail(
+                name: name,
+                tag: tag,
+                email: email,
+                password: password,
+                passwordConfirmation: passwordConfirmation,
+                countryCode: "UG",
+                locale: "en",
+                timezone: TimeZone.autoupdatingCurrent.identifier
+            )
+            guard authenticationAttempt == attempt else { return nil }
+            guard EmailAccountResponsePolicy.acceptsRegistration(
+                result,
+                requestedEmail: email
+            )
+            else { throw AuthUIError.invalidResponse }
+            return result
+        } catch {
+            recordAuthenticationError(error, for: attempt)
+            return nil
+        }
+    }
+
+    func verifyEmail(token: String) async -> String? {
+        guard !isSignedIn, !isLoading else { return nil }
+        guard EmailAccountValidation.isValidOpaqueToken(token) else {
+            lastError = "Paste the complete verification token from your email."
+            return nil
+        }
+        let attempt = beginAuthenticationRequest()
+        defer { finishAuthenticationRequest(attempt) }
+        do {
+            let result = try await api.verifyEmail(token: token)
+            guard authenticationAttempt == attempt else { return nil }
+            guard let verifiedEmail = EmailAccountResponsePolicy.verifiedEmail(from: result)
+            else { throw AuthUIError.invalidResponse }
+            return verifiedEmail
+        } catch {
+            recordAuthenticationError(error, for: attempt)
+            return nil
+        }
+    }
+
+    func resendEmailVerification(email: String) async -> String? {
+        guard !isSignedIn else { return nil }
+        guard emailRegistrationAvailable else {
+            lastError = "New verification emails are not available right now."
+            return nil
+        }
+        guard !isLoading else { return nil }
+        guard EmailAccountValidation.isValidEmail(email) else {
+            lastError = "Enter a valid email address."
+            return nil
+        }
+        let attempt = beginAuthenticationRequest()
+        defer { finishAuthenticationRequest(attempt) }
+        do {
+            let result = try await api.resendEmailVerification(email: email)
+            guard authenticationAttempt == attempt else { return nil }
+            return result.message
+                ?? "If the address is eligible, a new verification email will be sent."
+        } catch {
+            recordAuthenticationError(error, for: attempt)
+            return nil
+        }
+    }
+
+    func requestPasswordReset(email: String) async -> String? {
+        guard !isSignedIn else { return nil }
+        guard emailRecoveryAvailable else {
+            lastError = "Email password recovery is not available right now."
+            return nil
+        }
+        guard !isLoading else { return nil }
+        guard EmailAccountValidation.isValidEmail(email) else {
+            lastError = "Enter a valid email address."
+            return nil
+        }
+        let attempt = beginAuthenticationRequest()
+        defer { finishAuthenticationRequest(attempt) }
+        do {
+            let result = try await api.requestPasswordReset(email: email)
+            guard authenticationAttempt == attempt else { return nil }
+            return result.message
+                ?? "If an account exists for that address, password reset instructions will be sent."
+        } catch {
+            recordAuthenticationError(error, for: attempt)
+            return nil
+        }
+    }
+
+    func resetPassword(
+        token: String,
+        password: String,
+        passwordConfirmation: String
+    ) async -> PasswordResetSubmissionOutcome {
+        guard !isSignedIn, !isLoading else { return .failed }
+        if let validationError = EmailAccountValidation.passwordResetError(
+            token: token,
+            password: password,
+            passwordConfirmation: passwordConfirmation
+        ) {
+            lastError = emailAccountValidationMessage(validationError, reset: true)
+            return .failed
+        }
+        let attempt = beginAuthenticationRequest()
+        defer { finishAuthenticationRequest(attempt) }
+        do {
+            let result = try await api.resetPassword(
+                token: token,
+                password: password,
+                passwordConfirmation: passwordConfirmation
+            )
+            guard authenticationAttempt == attempt else { return .failed }
+            guard result.passwordReset == true else { throw AuthUIError.invalidResponse }
+            return .completed
+        } catch {
+            guard authenticationAttempt == attempt else { return .failed }
+            if IrreversibleAuthenticationMutationPolicy.completionIsUncertain(after: error) {
+                lastError = nil
+                return .completionUncertain
+            }
+            recordAuthenticationError(error, for: attempt)
+            return .failed
+        }
+    }
+
+    private func beginAuthenticationRequest(preservingChallenge: Bool = false) -> UUID {
+        let attempt = UUID()
+        authenticationAttempt = attempt
+        if !preservingChallenge {
+            clearPendingAuthentication()
+        }
+        lastError = nil
+        isLoading = true
+        return attempt
+    }
+
+    private func finishAuthenticationRequest(_ attempt: UUID) {
+        guard authenticationAttempt == attempt else { return }
+        isLoading = false
+    }
+
+    private func recordAuthenticationError(_ error: Error, for attempt: UUID) {
+        guard authenticationAttempt == attempt else { return }
+        if AuthenticationChallengeErrorPolicy.isTerminal(error) {
+            clearPendingAuthentication()
+        }
+        lastError = error.localizedDescription
+    }
+
+    private func requiredChallenge(from result: AuthResult, type: String) throws -> AuthChallenge {
+        let expectedKind: AuthChallengeKind
+        switch type.lowercased() {
+        case "otp", "phone_otp": expectedKind = .phoneOTP
+        case "two_factor": expectedKind = .twoFactor
+        default: throw AuthUIError.invalidResponse
+        }
+        guard result.state.caseInsensitiveCompare("challenge_required") == .orderedSame,
+              result.session == nil,
+              result.user == nil,
+              let challenge = result.challenge,
+              AuthenticationChallengeContractPolicy.isValid(
+                challenge,
+                expectedKind: expectedKind
+              )
+        else { throw AuthUIError.invalidResponse }
+        return challenge
+    }
+
+    private func handleAuthenticationResult(
+        _ result: AuthResult,
+        allowingChallengeKind: AuthChallengeKind? = nil,
+        attempt: UUID
+    ) async throws {
+        switch AuthResultPolicy.disposition(for: result) {
+        case .challengeRequired(let kind):
+            guard kind == allowingChallengeKind,
+                  let challenge = result.challenge,
+                  AuthenticationChallengeContractPolicy.isValid(
+                    challenge,
+                    expectedKind: kind
+                  )
+            else { throw AuthUIError.invalidResponse }
+            guard authenticationAttempt == attempt else { return }
+            pendingPhone = nil
+            pendingChallenge = challenge
+            pendingChallengeReceivedAt = Date()
+        case .authenticated:
+            try await adoptAuthenticatedResult(result, attempt: attempt)
+        case .invalid:
+            throw AuthUIError.invalidResponse
+        }
+    }
+
+    private func adoptAuthenticatedResult(_ result: AuthResult, attempt: UUID) async throws {
+        guard result.state.caseInsensitiveCompare("authenticated") == .orderedSame,
+              result.challenge == nil,
+              let session = result.session,
+              let user = result.user,
+              let boundSession = session.bound(to: user.id)
+        else { throw AuthUIError.invalidResponse }
+        guard authenticationAttempt == attempt else { return }
+        do {
+            guard try await sessions.saveIfEmpty(boundSession) else {
+                throw AuthUIError.staleResponse
+            }
+            try await store.update { persisted in
+                persisted.bindAuthenticatedProfile(user)
+                persisted.sessionAssurance = result.sessionAssurance
+            }
+        } catch {
+            _ = try? await sessions.clearIfCurrent(boundSession)
+            throw error
+        }
+        guard authenticationAttempt == attempt else {
+            _ = try? await sessions.clearIfCurrent(boundSession)
+            throw AuthUIError.staleResponse
+        }
+        cancelEphemeralOutgoingCall(dismissPresentation: true)
+        clearAllCallWaitingState()
+        activeConversationID = nil
+        stopVisibleConversationSync()
+        pendingDeepLink = nil
+        accountEpoch = UUID()
+        paymentRequestChatShareLeases.removeAll()
+        resetCommunicationPrivacyState()
+        resetSecurityPreferencesState()
+        secureMessagingSyncError.reset()
+        kycRequestGeneration &+= 1
+        kycStatus = nil
+        sessionAssurance = result.sessionAssurance
+        contactDirectoryRevision &+= 1
+        state = await store.snapshot()
+        isSignedIn = true
+        let authenticatedContext = AuthenticatedSecurityContext(
+            accountEpoch: accountEpoch,
+            userID: user.id,
+            sessionID: boundSession.sessionId
+        )
+        accountSetupStep = AccountSetupPolicy.initialStep(
+            afterAuthentication: user,
+            assurance: nil
+        )
+        didResumeAuthenticatedSession = false
+        pendingChallenge = nil
+        pendingPhone = nil
+        pendingChallengeReceivedAt = nil
+        guard await loadBiometricConfiguration(context: authenticatedContext),
+              authenticationAttempt == attempt,
+              await authenticatedSecurityContextIsCurrent(authenticatedContext)
+        else { return }
+        if sessionAssurance == nil {
+            let assurance = try await APIClientSessionBinding.$sessionID.withValue(
+                boundSession.sessionId
+            ) {
+                try await api.sessionAssurance()
+            }
+            guard authenticationAttempt == attempt,
+                  await authenticatedSecurityContextIsCurrent(authenticatedContext)
+            else { return }
+            sessionAssurance = assurance
+        }
+        accountSetupStep = AccountSetupPolicy.initialStep(
+            afterAuthentication: user,
+            assurance: sessionAssurance
+        )
+        biometricAccessState = accountSetupStep == nil && biometricUnlockEnabled
+            ? .locked
+            : .authorized
+        homeBiometricState = biometricUnlockEnabled ? .locked : .notRequired
+        if accountSetupStep == nil, biometricUnlockEnabled {
+            guard await authenticateBiometrically(for: .returningSignIn) else { return }
+            guard authenticationAttempt == attempt,
+                  await authenticatedSecurityContextIsCurrent(authenticatedContext)
+            else { return }
+        }
+        await resumeAuthenticatedSessionIfNeeded()
+    }
+
+    func loadAccountDeletionPreflight() async throws -> AccountDeletionPreflightDTO {
+        guard accountDeletionSubmissionID == nil else {
+            throw AccountDeletionSubmissionError.operationInProgress
+        }
+        let context = try await captureAccountDeletionContext()
+        let response = try await APIClientSessionBinding.$sessionID.withValue(
+            context.sessionID
+        ) {
+            try await api.accountDeletionPreflight()
+        }
+        guard accountDeletionSubmissionID == nil,
+              await authenticatedSecurityContextIsCurrent(context),
+              AccountDeletionContract.canonicalAccountID(context.userID) == response.accountID
+        else { throw AccountDeletionSubmissionError.accountChanged }
+        return response
+    }
+
+    /// Submits the irreversible request and erases local communication history only after a
+    /// strict, authenticated `accepted`/`deletion_pending` receipt for this exact account session.
+    func submitAccountDeletion(
+        preflight: AccountDeletionPreflightDTO,
+        confirmation: String,
+        pin: String
+    ) async throws -> AccountDeletionReceiptDTO {
+        guard confirmation == AccountDeletionContract.confirmation,
+              confirmation == preflight.confirmationText
+        else { throw AccountDeletionContractError.invalidConfirmation }
+        if !AccountDeletionContract.validPIN(pin) {
+            throw AccountDeletionContractError.invalidPIN
+        }
+
+        let context = try await captureAccountDeletionContext()
+        let operationID = try beginAccountDeletionSubmission(
+            targetAccountID: context.userID
+        )
+        defer { finishAccountDeletionSubmission(operationID) }
+        guard AccountDeletionContract.canonicalAccountID(context.userID) == preflight.accountID,
+              preflight.purpose == AccountDeletionContract.purpose
+        else { throw AccountDeletionContractError.invalidPreflight }
+
+        let approval = try await authorizeFinancialStepUp(
+            purpose: preflight.purpose,
+            intent: preflight.intent,
+            pin: pin,
+            reason: "Approve permanent Kit Pay account deletion"
+        )
+        guard await accountDeletionOperationIsCurrent(operationID, context: context) else {
+            throw AccountDeletionSubmissionError.accountChanged
+        }
+        guard AccountDeletionContract.validStepUpToken(approval.stepUpToken) else {
+            throw AccountDeletionContractError.invalidStepUp
+        }
+
+        let deletionAttempt: PendingAccountDeletionAttempt
+        do {
+            deletionAttempt = try PendingAccountDeletionAttempt(
+                accountID: context.userID,
+                sessionID: context.sessionID,
+                attemptID: UUID().uuidString
+            )
+            try await accountDeletionAttempts.schedule(deletionAttempt)
+        } catch {
+            throw AccountDeletionSubmissionError.unavailable
+        }
+        privacyQuarantineTargetAccountID = deletionAttempt.accountID
+        await enterCommunicationPrivacyQuarantine()
+        guard await accountDeletionOperationIsCurrent(operationID, context: context) else {
+            do {
+                guard try await accountDeletionAttempts.completeIfCurrent(deletionAttempt)
+                else { throw AccountDeletionPurgeMarkerError.persistenceVerificationFailed }
+            } catch {
+                await blockUnresolvedAccountDeletionAttempt()
+                throw AccountDeletionSubmissionError.completionUncertain
+            }
+            throw AccountDeletionSubmissionError.accountChanged
+        }
+
+        let receipt: AccountDeletionReceiptDTO
+        do {
+            receipt = try await APIClientSessionBinding.$sessionID.withValue(
+                context.sessionID
+            ) {
+                try await api.requestAccountDeletion(
+                    preflight: preflight,
+                    confirmation: confirmation,
+                    stepUpToken: approval.stepUpToken
+                )
+            }
+        } catch {
+            if IrreversibleAuthenticationMutationPolicy.completionIsUncertain(after: error) {
+                await blockUnresolvedAccountDeletionAttempt()
+                throw AccountDeletionSubmissionError.completionUncertain
+            }
+            do {
+                guard try await accountDeletionAttempts.completeIfCurrent(deletionAttempt)
+                else {
+                    await blockUnresolvedAccountDeletionAttempt()
+                    throw AccountDeletionSubmissionError.completionUncertain
+                }
+            } catch let submissionError as AccountDeletionSubmissionError {
+                throw submissionError
+            } catch {
+                await blockUnresolvedAccountDeletionAttempt()
+                throw AccountDeletionSubmissionError.completionUncertain
+            }
+            await resumeCommunicationAfterDefiniteAccountDeletionFailure(
+                context: context,
+                operationID: operationID
+            )
+            throw error
+        }
+
+        guard receipt.state == AccountDeletionContract.acceptedState,
+              receipt.accountStatus == AccountDeletionContract.pendingAccountStatus
+        else {
+            await blockUnresolvedAccountDeletionAttempt()
+            throw AccountDeletionSubmissionError.completionUncertain
+        }
+
+        let pendingDeletion: PendingAcceptedAccountDeletion
+        do {
+            pendingDeletion = try PendingAcceptedAccountDeletion(
+                accountID: context.userID,
+                sessionID: context.sessionID,
+                receiptID: receipt.receiptID
+            )
+        } catch {
+            await concealUnresolvedAcceptedAccountDeletionProjection()
+            acceptedAccountDeletionCleanupBlocked = true
+            isLoading = true
+            throw AccountDeletionSubmissionError.acceptedButLocalCleanupFailed
+        }
+
+        let markerIsDurable: Bool
+        do {
+            try await acceptedAccountDeletionPurges.schedule(pendingDeletion)
+            markerIsDurable = true
+            if volatileAcceptedAccountDeletion == pendingDeletion {
+                volatileAcceptedAccountDeletion = nil
+            }
+        } catch {
+            // The receipt is irreversible, but projection/session absence alone cannot recreate
+            // that proof after a crash. Never start destructive cleanup until the accepted marker
+            // has been written and read back successfully.
+            markerIsDurable = false
+            volatileAcceptedAccountDeletion = pendingDeletion
+        }
+
+        guard markerIsDurable else {
+            privacyQuarantineTargetAccountID = pendingDeletion.accountID
+            await concealUnresolvedAcceptedAccountDeletionProjection()
+            acceptedAccountDeletionCleanupBlocked = true
+            isLoading = true
+            throw AccountDeletionSubmissionError.acceptedButLocalCleanupFailed
+        }
+
+        // Receipt acceptance is irreversible. Ignore view-task cancellation from this point, but
+        // never erase a replacement account that won the session slot while the POST was in flight.
+        guard await accountDeletionContextStillOwnsSession(
+            context,
+            operationID: operationID
+        ) else {
+            // A replacement session/account now owns the app. The durable marker is the only
+            // authority allowed to retry on launch after proving that replacement is absent; do
+            // not perform any destructive cleanup from this stale completion.
+            await concealUnresolvedAcceptedAccountDeletionProjection()
+            acceptedAccountDeletionCleanupBlocked = true
+            isLoading = true
+            throw markerIsDurable
+                ? AccountDeletionSubmissionError.acceptedForPreviousSession
+                : AccountDeletionSubmissionError.acceptedButLocalCleanupFailed
+        }
+
+        let signOutResult = await performSignOut(
+            removeBiometricCredential: true,
+            dataPolicy: .acceptedAccountDeletion,
+            expectedContext: context,
+            acceptedDeletion: pendingDeletion,
+            acceptedDeletionMarkerIsDurable: markerIsDurable,
+            acceptedDeletionAttempt: deletionAttempt
+        )
+        switch signOutResult {
+        case .completed:
+            return receipt
+        case .contextChanged:
+            await concealUnresolvedAcceptedAccountDeletionProjection()
+            acceptedAccountDeletionCleanupBlocked = true
+            isLoading = true
+            throw AccountDeletionSubmissionError.acceptedForPreviousSession
+        case .localCleanupFailed:
+            await concealUnresolvedAcceptedAccountDeletionProjection()
+            acceptedAccountDeletionCleanupBlocked = true
+            isLoading = true
+            throw AccountDeletionSubmissionError.acceptedButLocalCleanupFailed
+        }
+    }
+
+    private func captureAccountDeletionContext() async throws
+        -> AuthenticatedSecurityContext {
+        guard isOnline,
+              AccountDeletionContract.protectedFlowAvailable(
+                features: capabilities?.features
+              ),
+              !isSigningOut,
+              isSignedIn,
+              !isUpdatingProfile,
+              profileEmailOperation == nil,
+              accountSetupStep == nil,
+              !requiresBiometricSignIn,
+              sessionAssurance?.grantsFullAccess == true,
+              let profile,
+              AccountDeletionContract.canonicalAccountID(profile.id) != nil,
+              let session = await sessions.current(),
+              session.accountId?.caseInsensitiveCompare(profile.id) == .orderedSame
+        else { throw AccountDeletionSubmissionError.unavailable }
+        let context = AuthenticatedSecurityContext(
+            accountEpoch: accountEpoch,
+            userID: profile.id,
+            sessionID: session.sessionId
+        )
+        guard await authenticatedSecurityContextIsCurrent(context) else {
+            throw AccountDeletionSubmissionError.accountChanged
+        }
+        return context
+    }
+
+    private func beginAccountDeletionSubmission(targetAccountID: String) throws -> UUID {
+        guard accountDeletionSubmissionID == nil,
+              !isSubmittingAccountDeletion,
+              flushingAccountEpoch == nil
+        else {
+            throw AccountDeletionSubmissionError.operationInProgress
+        }
+        let operationID = UUID()
+        accountDeletionSubmissionID = operationID
+        isSubmittingAccountDeletion = true
+        privacyQuarantineTargetAccountID = targetAccountID
+        clearAllCallWaitingState()
+        NotificationCoordinator.shared.beginPrivacyQuarantine(
+            targetAccountID: targetAccountID
+        )
+        return operationID
+    }
+
+    private func finishAccountDeletionSubmission(_ operationID: UUID) {
+        guard accountDeletionSubmissionID == operationID else { return }
+        accountDeletionSubmissionID = nil
+        isSubmittingAccountDeletion = false
+        if let invalidatedSessionID = deferredInvalidatedSessionID {
+            deferredInvalidatedSessionID = nil
+            Task { @MainActor [weak self] in
+                await self?.handleSessionInvalidation(invalidatedSessionID)
+            }
+        } else {
+            Task { @MainActor [weak self] in
+                await self?.resumeAuthenticatedSessionIfNeeded()
+            }
+        }
+    }
+
+    private func handleSessionInvalidation(_ invalidatedSessionID: String) async {
+        guard isSignedIn else { return }
+        if isSubmittingAccountDeletion {
+            deferredInvalidatedSessionID = invalidatedSessionID
+            return
+        }
+        guard !acceptedAccountDeletionCleanupBlocked,
+              !protectedLocalStateRecoveryBlocked,
+              !unresolvedAccountDeletionAttemptBlocked
+        else { return }
+        let currentSessionID = await sessions.current()?.sessionId
+        let invalidatesCurrentSession = SessionRefreshPolicy.shouldApplyInvalidation(
+            invalidatedSessionID: invalidatedSessionID,
+            currentSessionID: currentSessionID
+        ) || (currentSessionID == nil
+            && callMediaAccountLease?.sessionID.caseInsensitiveCompare(invalidatedSessionID)
+                == .orderedSame)
+        guard invalidatesCurrentSession else { return }
+        await signOut(removeBiometricCredential: false)
+        guard !isSignedIn,
+              !acceptedAccountDeletionCleanupBlocked,
+              !protectedLocalStateRecoveryBlocked,
+              !unresolvedAccountDeletionAttemptBlocked
+        else { return }
+        lastError = "Your Kit Pay session expired. Sign in again to continue."
+    }
+
+    private func resumeCommunicationAfterDefiniteAccountDeletionFailure(
+        context: AuthenticatedSecurityContext,
+        operationID: UUID
+    ) async {
+        guard await accountDeletionOperationIsCurrent(operationID, context: context) else {
+            return
+        }
+        do {
+            guard try await accountDeletionAttempts.pending() == nil else { return }
+        } catch {
+            return
+        }
+        privacyQuarantineTargetAccountID = nil
+        NotificationCoordinator.shared.resumeRegistration(
+            afterOwnershipRecoveryFor: context.userID
+        )
+    }
+
+    private func accountDeletionOperationIsCurrent(
+        _ operationID: UUID,
+        context: AuthenticatedSecurityContext
+    ) async -> Bool {
+        guard accountDeletionSubmissionID == operationID,
+              isSubmittingAccountDeletion,
+              AccountDeletionContract.protectedFlowAvailable(
+                features: capabilities?.features
+              )
+        else { return false }
+        return await authenticatedSecurityContextIsCurrent(context)
+    }
+
+    /// Unlike ordinary mutation fences, a confirmed irreversible receipt must finish cleanup even
+    /// if SwiftUI cancels the initiating task. This check deliberately ignores task cancellation.
+    private func accountDeletionContextStillOwnsSession(
+        _ context: AuthenticatedSecurityContext,
+        operationID: UUID
+    ) async -> Bool {
+        guard accountDeletionSubmissionID == operationID,
+              isSubmittingAccountDeletion,
+              !isSigningOut,
+              isSignedIn,
+              accountEpoch == context.accountEpoch,
+              profile?.id.caseInsensitiveCompare(context.userID) == .orderedSame,
+              let currentSession = await sessions.current()
+        else { return false }
+        return !isSigningOut
+            && isSignedIn
+            && accountEpoch == context.accountEpoch
+            && currentSession.sessionId.caseInsensitiveCompare(context.sessionID) == .orderedSame
+            && currentSession.accountId?.caseInsensitiveCompare(context.userID) == .orderedSame
+    }
+
+    func signOut(removeBiometricCredential: Bool = true) async {
+        _ = await performSignOut(
+            removeBiometricCredential: removeBiometricCredential,
+            dataPolicy: .ordinaryLogout,
+            expectedContext: nil
+        )
+    }
+
+    /// Accepts an inbound `kitwallet://` link.
+    ///
+    /// Both routes complete a pre-authentication flow, so a link that arrives while somebody is
+    /// already signed in is dropped rather than queued: acting on it later would drag a signed-in
+    /// customer to a sign-out-shaped screen for a token that is no longer theirs. Nothing is
+    /// submitted here — the link only chooses a screen and fills the field.
+    func handleDeepLink(_ url: URL) {
+        guard let link = KitDeepLink.parse(url) else { return }
+        guard !isSignedIn,
+              !requiresBiometricSignIn,
+              !acceptedAccountDeletionCleanupBlocked,
+              !unresolvedAccountDeletionAttemptBlocked,
+              !protectedLocalStateRecoveryBlocked
+        else { return }
+        pendingDeepLink = link
+    }
+
+    /// Called by the screen that has applied the link.
+    func consumeDeepLink(_ link: KitDeepLink) {
+        guard pendingDeepLink == link else { return }
+        pendingDeepLink = nil
+    }
+
+    /// Drops every HTTP response the app cached for the account that is going away. Avatar images
+    /// are the only account-bound bytes that live outside the encrypted store.
+    private func purgeSharedResponseCache() {
+        URLCache.shared.removeAllCachedResponses()
+    }
+
+    @discardableResult
+    private func performSignOut(
+        removeBiometricCredential: Bool,
+        dataPolicy: AccountSignOutDataPolicy,
+        expectedContext: AuthenticatedSecurityContext?,
+        acceptedDeletion: PendingAcceptedAccountDeletion? = nil,
+        acceptedDeletionMarkerIsDurable: Bool = false,
+        acceptedDeletionAttempt: PendingAccountDeletionAttempt? = nil
+    ) async -> AccountSignOutResult {
+        let isAcceptedDeletion = dataPolicy == .acceptedAccountDeletion
+        guard !isSigningOut,
+              isAcceptedDeletion == (acceptedDeletion != nil),
+              isAcceptedDeletion == (acceptedDeletionAttempt != nil),
+              !isAcceptedDeletion || expectedContext != nil,
+              isAcceptedDeletion || accountDeletionSubmissionID == nil
+        else { return .contextChanged }
+        if let expectedContext {
+            guard isSignedIn,
+                  accountEpoch == expectedContext.accountEpoch,
+                  profile?.id.caseInsensitiveCompare(expectedContext.userID) == .orderedSame
+            else { return .contextChanged }
+        }
+        isSigningOut = true
+        // Revoke the non-idempotent waiting invitation before sign-out reaches its first await.
+        // The normal teardown below still clears the retained waiting presentation and CallKit.
+        cancelWaitingCallMergeOperation()
+        authenticationAttempt = UUID()
+        activeConversationID = nil
+        stopVisibleConversationSync()
+        defer { isSigningOut = false }
+        let signedOutUserID = expectedContext?.userID ?? profile?.id
+        let signedOutInstallationID = installationID()
+        let revokedMediaLease = callMediaAccountLease
+        let provisionalCallID = ephemeralOutgoingCallGate.attempt?.clientCallIDString
+        let activeBackendCallID = CallMediaCoordinator.shared.activeCall?.id
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let callToEndOnSignOut: String?
+        if let activeBackendCallID,
+           UUID(uuidString: activeBackendCallID) != nil,
+           activeBackendCallID.caseInsensitiveCompare(provisionalCallID ?? "") != .orderedSame {
+            callToEndOnSignOut = activeBackendCallID.lowercased()
+        } else {
+            callToEndOnSignOut = nil
+        }
+        let cancelledOutgoingAttempt = cancelEphemeralOutgoingCall(
+            dismissPresentation: true
+        )
+        callMediaAccountLease = nil
+        // Revoke every in-flight account fence before the first suspension, then let both
+        // user-initiated and silent avatar work unwind before credentials or encrypted state
+        // are cleared.
+        accountEpoch = UUID()
+        capabilitiesRequestTracker.invalidate()
+        capabilities = nil
+        resetCommunicationPrivacyState()
+        resetSecurityPreferencesState()
+        var acceptedDeletionLocalCleanupSucceeded = true
+        if let acceptedDeletion {
+            acceptedDeletionLocalCleanupSucceeded = await
+                finishAcceptedAccountDeletionLocalPurge(acceptedDeletion)
+            // Publish only the post-cleanup projection; an exact-target write failure is already
+            // concealed by SecureLocalStore, while an ownership conflict remains marker-blocked.
+            state = await store.snapshot()
+            guard acceptedDeletionLocalCleanupSucceeded else {
+                return .localCleanupFailed
+            }
+        }
+        await cancelAllProfileWorkAndWait()
+        paymentRequestChatShareLeases.removeAll()
+        deviceManagementGeneration &+= 1
+        isRefreshingRegisteredDevices = false
+        revokingRegisteredDeviceID = nil
+        deviceManagementErrorMessage = nil
+        // Revoke CallKit/media admission before any account teardown request is made. Nothing
+        // from this account may survive into a replacement sign-in.
+        clearAllCallWaitingState()
+        NotificationCoordinator.shared.beginAccountSignOut()
+        callEventDrainTask?.cancel()
+        callEventDrainTask = nil
+        callSystemEventDrainTask?.cancel()
+        callSystemEventDrainTask = nil
+        for event in queuedCallEvents {
+            NotificationCoordinator.shared.acknowledgeCallEvent(event.id)
+        }
+        for action in queuedCallSystemActions {
+            NotificationCoordinator.shared.acknowledgeCallEvent(action.eventId)
+        }
+        queuedCallEvents.removeAll()
+        queuedCallSystemActions.removeAll()
+        await CallMediaCoordinator.shared.resetForSignOut(revoking: revokedMediaLease)
+        if !isAcceptedDeletion,
+           let callToEndOnSignOut,
+           let revokedMediaLease,
+           isOnline {
+            _ = try? await APIClientSessionBinding.$sessionID.withValue(
+                revokedMediaLease.sessionID
+            ) {
+                try await api.endCall(id: callToEndOnSignOut, reason: "cancelled")
+            }
+        }
+        if !isAcceptedDeletion, let cancelledOutgoingAttempt {
+            await cancelEphemeralCallOnServerOnce(cancelledOutgoingAttempt)
+        }
+        let signedOutSessionID: String?
+        if let expectedContext {
+            signedOutSessionID = expectedContext.sessionID
+        } else if let revokedMediaLease {
+            signedOutSessionID = revokedMediaLease.sessionID
+        } else {
+            signedOutSessionID = await sessions.current()?.sessionId
+        }
+        if let signedOutUserID {
+            await pushRegistrations.reset(accountID: signedOutUserID)
+        }
+        if !isAcceptedDeletion, isSignedIn, let pushSessionID = signedOutSessionID {
+            await unregisterApplePushProvidersBeforeSignOut(sessionID: pushSessionID)
+            _ = try? await APIClientSessionBinding.$sessionID.withValue(pushSessionID) {
+                try await api.logout()
+            }
+        }
+        NotificationCoordinator.shared.suspendRegistrationAfterSignOut()
+        contactSyncTask?.cancel()
+        contactSyncTask = nil
+        contactSyncGeneration &+= 1
+        contactChangeDebounceTask?.cancel()
+        contactChangeDebounceTask = nil
+        contactSyncNeedsAnotherPass = false
+        contactSyncState = .idle
+        callHistoryRefreshTask?.cancel()
+        callHistoryRefreshTask = nil
+        callHistoryRefreshGeneration &+= 1
+        callHistoryBackfillTask?.cancel()
+        callHistoryBackfillTask = nil
+        callHistoryBackfillGeneration &+= 1
+        callHistoryBackfillRetryNotBefore = nil
+        outboxWakeTask?.cancel()
+        outboxWakeTask = nil
+        communicationReplayTask?.cancel()
+        communicationReplayTask = nil
+        CommunicationBackgroundReplayScheduler.shared.cancel()
+        ephemeralCallCancellationTask?.cancel()
+        ephemeralCallCancellationTask = nil
+        pendingEphemeralCallCancellations.removeAll()
+        secureMessagingSyncError.reset()
+        kycRequestGeneration &+= 1
+        kycStatus = nil
+        sessionAssurance = nil
+        contactDirectoryRevision &+= 1
+        if removeBiometricCredential {
+            if isAcceptedDeletion,
+               acceptedDeletionLocalCleanupSucceeded,
+               let acceptedDeletion {
+                do {
+                    _ = try await biometrics.removeEnrollmentForAcceptedAccountDeletion(
+                        userID: acceptedDeletion.accountID,
+                        installationID: signedOutInstallationID
+                    )
+                } catch {
+                    acceptedDeletionLocalCleanupSucceeded = false
+                }
+            } else if !isAcceptedDeletion, let signedOutUserID, let signedOutSessionID {
+                do {
+                    try await biometrics.disable(
+                        forUserID: signedOutUserID,
+                        sessionID: signedOutSessionID,
+                        installationID: signedOutInstallationID
+                    )
+                } catch {
+                    await biometrics.removeAnyEnrollment()
+                }
+            } else if !isAcceptedDeletion {
+                await biometrics.removeAnyEnrollment()
+            }
+        }
+        let sessionCleanupSucceeded: Bool
+        if isAcceptedDeletion {
+            sessionCleanupSucceeded = acceptedDeletionLocalCleanupSucceeded
+        } else {
+            do {
+                try await sessions.clear()
+                sessionCleanupSucceeded = true
+            } catch {
+                sessionCleanupSucceeded = false
+            }
+        }
+        let projectionCleanupSucceeded: Bool
+        if isAcceptedDeletion {
+            projectionCleanupSucceeded = acceptedDeletionLocalCleanupSucceeded
+        } else {
+            do {
+                try await store.clearFinancialAndSessionProjections(
+                    preserveCommunicationHistory: dataPolicy.preserveCommunicationHistory
+                )
+                projectionCleanupSucceeded = true
+            } catch {
+                projectionCleanupSucceeded = false
+            }
+        }
+        // Avatars are the one piece of account data that never reaches SecureLocalStore: they are
+        // fetched over HTTPS and `URLSession.shared` writes them into the shared URLCache, on disk,
+        // in the clear. Every other projection is cleared above, so leaving them behind meant a
+        // signed-out — or deleted — customer's photo, and their contacts' photos, survived in the
+        // container and could be re-displayed to whoever signed in next.
+        purgeSharedResponseCache()
+        state = await store.snapshot()
+        isSignedIn = false
+        accountSetupStep = nil
+        isCompletingAccountSetup = false
+        pendingPhone = nil
+        pendingChallenge = nil
+        pendingChallengeReceivedAt = nil
+        callContacts = []
+        activeConversationID = nil
+        messageConversationNavigationRequest = nil
+        let deletedAccountFingerprint = acceptedDeletion.flatMap {
+            MessageNotificationContract.accountFingerprint(for: $0.accountID)
+        }
+        await NotificationCoordinator.shared.clearMessageNotifications(
+            accountFingerprint: deletedAccountFingerprint
+        )
+        if let acceptedDeletion, acceptedDeletionLocalCleanupSucceeded {
+            if let acceptedDeletionAttempt {
+                do {
+                    acceptedDeletionLocalCleanupSucceeded = try await
+                        accountDeletionAttempts.completeIfCurrent(acceptedDeletionAttempt)
+                } catch {
+                    acceptedDeletionLocalCleanupSucceeded = false
+                }
+            }
+            if acceptedDeletionLocalCleanupSucceeded, acceptedDeletionMarkerIsDurable {
+                do {
+                    acceptedDeletionLocalCleanupSucceeded = try await
+                        acceptedAccountDeletionPurges.completeIfCurrent(acceptedDeletion)
+                } catch {
+                    acceptedDeletionLocalCleanupSucceeded = false
+                }
+            }
+            if acceptedDeletionLocalCleanupSucceeded,
+               volatileAcceptedAccountDeletion == acceptedDeletion {
+                volatileAcceptedAccountDeletion = nil
+            }
+            if acceptedDeletionLocalCleanupSucceeded {
+                privacyQuarantineTargetAccountID = nil
+            }
+        }
+        if isAcceptedDeletion, !acceptedDeletionLocalCleanupSucceeded {
+            await concealUnresolvedAcceptedAccountDeletionProjection()
+        }
+        locallyTerminatedCallIds.removeAll()
+        didResumeAuthenticatedSession = false
+        biometricUnlockEnabled = false
+        biometricAccessState = .notRequired
+        homeBiometricState = .notRequired
+        biometricErrorMessage = nil
+        acceptedAccountDeletionCleanupBlocked = isAcceptedDeletion
+            && !acceptedDeletionLocalCleanupSucceeded
+        isLoading = acceptedAccountDeletionCleanupBlocked
+        let completed = sessionCleanupSucceeded
+            && projectionCleanupSucceeded
+            && (!isAcceptedDeletion || acceptedDeletionLocalCleanupSucceeded)
+        if completed {
+            // The signed-in projection was cleared before credentials. Repopulate only the public
+            // sign-in capabilities after teardown, so onboarding never reuses the departed
+            // account's cohort response and does not remain disabled until another path change.
+            _ = await reloadCapabilities()
+        }
+        return completed ? .completed : .localCleanupFailed
+    }
+
+    func refreshRegisteredDevices() async {
+        guard !isRefreshingRegisteredDevices,
+              revokingRegisteredDeviceID == nil,
+              !isSigningOut,
+              isSignedIn
+        else { return }
+        guard isOnline else {
+            deviceManagementErrorMessage = DeviceManagementError.unavailable.localizedDescription
+            return
+        }
+        guard let expectedUserID = profile?.id else { return }
+
+        let expectedAccountEpoch = accountEpoch
+        deviceManagementGeneration &+= 1
+        let expectedGeneration = deviceManagementGeneration
+        isRefreshingRegisteredDevices = true
+        deviceManagementErrorMessage = nil
+        defer {
+            if deviceManagementGeneration == expectedGeneration {
+                // Invalidate bootstrap/device reads that began while this operation was active.
+                deviceManagementGeneration &+= 1
+                isRefreshingRegisteredDevices = false
+            }
+        }
+        guard let expectedSessionID = await sessions.current()?.sessionId,
+              await deviceManagementContextIsCurrent(
+                generation: expectedGeneration,
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+              )
+        else { return }
+
+        do {
+            let response = try await APIClientSessionBinding.$sessionID.withValue(
+                expectedSessionID
+            ) {
+                try await api.registeredDevices()
+            }
+            guard let devices = RegisteredDevicePolicy.validated(response.items) else {
+                throw DeviceManagementError.invalidServiceResponse
+            }
+            guard await deviceManagementContextIsCurrent(
+                generation: expectedGeneration,
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            ) else { return }
+            try await store.update { persisted in
+                guard persisted.profile?.id.caseInsensitiveCompare(expectedUserID) == .orderedSame
+                else { throw StoreError.accountChanged }
+                persisted.replaceRegisteredDeviceProjection(devices)
+            }
+            guard await deviceManagementContextIsCurrent(
+                generation: expectedGeneration,
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            ) else { return }
+            state = await store.snapshot()
+            deviceManagementErrorMessage = nil
+        } catch is CancellationError {
+            return
+        } catch {
+            guard await deviceManagementContextIsCurrent(
+                generation: expectedGeneration,
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            ) else { return }
+            deviceManagementErrorMessage = deviceManagementFailureMessage(
+                error,
+                operation: .refresh
+            )
+        }
+    }
+
+    func revokeRegisteredDevice(id: String) async {
+        guard !isRefreshingRegisteredDevices,
+              revokingRegisteredDeviceID == nil,
+              !isSigningOut,
+              isSignedIn
+        else { return }
+        guard let deviceID = RegisteredDevicePolicy.canonicalID(id) else {
+            deviceManagementErrorMessage = DeviceManagementError.invalidDevice.localizedDescription
+            return
+        }
+        guard let validatedDevices = RegisteredDevicePolicy.validated(registeredDevices) else {
+            deviceManagementErrorMessage = DeviceManagementError.invalidServiceResponse
+                .localizedDescription
+            return
+        }
+        let matchingDevices = validatedDevices.filter { $0.id == deviceID }
+        guard matchingDevices.count == 1, let device = matchingDevices.first else {
+            deviceManagementErrorMessage = DeviceManagementError.invalidDevice.localizedDescription
+            return
+        }
+        guard RegisteredDevicePolicy.canRevoke(device) else {
+            deviceManagementErrorMessage = DeviceManagementError.currentDevice.localizedDescription
+            return
+        }
+        guard isOnline else {
+            deviceManagementErrorMessage = DeviceManagementError.unavailable.localizedDescription
+            return
+        }
+        guard let expectedUserID = profile?.id else { return }
+
+        let expectedAccountEpoch = accountEpoch
+        deviceManagementGeneration &+= 1
+        let expectedGeneration = deviceManagementGeneration
+        revokingRegisteredDeviceID = deviceID
+        deviceManagementErrorMessage = nil
+        defer {
+            if deviceManagementGeneration == expectedGeneration {
+                // Invalidate bootstrap/device reads that began before remote revocation settled.
+                deviceManagementGeneration &+= 1
+                revokingRegisteredDeviceID = nil
+            }
+        }
+        guard let expectedSessionID = await sessions.current()?.sessionId,
+              await deviceManagementContextIsCurrent(
+                generation: expectedGeneration,
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+              )
+        else { return }
+
+        var revocationConfirmed = false
+        do {
+            do {
+                try await APIClientSessionBinding.$sessionID.withValue(expectedSessionID) {
+                    try await api.revokeRegisteredDevice(id: deviceID)
+                }
+                revocationConfirmed = true
+            } catch let payload as APIErrorPayload
+                where payload.code.caseInsensitiveCompare("DEVICE_NOT_FOUND") == .orderedSame {
+                // A previously removed installation is already in the requested terminal state.
+                // Remove the stale encrypted projection after the same account/session fences.
+                revocationConfirmed = true
+            }
+
+            guard await deviceManagementContextIsCurrent(
+                generation: expectedGeneration,
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            ) else { return }
+            try await store.update { persisted in
+                guard persisted.profile?.id.caseInsensitiveCompare(expectedUserID) == .orderedSame
+                else { throw StoreError.accountChanged }
+                let currentDevices = persisted.registeredDevices
+                    .flatMap { RegisteredDevicePolicy.validated($0) }
+                    ?? validatedDevices
+                if let persistedDevice = currentDevices.first(where: { $0.id == deviceID }),
+                   !RegisteredDevicePolicy.canRevoke(persistedDevice) {
+                    throw DeviceManagementError.currentDevice
+                }
+                persisted.replaceRegisteredDeviceProjection(
+                    currentDevices.filter { $0.id != deviceID }
+                )
+            }
+            guard await deviceManagementContextIsCurrent(
+                generation: expectedGeneration,
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            ) else { return }
+            state = await store.snapshot()
+            deviceManagementErrorMessage = nil
+        } catch is CancellationError {
+            return
+        } catch {
+            guard await deviceManagementContextIsCurrent(
+                generation: expectedGeneration,
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            ) else { return }
+            deviceManagementErrorMessage = deviceManagementFailureMessage(
+                error,
+                operation: revocationConfirmed ? .persistConfirmedRevocation : .revoke
+            )
+        }
+    }
+
+    private enum DeviceManagementOperation {
+        case refresh
+        case revoke
+        case persistConfirmedRevocation
+    }
+
+    private func deviceManagementContextIsCurrent(
+        generation expectedGeneration: UInt64,
+        accountEpoch expectedAccountEpoch: UUID,
+        userID expectedUserID: String,
+        sessionID expectedSessionID: String
+    ) async -> Bool {
+        guard !Task.isCancelled,
+              !isSigningOut,
+              isSignedIn,
+              deviceManagementGeneration == expectedGeneration,
+              accountEpoch == expectedAccountEpoch,
+              profile?.id.caseInsensitiveCompare(expectedUserID) == .orderedSame,
+              await sessions.current()?.sessionId == expectedSessionID
+        else { return false }
+        return !Task.isCancelled
+            && !isSigningOut
+            && isSignedIn
+            && deviceManagementGeneration == expectedGeneration
+            && accountEpoch == expectedAccountEpoch
+            && profile?.id.caseInsensitiveCompare(expectedUserID) == .orderedSame
+    }
+
+    private func deviceManagementFailureMessage(
+        _ error: Error,
+        operation: DeviceManagementOperation
+    ) -> String {
+        if !isOnline { return DeviceManagementError.unavailable.localizedDescription }
+        if let managementError = error as? DeviceManagementError {
+            return managementError.localizedDescription
+        }
+        if let payload = error as? APIErrorPayload {
+            switch payload.code.uppercased() {
+            case "CURRENT_DEVICE_REQUIRES_LOGOUT":
+                return DeviceManagementError.currentDevice.localizedDescription
+            case "DEVICE_NOT_FOUND":
+                return DeviceManagementError.invalidDevice.localizedDescription
+            default:
+                break
+            }
+        }
+        switch operation {
+        case .refresh:
+            return DeviceManagementError.invalidServiceResponse.localizedDescription
+        case .revoke:
+            return DeviceManagementError.revocationFailed.localizedDescription
+        case .persistConfirmedRevocation:
+            return "This device was signed out, but the saved list could not be updated. Refresh to check again."
+        }
+    }
+
+    func loadSecurityPreferences(force: Bool = false) async {
+        guard !isManagingSecurityPreferences,
+              !isSigningOut,
+              isSignedIn
+        else { return }
+        if !force, securityPreferences != nil { return }
+        guard isOnline else {
+            securityPreferencesErrorMessage =
+                "Connect to the internet to load this security setting."
+            return
+        }
+
+        securityPreferencesRequestGeneration &+= 1
+        let generation = securityPreferencesRequestGeneration
+        isLoadingSecurityPreferences = true
+        securityPreferencesErrorMessage = nil
+        defer {
+            if securityPreferencesRequestGeneration == generation {
+                isLoadingSecurityPreferences = false
+            }
+        }
+        guard let context = await securityPreferencesContext() else {
+            if securityPreferencesRequestGeneration == generation {
+                securityPreferencesErrorMessage =
+                    "Sign in again to manage this security setting."
+            }
+            return
+        }
+
+        do {
+            let preferences = try await APIClientSessionBinding.$sessionID.withValue(
+                context.sessionID
+            ) {
+                try await api.securityPreferences()
+            }
+            guard securityPreferencesRequestGeneration == generation,
+                  await securityPreferencesContextIsCurrent(context)
+            else { return }
+            securityPreferences = preferences
+        } catch is CancellationError {
+            return
+        } catch {
+            guard securityPreferencesRequestGeneration == generation,
+                  await securityPreferencesContextIsCurrent(context)
+            else { return }
+            securityPreferencesErrorMessage = securityPreferencesFailureMessage(
+                error,
+                operation: .load
+            )
+        }
+    }
+
+    func setVerifyIdentityOnNewLogin(_ enabled: Bool) async {
+        guard !isManagingSecurityPreferences else { return }
+        if securityPreferences == nil {
+            await loadSecurityPreferences()
+        }
+        guard let current = securityPreferences,
+              !isManagingSecurityPreferences
+        else { return }
+        guard current.verifyIdentityOnNewLogin != enabled else {
+            securityPreferencesErrorMessage = nil
+            return
+        }
+        guard isOnline else {
+            securityPreferencesErrorMessage =
+                "Connect to the internet to update this security setting."
+            return
+        }
+
+        securityPreferencesRequestGeneration &+= 1
+        let generation = securityPreferencesRequestGeneration
+        isUpdatingSecurityPreferences = true
+        securityPreferencesErrorMessage = nil
+        defer {
+            if securityPreferencesRequestGeneration == generation {
+                isUpdatingSecurityPreferences = false
+            }
+        }
+        guard let context = await securityPreferencesContext() else {
+            if securityPreferencesRequestGeneration == generation {
+                securityPreferencesErrorMessage =
+                    "Sign in again to update this security setting."
+            }
+            return
+        }
+
+        do {
+            let result = try await saveSecurityPreferences(
+                enabled: enabled,
+                current: current,
+                context: context,
+                generation: generation
+            )
+            guard securityPreferencesRequestGeneration == generation,
+                  await securityPreferencesContextIsCurrent(context)
+            else { return }
+            switch result {
+            case .updated(let preferences):
+                securityPreferences = preferences
+            case .refreshedAfterConflict(let preferences):
+                securityPreferences = preferences
+                securityPreferencesErrorMessage =
+                    "This setting changed on another device. The latest choice is shown; review it and try again."
+            }
+        } catch is CancellationError {
+            return
+        } catch is SecurityPreferencesConflictRefreshFailure {
+            guard securityPreferencesRequestGeneration == generation,
+                  await securityPreferencesContextIsCurrent(context)
+            else { return }
+            securityPreferences = nil
+            securityPreferencesErrorMessage =
+                "This setting changed on another device, but the latest choice could not be loaded. Refresh and try again."
+        } catch {
+            guard securityPreferencesRequestGeneration == generation,
+                  await securityPreferencesContextIsCurrent(context)
+            else { return }
+            securityPreferencesErrorMessage = securityPreferencesFailureMessage(
+                error,
+                operation: .update
+            )
+        }
+    }
+
+    private func saveSecurityPreferences(
+        enabled: Bool,
+        current: SecurityPreferencesDTO,
+        context: SecurityPreferencesAccountContext,
+        generation: UInt64
+    ) async throws -> SecurityPreferencesSaveResult {
+        do {
+            let request = try UpdateSecurityPreferencesRequest(
+                version: current.version,
+                verifyIdentityOnNewLogin: enabled
+            )
+            let updated = try await APIClientSessionBinding.$sessionID.withValue(
+                context.sessionID
+            ) {
+                try await api.updateSecurityPreferences(request)
+            }
+            guard SecurityPreferencesUpdatePolicy.isValidTransition(
+                from: current,
+                to: updated,
+                requestedValue: enabled
+            ) else { throw APIClientError.invalidResponse }
+            return .updated(updated)
+        } catch let error as APIErrorPayload
+            where error.code.caseInsensitiveCompare(
+                "SECURITY_PREFERENCES_VERSION_CONFLICT"
+            ) == .orderedSame {
+            let latest: SecurityPreferencesDTO
+            do {
+                latest = try await APIClientSessionBinding.$sessionID.withValue(
+                    context.sessionID
+                ) {
+                    try await api.securityPreferences()
+                }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw SecurityPreferencesConflictRefreshFailure()
+            }
+            guard securityPreferencesRequestGeneration == generation,
+                  await securityPreferencesContextIsCurrent(context)
+            else { throw CancellationError() }
+            // Never replay a stale edit over the newer choice made by another session.
+            return .refreshedAfterConflict(latest)
+        }
+    }
+
+    private func securityPreferencesContext() async -> SecurityPreferencesAccountContext? {
+        guard !isSigningOut,
+              isSignedIn,
+              accountSetupStep == nil,
+              sessionAssurance?.grantsFullAccess == true,
+              let userID = profile?.id
+        else { return nil }
+        let expectedAccountEpoch = accountEpoch
+        guard let sessionID = await sessions.current()?.sessionId,
+              !isSigningOut,
+              isSignedIn,
+              accountSetupStep == nil,
+              sessionAssurance?.grantsFullAccess == true,
+              accountEpoch == expectedAccountEpoch,
+              profile?.id.caseInsensitiveCompare(userID) == .orderedSame
+        else { return nil }
+        return SecurityPreferencesAccountContext(
+            accountEpoch: expectedAccountEpoch,
+            userID: userID,
+            sessionID: sessionID
+        )
+    }
+
+    private func securityPreferencesContextIsCurrent(
+        _ context: SecurityPreferencesAccountContext
+    ) async -> Bool {
+        guard !Task.isCancelled,
+              !isSigningOut,
+              isSignedIn,
+              accountSetupStep == nil,
+              sessionAssurance?.grantsFullAccess == true,
+              accountEpoch == context.accountEpoch,
+              profile?.id.caseInsensitiveCompare(context.userID) == .orderedSame,
+              await sessions.current()?.sessionId == context.sessionID
+        else { return false }
+        return !Task.isCancelled
+            && !isSigningOut
+            && isSignedIn
+            && accountEpoch == context.accountEpoch
+            && profile?.id.caseInsensitiveCompare(context.userID) == .orderedSame
+    }
+
+    private func resetSecurityPreferencesState() {
+        securityPreferencesRequestGeneration &+= 1
+        securityPreferences = nil
+        isLoadingSecurityPreferences = false
+        isUpdatingSecurityPreferences = false
+        securityPreferencesErrorMessage = nil
+    }
+
+    private enum SecurityPreferencesOperation: Equatable {
+        case load
+        case update
+    }
+
+    private func securityPreferencesFailureMessage(
+        _ error: Error,
+        operation: SecurityPreferencesOperation
+    ) -> String {
+        if !isOnline {
+            return operation == .load
+                ? "Connect to the internet to load this security setting."
+                : "Connect to the internet to update this security setting."
+        }
+        if let payload = error as? APIErrorPayload,
+           payload.code.caseInsensitiveCompare("ACCOUNT_RESTRICTED") == .orderedSame {
+            return "This security setting is unavailable for this account."
+        }
+        if let clientError = error as? APIClientError,
+           case .signedOut = clientError {
+            return "Sign in again to manage this security setting."
+        }
+        return operation == .load
+            ? "Kit Pay could not load this security setting. Please try again."
+            : "Kit Pay could not update this security setting. Please try again."
+    }
+
+    func refreshMFAStatus() async throws -> Bool {
+        let context = try await captureAuthenticatedSecurityContext()
+        let updated = try await APIClientSessionBinding.$sessionID.withValue(
+            context.sessionID
+        ) {
+            try await api.currentProfile()
+        }
+        guard updated.id.caseInsensitiveCompare(context.userID) == .orderedSame,
+              await authenticatedSecurityContextIsCurrent(context)
+        else { throw APIClientError.signedOut }
+        guard let enabled = updated.mfaEnabled else {
+            throw MFAManagementError.invalidResponse
+        }
+        await cacheMFAStatus(enabled, context: context)
+        return enabled
+    }
+
+    func beginTOTPEnrollment() async throws -> TOTPEnrollmentDTO {
+        let context = try await captureAuthenticatedSecurityContext()
+        let enrollment = try await APIClientSessionBinding.$sessionID.withValue(
+            context.sessionID
+        ) {
+            try await api.enrollTOTP()
+        }
+        guard await authenticatedSecurityContextIsCurrent(context) else {
+            throw APIClientError.signedOut
+        }
+        guard TOTPEnrollmentPolicy.isValid(enrollment) else {
+            throw MFAManagementError.invalidResponse
+        }
+        return enrollment
+    }
+
+    func confirmTOTPEnrollment(code: String) async throws -> [String] {
+        guard let normalizedCode = MFAFactorCodePolicy.normalizedSixDigitCode(code) else {
+            throw APIErrorPayload(
+                code: "MFA_CODE_INVALID",
+                message: "Enter the complete six-digit authenticator code."
+            )
+        }
+        let context = try await captureAuthenticatedSecurityContext()
+        let result = try await APIClientSessionBinding.$sessionID.withValue(context.sessionID) {
+            try await api.confirmTOTP(code: normalizedCode)
+        }
+        guard await authenticatedSecurityContextIsCurrent(context) else {
+            throw APIClientError.signedOut
+        }
+        guard result.enabled == true,
+              let recoveryCodes = MFAFactorCodePolicy.validatedRecoveryCodes(result.recoveryCodes)
+        else { throw MFAManagementError.invalidResponse }
+        await cacheMFAStatus(true, context: context)
+        return recoveryCodes
+    }
+
+    func regenerateMFARecoveryCodes(code: String) async throws -> [String] {
+        guard let normalizedCode = MFAFactorCodePolicy.normalizedFactorCode(code) else {
+            throw APIErrorPayload(
+                code: "MFA_CODE_INVALID",
+                message: "Enter a current authenticator code or a complete recovery code."
+            )
+        }
+        let context = try await captureAuthenticatedSecurityContext()
+        let result: MFARecoveryCodesDTO
+        do {
+            result = try await APIClientSessionBinding.$sessionID.withValue(context.sessionID) {
+                try await api.regenerateMFARecoveryCodes(code: normalizedCode)
+            }
+        } catch {
+            if IrreversibleAuthenticationMutationPolicy.completionIsUncertain(after: error) {
+                throw MFAManagementError.recoveryCodesUncertain
+            }
+            throw error
+        }
+        guard await authenticatedSecurityContextIsCurrent(context) else {
+            throw APIClientError.signedOut
+        }
+        guard let recoveryCodes = MFAFactorCodePolicy.validatedRecoveryCodes(result.recoveryCodes)
+        else { throw MFAManagementError.recoveryCodesUncertain }
+        return recoveryCodes
+    }
+
+    func disableTOTP(code: String) async throws {
+        guard let normalizedCode = MFAFactorCodePolicy.normalizedFactorCode(code) else {
+            throw APIErrorPayload(
+                code: "MFA_CODE_INVALID",
+                message: "Enter a current authenticator code or a complete recovery code."
+            )
+        }
+        let context = try await captureAuthenticatedSecurityContext()
+        let result = try await APIClientSessionBinding.$sessionID.withValue(context.sessionID) {
+            try await api.disableTOTP(code: normalizedCode)
+        }
+        guard await authenticatedSecurityContextIsCurrent(context) else {
+            throw APIClientError.signedOut
+        }
+        guard result.enabled == false else { throw MFAManagementError.invalidResponse }
+        await cacheMFAStatus(false, context: context)
+    }
+
+    private func captureAuthenticatedSecurityContext() async throws
+        -> AuthenticatedSecurityContext {
+        guard isOnline else { throw MFAManagementError.offline }
+        guard authenticatorMFAAvailable,
+              isSignedIn,
+              accountSetupStep == nil,
+              sessionAssurance?.grantsFullAccess == true,
+              let userID = profile?.id,
+              let session = await sessions.current(),
+              session.accountId?.caseInsensitiveCompare(userID) == .orderedSame
+        else { throw MFAManagementError.unavailable }
+        let context = AuthenticatedSecurityContext(
+            accountEpoch: accountEpoch,
+            userID: userID,
+            sessionID: session.sessionId
+        )
+        guard await authenticatedSecurityContextIsCurrent(context) else {
+            throw MFAManagementError.unavailable
+        }
+        return context
+    }
+
+    private func authenticatedSecurityContextIsCurrent(
+        _ context: AuthenticatedSecurityContext
+    ) async -> Bool {
+        await sessionOwnershipContextIsCurrent(context, requiresSignedIn: true)
+    }
+
+    private func sessionOwnershipContextIsCurrent(
+        _ context: AuthenticatedSecurityContext,
+        requiresSignedIn: Bool
+    ) async -> Bool {
+        guard !Task.isCancelled,
+              !isSigningOut,
+              !requiresSignedIn || isSignedIn,
+              accountEpoch == context.accountEpoch,
+              profile?.id.caseInsensitiveCompare(context.userID) == .orderedSame,
+              let currentSession = await sessions.current()
+        else { return false }
+        return !Task.isCancelled
+            && (!requiresSignedIn || isSignedIn)
+            && !isSigningOut
+            && accountEpoch == context.accountEpoch
+            && currentSession.sessionId.caseInsensitiveCompare(context.sessionID) == .orderedSame
+            && currentSession.accountId?.caseInsensitiveCompare(context.userID) == .orderedSame
+    }
+
+    private func cacheMFAStatus(
+        _ enabled: Bool,
+        context: AuthenticatedSecurityContext
+    ) async {
+        guard await authenticatedSecurityContextIsCurrent(context) else { return }
+        do {
+            try await store.update { persisted in
+                guard persisted.profile?.id.caseInsensitiveCompare(context.userID) == .orderedSame
+                else { throw StoreError.accountChanged }
+                persisted.profile?.mfaEnabled = enabled
+            }
+            let updatedState = await store.snapshot()
+            guard updatedState.profile?.id.caseInsensitiveCompare(context.userID) == .orderedSame,
+                  await authenticatedSecurityContextIsCurrent(context)
+            else { return }
+            state = updatedState
+        } catch {
+            // The server result remains authoritative. Keep this process accurate even if the
+            // encrypted cache cannot be rewritten; the next profile refresh repairs persistence.
+            guard await authenticatedSecurityContextIsCurrent(context),
+                  state.profile?.id.caseInsensitiveCompare(context.userID) == .orderedSame
+            else { return }
+            var updatedState = state
+            updatedState.profile?.mfaEnabled = enabled
+            state = updatedState
+        }
+    }
+
+    @discardableResult
+    func setBiometricUnlockEnabled(_ enabled: Bool) async -> Bool {
+        guard !isConfiguringBiometrics,
+              isSignedIn,
+              accountSetupStep == nil,
+              sessionAssurance?.grantsFullAccess == true,
+              let userID = profile?.id,
+              let session = await sessions.current()
+        else { return false }
+        if enabled == biometricUnlockEnabled { return true }
+
+        let expectedAccountEpoch = accountEpoch
+        let expectedSessionID = session.sessionId
+        let expectedInstallationID = installationID()
+        isConfiguringBiometrics = true
+        biometricErrorMessage = nil
+        var serverCredentialRemoved = false
+        defer { isConfiguringBiometrics = false }
+
+        do {
+            if enabled {
+                let availability = await biometrics.availability()
+                biometricKind = availability.kind
+                guard availability.isAvailable else {
+                    throw KitBiometricError.unavailable
+                }
+                biometricKind = try await biometrics.enable(
+                    forUserID: userID,
+                    sessionID: expectedSessionID,
+                    installationID: expectedInstallationID
+                )
+                let publicKeyPEM = try await biometrics.publicKeyPEM(
+                    forUserID: userID,
+                    sessionID: expectedSessionID,
+                    installationID: expectedInstallationID
+                )
+                let registration = try await api.enrollBiometricKey(
+                    publicKeyPEM: publicKeyPEM,
+                    attestation: [
+                        "platform": "ios",
+                        "key_storage": "secure_enclave",
+                        "access_control": "biometry_current_set",
+                    ]
+                )
+                guard registration.algorithm?.caseInsensitiveCompare("ES256") == .orderedSame else {
+                    throw KitBiometricError.storage
+                }
+            } else {
+                _ = try await api.removeBiometricKey()
+                serverCredentialRemoved = true
+                try await biometrics.disable(
+                    forUserID: userID,
+                    sessionID: expectedSessionID,
+                    installationID: expectedInstallationID
+                )
+            }
+            let updatedAssurance = try await api.sessionAssurance()
+
+            guard isSignedIn,
+                  accountEpoch == expectedAccountEpoch,
+                  profile?.id == userID,
+                  await sessions.current()?.sessionId == expectedSessionID
+            else {
+                await biometrics.removeAnyEnrollment()
+                throw KitBiometricError.accountChanged
+            }
+            sessionAssurance = updatedAssurance
+            biometricUnlockEnabled = enabled
+            biometricAccessState = enabled ? .authorized : .notRequired
+            homeBiometricState = enabled ? .locked : .notRequired
+            return true
+        } catch {
+            if enabled {
+                _ = try? await api.removeBiometricKey()
+                await biometrics.removeAnyEnrollment()
+            } else if serverCredentialRemoved {
+                await biometrics.removeAnyEnrollment()
+                biometricUnlockEnabled = false
+                biometricAccessState = .notRequired
+                homeBiometricState = .notRequired
+            }
+            biometricErrorMessage = error.localizedDescription
+            return false
+        }
+    }
+
+    func retryBiometricSignIn() async {
+        guard requiresBiometricSignIn else { return }
+        guard await authenticateBiometrically(for: .returningSignIn) else {
+            isLoading = false
+            return
+        }
+        await resumeAuthenticatedSessionIfNeeded()
+    }
+
+    @discardableResult
+    func retrySignInWithPIN(_ pin: String) async -> Bool {
+        guard isSignedIn,
+              accountSetupStep == nil,
+              sessionAssurance?.grantsFullAccess == true,
+              biometricAccessState != .authorizing,
+              isValidPaymentPin(pin),
+              let expectedSessionID = await sessions.current()?.sessionId
+        else { return false }
+        let expectedAccountEpoch = accountEpoch
+        biometricAccessState = .authorizing
+        biometricErrorMessage = nil
+        do {
+            let result = try await api.unlockSession(pin: pin)
+            guard result.method.caseInsensitiveCompare("pin") == .orderedSame,
+                  result.sessionAssurance.grantsFullAccess,
+                  isSignedIn,
+                  accountEpoch == expectedAccountEpoch,
+                  await sessions.current()?.sessionId == expectedSessionID
+            else { throw AccountSetupError.sessionNotUnlocked }
+            sessionAssurance = result.sessionAssurance
+            biometricAccessState = .authorized
+            if selectedTab == MainTabIndex.home { homeBiometricState = .authorized }
+            await resumeAuthenticatedSessionIfNeeded()
+            return true
+        } catch {
+            guard isSignedIn,
+                  accountEpoch == expectedAccountEpoch,
+                  await sessions.current()?.sessionId == expectedSessionID
+            else { return false }
+            biometricAccessState = .locked
+            biometricErrorMessage = error.localizedDescription
+            return false
+        }
+    }
+
+    func applicationDidEnterBackgroundSecurely() {
+        suspendEphemeralOutgoingCallSubmission()
+        returningSignInBiometricAuthorizationFence.invalidate()
+        homeBiometricAuthorizationFence.invalidate()
+        guard isSignedIn, accountSetupStep == nil, biometricUnlockEnabled else { return }
+        biometricAccessState = .locked
+        homeBiometricState = .locked
+        biometricErrorMessage = nil
+    }
+
+    func applicationDidBecomeActiveSecurely() async {
+        if let restoreTask { await restoreTask.value }
+        if protectedLocalStateRecoveryBlocked {
+            await retryProtectedLocalStateRecovery()
+        }
+        guard !acceptedAccountDeletionCleanupBlocked,
+              !protectedLocalStateRecoveryBlocked,
+              !unresolvedAccountDeletionAttemptBlocked
+        else { return }
+        if isSignedIn,
+           accountSetupStep == nil,
+           biometricUnlockEnabled,
+           biometricAccessState == .locked,
+           !biometricAuthenticationInProgress {
+            guard await authenticateBiometrically(for: .returningSignIn) else { return }
+            await resumeAuthenticatedSessionIfNeeded()
+        }
+        applicationDidBecomeActive()
+    }
+
+    func homeDidBecomeActive() async {
+        guard selectedTab == MainTabIndex.home,
+              isSignedIn,
+              accountSetupStep == nil,
+              !requiresBiometricSignIn
+        else { return }
+        guard biometricUnlockEnabled else {
+            homeBiometricState = .notRequired
+            return
+        }
+        guard homeBiometricState != .authorized else { return }
+        _ = await authenticateBiometrically(for: .home)
+    }
+
+    func homeDidResignActive() {
+        homeBiometricAuthorizationFence.invalidate()
+        guard biometricUnlockEnabled else {
+            homeBiometricState = .notRequired
+            return
+        }
+        homeBiometricState = .locked
+    }
+
+    func authorizePaymentRequestSubmission() async -> Bool {
+        guard isSignedIn, !requiresBiometricSignIn else { return false }
+        guard biometricUnlockEnabled else { return true }
+        return await authenticateBiometrically(for: .paymentRequest)
+    }
+
+    /// Creates a financial request only for the authenticated account/session captured before the
+    /// network call. The caller separately queues its end-to-end encrypted chat card after the
+    /// exact response is validated; a replacement login can never inherit this operation.
+    func createPaymentRequest(
+        destinationWalletID: String,
+        requestedFromUserID: String,
+        amount: String,
+        note: String?,
+        idempotencyKey: String
+    ) async throws -> PaymentRequestDTO {
+        guard isSignedIn,
+              isOnline,
+              accountSetupStep == nil,
+              !requiresBiometricSignIn,
+              sessionAssurance?.grantsFullAccess == true,
+              let expectedWallet = state.wallets.first(where: { $0.id == destinationWalletID }),
+              let expectedUserID = profile?.id,
+              let expectedSessionID = await sessions.current()?.sessionId,
+              let recipientUUID = UUID(
+                  uuidString: requestedFromUserID.trimmingCharacters(in: .whitespacesAndNewlines)
+              ),
+              recipientUUID.uuidString.caseInsensitiveCompare(expectedUserID) != .orderedSame
+        else { throw PaymentRequestSubmissionError.invalidRecipient }
+        let expectedAccountEpoch = accountEpoch
+        guard await outboxContextIsCurrent(
+            accountEpoch: expectedAccountEpoch,
+            userID: expectedUserID,
+            sessionID: expectedSessionID
+        ) else { throw PaymentRequestSubmissionError.accountChanged }
+        let canonicalRecipient = recipientUUID.uuidString.lowercased()
+
+        let request = try await APIClientSessionBinding.$sessionID.withValue(expectedSessionID) {
+            try await api.createPaymentRequest(
+                destinationWalletId: destinationWalletID,
+                requestedFromUserId: canonicalRecipient,
+                amount: amount,
+                note: note,
+                idempotencyKey: idempotencyKey
+            )
+        }
+        guard await outboxContextIsCurrent(
+            accountEpoch: expectedAccountEpoch,
+            userID: expectedUserID,
+            sessionID: expectedSessionID
+        ) else { throw PaymentRequestSubmissionError.accountChanged }
+        guard UUID(uuidString: request.id) != nil,
+              request.type == "payment_request",
+              request.knownStatus == .pending,
+              request.destinationWalletId == destinationWalletID,
+              request.requestedFromUserId?.caseInsensitiveCompare(canonicalRecipient)
+                == .orderedSame,
+              request.amount == amount,
+              request.currency == expectedWallet.currency,
+              let paymentDescriptor = KitPaymentMessage(
+                  action: .request,
+                  paymentRequest: request
+              )
+        else { throw PaymentRequestSubmissionError.unconfirmedRequest }
+        paymentRequestChatShareLeases[request.id.lowercased()] = PaymentRequestChatShareLease(
+            accountEpoch: expectedAccountEpoch,
+            userID: expectedUserID,
+            sessionID: expectedSessionID,
+            recipientUserID: canonicalRecipient,
+            descriptor: paymentDescriptor
+        )
+        return request
+    }
+
+    func authorizeFinancialStepUp(
+        purpose: String,
+        intent: [String: String?],
+        pin: String,
+        reason: String
+    ) async throws -> StepUpVerificationDTO {
+        guard isSignedIn,
+              isOnline,
+              accountSetupStep == nil,
+              !requiresBiometricSignIn,
+              sessionAssurance?.grantsFullAccess == true,
+              let expectedUserID = profile?.id
+        else { throw APIClientError.signedOut }
+
+        let expectedAccountEpoch = accountEpoch
+        // Snapshot the enrolled mode for this attempt. A failed or cancelled biometric
+        // signature must never be retried with the PIN behind the user's back.
+        let method = KitFinancialStepUpApprovalPolicy.method(
+            purpose: purpose,
+            biometricsEnabled: biometricUnlockEnabled
+        )
+        if method == .pin,
+           pin.range(of: #"^[0-9]{4}$"#, options: .regularExpression) == nil {
+            throw KitFinancialStepUpError.invalidPIN
+        }
+        let biometricOperationID: UUID?
+        if method == .biometricSignature {
+            guard let operationID = biometricAuthenticationGate.begin() else {
+                throw KitFinancialStepUpError.authorizationInProgress
+            }
+            biometricOperationID = operationID
+            biometricErrorMessage = nil
+        } else {
+            biometricOperationID = nil
+        }
+        defer {
+            if let biometricOperationID {
+                biometricAuthenticationGate.finish(biometricOperationID)
+            }
+        }
+
+        guard let session = await sessions.current() else {
+            throw APIClientError.signedOut
+        }
+        let expectedSessionID = session.sessionId
+        let expectedInstallationID = installationID()
+        guard isSignedIn,
+              accountEpoch == expectedAccountEpoch,
+              profile?.id == expectedUserID
+        else { throw KitFinancialStepUpError.accountChanged }
+
+        do {
+            let initialChallenge = try await api.createStepUp(
+                purpose: purpose,
+                intent: intent
+            )
+            let challenge = try await KitFinancialStepUpChallengeResolver.resolve(
+                initial: initialChallenge,
+                purpose: purpose,
+                intent: intent,
+                method: method,
+                repairBiometricEnrollment: {
+                    try await self.repairServerBiometricEnrollment(
+                        expectedUserID: expectedUserID,
+                        expectedSessionID: expectedSessionID,
+                        expectedInstallationID: expectedInstallationID,
+                        expectedAccountEpoch: expectedAccountEpoch
+                    )
+                },
+                createReplacementChallenge: {
+                    try await self.api.createStepUp(
+                        purpose: purpose,
+                        intent: intent
+                    )
+                }
+            )
+            guard isSignedIn,
+                  accountEpoch == expectedAccountEpoch,
+                  profile?.id == expectedUserID,
+                  await sessions.current()?.sessionId == expectedSessionID
+            else { throw KitFinancialStepUpError.accountChanged }
+
+            let verification: StepUpVerificationDTO
+            switch method {
+            case .biometricSignature:
+                let signature = try await biometrics.sign(
+                    signingPayload: challenge.signingPayload,
+                    userID: expectedUserID,
+                    sessionID: expectedSessionID,
+                    installationID: expectedInstallationID,
+                    reason: reason
+                )
+                guard isSignedIn,
+                      accountEpoch == expectedAccountEpoch,
+                      profile?.id == expectedUserID,
+                      await sessions.current()?.sessionId == expectedSessionID
+                else { throw KitFinancialStepUpError.accountChanged }
+                verification = try await api.verifyStepUp(
+                    challengeId: challenge.id,
+                    nonce: challenge.nonce,
+                    signature: signature
+                )
+            case .pin:
+                verification = try await api.verifyStepUp(
+                    challengeId: challenge.id,
+                    pin: pin
+                )
+            }
+
+            try KitFinancialStepUpBinding.validate(
+                verification,
+                method: method
+            )
+            guard isSignedIn,
+                  accountEpoch == expectedAccountEpoch,
+                  profile?.id == expectedUserID,
+                  await sessions.current()?.sessionId == expectedSessionID
+            else { throw KitFinancialStepUpError.accountChanged }
+            return verification
+        } catch {
+            if method == .biometricSignature {
+                biometricErrorMessage = error.localizedDescription
+                if let biometricError = error as? KitBiometricError,
+                   [.biometricSetChanged, .enrollmentMissing, .keyMissing, .notEnrolled,
+                    .unavailable, .passcodeNotSet].contains(biometricError) {
+                    await biometrics.removeAnyEnrollment()
+                    biometricUnlockEnabled = false
+                    biometricAccessState = .notRequired
+                    homeBiometricState = .notRequired
+                }
+            }
+            throw error
+        }
+    }
+
+    private func repairServerBiometricEnrollment(
+        expectedUserID: String,
+        expectedSessionID: String,
+        expectedInstallationID: String,
+        expectedAccountEpoch: UUID
+    ) async throws {
+        guard isSignedIn,
+              biometricUnlockEnabled,
+              accountSetupStep == nil,
+              sessionAssurance?.grantsFullAccess == true,
+              accountEpoch == expectedAccountEpoch,
+              profile?.id == expectedUserID,
+              installationID() == expectedInstallationID,
+              await sessions.current()?.sessionId == expectedSessionID
+        else { throw KitFinancialStepUpError.accountChanged }
+
+        let publicKeyPEM = try await biometrics.publicKeyPEM(
+            forUserID: expectedUserID,
+            sessionID: expectedSessionID,
+            installationID: expectedInstallationID
+        )
+        guard isSignedIn,
+              accountEpoch == expectedAccountEpoch,
+              profile?.id == expectedUserID,
+              installationID() == expectedInstallationID,
+              await sessions.current()?.sessionId == expectedSessionID
+        else { throw KitFinancialStepUpError.accountChanged }
+
+        let registration = try await api.enrollBiometricKey(
+            publicKeyPEM: publicKeyPEM,
+            attestation: [
+                "platform": "ios",
+                "key_storage": "secure_enclave",
+                "access_control": "biometry_current_set",
+            ]
+        )
+        guard registration.algorithm?.caseInsensitiveCompare("ES256") == .orderedSame,
+              registration.removed != true
+        else { throw KitFinancialStepUpError.approvalMethodUnavailable }
+
+        let updatedAssurance: SessionAssuranceDTO
+        if let responseAssurance = registration.sessionAssurance {
+            updatedAssurance = responseAssurance
+        } else {
+            updatedAssurance = try await api.sessionAssurance()
+        }
+        guard isSignedIn,
+              accountEpoch == expectedAccountEpoch,
+              profile?.id == expectedUserID,
+              installationID() == expectedInstallationID,
+              await sessions.current()?.sessionId == expectedSessionID
+        else { throw KitFinancialStepUpError.accountChanged }
+        guard updatedAssurance.grantsFullAccess,
+              updatedAssurance.loginUnlock.supportsBiometricSignature
+        else { throw KitFinancialStepUpError.approvalMethodUnavailable }
+        sessionAssurance = updatedAssurance
+    }
+
+    private func loadBiometricConfiguration(
+        context: AuthenticatedSecurityContext,
+        requiresSignedIn: Bool = true
+    ) async -> Bool {
+        guard await sessionOwnershipContextIsCurrent(
+            context,
+            requiresSignedIn: requiresSignedIn
+        ) else { return false }
+        let availability = await biometrics.availability()
+        guard await sessionOwnershipContextIsCurrent(
+            context,
+            requiresSignedIn: requiresSignedIn
+        ) else { return false }
+        let storedEnrollmentEnabled = await biometrics.isEnabled(
+            forUserID: context.userID,
+            sessionID: context.sessionID,
+            installationID: installationID()
+        )
+        guard await sessionOwnershipContextIsCurrent(
+            context,
+            requiresSignedIn: requiresSignedIn
+        ) else { return false }
+        if !storedEnrollmentEnabled {
+            // Remove only material owned by this account. A stale load must never delete an
+            // enrollment created by a replacement sign-in while the actor call was suspended.
+            try? await biometrics.disable(
+                forUserID: context.userID,
+                sessionID: context.sessionID,
+                installationID: installationID()
+            )
+            guard await sessionOwnershipContextIsCurrent(
+                context,
+                requiresSignedIn: requiresSignedIn
+            ) else { return false }
+        }
+        let enabled = storedEnrollmentEnabled && availability.isAvailable
+        biometricErrorMessage = nil
+        biometricKind = availability.kind
+        biometricUnlockEnabled = enabled
+        biometricAccessState = enabled ? .locked : .notRequired
+        homeBiometricState = enabled ? .locked : .notRequired
+        if storedEnrollmentEnabled, !availability.isAvailable {
+            biometricErrorMessage = availability.unavailableMessage
+        }
+        return true
+    }
+
+    private func authenticateBiometrically(
+        for purpose: KitBiometricPurpose
+    ) async -> Bool {
+        guard biometricUnlockEnabled,
+              isSignedIn,
+              let userID = profile?.id
+        else { return !biometricUnlockEnabled }
+
+        guard let operationID = biometricAuthenticationGate.begin() else { return false }
+        let expectedAccountEpoch = accountEpoch
+        let expectedInstallationID = installationID()
+        let expectedReturningSignInAuthorization =
+            returningSignInBiometricAuthorizationFence.capture()
+        let expectedHomeAuthorization = homeBiometricAuthorizationFence.capture()
+        biometricErrorMessage = nil
+        switch purpose {
+        case .returningSignIn: biometricAccessState = .authorizing
+        case .home: homeBiometricState = .authorizing
+        case .paymentRequest: break
+        }
+        defer { biometricAuthenticationGate.finish(operationID) }
+
+        guard let session = await sessions.current() else {
+            guard biometricAuthenticationGate.owns(operationID) else { return false }
+            switch purpose {
+            case .returningSignIn:
+                biometricAccessState = .locked
+            case .home:
+                if homeBiometricAuthorizationFence.authorizes(
+                    expectedHomeAuthorization,
+                    homeIsSelected: selectedTab == MainTabIndex.home
+                ) {
+                    homeBiometricState = .locked
+                }
+            case .paymentRequest:
+                break
+            }
+            return false
+        }
+        let expectedSessionID = session.sessionId
+
+        guard biometricAuthenticationGate.owns(operationID),
+              !Task.isCancelled,
+              isSignedIn,
+              accountEpoch == expectedAccountEpoch,
+              profile?.id == userID
+        else { return false }
+        if case .returningSignIn = purpose,
+           !returningSignInBiometricAuthorizationFence.authorizes(
+               expectedReturningSignInAuthorization
+           ) {
+            return false
+        }
+        if case .home = purpose,
+           !homeBiometricAuthorizationFence.authorizes(
+               expectedHomeAuthorization,
+               homeIsSelected: selectedTab == MainTabIndex.home
+           ) {
+            return false
+        }
+
+        do {
+            let kind = try await biometrics.authenticate(
+                userID: userID,
+                sessionID: expectedSessionID,
+                installationID: expectedInstallationID,
+                reason: purpose.reason(using: biometricKind)
+            )
+            guard biometricAuthenticationGate.owns(operationID),
+                  isSignedIn,
+                  accountEpoch == expectedAccountEpoch,
+                  profile?.id == userID,
+                  await sessions.current()?.sessionId == expectedSessionID
+            else { throw KitBiometricError.accountChanged }
+            if case .returningSignIn = purpose,
+               !returningSignInBiometricAuthorizationFence.authorizes(
+                   expectedReturningSignInAuthorization
+               ) {
+                return false
+            }
+            biometricKind = kind
+            switch purpose {
+            case .returningSignIn:
+                biometricAccessState = .authorized
+                if homeBiometricAuthorizationFence.authorizes(
+                    expectedHomeAuthorization,
+                    homeIsSelected: selectedTab == MainTabIndex.home
+                ) {
+                    homeBiometricState = .authorized
+                }
+            case .home:
+                guard homeBiometricAuthorizationFence.authorizes(
+                    expectedHomeAuthorization,
+                    homeIsSelected: selectedTab == MainTabIndex.home
+                ) else { return false }
+                homeBiometricState = .authorized
+            case .paymentRequest:
+                break
+            }
+            return true
+        } catch {
+            guard biometricAuthenticationGate.owns(operationID) else { return false }
+            if case .returningSignIn = purpose,
+               !returningSignInBiometricAuthorizationFence.authorizes(
+                   expectedReturningSignInAuthorization
+               ) {
+                return false
+            }
+            if case .home = purpose,
+               !homeBiometricAuthorizationFence.authorizes(
+                   expectedHomeAuthorization,
+                   homeIsSelected: selectedTab == MainTabIndex.home
+               ) {
+                return false
+            }
+            biometricErrorMessage = error.localizedDescription
+            switch purpose {
+            case .returningSignIn: biometricAccessState = .locked
+            case .home: homeBiometricState = .locked
+            case .paymentRequest: break
+            }
+            return false
+        }
+    }
+
+    private func resumeAuthenticatedSessionIfNeeded() async {
+        guard isSignedIn,
+              !isSigningOut,
+              !isSubmittingAccountDeletion,
+              !acceptedAccountDeletionCleanupBlocked,
+              !protectedLocalStateRecoveryBlocked,
+              !unresolvedAccountDeletionAttemptBlocked,
+              accountSetupStep == nil,
+              sessionAssurance?.grantsFullAccess == true,
+              !requiresBiometricSignIn,
+              let expectedUserID = profile?.id
+        else {
+            isLoading = false
+            return
+        }
+        let expectedAccountEpoch = accountEpoch
+        guard let expectedSessionID = await sessions.current()?.sessionId,
+              await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+              )
+        else {
+            if accountEpoch == expectedAccountEpoch,
+               profile?.id.caseInsensitiveCompare(expectedUserID) == .orderedSame {
+                didResumeAuthenticatedSession = false
+                isLoading = false
+            }
+            return
+        }
+        privacyQuarantineTargetAccountID = nil
+        if didResumeAuthenticatedSession {
+            NotificationCoordinator.shared.resumeRegistration(
+                afterOwnershipRecoveryFor: expectedUserID
+            )
+            isLoading = false
+            return
+        }
+        didResumeAuthenticatedSession = true
+        let lease = CallMediaAccountLease(
+            accountEpoch: expectedAccountEpoch,
+            userID: expectedUserID,
+            sessionID: expectedSessionID
+        )
+        guard CallMediaCoordinator.shared.activateAccountLease(lease) else {
+            didResumeAuthenticatedSession = false
+            isLoading = false
+            return
+        }
+        if ephemeralOutgoingCallGate.attempt?.lease != lease {
+            cancelEphemeralOutgoingCall(dismissPresentation: true)
+        }
+        callMediaAccountLease = lease
+        NotificationCoordinator.shared.requestAuthorizationAndRegister(
+            forAccountID: expectedUserID
+        )
+        NotificationCoordinator.shared.replayCurrentPushTokens()
+        capabilities = nil
+        await refresh()
+        guard await outboxContextIsCurrent(
+            accountEpoch: expectedAccountEpoch,
+            userID: expectedUserID,
+            sessionID: expectedSessionID
+        ) else { return }
+        try? await store.update { persisted in
+            guard persisted.profile?.id.caseInsensitiveCompare(expectedUserID) == .orderedSame,
+                  persisted.communicationOwnerUserID?.caseInsensitiveCompare(expectedUserID)
+                    == .orderedSame
+            else { throw StoreError.accountChanged }
+            OutboxPolicy.resumeSessionDeferredCommands(in: &persisted, at: Date())
+        }
+        let resumedState = await store.snapshot()
+        guard resumedState.profile?.id.caseInsensitiveCompare(expectedUserID) == .orderedSame,
+              resumedState.communicationOwnerUserID?.caseInsensitiveCompare(expectedUserID)
+                == .orderedSame,
+              await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+              )
+        else { return }
+        state = resumedState
+        scheduleOutboxWake()
+        if isOnline { await flushOutbox() }
+        guard await outboxContextIsCurrent(
+            accountEpoch: expectedAccountEpoch,
+            userID: expectedUserID,
+            sessionID: expectedSessionID
+        ) else { return }
+        isLoading = false
+        scheduleAutomaticContactSync()
+    }
+
+    private func unregisterApplePushProvidersBeforeSignOut(sessionID: String) async {
+        await withTaskGroup(of: Void.self) { group in
+            for provider in ["apns", "apns_voip"] {
+                group.addTask { [api] in
+                    _ = try? await APIClientSessionBinding.$sessionID.withValue(sessionID) {
+                        try await api.unregisterPushToken(provider: provider)
+                    }
+                }
+            }
+            await group.waitForAll()
+        }
+    }
+
+    /// - Parameter userInitiated: `true` only when the customer pulled to refresh. Automatic
+    ///   refreshes — launch, session resume, returning from the biometric prompt — stay silent
+    ///   about transient transport failures instead of raising an alert nobody can act on.
+    func refresh(userInitiated: Bool = false) async {
+        guard !isSigningOut,
+              isSignedIn,
+              isOnline,
+              accountSetupStep == nil,
+              sessionAssurance?.grantsFullAccess == true
+        else { return }
+        guard let expectedSessionID = await sessions.current()?.sessionId,
+              let expectedUserID = profile?.id
+        else { return }
+        let expectedAccountEpoch = accountEpoch
+        authenticatedRefreshCount += 1
+        if state.pendingProfileAvatarAttachment != nil {
+            profileAvatarResumeRequestedAfterRefresh = true
+        }
+        defer {
+            authenticatedRefreshCount -= 1
+            if authenticatedRefreshCount == 0,
+               profileAvatarResumeRequestedAfterRefresh {
+                profileAvatarResumeRequestedAfterRefresh = false
+                schedulePendingProfileAvatarResume()
+            }
+        }
+
+        // Bootstrap owns the profile projection while it is in flight. Cancel a silent avatar
+        // retry promptly, then restart it after all overlapping refreshes have committed.
+        await cancelProfileAvatarResumeAndWait()
+        guard isOnline,
+              await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+              )
+        else { return }
+        guard await reloadCapabilities() else { return }
+        guard !Task.isCancelled,
+              !isSigningOut,
+              isSignedIn,
+              isOnline,
+              accountEpoch == expectedAccountEpoch,
+              await sessions.current()?.sessionId == expectedSessionID
+        else { return }
+        // Fresh discovery is the earliest safe reconnect boundary for a visible process-only
+        // call attempt. Start its idempotent submission before wallet/bootstrap and history I/O;
+        // cancellation, backgrounding and account replacement still fence the in-memory gate,
+        // and nothing is made durable or replayable after relaunch.
+        resumeEphemeralOutgoingCallIfPossible()
+
+        // Connectivity recovery prioritizes user-created work. A large wallet/bootstrap or
+        // call-history refresh must never sit in front of queued encrypted messages.
+        await flushOutbox()
+        guard !Task.isCancelled,
+              !isSigningOut,
+              isSignedIn,
+              isOnline,
+              accountEpoch == expectedAccountEpoch,
+              profile?.id.caseInsensitiveCompare(expectedUserID) == .orderedSame,
+              await sessions.current()?.sessionId == expectedSessionID
+        else { return }
+        requestCallMicrophonePermissionInForeground()
+        let expectedDeviceManagementGeneration = deviceManagementGeneration
+        let expectedDeviceProjectionRevision = state.currentRegisteredDeviceProjectionRevision
+        do {
+            let bootstrap = try await APIClientSessionBinding.$sessionID.withValue(
+                expectedSessionID
+            ) {
+                try await api.bootstrap()
+            }
+            let selectedId = bootstrap.selectedWalletId
+                ?? bootstrap.wallets.first(where: { $0.isPrimary == true })?.id
+                ?? bootstrap.wallets.first?.id
+            let verifiedDevices = RegisteredDevicePolicy.validated(bootstrap.devices)
+            try Task.checkCancellation()
+            guard isSignedIn,
+                  !isSigningOut,
+                  accountEpoch == expectedAccountEpoch,
+                  profile?.id.caseInsensitiveCompare(expectedUserID) == .orderedSame,
+                  bootstrap.user.id.caseInsensitiveCompare(expectedUserID) == .orderedSame,
+                  await sessions.current()?.sessionId == expectedSessionID
+            else { return }
+            let canCommitDeviceProjection = verifiedDevices != nil
+                && deviceManagementGeneration == expectedDeviceManagementGeneration
+                && !isRefreshingRegisteredDevices
+                && revokingRegisteredDeviceID == nil
+            try await store.update { persisted in
+                guard persisted.profile?.id.caseInsensitiveCompare(expectedUserID) == .orderedSame
+                else { throw AccountSetupError.accountChanged }
+                let previousSelectedWalletID = persisted.selectedWalletId
+                persisted.bindAuthenticatedProfile(bootstrap.user)
+                persisted.sessionAssurance = bootstrap.sessionAssurance
+                persisted.wallets = bootstrap.wallets
+                if canCommitDeviceProjection,
+                   let verifiedDevices,
+                   persisted.currentRegisteredDeviceProjectionRevision
+                        == expectedDeviceProjectionRevision {
+                    persisted.replaceRegisteredDeviceProjection(verifiedDevices)
+                }
+                persisted.selectedWalletId = selectedId
+                if previousSelectedWalletID != selectedId {
+                    persisted.transactions = []
+                }
+            }
+            guard await callHistoryContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                sessionID: expectedSessionID,
+                userID: expectedUserID
+            ) else { return }
+            state = await store.snapshot()
+            sessionAssurance = bootstrap.sessionAssurance
+            accountSetupStep = AccountSetupPolicy.reconcile(
+                accountSetupStep,
+                with: bootstrap.user,
+                assurance: sessionAssurance
+            )
+            // A finalized photo may still be scanning after a previous suspension. Resume it in
+            // its own single-flight task so an ordinary refresh never waits for the poll window.
+            schedulePendingProfileAvatarResume()
+        } catch {
+            if RefreshCancellationPolicy.shouldSuppress(
+                error,
+                taskIsCancelled: Task.isCancelled
+            ) { return }
+            if TransientTransportErrorPolicy.shouldSuppressAutomatically(
+                error,
+                isUserInitiated: userInitiated
+            ) { return }
+            guard !Task.isCancelled,
+                  !isSigningOut,
+                  isSignedIn,
+                  isOnline,
+                  accountEpoch == expectedAccountEpoch,
+                  profile?.id.caseInsensitiveCompare(expectedUserID) == .orderedSame,
+                  await sessions.current()?.sessionId == expectedSessionID
+            else { return }
+            lastError = error.localizedDescription
+            return
+        }
+
+        // Communication blocks are account-wide authorization state. Refresh them before
+        // rebuilding recipient pickers so a stale local contact cannot remain selectable.
+        await loadCommunicationPrivacy()
+
+        // Call history is deliberately independent from wallet/bootstrap and secure messaging.
+        // A malformed deep cursor can neither hide refreshed balances nor stop encrypted messages.
+        if callsFeatureEnabled {
+            scheduleVisibleConversationCallHistoryRefresh()
+            scheduleCompleteCallHistoryBackfillIfNeeded()
+        } else {
+            rebuildCallContacts(remote: [])
+        }
+
+        _ = await syncSecureMessagingIfPermitted(
+            presentsVisibleMessageNotifications: true
+        )
+        guard await callHistoryContextIsCurrent(
+            accountEpoch: expectedAccountEpoch,
+            sessionID: expectedSessionID,
+            userID: expectedUserID
+        ) else { return }
+
+        if let selectedWalletID = state.selectedWalletId {
+            do {
+                let transactions = try await APIClientSessionBinding.$sessionID.withValue(
+                    expectedSessionID
+                ) {
+                    try await api.transactions(walletId: selectedWalletID).items
+                }
+                guard await callHistoryContextIsCurrent(
+                    accountEpoch: expectedAccountEpoch,
+                    sessionID: expectedSessionID,
+                    userID: expectedUserID
+                ) else { return }
+                try await store.update { persisted in
+                    guard persisted.profile?.id.caseInsensitiveCompare(expectedUserID)
+                            == .orderedSame,
+                          persisted.selectedWalletId == selectedWalletID
+                    else { throw StoreError.accountChanged }
+                    persisted.transactions = transactions
+                }
+                guard await callHistoryContextIsCurrent(
+                    accountEpoch: expectedAccountEpoch,
+                    sessionID: expectedSessionID,
+                    userID: expectedUserID
+                ) else { return }
+                state = await store.snapshot()
+            } catch {
+                if RefreshCancellationPolicy.shouldSuppress(
+                    error,
+                    taskIsCancelled: Task.isCancelled
+                ) { return }
+                guard await callHistoryContextIsCurrent(
+                    accountEpoch: expectedAccountEpoch,
+                    sessionID: expectedSessionID,
+                    userID: expectedUserID
+                ) else { return }
+                lastError = error.localizedDescription
+            }
+        }
+
+        if callsFeatureEnabled {
+            await loadCallContacts()
+        }
+    }
+
+    private func loadCompleteCallHistory(
+        accountEpoch expectedAccountEpoch: UUID,
+        sessionID expectedSessionID: String,
+        userID expectedUserID: String
+    ) async throws -> [CallDTO] {
+        // Return only after an authenticated terminal page. A cancellation, account switch, or
+        // malformed cursor leaves the previously complete encrypted cache untouched.
+        var accumulator = CallHistoryPageAccumulator()
+        while true {
+            try Task.checkCancellation()
+            guard isOnline,
+                  await callHistoryContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                sessionID: expectedSessionID,
+                userID: expectedUserID
+            ) else { throw CancellationError() }
+
+            let page = try await APIClientSessionBinding.$sessionID.withValue(
+                expectedSessionID
+            ) {
+                try await api.calls(
+                    cursor: accumulator.nextCursor,
+                    limit: CallHistoryPageAccumulator.pageLimit
+                )
+            }
+
+            try Task.checkCancellation()
+            guard isOnline,
+                  await callHistoryContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                sessionID: expectedSessionID,
+                userID: expectedUserID
+            ) else { throw CancellationError() }
+            if try accumulator.append(page) {
+                return accumulator.calls
+            }
+        }
+    }
+
+    private func callHistoryContextIsCurrent(
+        accountEpoch expectedAccountEpoch: UUID,
+        sessionID expectedSessionID: String,
+        userID expectedUserID: String
+    ) async -> Bool {
+        guard !Task.isCancelled,
+              !isSigningOut,
+              isSignedIn,
+              accountEpoch == expectedAccountEpoch,
+              profile?.id.caseInsensitiveCompare(expectedUserID) == .orderedSame
+        else { return false }
+        guard await sessions.current()?.sessionId == expectedSessionID else { return false }
+        return !Task.isCancelled
+            && !isSigningOut
+            && isSignedIn
+            && accountEpoch == expectedAccountEpoch
+            && profile?.id.caseInsensitiveCompare(expectedUserID) == .orderedSame
+    }
+
+    @discardableResult
+    private func syncSecureMessagingIfPermitted(
+        presentsVisibleMessageNotifications: Bool = false,
+        reportsFailure: Bool = true,
+        expectedContext: AuthenticatedSecurityContext? = nil
+    ) async -> UIBackgroundFetchResult {
+        if let expectedContext,
+           !(await authenticatedSecurityContextIsCurrent(expectedContext)) {
+            return .noData
+        }
+        guard secureMessagingReleasePermitted,
+              isSignedIn,
+              isOnline,
+              accountSetupStep == nil,
+              sessionAssurance?.grantsFullAccess == true,
+              let userID = profile?.id
+        else { return .noData }
+        let syncAttempt = secureMessagingSyncError.begin()
+        do {
+            let previousServerMessageIDs: Set<String>
+            if presentsVisibleMessageNotifications {
+                previousServerMessageIDs = Set(
+                    (await store.snapshot()).messages.compactMap(\.serverMessageId)
+                )
+            } else {
+                previousServerMessageIDs = []
+            }
+            try await SecureMessagingExchangeCoordinator.shared.activate(forUserID: userID)
+            let result = try await SecureMessagingExchangeCoordinator.shared.sync(forUserID: userID)
+            let latestState = await store.snapshot()
+            if let expectedContext,
+               !(await authenticatedSecurityContextIsCurrent(expectedContext)) {
+                return .noData
+            }
+            state = latestState
+            lastError = secureMessagingSyncError.resolve(
+                syncAttempt,
+                visibleMessage: lastError
+            )
+            if presentsVisibleMessageNotifications, result.receivedMessages > 0 {
+                let suppressedConversationID = UIApplication.shared.applicationState == .active
+                    ? activeConversationID
+                    : nil
+                let descriptors = VisibleMessageNotificationPolicy.descriptors(
+                    previousServerMessageIDs: previousServerMessageIDs,
+                    messages: latestState.messages,
+                    suppressedConversationID: suppressedConversationID,
+                    ownerUserID: latestState.communicationOwnerUserID ?? userID
+                )
+                await VisibleMessageNotificationCoordinator.shared.schedule(descriptors)
+            }
+            return result.receivedMessages > 0 || result.appliedTransitions > 0
+                ? .newData
+                : .noData
+        } catch {
+            if RefreshCancellationPolicy.shouldSuppress(
+                error,
+                taskIsCancelled: Task.isCancelled
+            ) {
+                return .noData
+            }
+            if reportsFailure {
+                let message = error.localizedDescription
+                if let ownedMessage = secureMessagingSyncError.record(message, for: syncAttempt) {
+                    lastError = ownedMessage
+                }
+            }
+            return .failed
+        }
+    }
+
+    func setConversationVisible(_ conversationID: String, visible: Bool) {
+        guard let uuid = UUID(uuidString: conversationID) else { return }
+        let canonical = uuid.uuidString.lowercased()
+        guard canonical.caseInsensitiveCompare(conversationID) == .orderedSame else { return }
+        if visible {
+            if activeConversationID != canonical || visibleConversationSyncTask == nil {
+                activeConversationID = canonical
+                startVisibleConversationSync(for: canonical)
+            }
+            scheduleVisibleConversationCallHistoryRefresh()
+            let accountFingerprint = MessageNotificationContract.accountFingerprint(
+                for: profile?.id
+            )
+            Task {
+                await NotificationCoordinator.shared.clearMessageNotifications(
+                    accountFingerprint: accountFingerprint,
+                    conversationID: canonical
+                )
+            }
+        } else if activeConversationID == canonical {
+            activeConversationID = nil
+            stopVisibleConversationSync()
+        }
+    }
+
+    private func startVisibleConversationSync(for conversationID: String) {
+        visibleConversationSyncTask?.cancel()
+        visibleConversationSyncGeneration &+= 1
+        let generation = visibleConversationSyncGeneration
+        visibleConversationSyncTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                if self.visibleConversationSyncGeneration == generation {
+                    self.visibleConversationSyncTask = nil
+                }
+            }
+            guard self.activeConversationID == conversationID,
+                  self.isSignedIn,
+                  let userID = self.profile?.id,
+                  let session = await self.sessions.current(),
+                  session.accountId?.caseInsensitiveCompare(userID) == .orderedSame
+            else { return }
+            let context = AuthenticatedSecurityContext(
+                accountEpoch: self.accountEpoch,
+                userID: userID,
+                sessionID: session.sessionId
+            )
+
+            while await self.visibleConversationContextIsCurrent(
+                conversationID: conversationID,
+                generation: generation,
+                context: context
+            ) {
+                if self.isOnline {
+                    // Existing unread state is published immediately on presentation. Keeping
+                    // the attempted boundary lets a failed POST wait for the next cadence while
+                    // still publishing a genuinely newer message discovered by this sync.
+                    let boundaryBeforeSync = VisibleConversationMessagingPolicy
+                        .newestUnreadIncomingServerMessageID(
+                            conversationID: conversationID,
+                            conversations: self.state.conversations,
+                            messages: self.state.messages
+                        )
+                    if let boundaryBeforeSync {
+                        await self.publishVisibleConversationReadReceipt(
+                            conversationID: conversationID,
+                            messageID: boundaryBeforeSync,
+                            generation: generation,
+                            context: context
+                        )
+                    }
+                    guard await self.visibleConversationContextIsCurrent(
+                        conversationID: conversationID,
+                        generation: generation,
+                        context: context
+                    ) else { return }
+                    _ = await APIClientSessionBinding.$sessionID.withValue(context.sessionID) {
+                        await self.syncSecureMessagingIfPermitted(
+                            presentsVisibleMessageNotifications: true,
+                            reportsFailure: false,
+                            expectedContext: context
+                        )
+                    }
+                    guard await self.visibleConversationContextIsCurrent(
+                        conversationID: conversationID,
+                        generation: generation,
+                        context: context
+                    ) else { return }
+                    let boundaryAfterSync = VisibleConversationMessagingPolicy
+                        .newestUnreadIncomingServerMessageID(
+                            conversationID: conversationID,
+                            conversations: self.state.conversations,
+                            messages: self.state.messages
+                        )
+                    if VisibleConversationMessagingPolicy.shouldPublishAfterSync(
+                        attemptedBoundary: boundaryBeforeSync,
+                        currentBoundary: boundaryAfterSync
+                    ), let boundaryAfterSync {
+                        await self.publishVisibleConversationReadReceipt(
+                            conversationID: conversationID,
+                            messageID: boundaryAfterSync,
+                            generation: generation,
+                            context: context
+                        )
+                    }
+                }
+
+                guard await self.visibleConversationContextIsCurrent(
+                    conversationID: conversationID,
+                    generation: generation,
+                    context: context
+                ) else { return }
+                do {
+                    try await Task.sleep(
+                        for: .seconds(
+                            VisibleConversationMessagingPolicy.foregroundSyncInterval
+                        )
+                    )
+                } catch {
+                    return
+                }
+            }
+        }
+    }
+
+    private func stopVisibleConversationSync() {
+        visibleConversationSyncGeneration &+= 1
+        visibleConversationSyncTask?.cancel()
+        visibleConversationSyncTask = nil
+    }
+
+    private func visibleConversationContextIsCurrent(
+        conversationID: String,
+        generation: UInt64,
+        context: AuthenticatedSecurityContext
+    ) async -> Bool {
+        guard visibleConversationSyncGeneration == generation,
+              activeConversationID == conversationID,
+              UIApplication.shared.applicationState == .active
+        else { return false }
+        return await authenticatedSecurityContextIsCurrent(context)
+    }
+
+    private func publishVisibleConversationReadReceipt(
+        conversationID: String,
+        messageID: String,
+        generation: UInt64,
+        context: AuthenticatedSecurityContext
+    ) async {
+        guard secureMessagingAvailable,
+              isOnline,
+              let conversation = MessageNotificationConversationPolicy.conversation(
+                  id: conversationID,
+                  in: state.conversations
+              ),
+              let recipientUserID = MessageNotificationConversationPolicy.recipientUserID(
+                  in: conversation,
+                  currentUserID: context.userID
+              ),
+              communicationPrivacyAllowsOutbound(to: recipientUserID),
+              VisibleConversationMessagingPolicy.newestUnreadIncomingServerMessageID(
+                  conversationID: conversationID,
+                  conversations: state.conversations,
+                  messages: state.messages
+              ) == messageID,
+              await authenticatedSecurityContextIsCurrent(context),
+              activeConversationID == conversationID
+        else { return }
+        do {
+            try await APIClientSessionBinding.$sessionID.withValue(context.sessionID) {
+                try await SecureMessagingExchangeCoordinator.shared.markConversationRead(
+                    conversationID: conversationID,
+                    throughServerMessageID: messageID,
+                    forUserID: context.userID
+                )
+            }
+            let latest = await store.snapshot()
+            guard latest.profile?.id.caseInsensitiveCompare(context.userID) == .orderedSame,
+                  await visibleConversationContextIsCurrent(
+                      conversationID: conversationID,
+                      generation: generation,
+                      context: context
+                  )
+            else { return }
+            state = latest
+        } catch is CancellationError {
+            return
+        } catch {
+            // Keep the durable unread counter unchanged. The next foreground cadence retries the
+            // exact newest inbound boundary without presenting transient transport noise.
+        }
+    }
+
+    func canOpenConversation(for activeCall: ActiveCallPresentation?) -> Bool {
+        if activeCallConversation(for: activeCall) != nil { return true }
+        guard isOnline,
+              secureMessagingAvailable,
+              let target = activeCallConversationCreationTarget(for: activeCall)
+        else { return false }
+        return communicationPrivacyAllowsOutbound(to: target.recipientUserID)
+    }
+
+    func unreadMessageCount(for activeCall: ActiveCallPresentation?) -> Int {
+        guard let activeCall,
+              activeCallConversation(for: activeCall) != nil
+        else { return 0 }
+        return ActiveCallConversationPolicy.unreadCount(
+            callID: activeCall.id,
+            explicitConversationID: activeCall.conversationId,
+            calls: state.calls,
+            conversations: state.conversations,
+            currentUserID: profile?.id
+        )
+    }
+
+    /// Reuses an exact local conversation or asks the authenticated messaging service to
+    /// idempotently create the sole remote participant's direct conversation. The caller minimizes
+    /// the call only after the validated server projection is durably stored and re-fenced to the
+    /// same account/session.
+    @discardableResult
+    func openConversation(for activeCall: ActiveCallPresentation?) async -> Bool {
+        guard !isSigningOut,
+              !isSubmittingAccountDeletion,
+              !acceptedAccountDeletionCleanupBlocked,
+              !protectedLocalStateRecoveryBlocked,
+              !unresolvedAccountDeletionAttemptBlocked,
+              isSignedIn,
+              accountSetupStep == nil,
+              let currentUserID = profile?.id,
+              MessageNotificationContract.canonicalUUID(state.communicationOwnerUserID)
+                == MessageNotificationContract.canonicalUUID(currentUserID),
+              let activeCall,
+              CallMediaCoordinator.shared.activeCall?.id.caseInsensitiveCompare(activeCall.id)
+                == .orderedSame
+        else { return false }
+
+        if let conversation = activeCallConversation(for: activeCall) {
+            routeToConversation(conversation)
+            return true
+        }
+
+        guard isOnline,
+              secureMessagingAvailable,
+              let target = activeCallConversationCreationTarget(for: activeCall),
+              communicationPrivacyDenialMessage(
+                for: target.recipientUserID,
+                blockedMessage: "Unblock this account before starting a chat."
+              ) == nil,
+              let expectedSessionID = await sessions.current()?.sessionId,
+              let commitAdmission = ProtectedCommunicationAdmissionGate.shared.lease(
+                forAccountID: currentUserID
+              )
+        else { return false }
+        let expectedAccountEpoch = accountEpoch
+        guard await outboxContextIsCurrent(
+            accountEpoch: expectedAccountEpoch,
+            userID: currentUserID,
+            sessionID: expectedSessionID
+        ) else { return false }
+
+        do {
+            let created = try await APIClientSessionBinding.$sessionID.withValue(
+                expectedSessionID
+            ) {
+                try await SecureMessagingExchangeCoordinator.shared.ensureDirectConversation(
+                    forUserID: currentUserID,
+                    recipientUserID: target.recipientUserID,
+                    title: activeCall.participantName,
+                    expectedConversationID: target.expectedConversationID,
+                    commitAdmission: commitAdmission
+                )
+            }
+            guard ProtectedCommunicationAdmissionGate.shared.permits(commitAdmission),
+                  await outboxContextIsCurrent(
+                    accountEpoch: expectedAccountEpoch,
+                    userID: currentUserID,
+                    sessionID: expectedSessionID
+                  ),
+                  CallMediaCoordinator.shared.activeCall?.id.caseInsensitiveCompare(activeCall.id)
+                    == .orderedSame
+            else { return false }
+            let latest = await store.snapshot()
+            guard latest.profile?.id.caseInsensitiveCompare(currentUserID) == .orderedSame,
+                  latest.communicationOwnerUserID?.caseInsensitiveCompare(currentUserID)
+                    == .orderedSame
+            else { return false }
+            state = latest
+            guard let resolved = activeCallConversation(for: activeCall),
+                  resolved.id.caseInsensitiveCompare(created.id) == .orderedSame
+            else { return false }
+            routeToConversation(resolved)
+            return true
+        } catch is CancellationError {
+            return false
+        } catch {
+            guard await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: currentUserID,
+                sessionID: expectedSessionID
+            ) else { return false }
+            lastError = CustomerFacingMessagingCopy.openConversationFailure
+            return false
+        }
+    }
+
+    private func routeToConversation(_ conversation: Conversation) {
+        selectedTab = MainTabIndex.messages
+        messageConversationNavigationRequest = MessageConversationNavigationRequest(
+            conversationID: conversation.id
+        )
+    }
+
+    private func activeCallConversation(
+        for activeCall: ActiveCallPresentation?
+    ) -> Conversation? {
+        guard let activeCall else { return nil }
+        return ActiveCallConversationPolicy.conversation(
+            callID: activeCall.id,
+            explicitConversationID: activeCall.conversationId,
+            calls: state.calls,
+            conversations: state.conversations,
+            currentUserID: profile?.id
+        )
+    }
+
+    private func activeCallConversationCreationTarget(
+        for activeCall: ActiveCallPresentation?
+    ) -> ActiveCallConversationPolicy.CreationTarget? {
+        guard let activeCall else { return nil }
+        return ActiveCallConversationPolicy.creationTarget(
+            callID: activeCall.id,
+            explicitConversationID: activeCall.conversationId,
+            calls: state.calls,
+            conversations: state.conversations,
+            currentUserID: profile?.id
+        )
+    }
+
+    func consumeMessageConversationNavigationRequest(_ requestID: UUID) {
+        guard messageConversationNavigationRequest?.id == requestID else { return }
+        messageConversationNavigationRequest = nil
+    }
+
+    private func handleMessageNotificationAction(
+        _ action: MessageNotificationAction
+    ) async -> Bool {
+        // Accepted-deletion recovery is the first protected-state access barrier. Inline replies
+        // must not inspect SessionStore or SecureLocalStore until that launch recovery completes.
+        if let restoreTask { await restoreTask.value }
+        guard !isSubmittingAccountDeletion,
+              !acceptedAccountDeletionCleanupBlocked,
+              !protectedLocalStateRecoveryBlocked,
+              !unresolvedAccountDeletionAttemptBlocked
+        else { return false }
+        switch action.kind {
+        case .open:
+            return await routeMessageNotificationOpen(action)
+        case .reply(let text):
+            return await queueMessageNotificationReply(text, action: action)
+        }
+    }
+
+    private func routeMessageNotificationOpen(_ action: MessageNotificationAction) async -> Bool {
+        if let restoreTask { await restoreTask.value }
+        guard !isSigningOut,
+              !isSubmittingAccountDeletion,
+              !acceptedAccountDeletionCleanupBlocked,
+              !protectedLocalStateRecoveryBlocked,
+              !unresolvedAccountDeletionAttemptBlocked,
+              isSignedIn,
+              let currentUserID = profile?.id,
+              MessageNotificationContract.accountFingerprint(for: currentUserID)
+                  == action.accountFingerprint,
+              MessageNotificationContract.canonicalUUID(state.communicationOwnerUserID)
+                  == MessageNotificationContract.canonicalUUID(currentUserID),
+              let conversation = MessageNotificationConversationPolicy.conversation(
+                  id: action.conversationID,
+                  in: state.conversations
+              )
+        else { return false }
+        selectedTab = MainTabIndex.messages
+        messageConversationNavigationRequest = MessageConversationNavigationRequest(
+            conversationID: conversation.id
+        )
+        // Clear only after the final account/deletion routing gate has succeeded. A failed cold
+        // launch remains retryable and cannot consume another account's delivered notification.
+        await NotificationCoordinator.shared.clearMessageNotifications(
+            accountFingerprint: action.accountFingerprint,
+            conversationID: action.conversationID
+        )
+        return true
+    }
+
+    private func queueMessageNotificationReply(
+        _ text: String,
+        action: MessageNotificationAction
+    ) async -> Bool {
+        guard !isSigningOut,
+              !isSubmittingAccountDeletion,
+              !acceptedAccountDeletionCleanupBlocked,
+              !protectedLocalStateRecoveryBlocked,
+              !unresolvedAccountDeletionAttemptBlocked,
+              SecureMessagingReleaseGate.enabled,
+              let clientMessageID = action.replyClientMessageID,
+              let currentSession = await sessions.current()
+        else { return false }
+        let expectedAccountEpoch = accountEpoch
+        let snapshot = await store.snapshot()
+        guard let currentUserID = snapshot.profile?.id,
+              MessageNotificationContract.accountFingerprint(for: currentUserID)
+                  == action.accountFingerprint,
+              MessageNotificationContract.canonicalUUID(snapshot.communicationOwnerUserID)
+                  == MessageNotificationContract.canonicalUUID(currentUserID),
+              snapshot.sessionAssurance?.grantsFullAccess == true,
+              AccountSetupPolicy.restoredStep(
+                  user: snapshot.profile,
+                  assurance: snapshot.sessionAssurance
+              ) == nil,
+              snapshot.secureMessaging?.enrollment?.userID == currentUserID,
+              let conversation = MessageNotificationConversationPolicy.conversation(
+                  id: action.conversationID,
+                  in: snapshot.conversations
+              ),
+              let recipientUserID = MessageNotificationConversationPolicy.recipientUserID(
+                  in: conversation,
+                  currentUserID: currentUserID
+              ),
+              CommunicationPrivacyAccessPolicy.decision(
+                  ownerUserID: currentUserID,
+                  recipientUserID: recipientUserID,
+                  cache: snapshot.communicationPrivacy
+              ) == .allowed,
+              // If restore has already installed a live projection, it is newer than the snapshot
+              // captured for a cold-launch reply and must also authorize the recipient.
+              (!isSignedIn || communicationPrivacyAllowsOutbound(to: recipientUserID))
+        else { return false }
+
+        do {
+            // Queue from the protected local projection without waiting for restore's live HTTP
+            // calls. UNTextInputNotificationAction already requires device authentication; fresh
+            // capabilities, roster and session checks still run before any ciphertext is sent.
+            guard await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: currentUserID,
+                sessionID: currentSession.sessionId
+            ), let commitAdmission = ProtectedCommunicationAdmissionGate.shared.lease(
+                forAccountID: currentUserID
+            ) else { return false }
+            _ = try await SecureMessagingExchangeCoordinator.shared.queueDeferredText(
+                forUserID: currentUserID,
+                conversationID: conversation.id,
+                expectedRecipientUserID: recipientUserID,
+                title: conversation.title,
+                text: text,
+                clientMessageID: clientMessageID,
+                commitAdmission: commitAdmission
+            )
+            let queuedState = await store.snapshot()
+            guard ProtectedCommunicationAdmissionGate.shared.permits(commitAdmission),
+                  await outboxContextIsCurrent(
+                    accountEpoch: expectedAccountEpoch,
+                    userID: currentUserID,
+                    sessionID: currentSession.sessionId
+                  )
+            else { return false }
+            if !isSigningOut,
+               !isSubmittingAccountDeletion,
+               queuedState.profile?.id.caseInsensitiveCompare(currentUserID) == .orderedSame,
+               await sessions.current()?.sessionId == currentSession.sessionId {
+                state = queuedState
+                scheduleOutboxWake()
+            }
+            await NotificationCoordinator.shared.clearMessageNotifications(
+                accountFingerprint: action.accountFingerprint,
+                conversationID: conversation.id
+            )
+            Task { @MainActor [weak self] in
+                await self?.reconcileNotificationReplyAfterRestore(
+                    userID: currentUserID,
+                    sessionID: currentSession.sessionId,
+                    accountEpoch: expectedAccountEpoch,
+                    admission: commitAdmission
+                )
+            }
+            return true
+        } catch {
+            if UIApplication.shared.applicationState == .active {
+                lastError = error.localizedDescription
+            }
+            return false
+        }
+    }
+
+    private func reconcileNotificationReplyAfterRestore(
+        userID: String,
+        sessionID: String,
+        accountEpoch expectedAccountEpoch: UUID,
+        admission: ProtectedCommunicationAdmissionLease
+    ) async {
+        if let restoreTask { await restoreTask.value }
+        guard !isSigningOut,
+              !isSubmittingAccountDeletion,
+              !acceptedAccountDeletionCleanupBlocked,
+              !protectedLocalStateRecoveryBlocked,
+              !unresolvedAccountDeletionAttemptBlocked,
+              ProtectedCommunicationAdmissionGate.shared.permits(admission),
+              accountEpoch == expectedAccountEpoch,
+              isSignedIn,
+              profile?.id.caseInsensitiveCompare(userID) == .orderedSame,
+              await sessions.current()?.sessionId == sessionID
+        else { return }
+        let latest = await store.snapshot()
+        guard latest.profile?.id.caseInsensitiveCompare(userID) == .orderedSame,
+              latest.communicationOwnerUserID?.caseInsensitiveCompare(userID) == .orderedSame
+        else { return }
+        state = latest
+        scheduleOutboxWake()
+        guard ProtectedCommunicationAdmissionGate.shared.permits(admission),
+              !isSubmittingAccountDeletion
+        else { return }
+        if isOnline { await flushOutbox() }
+    }
+
+    private func scheduleVisibleConversationCallHistoryRefresh() {
+        guard callHistoryRefreshTask == nil else { return }
+        callHistoryRefreshGeneration &+= 1
+        let generation = callHistoryRefreshGeneration
+        callHistoryRefreshTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.refreshVisibleConversationCallHistory()
+            guard self.callHistoryRefreshGeneration == generation else { return }
+            self.callHistoryRefreshTask = nil
+        }
+    }
+
+    private func refreshVisibleConversationCallHistory() async {
+        guard isSignedIn,
+              isOnline,
+              callsFeatureEnabled,
+              accountSetupStep == nil,
+              sessionAssurance?.grantsFullAccess == true,
+              let expectedUserID = profile?.id,
+              let expectedSessionID = await sessions.current()?.sessionId
+        else { return }
+        let expectedAccountEpoch = accountEpoch
+
+        do {
+            let response = try await APIClientSessionBinding.$sessionID.withValue(
+                expectedSessionID
+            ) {
+                try await api.calls(cursor: nil, limit: CallHistoryPageAccumulator.pageLimit)
+            }
+            let callDTOs = try CallHistoryPageAccumulator.validateNewestPage(response)
+            let callRecords = callDTOs.map { mapCall($0) }
+            guard await callHistoryContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                sessionID: expectedSessionID,
+                userID: expectedUserID
+            ) else { return }
+            try await commitCallHistory(
+                callRecords,
+                receipt: nil,
+                accountEpoch: expectedAccountEpoch,
+                sessionID: expectedSessionID,
+                userID: expectedUserID
+            )
+            guard await callHistoryContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                sessionID: expectedSessionID,
+                userID: expectedUserID
+            ) else { return }
+            state = await store.snapshot()
+            rebuildCallContacts()
+            reconcileCallWaitingAfterHistoryRefresh()
+            await CallMediaCoordinator.shared.reconcileBackendCalls(state.calls)
+        } catch {
+            // Chat opening must remain offline-first. A cancelled, incomplete, or malformed
+            // refresh leaves the last authenticated encrypted history untouched for the next pass.
+        }
+    }
+
+    private func scheduleCompleteCallHistoryBackfillIfNeeded(now: Date = Date()) {
+        guard callHistoryBackfillTask == nil,
+              callHistoryBackfillRetryNotBefore.map({ $0 <= now }) ?? true,
+              let expectedUserID = profile?.id,
+              CallHistoryBackfillPolicy.isDue(
+                receipt: state.callHistoryBackfillReceipt,
+                userID: expectedUserID,
+                now: now
+              )
+        else { return }
+
+        callHistoryBackfillGeneration &+= 1
+        let generation = callHistoryBackfillGeneration
+        callHistoryBackfillTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let completed = await self.refreshCompleteCallHistory()
+            guard self.callHistoryBackfillGeneration == generation else { return }
+            self.callHistoryBackfillTask = nil
+            self.callHistoryBackfillRetryNotBefore = completed
+                ? nil
+                : Date().addingTimeInterval(CallHistoryBackfillPolicy.retryDelay)
+        }
+    }
+
+    private func refreshCompleteCallHistory() async -> Bool {
+        guard isSignedIn,
+              isOnline,
+              callsFeatureEnabled,
+              accountSetupStep == nil,
+              sessionAssurance?.grantsFullAccess == true,
+              let expectedUserID = profile?.id,
+              let expectedSessionID = await sessions.current()?.sessionId
+        else { return false }
+        let expectedAccountEpoch = accountEpoch
+
+        do {
+            let callDTOs = try await loadCompleteCallHistory(
+                accountEpoch: expectedAccountEpoch,
+                sessionID: expectedSessionID,
+                userID: expectedUserID
+            )
+            let receipt = CallHistoryBackfillReceipt(
+                ownerUserID: expectedUserID,
+                schemaVersion: CallHistoryBackfillPolicy.schemaVersion,
+                completedAt: Date()
+            )
+            try await commitCallHistory(
+                callDTOs.map { mapCall($0) },
+                receipt: receipt,
+                accountEpoch: expectedAccountEpoch,
+                sessionID: expectedSessionID,
+                userID: expectedUserID
+            )
+            guard await callHistoryContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                sessionID: expectedSessionID,
+                userID: expectedUserID
+            ) else { return false }
+            state = await store.snapshot()
+            rebuildCallContacts()
+            reconcileCallWaitingAfterHistoryRefresh()
+            await CallMediaCoordinator.shared.reconcileBackendCalls(state.calls)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private func commitCallHistory(
+        _ callRecords: [CallRecord],
+        receipt: CallHistoryBackfillReceipt?,
+        accountEpoch expectedAccountEpoch: UUID,
+        sessionID expectedSessionID: String,
+        userID expectedUserID: String
+    ) async throws {
+        guard await callHistoryContextIsCurrent(
+            accountEpoch: expectedAccountEpoch,
+            sessionID: expectedSessionID,
+            userID: expectedUserID
+        ) else { throw CancellationError() }
+        try await store.update { persisted in
+            guard persisted.profile?.id.caseInsensitiveCompare(expectedUserID) == .orderedSame,
+                  persisted.communicationOwnerUserID?.caseInsensitiveCompare(expectedUserID)
+                    == .orderedSame
+            else { throw StoreError.accountChanged }
+            persisted.calls = CallLifecyclePolicy.applyingPendingTerminations(
+                to: CallLifecyclePolicy.mergeHistory(
+                    remote: callRecords,
+                    local: persisted.calls
+                ),
+                outbox: persisted.outbox
+            )
+            if let receipt {
+                persisted.callHistoryBackfillReceipt = receipt
+            }
+        }
+    }
+
+    /// A server call-history refresh is the remote lifecycle signal for calls that ended without a
+    /// local CallKit action. Retire only the matching waiting presentation, and also dismiss the
+    /// waiter when the primary media call itself became terminal.
+    private func reconcileCallWaitingAfterHistoryRefresh(now: Date = Date()) {
+        guard let waiting = callWaitingState.waitingCall else { return }
+        if waiting.ringExpiryDate <= now {
+            _ = clearWaitingCallForLifecycle(callID: waiting.callID)
+            NotificationCoordinator.shared.reportCallEnded(waiting.callUUID, reason: .unanswered)
+            return
+        }
+
+        if let record = state.calls.first(where: {
+            canonicalCallID($0.id) == waiting.callID
+        }) {
+            let reason: CXCallEndedReason?
+            switch record.state {
+            case .queued, .ringing:
+                reason = nil
+            case .active:
+                reason = .answeredElsewhere
+            case .missed:
+                reason = .unanswered
+            case .declined:
+                reason = .declinedElsewhere
+            case .failed:
+                reason = .failed
+            case .completed:
+                reason = .remoteEnded
+            }
+            if let reason {
+                _ = clearWaitingCallForLifecycle(callID: waiting.callID)
+                NotificationCoordinator.shared.reportCallEnded(waiting.callUUID, reason: reason)
+                return
+            }
+        }
+
+        guard let activeCallID = CallMediaCoordinator.shared.activeCall?.id,
+              let activeRecord = state.calls.first(where: {
+                canonicalCallID($0.id) == canonicalCallID(activeCallID)
+              }),
+              [.completed, .missed, .declined, .failed].contains(activeRecord.state)
+        else { return }
+        declineWaitingCallAfterActiveCallTermination()
+    }
+
+    func completeProfile(name: String, tag: String) async {
+        guard let currentStep = accountSetupStep, case .profile = currentStep else { return }
+        guard isOnline else {
+            lastError = "Connect to the internet to finish setting up your profile."
+            return
+        }
+        let normalizedName = normalizeProfileName(name)
+        let normalizedTag = normalizeProfileTag(tag)
+        if let validationError = profileIdentityValidationError(
+            name: normalizedName,
+            tag: normalizedTag
+        ) {
+            lastError = validationError
+            return
+        }
+
+        isCompletingAccountSetup = true
+        defer { isCompletingAccountSetup = false }
+        do {
+            guard let expectedSessionID = await sessions.current()?.sessionId else {
+                throw APIClientError.signedOut
+            }
+            let response = try await api.updateProfile(name: normalizedName, tag: normalizedTag)
+            guard isSignedIn,
+                  accountSetupStep == currentStep,
+                  await sessions.current()?.sessionId == expectedSessionID
+            else { throw APIClientError.signedOut }
+            guard let currentProfile = profile,
+                  let updated = UserProfileMutationMergePolicy.merge(
+                    response: response,
+                    current: currentProfile,
+                    requestedName: normalizedName,
+                    requestedTag: normalizedTag
+                  )
+            else {
+                throw AccountSetupError.accountChanged
+            }
+            guard !AccountSetupPolicy.requiresProfileSetup(updated) else {
+                throw AccountSetupError.profileStillRequired
+            }
+            try await store.update { persisted in persisted.profile = updated }
+            state = await store.snapshot()
+            accountSetupStep = AccountSetupPolicy.reconcile(
+                currentStep,
+                with: updated,
+                assurance: sessionAssurance
+            )
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
+    @discardableResult
+    func updateProfile(name: String, tag: String, avatarJPEG: Data? = nil) async -> Bool {
+        guard profileUpdateTask == nil else { return false }
+        let taskID = UUID()
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return false }
+            return await self.performProfileUpdate(name: name, tag: tag, avatarJPEG: avatarJPEG)
+        }
+        profileUpdateTaskID = taskID
+        profileUpdateTask = task
+        let result = await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
+        guard profileUpdateTaskID == taskID else { return false }
+        profileUpdateTask = nil
+        profileUpdateTaskID = nil
+        return result
+    }
+
+    /// Starts (or resends) the authenticated profile-email challenge. The returned proof is
+    /// process-local and bound to the exact account/session that requested it.
+    func requestProfileEmailAttachment(email: String) async throws -> ProfileEmailChallenge {
+        let normalizedEmail = ProfileEmailChallengePolicy.normalizedEmail(email)
+        guard EmailAccountValidation.isValidEmail(normalizedEmail) else {
+            throw ProfileEmailAttachmentError.invalidEmail
+        }
+        let operationID = try beginProfileEmailOperation(.requestingCode)
+        defer { finishProfileEmailOperation(operationID) }
+
+        let context = try await captureProfileEmailContext()
+        let result = try await APIClientSessionBinding.$sessionID.withValue(context.sessionID) {
+            try await api.requestProfileEmailAttachment(email: normalizedEmail)
+        }
+        let receivedAt = Date()
+        guard emailRegistrationAvailable,
+              await authenticatedSecurityContextIsCurrent(context),
+              let challenge = ProfileEmailChallengePolicy.challenge(
+                from: result,
+                requestedEmail: normalizedEmail,
+                ownerUserID: context.userID,
+                sessionID: context.sessionID,
+                issuedAt: receivedAt
+              )
+        else { throw ProfileEmailAttachmentError.invalidResponse }
+        return challenge
+    }
+
+    /// Consumes a six-digit proof only in its originating session, then atomically replaces the
+    /// encrypted cached profile after the server confirms the same account and email address.
+    func verifyProfileEmailAttachment(
+        challenge: ProfileEmailChallenge,
+        code: String
+    ) async throws {
+        guard let normalizedCode = ProfileEmailVerificationCodePolicy.normalizedCode(code) else {
+            throw ProfileEmailAttachmentError.invalidCode
+        }
+        guard ProfileEmailChallengePolicy.isValid(challenge) else {
+            throw ProfileEmailAttachmentError.invalidOrExpiredChallenge
+        }
+        let operationID = try beginProfileEmailOperation(.verifyingCode)
+        defer { finishProfileEmailOperation(operationID) }
+
+        let context = try await captureProfileEmailContext()
+        guard ProfileEmailChallengePolicy.belongs(
+            challenge,
+            toUserID: context.userID,
+            sessionID: context.sessionID
+        ) else { throw ProfileEmailAttachmentError.invalidOrExpiredChallenge }
+
+        let response = try await APIClientSessionBinding.$sessionID.withValue(context.sessionID) {
+            try await api.verifyProfileEmailAttachment(
+                challengeId: challenge.id,
+                code: normalizedCode
+            )
+        }
+        guard emailRegistrationAvailable,
+              await authenticatedSecurityContextIsCurrent(context)
+        else { throw ProfileEmailAttachmentError.unavailable }
+
+        let updatedState = try await commitAuthenticatedMutation(
+            accountEpoch: context.accountEpoch,
+            userID: context.userID,
+            sessionID: context.sessionID
+        ) { persisted in
+            guard let currentProfile = persisted.profile,
+                  let verifiedProfile = ProfileEmailVerificationResponsePolicy.validatedProfile(
+                    response,
+                    for: challenge,
+                    currentProfile: currentProfile
+                  )
+            else { throw ProfileEmailAttachmentError.invalidResponse }
+            persisted.profile = verifiedProfile
+        }
+        guard await authenticatedSecurityContextIsCurrent(context) else {
+            throw APIClientError.signedOut
+        }
+        state = updatedState
+    }
+
+    private func beginProfileEmailOperation(
+        _ operation: ProfileEmailOperation
+    ) throws -> UUID {
+        guard profileEmailOperation == nil else {
+            throw ProfileEmailAttachmentError.operationInProgress
+        }
+        let id = UUID()
+        profileEmailOperationID = id
+        profileEmailOperation = operation
+        return id
+    }
+
+    private func finishProfileEmailOperation(_ id: UUID) {
+        guard profileEmailOperationID == id else { return }
+        profileEmailOperationID = nil
+        profileEmailOperation = nil
+    }
+
+    private func captureProfileEmailContext() async throws -> AuthenticatedSecurityContext {
+        guard isOnline else { throw ProfileEmailAttachmentError.offline }
+        guard emailRegistrationAvailable,
+              isSignedIn,
+              !isUpdatingProfile,
+              accountSetupStep == nil,
+              sessionAssurance?.grantsFullAccess == true,
+              let profile,
+              profile.emailVerified != true,
+              let session = await sessions.current(),
+              session.accountId?.caseInsensitiveCompare(profile.id) == .orderedSame
+        else { throw ProfileEmailAttachmentError.unavailable }
+        let context = AuthenticatedSecurityContext(
+            accountEpoch: accountEpoch,
+            userID: profile.id,
+            sessionID: session.sessionId
+        )
+        guard await authenticatedSecurityContextIsCurrent(context) else {
+            throw ProfileEmailAttachmentError.unavailable
+        }
+        return context
+    }
+
+    private func performProfileUpdate(
+        name: String,
+        tag: String,
+        avatarJPEG: Data?
+    ) async -> Bool {
+        guard !Task.isCancelled else { return false }
+        guard !isSigningOut, isSignedIn else { return false }
+        guard profileEmailOperation == nil else {
+            lastError = "Wait for email verification to finish before updating your profile."
+            return false
+        }
+        guard isOnline else {
+            lastError = "Connect to the internet to update your profile."
+            return false
+        }
+        if avatarJPEG != nil, capabilities?.enablesProfileAvatars != true {
+            lastError = "Your profile photo could not be updated right now. Try again shortly."
+            return false
+        }
+        guard !isUpdatingProfile else { return false }
+        let normalizedName = normalizeProfileName(name)
+        let normalizedTag = normalizeProfileTag(tag)
+        if let validationError = profileIdentityValidationError(
+            name: normalizedName,
+            tag: normalizedTag
+        ) {
+            lastError = validationError
+            return false
+        }
+        var shouldRestartInterruptedAvatarResume = avatarJPEG == nil
+        isUpdatingProfile = true
+        defer {
+            isUpdatingProfile = false
+            if shouldRestartInterruptedAvatarResume {
+                schedulePendingProfileAvatarResume()
+            }
+        }
+
+        // A user-initiated replacement owns the avatar lane. Wait for any silent retry to unwind
+        // so two attach operations can never race against the same encrypted pending record.
+        await cancelProfileAvatarResumeAndWait()
+        guard !Task.isCancelled,
+              !isSigningOut,
+              isSignedIn,
+              let expectedSessionID = await sessions.current()?.sessionId,
+              let expectedUserID = profile?.id
+        else {
+            lastError = APIClientError.signedOut.localizedDescription
+            return false
+        }
+        let expectedAccountEpoch = accountEpoch
+        var attemptedPendingAttachment: PendingProfileAvatarAttachment?
+
+        if let avatarJPEG,
+           let existingPendingAttachment = state.pendingProfileAvatarAttachment {
+            switch ProfileAvatarPendingAttachmentPolicy.selectionDisposition(
+                for: existingPendingAttachment,
+                jpegData: avatarJPEG,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            ) {
+            case .resumeExisting:
+                // If the PATCH fails before polling starts, restart the exact upload interrupted
+                // above. Once polling begins its own timeout/terminal policy owns the record.
+                shouldRestartInterruptedAvatarResume = true
+            case .discardBeforeProfileUpdate:
+                // Record the replacement intent before a fallible profile PATCH. Otherwise that
+                // request could fail and a later foreground retry would attach the old selection.
+                guard await clearPendingProfileAvatarAttachmentIfCurrent(
+                    existingPendingAttachment,
+                    accountEpoch: expectedAccountEpoch,
+                    userID: expectedUserID,
+                    sessionID: expectedSessionID
+                ) else { return false }
+            }
+        }
+
+        do {
+            let profileUpdate = try await APIClientSessionBinding.$sessionID.withValue(
+                expectedSessionID
+            ) {
+                try await api.updateProfile(name: normalizedName, tag: normalizedTag)
+            }
+            guard profileUpdate.id.caseInsensitiveCompare(expectedUserID) == .orderedSame else {
+                throw AccountSetupError.accountChanged
+            }
+            var updatedState = try await commitAuthenticatedMutation(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            ) { persisted in
+                guard let currentProfile = persisted.profile,
+                      let committedProfile = UserProfileMutationMergePolicy.merge(
+                        response: profileUpdate,
+                        current: currentProfile,
+                        requestedName: normalizedName,
+                        requestedTag: normalizedTag
+                      )
+                else { throw AccountSetupError.accountChanged }
+                persisted.profile = committedProfile
+            }
+            state = updatedState
+
+            guard let avatarJPEG else { return true }
+
+            let pendingAttachment: PendingProfileAvatarAttachment
+            if let pending = updatedState.pendingProfileAvatarAttachment,
+               ProfileAvatarPendingAttachmentPolicy.represents(
+                pending,
+                jpegData: avatarJPEG,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+               ) {
+                pendingAttachment = pending
+            } else {
+                // A different selection supersedes an older finalized upload. Clear its durable
+                // retry first so a failed replacement can never attach the image the user rejected.
+                if let superseded = updatedState.pendingProfileAvatarAttachment {
+                    guard await clearPendingProfileAvatarAttachmentIfCurrent(
+                        superseded,
+                        accountEpoch: expectedAccountEpoch,
+                        userID: expectedUserID,
+                        sessionID: expectedSessionID
+                    ) else { throw CancellationError() }
+                }
+
+                try Task.checkCancellation()
+                guard await outboxContextIsCurrent(
+                    accountEpoch: expectedAccountEpoch,
+                    userID: expectedUserID,
+                    sessionID: expectedSessionID
+                ) else { throw CancellationError() }
+                let prepared = try await APIClientSessionBinding.$sessionID.withValue(
+                    expectedSessionID
+                ) {
+                    try await api.prepareProfileAvatarUpload(jpegData: avatarJPEG)
+                }
+                guard prepared.sourceSHA256 == ProfileAvatarUploadPolicy.sha256(of: avatarJPEG)
+                else { throw ProfileAvatarUploadError.invalidServiceResponse }
+
+                pendingAttachment = PendingProfileAvatarAttachment(
+                    assetID: prepared.assetID,
+                    ownerUserID: expectedUserID,
+                    sessionID: expectedSessionID,
+                    sourceSHA256: prepared.sourceSHA256,
+                    finalizedAt: Date()
+                )
+                updatedState = try await commitAuthenticatedMutation(
+                    accountEpoch: expectedAccountEpoch,
+                    userID: expectedUserID,
+                    sessionID: expectedSessionID
+                ) { persisted in
+                    persisted.pendingProfileAvatarAttachment = pendingAttachment
+                }
+                state = updatedState
+            }
+
+            shouldRestartInterruptedAvatarResume = false
+            attemptedPendingAttachment = pendingAttachment
+            let avatarUpdate = try await APIClientSessionBinding.$sessionID.withValue(
+                expectedSessionID
+            ) {
+                try await api.resumeProfileAvatarAttachment(assetID: pendingAttachment.assetID)
+            }
+            guard avatarUpdate.id.caseInsensitiveCompare(expectedUserID) == .orderedSame else {
+                throw AccountSetupError.accountChanged
+            }
+            updatedState = try await commitAuthenticatedMutation(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            ) { persisted in
+                guard persisted.pendingProfileAvatarAttachment == pendingAttachment
+                else { throw CancellationError() }
+                guard let currentProfile = persisted.profile,
+                      let committedProfile = UserProfileMutationMergePolicy.merge(
+                        response: avatarUpdate,
+                        current: currentProfile
+                      )
+                else { throw AccountSetupError.accountChanged }
+                persisted.profile = committedProfile
+                persisted.pendingProfileAvatarAttachment = nil
+            }
+            state = updatedState
+            return true
+        } catch is CancellationError {
+            return false
+        } catch {
+            if let attemptedPendingAttachment,
+               ProfileAvatarPendingAttachmentPolicy.shouldDiscard(after: error) {
+                _ = await clearPendingProfileAvatarAttachmentIfCurrent(
+                    attemptedPendingAttachment,
+                    accountEpoch: expectedAccountEpoch,
+                    userID: expectedUserID,
+                    sessionID: expectedSessionID
+                )
+            }
+            guard await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            )
+            else { return false }
+            lastError = error.localizedDescription
+            return false
+        }
+    }
+
+    private func cancelAllProfileWorkAndWait() async {
+        // Snapshot and cancel both lanes before awaiting either. A foreground update may itself
+        // be waiting for the silent retry to unwind, so sequential cancellation could otherwise
+        // delay sign-out behind the full scan window.
+        let updateTask = profileUpdateTask
+        let resumeTask = profileAvatarResumeTask
+        profileUpdateTask = nil
+        profileUpdateTaskID = nil
+        profileAvatarResumeTask = nil
+        profileAvatarResumeTaskID = nil
+        updateTask?.cancel()
+        resumeTask?.cancel()
+        if let updateTask { _ = await updateTask.value }
+        if let resumeTask { await resumeTask.value }
+        isUpdatingProfile = false
+    }
+
+    /// Starts at most one silent retry for a finalized upload. The task captures the encrypted
+    /// record and account epoch up front; the current session is resolved inside the task and
+    /// must still exactly match before any authenticated request is sent.
+    private func schedulePendingProfileAvatarResume() {
+        guard profileAvatarResumeTask == nil,
+              !isSigningOut,
+              !isUpdatingProfile,
+              isSignedIn,
+              isOnline,
+              accountSetupStep == nil,
+              sessionAssurance?.grantsFullAccess == true,
+              capabilities?.enablesProfileAvatars == true,
+              let expectedUserID = profile?.id,
+              let pendingAttachment = state.pendingProfileAvatarAttachment
+        else { return }
+        guard authenticatedRefreshCount == 0 else {
+            profileAvatarResumeRequestedAfterRefresh = true
+            return
+        }
+
+        let expectedAccountEpoch = accountEpoch
+        let taskID = UUID()
+        profileAvatarResumeTaskID = taskID
+        profileAvatarResumeTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.resumePendingProfileAvatarAttachment(
+                pendingAttachment,
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID
+            )
+            guard self.profileAvatarResumeTaskID == taskID else { return }
+            self.profileAvatarResumeTask = nil
+            self.profileAvatarResumeTaskID = nil
+        }
+    }
+
+    private func cancelProfileAvatarResumeAndWait() async {
+        guard let task = profileAvatarResumeTask else {
+            profileAvatarResumeTaskID = nil
+            return
+        }
+        profileAvatarResumeTask = nil
+        profileAvatarResumeTaskID = nil
+        task.cancel()
+        await task.value
+    }
+
+    private func resumePendingProfileAvatarAttachment(
+        _ pendingAttachment: PendingProfileAvatarAttachment,
+        accountEpoch expectedAccountEpoch: UUID,
+        userID expectedUserID: String
+    ) async {
+        guard !Task.isCancelled,
+              !isSigningOut,
+              isSignedIn,
+              isOnline,
+              state.pendingProfileAvatarAttachment == pendingAttachment,
+              let expectedSessionID = await sessions.current()?.sessionId,
+              await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+              )
+        else { return }
+
+        guard ProfileAvatarPendingAttachmentPolicy.isResumable(
+            pendingAttachment,
+            userID: expectedUserID,
+            sessionID: expectedSessionID
+        ) else {
+            _ = await clearPendingProfileAvatarAttachmentIfCurrent(
+                pendingAttachment,
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            )
+            return
+        }
+
+        do {
+            let avatarUpdate = try await APIClientSessionBinding.$sessionID.withValue(
+                expectedSessionID
+            ) {
+                try await api.resumeProfileAvatarAttachment(
+                    assetID: pendingAttachment.assetID
+                )
+            }
+            guard avatarUpdate.id.caseInsensitiveCompare(expectedUserID) == .orderedSame else {
+                throw AccountSetupError.accountChanged
+            }
+            let updatedState = try await commitAuthenticatedMutation(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            ) { persisted in
+                guard persisted.pendingProfileAvatarAttachment == pendingAttachment
+                else { throw CancellationError() }
+                guard let currentProfile = persisted.profile,
+                      let committedProfile = UserProfileMutationMergePolicy.merge(
+                        response: avatarUpdate,
+                        current: currentProfile
+                      )
+                else { throw AccountSetupError.accountChanged }
+                persisted.profile = committedProfile
+                persisted.pendingProfileAvatarAttachment = nil
+            }
+            state = updatedState
+        } catch is CancellationError {
+            return
+        } catch {
+            // Timeout, loss of connectivity, server errors, and cancellation retain the finalized
+            // record. Only a terminal rejection/not-found response makes a future retry unsafe.
+            guard ProfileAvatarPendingAttachmentPolicy.shouldDiscard(after: error) else { return }
+            _ = await clearPendingProfileAvatarAttachmentIfCurrent(
+                pendingAttachment,
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            )
+        }
+    }
+
+    @discardableResult
+    private func clearPendingProfileAvatarAttachmentIfCurrent(
+        _ pendingAttachment: PendingProfileAvatarAttachment,
+        accountEpoch expectedAccountEpoch: UUID,
+        userID expectedUserID: String,
+        sessionID expectedSessionID: String
+    ) async -> Bool {
+        do {
+            let updatedState = try await commitAuthenticatedMutation(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            ) { persisted in
+                guard persisted.pendingProfileAvatarAttachment == pendingAttachment
+                else { throw CancellationError() }
+                persisted.pendingProfileAvatarAttachment = nil
+            }
+            state = updatedState
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    func completePaymentPinSetup(pin: String) async {
+        guard accountSetupStep == .paymentPin else { return }
+        guard isOnline else {
+            lastError = "Connect to the internet to set your wallet PIN."
+            return
+        }
+        guard isValidPaymentPin(pin) else {
+            lastError = "Enter a four-digit wallet PIN."
+            return
+        }
+
+        isCompletingAccountSetup = true
+        defer { isCompletingAccountSetup = false }
+        do {
+            guard let expectedSessionID = await sessions.current()?.sessionId else {
+                throw APIClientError.signedOut
+            }
+            let status = try await api.setPaymentPin(pin: pin)
+            guard isSignedIn,
+                  accountSetupStep == .paymentPin,
+                  await sessions.current()?.sessionId == expectedSessionID
+            else { throw APIClientError.signedOut }
+            guard status.paymentPinSet == true else { throw AccountSetupError.pinNotEnabled }
+            try await store.update { persisted in
+                persisted.profile?.paymentPinSet = true
+            }
+            state = await store.snapshot()
+            guard let updatedProfile = state.profile else { throw AuthUIError.missingUser }
+            if let assurance = status.sessionAssurance {
+                sessionAssurance = assurance
+            } else {
+                sessionAssurance = try await api.sessionAssurance()
+            }
+            accountSetupStep = AccountSetupPolicy.reconcile(
+                accountSetupStep,
+                with: updatedProfile,
+                assurance: sessionAssurance
+            )
+            if accountSetupStep == nil {
+                biometricAccessState = .authorized
+                await resumeAuthenticatedSessionIfNeeded()
+            }
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
+    func unlockSessionWithPIN(_ pin: String) async {
+        guard accountSetupStep == .loginUnlock, !isCompletingAccountSetup else { return }
+        guard isOnline else {
+            lastError = "Connect to the internet to unlock Kit Pay."
+            return
+        }
+        guard isValidPaymentPin(pin) else {
+            lastError = "Enter your four-digit Kit Pay PIN."
+            return
+        }
+        guard let expectedSessionID = await sessions.current()?.sessionId,
+              let expectedUserID = profile?.id
+        else {
+            lastError = APIClientError.signedOut.localizedDescription
+            return
+        }
+        let expectedAccountEpoch = accountEpoch
+
+        isCompletingAccountSetup = true
+        defer { isCompletingAccountSetup = false }
+        do {
+            let result = try await api.unlockSession(pin: pin)
+            guard result.method.caseInsensitiveCompare("pin") == .orderedSame,
+                  result.sessionAssurance.grantsFullAccess,
+                  isSignedIn,
+                  accountEpoch == expectedAccountEpoch,
+                  profile?.id == expectedUserID,
+                  await sessions.current()?.sessionId == expectedSessionID
+            else { throw AccountSetupError.sessionNotUnlocked }
+            sessionAssurance = result.sessionAssurance
+            guard let currentProfile = profile else { throw AuthUIError.missingUser }
+            accountSetupStep = AccountSetupPolicy.reconcile(
+                accountSetupStep,
+                with: currentProfile,
+                assurance: sessionAssurance
+            )
+            guard accountSetupStep == nil else { throw AccountSetupError.sessionNotUnlocked }
+            biometricAccessState = .authorized
+            homeBiometricState = biometricUnlockEnabled ? .authorized : .notRequired
+            if !biometricUnlockEnabled,
+               result.sessionAssurance.loginUnlock.supportsBiometricSignature {
+                _ = try? await api.removeBiometricKey()
+                if let updatedAssurance = try? await api.sessionAssurance() {
+                    sessionAssurance = updatedAssurance
+                }
+            }
+            await resumeAuthenticatedSessionIfNeeded()
+        } catch {
+            guard isSignedIn,
+                  accountEpoch == expectedAccountEpoch,
+                  await sessions.current()?.sessionId == expectedSessionID
+            else { return }
+            lastError = error.localizedDescription
+        }
+    }
+
+    func unlockSessionWithBiometrics() async {
+        guard accountSetupStep == .loginUnlock,
+              loginUnlockSupportsBiometrics,
+              !isCompletingAccountSetup,
+              isOnline,
+              let expectedSessionID = await sessions.current()?.sessionId,
+              let expectedUserID = profile?.id
+        else { return }
+        let expectedAccountEpoch = accountEpoch
+        let expectedInstallationID = installationID()
+
+        isCompletingAccountSetup = true
+        biometricErrorMessage = nil
+        defer { isCompletingAccountSetup = false }
+        do {
+            let challenge = try await api.createLoginBiometricChallenge()
+            let signature = try await biometrics.sign(
+                signingPayload: challenge.signingPayload,
+                userID: expectedUserID,
+                sessionID: expectedSessionID,
+                installationID: expectedInstallationID,
+                reason: "Use \(biometricDisplayName) to finish signing in to Kit Pay"
+            )
+            guard isSignedIn,
+                  accountEpoch == expectedAccountEpoch,
+                  profile?.id == expectedUserID,
+                  await sessions.current()?.sessionId == expectedSessionID
+            else { throw KitBiometricError.accountChanged }
+            let result = try await api.assertLoginBiometricChallenge(
+                challengeId: challenge.challengeId,
+                nonce: challenge.nonce,
+                signature: signature
+            )
+            guard result.method.caseInsensitiveCompare("biometric_signature") == .orderedSame,
+                  result.sessionAssurance.grantsFullAccess,
+                  isSignedIn,
+                  accountEpoch == expectedAccountEpoch,
+                  profile?.id == expectedUserID,
+                  await sessions.current()?.sessionId == expectedSessionID
+            else { throw AccountSetupError.sessionNotUnlocked }
+            sessionAssurance = result.sessionAssurance
+            guard let currentProfile = profile else { throw AuthUIError.missingUser }
+            accountSetupStep = AccountSetupPolicy.reconcile(
+                accountSetupStep,
+                with: currentProfile,
+                assurance: sessionAssurance
+            )
+            guard accountSetupStep == nil else { throw AccountSetupError.sessionNotUnlocked }
+            biometricAccessState = .authorized
+            homeBiometricState = .authorized
+            await resumeAuthenticatedSessionIfNeeded()
+        } catch {
+            guard isSignedIn,
+                  accountEpoch == expectedAccountEpoch,
+                  await sessions.current()?.sessionId == expectedSessionID
+            else { return }
+            biometricErrorMessage = error.localizedDescription
+            if let biometricError = error as? KitBiometricError,
+               [.biometricSetChanged, .enrollmentMissing, .keyMissing, .notEnrolled,
+                .unavailable, .passcodeNotSet].contains(biometricError) {
+                await biometrics.removeAnyEnrollment()
+                biometricUnlockEnabled = false
+                biometricAccessState = .notRequired
+                homeBiometricState = .notRequired
+            }
+        }
+    }
+
+    private func reloadCapabilities() async -> Bool {
+        // Keep the last confirmed value while requests are in flight. A newer authoritative
+        // completion supersedes older results, while cancellation leaves older work eligible to
+        // provide the last confirmed value.
+        let requestGeneration = capabilitiesRequestTracker.begin()
+        let expectedAccountEpoch = accountEpoch
+        let expectedSessionID = await sessions.current()?.sessionId
+        do {
+            let discovered = try await APIClientSessionBinding.$sessionID.withValue(
+                expectedSessionID
+            ) {
+                try await api.capabilities()
+            }
+            guard await capabilitiesContextIsCurrent(
+                      accountEpoch: expectedAccountEpoch,
+                      sessionID: expectedSessionID
+                  ),
+                  capabilitiesRequestTracker.accepts(
+                      requestGeneration,
+                      cancelled: false
+                  )
+            else { return false }
+            capabilities = discovered
+            return true
+        } catch {
+            guard await capabilitiesContextIsCurrent(
+                      accountEpoch: expectedAccountEpoch,
+                      sessionID: expectedSessionID
+                  )
+            else { return false }
+            let cancelled = RefreshCancellationPolicy.shouldSuppress(
+                error,
+                taskIsCancelled: Task.isCancelled
+            )
+            guard capabilitiesRequestTracker.accepts(
+                requestGeneration,
+                cancelled: cancelled
+            ) else {
+                // A view/task cancellation is not evidence that the server withdrew a
+                // previously confirmed capability projection, and an older completion must not
+                // overwrite a newer authoritative result.
+                return false
+            }
+            capabilities = nil
+            lastError = error.localizedDescription
+            return false
+        }
+    }
+
+    private func capabilitiesContextIsCurrent(
+        accountEpoch expectedAccountEpoch: UUID,
+        sessionID expectedSessionID: String?
+    ) async -> Bool {
+        guard accountEpoch == expectedAccountEpoch else { return false }
+        let currentSessionID = await sessions.current()?.sessionId
+        switch (expectedSessionID, currentSessionID) {
+        case (nil, nil):
+            return true
+        case let (expected?, current?):
+            return SessionRefreshPolicy.matchesSessionID(expected, current: current)
+        default:
+            return false
+        }
+    }
+
+    var communicationBlockedPeople: [CommunicationBlockedPerson] {
+        CommunicationBlockedPersonResolver.resolve(
+            blocks: communicationBlocks,
+            contacts: contactDirectory,
+            conversations: state.conversations,
+            currentUserID: profile?.id
+        )
+    }
+
+    var communicationBlockCandidates: [CommunicationBlockCandidate] {
+        CommunicationBlockCandidateResolver.resolve(
+            contacts: contactDirectory,
+            blocks: communicationBlocks,
+            currentUserID: profile?.id
+        )
+    }
+
+    var isCommunicationPrivacyBusy: Bool {
+        isLoadingCommunicationPrivacy || communicationPrivacyMutation != nil
+    }
+
+    var hasUsableCommunicationPrivacyProjection: Bool {
+        communicationPreferences != nil
+            && CommunicationPrivacyAccessPolicy.isCompleteProjection(
+                ownerUserID: profile?.id,
+                hasLoadedCompleteProjection: hasLoadedCommunicationPrivacy,
+                blocks: communicationBlocks
+            )
+    }
+
+    func communicationPrivacyAllowsOutbound(to rawUserID: String?) -> Bool {
+        CommunicationPrivacyAccessPolicy.decision(
+            ownerUserID: profile?.id,
+            recipientUserID: rawUserID,
+            hasLoadedCompleteProjection: hasUsableCommunicationPrivacyProjection,
+            blocks: communicationBlocks
+        ) == .allowed
+    }
+
+    func isCommunicationBlocked(userID rawUserID: String?) -> Bool {
+        guard let userID = CommunicationPrivacyIdentifier.canonicalUUID(rawUserID) else {
+            return false
+        }
+        return communicationBlocks.contains { $0.blocked && $0.userId == userID }
+    }
+
+    private func communicationPrivacyDenialMessage(
+        for rawUserID: String?,
+        blockedMessage: String
+    ) -> String? {
+        switch CommunicationPrivacyAccessPolicy.decision(
+            ownerUserID: profile?.id,
+            recipientUserID: rawUserID,
+            hasLoadedCompleteProjection: hasUsableCommunicationPrivacyProjection,
+            blocks: communicationBlocks
+        ) {
+        case .allowed:
+            return nil
+        case .blocked:
+            return blockedMessage
+        case .unavailable:
+            return "Communication privacy is still loading. Refresh and try again."
+        }
+    }
+
+    func loadCommunicationPrivacy() async {
+        guard !isLoadingCommunicationPrivacy, communicationPrivacyMutation == nil else { return }
+        guard isOnline else {
+            communicationPrivacyErrorMessage = "Connect to the internet to refresh communication privacy."
+            return
+        }
+        communicationPrivacyRequestGeneration &+= 1
+        let generation = communicationPrivacyRequestGeneration
+        isLoadingCommunicationPrivacy = true
+        communicationPrivacyErrorMessage = nil
+        defer {
+            if communicationPrivacyRequestGeneration == generation {
+                isLoadingCommunicationPrivacy = false
+            }
+        }
+        guard let context = await communicationPrivacyContext() else {
+            if communicationPrivacyRequestGeneration == generation {
+                communicationPrivacyErrorMessage = "Sign in again to manage communication privacy."
+            }
+            return
+        }
+
+        let previousBlockedUserIDs = Set(
+            communicationBlocks.lazy.filter(\.blocked).map(\.userId)
+        )
+        do {
+            let result = try await APIClientSessionBinding.$sessionID.withValue(
+                context.sessionID
+            ) {
+                async let preferences = api.communicationPreferences()
+                async let blocks = api.communicationBlocks()
+                return try await (preferences, blocks)
+            }
+            guard communicationPrivacyRequestGeneration == generation,
+                  await communicationPrivacyContextIsCurrent(context)
+            else { return }
+            communicationPreferences = result.0
+            communicationBlocks = result.1
+            hasLoadedCommunicationPrivacy = true
+            rebuildCallContacts()
+            await persistCommunicationPrivacyCache(context: context)
+            let refreshedBlockedUserIDs = Set(result.1.lazy.filter(\.blocked).map(\.userId))
+            if refreshedBlockedUserIDs != previousBlockedUserIDs {
+                await refreshContactsAfterCommunicationBlockChange(context: context)
+            }
+        } catch is CancellationError {
+            return
+        } catch {
+            guard communicationPrivacyRequestGeneration == generation,
+                  await communicationPrivacyContextIsCurrent(context)
+            else { return }
+            communicationPrivacyErrorMessage = CommunicationPrivacyErrorCopy.message(
+                for: error,
+                operation: .load
+            )
+        }
+    }
+
+    func setPhoneDiscoverable(_ enabled: Bool) async {
+        await updateCommunicationPreference(.phoneDiscovery(enabled))
+    }
+
+    func setDirectMessageRequestsEnabled(_ enabled: Bool) async {
+        await updateCommunicationPreference(.messageRequests(enabled))
+    }
+
+    func setCommunicationBlocked(_ blocked: Bool, userID rawUserID: String) async -> Bool {
+        guard let userID = CommunicationPrivacyIdentifier.canonicalUUID(rawUserID),
+              userID != CommunicationPrivacyIdentifier.canonicalUUID(profile?.id)
+        else {
+            communicationPrivacyErrorMessage = "This Kit Pay account cannot be updated."
+            return false
+        }
+        if !hasUsableCommunicationPrivacyProjection {
+            await loadCommunicationPrivacy()
+            guard hasUsableCommunicationPrivacyProjection else { return false }
+        }
+        guard isCommunicationBlocked(userID: userID) != blocked else { return true }
+        guard communicationPrivacyMutation == nil, !isLoadingCommunicationPrivacy else {
+            return false
+        }
+        guard isOnline else {
+            communicationPrivacyErrorMessage = "Connect to the internet to update blocked accounts."
+            return false
+        }
+        communicationPrivacyRequestGeneration &+= 1
+        let generation = communicationPrivacyRequestGeneration
+        communicationPrivacyMutation = blocked ? .block(userID) : .unblock(userID)
+        communicationPrivacyErrorMessage = nil
+        defer {
+            if communicationPrivacyRequestGeneration == generation {
+                communicationPrivacyMutation = nil
+            }
+        }
+        guard let context = await communicationPrivacyContext() else {
+            if communicationPrivacyRequestGeneration == generation {
+                communicationPrivacyErrorMessage = "Sign in again to update blocked accounts."
+            }
+            return false
+        }
+
+        do {
+            let response = try await APIClientSessionBinding.$sessionID.withValue(
+                context.sessionID
+            ) {
+                if blocked {
+                    return try await api.blockCommunicationUser(userID: userID)
+                }
+                return try await api.unblockCommunicationUser(userID: userID)
+            }
+            guard communicationPrivacyRequestGeneration == generation,
+                  await communicationPrivacyContextIsCurrent(context)
+            else { return false }
+            communicationBlocks.removeAll { $0.userId == userID }
+            if response.blocked { communicationBlocks.insert(response, at: 0) }
+            hasLoadedCommunicationPrivacy = true
+            rebuildCallContacts()
+            await persistCommunicationPrivacyCache(context: context)
+            await refreshContactsAfterCommunicationBlockChange(context: context)
+            return true
+        } catch is CancellationError {
+            return false
+        } catch {
+            guard communicationPrivacyRequestGeneration == generation,
+                  await communicationPrivacyContextIsCurrent(context)
+            else { return false }
+            communicationPrivacyErrorMessage = CommunicationPrivacyErrorCopy.message(
+                for: error,
+                operation: blocked ? .block : .unblock
+            )
+            return false
+        }
+    }
+
+    private func updateCommunicationPreference(_ change: CommunicationPreferenceChange) async {
+        if communicationPreferences == nil {
+            await loadCommunicationPrivacy()
+        }
+        guard let current = communicationPreferences,
+              communicationPrivacyMutation == nil,
+              !isLoadingCommunicationPrivacy
+        else { return }
+        guard isOnline else {
+            communicationPrivacyErrorMessage = "Connect to the internet to update communication privacy."
+            return
+        }
+        communicationPrivacyRequestGeneration &+= 1
+        let generation = communicationPrivacyRequestGeneration
+        communicationPrivacyMutation = .preference
+        communicationPrivacyErrorMessage = nil
+        defer {
+            if communicationPrivacyRequestGeneration == generation {
+                communicationPrivacyMutation = nil
+            }
+        }
+        guard let context = await communicationPrivacyContext() else {
+            if communicationPrivacyRequestGeneration == generation {
+                communicationPrivacyErrorMessage = "Sign in again to update communication privacy."
+            }
+            return
+        }
+
+        do {
+            let result = try await saveCommunicationPreference(
+                change,
+                current: current,
+                context: context,
+                generation: generation
+            )
+            guard communicationPrivacyRequestGeneration == generation,
+                  await communicationPrivacyContextIsCurrent(context)
+            else { return }
+            switch result {
+            case .updated(let preferences):
+                communicationPreferences = preferences
+            case .refreshedAfterConflict(let preferences):
+                communicationPreferences = preferences
+                communicationPrivacyErrorMessage =
+                    "Your communication settings changed on another device. The latest choices are shown; review them and try again."
+            }
+            await persistCommunicationPrivacyCache(context: context)
+        } catch is CancellationError {
+            return
+        } catch is CommunicationPreferenceConflictRefreshFailure {
+            guard communicationPrivacyRequestGeneration == generation,
+                  await communicationPrivacyContextIsCurrent(context)
+            else { return }
+            await invalidateCommunicationPrivacyProjection(context: context)
+            communicationPrivacyErrorMessage =
+                "Your communication settings changed on another device, but the latest choices could not be loaded. Refresh and try again."
+        } catch {
+            guard communicationPrivacyRequestGeneration == generation,
+                  await communicationPrivacyContextIsCurrent(context)
+            else { return }
+            communicationPrivacyErrorMessage = CommunicationPrivacyErrorCopy.message(
+                for: error,
+                operation: .updatePreferences
+            )
+        }
+    }
+
+    private func saveCommunicationPreference(
+        _ change: CommunicationPreferenceChange,
+        current: CommunicationPreferencesDTO,
+        context: CommunicationPrivacyAccountContext,
+        generation: UInt64
+    ) async throws -> CommunicationPreferenceSaveResult {
+        do {
+            let updated = try await APIClientSessionBinding.$sessionID.withValue(context.sessionID) {
+                try await api.updateCommunicationPreferences(
+                    change.request(version: current.version)
+                )
+            }
+            guard change.isValidTransition(from: current, to: updated) else {
+                throw APIClientError.invalidResponse
+            }
+            return .updated(updated)
+        } catch let error as APIErrorPayload
+            where error.code.caseInsensitiveCompare(
+                "COMMUNICATION_PREFERENCES_VERSION_CONFLICT"
+            ) == .orderedSame {
+            let latest: CommunicationPreferencesDTO
+            do {
+                latest = try await APIClientSessionBinding.$sessionID.withValue(context.sessionID) {
+                    try await api.communicationPreferences()
+                }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw CommunicationPreferenceConflictRefreshFailure()
+            }
+            guard communicationPrivacyRequestGeneration == generation,
+                  await communicationPrivacyContextIsCurrent(context)
+            else { throw CancellationError() }
+            // Do not silently replay the user's edit over a newer choice from another device.
+            return .refreshedAfterConflict(latest)
+        }
+    }
+
+    private func communicationPrivacyContext() async -> CommunicationPrivacyAccountContext? {
+        guard !isSigningOut,
+              isSignedIn,
+              accountSetupStep == nil,
+              sessionAssurance?.grantsFullAccess == true,
+              let userID = CommunicationPrivacyIdentifier.canonicalUUID(profile?.id)
+        else { return nil }
+        let expectedAccountEpoch = accountEpoch
+        guard let sessionID = await sessions.current()?.sessionId,
+              !isSigningOut,
+              isSignedIn,
+              accountSetupStep == nil,
+              sessionAssurance?.grantsFullAccess == true,
+              accountEpoch == expectedAccountEpoch,
+              CommunicationPrivacyIdentifier.canonicalUUID(profile?.id) == userID
+        else { return nil }
+        return CommunicationPrivacyAccountContext(
+            accountEpoch: expectedAccountEpoch,
+            userID: userID,
+            sessionID: sessionID
+        )
+    }
+
+    private func communicationPrivacyContextIsCurrent(
+        _ context: CommunicationPrivacyAccountContext
+    ) async -> Bool {
+        guard !Task.isCancelled,
+              !isSigningOut,
+              isSignedIn,
+              accountSetupStep == nil,
+              sessionAssurance?.grantsFullAccess == true,
+              accountEpoch == context.accountEpoch,
+              CommunicationPrivacyIdentifier.canonicalUUID(profile?.id) == context.userID
+        else { return false }
+        return await sessions.current()?.sessionId == context.sessionID
+    }
+
+    private func resetCommunicationPrivacyState() {
+        communicationPrivacyRequestGeneration &+= 1
+        communicationPreferences = nil
+        communicationBlocks = []
+        isLoadingCommunicationPrivacy = false
+        communicationPrivacyMutation = nil
+        communicationPrivacyErrorMessage = nil
+        hasLoadedCommunicationPrivacy = false
+    }
+
+    private func restoreCommunicationPrivacyCache() {
+        resetCommunicationPrivacyState()
+        guard let userID = CommunicationPrivacyIdentifier.canonicalUUID(profile?.id),
+              CommunicationPrivacyIdentifier.canonicalUUID(state.communicationOwnerUserID)
+                == userID,
+              let cache = state.communicationPrivacy,
+              cache.ownerUserId == userID
+        else { return }
+        communicationPreferences = cache.preferences
+        communicationBlocks = cache.blocks
+        hasLoadedCommunicationPrivacy = true
+    }
+
+    private func persistCommunicationPrivacyCache(
+        context: CommunicationPrivacyAccountContext
+    ) async {
+        guard let preferences = communicationPreferences,
+              let cache = CommunicationPrivacyCache(
+                  ownerUserId: context.userID,
+                  preferences: preferences,
+                  blocks: communicationBlocks
+              ),
+              await communicationPrivacyContextIsCurrent(context)
+        else { return }
+        do {
+            try await store.update { persisted in
+                guard CommunicationPrivacyIdentifier.canonicalUUID(persisted.profile?.id)
+                        == context.userID,
+                      CommunicationPrivacyIdentifier.canonicalUUID(
+                          persisted.communicationOwnerUserID
+                      ) == context.userID
+                else { throw StoreError.accountChanged }
+                persisted.communicationPrivacy = cache
+            }
+        } catch {
+            // Live server-confirmed state remains usable for this process. A later refresh retries
+            // the encrypted cache write; never replace it with a less-authoritative projection.
+        }
+    }
+
+    private func invalidateCommunicationPrivacyProjection(
+        context: CommunicationPrivacyAccountContext
+    ) async {
+        communicationPreferences = nil
+        communicationBlocks = []
+        hasLoadedCommunicationPrivacy = false
+        rebuildCallContacts()
+        do {
+            try await store.update { persisted in
+                guard CommunicationPrivacyIdentifier.canonicalUUID(persisted.profile?.id)
+                        == context.userID,
+                      CommunicationPrivacyIdentifier.canonicalUUID(
+                          persisted.communicationOwnerUserID
+                      ) == context.userID
+                else { throw StoreError.accountChanged }
+                persisted.communicationPrivacy = nil
+            }
+        } catch {
+            // The in-memory projection remains closed. Account binding rejects this cache if the
+            // session changes, and the next successful refresh replaces it atomically.
+        }
+    }
+
+    /// Contact matching is authorization-sensitive on the backend. Force the next automatic pass
+    /// to fetch a fresh server projection after either side of a block transition instead of
+    /// waiting for the ordinary fifteen-minute unchanged-address-book interval.
+    private func refreshContactsAfterCommunicationBlockChange(
+        context: CommunicationPrivacyAccountContext
+    ) async {
+        guard await communicationPrivacyContextIsCurrent(context) else { return }
+        contactAuthorizationRevision &+= 1
+        do {
+            try await store.update { persisted in
+                guard CommunicationPrivacyIdentifier.canonicalUUID(persisted.profile?.id)
+                        == context.userID,
+                      CommunicationPrivacyIdentifier.canonicalUUID(
+                          persisted.communicationOwnerUserID
+                      ) == context.userID
+                else { throw StoreError.accountChanged }
+                persisted.contactSyncLastCompletedAt = nil
+            }
+            let refreshedState = await store.snapshot()
+            guard await communicationPrivacyContextIsCurrent(context),
+                  CommunicationPrivacyIdentifier.canonicalUUID(refreshedState.profile?.id)
+                    == context.userID,
+                  CommunicationPrivacyIdentifier.canonicalUUID(
+                      refreshedState.communicationOwnerUserID
+                  ) == context.userID
+            else { return }
+            state = refreshedState
+        } catch {
+            // The live block already filters every in-memory communication picker. Clearing this
+            // process's freshness marker still makes the next pass re-check server discovery.
+            guard await communicationPrivacyContextIsCurrent(context) else { return }
+            state.contactSyncLastCompletedAt = nil
+        }
+        guard await communicationPrivacyContextIsCurrent(context) else { return }
+        scheduleAutomaticContactSync()
+    }
+
+    @discardableResult
+    func persistConversationDraft(
+        _ body: String,
+        conversationId: String,
+        writeVersion: ConversationDraftWriteVersion
+    ) async -> Bool {
+        let expectedAccountEpoch = accountEpoch
+        guard !Task.isCancelled,
+              isSignedIn,
+              !isSigningOut,
+              let userID = profile?.id,
+              let canonicalConversationID = OutboxPolicy.canonicalConversationID(conversationId),
+              state.conversations.contains(where: {
+                  OutboxPolicy.canonicalConversationID($0.id) == canonicalConversationID
+              })
+        else { return false }
+        let boundedBody = ConversationDraftPolicy.boundedBody(body)
+        do {
+            try Task.checkCancellation()
+            try await store.update { persisted in
+                try Task.checkCancellation()
+                guard persisted.profile?.id.caseInsensitiveCompare(userID) == .orderedSame,
+                      persisted.communicationOwnerUserID?.caseInsensitiveCompare(userID)
+                        == .orderedSame
+                else { throw StoreError.accountChanged }
+                ConversationDraftPolicy.store(
+                    boundedBody,
+                    conversationID: canonicalConversationID,
+                    ownerUserID: userID,
+                    writeVersion: writeVersion,
+                    in: &persisted
+                )
+            }
+            try Task.checkCancellation()
+            let snapshot = await store.snapshot()
+            guard !Task.isCancelled,
+                  isSignedIn,
+                  !isSigningOut,
+                  accountEpoch == expectedAccountEpoch,
+                  profile?.id.caseInsensitiveCompare(userID) == .orderedSame,
+                  snapshot.profile?.id.caseInsensitiveCompare(userID) == .orderedSame,
+                  snapshot.communicationOwnerUserID?.caseInsensitiveCompare(userID)
+                    == .orderedSame
+            else { return false }
+            let snapshotDraft = snapshot.conversationDrafts?[canonicalConversationID]
+            let currentDraft = state.conversationDrafts?[canonicalConversationID]
+            if ConversationDraftPolicy.shouldApplySnapshotDraft(
+                snapshotDraft,
+                over: currentDraft,
+                activeWriterID: conversationDraftWriterID
+            ) {
+                var drafts = state.conversationDrafts ?? [:]
+                if let snapshotDraft {
+                    drafts[canonicalConversationID] = snapshotDraft
+                } else {
+                    drafts.removeValue(forKey: canonicalConversationID)
+                }
+                state.conversationDrafts = drafts.isEmpty ? nil : drafts
+            }
+            return true
+        } catch is CancellationError {
+            return false
+        } catch StoreError.accountChanged {
+            return false
+        } catch {
+            guard isSignedIn,
+                  !isSigningOut,
+                  accountEpoch == expectedAccountEpoch,
+                  profile?.id.caseInsensitiveCompare(userID) == .orderedSame,
+                  state.conversations.contains(where: {
+                      OutboxPolicy.canonicalConversationID($0.id) == canonicalConversationID
+                  })
+            else { return false }
+            lastError = CustomerFacingMessagingCopy.draftSaveFailure
+            return false
+        }
+    }
+
+    func conversationDraft(for conversationId: String) -> String {
+        guard let userID = profile?.id else { return "" }
+        return ConversationDraftPolicy.body(
+            conversationID: conversationId,
+            ownerUserID: userID,
+            in: state
+        )
+    }
+
+    func nextConversationDraftWriteVersion() -> ConversationDraftWriteVersion {
+        conversationDraftWriteSequence &+= 1
+        if conversationDraftWriteSequence == 0 {
+            conversationDraftWriterID = UUID()
+            conversationDraftWriteSequence = 1
+        }
+        return ConversationDraftWriteVersion(
+            writerID: conversationDraftWriterID,
+            sequence: conversationDraftWriteSequence
+        )
+    }
+
+    @discardableResult
+    func queueMessage(
+        conversationId: String,
+        title: String,
+        recipientId: String? = nil,
+        body: String,
+        clientMessageID: UUID? = nil,
+        draftClearVersion: ConversationDraftWriteVersion? = nil
+    ) async -> Bool {
+        let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        guard let cleanConversationId = OutboxPolicy.canonicalConversationID(conversationId) else {
+            lastError = "This conversation is no longer available. Your message was not sent."
+            return false
+        }
+        guard secureMessagingAvailable else {
+            lastError = messagingSendFailureMessage
+            return false
+        }
+        guard let userID = profile?.id,
+              let expectedSessionID = await sessions.current()?.sessionId,
+              let recipientId,
+              let recipientUUID = UUID(
+                  uuidString: recipientId.trimmingCharacters(in: .whitespacesAndNewlines)
+              )
+        else {
+            lastError = "Choose one valid Kit Pay recipient."
+            return false
+        }
+        let expectedAccountEpoch = accountEpoch
+        guard await outboxContextIsCurrent(
+            accountEpoch: expectedAccountEpoch,
+            userID: userID,
+            sessionID: expectedSessionID
+        ) else { return false }
+        let recipientUserID = recipientUUID.uuidString.lowercased()
+        if let denial = communicationPrivacyDenialMessage(
+            for: recipientUserID,
+            blockedMessage: "Unblock this account before sending a message."
+        ) {
+            lastError = denial
+            return false
+        }
+        do {
+            _ = try await SecureMessagingExchangeCoordinator.shared.queueDeferredText(
+                forUserID: userID,
+                conversationID: cleanConversationId,
+                expectedRecipientUserID: recipientUserID,
+                title: title,
+                text: trimmed,
+                clientMessageID: clientMessageID,
+                submittedDraftBody: draftClearVersion == nil ? nil : body,
+                draftClearVersion: draftClearVersion
+            )
+            guard await reloadOutboxStateIfCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: userID,
+                sessionID: expectedSessionID
+            ) else { return false }
+            // The encrypted projection and command are durable now. `scheduleOutboxWake` owns
+            // online delivery so the composer can clear without waiting for roster/network I/O.
+            scheduleOutboxWake()
+            return true
+        } catch {
+            guard await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: userID,
+                sessionID: expectedSessionID
+            ) else { return false }
+            lastError = error.localizedDescription
+            return false
+        }
+    }
+
+    /// Queues the canonical encrypted card for one server-confirmed request. Both the financial
+    /// recipient and the message idempotency UUID come from that exact response.
+    @discardableResult
+    func queuePaymentRequest(
+        _ request: PaymentRequestDTO,
+        recipientId: String,
+        title: String,
+        conversationId: String? = nil
+    ) async -> Bool {
+        let leaseKey = request.id.lowercased()
+        guard let lease = paymentRequestChatShareLeases[leaseKey],
+              await outboxContextIsCurrent(
+                  accountEpoch: lease.accountEpoch,
+                  userID: lease.userID,
+                  sessionID: lease.sessionID
+              )
+        else { return false }
+        guard let share = KitPaymentRequestChatShare(
+            paymentRequest: request,
+            recipientUserID: recipientId,
+            recipientName: title
+        ) else {
+            lastError = "Kit Pay could not confirm who should receive this request. Nothing was sent in chat."
+            return false
+        }
+        guard lease.authorizes(share) else { return false }
+        let queued: Bool
+        if let conversationId {
+            queued = await queueMessage(
+                conversationId: conversationId,
+                title: share.recipientName,
+                recipientId: share.recipientUserID,
+                body: share.descriptor.encoded,
+                clientMessageID: share.clientMessageID
+            )
+        } else {
+            queued = await queueDirectMessage(
+                recipientId: share.recipientUserID,
+                title: share.recipientName,
+                body: share.descriptor.encoded,
+                clientMessageID: share.clientMessageID
+            )
+        }
+        guard queued,
+              await outboxContextIsCurrent(
+                  accountEpoch: lease.accountEpoch,
+                  userID: lease.userID,
+                  sessionID: lease.sessionID
+              )
+        else { return false }
+        if paymentRequestChatShareLeases[leaseKey] == lease {
+            paymentRequestChatShareLeases.removeValue(forKey: leaseKey)
+        }
+        return true
+    }
+
+    @discardableResult
+    func queueImageMessage(
+        conversationId: String,
+        title: String,
+        recipientId: String?,
+        imageData: Data,
+        mediaType: String,
+        caption: String?,
+        draftClearVersion: ConversationDraftWriteVersion? = nil
+    ) async -> Bool {
+        guard let cleanConversationId = OutboxPolicy.canonicalConversationID(conversationId) else {
+            lastError = "This conversation is no longer available. The photo was not sent."
+            return false
+        }
+        guard secureMessagingAvailable else {
+            lastError = messagingSendFailureMessage
+            return false
+        }
+        guard let userID = profile?.id,
+              let expectedSessionID = await sessions.current()?.sessionId,
+              let recipientId,
+              let recipientUUID = UUID(
+                  uuidString: recipientId.trimmingCharacters(in: .whitespacesAndNewlines)
+              )
+        else {
+            lastError = "Choose one valid Kit Pay recipient."
+            return false
+        }
+        let expectedAccountEpoch = accountEpoch
+        guard await outboxContextIsCurrent(
+            accountEpoch: expectedAccountEpoch,
+            userID: userID,
+            sessionID: expectedSessionID
+        ) else { return false }
+        let recipientUserID = recipientUUID.uuidString.lowercased()
+        if let denial = communicationPrivacyDenialMessage(
+            for: recipientUserID,
+            blockedMessage: "Unblock this account before sending a photo."
+        ) {
+            lastError = denial
+            return false
+        }
+        do {
+            _ = try await SecureMessagingExchangeCoordinator.shared.queueDeferredImage(
+                forUserID: userID,
+                conversationID: cleanConversationId,
+                expectedRecipientUserID: recipientUserID,
+                title: title,
+                imageData: imageData,
+                mediaType: mediaType,
+                caption: caption,
+                submittedDraftBody: draftClearVersion == nil ? nil : (caption ?? ""),
+                draftClearVersion: draftClearVersion
+            )
+            guard await reloadOutboxStateIfCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: userID,
+                sessionID: expectedSessionID
+            ) else { return false }
+            // Media bytes, pending attachment metadata and the outbox command are protected by
+            // the same local commit. Upload/encryption replay continues independently from here.
+            scheduleOutboxWake()
+            return true
+        } catch {
+            guard await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: userID,
+                sessionID: expectedSessionID
+            ) else { return false }
+            lastError = error.localizedDescription
+            return false
+        }
+    }
+
+    func loadSecureImage(
+        conversationId: String,
+        descriptorText: String
+    ) async throws -> Data {
+        if let cached = state.messages.first(where: {
+            $0.conversationId == conversationId && $0.body == descriptorText
+        })?.attachmentData,
+           !cached.isEmpty {
+            return cached
+        }
+        guard isOnline else { throw URLError(.notConnectedToInternet) }
+        guard secureMessagingAvailable, let userID = profile?.id else {
+            throw SecureMessagingExchangeError.invalidAccount
+        }
+        let data = try await SecureMessagingExchangeCoordinator.shared.openImage(
+            forUserID: userID,
+            conversationID: conversationId,
+            descriptorText: descriptorText
+        )
+        try await store.update { persisted in
+            guard persisted.profile?.id == userID else { throw StoreError.accountChanged }
+            guard let index = persisted.messages.firstIndex(where: {
+                $0.conversationId == conversationId && $0.body == descriptorText
+            }) else { throw SecureMessagingExchangeError.invalidConversation }
+            persisted.messages[index].attachmentData = data
+        }
+        state = await store.snapshot()
+        return data
+    }
+
+    /// Direct chats must first be created/replayed by the authenticated messaging API so the
+    /// server-issued conversation UUID and authoritative device roster can be encrypted against.
+    /// Keep this boundary explicit; never recreate the old `direct:<user-id>` placeholder.
+    @discardableResult
+    func queueDirectMessage(
+        recipientId: String,
+        title: String,
+        body: String,
+        clientMessageID: UUID? = nil
+    ) async -> Bool {
+        let result = await queueDirectMessageResult(
+            recipientId: recipientId,
+            title: title,
+            body: body,
+            clientMessageID: clientMessageID
+        )
+        return result != nil
+    }
+
+    /// Returns the exact conversation whose encrypted outbox projection is durable locally.
+    /// New-chat UI uses this result to navigate only after the idempotent queue commit succeeds.
+    func queueDirectMessageResult(
+        recipientId: String,
+        title: String,
+        body: String,
+        clientMessageID: UUID? = nil
+    ) async -> SecureMessagingQueueResult? {
+        let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        guard let recipientUUID = UUID(
+            uuidString: recipientId.trimmingCharacters(in: .whitespacesAndNewlines)
+        ),
+              !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else {
+            lastError = "Choose a valid Kit Pay contact."
+            return nil
+        }
+        let cleanRecipientID = recipientUUID.uuidString.lowercased()
+        if let denial = communicationPrivacyDenialMessage(
+            for: cleanRecipientID,
+            blockedMessage: "Unblock this account before starting a chat."
+        ) {
+            lastError = denial
+            return nil
+        }
+        guard secureMessagingAvailable,
+              let userID = profile?.id,
+              let expectedSessionID = await sessions.current()?.sessionId
+        else {
+            lastError = messagingSendFailureMessage
+            return nil
+        }
+        let expectedAccountEpoch = accountEpoch
+        guard await outboxContextIsCurrent(
+            accountEpoch: expectedAccountEpoch,
+            userID: userID,
+            sessionID: expectedSessionID
+        ) else { return nil }
+        do {
+            let result: SecureMessagingQueueResult
+            if isOnline {
+                result = try await APIClientSessionBinding.$sessionID.withValue(expectedSessionID) {
+                    try await SecureMessagingExchangeCoordinator.shared.queueDirectText(
+                        forUserID: userID,
+                        recipientUserID: cleanRecipientID,
+                        title: title,
+                        text: trimmed,
+                        clientMessageID: clientMessageID
+                    )
+                }
+            } else {
+                let recipient = cleanRecipientID
+                let local = UUID(uuidString: userID)?.uuidString.lowercased()
+                guard let local,
+                      let conversation = state.conversations.first(where: {
+                          Set($0.participantUserIds) == Set([local, recipient])
+                      })
+                else {
+                    lastError = "Connect to the internet once to start this conversation."
+                    return nil
+                }
+                result = try await SecureMessagingExchangeCoordinator.shared.queueDeferredText(
+                    forUserID: local,
+                    conversationID: conversation.id,
+                    expectedRecipientUserID: recipient,
+                    title: title,
+                    text: trimmed,
+                    clientMessageID: clientMessageID
+                )
+            }
+            guard await reloadOutboxStateIfCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: userID,
+                sessionID: expectedSessionID
+            ) else { return nil }
+            scheduleOutboxWake()
+            guard await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: userID,
+                sessionID: expectedSessionID
+            ) else { return nil }
+            return result
+        } catch {
+            guard await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: userID,
+                sessionID: expectedSessionID
+            ) else { return nil }
+            lastError = error.localizedDescription
+            return nil
+        }
+    }
+
+    func queueCall(
+        recipientId: String,
+        name: String,
+        video: Bool
+    ) async {
+        let rawRecipientId = recipientId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let recipientUUID = UUID(uuidString: rawRecipientId),
+              !cleanName.isEmpty
+        else {
+            lastError = "Choose a Kit Pay contact to call."
+            return
+        }
+        let cleanRecipientId = recipientUUID.uuidString.lowercased()
+        if let denial = communicationPrivacyDenialMessage(
+            for: cleanRecipientId,
+            blockedMessage: "Unblock this account before starting a call."
+        ) {
+            lastError = denial
+            return
+        }
+        guard mayCreateCall else {
+            lastError = "Calls are not available for this account."
+            return
+        }
+        guard ephemeralOutgoingCallGate.attempt == nil,
+              CallMediaCoordinator.shared.activeCall == nil,
+              !state.calls.contains(where: { [.ringing, .active].contains($0.state) })
+        else {
+            lastError = "Finish or cancel the current call attempt before starting another."
+            return
+        }
+        guard UIApplication.shared.applicationState == .active,
+              let lease = callMediaAccountLease,
+              lease.accountEpoch == accountEpoch,
+              profile?.id.caseInsensitiveCompare(lease.userID) == .orderedSame
+        else {
+            lastError = "Open Kit Pay to start this call."
+            return
+        }
+        do {
+            try await CallMediaCoordinator.shared.preparePermissions(video: video)
+        } catch {
+            lastError = error.localizedDescription
+            return
+        }
+        guard callMediaAccountLease == lease,
+              await outboxContextIsCurrent(
+                accountEpoch: lease.accountEpoch,
+                userID: lease.userID,
+                sessionID: lease.sessionID
+              )
+        else { return }
+
+        let attempt = EphemeralOutgoingCallAttempt(
+            clientCallID: UUID(),
+            recipientUserID: cleanRecipientId,
+            recipientName: cleanName,
+            video: video,
+            // Android starts every call through the global callable-user contract. Keeping this
+            // unbound lets an established one-to-one call become a group call; chat timelines
+            // still resolve the original peer deterministically from the authenticated roster.
+            conversationID: nil,
+            createdAt: Date(),
+            lease: lease
+        )
+        guard ephemeralOutgoingCallGate.begin(attempt) else {
+            lastError = "Finish or cancel the current call attempt before starting another."
+            return
+        }
+        let presentation = ActiveCallPresentation(
+            id: attempt.clientCallIDString,
+            conversationId: nil,
+            participantName: cleanName,
+            participantAvatarURL: callParticipantAvatarURL(
+                for: [cleanRecipientId]
+            ),
+            video: video,
+            direction: "outgoing"
+        )
+        guard CallMediaCoordinator.shared.presentPendingOutgoing(
+            presentation,
+            lease: lease
+        ) else {
+            _ = ephemeralOutgoingCallGate.cancel(
+                clientCallID: attempt.clientCallIDString
+            )
+            lastError = "Finish or cancel the current call attempt before starting another."
+            return
+        }
+        lastError = nil
+        resumeEphemeralOutgoingCallIfPossible()
+    }
+
+    private var callWaitingMediaState: CallWaitingMediaState {
+        switch CallMediaCoordinator.shared.state {
+        case .idle: .idle
+        case .preparing: .preparing
+        case .connecting: .connecting
+        case .reconnecting: .reconnecting
+        case .connected: .connected
+        case .ending: .ending
+        }
+    }
+
+    private func liveCallInvitationContext(
+        for activeCall: ActiveCallPresentation?
+    ) -> ActiveCallInvitationContext? {
+        guard let activeCall,
+              let coordinatorCall = CallMediaCoordinator.shared.activeCall,
+              coordinatorCall.conversationId == nil,
+              [.connected, .reconnecting].contains(CallMediaCoordinator.shared.state),
+              let context = ActiveCallInvitationPolicy.context(
+                  for: activeCall,
+                  calls: state.calls,
+                  currentUserID: profile?.id
+              ),
+              UUID(uuidString: coordinatorCall.id)?.uuidString.lowercased() == context.callID
+        else { return nil }
+        return context
+    }
+
+    private func routeAuthenticatedIncomingCall(
+        _ incoming: AuthenticatedIncomingCall
+    ) {
+        let route = CallWaitingRoutingPolicy.route(
+            incoming: incoming,
+            activeCallID: CallMediaCoordinator.shared.activeCall?.id,
+            mediaState: callWaitingMediaState
+        )
+        switch route {
+        case .primary, .currentCall:
+            return
+        case .decline:
+            NotificationCoordinator.shared.requestDeclineIncomingCall(
+                callId: incoming.record.id
+            )
+        case .waiting(let waiting):
+            switch callWaitingState.retain(waiting) {
+            case .retained, .refreshed:
+                CallProgressSoundPlayer.shared.beginAuthenticatedCallWaiting(
+                    callID: waiting.callID
+                )
+            case .occupied(let unretained):
+                // Match Android's single waiting banner. CallKit has room for exactly one waiting
+                // record, so a third simultaneous call is declined without disturbing either the
+                // connected room or the first authenticated waiting caller.
+                NotificationCoordinator.shared.requestDeclineIncomingCall(
+                    callId: unretained.callID
+                )
+            }
+        }
+    }
+
+    @discardableResult
+    private func clearWaitingCallForLifecycle(callID: String) -> AuthenticatedWaitingCall? {
+        guard let canonicalCallID = canonicalCallID(callID),
+              callWaitingState.waitingCall?.callID == canonicalCallID
+        else { return nil }
+        cancelWaitingCallMergeOperation(for: canonicalCallID)
+        // A CallKit-originated merge marks the UUID before AppModel creates its own operation.
+        // Lifecycle cleanup must release that premark too.
+        NotificationCoordinator.shared.finishWaitingCallMergeAttempt(callId: canonicalCallID)
+        guard let removed = callWaitingState.clearForLifecycle(callID: callID) else {
+            return nil
+        }
+        CallProgressSoundPlayer.shared.clearAuthenticatedCallWaiting(callID: removed.callID)
+        return removed
+    }
+
+    @discardableResult
+    private func clearAllCallWaitingState() -> AuthenticatedWaitingCall? {
+        let waitingCallID = callWaitingState.waitingCall?.callID
+        cancelWaitingCallMergeOperation()
+        if let waitingCallID {
+            NotificationCoordinator.shared.finishWaitingCallMergeAttempt(callId: waitingCallID)
+        }
+        guard let removed = callWaitingState.decline() else {
+            callWaitingState = CallWaitingState()
+            return nil
+        }
+        CallProgressSoundPlayer.shared.clearAuthenticatedCallWaiting(callID: removed.callID)
+        callWaitingState = CallWaitingState()
+        return removed
+    }
+
+    private func declineWaitingCallAfterActiveCallTermination() {
+        guard let waiting = clearAllCallWaitingState() else { return }
+        NotificationCoordinator.shared.requestDeclineIncomingCall(callId: waiting.callID)
+    }
+
+    private func handleRemoteCallMediaEndedWake(_ wake: RemoteCallMediaEndedWake) {
+        guard let endedCallID = canonicalCallID(wake.callId),
+              let waiting = callWaitingState.waitingCall,
+              waiting.callID != endedCallID
+        else { return }
+        declineWaitingCallAfterActiveCallTermination()
+    }
+
+    private func waitingCallMergeOperationIsCurrent(
+        _ operationID: UUID,
+        attempt: CallWaitingMergeAttempt
+    ) -> Bool {
+        waitingCallMergeOperationID == operationID
+            && waitingCallMergeAttempt == attempt
+            && waitingCallMergeOperationGate.isCurrent(operationID)
+            && callWaitingState.mergeAttempt == attempt
+            && callWaitingState.waitingCall?.callID == attempt.target.waitingCallID
+            && callWaitingState.waitingCall?.initiatorUserID == attempt.target.recipientUserID
+    }
+
+    private func finishWaitingCallMergeOperationIfOwned(
+        _ operationID: UUID,
+        attempt: CallWaitingMergeAttempt
+    ) {
+        guard waitingCallMergeOperationID == operationID,
+              waitingCallMergeAttempt == attempt
+        else { return }
+        waitingCallMergeOperationGate.invalidate(operationID)
+        resolveWaitingCallMergeResultSignal(false, operationID: operationID)
+        waitingCallMergeTask = nil
+        waitingCallMergeOperationID = nil
+        waitingCallMergeAttempt = nil
+        NotificationCoordinator.shared.finishWaitingCallMergeAttempt(
+            callId: attempt.target.waitingCallID
+        )
+        if callWaitingState.mergeAttempt == attempt,
+           case .retainedForRetry(let waiting) = callWaitingState.completeMerge(
+               attempt,
+               result: .failure
+           ) {
+            resumeWaitingToneIfRetained(callID: waiting.callID)
+        }
+    }
+
+    /// Invalidates authority before cancelling transport. The store mutation gate observes this
+    /// synchronously, so a lifecycle clear that wins the race cannot accept a late roster response.
+    private func cancelWaitingCallMergeOperation(for callID: String? = nil) {
+        guard let operationID = waitingCallMergeOperationID,
+              let attempt = waitingCallMergeAttempt
+        else { return }
+        if let callID,
+           canonicalCallID(callID) != attempt.target.waitingCallID {
+            return
+        }
+        waitingCallMergeOperationGate.invalidate(operationID)
+        resolveWaitingCallMergeResultSignal(false, operationID: operationID)
+        waitingCallMergeTask?.cancel()
+        waitingCallMergeTask = nil
+        waitingCallMergeOperationID = nil
+        waitingCallMergeAttempt = nil
+        NotificationCoordinator.shared.finishWaitingCallMergeAttempt(
+            callId: attempt.target.waitingCallID
+        )
+    }
+
+    private func resolveWaitingCallMergeResultSignal(
+        _ result: Bool,
+        operationID: UUID
+    ) {
+        guard let signal = waitingCallMergeResultSignal,
+              signal.operationID == operationID
+        else { return }
+        waitingCallMergeResultSignal = nil
+        signal.continuation.yield(result)
+        signal.continuation.finish()
+    }
+
+    private func resumeWaitingToneIfRetained(callID: String? = nil) {
+        guard !callWaitingState.isMerging,
+              let waiting = callWaitingState.waitingCall,
+              waiting.ringExpiryDate > Date(),
+              callID.map({ canonicalCallID($0) == waiting.callID }) ?? true
+        else { return }
+        CallProgressSoundPlayer.shared.beginAuthenticatedCallWaiting(callID: waiting.callID)
+    }
+
+    /// Consumes any matching authenticated notice still queued behind a restored CallKit action.
+    /// Live delivery normally places the notice first; this recovery path also makes persisted
+    /// replay ordering fail closed instead of trying to merge from display-only action metadata.
+    private func ingestQueuedAuthenticatedIncomingCall(callID: String) async {
+        guard let canonicalCallID = canonicalCallID(callID) else { return }
+        while let index = queuedCallEvents.firstIndex(where: { event in
+            guard case .incoming(let notice) = event else { return false }
+            return self.canonicalCallID(notice.call.record.id) == canonicalCallID
+        }) {
+            guard case .incoming(let notice) = queuedCallEvents.remove(at: index) else { continue }
+            await recordAuthenticatedIncomingCall(notice.call)
+            NotificationCoordinator.shared.acknowledgeCallEvent(notice.eventId)
+        }
+    }
+
+    private func authorizedCallInvitationContext(
+        for activeCall: ActiveCallPresentation?
+    ) -> ActiveCallInvitationContext? {
+        guard isSignedIn,
+              isOnline,
+              accountSetupStep == nil,
+              sessionAssurance?.grantsFullAccess == true,
+              callsFeatureEnabled,
+              let lease = callMediaAccountLease,
+              lease.accountEpoch == accountEpoch,
+              profile?.id.caseInsensitiveCompare(lease.userID) == .orderedSame,
+              let context = liveCallInvitationContext(for: activeCall)
+        else { return nil }
+        return context
+    }
+
+    func canInviteParticipant(to activeCall: ActiveCallPresentation?) -> Bool {
+        authorizedCallInvitationContext(for: activeCall)?.canInviteAnotherParticipant == true
+    }
+
+    func participantUserIDs(for activeCall: ActiveCallPresentation?) -> Set<String> {
+        ActiveCallInvitationPolicy.context(
+            for: activeCall,
+            calls: state.calls,
+            currentUserID: profile?.id
+        )?.participantUserIDs ?? []
+    }
+
+    /// Adds one callable Kit Pay user to the authenticated call already owned by this account and
+    /// refreshes the encrypted local call projection from the server response.
+    @discardableResult
+    func inviteParticipant(
+        _ recipientUserID: String,
+        to activeCall: ActiveCallPresentation
+    ) async -> Bool {
+        guard let context = authorizedCallInvitationContext(for: activeCall) else {
+            lastError = "People can no longer be added to this call."
+            return false
+        }
+        guard context.canInviteAnotherParticipant else {
+            lastError = "This call already has the maximum number of participants."
+            return false
+        }
+        guard let recipientID = ActiveCallInvitationPolicy.canonicalRecipientID(recipientUserID)
+        else {
+            lastError = "Choose a valid Kit Pay contact."
+            return false
+        }
+        if let denial = communicationPrivacyDenialMessage(
+            for: recipientID,
+            blockedMessage: "Unblock this account before adding this person to a call."
+        ) {
+            lastError = denial
+            return false
+        }
+        guard ActiveCallInvitationPolicy.canInvite(
+            recipientUserID: recipientID,
+            in: context
+        ) else {
+            lastError = "This person is already in the call."
+            return false
+        }
+        guard let lease = callMediaAccountLease,
+              await outboxContextIsCurrent(
+                  accountEpoch: lease.accountEpoch,
+                  userID: lease.userID,
+                  sessionID: lease.sessionID
+              )
+        else {
+            lastError = "People can no longer be added to this call."
+            return false
+        }
+        let callID = context.callID
+
+        do {
+            let response = try await APIClientSessionBinding.$sessionID.withValue(
+                lease.sessionID
+            ) {
+                try await api.inviteToCall(id: callID, recipientUserIds: [recipientID])
+            }
+            guard ActiveCallInvitationPolicy.accepts(
+                      response: response,
+                      expectedCallID: callID,
+                      invitedRecipientID: recipientID,
+                      currentUserID: lease.userID
+                  ),
+                  callMediaAccountLease == lease,
+                  liveCallInvitationContext(for: activeCall)?.callID == callID,
+                  await outboxContextIsCurrent(
+                    accountEpoch: lease.accountEpoch,
+                    userID: lease.userID,
+                    sessionID: lease.sessionID
+                  )
+            else {
+                lastError = "Kit could not verify that this person joined the active call."
+                return false
+            }
+
+            let mapped = mapCall(response)
+            try await store.update { persisted in
+                guard persisted.profile?.id.caseInsensitiveCompare(lease.userID) == .orderedSame,
+                      persisted.communicationOwnerUserID?.caseInsensitiveCompare(lease.userID)
+                        == .orderedSame,
+                      ActiveCallInvitationPolicy.context(
+                          for: activeCall,
+                          calls: persisted.calls,
+                          currentUserID: lease.userID
+                      )?.callID == callID
+                else { throw StoreError.accountChanged }
+                persisted.calls = CallLifecyclePolicy.merge(
+                    remote: [mapped],
+                    local: persisted.calls
+                )
+            }
+            guard await outboxContextIsCurrent(
+                accountEpoch: lease.accountEpoch,
+                userID: lease.userID,
+                sessionID: lease.sessionID
+            ) else { return false }
+            state = await store.snapshot()
+            rebuildCallContacts()
+            lastError = nil
+            return true
+        } catch is CancellationError {
+            return false
+        } catch {
+            lastError = callInviteFailureMessage(error)
+            return false
+        }
+    }
+
+    /// Merge uses a stricter invitation contract than the ordinary people picker. A lost mutation
+    /// response is reconciled exactly once against the same authenticated active call; success is
+    /// published only when that read-back contains the exact waiting initiator in its live roster.
+    private func inviteWaitingParticipant(
+        _ attempt: CallWaitingMergeAttempt,
+        operationID: UUID,
+        to activeCall: ActiveCallPresentation
+    ) async -> Bool {
+        let operationGate = waitingCallMergeOperationGate
+        guard waitingCallMergeOperationIsCurrent(operationID, attempt: attempt),
+              let context = authorizedCallInvitationContext(for: activeCall),
+              context.callID == attempt.target.activeCallID,
+              context.canInviteAnotherParticipant,
+              let recipientID = ActiveCallInvitationPolicy.canonicalRecipientID(
+                  attempt.target.recipientUserID
+              ),
+              recipientID == attempt.target.recipientUserID,
+              communicationPrivacyDenialMessage(
+                  for: recipientID,
+                  blockedMessage: "Unblock this account before adding this person to a call."
+              ) == nil,
+              ActiveCallInvitationPolicy.canInvite(
+                recipientUserID: recipientID,
+                in: context
+              ),
+              let lease = callMediaAccountLease,
+              await outboxContextIsCurrent(
+                accountEpoch: lease.accountEpoch,
+                userID: lease.userID,
+                sessionID: lease.sessionID
+              ),
+              waitingCallMergeOperationIsCurrent(operationID, attempt: attempt)
+        else {
+            if waitingCallMergeOperationIsCurrent(operationID, attempt: attempt) {
+                lastError = "This caller could not be added to the current call."
+            }
+            return false
+        }
+        let callID = context.callID
+
+        do {
+            let response = try await APIClientSessionBinding.$sessionID.withValue(
+                lease.sessionID
+            ) {
+                try Task.checkCancellation()
+                // This closure runs immediately at the transport boundary. The lock-protected
+                // token is safe to consult off MainActor and prevents a pre-dispatch cancellation.
+                guard operationGate.isCurrent(operationID) else {
+                    throw CancellationError()
+                }
+                return try await api.inviteToCall(id: callID, recipientUserIds: [recipientID])
+            }
+            guard waitingCallMergeOperationIsCurrent(operationID, attempt: attempt),
+                  WaitingCallMergeInvitationReconciliationPolicy.accepts(
+                      response: response,
+                      expectedCallID: callID,
+                      invitedRecipientID: recipientID,
+                      currentUserID: lease.userID
+            )
+            else {
+                lastError = "This caller could not be added yet. Please try again."
+                return false
+            }
+            return await commitWaitingMergeRoster(
+                response,
+                activeCall: activeCall,
+                callID: callID,
+                recipientID: recipientID,
+                lease: lease,
+                attempt: attempt,
+                operationID: operationID
+            )
+        } catch is CancellationError {
+            return false
+        } catch {
+            guard waitingCallMergeOperationIsCurrent(operationID, attempt: attempt)
+            else { return false }
+            guard WaitingCallMergeInvitationReconciliationPolicy.shouldReconcile(after: error)
+            else {
+                lastError = callInviteFailureMessage(error)
+                return false
+            }
+            return await reconcileWaitingMergeInvitation(
+                activeCall: activeCall,
+                callID: callID,
+                recipientID: recipientID,
+                lease: lease,
+                attempt: attempt,
+                operationID: operationID
+            )
+        }
+    }
+
+    private func reconcileWaitingMergeInvitation(
+        activeCall: ActiveCallPresentation,
+        callID: String,
+        recipientID: String,
+        lease: CallMediaAccountLease,
+        attempt: CallWaitingMergeAttempt,
+        operationID: UUID
+    ) async -> Bool {
+        let operationGate = waitingCallMergeOperationGate
+        guard waitingCallMergeOperationIsCurrent(operationID, attempt: attempt),
+              callMediaAccountLease == lease,
+              liveCallInvitationContext(for: activeCall)?.callID == callID,
+              await outboxContextIsCurrent(
+                accountEpoch: lease.accountEpoch,
+                userID: lease.userID,
+                sessionID: lease.sessionID
+              ),
+              waitingCallMergeOperationIsCurrent(operationID, attempt: attempt)
+        else { return false }
+
+        do {
+            let response = try await APIClientSessionBinding.$sessionID.withValue(
+                lease.sessionID
+            ) {
+                try Task.checkCancellation()
+                guard operationGate.isCurrent(operationID) else {
+                    throw CancellationError()
+                }
+                return try await api.call(id: callID)
+            }
+            guard waitingCallMergeOperationIsCurrent(operationID, attempt: attempt),
+                  WaitingCallMergeInvitationReconciliationPolicy.accepts(
+                      response: response,
+                      expectedCallID: callID,
+                      invitedRecipientID: recipientID,
+                      currentUserID: lease.userID
+                  )
+            else {
+                lastError = "This caller could not be added yet. Please try again."
+                return false
+            }
+            return await commitWaitingMergeRoster(
+                response,
+                activeCall: activeCall,
+                callID: callID,
+                recipientID: recipientID,
+                lease: lease,
+                attempt: attempt,
+                operationID: operationID
+            )
+        } catch is CancellationError {
+            return false
+        } catch {
+            guard waitingCallMergeOperationIsCurrent(operationID, attempt: attempt),
+                  callMediaAccountLease == lease,
+                  await outboxContextIsCurrent(
+                    accountEpoch: lease.accountEpoch,
+                    userID: lease.userID,
+                    sessionID: lease.sessionID
+                  ),
+                  waitingCallMergeOperationIsCurrent(operationID, attempt: attempt)
+            else { return false }
+            lastError = "This caller could not be added yet. Please try again."
+            return false
+        }
+    }
+
+    private func commitWaitingMergeRoster(
+        _ response: CallDTO,
+        activeCall: ActiveCallPresentation,
+        callID: String,
+        recipientID: String,
+        lease: CallMediaAccountLease,
+        attempt: CallWaitingMergeAttempt,
+        operationID: UUID
+    ) async -> Bool {
+        let operationGate = waitingCallMergeOperationGate
+        guard waitingCallMergeOperationIsCurrent(operationID, attempt: attempt),
+              WaitingCallMergeInvitationReconciliationPolicy.accepts(
+                  response: response,
+                  expectedCallID: callID,
+                  invitedRecipientID: recipientID,
+                  currentUserID: lease.userID
+              ),
+              callMediaAccountLease == lease,
+              liveCallInvitationContext(for: activeCall)?.callID == callID,
+              await outboxContextIsCurrent(
+                accountEpoch: lease.accountEpoch,
+                userID: lease.userID,
+                sessionID: lease.sessionID
+              ),
+              waitingCallMergeOperationIsCurrent(operationID, attempt: attempt)
+        else { return false }
+
+        let mapped = mapCall(response)
+        do {
+            try await store.update { persisted in
+                let committed = try operationGate.performIfCurrent(operationID) {
+                    guard persisted.profile?.id.caseInsensitiveCompare(lease.userID) == .orderedSame,
+                          persisted.communicationOwnerUserID?.caseInsensitiveCompare(lease.userID)
+                            == .orderedSame,
+                          ActiveCallInvitationPolicy.context(
+                              for: activeCall,
+                              calls: persisted.calls,
+                              currentUserID: lease.userID
+                          )?.callID == callID
+                    else { throw StoreError.accountChanged }
+                    persisted.calls = CallLifecyclePolicy.merge(
+                        remote: [mapped],
+                        local: persisted.calls
+                    )
+                }
+                guard committed else { throw CancellationError() }
+            }
+            guard waitingCallMergeOperationIsCurrent(operationID, attempt: attempt),
+                  callMediaAccountLease == lease,
+                  await outboxContextIsCurrent(
+                    accountEpoch: lease.accountEpoch,
+                    userID: lease.userID,
+                    sessionID: lease.sessionID
+                  ),
+                  waitingCallMergeOperationIsCurrent(operationID, attempt: attempt)
+            else { return false }
+            let snapshot = await store.snapshot()
+            guard waitingCallMergeOperationIsCurrent(operationID, attempt: attempt)
+            else { return false }
+            state = snapshot
+            rebuildCallContacts()
+            lastError = nil
+            return true
+        } catch is CancellationError {
+            return false
+        } catch {
+            guard waitingCallMergeOperationIsCurrent(operationID, attempt: attempt),
+                  callMediaAccountLease == lease,
+                  await outboxContextIsCurrent(
+                    accountEpoch: lease.accountEpoch,
+                    userID: lease.userID,
+                    sessionID: lease.sessionID
+                  ),
+                  waitingCallMergeOperationIsCurrent(operationID, attempt: attempt)
+            else { return false }
+            lastError = error.localizedDescription
+            return false
+        }
+    }
+
+    /// Declines only the authenticated waiting call. The connected LiveKit room and its CallKit
+    /// record remain untouched while the normal CallKit action owns durable backend replay.
+    func declineWaitingCall() {
+        guard let retained = callWaitingState.waitingCall else {
+            cancelWaitingCallMergeOperation()
+            return
+        }
+        cancelWaitingCallMergeOperation(for: retained.callID)
+        NotificationCoordinator.shared.finishWaitingCallMergeAttempt(callId: retained.callID)
+        guard let waiting = callWaitingState.decline() else { return }
+        CallProgressSoundPlayer.shared.clearAuthenticatedCallWaiting(
+            callID: waiting.callID
+        )
+        NotificationCoordinator.shared.requestDeclineIncomingCall(callId: waiting.callID)
+    }
+
+    /// Android-parity Merge is a signalling operation, not a second media connection: invite the
+    /// authenticated waiting initiator into the connected room, then retire and decline their
+    /// separate incoming call. The initiator must accept the fresh invitation before media joins.
+    func mergeWaitingCall() async {
+        let activeCall = CallMediaCoordinator.shared.activeCall
+        switch callWaitingState.beginMerge(
+            activeCallID: activeCall?.id,
+            mediaState: callWaitingMediaState,
+            calls: state.calls,
+            currentUserID: profile?.id
+        ) {
+        case .denied(let denial):
+            if denial == .waitingCallExpired,
+               let expired = callWaitingState.expire() {
+                CallProgressSoundPlayer.shared.clearAuthenticatedCallWaiting(
+                    callID: expired.callID
+                )
+                NotificationCoordinator.shared.requestDeclineIncomingCall(
+                    callId: expired.callID
+                )
+            } else if denial == .callerAlreadyParticipant,
+                      let alreadyMerged = callWaitingState.decline() {
+                await completeWaitingCallMerge(alreadyMerged)
+                return
+            }
+            resumeWaitingToneIfRetained()
+            lastError = callWaitingMergeFailureMessage(denial)
+
+        case .begin(let attempt):
+            cancelWaitingCallMergeOperation()
+            let operationID = UUID()
+            waitingCallMergeOperationGate.activate(operationID)
+            waitingCallMergeOperationID = operationID
+            waitingCallMergeAttempt = attempt
+            NotificationCoordinator.shared.beginWaitingCallMergeAttempt(
+                callId: attempt.target.waitingCallID
+            )
+            defer {
+                finishWaitingCallMergeOperationIfOwned(operationID, attempt: attempt)
+            }
+            CallProgressSoundPlayer.shared.clearAuthenticatedCallWaiting(
+                callID: attempt.target.waitingCallID
+            )
+            guard let activeCall,
+                  activeCall.id.caseInsensitiveCompare(attempt.target.activeCallID)
+                    == .orderedSame
+            else {
+                _ = callWaitingState.completeMerge(attempt, result: .failure)
+                resumeWaitingToneIfRetained(callID: attempt.target.waitingCallID)
+                lastError = callWaitingMergeFailureMessage(.mediaUnavailable)
+                return
+            }
+            let resultChannel = AsyncStream.makeStream(
+                of: Bool.self,
+                bufferingPolicy: .bufferingNewest(1)
+            )
+            waitingCallMergeResultSignal = WaitingCallMergeResultSignal(
+                operationID: operationID,
+                continuation: resultChannel.continuation
+            )
+            let inviteTask = Task { @MainActor [weak self] in
+                guard let self,
+                      self.waitingCallMergeOperationIsCurrent(
+                          operationID,
+                          attempt: attempt
+                      )
+                else {
+                    self?.resolveWaitingCallMergeResultSignal(
+                        false,
+                        operationID: operationID
+                    )
+                    return false
+                }
+                let result = await self.inviteWaitingParticipant(
+                    attempt,
+                    operationID: operationID,
+                    to: activeCall
+                )
+                self.resolveWaitingCallMergeResultSignal(
+                    result,
+                    operationID: operationID
+                )
+                return result
+            }
+            waitingCallMergeTask = inviteTask
+            let operationGate = waitingCallMergeOperationGate
+            let invited = await withTaskCancellationHandler {
+                // Do not await the transport task directly. AsyncStream cancellation resumes this
+                // iterator even if an underlying URLSession/store await is temporarily uncooperative.
+                var iterator = resultChannel.stream.makeAsyncIterator()
+                return await iterator.next() ?? false
+            } onCancel: {
+                // Cancellation must revoke store-commit authority synchronously. Transport
+                // cancellation alone is advisory and a late response must not publish a roster.
+                operationGate.invalidate(operationID)
+                resultChannel.continuation.yield(false)
+                resultChannel.continuation.finish()
+                inviteTask.cancel()
+                Task { @MainActor [weak self] in
+                    self?.finishWaitingCallMergeOperationIfOwned(
+                        operationID,
+                        attempt: attempt
+                    )
+                }
+            }
+            guard waitingCallMergeOperationIsCurrent(operationID, attempt: attempt)
+            else { return }
+            waitingCallMergeTask = nil
+            switch callWaitingState.completeMerge(
+                attempt,
+                result: invited && !Task.isCancelled ? .success : .failure
+            ) {
+            case .merged(let waiting):
+                await completeWaitingCallMerge(waiting)
+            case .retainedForRetry(let waiting):
+                resumeWaitingToneIfRetained(callID: waiting.callID)
+                if lastError == nil {
+                    lastError = "This caller could not be added yet. Please try again."
+                }
+            case .stale:
+                break
+            }
+        }
+    }
+
+    private func completeWaitingCallMerge(_ waiting: AuthenticatedWaitingCall) async {
+        CallProgressSoundPlayer.shared.clearAuthenticatedCallWaiting(callID: waiting.callID)
+        NotificationCoordinator.shared.reportWaitingCallMerged(callId: waiting.callID)
+        // Keep the decline durable. A lost response or brief disconnect must not resurrect the
+        // separate incoming call after its initiator has been invited into the current room.
+        await terminateCall(id: waiting.callID, kind: .decline, reason: nil)
+    }
+
+    private func callWaitingMergeFailureMessage(_ denial: CallWaitingMergeDenial) -> String {
+        switch denial {
+        case .noWaitingCall:
+            "There is no waiting call to merge."
+        case .mergeInProgress:
+            "This caller is already being added."
+        case .waitingCallExpired:
+            "This waiting call has ended."
+        case .participantLimitReached:
+            "This call already has the maximum number of participants."
+        case .conversationBound:
+            "This call cannot add another person."
+        case .callerAlreadyParticipant:
+            "This caller is already in the call."
+        case .mediaUnavailable, .invalidActiveCall, .sameCall, .activeCallNotFound,
+             .ambiguousActiveCall, .activeCallNotActive, .invalidRoster:
+            "This call can no longer be merged."
+        }
+    }
+
+    private func callInviteFailureMessage(_ error: Error) -> String {
+        guard let payload = error as? APIErrorPayload else {
+            return "This person could not be added to the call. Check your connection and try again."
+        }
+        switch payload.code.uppercased() {
+        case "CALL_PARTICIPANTS_UNCHANGED":
+            return "This person is already in the call."
+        case "CALL_FULL":
+            return "This call already has the maximum number of participants."
+        case "CALL_NOT_JOINABLE", "CALL_NOT_FOUND":
+            return "People can no longer be added to this call."
+        case "CALL_CONVERSATION_INVALID":
+            return "This call is linked to its current chat, so another person cannot be added."
+        default:
+            return "This person could not be added to the call. Please try again."
+        }
+    }
+
+    /// Resumes only the call that is still visible in this foreground process. Nothing from this
+    /// path is written to the durable outbox, scheduled as background work, or restored at launch.
+    private func resumeEphemeralOutgoingCallIfPossible() {
+        guard let attempt = ephemeralOutgoingCallGate.attempt,
+              isOnline,
+              !isSigningOut,
+              isSignedIn,
+              accountSetupStep == nil,
+              sessionAssurance?.grantsFullAccess == true,
+              callsFeatureEnabled,
+              UIApplication.shared.applicationState == .active,
+              callMediaAccountLease == attempt.lease,
+              accountEpoch == attempt.lease.accountEpoch,
+              profile?.id.caseInsensitiveCompare(attempt.lease.userID) == .orderedSame
+        else { return }
+        guard ephemeralOutgoingCallTask == nil else {
+            // Do not overlap two POSTs for the same idempotency key. A cancelled URLSession task
+            // can still be delivering its response while connectivity/foreground state returns.
+            ephemeralOutgoingCallResumePending = true
+            return
+        }
+
+        ephemeralOutgoingCallResumePending = false
+        let taskID = UUID()
+        ephemeralOutgoingCallTaskID = taskID
+        ephemeralOutgoingCallTask = Task { @MainActor [weak self] in
+            await self?.runEphemeralOutgoingCall(taskID: taskID)
+        }
+    }
+
+    /// Connectivity/background transitions invalidate any suspended HTTP response but retain the
+    /// visible attempt in memory. Returning to the foreground starts a fresh idempotent submission
+    /// with the same client call ID.
+    private func suspendEphemeralOutgoingCallSubmission() {
+        ephemeralOutgoingCallResumePending = false
+        ephemeralOutgoingCallGate.suspendSubmission()
+        ephemeralOutgoingCallTask?.cancel()
+    }
+
+    @discardableResult
+    private func cancelEphemeralOutgoingCall(
+        clientCallID: String? = nil,
+        dismissPresentation: Bool
+    ) -> EphemeralOutgoingCallAttempt? {
+        guard let attempt = ephemeralOutgoingCallGate.cancel(
+            clientCallID: clientCallID
+        ) else { return nil }
+        ephemeralOutgoingCallResumePending = false
+        ephemeralOutgoingCallTask?.cancel()
+        if dismissPresentation {
+            CallMediaCoordinator.shared.dismissPendingOutgoing(
+                clientCallID: attempt.clientCallIDString,
+                lease: attempt.lease
+            )
+        }
+        pendingEphemeralCallCancellations[attempt.clientCallIDString] = attempt
+        scheduleEphemeralCallCancellationDrain()
+        return attempt
+    }
+
+    private func scheduleEphemeralCallCancellationDrain() {
+        guard ephemeralCallCancellationTask == nil,
+              isOnline,
+              !pendingEphemeralCallCancellations.isEmpty
+        else { return }
+        ephemeralCallCancellationTask = Task { @MainActor [weak self] in
+            await self?.drainEphemeralCallCancellations()
+        }
+    }
+
+    /// Cancellation intents are process-only, just like the provisional call. The backend stores
+    /// the authoritative tombstone so a racing/lost start response cannot ring after local cancel.
+    private func drainEphemeralCallCancellations() async {
+        defer { ephemeralCallCancellationTask = nil }
+        var retryCounts: [String: Int] = [:]
+        while !Task.isCancelled, isOnline,
+              let attempt = pendingEphemeralCallCancellations.values.first {
+            let identifier = attempt.clientCallIDString
+            guard SessionRefreshPolicy.matchesSessionID(
+                attempt.lease.sessionID,
+                current: await sessions.current()?.sessionId ?? ""
+            ) else {
+                pendingEphemeralCallCancellations.removeValue(forKey: identifier)
+                continue
+            }
+            do {
+                let response = try await APIClientSessionBinding.$sessionID.withValue(
+                    attempt.lease.sessionID
+                ) {
+                    try await api.cancelCallAttempt(clientCallId: identifier)
+                }
+                guard response.cancelled,
+                      response.clientCallId.caseInsensitiveCompare(identifier) == .orderedSame
+                else { throw APIClientError.invalidResponse }
+                pendingEphemeralCallCancellations.removeValue(forKey: identifier)
+                retryCounts.removeValue(forKey: identifier)
+            } catch is CancellationError {
+                return
+            } catch {
+                switch OutboxPolicy.failureDecision(for: error) {
+                case .retry(let retryAfter):
+                    let failureCount = (retryCounts[identifier] ?? 0) + 1
+                    retryCounts[identifier] = failureCount
+                    let delay = EphemeralOutgoingCallRetryPolicy.delay(
+                        failureCount: failureCount,
+                        retryAfter: retryAfter
+                    )
+                    do {
+                        try await Task.sleep(for: .seconds(delay))
+                    } catch {
+                        return
+                    }
+                case .unchanged:
+                    return
+                case .awaitSession, .permanent:
+                    pendingEphemeralCallCancellations.removeValue(forKey: identifier)
+                }
+            }
+        }
+    }
+
+    private func cancelEphemeralCallOnServerOnce(
+        _ attempt: EphemeralOutgoingCallAttempt
+    ) async {
+        guard isOnline,
+              SessionRefreshPolicy.matchesSessionID(
+                attempt.lease.sessionID,
+                current: await sessions.current()?.sessionId ?? ""
+              )
+        else { return }
+        let response = try? await APIClientSessionBinding.$sessionID.withValue(
+            attempt.lease.sessionID
+        ) {
+            try await api.cancelCallAttempt(clientCallId: attempt.clientCallIDString)
+        }
+        if response?.cancelled == true,
+           response?.clientCallId.caseInsensitiveCompare(attempt.clientCallIDString)
+                == .orderedSame {
+            pendingEphemeralCallCancellations.removeValue(
+                forKey: attempt.clientCallIDString
+            )
+        }
+    }
+
+    private func runEphemeralOutgoingCall(taskID: UUID) async {
+        defer {
+            if ephemeralOutgoingCallTaskID == taskID {
+                ephemeralOutgoingCallTaskID = nil
+                ephemeralOutgoingCallTask = nil
+                let shouldResume = ephemeralOutgoingCallResumePending
+                ephemeralOutgoingCallResumePending = false
+                if shouldResume {
+                    resumeEphemeralOutgoingCallIfPossible()
+                }
+            }
+        }
+
+        while !Task.isCancelled {
+            guard ephemeralOutgoingCallTaskID == taskID,
+                  let attempt = ephemeralOutgoingCallGate.attempt,
+                  isOnline,
+                  !isSigningOut,
+                  isSignedIn,
+                  accountSetupStep == nil,
+                  sessionAssurance?.grantsFullAccess == true,
+                  callsFeatureEnabled,
+                  UIApplication.shared.applicationState == .active,
+                  callMediaAccountLease == attempt.lease,
+                  await outboxContextIsCurrent(
+                    accountEpoch: attempt.lease.accountEpoch,
+                    userID: attempt.lease.userID,
+                    sessionID: attempt.lease.sessionID
+                  )
+            else {
+                ephemeralOutgoingCallGate.suspendSubmission()
+                return
+            }
+            guard let submission = ephemeralOutgoingCallGate.beginSubmission() else { return }
+
+            do {
+                let result = try await APIClientSessionBinding.$sessionID.withValue(
+                    attempt.lease.sessionID
+                ) {
+                    try await api.startCall(
+                        recipientUserIds: [attempt.recipientUserID],
+                        video: attempt.video,
+                        conversationId: attempt.conversationID,
+                        clientCallId: attempt.clientCallIDString
+                    )
+                }
+                await acceptEphemeralOutgoingCall(
+                    result,
+                    submission: submission,
+                    taskID: taskID
+                )
+                return
+            } catch is CancellationError {
+                if ephemeralOutgoingCallGate.accepts(submission) {
+                    ephemeralOutgoingCallGate.suspendSubmission()
+                }
+                return
+            } catch {
+                guard ephemeralOutgoingCallGate.accepts(submission) else { return }
+                switch OutboxPolicy.failureDecision(for: error) {
+                case .retry(let retryAfter):
+                    guard let failureCount = ephemeralOutgoingCallGate
+                        .finishRetryableFailure(submission)
+                    else { return }
+                    let delay = EphemeralOutgoingCallRetryPolicy.delay(
+                        failureCount: failureCount,
+                        retryAfter: retryAfter
+                    )
+                    do {
+                        try await Task.sleep(for: .seconds(delay))
+                    } catch {
+                        return
+                    }
+                case .awaitSession, .unchanged:
+                    ephemeralOutgoingCallGate.suspendSubmission()
+                    return
+                case .permanent:
+                    cancelEphemeralOutgoingCall(
+                        clientCallID: attempt.clientCallIDString,
+                        dismissPresentation: true
+                    )
+                    lastError = ephemeralCallFailureMessage(error)
+                    return
+                }
+            }
+        }
+    }
+
+    private func acceptEphemeralOutgoingCall(
+        _ result: CallSessionDTO,
+        submission: EphemeralOutgoingCallAttemptGate.Submission,
+        taskID: UUID
+    ) async {
+        let attempt = submission.attempt
+        let contextIsCurrent = await outboxContextIsCurrent(
+            accountEpoch: attempt.lease.accountEpoch,
+            userID: attempt.lease.userID,
+            sessionID: attempt.lease.sessionID
+        )
+        guard contextIsCurrent,
+              isOnline,
+              callsFeatureEnabled,
+              UIApplication.shared.applicationState != .background,
+              callMediaAccountLease == attempt.lease,
+              ephemeralOutgoingCallGate.accepts(submission)
+                || ephemeralOutgoingCallGate.attempt == attempt
+        else {
+            cancelEphemeralOutgoingCall(
+                clientCallID: attempt.clientCallIDString,
+                dismissPresentation: true
+            )
+            await endLateAcceptedCall(result.call.id, lease: attempt.lease)
+            return
+        }
+
+        let handoff: CallMediaHandoff
+        do {
+            handoff = try CallMediaHandoff(
+                session: result,
+                participantAvatarURL: callParticipantAvatarURL(
+                    for: result.call.participantUserIds
+                )
+            )
+        } catch {
+            cancelEphemeralOutgoingCall(
+                clientCallID: attempt.clientCallIDString,
+                dismissPresentation: true
+            )
+            await endLateAcceptedCall(result.call.id, lease: attempt.lease)
+            lastError = "This call is unavailable right now."
+            return
+        }
+
+        let request = AuthenticatedCallMediaHandoff(
+            lease: attempt.lease,
+            handoff: handoff
+        )
+        let acceptedAttempt = ephemeralOutgoingCallGate.accepts(submission)
+            ? ephemeralOutgoingCallGate.finishAccepted(submission)
+            : ephemeralOutgoingCallGate.finishCurrentAttemptAccepted(attempt)
+        guard acceptedAttempt != nil,
+              CallMediaCoordinator.shared.promotePendingOutgoing(
+                clientCallID: attempt.clientCallIDString,
+                request: request
+              )
+        else {
+            await endLateAcceptedCall(result.call.id, lease: attempt.lease)
+            return
+        }
+        if ephemeralOutgoingCallTaskID != taskID {
+            // A response from the cancelled transport won the idempotent race. Fence the newer
+            // request for this same client call ID; a duplicate response must not end this call.
+            ephemeralOutgoingCallTask?.cancel()
+            ephemeralOutgoingCallTask = nil
+            ephemeralOutgoingCallTaskID = nil
+        }
+
+        let mapped = mapCall(result.call)
+        do {
+            try await store.update { persisted in
+                guard persisted.profile?.id.caseInsensitiveCompare(attempt.lease.userID)
+                        == .orderedSame,
+                      persisted.communicationOwnerUserID?.caseInsensitiveCompare(
+                        attempt.lease.userID
+                      ) == .orderedSame
+                else { throw StoreError.accountChanged }
+                let existing = persisted.calls.first {
+                    $0.id.caseInsensitiveCompare(mapped.id) == .orderedSame
+                }
+                let merged = CallLifecyclePolicy.mergingStartResponse(
+                    mapped,
+                    with: existing
+                )
+                let durable = CallLifecyclePolicy.preservingDurableContext(
+                    in: merged,
+                    from: existing,
+                    fallbackConversationID: attempt.conversationID,
+                    fallbackParticipantUserIDs: [attempt.recipientUserID],
+                    fallbackName: attempt.recipientName
+                )
+                persisted.calls = CallLifecyclePolicy.merge(
+                    remote: [durable],
+                    local: persisted.calls
+                )
+            }
+            guard await outboxContextIsCurrent(
+                accountEpoch: attempt.lease.accountEpoch,
+                userID: attempt.lease.userID,
+                sessionID: attempt.lease.sessionID
+            ) else { return }
+            state = await store.snapshot()
+            rebuildCallContacts()
+        } catch {
+            // The authenticated call is already live. A later authoritative history refresh repairs
+            // a protected-storage failure without interrupting media or exposing an internal error.
+        }
+    }
+
+    private func endLateAcceptedCall(
+        _ callID: String,
+        lease: CallMediaAccountLease
+    ) async {
+        guard !CallMediaCoordinator.shared.ownsAuthenticatedCall(
+            callID: callID,
+            lease: lease
+        ) else { return }
+        _ = try? await APIClientSessionBinding.$sessionID.withValue(lease.sessionID) {
+            try await api.endCall(id: callID, reason: "cancelled")
+        }
+    }
+
+    private func ephemeralCallFailureMessage(_ error: Error) -> String {
+        if let payload = error as? APIErrorPayload {
+            let message = payload.message.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !message.isEmpty { return message }
+        }
+        return "This call is unavailable right now."
+    }
+
+    func flushOutbox(reportFailures: Bool = false) async {
+        guard isOnline,
+              !isSigningOut,
+              !isSubmittingAccountDeletion,
+              !acceptedAccountDeletionCleanupBlocked,
+              !protectedLocalStateRecoveryBlocked,
+              !unresolvedAccountDeletionAttemptBlocked,
+              isSignedIn,
+              capabilities != nil,
+              let expectedUserID = profile?.id,
+              let communicationAdmission = ProtectedCommunicationAdmissionGate.shared.lease(
+                forAccountID: expectedUserID
+              )
+        else { return }
+        let expectedAccountEpoch = accountEpoch
+        guard let activeAccountLease = callMediaAccountLease,
+              activeAccountLease.accountEpoch == expectedAccountEpoch,
+              activeAccountLease.userID.caseInsensitiveCompare(expectedUserID) == .orderedSame
+        else { return }
+        guard flushingAccountEpoch != expectedAccountEpoch else { return }
+        flushingAccountEpoch = expectedAccountEpoch
+        var encounteredUnavailableCommunicationPrivacy = false
+        defer {
+            if flushingAccountEpoch == expectedAccountEpoch {
+                flushingAccountEpoch = nil
+                if accountEpoch == expectedAccountEpoch,
+                   ProtectedCommunicationAdmissionGate.shared.permits(communicationAdmission),
+                   !isSubmittingAccountDeletion {
+                    if encounteredUnavailableCommunicationPrivacy {
+                        // A missing complete block projection must never create a zero-delay replay
+                        // loop. The next authenticated refresh (or bounded background replay) first
+                        // reloads privacy authority, while call terminations remain independently
+                        // replayable during this pass.
+                        outboxWakeTask?.cancel()
+                        outboxWakeTask = nil
+                        CommunicationBackgroundReplayScheduler.shared.schedule(
+                            earliestBeginDate: Date().addingTimeInterval(5 * 60)
+                        )
+                    } else {
+                        scheduleOutboxWake()
+                    }
+                }
+            }
+        }
+        guard let expectedSessionID = await sessions.current()?.sessionId,
+              await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+              ),
+              SessionRefreshPolicy.matchesSessionID(
+                activeAccountLease.sessionID,
+                current: expectedSessionID
+              )
+        else { return }
+
+        if state.outbox.contains(where: { $0.kind == .callAttempt }) {
+            do {
+                state = try await commitAuthenticatedMutation(
+                    accountEpoch: expectedAccountEpoch,
+                    userID: expectedUserID,
+                    sessionID: expectedSessionID
+                ) { persisted in
+                    OutboxPolicy.removeLegacyCallAttempts(in: &persisted)
+                }
+            } catch {
+                // A protected-store failure cannot make a legacy prototype call replayable in
+                // this process. The migration is attempted again on the next restore/flush.
+                OutboxPolicy.removeLegacyCallAttempts(in: &state)
+            }
+        }
+
+        let commands = OutboxPolicy.readyCommands(state.outbox, at: Date())
+        for command in commands {
+            var activeCommand = command
+            guard isOnline,
+                  !isSubmittingAccountDeletion,
+                  ProtectedCommunicationAdmissionGate.shared.permits(communicationAdmission),
+                  await outboxContextIsCurrent(
+                    accountEpoch: expectedAccountEpoch,
+                    userID: expectedUserID,
+                    sessionID: expectedSessionID
+                  ),
+                  state.outbox.contains(activeCommand)
+            else { return }
+            switch command.kind {
+            case .secureMessage:
+                if !hasUsableCommunicationPrivacyProjection {
+                    await loadCommunicationPrivacy()
+                }
+                switch communicationPrivacyDecision(for: activeCommand) {
+                case .allowed:
+                    break
+                case .blocked:
+                    await handleOutboxFailure(
+                        activeCommand,
+                        error: CommunicationPrivacyMessageAdmissionFailure.blocked,
+                        reportFailure: reportFailures,
+                        accountEpoch: expectedAccountEpoch,
+                        userID: expectedUserID,
+                        sessionID: expectedSessionID
+                    )
+                    continue
+                case .unavailable:
+                    if hasUsableCommunicationPrivacyProjection {
+                        await handleOutboxFailure(
+                            activeCommand,
+                            error: CommunicationPrivacyMessageAdmissionFailure.invalidRecipient,
+                            reportFailure: reportFailures,
+                            accountEpoch: expectedAccountEpoch,
+                            userID: expectedUserID,
+                            sessionID: expectedSessionID
+                        )
+                    } else {
+                        encounteredUnavailableCommunicationPrivacy = true
+                    }
+                    continue
+                }
+                guard secureMessagingAvailable else {
+                    await handleOutboxFailure(
+                        command,
+                        error: APIErrorPayload(
+                            code: "MESSAGING_UNAVAILABLE",
+                            message: messagingSendFailureMessage,
+                            httpStatus: 403
+                        ),
+                        reportFailure: reportFailures,
+                        accountEpoch: expectedAccountEpoch,
+                        userID: expectedUserID,
+                        sessionID: expectedSessionID
+                    )
+                    continue
+                }
+                do {
+                    if command.secureMessageFanout == nil {
+                        guard ProtectedCommunicationAdmissionGate.shared.permits(
+                            communicationAdmission
+                        ), !isSubmittingAccountDeletion else { return }
+                        _ = try await APIClientSessionBinding.$sessionID.withValue(
+                            expectedSessionID
+                        ) {
+                            try await SecureMessagingExchangeCoordinator.shared.prepareDeferredMessage(
+                                commandID: command.id,
+                                forUserID: expectedUserID
+                            )
+                        }
+                        guard await reloadOutboxStateIfCurrent(
+                            accountEpoch: expectedAccountEpoch,
+                            userID: expectedUserID,
+                            sessionID: expectedSessionID
+                        ) else { return }
+                        guard let preparedCommand = state.outbox.first(where: {
+                            $0.id == command.id && $0.kind == command.kind
+                        }) else { continue }
+                        activeCommand = preparedCommand
+                    }
+                    switch communicationPrivacyDecision(for: activeCommand) {
+                    case .allowed:
+                        break
+                    case .blocked:
+                        await handleOutboxFailure(
+                            activeCommand,
+                            error: CommunicationPrivacyMessageAdmissionFailure.blocked,
+                            reportFailure: reportFailures,
+                            accountEpoch: expectedAccountEpoch,
+                            userID: expectedUserID,
+                            sessionID: expectedSessionID
+                        )
+                        continue
+                    case .unavailable:
+                        if hasUsableCommunicationPrivacyProjection {
+                            await handleOutboxFailure(
+                                activeCommand,
+                                error: CommunicationPrivacyMessageAdmissionFailure.invalidRecipient,
+                                reportFailure: reportFailures,
+                                accountEpoch: expectedAccountEpoch,
+                                userID: expectedUserID,
+                                sessionID: expectedSessionID
+                            )
+                        } else {
+                            encounteredUnavailableCommunicationPrivacy = true
+                        }
+                        continue
+                    }
+                    guard ProtectedCommunicationAdmissionGate.shared.permits(
+                        communicationAdmission
+                    ), !isSubmittingAccountDeletion else { return }
+                    _ = try await APIClientSessionBinding.$sessionID.withValue(expectedSessionID) {
+                        try await SecureMessagingExchangeCoordinator.shared.sendQueuedMessage(
+                            commandID: command.id,
+                            forUserID: expectedUserID
+                        )
+                    }
+                    guard await reloadOutboxStateIfCurrent(
+                        accountEpoch: expectedAccountEpoch,
+                        userID: expectedUserID,
+                        sessionID: expectedSessionID
+                    ) else { return }
+                } catch SecureMessagingExchangeError.staleOutboundFanout {
+                    guard await reloadOutboxStateIfCurrent(
+                        accountEpoch: expectedAccountEpoch,
+                        userID: expectedUserID,
+                        sessionID: expectedSessionID
+                    ) else { return }
+                    if reportFailures {
+                        lastError = SecureMessagingExchangeError.staleOutboundFanout.localizedDescription
+                    }
+                } catch is CancellationError {
+                    return
+                } catch {
+                    guard await outboxContextIsCurrent(
+                        accountEpoch: expectedAccountEpoch,
+                        userID: expectedUserID,
+                        sessionID: expectedSessionID
+                    ) else { return }
+                    await handleOutboxFailure(
+                        activeCommand,
+                        error: error,
+                        reportFailure: reportFailures,
+                        accountEpoch: expectedAccountEpoch,
+                        userID: expectedUserID,
+                        sessionID: expectedSessionID
+                    )
+                }
+            case .callAttempt:
+                // Legacy rows are migration-only and are never submitted or replayed.
+                continue
+            case .callTermination:
+                guard state.outbox.contains(where: { $0.id == command.id }) else { continue }
+                guard let replay = OutboxPolicy.terminationReplay(for: command) else {
+                    do {
+                        state = try await commitOutboxMutation(
+                            accountEpoch: expectedAccountEpoch,
+                            userID: expectedUserID,
+                            sessionID: expectedSessionID,
+                            command: command
+                        ) { persisted in
+                            persisted.outbox.removeAll { $0.id == command.id }
+                        }
+                    } catch is CancellationError {
+                        return
+                    } catch {
+                        if reportFailures { lastError = error.localizedDescription }
+                    }
+                    continue
+                }
+                do {
+                    guard ProtectedCommunicationAdmissionGate.shared.permits(
+                        communicationAdmission
+                    ), !isSubmittingAccountDeletion else { return }
+                    let call: CallDTO
+                    switch replay.kind {
+                    case .decline:
+                        call = try await APIClientSessionBinding.$sessionID.withValue(
+                            expectedSessionID
+                        ) {
+                            try await api.declineCall(id: replay.callId)
+                        }
+                    case .end:
+                        call = try await APIClientSessionBinding.$sessionID.withValue(
+                            expectedSessionID
+                        ) {
+                            try await api.endCall(
+                                id: replay.callId,
+                                reason: replay.reason ?? "cancelled"
+                            )
+                        }
+                    }
+                    guard await outboxContextIsCurrent(
+                        accountEpoch: expectedAccountEpoch,
+                        userID: expectedUserID,
+                        sessionID: expectedSessionID
+                    ) else { return }
+                    let mappedCall = mapCall(call)
+                    state = try await commitOutboxMutation(
+                        accountEpoch: expectedAccountEpoch,
+                        userID: expectedUserID,
+                        sessionID: expectedSessionID,
+                        command: command
+                    ) { persisted in
+                            persisted.outbox.removeAll { $0.id == command.id }
+                            persisted.calls = CallLifecyclePolicy.merge(
+                                remote: [mappedCall],
+                                local: persisted.calls
+                            )
+                        }
+                } catch is CancellationError {
+                    return
+                } catch {
+                    guard await outboxContextIsCurrent(
+                        accountEpoch: expectedAccountEpoch,
+                        userID: expectedUserID,
+                        sessionID: expectedSessionID
+                    ) else { return }
+                    if CallLifecyclePolicy.isIdempotentTerminationFailure(
+                        error,
+                        kind: replay.kind
+                    ) {
+                        await acknowledgeReplayedTermination(
+                            command: command,
+                            callId: replay.callId,
+                            kind: replay.kind,
+                            suppressingErrorMessage: error.localizedDescription,
+                            accountEpoch: expectedAccountEpoch,
+                            userID: expectedUserID,
+                            sessionID: expectedSessionID
+                        )
+                    } else {
+                        await handleOutboxFailure(
+                            command,
+                            error: error,
+                            reportFailure: reportFailures,
+                            accountEpoch: expectedAccountEpoch,
+                            userID: expectedUserID,
+                            sessionID: expectedSessionID
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private func communicationPrivacyDecision(
+        for command: OfflineCommand
+    ) -> CommunicationPrivacyAccessDecision {
+        guard command.kind == .secureMessage,
+              let recipientUserIDs = command.recipientUserIds,
+              recipientUserIDs.count == 1
+        else { return .unavailable }
+        return CommunicationPrivacyAccessPolicy.decision(
+            ownerUserID: profile?.id,
+            recipientUserID: recipientUserIDs[0],
+            hasLoadedCompleteProjection: hasUsableCommunicationPrivacyProjection,
+            blocks: communicationBlocks
+        )
+    }
+
+    private func outboxContextIsCurrent(
+        accountEpoch expectedAccountEpoch: UUID,
+        userID expectedUserID: String,
+        sessionID expectedSessionID: String
+    ) async -> Bool {
+        guard !Task.isCancelled,
+              !isSigningOut,
+              !isSubmittingAccountDeletion,
+              !acceptedAccountDeletionCleanupBlocked,
+              !protectedLocalStateRecoveryBlocked,
+              !unresolvedAccountDeletionAttemptBlocked,
+              isSignedIn,
+              accountEpoch == expectedAccountEpoch,
+              profile?.id.caseInsensitiveCompare(expectedUserID) == .orderedSame
+        else { return false }
+        guard let currentSession = await sessions.current() else { return false }
+        return currentSession.sessionId.caseInsensitiveCompare(expectedSessionID) == .orderedSame
+            && currentSession.accountId?.caseInsensitiveCompare(expectedUserID) == .orderedSame
+    }
+
+    /// Commits a replay mutation only into the same encrypted account that issued the network
+    /// request, then returns a snapshot proven to still belong to that live session.
+    private func commitOutboxMutation(
+        accountEpoch expectedAccountEpoch: UUID,
+        userID expectedUserID: String,
+        sessionID expectedSessionID: String,
+        command expectedCommand: OfflineCommand,
+        _ mutation: (inout PersistedState) throws -> Void
+    ) async throws -> PersistedState {
+        try await commitAuthenticatedMutation(
+            accountEpoch: expectedAccountEpoch,
+            userID: expectedUserID,
+            sessionID: expectedSessionID
+        ) { persisted in
+            guard persisted.outbox.contains(expectedCommand) else { throw CancellationError() }
+            try mutation(&persisted)
+        }
+    }
+
+    private func commitAuthenticatedMutation(
+        accountEpoch expectedAccountEpoch: UUID,
+        userID expectedUserID: String,
+        sessionID expectedSessionID: String,
+        _ mutation: (inout PersistedState) throws -> Void
+    ) async throws -> PersistedState {
+        guard await outboxContextIsCurrent(
+            accountEpoch: expectedAccountEpoch,
+            userID: expectedUserID,
+            sessionID: expectedSessionID
+        ) else { throw CancellationError() }
+        try await store.update { persisted in
+            guard persisted.profile?.id.caseInsensitiveCompare(expectedUserID) == .orderedSame,
+                  persisted.communicationOwnerUserID?.caseInsensitiveCompare(expectedUserID)
+                    == .orderedSame
+            else { throw CancellationError() }
+            try mutation(&persisted)
+        }
+        let snapshot = await store.snapshot()
+        guard snapshot.profile?.id.caseInsensitiveCompare(expectedUserID) == .orderedSame,
+              snapshot.communicationOwnerUserID?.caseInsensitiveCompare(expectedUserID)
+                == .orderedSame,
+              await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+              )
+        else { throw CancellationError() }
+        return snapshot
+    }
+
+    @discardableResult
+    private func reloadOutboxStateIfCurrent(
+        accountEpoch expectedAccountEpoch: UUID,
+        userID expectedUserID: String,
+        sessionID expectedSessionID: String
+    ) async -> Bool {
+        let snapshot = await store.snapshot()
+        guard snapshot.profile?.id.caseInsensitiveCompare(expectedUserID) == .orderedSame,
+              snapshot.communicationOwnerUserID?.caseInsensitiveCompare(expectedUserID)
+                == .orderedSame,
+              await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+              )
+        else { return false }
+        state = snapshot
+        return true
+    }
+
+    /// Requests Contacts once, as the first scene becomes active. iOS persists
+    /// the choice; later launches only inspect the stored authorization state.
+    func requestContactsPermissionAtLaunch() async {
+        guard UIApplication.shared.applicationState == .active else { return }
+        if let restoreTask { await restoreTask.value }
+        guard !acceptedAccountDeletionCleanupBlocked,
+              !protectedLocalStateRecoveryBlocked,
+              !unresolvedAccountDeletionAttemptBlocked
+        else { return }
+        guard !didRequestContactsAtLaunch else {
+            applicationDidBecomeActive()
+            return
+        }
+        didRequestContactsAtLaunch = true
+
+        // Unit-test hosts must never display a system privacy prompt.
+        guard ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil else {
+            return
+        }
+
+        switch contactSource.accessState() {
+        case .notDetermined:
+            contactSyncState = .requestingPermission
+            do {
+                guard try await contactSource.requestAccess() else {
+                    contactSyncState = .denied
+                    invalidateContactSyncForRevocation()
+                    await clearLocalContactsAfterRevocation()
+                    return
+                }
+            } catch {
+                contactSyncState = .failed(error.localizedDescription)
+                return
+            }
+        case .denied:
+            contactSyncState = .denied
+            invalidateContactSyncForRevocation()
+            await clearLocalContactsAfterRevocation()
+            return
+        case .allowed, .limited:
+            break
+        }
+
+        scheduleAutomaticContactSync()
+    }
+
+    /// Re-checks Settings whenever the app returns to the foreground, then
+    /// scans for changes. An unchanged encrypted fingerprint avoids needless
+    /// uploads while a periodic server refresh discovers newly joined users.
+    func applicationDidBecomeActive() {
+        resumeEphemeralOutgoingCallIfPossible()
+        schedulePendingProfileAvatarResume()
+        switch contactSource.accessState() {
+        case .allowed, .limited:
+            scheduleAutomaticContactSync()
+        case .denied:
+            contactSyncState = .denied
+            invalidateContactSyncForRevocation()
+            Task { [weak self] in await self?.clearLocalContactsAfterRevocation() }
+        case .notDetermined:
+            break
+        }
+        requestCallMicrophonePermissionInForeground()
+        Task { @MainActor in
+            await CallMediaCoordinator.shared.resumeDeferredInitialCameraIfPossible()
+        }
+    }
+
+    private func requestCallMicrophonePermissionInForeground() {
+        guard isSignedIn,
+              accountSetupStep == nil,
+              sessionAssurance?.grantsFullAccess == true,
+              callsFeatureEnabled,
+              UIApplication.shared.applicationState == .active,
+              ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil
+        else { return }
+        Task {
+            try? await CallMediaCoordinator.shared.prepareMicrophonePermission()
+        }
+    }
+
+    func retryAutomaticContactSync() {
+        scheduleAutomaticContactSync()
+    }
+
+    private func handleBackgroundContactRefresh(_ refreshTask: BGAppRefreshTask) async {
+        let taskID = ObjectIdentifier(refreshTask)
+        refreshTask.expirationHandler = { [weak self, weak refreshTask] in
+            Task { @MainActor in
+                guard let self, let refreshTask else { return }
+                self.expiredBackgroundContactTasks.insert(taskID)
+                self.contactSyncTask?.cancel()
+                self.contactSyncTask = nil
+                self.contactSyncGeneration &+= 1
+                self.contactSyncNeedsAnotherPass = false
+                refreshTask.setTaskCompleted(success: false)
+            }
+        }
+        if let restoreTask { await restoreTask.value }
+        for _ in 0 ..< 30 where !hasConnectivityStatus {
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        guard expiredBackgroundContactTasks.remove(taskID) == nil else { return }
+        guard let runningTask = scheduleAutomaticContactSync() else {
+            refreshTask.setTaskCompleted(success: false)
+            return
+        }
+        let succeeded = await runningTask.value
+
+        guard expiredBackgroundContactTasks.remove(taskID) == nil else { return }
+        refreshTask.setTaskCompleted(success: succeeded)
+    }
+
+    private func handleBackgroundCommunicationReplay(
+        _ processingTask: BGProcessingTask
+    ) async {
+        let taskID = ObjectIdentifier(processingTask)
+        processingTask.expirationHandler = { [weak self, weak processingTask] in
+            Task { @MainActor in
+                guard let self, let processingTask else { return }
+                self.expiredBackgroundCommunicationTasks.insert(taskID)
+                self.communicationReplayTask?.cancel()
+                self.communicationReplayTask = nil
+                processingTask.setTaskCompleted(success: false)
+            }
+        }
+        if let restoreTask { await restoreTask.value }
+        for _ in 0 ..< 30 where !hasConnectivityStatus {
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        guard expiredBackgroundCommunicationTasks.remove(taskID) == nil else { return }
+
+        let replay: Task<Bool, Never> = Task { @MainActor [weak self] in
+            guard let self,
+                  self.isOnline,
+                  self.isSignedIn,
+                  self.accountSetupStep == nil,
+                  self.sessionAssurance?.grantsFullAccess == true
+            else { return false }
+            await self.refresh()
+            await self.drainReadyOutbox()
+            return !Task.isCancelled && self.isOnline && self.isSignedIn
+        }
+        communicationReplayTask = replay
+        let succeeded = await replay.value
+        communicationReplayTask = nil
+
+        guard expiredBackgroundCommunicationTasks.remove(taskID) == nil else { return }
+        processingTask.setTaskCompleted(success: succeeded)
+        scheduleOutboxWake()
+    }
+
+    private func contactsDidChange() {
+        contactChangeDebounceTask?.cancel()
+        contactChangeDebounceTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(1))
+            guard !Task.isCancelled else { return }
+            self?.scheduleAutomaticContactSync()
+        }
+    }
+
+    private func invalidateContactSyncForRevocation() {
+        contactSyncTask?.cancel()
+        contactSyncTask = nil
+        contactSyncGeneration &+= 1
+        contactSyncNeedsAnotherPass = false
+        contactDirectoryRevision &+= 1
+    }
+
+    private func clearLocalContactsAfterRevocation() async {
+        do {
+            try await store.update { persisted in
+                persisted.contacts = []
+                persisted.contactSyncFingerprint = nil
+                persisted.contactSyncSnapshotScope = nil
+                persisted.contactSyncLastCompletedAt = nil
+            }
+            state = await store.snapshot()
+            rebuildCallContacts()
+        } catch {
+            // Revocation must take effect in-memory even if protected storage
+            // is temporarily unavailable; retry persistence next foreground.
+            state.contacts = []
+            state.contactSyncFingerprint = nil
+            state.contactSyncSnapshotScope = nil
+            state.contactSyncLastCompletedAt = nil
+            rebuildCallContacts()
+        }
+        contactSyncState = .denied
+    }
+
+    @discardableResult
+    private func scheduleAutomaticContactSync() -> Task<Bool, Never>? {
+        guard isSignedIn,
+              isOnline,
+              accountSetupStep == nil,
+              sessionAssurance?.grantsFullAccess == true
+        else { return nil }
+        guard [.allowed, .limited].contains(contactSource.accessState()) else { return nil }
+        if let contactSyncTask {
+            contactSyncNeedsAnotherPass = true
+            return contactSyncTask
+        }
+
+        let expectedAccountEpoch = accountEpoch
+        contactSyncGeneration &+= 1
+        let expectedSyncGeneration = contactSyncGeneration
+        let task = Task { [weak self] in
+            guard let self else { return false }
+            let succeeded = await self.performAutomaticContactSync(
+                expectedAccountEpoch: expectedAccountEpoch,
+                expectedSyncGeneration: expectedSyncGeneration
+            )
+            guard self.accountEpoch == expectedAccountEpoch,
+                  self.contactSyncGeneration == expectedSyncGeneration
+            else { return false }
+            self.contactSyncTask = nil
+            if self.contactSyncNeedsAnotherPass {
+                self.contactSyncNeedsAnotherPass = false
+                self.scheduleAutomaticContactSync()
+            }
+            return succeeded
+        }
+        contactSyncTask = task
+        return task
+    }
+
+    private func performAutomaticContactSync(
+        expectedAccountEpoch: UUID,
+        expectedSyncGeneration: UInt64
+    ) async -> Bool {
+        guard isSignedIn, isOnline,
+              accountSetupStep == nil,
+              sessionAssurance?.grantsFullAccess == true,
+              accountEpoch == expectedAccountEpoch,
+              contactSyncGeneration == expectedSyncGeneration,
+              let expectedSessionID = await sessions.current()?.sessionId
+        else { return false }
+        let expectedContactAuthorizationRevision = contactAuthorizationRevision
+
+        let accessState = contactSource.accessState()
+        guard accessState == .allowed || accessState == .limited else {
+            contactSyncState = .denied
+            invalidateContactSyncForRevocation()
+            await clearLocalContactsAfterRevocation()
+            return false
+        }
+        let limitedAccess = accessState == .limited
+
+        contactDirectoryRevision &+= 1
+        let expectedDirectoryRevision = contactDirectoryRevision
+        contactSyncState = .syncing(
+            ContactSyncProgress(phase: .preparing, completedUnitCount: 0, totalUnitCount: 0)
+        )
+
+        do {
+            let rawContacts = try await contactSource.phoneNumbers()
+            let identityContext = phoneIdentityContext
+            let normalizationTask = Task.detached(priority: .utility) {
+                let snapshot = ContactSyncNormalizer.snapshot(
+                    from: rawContacts,
+                    context: identityContext
+                )
+                return (snapshot: snapshot, fingerprint: snapshot.fingerprint)
+            }
+            let normalized = await withTaskCancellationHandler {
+                await normalizationTask.value
+            } onCancel: {
+                normalizationTask.cancel()
+            }
+            let snapshot = normalized.snapshot
+            let snapshotFingerprint = normalized.fingerprint
+            try Task.checkCancellation()
+            guard snapshot.omittedCount == 0 else {
+                throw ContactSyncError.snapshotTooLarge(limit: ContactSyncSnapshot.serverLimit)
+            }
+            guard await contactSyncContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                syncGeneration: expectedSyncGeneration,
+                sessionID: expectedSessionID,
+                directoryRevision: expectedDirectoryRevision
+            ) else { return false }
+
+            let recentlyRefreshed = state.contactSyncLastCompletedAt.map {
+                Date().timeIntervalSince($0) < 15 * 60
+            } ?? false
+            // Automatic snapshots are device-local, not account-global. Always
+            // upsert so a second iPhone (or limited access) cannot erase rows
+            // learned from another device. Full replacement requires a future
+            // device-scoped server snapshot model.
+            let snapshotScope: ContactSyncSnapshotScope = .partial
+            let snapshotIsUnchanged = state.contactSyncFingerprint == snapshotFingerprint
+                && state.contactSyncSnapshotScope == snapshotScope
+            let requiresAuthorizationRefresh = refreshedContactAuthorizationRevision
+                < expectedContactAuthorizationRevision
+            if snapshotIsUnchanged, recentlyRefreshed, !requiresAuthorizationRefresh {
+                contactSyncState = .synced(
+                    uploaded: snapshot.contacts.count,
+                    matched: contactDirectory.filter { $0.isKitUser == true }.count,
+                    limitedAccess: limitedAccess
+                )
+                return true
+            }
+            let response = try await contactSyncRequestWithRetry(
+                accountEpoch: expectedAccountEpoch,
+                syncGeneration: expectedSyncGeneration,
+                sessionID: expectedSessionID,
+                directoryRevision: expectedDirectoryRevision
+            ) { [weak self] in
+                guard let self else { throw CancellationError() }
+                if snapshotIsUnchanged {
+                    self.contactSyncState = .syncing(
+                        ContactSyncProgress(
+                            phase: .refreshing,
+                            completedUnitCount: 0,
+                            totalUnitCount: 0
+                        )
+                    )
+                    return try await self.api.contacts()
+                }
+                return try await self.api.syncContacts(
+                    snapshot.contacts,
+                    scope: snapshotScope
+                ) { [weak self] progress in
+                    await self?.recordContactSyncProgress(
+                        progress,
+                        accountEpoch: expectedAccountEpoch,
+                        syncGeneration: expectedSyncGeneration,
+                        sessionID: expectedSessionID,
+                        directoryRevision: expectedDirectoryRevision
+                    )
+                }
+            }
+
+            try Task.checkCancellation()
+            guard await contactSyncContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                syncGeneration: expectedSyncGeneration,
+                sessionID: expectedSessionID,
+                directoryRevision: expectedDirectoryRevision
+            ) else { return false }
+
+            let serverContacts = response.items ?? []
+            let snapshotEntries = snapshot.contacts
+            let directoryTask = Task.detached(priority: .utility) {
+                let visibleContacts = ContactRecipientDirectory.restrictedToSnapshot(
+                    serverContacts,
+                    entries: snapshotEntries,
+                    context: identityContext
+                )
+                return ContactRecipientDirectory.ordered(
+                    visibleContacts,
+                    context: identityContext
+                )
+            }
+            let directory = await withTaskCancellationHandler {
+                await directoryTask.value
+            } onCancel: {
+                directoryTask.cancel()
+            }
+            try Task.checkCancellation()
+            guard await contactSyncContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                syncGeneration: expectedSyncGeneration,
+                sessionID: expectedSessionID,
+                directoryRevision: expectedDirectoryRevision
+            ) else { return false }
+            let completedAt = Date()
+            try await store.update { persisted in
+                persisted.contacts = directory
+                persisted.contactSyncFingerprint = snapshotFingerprint
+                persisted.contactSyncSnapshotScope = snapshotScope
+                persisted.contactSyncLastCompletedAt = completedAt
+            }
+            let updatedState = await store.snapshot()
+            guard await contactSyncContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                syncGeneration: expectedSyncGeneration,
+                sessionID: expectedSessionID,
+                directoryRevision: expectedDirectoryRevision
+            ) else { return false }
+            state = updatedState
+            refreshedContactAuthorizationRevision = max(
+                refreshedContactAuthorizationRevision,
+                expectedContactAuthorizationRevision
+            )
+            rebuildCallContacts()
+            contactSyncState = .synced(
+                uploaded: snapshot.contacts.count,
+                matched: directory.filter { $0.isKitUser == true }.count,
+                limitedAccess: limitedAccess
+            )
+            return true
+        } catch is CancellationError {
+            if contactSyncGeneration == expectedSyncGeneration,
+               contactSyncState != .denied {
+                contactSyncState = .idle
+            }
+            return false
+        } catch {
+            guard accountEpoch == expectedAccountEpoch,
+                  contactSyncGeneration == expectedSyncGeneration,
+                  contactDirectoryRevision == expectedDirectoryRevision
+            else { return false }
+            contactSyncState = .failed(contactSyncErrorMessage(error))
+            return false
+        }
+    }
+
+    private func recordContactSyncProgress(
+        _ progress: ContactSyncProgress,
+        accountEpoch expectedAccountEpoch: UUID,
+        syncGeneration expectedSyncGeneration: UInt64,
+        sessionID expectedSessionID: String,
+        directoryRevision expectedDirectoryRevision: UInt64
+    ) async {
+        guard await contactSyncContextIsCurrent(
+            accountEpoch: expectedAccountEpoch,
+            syncGeneration: expectedSyncGeneration,
+            sessionID: expectedSessionID,
+            directoryRevision: expectedDirectoryRevision
+        ) else { return }
+        contactSyncState = .syncing(progress)
+    }
+
+    private func contactSyncRequestWithRetry<Value>(
+        accountEpoch expectedAccountEpoch: UUID,
+        syncGeneration expectedSyncGeneration: UInt64,
+        sessionID expectedSessionID: String,
+        directoryRevision expectedDirectoryRevision: UInt64,
+        operation: () async throws -> Value
+    ) async throws -> Value {
+        var automaticRetryCount = 0
+        while true {
+            do {
+                return try await operation()
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                switch ContactSyncRetryPolicy.decision(
+                    for: error,
+                    automaticRetryCount: automaticRetryCount
+                ) {
+                case .retry(let delay):
+                    automaticRetryCount += 1
+                    try await Task.sleep(for: .seconds(delay))
+                case .waitForConnectivity:
+                    throw CancellationError()
+                case .stop:
+                    throw error
+                }
+                try Task.checkCancellation()
+                guard await contactSyncContextIsCurrent(
+                    accountEpoch: expectedAccountEpoch,
+                    syncGeneration: expectedSyncGeneration,
+                    sessionID: expectedSessionID,
+                    directoryRevision: expectedDirectoryRevision
+                ) else { throw CancellationError() }
+            }
+        }
+    }
+
+    private func contactSyncContextIsCurrent(
+        accountEpoch expectedAccountEpoch: UUID,
+        syncGeneration expectedSyncGeneration: UInt64,
+        sessionID expectedSessionID: String,
+        directoryRevision expectedDirectoryRevision: UInt64
+    ) async -> Bool {
+        guard isSignedIn,
+              accountEpoch == expectedAccountEpoch,
+              contactSyncGeneration == expectedSyncGeneration,
+              contactDirectoryRevision == expectedDirectoryRevision
+        else { return false }
+        return await sessions.current()?.sessionId == expectedSessionID
+    }
+
+    private func contactSyncErrorMessage(_ error: Error) -> String {
+        if let payload = error as? APIErrorPayload { return payload.message }
+        return error.localizedDescription
+    }
+
+    /// Searches the authenticated Kit Pay member directory without persisting
+    /// server-wide results into the user's private address-book projection.
+    func searchKitUsers(query: String) async throws -> [KitUserSearchResultDTO] {
+        guard !isSigningOut,
+              isSignedIn,
+              isOnline,
+              hasUsableCommunicationPrivacyProjection,
+              let expectedUserID = profile?.id,
+              let expectedSessionID = await sessions.current()?.sessionId
+        else { return [] }
+        let expectedAccountEpoch = accountEpoch
+        let response = try await APIClientSessionBinding.$sessionID.withValue(
+            expectedSessionID
+        ) {
+            try await api.searchKitUsers(query: query)
+        }
+        try Task.checkCancellation()
+        guard !isSigningOut,
+              isSignedIn,
+              isOnline,
+              accountEpoch == expectedAccountEpoch,
+              profile?.id.caseInsensitiveCompare(expectedUserID) == .orderedSame,
+              await sessions.current()?.sessionId == expectedSessionID
+        else { throw CancellationError() }
+        return (response.items ?? []).filter {
+            communicationPrivacyAllowsOutbound(to: $0.id)
+        }
+    }
+
+    func loadContactDirectory() async {
+        rebuildCallContacts()
+        if let runningTask = scheduleAutomaticContactSync() { _ = await runningTask.value }
+    }
+
+    func loadCallContacts() async {
+        guard callsFeatureEnabled else {
+            rebuildCallContacts()
+            return
+        }
+        await loadContactDirectory()
+    }
+
+    func callContactMatches(_ contact: CallableContact, query: String) -> Bool {
+        if let source = contact.source {
+            return ContactRecipientDirectory.matches(
+                source,
+                query: query,
+                context: phoneIdentityContext
+            )
+        }
+        return contact.name.localizedCaseInsensitiveContains(query)
+            || contact.subtitle.localizedCaseInsensitiveContains(query)
+    }
+
+    private func verifyIncomingCallOwnership(
+        _ request: IncomingCallVerificationRequest
+    ) async {
+        guard NotificationCoordinator.shared.isAwaitingIncomingCallVerification(request) else {
+            return
+        }
+        guard isOnline else {
+            NotificationCoordinator.shared.retryIncomingCallVerificationAfterTransientFailure(
+                request
+            )
+            return
+        }
+        guard callsFeatureEnabled else {
+            NotificationCoordinator.shared.rejectIncomingCallVerification(request)
+            return
+        }
+        guard !isSigningOut,
+              isSignedIn,
+              let expectedUserID = profile?.id,
+              let expectedLease = callMediaAccountLease
+        else { return }
+        let expectedAccountEpoch = accountEpoch
+        guard let expectedSessionID = await sessions.current()?.sessionId,
+              expectedLease.accountEpoch == expectedAccountEpoch,
+              expectedLease.userID.caseInsensitiveCompare(expectedUserID) == .orderedSame,
+              expectedLease.sessionID.caseInsensitiveCompare(expectedSessionID) == .orderedSame,
+              await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+              ),
+              NotificationCoordinator.shared.isAwaitingIncomingCallVerification(request)
+        else { return }
+
+        do {
+            let response = try await APIClientSessionBinding.$sessionID.withValue(
+                expectedSessionID
+            ) {
+                try await api.call(id: request.push.callId)
+            }
+            guard callMediaAccountLease == expectedLease,
+                  await outboxContextIsCurrent(
+                    accountEpoch: expectedAccountEpoch,
+                    userID: expectedUserID,
+                    sessionID: expectedSessionID
+                  ),
+                  NotificationCoordinator.shared.isAwaitingIncomingCallVerification(request)
+            else { return }
+            guard let incoming = IncomingCallAuthenticationPolicy.authenticatedCall(
+                response: response,
+                matching: request.push,
+                currentUserID: expectedUserID
+            ) else {
+                NotificationCoordinator.shared.rejectIncomingCallVerification(request)
+                return
+            }
+            _ = NotificationCoordinator.shared.promoteAuthenticatedIncomingCall(
+                incoming,
+                for: request
+            )
+        } catch is CancellationError {
+            return
+        } catch {
+            guard callMediaAccountLease == expectedLease,
+                  await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+                  ),
+                  NotificationCoordinator.shared.isAwaitingIncomingCallVerification(request)
+            else { return }
+            switch IncomingCallLookupFailurePolicy.disposition(for: error) {
+            case .terminal:
+                NotificationCoordinator.shared.rejectIncomingCallVerification(request)
+            case .transient:
+                NotificationCoordinator.shared.retryIncomingCallVerificationAfterTransientFailure(
+                    request,
+                    retryAfter: IncomingCallLookupRetryPolicy.retryAfter(from: error)
+                )
+            }
+        }
+    }
+
+    private func recordAuthenticatedIncomingCall(
+        _ incoming: AuthenticatedIncomingCall
+    ) async {
+        let record = incoming.record
+        guard !locallyTerminatedCallIds.contains(record.id.lowercased()) else {
+            NotificationCoordinator.shared.reportCallEnded(incoming.callUUID, reason: .remoteEnded)
+            return
+        }
+        guard !isSigningOut,
+              isSignedIn,
+              incoming.ringExpiryDate > Date(),
+              let expectedUserID = profile?.id,
+              let expectedLease = callMediaAccountLease
+        else { return }
+        let expectedAccountEpoch = accountEpoch
+        guard let expectedSessionID = await sessions.current()?.sessionId,
+              expectedLease.accountEpoch == expectedAccountEpoch,
+              expectedLease.userID.caseInsensitiveCompare(expectedUserID) == .orderedSame,
+              expectedLease.sessionID.caseInsensitiveCompare(expectedSessionID) == .orderedSame,
+              await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+              )
+        else { return }
+        do {
+            state = try await commitAuthenticatedMutation(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            ) { persisted in
+                persisted.calls = CallLifecyclePolicy.mergingIncomingRing(
+                    record,
+                    into: persisted.calls
+                )
+            }
+            rebuildCallContacts()
+            routeAuthenticatedIncomingCall(incoming)
+        } catch is CancellationError {
+            return
+        } catch {
+            guard await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            ) else { return }
+            lastError = error.localizedDescription
+        }
+    }
+
+    private var connectedMediaPermitsCallWaitingMerge: Bool {
+        switch CallMediaCoordinator.shared.state {
+        case .connected, .reconnecting:
+            true
+        case .idle, .preparing, .connecting, .ending:
+            false
+        }
+    }
+
+    private func handleWaitingCallSystemAction(_ action: CallSystemAction) async {
+        // CallKit marks the waiting UUID before publishing this action. AppModel's successful
+        // merge scope also finishes it, while this outer idempotent release covers authentication,
+        // replay, and eligibility failures that never create an AppModel operation token.
+        defer {
+            NotificationCoordinator.shared.finishWaitingCallMergeAttempt(callId: action.callId)
+        }
+        await ingestQueuedAuthenticatedIncomingCall(callID: action.callId)
+        guard let actionCallID = canonicalCallID(action.callId),
+              callWaitingState.waitingCall?.callID == actionCallID
+        else {
+            await rejectUnmergeableSecondaryCall(action)
+            return
+        }
+        await mergeWaitingCall()
+    }
+
+    /// Retires only the second CallKit/backend call. It deliberately does not ask the media
+    /// coordinator to disconnect, because a different call owns the current LiveKit room.
+    private func rejectUnmergeableSecondaryCall(_ action: CallSystemAction) async {
+        _ = clearWaitingCallForLifecycle(callID: action.callId)
+        NotificationCoordinator.shared.reportCallEnded(action.callUUID, reason: .failed)
+        await terminateCall(id: action.callId, kind: .decline, reason: nil)
+    }
+
+    func handleCallSystemAction(_ action: CallSystemAction) async {
+        guard !isSubmittingAccountDeletion,
+              !acceptedAccountDeletionCleanupBlocked,
+              !protectedLocalStateRecoveryBlocked,
+              !unresolvedAccountDeletionAttemptBlocked
+        else {
+            await retireBlockedCallActionIfOwned(action)
+            return
+        }
+        switch action.kind {
+        case .answer:
+            if callActionTargetsDifferentActiveMediaCall(action) {
+                await ingestQueuedAuthenticatedIncomingCall(callID: action.callId)
+                if connectedMediaPermitsCallWaitingMerge {
+                    await handleWaitingCallSystemAction(action)
+                } else {
+                    await rejectUnmergeableSecondaryCall(action)
+                }
+                return
+            }
+            let expectedAccountEpoch = accountEpoch
+            guard !isSigningOut,
+                  isSignedIn,
+                  let expectedUserID = profile?.id,
+                  let expectedSessionID = await sessions.current()?.sessionId,
+                  let mediaLease = callMediaAccountLease,
+                  mediaLease.accountEpoch == expectedAccountEpoch,
+                  mediaLease.userID.caseInsensitiveCompare(expectedUserID) == .orderedSame,
+                  SessionRefreshPolicy.matchesSessionID(
+                    mediaLease.sessionID,
+                    current: expectedSessionID
+                  ),
+                  await outboxContextIsCurrent(
+                    accountEpoch: expectedAccountEpoch,
+                    userID: expectedUserID,
+                    sessionID: expectedSessionID
+                  )
+            else {
+                await CallMediaCoordinator.shared.disconnectFromCallKit(callId: action.callId)
+                NotificationCoordinator.shared.reportCallEnded(action.callUUID, reason: .failed)
+                if !isSigningOut, isSignedIn { lastError = "Sign in to answer this call." }
+                return
+            }
+            // Reading the session and account fence suspends. Repeat media ownership before this
+            // action is allowed to alter the connecting presentation.
+            if callActionTargetsDifferentActiveMediaCall(action) {
+                await ingestQueuedAuthenticatedIncomingCall(callID: action.callId)
+                if connectedMediaPermitsCallWaitingMerge {
+                    await handleWaitingCallSystemAction(action)
+                } else {
+                    await rejectUnmergeableSecondaryCall(action)
+                }
+                return
+            }
+            CallMediaCoordinator.shared.presentConnecting(
+                incomingPresentation(for: action),
+                lease: mediaLease
+            )
+            do {
+                let session = try await APIClientSessionBinding.$sessionID.withValue(
+                    expectedSessionID
+                ) {
+                    try await api.acceptCall(id: action.callId)
+                }
+                guard !callActionTargetsDifferentActiveMediaCall(action) else {
+                    await terminateCall(id: session.call.id, kind: .end, reason: "cancelled")
+                    NotificationCoordinator.shared.reportCallEnded(
+                        action.callUUID,
+                        reason: .failed
+                    )
+                    return
+                }
+                guard await outboxContextIsCurrent(
+                    accountEpoch: expectedAccountEpoch,
+                    userID: expectedUserID,
+                    sessionID: expectedSessionID
+                ) else {
+                    _ = try? await APIClientSessionBinding.$sessionID.withValue(
+                        expectedSessionID
+                    ) {
+                        try await api.endCall(id: session.call.id, reason: "cancelled")
+                    }
+                    await CallMediaCoordinator.shared.disconnectFromCallKit(callId: action.callId)
+                    NotificationCoordinator.shared.reportCallEnded(action.callUUID, reason: .failed)
+                    return
+                }
+                guard !locallyTerminatedCallIds.contains(action.callId.lowercased()) else {
+                    await flushOutbox()
+                    await CallMediaCoordinator.shared.disconnectFromCallKit(callId: action.callId)
+                    NotificationCoordinator.shared.reportCallEnded(action.callUUID, reason: .failed)
+                    return
+                }
+                let activeRecord = mapCall(session.call, stateOverride: .active)
+                state = try await commitAuthenticatedMutation(
+                    accountEpoch: expectedAccountEpoch,
+                    userID: expectedUserID,
+                    sessionID: expectedSessionID
+                ) { persisted in
+                    let existing = persisted.calls.first {
+                        $0.id.caseInsensitiveCompare(activeRecord.id) == .orderedSame
+                    }
+                    let reconciled = CallLifecyclePolicy.mergingStartResponse(
+                        activeRecord,
+                        with: existing
+                    )
+                    persisted.calls = CallLifecyclePolicy.merge(
+                        remote: [reconciled],
+                        local: persisted.calls
+                    )
+                }
+                rebuildCallContacts()
+                guard !callActionTargetsDifferentActiveMediaCall(action),
+                      !locallyTerminatedCallIds.contains(action.callId.lowercased()),
+                      CallLifecyclePolicy.allowsMediaStart(
+                        callID: session.call.id,
+                        in: state.calls
+                      )
+                else {
+                    await terminateCall(id: session.call.id, kind: .end, reason: "cancelled")
+                    await CallMediaCoordinator.shared.disconnectFromCallKit(callId: action.callId)
+                    NotificationCoordinator.shared.reportCallEnded(action.callUUID, reason: .failed)
+                    return
+                }
+                let mediaResult = Result {
+                    try CallMediaHandoff(
+                        session: session,
+                        participantAvatarURL: callParticipantAvatarURL(
+                            for: session.call.participantUserIds
+                        )
+                    )
+                }
+                switch mediaResult {
+                case .success(let handoff):
+                    await CallMediaCoordinator.shared.consumeAuthenticated(
+                        AuthenticatedCallMediaHandoff(lease: mediaLease, handoff: handoff)
+                    )
+                case .failure(let error):
+                    await APIClientSessionBinding.$sessionID.withValue(expectedSessionID) {
+                        await terminateCall(
+                            id: session.call.id,
+                            kind: .end,
+                            reason: "network_error"
+                        )
+                    }
+                    await CallMediaCoordinator.shared.disconnectFromCallKit(callId: action.callId)
+                    NotificationCoordinator.shared.reportCallEnded(action.callUUID, reason: .failed)
+                    if await outboxContextIsCurrent(
+                        accountEpoch: expectedAccountEpoch,
+                        userID: expectedUserID,
+                        sessionID: expectedSessionID
+                    ) {
+                        lastError = error.localizedDescription
+                    }
+                }
+            } catch is CancellationError {
+                await CallMediaCoordinator.shared.disconnectFromCallKit(callId: action.callId)
+                NotificationCoordinator.shared.reportCallEnded(action.callUUID, reason: .failed)
+            } catch {
+                guard await outboxContextIsCurrent(
+                    accountEpoch: expectedAccountEpoch,
+                    userID: expectedUserID,
+                    sessionID: expectedSessionID
+                ) else {
+                    await CallMediaCoordinator.shared.disconnectFromCallKit(callId: action.callId)
+                    NotificationCoordinator.shared.reportCallEnded(action.callUUID, reason: .failed)
+                    return
+                }
+                do {
+                    state = try await commitAuthenticatedMutation(
+                        accountEpoch: expectedAccountEpoch,
+                        userID: expectedUserID,
+                        sessionID: expectedSessionID
+                    ) { persisted in
+                        if let index = persisted.calls.firstIndex(where: {
+                            $0.id.caseInsensitiveCompare(action.callId) == .orderedSame
+                        }) {
+                            persisted.calls[index].state = .failed
+                            persisted.calls[index].endedAt = Date()
+                        }
+                    }
+                } catch {
+                    // The authenticated context is rechecked below before any visible error.
+                }
+                await enqueueTermination(
+                    callId: action.callId,
+                    kind: .decline,
+                    reason: nil,
+                    accountEpoch: expectedAccountEpoch,
+                    userID: expectedUserID,
+                    sessionID: expectedSessionID
+                )
+                await CallMediaCoordinator.shared.disconnectFromCallKit(callId: action.callId)
+                NotificationCoordinator.shared.reportCallEnded(action.callUUID, reason: .failed)
+                if await outboxContextIsCurrent(
+                    accountEpoch: expectedAccountEpoch,
+                    userID: expectedUserID,
+                    sessionID: expectedSessionID
+                ) {
+                    lastError = error.localizedDescription
+                }
+            }
+        case .mergeWaiting:
+            await handleWaitingCallSystemAction(action)
+        case .decline:
+            _ = clearWaitingCallForLifecycle(callID: action.callId)
+            await terminateCall(id: action.callId, kind: .decline, reason: nil)
+        case .end:
+            _ = clearWaitingCallForLifecycle(callID: action.callId)
+            await terminateCall(id: action.callId, kind: .end, reason: "cancelled")
+        case .timedOut:
+            _ = clearWaitingCallForLifecycle(callID: action.callId)
+            await markCallMissed(action.callId)
+        }
+    }
+
+    private func retireBlockedCallActionIfOwned(_ action: CallSystemAction) async {
+        guard let targetAccountID = privacyQuarantineTargetAccountID,
+              callMediaAccountLease?.userID.caseInsensitiveCompare(targetAccountID)
+                == .orderedSame
+        else { return }
+        await CallMediaCoordinator.shared.disconnectFromCallKit(callId: action.callId)
+        NotificationCoordinator.shared.reportCallEnded(action.callUUID, reason: .failed)
+    }
+
+    func handleCallMediaFailure(_ failure: CallMediaFailure) async {
+        guard !isSigningOut,
+              callMediaAccountLease == failure.lease,
+              !locallyTerminatedCallIds.contains(failure.callId.lowercased()),
+              await outboxContextIsCurrent(
+                accountEpoch: failure.lease.accountEpoch,
+                userID: failure.lease.userID,
+                sessionID: failure.lease.sessionID
+              )
+        else { return }
+        lastError = "Call media failed: \(failure.message)"
+        await terminateCall(id: failure.callId, kind: .end, reason: "network_error")
+    }
+
+    func registerPushToken(_ token: String, provider: String = "apns") async {
+        guard !isSigningOut,
+              isSignedIn,
+              accountSetupStep == nil,
+              sessionAssurance?.grantsFullAccess == true,
+              let accountID = profile?.id
+        else { return }
+        let expectedAccountEpoch = accountEpoch
+        guard let expectedSessionID = await sessions.current()?.sessionId,
+              await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: accountID,
+                sessionID: expectedSessionID
+              )
+        else { return }
+        _ = await pushRegistrations.register(
+            accountID: accountID,
+            provider: provider,
+            token: token
+        ) { [api] in
+            let result = try await APIClientSessionBinding.$sessionID.withValue(
+                expectedSessionID
+            ) {
+                try await api.registerPushToken(token, provider: provider)
+            }
+            return result.registered == true
+        }
+    }
+
+    func unregisterPushToken(provider: String) async {
+        guard let accountID = profile?.id else { return }
+        let expectedAccountEpoch = accountEpoch
+        let expectedSessionID = await sessions.current()?.sessionId
+        await pushRegistrations.reset(accountID: accountID, provider: provider)
+        guard let expectedSessionID,
+              await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: accountID,
+                sessionID: expectedSessionID
+              )
+        else { return }
+        // Token invalidation is a background cleanup signal. A future Apple token replay will
+        // repair transient failures, so it must never replace a user's actionable foreground error.
+        _ = try? await APIClientSessionBinding.$sessionID.withValue(expectedSessionID) {
+            try await api.unregisterPushToken(provider: provider)
+        }
+    }
+
+    func refreshKYC() async {
+        guard isSignedIn, isOnline,
+              let expectedSessionID = await sessions.current()?.sessionId
+        else { return }
+        kycRequestGeneration &+= 1
+        let expectedGeneration = kycRequestGeneration
+        do {
+            let status = try await api.kycStatus()
+            guard await kycRequestIsCurrent(
+                generation: expectedGeneration,
+                sessionID: expectedSessionID
+            ) else { return }
+            kycStatus = status
+            if case .deviceVerification = accountSetupStep {
+                let assurance = try await api.sessionAssurance()
+                guard await kycRequestIsCurrent(
+                    generation: expectedGeneration,
+                    sessionID: expectedSessionID
+                ) else { return }
+                sessionAssurance = assurance
+                if let currentProfile = profile {
+                    accountSetupStep = AccountSetupPolicy.reconcile(
+                        accountSetupStep,
+                        with: currentProfile,
+                        assurance: assurance
+                    )
+                }
+            }
+        } catch {
+            guard await kycRequestIsCurrent(
+                generation: expectedGeneration,
+                sessionID: expectedSessionID
+            ) else { return }
+            lastError = error.localizedDescription
+        }
+    }
+
+    func startKYC() async -> URL? {
+        guard isSignedIn else {
+            lastError = APIClientError.signedOut.localizedDescription
+            return nil
+        }
+        guard isOnline else {
+            lastError = "Connect to the internet to start identity verification."
+            return nil
+        }
+        guard let expectedSessionID = await sessions.current()?.sessionId else {
+            lastError = APIClientError.signedOut.localizedDescription
+            return nil
+        }
+        kycRequestGeneration &+= 1
+        let expectedGeneration = kycRequestGeneration
+        do {
+            let status = try await api.createKYCSession(
+                consent: true,
+                privacyNoticeVersion: "kit-privacy-2026-07"
+            )
+            guard await kycRequestIsCurrent(
+                generation: expectedGeneration,
+                sessionID: expectedSessionID
+            ) else { return nil }
+            kycStatus = status
+            guard let url = KYCVerificationURLPolicy.validatedURL(
+                from: status.providerSession?.verificationURL
+            ) else {
+                throw KYCUIError.invalidVerificationURL
+            }
+            return url
+        } catch {
+            guard await kycRequestIsCurrent(
+                generation: expectedGeneration,
+                sessionID: expectedSessionID
+            ) else { return nil }
+            lastError = error.localizedDescription
+            return nil
+        }
+    }
+
+    private func kycRequestIsCurrent(generation: UInt64, sessionID: String) async -> Bool {
+        guard isSignedIn, kycRequestGeneration == generation else { return false }
+        return await sessions.current()?.sessionId == sessionID
+    }
+
+    private func terminateCall(
+        id: String,
+        kind: CallTerminationKind,
+        reason: String?
+    ) async {
+        if callOwnsActiveMedia(callID: id) {
+            declineWaitingCallAfterActiveCallTermination()
+        }
+        guard !isSigningOut,
+              isSignedIn,
+              let expectedUserID = profile?.id
+        else { return }
+        let expectedAccountEpoch = accountEpoch
+        guard let expectedSessionID = await sessions.current()?.sessionId,
+              await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+              )
+        else { return }
+        locallyTerminatedCallIds.insert(id.lowercased())
+        let endedAt = Date()
+        do {
+            state = try await commitAuthenticatedMutation(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            ) { persisted in
+                if let index = persisted.calls.firstIndex(where: {
+                    $0.id.caseInsensitiveCompare(id) == .orderedSame
+                }) {
+                    persisted.calls[index].state = kind == .decline ? .declined : .completed
+                    persisted.calls[index].endedAt = endedAt
+                }
+            }
+        } catch is CancellationError {
+            return
+        } catch {
+            guard await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            ) else { return }
+            lastError = error.localizedDescription
+        }
+
+        guard isOnline || !hasConnectivityStatus else {
+            await enqueueTermination(
+                callId: id,
+                kind: kind,
+                reason: reason,
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            )
+            return
+        }
+
+        do {
+            let result: CallDTO
+            switch kind {
+            case .decline:
+                result = try await APIClientSessionBinding.$sessionID.withValue(
+                    expectedSessionID
+                ) {
+                    try await api.declineCall(id: id)
+                }
+            case .end:
+                result = try await APIClientSessionBinding.$sessionID.withValue(
+                    expectedSessionID
+                ) {
+                    try await api.endCall(id: id, reason: reason ?? "cancelled")
+                }
+            }
+            guard await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            ) else { return }
+            let mappedResult = mapCall(result)
+            state = try await commitAuthenticatedMutation(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            ) { persisted in
+                persisted.outbox.removeAll {
+                    $0.kind == .callTermination
+                        && $0.callId?.caseInsensitiveCompare(id) == .orderedSame
+                }
+                persisted.calls = CallLifecyclePolicy.mergeHistory(
+                    remote: [mappedResult],
+                    local: persisted.calls
+                )
+            }
+        } catch is CancellationError {
+            return
+        } catch {
+            guard await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            ) else { return }
+            if CallLifecyclePolicy.isIdempotentTerminationFailure(error, kind: kind) {
+                await acknowledgeTermination(
+                    callId: id,
+                    kind: kind,
+                    suppressingErrorMessage: error.localizedDescription,
+                    accountEpoch: expectedAccountEpoch,
+                    userID: expectedUserID,
+                    sessionID: expectedSessionID
+                )
+            } else {
+                await enqueueTermination(
+                    callId: id,
+                    kind: kind,
+                    reason: reason,
+                    accountEpoch: expectedAccountEpoch,
+                    userID: expectedUserID,
+                    sessionID: expectedSessionID
+                )
+            }
+        }
+    }
+
+    private func acknowledgeTermination(
+        callId: String,
+        kind: CallTerminationKind,
+        suppressingErrorMessage terminalErrorMessage: String,
+        accountEpoch expectedAccountEpoch: UUID,
+        userID expectedUserID: String,
+        sessionID expectedSessionID: String
+    ) async {
+        do {
+            state = try await commitAuthenticatedMutation(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            ) { persisted in
+                OutboxPolicy.acknowledgeTermination(
+                    callId: callId,
+                    kind: kind,
+                    in: &persisted,
+                    at: Date()
+                )
+            }
+            if lastError == terminalErrorMessage { lastError = nil }
+        } catch is CancellationError {
+            return
+        } catch {
+            // The server operation is already terminal, but a local persistence failure remains
+            // actionable and must not be disguised as a successful durable reconciliation.
+            guard await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            ) else { return }
+            lastError = error.localizedDescription
+        }
+    }
+
+    private func acknowledgeReplayedTermination(
+        command: OfflineCommand,
+        callId: String,
+        kind: CallTerminationKind,
+        suppressingErrorMessage terminalErrorMessage: String,
+        accountEpoch expectedAccountEpoch: UUID,
+        userID expectedUserID: String,
+        sessionID expectedSessionID: String
+    ) async {
+        do {
+            state = try await commitOutboxMutation(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID,
+                command: command
+            ) { persisted in
+                OutboxPolicy.acknowledgeTermination(
+                    callId: callId,
+                    kind: kind,
+                    in: &persisted,
+                    at: Date()
+                )
+            }
+            if lastError == terminalErrorMessage { lastError = nil }
+        } catch is CancellationError {
+            return
+        } catch {
+            guard await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            ) else { return }
+            lastError = error.localizedDescription
+        }
+    }
+
+    private func enqueueTermination(
+        callId: String,
+        kind: CallTerminationKind,
+        reason: String?,
+        accountEpoch expectedAccountEpoch: UUID,
+        userID expectedUserID: String,
+        sessionID expectedSessionID: String
+    ) async {
+        guard UUID(uuidString: callId) != nil,
+              await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+              )
+        else { return }
+        let now = Date()
+        let command = OfflineCommand(
+            id: UUID(),
+            kind: .callTermination,
+            createdAt: now,
+            nextAttemptAt: now,
+            attemptCount: 0,
+            conversationId: nil,
+            messageId: nil,
+            recipientUserIds: nil,
+            recipientName: nil,
+            video: nil,
+            expiresAt: nil,
+            callId: callId.lowercased(),
+            terminationKind: kind,
+            terminationReason: reason
+        )
+        do {
+            state = try await commitAuthenticatedMutation(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            ) { persisted in
+                let alreadyQueued = persisted.outbox.contains {
+                    $0.kind == .callTermination
+                        && $0.callId?.caseInsensitiveCompare(callId) == .orderedSame
+                }
+                if !alreadyQueued { persisted.outbox.append(command) }
+                if let index = persisted.calls.firstIndex(where: {
+                    $0.id.caseInsensitiveCompare(callId) == .orderedSame
+                }) {
+                    persisted.calls[index].state = kind == .decline ? .declined : .completed
+                    persisted.calls[index].endedAt = persisted.calls[index].endedAt ?? now
+                }
+            }
+            scheduleOutboxWake()
+        } catch is CancellationError {
+            return
+        } catch {
+            guard await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            ) else { return }
+            lastError = error.localizedDescription
+        }
+    }
+
+    private func markCallFailed(_ callId: String) async {
+        guard !isSigningOut, isSignedIn, let expectedUserID = profile?.id else { return }
+        let expectedAccountEpoch = accountEpoch
+        guard let expectedSessionID = await sessions.current()?.sessionId else { return }
+        state = (try? await commitAuthenticatedMutation(
+            accountEpoch: expectedAccountEpoch,
+            userID: expectedUserID,
+            sessionID: expectedSessionID
+        ) { persisted in
+            if let index = persisted.calls.firstIndex(where: {
+                $0.id.caseInsensitiveCompare(callId) == .orderedSame
+            }) {
+                persisted.calls[index].state = .failed
+                persisted.calls[index].endedAt = Date()
+            }
+        }) ?? state
+    }
+
+    private func markCallMissed(_ callId: String) async {
+        guard !isSigningOut, isSignedIn, let expectedUserID = profile?.id else { return }
+        let expectedAccountEpoch = accountEpoch
+        guard let expectedSessionID = await sessions.current()?.sessionId else { return }
+        state = (try? await commitAuthenticatedMutation(
+            accountEpoch: expectedAccountEpoch,
+            userID: expectedUserID,
+            sessionID: expectedSessionID
+        ) { persisted in
+            if let index = persisted.calls.firstIndex(where: {
+                $0.id.caseInsensitiveCompare(callId) == .orderedSame
+            }) {
+                persisted.calls[index].state = .missed
+                persisted.calls[index].direction = "missed"
+                persisted.calls[index].endedAt = Date()
+            }
+        }) ?? state
+        rebuildCallContacts()
+    }
+
+    private func rebuildCallContacts(remote: [WalletContactDTO]? = nil) {
+        // Lifecycle updates should add call-history options without discarding
+        // the API directory already loaded for this session. Passing an
+        // explicit empty array still clears remote contacts authoritatively.
+        let remoteContacts = (remote ?? contactDirectory).filter { contact in
+            if let userID = ContactRecipientDirectory.recipientUserId(for: contact) {
+                return communicationPrivacyAllowsOutbound(to: userID)
+            }
+            return contact.isKitUser != true
+        }
+        callContacts = CallLifecyclePolicy.contactOptions(
+            remote: remoteContacts,
+            history: state.calls,
+            context: phoneIdentityContext,
+            excludingUserId: profile?.id,
+            remoteAlreadyOrdered: true
+        ).filter { !$0.isKitUser || communicationPrivacyAllowsOutbound(to: $0.id) }
+    }
+
+    func canRetryMessage(_ messageID: UUID) -> Bool {
+        guard OutboxPolicy.canRetryMessage(messageID, in: state.outbox),
+              let command = state.outbox.first(where: {
+                  $0.kind == .secureMessage && $0.messageId == messageID
+              }),
+              let recipientUserIDs = command.recipientUserIds,
+              recipientUserIDs.count == 1,
+              communicationPrivacyAllowsOutbound(to: recipientUserIDs[0])
+        else { return false }
+        return true
+    }
+
+    func retryFailedMessage(_ messageID: UUID) async {
+        guard canRetryMessage(messageID) else { return }
+        do {
+            try await store.update { persisted in
+                _ = OutboxPolicy.resumeFailedMessage(
+                    messageID: messageID,
+                    in: &persisted,
+                    at: Date()
+                )
+            }
+            state = await store.snapshot()
+            scheduleOutboxWake()
+            if isOnline { await flushOutbox(reportFailures: true) }
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
+    private func handleOutboxFailure(
+        _ command: OfflineCommand,
+        error: Error,
+        reportFailure: Bool,
+        accountEpoch expectedAccountEpoch: UUID,
+        userID expectedUserID: String,
+        sessionID expectedSessionID: String
+    ) async {
+        guard await outboxContextIsCurrent(
+            accountEpoch: expectedAccountEpoch,
+            userID: expectedUserID,
+            sessionID: expectedSessionID
+        ) else { return }
+        let reason = error.localizedDescription
+        do {
+            switch OutboxPolicy.failureDecision(for: error) {
+            case .retry(let retryAfter):
+                state = try await commitOutboxMutation(
+                    accountEpoch: expectedAccountEpoch,
+                    userID: expectedUserID,
+                    sessionID: expectedSessionID,
+                    command: command
+                ) { persisted in
+                    OutboxPolicy.scheduleRetry(
+                        for: command,
+                        in: &persisted,
+                        at: Date(),
+                        retryAfter: retryAfter
+                    )
+                }
+            case .awaitSession:
+                state = try await commitOutboxMutation(
+                    accountEpoch: expectedAccountEpoch,
+                    userID: expectedUserID,
+                    sessionID: expectedSessionID,
+                    command: command
+                ) { persisted in
+                    OutboxPolicy.markAwaitingSession(
+                        for: command,
+                        reason: reason,
+                        in: &persisted
+                    )
+                }
+            case .unchanged:
+                guard await reloadOutboxStateIfCurrent(
+                    accountEpoch: expectedAccountEpoch,
+                    userID: expectedUserID,
+                    sessionID: expectedSessionID
+                ) else { return }
+            case .permanent:
+                state = try await commitOutboxMutation(
+                    accountEpoch: expectedAccountEpoch,
+                    userID: expectedUserID,
+                    sessionID: expectedSessionID,
+                    command: command
+                ) { persisted in
+                    OutboxPolicy.markPermanentFailure(
+                        for: command,
+                        reason: reason,
+                        in: &persisted
+                    )
+                }
+            }
+        } catch is CancellationError {
+            return
+        } catch {
+            guard await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            ) else { return }
+            if reportFailure { lastError = error.localizedDescription }
+            return
+        }
+        if reportFailure, !(error is CancellationError) { lastError = reason }
+    }
+
+    private func drainReadyOutbox(maximumPasses: Int = 32) async {
+        for _ in 0 ..< maximumPasses {
+            guard !Task.isCancelled else { return }
+            let before = state.outbox
+            guard !OutboxPolicy.readyCommands(before, at: Date()).isEmpty else { return }
+            await flushOutbox()
+            if state.outbox == before { return }
+        }
+    }
+
+    private func scheduleOutboxWake() {
+        outboxWakeTask?.cancel()
+        outboxWakeTask = nil
+        guard let backgroundWakeDate = OutboxPolicy.nextWakeDate(state.outbox) else {
+            CommunicationBackgroundReplayScheduler.shared.cancel()
+            return
+        }
+        CommunicationBackgroundReplayScheduler.shared.schedule(
+            earliestBeginDate: max(Date(), backgroundWakeDate)
+        )
+        guard isOnline,
+              isSignedIn,
+              !isSigningOut,
+              !isSubmittingAccountDeletion,
+              !acceptedAccountDeletionCleanupBlocked,
+              !protectedLocalStateRecoveryBlocked,
+              !unresolvedAccountDeletionAttemptBlocked,
+              let wakeDate = OutboxPolicy.nextWakeDate(state.outbox)
+        else { return }
+
+        let expectedAccountEpoch = accountEpoch
+        outboxWakeTask = Task { @MainActor [weak self] in
+            let delay = max(0, wakeDate.timeIntervalSinceNow)
+            do {
+                try await Task.sleep(for: .seconds(delay))
+            } catch {
+                return
+            }
+            guard let self,
+                  self.accountEpoch == expectedAccountEpoch,
+                  self.isOnline,
+                  self.isSignedIn
+            else { return }
+            self.outboxWakeTask = nil
+            await self.flushOutbox()
+        }
+    }
+
+    private func deviceRegistration() -> DeviceRegistration {
+        let info = Bundle.main.infoDictionary
+        return DeviceRegistration(
+            installationId: installationID(),
+            name: UIDevice.current.name,
+            appVersion: info?["CFBundleShortVersionString"] as? String ?? "0.2.5",
+            osVersion: UIDevice.current.systemVersion,
+            model: UIDevice.current.model
+        )
+    }
+
+    private func installationID() -> String {
+        let installationAccount = "kit-pay-installation-id"
+        if let data = try? KeychainStore.data(for: installationAccount),
+           let value = String(data: data, encoding: .utf8),
+           UUID(uuidString: value) != nil {
+            return value.lowercased()
+        }
+        let value = UUID().uuidString.lowercased()
+        try? KeychainStore.set(Data(value.utf8), for: installationAccount)
+        return value
+    }
+}
+
+@MainActor
+final class CommunicationBackgroundReplayScheduler {
+    static let shared = CommunicationBackgroundReplayScheduler()
+    static let identifier = "africa.kit.pay.ios.communication-replay"
+
+    private var handler: ((BGProcessingTask) -> Void)?
+    private var pendingTask: BGProcessingTask?
+
+    func register() {
+        BGTaskScheduler.shared.register(
+            forTaskWithIdentifier: Self.identifier,
+            using: .main
+        ) { [weak self] task in
+            guard let processingTask = task as? BGProcessingTask else {
+                task.setTaskCompleted(success: false)
+                return
+            }
+            if let handler = self?.handler {
+                handler(processingTask)
+            } else {
+                self?.pendingTask = processingTask
+            }
+        }
+    }
+
+    func installHandler(_ handler: @escaping (BGProcessingTask) -> Void) {
+        self.handler = handler
+        if let pendingTask {
+            self.pendingTask = nil
+            handler(pendingTask)
+        }
+    }
+
+    func schedule(earliestBeginDate: Date) {
+        BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: Self.identifier)
+        let request = BGProcessingTaskRequest(identifier: Self.identifier)
+        request.earliestBeginDate = earliestBeginDate
+        request.requiresNetworkConnectivity = true
+        request.requiresExternalPower = false
+        try? BGTaskScheduler.shared.submit(request)
+    }
+
+    func cancel() {
+        BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: Self.identifier)
+    }
+}
+
+enum KitBiometricGateState: Equatable {
+    case notRequired
+    case locked
+    case authorizing
+    case authorized
+}
+
+private enum KitBiometricPurpose {
+    case returningSignIn
+    case home
+    case paymentRequest
+
+    func reason(using kind: KitBiometricKind) -> String {
+        switch self {
+        case .returningSignIn:
+            "Use \(kind.displayName) to sign in to Kit Pay"
+        case .home:
+            "Use \(kind.displayName) to view your wallet and payments"
+        case .paymentRequest:
+            "Use \(kind.displayName) to send this payment request"
+        }
+    }
+}
+
+private enum MainTabIndex {
+    static let home = 0
+    static let messages = 1
+}
+
+/// A reviewable build-time latch in addition to server protocol discovery. Build 5 enables the
+/// encrypted path for TestFlight validation; server flags still cannot enable an unreviewed wire.
+enum SecureMessagingReleaseGate {
+    static let enabled = true
+}
+
+struct SecureMessagingRemoteWake: Sendable {
+    let notificationID: UUID
+
+    init?(_ object: Any?) {
+        guard let payload = object as? [AnyHashable: Any],
+              payload["type"] as? String == "messaging.sync",
+              payload["scope"] as? String == "messaging",
+              let rawNotificationID = payload["notification_id"] as? String,
+              let notificationID = UUID(uuidString: rawNotificationID),
+              let aps = payload["aps"] as? [AnyHashable: Any],
+              (aps["content-available"] as? NSNumber)?.intValue == 1,
+              aps.count == 1,
+              aps.keys.allSatisfy({ ($0 as? String) == "content-available" }),
+              payload.count == 4,
+              Set(payload.keys.compactMap { $0 as? String }) == Set([
+                  "type", "scope", "notification_id", "aps",
+              ])
+        else { return nil }
+        self.notificationID = notificationID
+    }
+}
+
+private func mapCall(_ dto: CallDTO, stateOverride: CallState? = nil) -> CallRecord {
+    CallRecord(
+        id: dto.id,
+        name: dto.name?.isEmpty == false ? dto.name! : "Kit Pay user",
+        participantUserIds: dto.participantUserIds ?? [],
+        direction: dto.direction,
+        type: dto.type,
+        video: dto.isVideoCall,
+        state: stateOverride ?? CallLifecyclePolicy.mappedState(dto.state),
+        // Invalid server timestamps must never make an old call appear to have happened "now".
+        startedAt: CallLifecyclePolicy.serverTimestamp(dto.startedAt)
+            ?? Date(timeIntervalSince1970: 0),
+        endedAt: CallLifecyclePolicy.serverTimestamp(dto.endedAt),
+        isDeferredAttempt: false,
+        conversationId: dto.conversationId,
+        answeredAt: CallLifecyclePolicy.serverTimestamp(dto.answeredAt)
+    )
+}
+
+private func emailAccountValidationMessage(
+    _ error: EmailAccountValidationError,
+    reset: Bool = false
+) -> String {
+    switch error {
+    case .invalidNameLength:
+        "Enter a username / display name (2–120 characters)."
+    case .placeholderName:
+        "Choose the username / display name people should see."
+    case .invalidTagLength:
+        "Your Kit Pay tag must be 3 to 32 characters."
+    case .provisionalTag:
+        "Choose your own Kit Pay tag."
+    case .reservedTag:
+        "This Kit Pay tag is reserved."
+    case .invalidTagCharacters:
+        "Use only lowercase letters, numbers, and underscores in your Kit Pay tag."
+    case .invalidEmail:
+        "Enter a valid email address."
+    case .weakPassword:
+        "Use at least 12 characters with uppercase, lowercase, and a number."
+    case .passwordMismatch:
+        "The passwords do not match."
+    case .invalidToken:
+        reset
+            ? "Paste the complete reset token from your email."
+            : "Paste the complete verification token from your email."
+    }
+}
+
+enum AuthUIError: LocalizedError {
+    case missingChallenge, missingSession, missingUser, invalidResponse, staleResponse
+    var errorDescription: String? {
+        switch self {
+        case .missingChallenge: "Kit did not return an OTP challenge."
+        case .missingSession: "Sign-in completed without a usable session."
+        case .missingUser: "Sign-in completed without a usable profile."
+        case .invalidResponse: "Kit returned an invalid authentication response. Start again."
+        case .staleResponse: "That sign-in request is no longer active. Start again."
+        }
+    }
+}
+
+enum AccountSetupError: LocalizedError {
+    case accountChanged, profileStillRequired, pinNotEnabled, sessionNotUnlocked
+
+    var errorDescription: String? {
+        switch self {
+        case .accountChanged: "The profile response belongs to another account. Sign in again."
+        case .profileStillRequired: "Profile setup is still required after saving the profile."
+        case .pinNotEnabled: "The wallet PIN was not enabled."
+        case .sessionNotUnlocked: "Kit Pay could not confirm this session unlock. Try again."
+        }
+    }
+}
+
+enum CallQueueError: LocalizedError {
+    case invalidRTC
+    case unexpectedCall
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidRTC: "Kit returned invalid call credentials."
+        case .unexpectedCall: "Kit returned a different call than the one requested."
+        }
+    }
+}
+
+enum KYCUIError: LocalizedError {
+    case invalidVerificationURL
+    var errorDescription: String? { "Kit returned an invalid identity-verification link." }
+}

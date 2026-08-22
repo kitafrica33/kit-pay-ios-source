@@ -1,0 +1,17 @@
+source 'https://cdn.cocoapods.org/'
+
+platform :ios, '17.0'
+use_frameworks!
+
+# Signal publishes the matching iOS FFI archive separately from the source tag. The checksum is
+# public release metadata (not a credential) and prevents CocoaPods from accepting changed bytes.
+ENV['LIBSIGNAL_FFI_PREBUILD_CHECKSUM'] =
+  'ef01dc615300fc2bb63559de6b8d2bbfd9798db459ef24b3b23ef224defaecee'
+
+project 'KitPay.xcodeproj'
+
+target 'KitPay' do
+  pod 'LibSignalClient',
+      git: 'https://github.com/signalapp/libsignal.git',
+      commit: 'b5121d07c72f9e631f178d907ca892587f64f9e2'
+end

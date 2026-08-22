@@ -1,0 +1,587 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {};
+	objectVersion = 60;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A10000000000000000000001 /* KitPayApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000001 /* KitPayApp.swift */; };
+		A10000000000000000000002 /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000002 /* AppModel.swift */; };
+		A10000000000000000000003 /* NotificationCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000003 /* NotificationCoordinator.swift */; };
+		A10000000000000000000004 /* ConnectivityMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000004 /* ConnectivityMonitor.swift */; };
+		A10000000000000000000005 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000005 /* Models.swift */; };
+		A10000000000000000000006 /* KeychainStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000006 /* KeychainStore.swift */; };
+		A10000000000000000000007 /* SessionStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000007 /* SessionStore.swift */; };
+		A10000000000000000000008 /* SecureLocalStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000008 /* SecureLocalStore.swift */; };
+		A10000000000000000000009 /* APIClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000009 /* APIClient.swift */; };
+		A1000000000000000000000A /* KitTheme.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000000A /* KitTheme.swift */; };
+		A1000000000000000000000B /* RootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000000B /* RootView.swift */; };
+		A1000000000000000000000C /* OnboardingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000000C /* OnboardingView.swift */; };
+		A1000000000000000000000D /* HomeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000000D /* HomeView.swift */; };
+		A1000000000000000000000E /* MessagesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000000E /* MessagesView.swift */; };
+		A1000000000000000000000F /* CallsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000000F /* CallsView.swift */; };
+		A10000000000000000000010 /* ProfileView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000010 /* ProfileView.swift */; };
+		A10000000000000000000011 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000011 /* Assets.xcassets */; };
+		A10000000000000000000012 /* KYCView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000015 /* KYCView.swift */; };
+		A10000000000000000000013 /* BiometricAuthentication.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000016 /* BiometricAuthentication.swift */; };
+		A10000000000000000000014 /* SecurityView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000017 /* SecurityView.swift */; };
+		AF1000000000000000000001 /* AppLaunchUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF1000000000000000000001 /* AppLaunchUITests.swift */; };
+		A20000000000000000000001 /* OutboxPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000001 /* OutboxPolicy.swift */; };
+		A20000000000000000000002 /* WalletFlowViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000002 /* WalletFlowViews.swift */; };
+		A30000000000000000000001 /* SecureLocalStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B30000000000000000000001 /* SecureLocalStoreTests.swift */; };
+		A30000000000000000000002 /* OutboxPolicyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B30000000000000000000002 /* OutboxPolicyTests.swift */; };
+		A30000000000000000000003 /* WalletAPIEncodingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B30000000000000000000004 /* WalletAPIEncodingTests.swift */; };
+		A30000000000000000000005 /* BiometricAuthenticationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B30000000000000000000005 /* BiometricAuthenticationTests.swift */; };
+		A40000000000000000000001 /* ProviderModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = B40000000000000000000001 /* ProviderModels.swift */; };
+		A40000000000000000000002 /* APIClient+Providers.swift in Sources */ = {isa = PBXBuildFile; fileRef = B40000000000000000000002 /* APIClient+Providers.swift */; };
+		A40000000000000000000003 /* ProviderFlowViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = B40000000000000000000003 /* ProviderFlowViews.swift */; };
+		A40000000000000000000004 /* ProviderAPIEncodingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B40000000000000000000004 /* ProviderAPIEncodingTests.swift */; };
+		A20000000000000000000009 /* AppLifecyclePolicyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000009 /* AppLifecyclePolicyTests.swift */; };
+		A50000000000000000000001 /* AccountSetup.swift in Sources */ = {isa = PBXBuildFile; fileRef = B50000000000000000000001 /* AccountSetup.swift */; };
+		A50000000000000000000002 /* AccountSetupView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B50000000000000000000002 /* AccountSetupView.swift */; };
+		A50000000000000000000003 /* AccountSetupPolicyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B50000000000000000000003 /* AccountSetupPolicyTests.swift */; };
+		A60000000000000000000001 /* ContactSyncModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = B60000000000000000000001 /* ContactSyncModels.swift */; };
+		A60000000000000000000002 /* APIClient+Contacts.swift in Sources */ = {isa = PBXBuildFile; fileRef = B60000000000000000000002 /* APIClient+Contacts.swift */; };
+		A60000000000000000000003 /* ContactSynchronizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = B60000000000000000000003 /* ContactSynchronizer.swift */; };
+		A60000000000000000000004 /* ContactSyncButton.swift in Sources */ = {isa = PBXBuildFile; fileRef = B60000000000000000000004 /* ContactSyncButton.swift */; };
+		A60000000000000000000005 /* ContactSyncTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B60000000000000000000005 /* ContactSyncTests.swift */; };
+		A70000000000000000000001 /* PaymentRequestModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = B70000000000000000000001 /* PaymentRequestModels.swift */; };
+		A70000000000000000000002 /* APIClient+PaymentRequests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B70000000000000000000002 /* APIClient+PaymentRequests.swift */; };
+		A70000000000000000000003 /* PaymentRequestsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B70000000000000000000003 /* PaymentRequestsView.swift */; };
+		A70000000000000000000004 /* PaymentRequestTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B70000000000000000000004 /* PaymentRequestTests.swift */; };
+		A80000000000000000000001 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = B80000000000000000000001 /* PrivacyInfo.xcprivacy */; };
+		A90000000000000000000001 /* APIClient+Calls.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000001 /* APIClient+Calls.swift */; };
+		A90000000000000000000002 /* CallLifecycle.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000002 /* CallLifecycle.swift */; };
+		A90000000000000000000003 /* CallMediaHandoff.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000003 /* CallMediaHandoff.swift */; };
+		A90000000000000000000004 /* CallLifecycleTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000004 /* CallLifecycleTests.swift */; };
+		AA0000000000000000000001 /* CallMediaCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA0000000000000000000001 /* CallMediaCoordinator.swift */; };
+		AA0000000000000000000002 /* ActiveCallView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA0000000000000000000002 /* ActiveCallView.swift */; };
+		AA0000000000000000000003 /* LiveKit in Frameworks */ = {isa = PBXBuildFile; productRef = D90000000000000000000001 /* LiveKit */; };
+		AB0000000000000000000001 /* MessagingAPIModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0000000000000000000001 /* MessagingAPIModels.swift */; };
+		AB0000000000000000000002 /* APIClient+Messaging.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0000000000000000000002 /* APIClient+Messaging.swift */; };
+		AB0000000000000000000003 /* MessagingAPIContractTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0000000000000000000003 /* MessagingAPIContractTests.swift */; };
+		AC0000000000000000000001 /* SecureMessagingCrypto.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC0000000000000000000001 /* SecureMessagingCrypto.swift */; };
+		AC0000000000000000000002 /* SignalProtocolStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC0000000000000000000002 /* SignalProtocolStore.swift */; };
+		AC0000000000000000000003 /* SecureMessagingMapper.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC0000000000000000000003 /* SecureMessagingMapper.swift */; };
+		AC0000000000000000000004 /* SecureMessagingCryptoTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC0000000000000000000004 /* SecureMessagingCryptoTests.swift */; };
+		AD0000000000000000000001 /* ContactSyncRetryPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = BD0000000000000000000001 /* ContactSyncRetryPolicy.swift */; };
+		AD0000000000000000000002 /* ContactSyncRetryPolicyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BD0000000000000000000002 /* ContactSyncRetryPolicyTests.swift */; };
+		AE0000000000000000000001 /* SecureMessagingCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = BE0000000000000000000001 /* SecureMessagingCoordinator.swift */; };
+		AF0000000000000000000001 /* SecureMessagingCoordinatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF0000000000000000000001 /* SecureMessagingCoordinatorTests.swift */; };
+		A00000000000000000000001 /* MobileMoneyModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000001 /* MobileMoneyModels.swift */; };
+		A00000000000000000000002 /* APIClient+MobileMoney.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000002 /* APIClient+MobileMoney.swift */; };
+		A00000000000000000000003 /* MobileMoneyView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000003 /* MobileMoneyView.swift */; };
+		A00000000000000000000004 /* MerchantQRModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000004 /* MerchantQRModels.swift */; };
+		A00000000000000000000005 /* APIClient+MerchantQR.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000005 /* APIClient+MerchantQR.swift */; };
+		A00000000000000000000006 /* MerchantQRViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000006 /* MerchantQRViews.swift */; };
+		A00000000000000000000007 /* PaymentRailContractTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000007 /* PaymentRailContractTests.swift */; };
+		A00000000000000000000008 /* PaymentInputFormatting.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000008 /* PaymentInputFormatting.swift */; };
+		A11000000000000000000001 /* PushRegistrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B11000000000000000000001 /* PushRegistrationTests.swift */; };
+		A12000000000000000000001 /* ConversationSound.swift in Sources */ = {isa = PBXBuildFile; fileRef = B12000000000000000000001 /* ConversationSound.swift */; };
+		A12000000000000000000002 /* ConversationSoundTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B12000000000000000000002 /* ConversationSoundTests.swift */; };
+		A12000000000000000000003 /* knock_brush.mp3 in Resources */ = {isa = PBXBuildFile; fileRef = B12000000000000000000003 /* knock_brush.mp3 */; };
+		A12000000000000000000004 /* knock_brush.caf in Resources */ = {isa = PBXBuildFile; fileRef = B12000000000000000000004 /* knock_brush.caf */; };
+		A13000000000000000000001 /* BankTransferModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = B13000000000000000000001 /* BankTransferModels.swift */; };
+		A13000000000000000000002 /* APIClient+BankTransfers.swift in Sources */ = {isa = PBXBuildFile; fileRef = B13000000000000000000002 /* APIClient+BankTransfers.swift */; };
+		A13000000000000000000003 /* BankTransferView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B13000000000000000000003 /* BankTransferView.swift */; };
+		A13000000000000000000004 /* BankTransferContractTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B13000000000000000000004 /* BankTransferContractTests.swift */; };
+		A14000000000000000000001 /* RegisteredDevicePolicyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B14000000000000000000001 /* RegisteredDevicePolicyTests.swift */; };
+		A15000000000000000000001 /* CommunicationPrivacyModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = B15000000000000000000001 /* CommunicationPrivacyModels.swift */; };
+		A15000000000000000000002 /* APIClient+CommunicationPrivacy.swift in Sources */ = {isa = PBXBuildFile; fileRef = B15000000000000000000002 /* APIClient+CommunicationPrivacy.swift */; };
+		A15000000000000000000003 /* CommunicationPrivacyView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B15000000000000000000003 /* CommunicationPrivacyView.swift */; };
+		A15000000000000000000004 /* CommunicationPrivacyContractTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B15000000000000000000004 /* CommunicationPrivacyContractTests.swift */; };
+		AEE000000000000000000001 /* APIClient+ProfileEmail.swift in Sources */ = {isa = PBXBuildFile; fileRef = BEE000000000000000000001 /* APIClient+ProfileEmail.swift */; };
+		AEE000000000000000000002 /* ProfileEmailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BEE000000000000000000002 /* ProfileEmailView.swift */; };
+		AEE000000000000000000003 /* ProfileEmailContractTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BEE000000000000000000003 /* ProfileEmailContractTests.swift */; };
+		A16000000000000000000001 /* LegalPresentation.swift in Sources */ = {isa = PBXBuildFile; fileRef = B16000000000000000000001 /* LegalPresentation.swift */; };
+		A16000000000000000000002 /* LegalPrivacyView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B16000000000000000000002 /* LegalPrivacyView.swift */; };
+		A16000000000000000000003 /* AGPL-3.0-only.txt in Resources */ = {isa = PBXBuildFile; fileRef = B16000000000000000000003 /* AGPL-3.0-only.txt */; };
+		A16000000000000000000004 /* THIRD_PARTY_NOTICES.txt in Resources */ = {isa = PBXBuildFile; fileRef = B16000000000000000000004 /* THIRD_PARTY_NOTICES.txt */; };
+		A16000000000000000000005 /* LegalURLPolicyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B16000000000000000000005 /* LegalURLPolicyTests.swift */; };
+		A17000000000000000000001 /* AccountDeletionModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = B17000000000000000000001 /* AccountDeletionModels.swift */; };
+		A17000000000000000000002 /* APIClient+AccountDeletion.swift in Sources */ = {isa = PBXBuildFile; fileRef = B17000000000000000000002 /* APIClient+AccountDeletion.swift */; };
+		A17000000000000000000003 /* AccountDeletionView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B17000000000000000000003 /* AccountDeletionView.swift */; };
+		A17000000000000000000004 /* AccountDeletionContractTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B17000000000000000000004 /* AccountDeletionContractTests.swift */; };
+		A18000000000000000000001 /* MerchantAccountEducationView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B18000000000000000000001 /* MerchantAccountEducationView.swift */; };
+		A18000000000000000000002 /* MerchantAccountOnboardingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B18000000000000000000002 /* MerchantAccountOnboardingTests.swift */; };
+		A19000000000000000000001 /* CallOverlayWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = B19000000000000000000001 /* CallOverlayWindow.swift */; };
+		A19000000000000000000002 /* KitChatWallpaper.swift in Sources */ = {isa = PBXBuildFile; fileRef = B19000000000000000000002 /* KitChatWallpaper.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		C30000000000000000000004 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = E10000000000000000000002 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = E10000000000000000000001;
+			remoteInfo = KitPay;
+		};
+		CF1000000000000000000004 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = E10000000000000000000002 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = E10000000000000000000001;
+			remoteInfo = KitPay;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		B10000000000000000000001 /* KitPayApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/App/KitPayApp.swift; sourceTree = SOURCE_ROOT; };
+		B10000000000000000000002 /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/App/AppModel.swift; sourceTree = SOURCE_ROOT; };
+		B10000000000000000000003 /* NotificationCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/App/NotificationCoordinator.swift; sourceTree = SOURCE_ROOT; };
+		B10000000000000000000004 /* ConnectivityMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/ConnectivityMonitor.swift; sourceTree = SOURCE_ROOT; };
+		B10000000000000000000005 /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/Models.swift; sourceTree = SOURCE_ROOT; };
+		B10000000000000000000006 /* KeychainStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/KeychainStore.swift; sourceTree = SOURCE_ROOT; };
+		B10000000000000000000007 /* SessionStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/SessionStore.swift; sourceTree = SOURCE_ROOT; };
+		B10000000000000000000008 /* SecureLocalStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/SecureLocalStore.swift; sourceTree = SOURCE_ROOT; };
+		B10000000000000000000009 /* APIClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/APIClient.swift; sourceTree = SOURCE_ROOT; };
+		B1000000000000000000000A /* KitTheme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Design/KitTheme.swift; sourceTree = SOURCE_ROOT; };
+		B1000000000000000000000B /* RootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/RootView.swift; sourceTree = SOURCE_ROOT; };
+		B1000000000000000000000C /* OnboardingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Auth/OnboardingView.swift; sourceTree = SOURCE_ROOT; };
+		B1000000000000000000000D /* HomeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Home/HomeView.swift; sourceTree = SOURCE_ROOT; };
+		B1000000000000000000000E /* MessagesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Messages/MessagesView.swift; sourceTree = SOURCE_ROOT; };
+		B1000000000000000000000F /* CallsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Calls/CallsView.swift; sourceTree = SOURCE_ROOT; };
+		B10000000000000000000010 /* ProfileView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Profile/ProfileView.swift; sourceTree = SOURCE_ROOT; };
+		B10000000000000000000011 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = KitPay/Assets.xcassets; sourceTree = SOURCE_ROOT; };
+		B10000000000000000000012 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = KitPay/Info.plist; sourceTree = SOURCE_ROOT; };
+		B10000000000000000000013 /* KitPay.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = KitPay/KitPay.entitlements; sourceTree = SOURCE_ROOT; };
+		B10000000000000000000014 /* KitPay.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = KitPay.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		B10000000000000000000015 /* KYCView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Profile/KYCView.swift; sourceTree = SOURCE_ROOT; };
+		B10000000000000000000016 /* BiometricAuthentication.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/BiometricAuthentication.swift; sourceTree = SOURCE_ROOT; };
+		B10000000000000000000017 /* SecurityView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Profile/SecurityView.swift; sourceTree = SOURCE_ROOT; };
+		B20000000000000000000001 /* OutboxPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/OutboxPolicy.swift; sourceTree = SOURCE_ROOT; };
+		B20000000000000000000002 /* WalletFlowViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Home/WalletFlowViews.swift; sourceTree = SOURCE_ROOT; };
+		B30000000000000000000001 /* SecureLocalStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/SecureLocalStoreTests.swift; sourceTree = SOURCE_ROOT; };
+		B30000000000000000000002 /* OutboxPolicyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/OutboxPolicyTests.swift; sourceTree = SOURCE_ROOT; };
+		B30000000000000000000003 /* KitPayTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = KitPayTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		B30000000000000000000004 /* WalletAPIEncodingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/WalletAPIEncodingTests.swift; sourceTree = SOURCE_ROOT; };
+		B30000000000000000000005 /* BiometricAuthenticationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/BiometricAuthenticationTests.swift; sourceTree = SOURCE_ROOT; };
+		B40000000000000000000001 /* ProviderModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/ProviderModels.swift; sourceTree = SOURCE_ROOT; };
+		B40000000000000000000002 /* APIClient+Providers.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "KitPay/Core/APIClient+Providers.swift"; sourceTree = SOURCE_ROOT; };
+		B40000000000000000000003 /* ProviderFlowViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Home/ProviderFlowViews.swift; sourceTree = SOURCE_ROOT; };
+		B40000000000000000000004 /* ProviderAPIEncodingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/ProviderAPIEncodingTests.swift; sourceTree = SOURCE_ROOT; };
+		B20000000000000000000009 /* AppLifecyclePolicyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/AppLifecyclePolicyTests.swift; sourceTree = SOURCE_ROOT; };
+		B50000000000000000000001 /* AccountSetup.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/AccountSetup.swift; sourceTree = SOURCE_ROOT; };
+		B50000000000000000000002 /* AccountSetupView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Auth/AccountSetupView.swift; sourceTree = SOURCE_ROOT; };
+		B50000000000000000000003 /* AccountSetupPolicyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/AccountSetupPolicyTests.swift; sourceTree = SOURCE_ROOT; };
+		B60000000000000000000001 /* ContactSyncModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/ContactSyncModels.swift; sourceTree = SOURCE_ROOT; };
+		B60000000000000000000002 /* APIClient+Contacts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "KitPay/Core/APIClient+Contacts.swift"; sourceTree = SOURCE_ROOT; };
+		B60000000000000000000003 /* ContactSynchronizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/ContactSynchronizer.swift; sourceTree = SOURCE_ROOT; };
+		B60000000000000000000004 /* ContactSyncButton.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Home/ContactSyncButton.swift; sourceTree = SOURCE_ROOT; };
+		B60000000000000000000005 /* ContactSyncTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/ContactSyncTests.swift; sourceTree = SOURCE_ROOT; };
+		B70000000000000000000001 /* PaymentRequestModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/PaymentRequestModels.swift; sourceTree = SOURCE_ROOT; };
+		B70000000000000000000002 /* APIClient+PaymentRequests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "KitPay/Core/APIClient+PaymentRequests.swift"; sourceTree = SOURCE_ROOT; };
+		B70000000000000000000003 /* PaymentRequestsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Home/PaymentRequestsView.swift; sourceTree = SOURCE_ROOT; };
+		B70000000000000000000004 /* PaymentRequestTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/PaymentRequestTests.swift; sourceTree = SOURCE_ROOT; };
+		B80000000000000000000001 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = KitPay/PrivacyInfo.xcprivacy; sourceTree = SOURCE_ROOT; };
+		B90000000000000000000001 /* APIClient+Calls.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "KitPay/Core/APIClient+Calls.swift"; sourceTree = SOURCE_ROOT; };
+		B90000000000000000000002 /* CallLifecycle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/CallLifecycle.swift; sourceTree = SOURCE_ROOT; };
+		B90000000000000000000003 /* CallMediaHandoff.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/CallMediaHandoff.swift; sourceTree = SOURCE_ROOT; };
+		B90000000000000000000004 /* CallLifecycleTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/CallLifecycleTests.swift; sourceTree = SOURCE_ROOT; };
+		BA0000000000000000000001 /* CallMediaCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/CallMediaCoordinator.swift; sourceTree = SOURCE_ROOT; };
+		BA0000000000000000000002 /* ActiveCallView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Calls/ActiveCallView.swift; sourceTree = SOURCE_ROOT; };
+		BB0000000000000000000001 /* MessagingAPIModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/MessagingAPIModels.swift; sourceTree = SOURCE_ROOT; };
+		BB0000000000000000000002 /* APIClient+Messaging.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "KitPay/Core/APIClient+Messaging.swift"; sourceTree = SOURCE_ROOT; };
+		BB0000000000000000000003 /* MessagingAPIContractTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/MessagingAPIContractTests.swift; sourceTree = SOURCE_ROOT; };
+		BC0000000000000000000001 /* SecureMessagingCrypto.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/SecureMessagingCrypto.swift; sourceTree = SOURCE_ROOT; };
+		BC0000000000000000000002 /* SignalProtocolStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/SignalProtocolStore.swift; sourceTree = SOURCE_ROOT; };
+		BC0000000000000000000003 /* SecureMessagingMapper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/SecureMessagingMapper.swift; sourceTree = SOURCE_ROOT; };
+		BC0000000000000000000004 /* SecureMessagingCryptoTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/SecureMessagingCryptoTests.swift; sourceTree = SOURCE_ROOT; };
+		BD0000000000000000000001 /* ContactSyncRetryPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/ContactSyncRetryPolicy.swift; sourceTree = SOURCE_ROOT; };
+		BD0000000000000000000002 /* ContactSyncRetryPolicyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/ContactSyncRetryPolicyTests.swift; sourceTree = SOURCE_ROOT; };
+		BE0000000000000000000001 /* SecureMessagingCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/SecureMessagingCoordinator.swift; sourceTree = SOURCE_ROOT; };
+		BF0000000000000000000001 /* SecureMessagingCoordinatorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/SecureMessagingCoordinatorTests.swift; sourceTree = SOURCE_ROOT; };
+		B00000000000000000000001 /* MobileMoneyModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/MobileMoneyModels.swift; sourceTree = SOURCE_ROOT; };
+		B00000000000000000000002 /* APIClient+MobileMoney.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "KitPay/Core/APIClient+MobileMoney.swift"; sourceTree = SOURCE_ROOT; };
+		B00000000000000000000003 /* MobileMoneyView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Home/MobileMoneyView.swift; sourceTree = SOURCE_ROOT; };
+		B00000000000000000000004 /* MerchantQRModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/MerchantQRModels.swift; sourceTree = SOURCE_ROOT; };
+		B00000000000000000000005 /* APIClient+MerchantQR.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "KitPay/Core/APIClient+MerchantQR.swift"; sourceTree = SOURCE_ROOT; };
+		B00000000000000000000006 /* MerchantQRViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Home/MerchantQRViews.swift; sourceTree = SOURCE_ROOT; };
+		B00000000000000000000007 /* PaymentRailContractTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/PaymentRailContractTests.swift; sourceTree = SOURCE_ROOT; };
+		B00000000000000000000008 /* PaymentInputFormatting.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/PaymentInputFormatting.swift; sourceTree = SOURCE_ROOT; };
+		B11000000000000000000001 /* PushRegistrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/PushRegistrationTests.swift; sourceTree = SOURCE_ROOT; };
+		B12000000000000000000001 /* ConversationSound.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/ConversationSound.swift; sourceTree = SOURCE_ROOT; };
+		B12000000000000000000002 /* ConversationSoundTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/ConversationSoundTests.swift; sourceTree = SOURCE_ROOT; };
+		B12000000000000000000003 /* knock_brush.mp3 */ = {isa = PBXFileReference; lastKnownFileType = audio.mp3; path = KitPay/Sounds/knock_brush.mp3; sourceTree = SOURCE_ROOT; };
+		B12000000000000000000004 /* knock_brush.caf */ = {isa = PBXFileReference; lastKnownFileType = audio.caf; path = KitPay/Sounds/knock_brush.caf; sourceTree = SOURCE_ROOT; };
+		B13000000000000000000001 /* BankTransferModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/BankTransferModels.swift; sourceTree = SOURCE_ROOT; };
+		B13000000000000000000002 /* APIClient+BankTransfers.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "KitPay/Core/APIClient+BankTransfers.swift"; sourceTree = SOURCE_ROOT; };
+		B13000000000000000000003 /* BankTransferView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Home/BankTransferView.swift; sourceTree = SOURCE_ROOT; };
+		B13000000000000000000004 /* BankTransferContractTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/BankTransferContractTests.swift; sourceTree = SOURCE_ROOT; };
+		B14000000000000000000001 /* RegisteredDevicePolicyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/RegisteredDevicePolicyTests.swift; sourceTree = SOURCE_ROOT; };
+		B15000000000000000000001 /* CommunicationPrivacyModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/CommunicationPrivacyModels.swift; sourceTree = SOURCE_ROOT; };
+		B15000000000000000000002 /* APIClient+CommunicationPrivacy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "KitPay/Core/APIClient+CommunicationPrivacy.swift"; sourceTree = SOURCE_ROOT; };
+		B15000000000000000000003 /* CommunicationPrivacyView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Profile/CommunicationPrivacyView.swift; sourceTree = SOURCE_ROOT; };
+		B15000000000000000000004 /* CommunicationPrivacyContractTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/CommunicationPrivacyContractTests.swift; sourceTree = SOURCE_ROOT; };
+		BEE000000000000000000001 /* APIClient+ProfileEmail.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "KitPay/Core/APIClient+ProfileEmail.swift"; sourceTree = SOURCE_ROOT; };
+		BEE000000000000000000002 /* ProfileEmailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Profile/ProfileEmailView.swift; sourceTree = SOURCE_ROOT; };
+		BEE000000000000000000003 /* ProfileEmailContractTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/ProfileEmailContractTests.swift; sourceTree = SOURCE_ROOT; };
+		B16000000000000000000001 /* LegalPresentation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Legal/LegalPresentation.swift; sourceTree = SOURCE_ROOT; };
+		B16000000000000000000002 /* LegalPrivacyView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Legal/LegalPrivacyView.swift; sourceTree = SOURCE_ROOT; };
+		B16000000000000000000003 /* AGPL-3.0-only.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = KitPay/Resources/Legal/AGPL-3.0-only.txt; sourceTree = SOURCE_ROOT; };
+		B16000000000000000000004 /* THIRD_PARTY_NOTICES.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = KitPay/Resources/Legal/THIRD_PARTY_NOTICES.txt; sourceTree = SOURCE_ROOT; };
+		B16000000000000000000005 /* LegalURLPolicyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/LegalURLPolicyTests.swift; sourceTree = SOURCE_ROOT; };
+		B17000000000000000000001 /* AccountDeletionModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/AccountDeletionModels.swift; sourceTree = SOURCE_ROOT; };
+		B17000000000000000000002 /* APIClient+AccountDeletion.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "KitPay/Core/APIClient+AccountDeletion.swift"; sourceTree = SOURCE_ROOT; };
+		B17000000000000000000003 /* AccountDeletionView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Profile/AccountDeletionView.swift; sourceTree = SOURCE_ROOT; };
+		B17000000000000000000004 /* AccountDeletionContractTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/AccountDeletionContractTests.swift; sourceTree = SOURCE_ROOT; };
+		B18000000000000000000001 /* MerchantAccountEducationView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Profile/MerchantAccountEducationView.swift; sourceTree = SOURCE_ROOT; };
+		B18000000000000000000002 /* MerchantAccountOnboardingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/MerchantAccountOnboardingTests.swift; sourceTree = SOURCE_ROOT; };
+		B19000000000000000000001 /* CallOverlayWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Calls/CallOverlayWindow.swift; sourceTree = SOURCE_ROOT; };
+		B19000000000000000000002 /* KitChatWallpaper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Design/KitChatWallpaper.swift; sourceTree = SOURCE_ROOT; };
+		BF1000000000000000000001 /* AppLaunchUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayUITests/AppLaunchUITests.swift; sourceTree = SOURCE_ROOT; };
+		BF1000000000000000000002 /* KitPayUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = KitPayUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		C10000000000000000000001 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (AA0000000000000000000003 /* LiveKit in Frameworks */,); runOnlyForDeploymentPostprocessing = 0; };
+		C30000000000000000000001 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		CF1000000000000000000002 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		D10000000000000000000001 = {
+			isa = PBXGroup;
+			children = (
+				D10000000000000000000002 /* Sources */,
+				D30000000000000000000001 /* Tests */,
+				DF1000000000000000000001 /* KitPayUITests */,
+				D10000000000000000000003 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		D10000000000000000000002 /* Sources */ = {
+			isa = PBXGroup;
+			children = (
+				B10000000000000000000001, B10000000000000000000002, B10000000000000000000003,
+				B10000000000000000000004, B10000000000000000000005, B10000000000000000000006,
+				B10000000000000000000007, B10000000000000000000008, B10000000000000000000009,
+				B1000000000000000000000A, B1000000000000000000000B, B1000000000000000000000C,
+				B1000000000000000000000D, B1000000000000000000000E, B1000000000000000000000F,
+				B10000000000000000000010, B10000000000000000000011, B10000000000000000000012,
+				B10000000000000000000013,
+				B10000000000000000000015,
+				B10000000000000000000016 /* BiometricAuthentication.swift */,
+				B10000000000000000000017 /* SecurityView.swift */,
+				B20000000000000000000001,
+				B20000000000000000000002,
+				B40000000000000000000001,
+				B40000000000000000000002,
+				B40000000000000000000003,
+				B50000000000000000000001,
+				B50000000000000000000002,
+				B60000000000000000000001,
+				B60000000000000000000002,
+				B60000000000000000000003,
+				B60000000000000000000004,
+				B70000000000000000000001,
+				B70000000000000000000002,
+				B70000000000000000000003,
+				B80000000000000000000001,
+				B90000000000000000000001,
+				B90000000000000000000002,
+				B90000000000000000000003,
+				BA0000000000000000000001,
+				BA0000000000000000000002,
+				BB0000000000000000000001,
+				BB0000000000000000000002,
+				BC0000000000000000000001 /* SecureMessagingCrypto.swift */,
+				BC0000000000000000000002 /* SignalProtocolStore.swift */,
+				BC0000000000000000000003 /* SecureMessagingMapper.swift */,
+				BD0000000000000000000001 /* ContactSyncRetryPolicy.swift */,
+				BE0000000000000000000001 /* SecureMessagingCoordinator.swift */,
+				B00000000000000000000001 /* MobileMoneyModels.swift */,
+				B00000000000000000000002 /* APIClient+MobileMoney.swift */,
+				B00000000000000000000003 /* MobileMoneyView.swift */,
+				B00000000000000000000004 /* MerchantQRModels.swift */,
+				B00000000000000000000005 /* APIClient+MerchantQR.swift */,
+				B00000000000000000000006 /* MerchantQRViews.swift */,
+				B00000000000000000000008 /* PaymentInputFormatting.swift */,
+				B12000000000000000000001 /* ConversationSound.swift */,
+				B12000000000000000000003 /* knock_brush.mp3 */,
+				B12000000000000000000004 /* knock_brush.caf */,
+				B13000000000000000000001 /* BankTransferModels.swift */,
+				B13000000000000000000002 /* APIClient+BankTransfers.swift */,
+				B13000000000000000000003 /* BankTransferView.swift */,
+				B15000000000000000000001 /* CommunicationPrivacyModels.swift */,
+				B15000000000000000000002 /* APIClient+CommunicationPrivacy.swift */,
+				B15000000000000000000003 /* CommunicationPrivacyView.swift */,
+				BEE000000000000000000001 /* APIClient+ProfileEmail.swift */,
+				BEE000000000000000000002 /* ProfileEmailView.swift */,
+				B16000000000000000000001 /* LegalPresentation.swift */,
+				B16000000000000000000002 /* LegalPrivacyView.swift */,
+				B16000000000000000000003 /* AGPL-3.0-only.txt */,
+				B16000000000000000000004 /* THIRD_PARTY_NOTICES.txt */,
+				B17000000000000000000001 /* AccountDeletionModels.swift */,
+				B17000000000000000000002 /* APIClient+AccountDeletion.swift */,
+				B17000000000000000000003 /* AccountDeletionView.swift */,
+				B18000000000000000000001 /* MerchantAccountEducationView.swift */,
+				B19000000000000000000001 /* CallOverlayWindow.swift */,
+				B19000000000000000000002 /* KitChatWallpaper.swift */,
+			);
+			name = KitPay;
+			sourceTree = "<group>";
+		};
+		D10000000000000000000003 /* Products */ = {isa = PBXGroup; children = (B10000000000000000000014 /* KitPay.app */, B30000000000000000000003 /* KitPayTests.xctest */, BF1000000000000000000002 /* KitPayUITests.xctest */,); name = Products; sourceTree = "<group>"; };
+		D30000000000000000000001 /* Tests */ = {
+			isa = PBXGroup;
+			children = (
+				B30000000000000000000001 /* SecureLocalStoreTests.swift */,
+				B30000000000000000000002 /* OutboxPolicyTests.swift */,
+				B30000000000000000000004 /* WalletAPIEncodingTests.swift */,
+				B30000000000000000000005 /* BiometricAuthenticationTests.swift */,
+				B40000000000000000000004 /* ProviderAPIEncodingTests.swift */,
+				B50000000000000000000003 /* AccountSetupPolicyTests.swift */,
+				B60000000000000000000005 /* ContactSyncTests.swift */,
+				B70000000000000000000004 /* PaymentRequestTests.swift */,
+				B90000000000000000000004 /* CallLifecycleTests.swift */,
+				BB0000000000000000000003 /* MessagingAPIContractTests.swift */,
+				BC0000000000000000000004 /* SecureMessagingCryptoTests.swift */,
+				BD0000000000000000000002 /* ContactSyncRetryPolicyTests.swift */,
+				BF0000000000000000000001 /* SecureMessagingCoordinatorTests.swift */,
+				B00000000000000000000007 /* PaymentRailContractTests.swift */,
+				B11000000000000000000001 /* PushRegistrationTests.swift */,
+				B12000000000000000000002 /* ConversationSoundTests.swift */,
+				B13000000000000000000004 /* BankTransferContractTests.swift */,
+				B14000000000000000000001 /* RegisteredDevicePolicyTests.swift */,
+				B15000000000000000000004 /* CommunicationPrivacyContractTests.swift */,
+				BEE000000000000000000003 /* ProfileEmailContractTests.swift */,
+				B16000000000000000000005 /* LegalURLPolicyTests.swift */,
+				B17000000000000000000004 /* AccountDeletionContractTests.swift */,
+				B18000000000000000000002 /* MerchantAccountOnboardingTests.swift */,
+				B20000000000000000000009 /* AppLifecyclePolicyTests.swift */,
+			);
+			name = KitPayTests;
+			sourceTree = "<group>";
+		};
+		DF1000000000000000000001 /* KitPayUITests */ = {
+			isa = PBXGroup;
+			children = (
+				BF1000000000000000000001 /* AppLaunchUITests.swift */,
+			);
+			name = KitPayUITests;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		E10000000000000000000001 /* KitPay */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = F10000000000000000000002 /* Build configuration list for PBXNativeTarget "KitPay" */;
+			buildPhases = (C10000000000000000000002 /* Sources */, C10000000000000000000001 /* Frameworks */, C10000000000000000000003 /* Resources */);
+			buildRules = ();
+			dependencies = ();
+			name = KitPay;
+			packageProductDependencies = (D90000000000000000000001 /* LiveKit */,);
+			productName = KitPay;
+			productReference = B10000000000000000000014 /* KitPay.app */;
+			productType = "com.apple.product-type.application";
+		};
+		E30000000000000000000001 /* KitPayTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = F30000000000000000000003 /* Build configuration list for PBXNativeTarget "KitPayTests" */;
+			buildPhases = (C30000000000000000000002 /* Sources */, C30000000000000000000001 /* Frameworks */, C30000000000000000000003 /* Resources */);
+			buildRules = ();
+			dependencies = (C30000000000000000000005 /* PBXTargetDependency */,);
+			name = KitPayTests;
+			productName = KitPayTests;
+			productReference = B30000000000000000000003 /* KitPayTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+		EF1000000000000000000001 /* KitPayUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = FF1000000000000000000003 /* Build configuration list for PBXNativeTarget "KitPayUITests" */;
+			buildPhases = (CF1000000000000000000001 /* Sources */, CF1000000000000000000002 /* Frameworks */);
+			buildRules = ();
+			dependencies = (CF1000000000000000000003 /* PBXTargetDependency */,);
+			name = KitPayUITests;
+			productName = KitPayUITests;
+			productReference = BF1000000000000000000002 /* KitPayUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		E10000000000000000000002 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {BuildIndependentTargetsInParallel = 1; LastSwiftUpdateCheck = 2600; LastUpgradeCheck = 2600; TargetAttributes = {E10000000000000000000001 = {CreatedOnToolsVersion = 26.0; }; E30000000000000000000001 = {CreatedOnToolsVersion = 26.0; TestTargetID = E10000000000000000000001; }; EF1000000000000000000001 = {CreatedOnToolsVersion = 26.0; TestTargetID = E10000000000000000000001; };};};
+			buildConfigurationList = F10000000000000000000001 /* Build configuration list for PBXProject "KitPay" */;
+			compatibilityVersion = "Xcode 15.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (en, Base,);
+			mainGroup = D10000000000000000000001;
+			packageReferences = (D90000000000000000000002 /* XCRemoteSwiftPackageReference "client-sdk-swift" */,);
+			productRefGroup = D10000000000000000000003 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (E10000000000000000000001 /* KitPay */, E30000000000000000000001 /* KitPayTests */, EF1000000000000000000001 /* KitPayUITests */,);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		C10000000000000000000003 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000011 /* Assets.xcassets in Resources */, A80000000000000000000001 /* PrivacyInfo.xcprivacy in Resources */, A12000000000000000000003 /* knock_brush.mp3 in Resources */, A12000000000000000000004 /* knock_brush.caf in Resources */, A16000000000000000000003 /* AGPL-3.0-only.txt in Resources */, A16000000000000000000004 /* THIRD_PARTY_NOTICES.txt in Resources */,); runOnlyForDeploymentPostprocessing = 0; };
+		C30000000000000000000003 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		C10000000000000000000002 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A10000000000000000000001, A10000000000000000000002, A10000000000000000000003,
+				A10000000000000000000004, A10000000000000000000005, A10000000000000000000006,
+				A10000000000000000000007, A10000000000000000000008, A10000000000000000000009,
+				A1000000000000000000000A, A1000000000000000000000B, A1000000000000000000000C,
+				A1000000000000000000000D, A1000000000000000000000E, A1000000000000000000000F,
+				A10000000000000000000010,
+				A10000000000000000000012,
+				A10000000000000000000013 /* BiometricAuthentication.swift in Sources */,
+				A10000000000000000000014 /* SecurityView.swift in Sources */,
+				A20000000000000000000001,
+				A20000000000000000000002,
+				A40000000000000000000001 /* ProviderModels.swift in Sources */,
+				A40000000000000000000002 /* APIClient+Providers.swift in Sources */,
+				A40000000000000000000003 /* ProviderFlowViews.swift in Sources */,
+				A50000000000000000000001 /* AccountSetup.swift in Sources */,
+				A50000000000000000000002 /* AccountSetupView.swift in Sources */,
+				A60000000000000000000001 /* ContactSyncModels.swift in Sources */,
+				A60000000000000000000002 /* APIClient+Contacts.swift in Sources */,
+				A60000000000000000000003 /* ContactSynchronizer.swift in Sources */,
+				A60000000000000000000004 /* ContactSyncButton.swift in Sources */,
+				A70000000000000000000001 /* PaymentRequestModels.swift in Sources */,
+				A70000000000000000000002 /* APIClient+PaymentRequests.swift in Sources */,
+				A70000000000000000000003 /* PaymentRequestsView.swift in Sources */,
+				A90000000000000000000001 /* APIClient+Calls.swift in Sources */,
+				A90000000000000000000002 /* CallLifecycle.swift in Sources */,
+				A90000000000000000000003 /* CallMediaHandoff.swift in Sources */,
+				AA0000000000000000000001 /* CallMediaCoordinator.swift in Sources */,
+				AA0000000000000000000002 /* ActiveCallView.swift in Sources */,
+				AB0000000000000000000001 /* MessagingAPIModels.swift in Sources */,
+				AB0000000000000000000002 /* APIClient+Messaging.swift in Sources */,
+				AC0000000000000000000001 /* SecureMessagingCrypto.swift in Sources */,
+				AC0000000000000000000002 /* SignalProtocolStore.swift in Sources */,
+				AC0000000000000000000003 /* SecureMessagingMapper.swift in Sources */,
+				AD0000000000000000000001 /* ContactSyncRetryPolicy.swift in Sources */,
+				AE0000000000000000000001 /* SecureMessagingCoordinator.swift in Sources */,
+				A00000000000000000000001 /* MobileMoneyModels.swift in Sources */,
+				A00000000000000000000002 /* APIClient+MobileMoney.swift in Sources */,
+				A00000000000000000000003 /* MobileMoneyView.swift in Sources */,
+				A00000000000000000000004 /* MerchantQRModels.swift in Sources */,
+				A00000000000000000000005 /* APIClient+MerchantQR.swift in Sources */,
+				A00000000000000000000006 /* MerchantQRViews.swift in Sources */,
+				A00000000000000000000008 /* PaymentInputFormatting.swift in Sources */,
+				A12000000000000000000001 /* ConversationSound.swift in Sources */,
+				A13000000000000000000001 /* BankTransferModels.swift in Sources */,
+				A13000000000000000000002 /* APIClient+BankTransfers.swift in Sources */,
+				A13000000000000000000003 /* BankTransferView.swift in Sources */,
+				A15000000000000000000001 /* CommunicationPrivacyModels.swift in Sources */,
+				A15000000000000000000002 /* APIClient+CommunicationPrivacy.swift in Sources */,
+				A15000000000000000000003 /* CommunicationPrivacyView.swift in Sources */,
+				AEE000000000000000000001 /* APIClient+ProfileEmail.swift in Sources */,
+				AEE000000000000000000002 /* ProfileEmailView.swift in Sources */,
+				A16000000000000000000001 /* LegalPresentation.swift in Sources */,
+				A16000000000000000000002 /* LegalPrivacyView.swift in Sources */,
+				A17000000000000000000001 /* AccountDeletionModels.swift in Sources */,
+				A17000000000000000000002 /* APIClient+AccountDeletion.swift in Sources */,
+				A17000000000000000000003 /* AccountDeletionView.swift in Sources */,
+				A18000000000000000000001 /* MerchantAccountEducationView.swift in Sources */,
+				A19000000000000000000001 /* CallOverlayWindow.swift in Sources */,
+				A19000000000000000000002 /* KitChatWallpaper.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		C30000000000000000000002 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A30000000000000000000001 /* SecureLocalStoreTests.swift in Sources */,
+				A30000000000000000000002 /* OutboxPolicyTests.swift in Sources */,
+				A30000000000000000000003 /* WalletAPIEncodingTests.swift in Sources */,
+				A30000000000000000000005 /* BiometricAuthenticationTests.swift in Sources */,
+				A40000000000000000000004 /* ProviderAPIEncodingTests.swift in Sources */,
+				A50000000000000000000003 /* AccountSetupPolicyTests.swift in Sources */,
+				A60000000000000000000005 /* ContactSyncTests.swift in Sources */,
+				A70000000000000000000004 /* PaymentRequestTests.swift in Sources */,
+				A90000000000000000000004 /* CallLifecycleTests.swift in Sources */,
+				AB0000000000000000000003 /* MessagingAPIContractTests.swift in Sources */,
+				AC0000000000000000000004 /* SecureMessagingCryptoTests.swift in Sources */,
+				AD0000000000000000000002 /* ContactSyncRetryPolicyTests.swift in Sources */,
+				AF0000000000000000000001 /* SecureMessagingCoordinatorTests.swift in Sources */,
+				A00000000000000000000007 /* PaymentRailContractTests.swift in Sources */,
+				A11000000000000000000001 /* PushRegistrationTests.swift in Sources */,
+				A12000000000000000000002 /* ConversationSoundTests.swift in Sources */,
+				A13000000000000000000004 /* BankTransferContractTests.swift in Sources */,
+				A14000000000000000000001 /* RegisteredDevicePolicyTests.swift in Sources */,
+				A15000000000000000000004 /* CommunicationPrivacyContractTests.swift in Sources */,
+				AEE000000000000000000003 /* ProfileEmailContractTests.swift in Sources */,
+				A16000000000000000000005 /* LegalURLPolicyTests.swift in Sources */,
+				A17000000000000000000004 /* AccountDeletionContractTests.swift in Sources */,
+				A18000000000000000000002 /* MerchantAccountOnboardingTests.swift in Sources */,
+				A20000000000000000000009 /* AppLifecyclePolicyTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		CF1000000000000000000001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				AF1000000000000000000001 /* AppLaunchUITests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		C30000000000000000000005 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = E10000000000000000000001 /* KitPay */;
+			targetProxy = C30000000000000000000004 /* PBXContainerItemProxy */;
+		};
+		CF1000000000000000000003 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = E10000000000000000000001 /* KitPay */;
+			targetProxy = CF1000000000000000000004 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		F20000000000000000000001 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {ALWAYS_SEARCH_USER_PATHS = NO; CLANG_ENABLE_MODULES = YES; CLANG_ENABLE_OBJC_ARC = YES; COPY_PHASE_STRIP = NO; DEBUG_INFORMATION_FORMAT = dwarf; ENABLE_TESTABILITY = YES; GCC_C_LANGUAGE_STANDARD = gnu17; GCC_OPTIMIZATION_LEVEL = 0; IPHONEOS_DEPLOYMENT_TARGET = 17.0; ONLY_ACTIVE_ARCH = YES; SDKROOT = iphoneos; SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)"; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; }; name = Debug; };
+		F20000000000000000000002 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {ALWAYS_SEARCH_USER_PATHS = NO; CLANG_ENABLE_MODULES = YES; CLANG_ENABLE_OBJC_ARC = YES; COPY_PHASE_STRIP = NO; DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym"; ENABLE_NS_ASSERTIONS = NO; GCC_C_LANGUAGE_STANDARD = gnu17; IPHONEOS_DEPLOYMENT_TARGET = 17.0; SDKROOT = iphoneos; SWIFT_COMPILATION_MODE = wholemodule; SWIFT_OPTIMIZATION_LEVEL = "-O"; VALIDATE_PRODUCT = YES; }; name = Release; };
+		F20000000000000000000003 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {APS_ENVIRONMENT = development; ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_ENTITLEMENTS = KitPay/KitPay.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 13; DEVELOPMENT_TEAM = AU55CKVJ55; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = KitPay/Info.plist; KIT_CORRESPONDING_SOURCE_URL = ""; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"; MARKETING_VERSION = 0.2.5; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Debug; };
+		F20000000000000000000004 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {APS_ENVIRONMENT = production; ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_ENTITLEMENTS = KitPay/KitPay.entitlements; CODE_SIGN_IDENTITY = "Apple Distribution"; CODE_SIGN_STYLE = Manual; CURRENT_PROJECT_VERSION = 13; DEVELOPMENT_TEAM = "$(KITPAY_APPLE_TEAM_ID)"; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = KitPay/Info.plist; KIT_CORRESPONDING_SOURCE_URL = ""; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"; MARKETING_VERSION = 0.2.5; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios; PRODUCT_NAME = "$(TARGET_NAME)"; PROVISIONING_PROFILE_SPECIFIER = "$(KITPAY_PROFILE_UUID)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Release; };
+		F30000000000000000000001 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {BUNDLE_LOADER = "$(TEST_HOST)"; CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = AU55CKVJ55; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks @loader_path/Frameworks"; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios.tests; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_EMIT_LOC_STRINGS = NO; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/KitPay.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/KitPay"; }; name = Debug; };
+		F30000000000000000000002 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {BUNDLE_LOADER = "$(TEST_HOST)"; CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = AU55CKVJ55; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks @loader_path/Frameworks"; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios.tests; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_EMIT_LOC_STRINGS = NO; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/KitPay.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/KitPay"; }; name = Release; };
+		FF1000000000000000000001 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = AU55CKVJ55; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks @loader_path/Frameworks"; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios.uitests; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_EMIT_LOC_STRINGS = NO; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; TEST_TARGET_NAME = KitPay;}; name = Debug; };
+		FF1000000000000000000002 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = AU55CKVJ55; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks @loader_path/Frameworks"; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios.uitests; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_EMIT_LOC_STRINGS = NO; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; TEST_TARGET_NAME = KitPay;}; name = Release; };
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		F10000000000000000000001 /* Project */ = {isa = XCConfigurationList; buildConfigurations = (F20000000000000000000001, F20000000000000000000002,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		F10000000000000000000002 /* Target */ = {isa = XCConfigurationList; buildConfigurations = (F20000000000000000000003, F20000000000000000000004,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		F30000000000000000000003 /* Build configuration list for PBXNativeTarget "KitPayTests" */ = {isa = XCConfigurationList; buildConfigurations = (F30000000000000000000001, F30000000000000000000002,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		FF1000000000000000000003 /* Build configuration list for PBXNativeTarget "KitPayUITests" */ = {isa = XCConfigurationList; buildConfigurations = (FF1000000000000000000001, FF1000000000000000000002,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+/* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		D90000000000000000000002 /* XCRemoteSwiftPackageReference "client-sdk-swift" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/livekit/client-sdk-swift.git";
+			requirement = {
+				kind = exactVersion;
+				version = 2.16.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		D90000000000000000000001 /* LiveKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = D90000000000000000000002 /* XCRemoteSwiftPackageReference "client-sdk-swift" */;
+			productName = LiveKit;
+		};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = E10000000000000000000002 /* Project object */;
+}

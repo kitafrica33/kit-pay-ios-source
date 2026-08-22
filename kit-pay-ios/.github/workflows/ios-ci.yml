@@ -1,0 +1,70 @@
+name: iOS quality
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Test release validators
+        run: python3 -m unittest discover -s .github/scripts/tests -p 'test_ios_signing.py'
+      - name: Select current Xcode
+        run: sudo xcode-select --switch /Applications/Xcode.app
+      - name: Install pinned native dependencies
+        run: pod install --repo-update
+      - name: Validate project and compile for Simulator
+        run: |
+          set -euo pipefail
+          xcodebuild -workspace KitPay.xcworkspace -scheme KitPay -list
+          xcodebuild \
+            -workspace KitPay.xcworkspace \
+            -scheme KitPay \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            SWIFT_ENABLE_EXPLICIT_MODULES=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            clean build
+      # Ad-hoc signed for the Simulator rather than unsigned. An unsigned app has no
+      # application-identifier entitlement, so every Keychain read returns
+      # errSecMissingEntitlement — and Kit Pay fails closed on that, parking the launch on its
+      # "Unlocking protected data" recovery screen. Correct behaviour, but it means an unsigned
+      # test run can never get past launch. Simulator signing needs no certificate.
+      - name: Run unit and UI tests
+        run: |
+          set -euo pipefail
+          DEVICE_ID="$(xcrun simctl list devices available -j | python3 -c 'import json,sys; data=json.load(sys.stdin)["devices"]; print(next(device["udid"] for devices in data.values() for device in devices if device.get("isAvailable") and device["name"].startswith("iPhone")))')"
+          # Pre-answer the Contacts prompt. AppModel asks for Contacts at launch and skips it only
+          # for unit-test hosts, which a UI test is not: the app runs as its own process, so the
+          # system alert appears and nothing in an unattended run taps it. While that alert is up
+          # the scene is not active, and the app — correctly — covers its sign-in form with
+          # "Authentication details hidden", so no UI test can ever get past launch.
+          xcrun simctl boot "$DEVICE_ID" >/dev/null 2>&1 || true
+          xcrun simctl bootstatus "$DEVICE_ID" -b >/dev/null 2>&1 || true
+          xcrun simctl privacy "$DEVICE_ID" grant contacts africa.kit.pay.ios || true
+          xcodebuild \
+            -workspace KitPay.xcworkspace \
+            -scheme KitPay \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination "platform=iOS Simulator,id=${DEVICE_ID}" \
+            -parallel-testing-enabled NO \
+            SWIFT_ENABLE_EXPLICIT_MODULES=NO \
+            CODE_SIGN_IDENTITY=- \
+            CODE_SIGN_STYLE=Manual \
+            PROVISIONING_PROFILE_SPECIFIER= \
+            DEVELOPMENT_TEAM= \
+            test
