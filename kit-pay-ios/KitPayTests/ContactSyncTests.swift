@@ -788,14 +788,14 @@ final class ContactSyncTests: XCTestCase {
                 phone: String(format: "0700%06d", index)
             )
         }
-        phones.append(DeviceContactPhone(name: "ExampleContact", phone: "0700000001"))
+        phones.append(DeviceContactPhone(name: "ExampleContact", phone: "0701000001"))
 
         let snapshot = ContactSyncNormalizer.snapshot(from: phones)
 
         XCTAssertEqual(snapshot.contacts.count, 10_001)
         XCTAssertEqual(snapshot.omittedCount, 0)
         XCTAssertEqual(snapshot.contacts.last?.name, "ExampleContact")
-        XCTAssertEqual(snapshot.contacts.last?.phone, "+256700000001")
+        XCTAssertEqual(snapshot.contacts.last?.phone, "+256701000001")
     }
 
     func testDeniedAccessNeverReadsOrUploadsContacts() async {

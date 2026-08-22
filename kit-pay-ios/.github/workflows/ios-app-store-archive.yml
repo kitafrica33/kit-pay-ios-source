@@ -20,7 +20,7 @@ on:
       corresponding_source_url:
         description: >-
           Exact public AGPL corresponding-source release URL for this build, for example
-          https://github.com/kitafrica33/kit-pay-ios-source/releases/tag/v0.2.5-build14 .
+          https://github.com/kitafrica33/kit-pay-ios-source/releases/tag/v0.2.5-build15 .
           The archive is rejected unless this tagged release is already publicly available.
         required: true
         type: string
