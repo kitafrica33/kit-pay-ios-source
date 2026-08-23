@@ -42,6 +42,7 @@ _UUID_PATTERN = re.compile(
 _RESOURCE_ID_PATTERN = re.compile(r"[A-Za-z0-9._:-]{1,256}")
 _BUNDLE_ID_PATTERN = re.compile(r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
 _PROFILE_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._()-]{0,99}")
+_IOS_BUNDLE_ID_PLATFORMS = {"IOS", "UNIVERSAL"}
 _DISTRIBUTION_CERTIFICATE_TYPES = {"DISTRIBUTION", "IOS_DISTRIBUTION"}
 _TRANSIENT_HTTP_STATUSES = frozenset({429, 500, 502, 503, 504})
 _PROFILE_CREATION_RETRYABLE_HTTP_STATUSES = _TRANSIENT_HTTP_STATUSES | {409}
@@ -292,7 +293,6 @@ def _find_bundle_id(client: object, bundle_id: str) -> str:
         "/v1/bundleIds",
         query={
             "filter[identifier]": bundle_id,
-            "filter[platform]": "IOS",
             "fields[bundleIds]": "identifier,platform",
             "limit": "2",
         },
@@ -302,7 +302,10 @@ def _find_bundle_id(client: object, bundle_id: str) -> str:
     matches: list[str] = []
     for candidate in _collection(response, "bundle ID"):
         resource_id, attributes = _resource(candidate, "bundleIds", "bundle ID")
-        if attributes.get("identifier") == bundle_id and attributes.get("platform") == "IOS":
+        if (
+            attributes.get("identifier") == bundle_id
+            and attributes.get("platform") in _IOS_BUNDLE_ID_PLATFORMS
+        ):
             matches.append(resource_id)
     if len(matches) != 1:
         _fail("The exact explicit iOS bundle ID was not found uniquely.")
@@ -344,7 +347,6 @@ def _load_icloud_capability(client: object, bundle_resource_id: str) -> tuple[st
         f"/v1/bundleIds/{urllib.parse.quote(bundle_resource_id, safe='')}/bundleIdCapabilities",
         query={
             "fields[bundleIdCapabilities]": "capabilityType,settings",
-            "limit": "50",
         },
         expected_status=200,
         operation="bundle capability lookup",
@@ -489,7 +491,11 @@ def _find_distribution_certificate(client: object, certificate_der: bytes) -> st
             continue
         if attributes.get("activated") is not True:
             _fail("The imported distribution certificate is not active.")
-        if attributes.get("platform") not in {"IOS", "UNIVERSAL"}:
+        platform = attributes.get("platform")
+        generic_platform_unspecified = (
+            certificate_type == "DISTRIBUTION" and platform is None
+        )
+        if platform not in {"IOS", "UNIVERSAL"} and not generic_platform_unspecified:
             _fail("The imported distribution certificate is not valid for iOS.")
         if _parse_api_date(attributes.get("expirationDate"), "certificate expiration") <= now:
             _fail("The imported distribution certificate has expired.")

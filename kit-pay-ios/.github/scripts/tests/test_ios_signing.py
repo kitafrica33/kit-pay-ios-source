@@ -107,13 +107,28 @@ def capability_resource(
     }
 
 
+def bundle_resource(
+    platform: str,
+    *,
+    resource_id: str = "bundle-resource",
+) -> dict[str, object]:
+    return {
+        "type": "bundleIds",
+        "id": resource_id,
+        "attributes": {
+            "identifier": BUNDLE,
+            "platform": platform,
+        },
+    }
+
+
 def certificate_resource(
     content: bytes,
     *,
     resource_id: str = "distribution-certificate",
     activated: bool = True,
     expiration: str = "2999-01-01T00:00:00Z",
-    platform: str = "IOS",
+    platform: str | None = "IOS",
     certificate_type: str = "DISTRIBUTION",
 ) -> dict[str, object]:
     return {
@@ -296,6 +311,54 @@ class PrepareIOSSigningTests(unittest.TestCase):
 
 
 class AppStoreProfileGeneratorTests(unittest.TestCase):
+    def test_bundle_lookup_accepts_exact_ios_and_universal_bundle(self) -> None:
+        for platform in ("IOS", "UNIVERSAL"):
+            with self.subTest(platform=platform):
+                client = FakeAppStoreConnectClient(
+                    [api_collection([bundle_resource(platform)])]
+                )
+
+                result = PROFILE_GENERATOR._find_bundle_id(client, BUNDLE)
+
+                self.assertEqual(result, "bundle-resource")
+                self.assertEqual(
+                    client.calls[0]["query"],
+                    {
+                        "filter[identifier]": BUNDLE,
+                        "fields[bundleIds]": "identifier,platform",
+                        "limit": "2",
+                    },
+                )
+
+    def test_bundle_lookup_rejects_mac_platform(self) -> None:
+        client = FakeAppStoreConnectClient(
+            [api_collection([bundle_resource("MAC_OS")])]
+        )
+
+        with self.assertRaisesRegex(
+            PROFILE_GENERATOR.ProvisioningError,
+            "not found uniquely",
+        ):
+            PROFILE_GENERATOR._find_bundle_id(client, BUNDLE)
+
+    def test_bundle_lookup_rejects_duplicate_exact_matches(self) -> None:
+        client = FakeAppStoreConnectClient(
+            [
+                api_collection(
+                    [
+                        bundle_resource("IOS", resource_id="first-bundle"),
+                        bundle_resource("UNIVERSAL", resource_id="second-bundle"),
+                    ]
+                )
+            ]
+        )
+
+        with self.assertRaisesRegex(
+            PROFILE_GENERATOR.ProvisioningError,
+            "not found uniquely",
+        ):
+            PROFILE_GENERATOR._find_bundle_id(client, BUNDLE)
+
     def test_existing_xcode6_capability_is_verified_without_mutation(self) -> None:
         existing = capability_resource("XCODE_6")
         client = FakeAppStoreConnectClient([api_collection([existing])])
@@ -305,6 +368,10 @@ class AppStoreProfileGeneratorTests(unittest.TestCase):
         self.assertEqual([call["method"] for call in client.calls], ["GET"])
         self.assertTrue(
             all("/bundleIdCapabilities" in str(call["path"]) for call in client.calls)
+        )
+        self.assertEqual(
+            client.calls[0]["query"],
+            {"fields[bundleIdCapabilities]": "capabilityType,settings"},
         )
 
     def test_missing_capability_uses_exact_creation_body(self) -> None:
@@ -517,6 +584,34 @@ class AppStoreProfileGeneratorTests(unittest.TestCase):
                 "limit": "200",
             },
         )
+
+    def test_generic_distribution_certificate_accepts_omitted_platform(self) -> None:
+        certificate = certificate_resource(CERTIFICATE_DER, platform=None)
+        client = FakeAppStoreConnectClient([api_collection([certificate])])
+
+        result = PROFILE_GENERATOR._find_distribution_certificate(
+            client,
+            CERTIFICATE_DER,
+        )
+
+        self.assertEqual(result, "distribution-certificate")
+
+    def test_ios_distribution_certificate_requires_platform(self) -> None:
+        certificate = certificate_resource(
+            CERTIFICATE_DER,
+            platform=None,
+            certificate_type="IOS_DISTRIBUTION",
+        )
+        client = FakeAppStoreConnectClient([api_collection([certificate])])
+
+        with self.assertRaisesRegex(
+            PROFILE_GENERATOR.ProvisioningError,
+            "not valid for iOS",
+        ):
+            PROFILE_GENERATOR._find_distribution_certificate(
+                client,
+                CERTIFICATE_DER,
+            )
 
     def test_distribution_certificate_rejects_invalid_matches(self) -> None:
         cases = (
