@@ -126,7 +126,7 @@ def certificate_resource(
     content: bytes,
     *,
     resource_id: str = "distribution-certificate",
-    activated: bool = True,
+    activated: object = True,
     expiration: str = "2999-01-01T00:00:00Z",
     platform: str | None = "IOS",
     certificate_type: str = "DISTRIBUTION",
@@ -595,6 +595,38 @@ class AppStoreProfileGeneratorTests(unittest.TestCase):
         )
 
         self.assertEqual(result, "distribution-certificate")
+
+    def test_distribution_certificate_accepts_omitted_activation_state(self) -> None:
+        certificate = certificate_resource(CERTIFICATE_DER, platform=None)
+        attributes = certificate["attributes"]
+        self.assertIsInstance(attributes, dict)
+        attributes.pop("activated")
+        client = FakeAppStoreConnectClient([api_collection([certificate])])
+
+        result = PROFILE_GENERATOR._find_distribution_certificate(
+            client,
+            CERTIFICATE_DER,
+        )
+
+        self.assertEqual(result, "distribution-certificate")
+
+    def test_distribution_certificate_rejects_invalid_activation_state(self) -> None:
+        for invalid_state in (None, "true", 1, [], {}):
+            with self.subTest(invalid_state=invalid_state):
+                certificate = certificate_resource(
+                    CERTIFICATE_DER,
+                    activated=invalid_state,
+                )
+                client = FakeAppStoreConnectClient([api_collection([certificate])])
+
+                with self.assertRaisesRegex(
+                    PROFILE_GENERATOR.ProvisioningError,
+                    "invalid certificate activation state",
+                ):
+                    PROFILE_GENERATOR._find_distribution_certificate(
+                        client,
+                        CERTIFICATE_DER,
+                    )
 
     def test_ios_distribution_certificate_requires_platform(self) -> None:
         certificate = certificate_resource(

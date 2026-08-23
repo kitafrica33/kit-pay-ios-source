@@ -489,8 +489,14 @@ def _find_distribution_certificate(client: object, certificate_der: bytes) -> st
         )
         if not hmac.compare_digest(content, certificate_der):
             continue
-        if attributes.get("activated") is not True:
-            _fail("The imported distribution certificate is not active.")
+        if "activated" in attributes:
+            activated = attributes["activated"]
+            if not isinstance(activated, bool):
+                _fail(
+                    "App Store Connect returned an invalid certificate activation state."
+                )
+            if not activated:
+                _fail("The imported distribution certificate is not active.")
         platform = attributes.get("platform")
         generic_platform_unspecified = (
             certificate_type == "DISTRIBUTION" and platform is None
