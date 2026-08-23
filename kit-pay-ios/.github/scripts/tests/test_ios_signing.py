@@ -19,6 +19,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[3]
 PREPARE = ROOT / ".github/scripts/prepare_ios_signing.py"
 VERIFY = ROOT / ".github/scripts/verify_ios_archive.py"
 PROFILE_GENERATOR_PATH = ROOT / ".github/scripts/create_ios_app_store_profile.py"
+PROFILE_ENTITLEMENTS_PATH = ROOT / ".github/scripts/ios_profile_entitlements.py"
 CLOUDKIT_HELPER = ROOT / ".github/scripts/prepare_cloudkit_schema.py"
 CLOUDKIT_SCHEMA = ROOT / ".github/cloudkit/KitMessageBackup.ckdb"
 TEAM = "A1B2C3D4E5"
@@ -42,6 +43,15 @@ if PROFILE_GENERATOR_SPEC is None or PROFILE_GENERATOR_SPEC.loader is None:
 PROFILE_GENERATOR = importlib.util.module_from_spec(PROFILE_GENERATOR_SPEC)
 sys.modules[PROFILE_GENERATOR_SPEC.name] = PROFILE_GENERATOR
 PROFILE_GENERATOR_SPEC.loader.exec_module(PROFILE_GENERATOR)
+
+PROFILE_ENTITLEMENTS_SPEC = importlib.util.spec_from_file_location(
+    "kitpay_ios_profile_entitlements",
+    PROFILE_ENTITLEMENTS_PATH,
+)
+if PROFILE_ENTITLEMENTS_SPEC is None or PROFILE_ENTITLEMENTS_SPEC.loader is None:
+    raise RuntimeError("Could not load ios_profile_entitlements.py")
+PROFILE_ENTITLEMENTS = importlib.util.module_from_spec(PROFILE_ENTITLEMENTS_SPEC)
+PROFILE_ENTITLEMENTS_SPEC.loader.exec_module(PROFILE_ENTITLEMENTS)
 
 
 def write_plist(path: pathlib.Path, value: dict) -> None:
@@ -144,6 +154,55 @@ def certificate_resource(
     }
 
 
+class IOSProfileEntitlementAuthorizationTests(unittest.TestCase):
+    def test_cloudkit_service_authorization_matrix(self) -> None:
+        cases = (
+            ("wildcard", "*", True),
+            ("exact-list", ["CloudKit"], True),
+            ("superset-list", ["CloudKit", "CloudDocuments"], True),
+            ("duplicate-list", ["CloudKit", "CloudKit"], True),
+            ("cloudkit-and-wildcard-list", ["CloudKit", "*"], True),
+            ("scalar-cloudkit", "CloudKit", False),
+            ("wildcard-list", ["*"], False),
+            ("missing-or-null", None, False),
+            ("empty-list", [], False),
+            ("nonstring-scalar", 1, False),
+            ("nonstring-list", ["CloudKit", 1], False),
+            ("list-without-cloudkit", ["CloudDocuments"], False),
+        )
+
+        for label, value, expected in cases:
+            with self.subTest(label=label):
+                self.assertIs(
+                    PROFILE_ENTITLEMENTS.authorizes_cloudkit(value),
+                    expected,
+                )
+
+    def test_production_icloud_environment_authorization_matrix(self) -> None:
+        cases = (
+            ("scalar-production", "Production", True),
+            ("production-list", ["Production"], True),
+            ("known-superset-list", ["Development", "Production"], True),
+            ("known-superset-reversed", ["Production", "Development"], True),
+            ("scalar-development", "Development", False),
+            ("development-only-list", ["Development"], False),
+            ("wildcard", "*", False),
+            ("missing-or-null", None, False),
+            ("empty-list", [], False),
+            ("nonstring-scalar", 1, False),
+            ("nonstring-list", ["Production", 1], False),
+            ("unknown-value", ["Production", "Staging"], False),
+            ("duplicate-value", ["Production", "Production"], False),
+        )
+
+        for label, value, expected in cases:
+            with self.subTest(label=label):
+                self.assertIs(
+                    PROFILE_ENTITLEMENTS.authorizes_production_icloud(value),
+                    expected,
+                )
+
+
 class PrepareIOSSigningTests(unittest.TestCase):
     def test_generates_manual_export_options_for_exact_profile(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -185,6 +244,52 @@ class PrepareIOSSigningTests(unittest.TestCase):
             self.assertEqual(export["provisioningProfiles"], {BUNDLE: PROFILE_UUID})
             self.assertEqual(uuid_path.read_text(encoding="ascii").strip(), PROFILE_UUID)
 
+    def test_accepts_profile_icloud_authorization_supersets(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = pathlib.Path(raw)
+            profile_path = root / "profile.plist"
+            certificate_path = root / "distribution.der"
+            certificate_path.write_bytes(CERTIFICATE_DER)
+            command = [
+                "python3",
+                str(PREPARE),
+                "--profile-plist",
+                str(profile_path),
+                "--certificate-der",
+                str(certificate_path),
+                "--bundle-id",
+                BUNDLE,
+                "--team-id",
+                TEAM,
+                "--export-options",
+                str(root / "ExportOptions.plist"),
+                "--profile-uuid-output",
+                str(root / "uuid"),
+            ]
+            cases = (
+                ("*", ["Production", "Development"]),
+                (["CloudKit", "CloudDocuments"], "Production"),
+                (["CloudKit"], ["Production"]),
+            )
+
+            for services, environment in cases:
+                with self.subTest(services=services, environment=environment):
+                    candidate = profile()
+                    candidate["Entitlements"][
+                        "com.apple.developer.icloud-services"
+                    ] = services
+                    candidate["Entitlements"][ICLOUD_ENVIRONMENT_KEY] = environment
+                    write_plist(profile_path, candidate)
+
+                    result = subprocess.run(
+                        command,
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+
+                    self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_rejects_nonproduction_push_profile(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = pathlib.Path(raw)
@@ -216,7 +321,7 @@ class PrepareIOSSigningTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("aps-environment=production", result.stderr)
 
-    def test_rejects_profile_without_exact_cloudkit_entitlements(self) -> None:
+    def test_rejects_profile_without_required_cloudkit_authorizations(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = pathlib.Path(raw)
             profile_path = root / "profile.plist"
@@ -253,7 +358,7 @@ class PrepareIOSSigningTests(unittest.TestCase):
             self.assertIn("exact Kit Pay iCloud container", missing_container.stderr)
 
             invalid = profile()
-            invalid["Entitlements"]["com.apple.developer.icloud-services"] = []
+            invalid["Entitlements"].pop("com.apple.developer.icloud-services")
             write_plist(profile_path, invalid)
             missing_service = subprocess.run(
                 command,
@@ -263,6 +368,29 @@ class PrepareIOSSigningTests(unittest.TestCase):
             )
             self.assertNotEqual(missing_service.returncode, 0)
             self.assertIn("CloudKit service", missing_service.stderr)
+
+            invalid_service_values = (
+                ("scalar-cloudkit", "CloudKit"),
+                ("wildcard-list", ["*"]),
+                ("empty-list", []),
+                ("nonstring-list", ["CloudKit", 1]),
+                ("list-without-cloudkit", ["CloudDocuments"]),
+            )
+            for label, value in invalid_service_values:
+                with self.subTest(service=label):
+                    invalid = profile()
+                    invalid["Entitlements"][
+                        "com.apple.developer.icloud-services"
+                    ] = value
+                    write_plist(profile_path, invalid)
+                    invalid_service = subprocess.run(
+                        command,
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertNotEqual(invalid_service.returncode, 0)
+                    self.assertIn("CloudKit service", invalid_service.stderr)
 
             invalid = profile()
             invalid["Entitlements"].pop(ICLOUD_ENVIRONMENT_KEY)
@@ -275,6 +403,32 @@ class PrepareIOSSigningTests(unittest.TestCase):
             )
             self.assertNotEqual(missing_environment.returncode, 0)
             self.assertIn("Production iCloud environment", missing_environment.stderr)
+
+            invalid_environment_values = (
+                ("scalar-development", "Development"),
+                ("development-only-list", ["Development"]),
+                ("wildcard", "*"),
+                ("empty-list", []),
+                ("nonstring-list", ["Production", 1]),
+                ("unknown-value", ["Production", "Staging"]),
+                ("duplicate-value", ["Production", "Production"]),
+            )
+            for label, value in invalid_environment_values:
+                with self.subTest(environment=label):
+                    invalid = profile()
+                    invalid["Entitlements"][ICLOUD_ENVIRONMENT_KEY] = value
+                    write_plist(profile_path, invalid)
+                    invalid_environment = subprocess.run(
+                        command,
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertNotEqual(invalid_environment.returncode, 0)
+                    self.assertIn(
+                        "Production iCloud environment",
+                        invalid_environment.stderr,
+                    )
 
     def test_rejects_wrong_platform_or_distribution_certificate(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -1393,20 +1547,140 @@ class VerifyIOSArchiveTests(unittest.TestCase):
                 hashlib.sha256(b"ipa").hexdigest(),
             )
 
-            invalid_profile = profile()
-            invalid_profile["Entitlements"][ICLOUD_ENVIRONMENT_KEY] = "Development"
-            write_plist(embedded, invalid_profile)
-            wrong_profile_environment = subprocess.run(
+            apple_generated_profile = profile()
+            apple_generated_profile["Entitlements"][
+                "com.apple.developer.icloud-services"
+            ] = "*"
+            apple_generated_profile["Entitlements"][ICLOUD_ENVIRONMENT_KEY] = [
+                "Production",
+                "Development",
+            ]
+            write_plist(embedded, apple_generated_profile)
+            wildcard_profile = subprocess.run(
                 command,
                 check=False,
                 capture_output=True,
                 text=True,
             )
-            self.assertNotEqual(wrong_profile_environment.returncode, 0)
+            self.assertEqual(wildcard_profile.returncode, 0, wildcard_profile.stderr)
+
+            list_profile = profile()
+            list_profile["Entitlements"][
+                "com.apple.developer.icloud-services"
+            ] = ["CloudKit", "CloudDocuments"]
+            write_plist(embedded, list_profile)
+            service_list_profile = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                service_list_profile.returncode,
+                0,
+                service_list_profile.stderr,
+            )
+
+            production_list_profile = profile()
+            production_list_profile["Entitlements"][ICLOUD_ENVIRONMENT_KEY] = [
+                "Production"
+            ]
+            write_plist(embedded, production_list_profile)
+            single_environment_profile = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                single_environment_profile.returncode,
+                0,
+                single_environment_profile.stderr,
+            )
+
+            invalid_profile = profile()
+            invalid_profile["Entitlements"].pop(
+                "com.apple.developer.icloud-services"
+            )
+            write_plist(embedded, invalid_profile)
+            missing_profile_service = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(missing_profile_service.returncode, 0)
+            self.assertIn(
+                "Embedded profile does not authorize CloudKit",
+                missing_profile_service.stderr,
+            )
+
+            invalid_service_values = (
+                ("scalar-cloudkit", "CloudKit"),
+                ("wildcard-list", ["*"]),
+                ("empty-list", []),
+                ("nonstring-list", ["CloudKit", 1]),
+                ("list-without-cloudkit", ["CloudDocuments"]),
+            )
+            for label, value in invalid_service_values:
+                with self.subTest(embedded_service=label):
+                    invalid_profile = profile()
+                    invalid_profile["Entitlements"][
+                        "com.apple.developer.icloud-services"
+                    ] = value
+                    write_plist(embedded, invalid_profile)
+                    invalid_profile_service = subprocess.run(
+                        command,
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertNotEqual(invalid_profile_service.returncode, 0)
+                    self.assertIn(
+                        "Embedded profile does not authorize CloudKit",
+                        invalid_profile_service.stderr,
+                    )
+
+            invalid_profile = profile()
+            invalid_profile["Entitlements"].pop(ICLOUD_ENVIRONMENT_KEY)
+            write_plist(embedded, invalid_profile)
+            missing_profile_environment = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(missing_profile_environment.returncode, 0)
             self.assertIn(
                 "Embedded profile does not authorize the Production iCloud environment",
-                wrong_profile_environment.stderr,
+                missing_profile_environment.stderr,
             )
+
+            invalid_environment_values = (
+                ("scalar-development", "Development"),
+                ("development-only-list", ["Development"]),
+                ("wildcard", "*"),
+                ("empty-list", []),
+                ("nonstring-list", ["Production", 1]),
+                ("unknown-value", ["Production", "Staging"]),
+                ("duplicate-value", ["Production", "Production"]),
+            )
+            for label, value in invalid_environment_values:
+                with self.subTest(embedded_environment=label):
+                    invalid_profile = profile()
+                    invalid_profile["Entitlements"][ICLOUD_ENVIRONMENT_KEY] = value
+                    write_plist(embedded, invalid_profile)
+                    invalid_profile_environment = subprocess.run(
+                        command,
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertNotEqual(invalid_profile_environment.returncode, 0)
+                    self.assertIn(
+                        "Embedded profile does not authorize the Production iCloud environment",
+                        invalid_profile_environment.stderr,
+                    )
             write_plist(embedded, profile())
 
             with signed.open("rb") as source:
@@ -1423,6 +1697,42 @@ class VerifyIOSArchiveTests(unittest.TestCase):
             self.assertIn(
                 "Signed app iCloud environment entitlement is not Production",
                 wrong_signed_environment.stderr,
+            )
+            signed_entitlements[ICLOUD_ENVIRONMENT_KEY] = "Production"
+            write_plist(signed, signed_entitlements)
+
+            signed_entitlements["com.apple.developer.icloud-services"] = [
+                "CloudKit",
+                "CloudDocuments",
+            ]
+            write_plist(signed, signed_entitlements)
+            nonexact_signed_service = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(nonexact_signed_service.returncode, 0)
+            self.assertIn(
+                "Signed app CloudKit service entitlement is not exact",
+                nonexact_signed_service.stderr,
+            )
+            signed_entitlements["com.apple.developer.icloud-services"] = ["CloudKit"]
+            signed_entitlements[ICLOUD_ENVIRONMENT_KEY] = [
+                "Production",
+                "Development",
+            ]
+            write_plist(signed, signed_entitlements)
+            nonexact_signed_environment = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(nonexact_signed_environment.returncode, 0)
+            self.assertIn(
+                "Signed app iCloud environment entitlement is not Production",
+                nonexact_signed_environment.stderr,
             )
             signed_entitlements[ICLOUD_ENVIRONMENT_KEY] = "Production"
             write_plist(signed, signed_entitlements)

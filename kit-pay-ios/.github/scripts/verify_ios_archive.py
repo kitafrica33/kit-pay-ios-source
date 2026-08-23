@@ -11,6 +11,11 @@ import pathlib
 import plistlib
 import re
 
+from ios_profile_entitlements import (
+    authorizes_cloudkit,
+    authorizes_production_icloud,
+)
+
 
 SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
 SOURCE_RELEASE_URL = (
@@ -144,15 +149,17 @@ def main() -> None:
             "Embedded profile does not authorize the exact iCloud container",
         ),
         (
-            "CloudKit" in profile_entitlements.get(
-                "com.apple.developer.icloud-services", []
+            authorizes_cloudkit(
+                profile_entitlements.get("com.apple.developer.icloud-services")
             ),
             "Embedded profile does not authorize CloudKit",
         ),
         (
-            profile_entitlements.get(
-                "com.apple.developer.icloud-container-environment"
-            ) == "Production",
+            authorizes_production_icloud(
+                profile_entitlements.get(
+                    "com.apple.developer.icloud-container-environment"
+                )
+            ),
             "Embedded profile does not authorize the Production iCloud environment",
         ),
         (
@@ -170,8 +177,8 @@ def main() -> None:
             "Signed app iCloud container entitlement is incorrect",
         ),
         (
-            "CloudKit" in signed.get("com.apple.developer.icloud-services", []),
-            "Signed app CloudKit service entitlement is missing",
+            signed.get("com.apple.developer.icloud-services") == ["CloudKit"],
+            "Signed app CloudKit service entitlement is not exact",
         ),
         (
             signed.get("com.apple.developer.icloud-container-environment")

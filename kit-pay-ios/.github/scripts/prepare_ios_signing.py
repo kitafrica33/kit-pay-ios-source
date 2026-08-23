@@ -9,6 +9,11 @@ import pathlib
 import plistlib
 import re
 
+from ios_profile_entitlements import (
+    authorizes_cloudkit,
+    authorizes_production_icloud,
+)
+
 
 TEAM_PATTERN = re.compile(r"[A-Z0-9]{10}")
 UUID_PATTERN = re.compile(
@@ -89,12 +94,12 @@ def main() -> None:
     if icloud_containers != [expected_icloud_container]:
         fail("The App Store profile must authorize the exact Kit Pay iCloud container")
     icloud_services = entitlements.get("com.apple.developer.icloud-services")
-    if not isinstance(icloud_services, list) or "CloudKit" not in icloud_services:
+    if not authorizes_cloudkit(icloud_services):
         fail("The App Store profile must authorize the CloudKit service")
-    if (
-        entitlements.get("com.apple.developer.icloud-container-environment")
-        != "Production"
-    ):
+    icloud_environment = entitlements.get(
+        "com.apple.developer.icloud-container-environment"
+    )
+    if not authorizes_production_icloud(icloud_environment):
         fail("The App Store profile must authorize the Production iCloud environment")
     if profile.get("ProvisionedDevices") or profile.get("ProvisionsAllDevices"):
         fail("An App Store distribution profile is required")
