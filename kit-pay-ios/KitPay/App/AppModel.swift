@@ -7573,11 +7573,15 @@ final class AppModel: ObservableObject {
     }
 
     func markConversationRead(_ conversationID: String) async {
+        // Only a message still in `.received` needs a receipt. Re-submitting the latest message
+        // after it was already marked made the coordinator's strict single-candidate guard throw
+        // "conversation no longer available" every time an up-to-date chat was reopened.
         let latestIncomingMessageID = state.messages
             .filter {
                 $0.conversationId == conversationID
                     && !$0.isOutgoing
                     && $0.serverMessageId != nil
+                    && $0.state == .received
             }
             .max(by: { $0.createdAt < $1.createdAt })?
             .serverMessageId
@@ -7593,8 +7597,11 @@ final class AppModel: ObservableObject {
                 forUserID: userID
             )
             state = await store.snapshot()
+        } catch is CancellationError {
+            return
         } catch {
-            lastError = error.localizedDescription
+            // Read receipts are background bookkeeping: a failed or already-applied receipt is
+            // retried on the next visit and must never interrupt the customer with an alert.
         }
     }
 

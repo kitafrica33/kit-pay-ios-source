@@ -1895,6 +1895,25 @@ enum ConversationCallPresentationPolicy {
     }
 }
 
+/// How the screen behaves while a call is active. A video call must never auto-dim or lock
+/// (the user is watching, not touching); an audio call held to the ear must blank via the
+/// proximity sensor like the system Phone app.
+enum CallScreenWakePolicy {
+    static func idleTimerDisabled(hasActiveCall: Bool, carriesVideo: Bool) -> Bool {
+        hasActiveCall && carriesVideo
+    }
+
+    static func proximityMonitoringEnabled(
+        hasActiveCall: Bool,
+        carriesVideo: Bool,
+        audioRoute: CallAudioRoute
+    ) -> Bool {
+        // Only the built-in receiver is held to the ear. Speaker, wired, Bluetooth and car
+        // routes must keep the display usable instead of blanking it whenever a hand is nearby.
+        hasActiveCall && !carriesVideo && audioRoute == .receiver
+    }
+}
+
 private extension String {
     var nilIfEmpty: String? { isEmpty ? nil : self }
 }

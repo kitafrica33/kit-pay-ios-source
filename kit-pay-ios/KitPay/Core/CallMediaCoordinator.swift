@@ -1731,12 +1731,27 @@ final class CallMediaCoordinator: ObservableObject {
         }
         invalidateReconnect()
         state = .ending
-        NotificationCoordinator.shared.requestEndCall(callId: callId)
+        let accepted = NotificationCoordinator.shared.requestEndCall(callId: callId)
+        if !accepted {
+            // CallKit could not take the transaction (registration suspended, registry ownership
+            // lost, malformed id). The user's hang-up must still win: publish the authenticated
+            // end action and tear media down directly instead of stranding a disabled End button.
+            Task { @MainActor in
+                await NotificationCoordinator.shared.endCallBypassingCallKit(callId: callId)
+            }
+        }
     }
 
     func requestMuted(_ muted: Bool) {
         guard let callId = activeCall?.id else { return }
-        NotificationCoordinator.shared.requestMuted(muted, callId: callId)
+        let accepted = NotificationCoordinator.shared.requestMuted(muted, callId: callId)
+        if !accepted {
+            // Same principle as hang-up: the mute button must never silently no-op just because
+            // CallKit cannot mirror it. Media applies the mute (or buffers the intent) directly.
+            Task { @MainActor in
+                try? await self.applyCallKitMute(muted, callId: callId)
+            }
+        }
     }
 
     func setMicrophone(enabled: Bool) async throws {

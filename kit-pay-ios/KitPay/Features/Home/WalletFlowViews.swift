@@ -233,9 +233,39 @@ struct SendMoneyView: View {
     @State private var setupPin = ""
     @State private var setupPinConfirmation = ""
     @State private var showingConfirmation = false
+    private let preselectedRecipientUserID: String?
+    private let locksRecipientSelection: Bool
+
+    /// Chat opens this flow with the conversation's recipient already chosen, mirroring
+    /// `RequestMoneyView`: the amount step comes first and the recipient cannot be swapped.
+    init(
+        flow: WalletFlowModel,
+        preselectedContact: WalletContactDTO? = nil,
+        preselectedRecipientUserID: String? = nil,
+        locksRecipientSelection: Bool = false
+    ) {
+        self.flow = flow
+        self.preselectedRecipientUserID = preselectedRecipientUserID
+            ?? preselectedContact.flatMap {
+                ContactRecipientDirectory.recipientUserId(for: $0)
+            }
+        self.locksRecipientSelection = locksRecipientSelection
+        let initialContact = preselectedContact?.canReceiveTransfer == true
+            ? preselectedContact
+            : nil
+        _selectedContact = State(initialValue: initialContact)
+        _step = State(initialValue: initialContact != nil ? .amount : .recipient)
+    }
 
     private var eligibleContacts: [WalletContactDTO] {
-        flow.contacts.filter(\.canReceiveTransfer)
+        let transferable = flow.contacts.filter(\.canReceiveTransfer)
+        guard locksRecipientSelection else { return transferable }
+        // A locked (in-chat) flow must never fall open into the full picker when the chat
+        // recipient is not transfer-eligible; it shows the empty state instead.
+        guard let preselectedRecipientUserID else { return [] }
+        return transferable.filter {
+            ContactRecipientDirectory.recipientUserId(for: $0) == preselectedRecipientUserID
+        }
     }
 
     /// The amount exactly as the review step, the confirm button and the receipt should all
@@ -274,8 +304,8 @@ struct SendMoneyView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarLeading) {
-                Button(step == .amount ? "Back" : "Close") {
-                    if step == .amount {
+                Button(step == .amount && !locksRecipientSelection ? "Back" : "Close") {
+                    if step == .amount && !locksRecipientSelection {
                         step = .recipient
                     } else {
                         dismiss()
@@ -286,12 +316,46 @@ struct SendMoneyView: View {
         .task {
             flow.errorMessage = nil
             await model.loadContactDirectory()
-            flow.useSyncedContacts(model.contactDirectory)
+            updateContacts(model.contactDirectory)
         }
         .onChange(of: model.contactDirectory) { _, contacts in
-            flow.useSyncedContacts(contacts)
+            updateContacts(contacts)
         }
         .sheet(isPresented: $showingConfirmation) { confirmationSheet }
+    }
+
+    /// Resolves the chat-provided recipient once the synced directory is available. The chat
+    /// recipient is identified by user ID because the directory row may not exist until the
+    /// first contact sync completes.
+    private func updateContacts(_ contacts: [WalletContactDTO]) {
+        flow.useSyncedContacts(contacts)
+
+        // Replace a selected row with the fresh server-backed directory value. If the recipient
+        // lost transfer eligibility (or disappeared), clear it instead of submitting stale wallet
+        // routing data retained by the SwiftUI sheet.
+        if let selectedContact {
+            if let selectedID = ContactRecipientDirectory.recipientUserId(for: selectedContact) {
+                self.selectedContact = contacts.first {
+                    ContactRecipientDirectory.recipientUserId(for: $0) == selectedID
+                        && $0.canReceiveTransfer
+                }
+            } else {
+                self.selectedContact = nil
+            }
+        }
+
+        if self.selectedContact == nil, let preselectedRecipientUserID {
+            self.selectedContact = contacts.first {
+                ContactRecipientDirectory.recipientUserId(for: $0) == preselectedRecipientUserID
+                    && $0.canReceiveTransfer
+            }
+        }
+
+        if locksRecipientSelection {
+            step = self.selectedContact == nil ? .recipient : .amount
+        } else if self.selectedContact == nil, step == .amount {
+            step = .recipient
+        }
     }
 
     private var navigationTitle: String {

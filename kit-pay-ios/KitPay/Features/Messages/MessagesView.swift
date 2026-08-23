@@ -6,11 +6,6 @@ import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
 
-extension Notification.Name {
-    /// Posted by chat surfaces to bring the active-call screen back to the foreground.
-    static let kitReopenActiveCall = Notification.Name("africa.kit.pay.reopen-active-call")
-}
-
 enum ConversationListFilter: String, CaseIterable, Identifiable, Sendable {
     case all
     case unread
@@ -54,6 +49,7 @@ enum ConversationListFilterPolicy {
 
 struct MessagesView: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.rootTabBarClearance) private var rootTabBarClearance
     @StateObject private var callMedia = CallMediaCoordinator.shared
     @ObservedObject private var callTransport = CallMediaCoordinator.shared.media
     @Binding var isConversationPresented: Bool
@@ -91,9 +87,14 @@ struct MessagesView: View {
             chatList
                 .background(KitColor.canvas)
                 .safeAreaInset(edge: .top, spacing: 0) { listHeader }
-                .safeAreaInset(edge: .bottom, spacing: 0) {
+                // The root tab bar is a floating overlay that reserves no safe area, so the
+                // selection capsule pads itself by the published clearance to float just above
+                // the glass menu instead of landing underneath it.
+                .overlay(alignment: .bottom) {
                     if isSelectingChats {
                         chatSelectionActionBar
+                            .padding(.bottom, rootTabBarClearance > 0 ? rootTabBarClearance : 6)
+                            .transition(.move(edge: .bottom).combined(with: .opacity))
                     }
                 }
                 .navigationTitle(isSelectingChats ? "Select chats" : "Chats")
@@ -407,23 +408,12 @@ struct MessagesView: View {
             .buttonStyle(.plain)
             .accessibilityLabel("Search chats, contacts, and messages")
 
-            if let activeCall = callMedia.activeCall {
-                LiveCallPill(
-                    call: activeCall,
-                    statusText: callMedia.statusText,
-                    isConnected: callMedia.state == .connected,
-                    localLevel: callTransport.localVoiceLevel,
-                    remoteLevel: callTransport.remoteVoiceLevel
-                ) {
-                    NotificationCenter.default.post(name: .kitReopenActiveCall, object: nil)
-                }
-                .transition(.move(edge: .top).combined(with: .opacity))
-            }
+            // The app-wide full-width call strip (CallOverlayWindow) is the single in-call
+            // indicator; a second pill here would stack two banners on this screen.
         }
         .padding(.horizontal, 14)
         .padding(.bottom, 9)
         .background(KitColor.canvas)
-        .animation(.snappy(duration: 0.28), value: callMedia.activeCall != nil)
     }
 
     @ToolbarContentBuilder
@@ -828,104 +818,6 @@ private func chatListTimestamp(_ date: Date) -> String {
         return date.formatted(.dateTime.weekday(.abbreviated))
     }
     return date.formatted(date: .numeric, time: .omitted)
-}
-
-// MARK: - Live call pill
-
-/// A liquid-glass strip above the chats: who you're talking to, live status, and a Kit-green
-/// voice wave that swells with whoever is speaking (heartbeat idle when the line is quiet).
-private struct LiveCallPill: View {
-    let call: ActiveCallPresentation
-    let statusText: String
-    let isConnected: Bool
-    let localLevel: Float
-    let remoteLevel: Float
-    let onTap: () -> Void
-
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    var body: some View {
-        Button(action: onTap) {
-            HStack(spacing: 11) {
-                RemoteAvatarView(
-                    name: call.participantName,
-                    avatarURL: call.participantAvatarURL,
-                    size: 36
-                )
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(call.participantName)
-                        .font(.subheadline.weight(.bold))
-                        .foregroundStyle(KitColor.navy)
-                        .lineLimit(1)
-                    Text(statusText)
-                        .font(.caption)
-                        .foregroundStyle(KitColor.green)
-                        .lineLimit(1)
-                }
-                Spacer(minLength: 8)
-                LiveCallVoiceWave(
-                    level: max(localLevel, remoteLevel),
-                    isConnected: isConnected,
-                    animated: !reduceMotion
-                )
-                .frame(width: 54, height: 24)
-                Image(systemName: call.video ? "video.fill" : "phone.fill")
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(.white)
-                    .frame(width: 32, height: 32)
-                    .background(KitColor.green, in: Circle())
-            }
-            .padding(.horizontal, 11)
-            .padding(.vertical, 8)
-            .background(.ultraThinMaterial, in: Capsule())
-            .background(KitColor.paleGreen.opacity(0.35), in: Capsule())
-            .overlay {
-                Capsule()
-                    .stroke(KitColor.green.opacity(0.45), lineWidth: 0.9)
-                    .allowsHitTesting(false)
-            }
-            .contentShape(Capsule())
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel("Return to call with \(call.participantName), \(statusText)")
-    }
-}
-
-/// Voice-weighted wave: bar heights follow the live audio level; a soft heart-pulse
-/// breathes through the bars when connected but silent.
-private struct LiveCallVoiceWave: View {
-    let level: Float
-    let isConnected: Bool
-    let animated: Bool
-
-    private static let barShape: [CGFloat] = [0.35, 0.65, 1.0, 0.75, 0.5, 0.85, 0.4]
-
-    var body: some View {
-        TimelineView(.animation(minimumInterval: 0.12, paused: !animated || !isConnected)) { timeline in
-            let phase = timeline.date.timeIntervalSinceReferenceDate
-            HStack(spacing: 2.6) {
-                ForEach(Self.barShape.indices, id: \.self) { index in
-                    Capsule()
-                        .fill(KitColor.green.opacity(0.55 + 0.45 * Double(level)))
-                        .frame(width: 3, height: barHeight(index: index, phase: phase))
-                }
-            }
-        }
-        .accessibilityHidden(true)
-    }
-
-    private func barHeight(index: Int, phase: TimeInterval) -> CGFloat {
-        let base: CGFloat = 5
-        guard isConnected else { return base }
-        let shape = Self.barShape[index]
-        if level > 0.02 {
-            return base + shape * CGFloat(level) * 17
-        }
-        guard animated else { return base + shape * 3 }
-        // Quiet line: a gentle double-beat heart pulse.
-        let beat = pow(max(0, sin(phase * 2.2 + Double(index) * 0.7)), 6)
-        return base + shape * CGFloat(beat) * 7
-    }
 }
 
 // MARK: - Global search
@@ -1375,6 +1267,7 @@ struct ConversationView: View {
     @State private var draftWriteVersion: ConversationDraftWriteVersion?
     @State private var immediateDraftPersistenceTask: Task<Void, Never>?
     @State private var showPaymentRequest = false
+    @State private var showSendMoney = false
     @State private var showContactProfile = false
     @State private var chatPaymentApproval: ChatPaymentApproval?
     @State private var resolvingPaymentRequestID: String?
@@ -1386,6 +1279,9 @@ struct ConversationView: View {
     @State private var showDeleteMessagesConfirmation = false
     @State private var incomingSoundPolicy: VisibleConversationSoundPolicy
     @StateObject private var paymentFlow = WalletFlowModel()
+    /// Separate model for in-chat transfers so a draft payment request and a draft transfer
+    /// can never share contacts, errors, or submission state.
+    @StateObject private var sendMoneyFlow = WalletFlowModel()
     @StateObject private var chatPaymentRequests = PaymentRequestsViewModel()
     @StateObject private var voiceRecorder = VoiceNoteRecorder()
     @FocusState private var isComposerFocused: Bool
@@ -1637,6 +1533,18 @@ struct ConversationView: View {
                             conversationId: conversation.id
                         )
                     }
+                )
+                .environmentObject(model)
+            }
+            .presentationBackground(.ultraThinMaterial)
+        }
+        .sheet(isPresented: $showSendMoney) {
+            NavigationStack {
+                SendMoneyView(
+                    flow: sendMoneyFlow,
+                    preselectedContact: recipientContact,
+                    preselectedRecipientUserID: paymentRecipientUserID,
+                    locksRecipientSelection: true
                 )
                 .environmentObject(model)
             }
@@ -1932,6 +1840,9 @@ struct ConversationView: View {
                     showDocumentImporter = true
                 } label: {
                     Label("Document", systemImage: "doc")
+                }
+                Button { openSendMoney() } label: {
+                    Label("Send money", systemImage: "arrow.up.circle")
                 }
                 Button { openPaymentRequest() } label: {
                     Label("Payment request", systemImage: "banknote")
@@ -2810,6 +2721,35 @@ struct ConversationView: View {
         paymentFlow.errorMessage = nil
         paymentFlow.useSyncedContacts(model.contactDirectory)
         showPaymentRequest = true
+    }
+
+    /// Opens the standard transfer flow with this chat's recipient already selected, the same
+    /// way payment requests start from the conversation.
+    private func openSendMoney() {
+        guard recipientCommunicationAllowed else {
+            model.lastError = recipientIsBlocked
+                ? "Unblock this account before sending money."
+                : "Communication privacy is still loading. Refresh and try again."
+            return
+        }
+        guard model.capabilities?.features?["wallets"] == true,
+              model.capabilities?.features?["internal_transfers"] == true
+        else {
+            model.lastError = "Sending money is not available for this account."
+            return
+        }
+        guard model.isOnline else {
+            model.lastError = "Connect to the internet to send money."
+            return
+        }
+        guard paymentRecipientUserID != nil else {
+            model.lastError = "Sending money is available only in a one-to-one Kit Pay chat."
+            return
+        }
+        isComposerFocused = false
+        sendMoneyFlow.errorMessage = nil
+        sendMoneyFlow.useSyncedContacts(model.contactDirectory)
+        showSendMoney = true
     }
 
     // MARK: Attachment staging

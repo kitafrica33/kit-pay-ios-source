@@ -4973,6 +4973,55 @@ final class CallControlAvailabilityPolicyTests: XCTestCase {
         )
     }
 
+    func testCallScreenWakePolicyKeepsVideoAwakeAndArmsProximityForAudio() {
+        XCTAssertTrue(
+            CallScreenWakePolicy.idleTimerDisabled(hasActiveCall: true, carriesVideo: true)
+        )
+        XCTAssertFalse(
+            CallScreenWakePolicy.idleTimerDisabled(hasActiveCall: true, carriesVideo: false)
+        )
+        XCTAssertFalse(
+            CallScreenWakePolicy.idleTimerDisabled(hasActiveCall: false, carriesVideo: true)
+        )
+        XCTAssertTrue(
+            CallScreenWakePolicy.proximityMonitoringEnabled(
+                hasActiveCall: true,
+                carriesVideo: false,
+                audioRoute: .receiver
+            )
+        )
+        XCTAssertFalse(
+            CallScreenWakePolicy.proximityMonitoringEnabled(
+                hasActiveCall: true,
+                carriesVideo: true,
+                audioRoute: .receiver
+            )
+        )
+        XCTAssertFalse(
+            CallScreenWakePolicy.proximityMonitoringEnabled(
+                hasActiveCall: false,
+                carriesVideo: false,
+                audioRoute: .receiver
+            )
+        )
+        for route in [
+            CallAudioRoute.speaker,
+            .wired,
+            .bluetooth,
+            .carAudio,
+            .unknown,
+        ] {
+            XCTAssertFalse(
+                CallScreenWakePolicy.proximityMonitoringEnabled(
+                    hasActiveCall: true,
+                    carriesVideo: false,
+                    audioRoute: route
+                ),
+                "\(route) must keep the screen available"
+            )
+        }
+    }
+
 }
 
 final class TransientTransportErrorPolicyTests: XCTestCase {

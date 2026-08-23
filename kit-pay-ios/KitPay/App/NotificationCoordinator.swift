@@ -1966,37 +1966,55 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
     }
 
     @MainActor
-    func requestEndCall(callId: String) {
+    /// Returns whether a CallKit end transaction was actually submitted. A hang-up must never
+    /// depend silently on CallKit accepting the call: when any admission guard fails, the caller
+    /// runs `endCallBypassingCallKit` so the user is never stranded on a live call with a dead
+    /// End button.
+    @discardableResult
+    func requestEndCall(callId: String) -> Bool {
+        guard let callUUID = UUID(uuidString: callId) else { return false }
+        // A transaction for this call is already in flight; report accepted so the caller does
+        // not race it with a duplicate fallback teardown.
+        guard !explicitlyRequestedEndCallUUIDs.contains(callUUID) else { return true }
         guard registrationEnabled, !privacyQuarantineActive,
-              let callUUID = UUID(uuidString: callId),
               hasCurrentCallRegistryOwnership(callUUID),
               backendCallIds[callUUID]?.caseInsensitiveCompare(callId) == .orderedSame,
               explicitlyRequestedEndCallUUIDs.insert(callUUID).inserted
-        else { return }
+        else { return false }
         callController.request(CXTransaction(action: CXEndCallAction(call: callUUID))) { error in
             guard let error else { return }
             Task { @MainActor in
                 let coordinator = NotificationCoordinator.shared
                 guard coordinator.explicitlyRequestedEndCallUUIDs.remove(callUUID) != nil
                 else { return }
-                let backendCallId = coordinator.backendCallIds[callUUID] ?? callId.lowercased()
-                coordinator.clearCall(callUUID)
-                coordinator.callProvider.reportCall(
-                    with: callUUID,
-                    endedAt: Date(),
-                    reason: .failed
-                )
-                coordinator.recordAndPublishCallEvent(
-                    .systemAction(CallSystemAction(
-                        callId: backendCallId,
-                        callUUID: callUUID,
-                        kind: .end
-                    ))
-                )
-                await CallMediaCoordinator.shared.disconnectFromCallKit(callId: backendCallId)
+                await coordinator.endCallBypassingCallKit(callId: callId)
                 CallMediaCoordinator.shared.recordControlError(error)
             }
         }
+        return true
+    }
+
+    /// Ends a call that CallKit cannot (or will not) terminate: tears the CallKit record down if
+    /// one exists, publishes the authenticated `.end` action so the backend termination replays,
+    /// and disconnects media directly.
+    @MainActor
+    func endCallBypassingCallKit(callId: String) async {
+        let backendCallId: String
+        if let callUUID = UUID(uuidString: callId) {
+            backendCallId = backendCallIds[callUUID] ?? callId.lowercased()
+            clearCall(callUUID)
+            callProvider.reportCall(with: callUUID, endedAt: Date(), reason: .failed)
+            recordAndPublishCallEvent(
+                .systemAction(CallSystemAction(
+                    callId: backendCallId,
+                    callUUID: callUUID,
+                    kind: .end
+                ))
+            )
+        } else {
+            backendCallId = callId.lowercased()
+        }
+        await CallMediaCoordinator.shared.disconnectFromCallKit(callId: backendCallId)
     }
 
     /// Declines one unanswered incoming CallKit call without touching the connected media call.
@@ -2053,14 +2071,25 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
     }
 
     @MainActor
-    func requestMuted(_ muted: Bool, callId: String) {
-        guard registrationEnabled, !privacyQuarantineActive else { return }
-        guard let callUUID = UUID(uuidString: callId) else { return }
+    /// Returns whether a CallKit mute transaction was submitted. When CallKit cannot take the
+    /// request (registration suspended, quarantine, unknown call), the caller applies the mute
+    /// directly to media so the button always works; the same direct path repairs a transaction
+    /// that CallKit accepts and then fails.
+    @discardableResult
+    func requestMuted(_ muted: Bool, callId: String) -> Bool {
+        guard registrationEnabled, !privacyQuarantineActive,
+              let callUUID = UUID(uuidString: callId),
+              backendCallIds[callUUID]?.caseInsensitiveCompare(callId) == .orderedSame
+        else { return false }
         let action = CXSetMutedCallAction(call: callUUID, muted: muted)
         callController.request(CXTransaction(action: action)) { error in
             guard let error else { return }
-            Task { @MainActor in CallMediaCoordinator.shared.recordControlError(error) }
+            Task { @MainActor in
+                try? await CallMediaCoordinator.shared.applyCallKitMute(muted, callId: callId)
+                CallMediaCoordinator.shared.recordControlError(error)
+            }
         }
+        return true
     }
 
     /// Promotes or demotes the CallKit record when the user turns their camera on or off during a

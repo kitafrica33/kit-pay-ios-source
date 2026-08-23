@@ -64,14 +64,16 @@ struct OnboardingView: View {
             ScrollView {
                 VStack(spacing: 26) {
                     Spacer(minLength: 42)
-                    VStack(spacing: 10) {
-                        Text("kit")
-                            .font(.system(size: 64, weight: .black, design: .rounded))
-                            .foregroundStyle(.white)
+                    VStack(spacing: 14) {
+                        KitLogoView(tint: .white)
+                            .frame(height: 58)
                         Text("Money, messages and calls—together.")
                             .font(.title3.weight(.medium))
                             .foregroundStyle(.white.opacity(0.82))
                             .multilineTextAlignment(.center)
+                            // Launch UI tests anchor on this identifier now that the wordmark
+                            // is a Shape-based logo rather than a static text.
+                            .accessibilityIdentifier("onboarding-wordmark")
                     }
 
                     VStack(alignment: .leading, spacing: 18) {

@@ -1126,6 +1126,7 @@ struct BiometricSignInView: View {
     @EnvironmentObject private var model: AppModel
     @State private var usePIN = false
     @State private var pin = ""
+    @State private var didSubmitPIN = false
 
     var body: some View {
         // A server-verified PIN remains an explicit recovery path after biometric cancellation
@@ -1145,6 +1146,7 @@ struct BiometricSignInView: View {
                 secondaryTitle: "Use my PIN instead",
                 secondaryAction: {
                     pin = ""
+                    didSubmitPIN = false
                     usePIN = true
                 }
             )
@@ -1153,80 +1155,52 @@ struct BiometricSignInView: View {
     }
 
     private var pinUnlock: some View {
-        ZStack {
-            LinearGradient(
-                colors: [KitColor.deepNavy, KitColor.navy, KitColor.green.opacity(0.78)],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-            .ignoresSafeArea()
-
-            VStack(spacing: 18) {
-                Image(systemName: "lock.shield.fill")
-                    .font(.system(size: 46, weight: .medium))
-                    .foregroundStyle(.white)
-                Text("Enter your Kit Pay PIN")
-                    .font(.title.bold())
-                    .foregroundStyle(.white)
-                Text(
-                    model.biometricSignInPermanentlyUnavailable
-                        ? "\(model.biometricDisplayName) is no longer available on this iPhone, so your PIN confirms it is you."
-                        : "Use your wallet PIN if \(model.biometricDisplayName) is locked or unavailable."
-                )
-                    .font(.subheadline)
-                    .foregroundStyle(.white.opacity(0.82))
-                    .multilineTextAlignment(.center)
-                SecureField("Four-digit PIN", text: $pin)
-                    .keyboardType(.numberPad)
-                    .multilineTextAlignment(.center)
-                    .font(.system(size: 28, weight: .bold, design: .monospaced))
-                    .privacySensitive()
-                    .padding(16)
-                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18))
-                    .onChange(of: pin) { _, value in
-                        let filtered = String(value.filter { $0 >= "0" && $0 <= "9" }.prefix(4))
-                        if filtered != value { pin = filtered }
-                    }
-                if let error = model.biometricErrorMessage {
-                    Text(error)
-                        .font(.footnote)
-                        .foregroundStyle(.white)
-                        .multilineTextAlignment(.center)
-                }
-                Button {
-                    let submitted = pin
-                    pin = ""
-                    Task { _ = await model.retrySignInWithPIN(submitted) }
-                } label: {
-                    Group {
-                        if model.biometricAccessState == .authorizing {
-                            ProgressView().tint(KitColor.navy)
-                        } else {
-                            Text("Unlock with PIN")
-                        }
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 15)
-                }
-                .buttonStyle(.borderedProminent)
-                .buttonBorderShape(.roundedRectangle(radius: 18))
-                .tint(.white)
-                .foregroundStyle(KitColor.navy)
-                .disabled(pin.count != 4 || model.biometricAccessState == .authorizing)
-
-                if !model.biometricSignInPermanentlyUnavailable {
-                    Button("Use \(model.biometricDisplayName)") {
+        KitPinEntryPage(
+            title: "Enter your Kit Pay PIN",
+            subtitle: model.biometricSignInPermanentlyUnavailable
+                ? "\(model.biometricDisplayName) is no longer available on this iPhone, so your PIN confirms it is you."
+                : "Use your wallet PIN if \(model.biometricDisplayName) is locked or unavailable.",
+            pin: $pin,
+            // Only surface errors from a PIN attempt here — the lingering biometric-cancel
+            // message belongs to the gate, not to a fresh PIN entry.
+            errorMessage: didSubmitPIN ? model.biometricErrorMessage : nil,
+            isBusy: model.biometricAccessState == .authorizing,
+            accessory: model.biometricSignInPermanentlyUnavailable
+                ? .none
+                : .biometric(
+                    symbolName: model.biometricSymbolName,
+                    label: "Use \(model.biometricDisplayName)",
+                    action: {
                         pin = ""
+                        didSubmitPIN = false
                         usePIN = false
                     }
-                    .foregroundStyle(.white.opacity(0.9))
-                    .disabled(model.biometricAccessState == .authorizing)
+                ),
+            onFilled: { submitted in
+                pin = ""
+                Task {
+                    _ = await model.retrySignInWithPIN(submitted)
+                    // Reveal the error only after this attempt resolves — flipping the flag
+                    // before the await would flash the stale biometric-cancel message (and its
+                    // error haptic) the moment the fourth digit lands.
+                    didSubmitPIN = true
                 }
             }
-            .padding(24)
-            .frame(maxWidth: 460)
-            .kitGlass(cornerRadius: 34)
-            .padding(22)
+        ) {
+            Label(
+                "Your PIN is verified by Kit and is never stored in this app.",
+                systemImage: "lock"
+            )
+            .font(.footnote)
+            .foregroundStyle(KitColor.secondaryText)
+            .multilineTextAlignment(.center)
+            .padding(.horizontal, 32)
+        }
+        .privacySensitive()
+        .onChange(of: pin) { _, value in
+            // A fresh entry must not inherit the previous attempt's failure state — red dots
+            // over digits the user is still typing read as "already wrong".
+            if !value.isEmpty { didSubmitPIN = false }
         }
     }
 }
@@ -1244,74 +1218,79 @@ struct KitBiometricGateView: View {
 
     var body: some View {
         ZStack {
-            LinearGradient(
-                colors: [KitColor.deepNavy, KitColor.navy, KitColor.green.opacity(0.78)],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-            .ignoresSafeArea()
+            KitAuthBackground()
 
-            VStack(spacing: 20) {
-                Image(systemName: symbolName)
-                    .font(.system(size: 48, weight: .medium))
-                    .foregroundStyle(.white)
-                    .frame(width: 104, height: 104)
-                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 34))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 34)
-                            .stroke(.white.opacity(0.34), lineWidth: 0.8)
-                    }
+            VStack(spacing: 0) {
+                Spacer(minLength: 24)
+                KitAuthLogoBadge()
+                Spacer(minLength: 16)
 
                 Text(title)
-                    .font(.largeTitle.bold())
-                    .foregroundStyle(.white)
-                Text(message)
-                    .font(.body)
-                    .foregroundStyle(.white.opacity(0.82))
+                    .font(.title2.bold())
+                    .foregroundStyle(KitColor.primaryText)
                     .multilineTextAlignment(.center)
+                Text(message)
+                    .font(.subheadline)
+                    .foregroundStyle(KitColor.secondaryText)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 36)
+                    .padding(.top, 6)
 
                 if let errorMessage {
                     Text(errorMessage)
-                        .font(.footnote)
-                        .foregroundStyle(.white)
+                        .font(.footnote.weight(.medium))
+                        .foregroundStyle(.red)
                         .multilineTextAlignment(.center)
                         .padding(12)
-                        .frame(maxWidth: .infinity)
-                        .background(.red.opacity(0.32), in: RoundedRectangle(cornerRadius: 16))
+                        .background(.red.opacity(0.10), in: RoundedRectangle(cornerRadius: 14))
+                        .padding(.horizontal, 32)
+                        .padding(.top, 14)
                 }
+
+                Spacer(minLength: 24)
+
+                Image(systemName: symbolName)
+                    .font(.system(size: 40, weight: .medium))
+                    .foregroundStyle(KitColor.green)
+                    .accessibilityHidden(true)
+
+                Spacer(minLength: 24)
 
                 Button {
                     Task { await authenticate() }
                 } label: {
                     Group {
                         if isAuthorizing {
-                            ProgressView().tint(KitColor.navy)
+                            ProgressView().tint(.white)
                         } else {
                             Label(buttonTitle, systemImage: symbolName)
+                                .font(.body.weight(.semibold))
                         }
                     }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 15)
+                    .foregroundStyle(.white)
+                    .frame(maxWidth: .infinity, minHeight: 54)
+                    .background(KitColor.green, in: Capsule())
                 }
-                .buttonStyle(.borderedProminent)
-                .buttonBorderShape(.roundedRectangle(radius: 18))
-                .tint(.white)
-                .foregroundStyle(KitColor.primaryText)
+                .buttonStyle(.plain)
                 .disabled(isAuthorizing)
+                .opacity(isAuthorizing ? 0.7 : 1)
+                .padding(.horizontal, 32)
 
                 if let secondaryTitle, let secondaryAction {
                     Button(secondaryTitle) {
                         Task { await secondaryAction() }
                     }
-                    .font(.subheadline.bold())
-                    .foregroundStyle(.white.opacity(0.9))
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(KitColor.green)
                     .disabled(isAuthorizing)
+                    .padding(.top, 16)
+                    .frame(minHeight: 44)
                 }
+
+                Spacer(minLength: 40)
             }
-            .padding(24)
-            .frame(maxWidth: 460)
-            .kitGlass(cornerRadius: 34)
-            .padding(22)
+            .frame(maxWidth: 430)
+            .frame(maxWidth: .infinity)
         }
     }
 }

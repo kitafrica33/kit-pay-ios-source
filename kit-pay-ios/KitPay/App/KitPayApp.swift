@@ -65,11 +65,6 @@ struct KitPayApp: App {
                     syncMinimizedCallSurface()
                 }
                 .onOpenURL { model.handleDeepLink($0) }
-                .onReceive(
-                    NotificationCenter.default.publisher(for: .kitReopenActiveCall)
-                ) { _ in
-                    if hasPresentableCall { isCallPresented = true }
-                }
                 .task { await model.requestContactsPermissionAtLaunch() }
                 .onChange(of: scenePhase) { _, phase in
                     if phase == .active {

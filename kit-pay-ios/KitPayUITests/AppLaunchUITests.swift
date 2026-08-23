@@ -93,7 +93,7 @@ final class AppLaunchUITests: XCTestCase {
         waitForFirstFrame(app)
 
         dismissSystemAlertIfPresent()
-        let wordmark = app.staticTexts["kit"]
+        let wordmark = app.staticTexts["onboarding-wordmark"]
         if !wordmark.waitForExistence(timeout: 90) {
             print("=== KitPay screen instead of onboarding ===")
             print(app.debugDescription)
@@ -189,7 +189,7 @@ final class AppLaunchUITests: XCTestCase {
     private func requireSignIn(_ app: XCUIApplication) throws {
         waitForFirstFrame(app)
         dismissSystemAlertIfPresent()
-        guard app.staticTexts["kit"].waitForExistence(timeout: 90) else {
+        guard app.staticTexts["onboarding-wordmark"].waitForExistence(timeout: 90) else {
             print("=== KitPay screen instead of onboarding ===")
             print(app.debugDescription)
             print("=== end hierarchy ===")

@@ -1736,12 +1736,34 @@ struct MinimizedCallView: View {
     var body: some View {
         GeometryReader { geometry in
             if let call = coordinator.activeCall {
-                let insets = CallFloatingInsets(geometry.safeAreaInsets)
-                let isVideo = isVideoPresentation(for: call)
-                let surfaceSize = CallFloatingSurfaceLayoutPolicy.minimizedSurfaceSize(
-                    container: geometry.size,
-                    isVideo: isVideo
-                )
+                if isVideoPresentation(for: call) {
+                    draggableVideoSurface(for: call, in: geometry)
+                } else {
+                    // An audio call presents as a static, full-width banner that extends behind
+                    // the status area and Dynamic Island — the system-call-strip pattern —
+                    // instead of a movable bubble fighting the notch.
+                    staticAudioCallBar(for: call, in: geometry)
+                }
+            }
+        }
+        // The hit region is zeroed only here, from the one stable ancestor. Zeroing inside each
+        // presentation branch raced the audio↔video swap: the incoming branch's onAppear reported
+        // its frame first and the outgoing branch's onDisappear then wiped it, leaving the new
+        // surface untappable through the pass-through window.
+        .onDisappear { onSurfaceFrameChange?(.zero) }
+    }
+
+    @ViewBuilder
+    private func draggableVideoSurface(
+        for call: ActiveCallPresentation,
+        in geometry: GeometryProxy
+    ) -> some View {
+        let insets = CallFloatingInsets(geometry.safeAreaInsets)
+        let isVideo = true
+        let surfaceSize = CallFloatingSurfaceLayoutPolicy.minimizedSurfaceSize(
+            container: geometry.size,
+            isVideo: isVideo
+        )
                 let restingOrigin = CallFloatingSurfaceLayoutPolicy.origin(
                     for: corner,
                     surfaceSize: surfaceSize,
@@ -1797,10 +1819,129 @@ struct MinimizedCallView: View {
                     .onDisappear {
                         dragTranslation = .zero
                         isDragging = false
-                        onSurfaceFrameChange?(.zero)
                     }
+    }
+
+    /// Full-width in-app call strip for audio calls: static, integrated with the status area and
+    /// Dynamic Island, with a live voice wave, duration, and inline mute/hang-up.
+    private func staticAudioCallBar(
+        for call: ActiveCallPresentation,
+        in geometry: GeometryProxy
+    ) -> some View {
+        let topInset = Self.windowTopSafeAreaInset()
+        let barContentHeight: CGFloat = 60
+        let barFrame = CGRect(
+            x: geometry.frame(in: .global).minX,
+            y: geometry.frame(in: .global).minY,
+            width: geometry.size.width,
+            height: topInset + barContentHeight
+        )
+        return HStack(spacing: 10) {
+            Button(action: reopen) {
+                HStack(spacing: 10) {
+                    CallParticipantAvatarView(
+                        name: call.participantName,
+                        avatarURL: call.participantAvatarURL,
+                        size: 38
+                    )
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(call.participantName)
+                            .font(.subheadline.bold())
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+                        HStack(spacing: 5) {
+                            Circle()
+                                .fill(KitColor.green)
+                                .frame(width: 7, height: 7)
+                            TimelineView(.periodic(from: .now, by: 1)) { timeline in
+                                Text(compactStatus(for: call, at: timeline.date))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .monospacedDigit()
+                                    .lineLimit(1)
+                            }
+                        }
+                    }
+                    Spacer(minLength: 6)
+                    CallBannerVoiceWave(
+                        level: max(media.localVoiceLevel, media.remoteVoiceLevel),
+                        isConnected: coordinator.state == .connected,
+                        animated: !reduceMotion
+                    )
+                    .frame(width: 52, height: 22)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Return to call with \(call.participantName)")
+            .accessibilityValue(compactStatus(for: call))
+
+            minimizedControl(
+                icon: media.isMicrophoneEnabled ? "mic.fill" : "mic.slash.fill",
+                label: media.isMicrophoneEnabled ? "Mute" : "Unmute",
+                foreground: media.isMicrophoneEnabled ? KitColor.primaryText : .white,
+                background: media.isMicrophoneEnabled
+                    ? AnyShapeStyle(.thinMaterial)
+                    : AnyShapeStyle(KitColor.navy),
+                enabled: CallControlAvailabilityPolicy.microphoneControlIsEnabled(
+                    isConnected: coordinator.state == .connected,
+                    isReconnecting: coordinator.state == .reconnecting
+                )
+            ) {
+                coordinator.requestMuted(media.isMicrophoneEnabled)
+            }
+            minimizedControl(
+                icon: "phone.down.fill",
+                label: "End call",
+                foreground: .white,
+                background: AnyShapeStyle(Color(red: 0.98, green: 0.02, blue: 0.25)),
+                enabled: coordinator.state != .ending
+            ) {
+                coordinator.requestEnd()
             }
         }
+        .padding(.horizontal, 14)
+        .frame(height: barContentHeight)
+        .padding(.top, topInset)
+        .frame(maxWidth: .infinity)
+        .background {
+            // The material runs edge to edge and up behind the island, so the strip reads as one
+            // piece with the system status area rather than a floating chip beside the notch.
+            let shape = UnevenRoundedRectangle(
+                cornerRadii: RectangleCornerRadii(bottomLeading: 22, bottomTrailing: 22),
+                style: .continuous
+            )
+            ZStack {
+                if reduceTransparency {
+                    shape.fill(Color(UIColor.secondarySystemBackground))
+                } else {
+                    shape.fill(.regularMaterial)
+                    shape.fill(KitColor.green.opacity(0.10))
+                }
+            }
+            .overlay {
+                shape
+                    .strokeBorder(.white.opacity(0.42), lineWidth: 0.8)
+                    .allowsHitTesting(false)
+            }
+            .shadow(color: .black.opacity(0.18), radius: 14, y: 6)
+            .ignoresSafeArea(edges: .top)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Active call with \(call.participantName)")
+        .accessibilityValue(compactStatus(for: call))
+        .onAppear { onSurfaceFrameChange?(barFrame) }
+        .onChange(of: barFrame) { _, frame in onSurfaceFrameChange?(frame) }
+    }
+
+    /// The overlay window ignores safe areas so the video tile can use the whole screen; the
+    /// banner still needs the real top inset to clear the status area and Dynamic Island.
+    private static func windowTopSafeAreaInset() -> CGFloat {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let window = scenes.flatMap(\.windows).first(where: \.isKeyWindow)
+            ?? scenes.first?.windows.first
+        return window?.safeAreaInsets.top ?? 59
     }
 
     private func minimizedDragGesture(
@@ -1931,89 +2072,6 @@ struct MinimizedCallView: View {
             .highPriorityGesture(dragGesture)
             .accessibilityLabel("Return to call with \(call.participantName)")
             .accessibilityValue(compactStatus(for: call))
-        } else {
-            HStack(spacing: 11) {
-                Button(action: reopen) {
-                    HStack(spacing: 11) {
-                        CallParticipantAvatarView(
-                            name: call.participantName,
-                            avatarURL: call.participantAvatarURL,
-                            size: 46
-                        )
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text(call.participantName)
-                                .font(.subheadline.bold())
-                                .lineLimit(1)
-                            HStack(spacing: 5) {
-                                Circle()
-                                    .fill(KitColor.green)
-                                    .frame(width: 7, height: 7)
-                                TimelineView(.periodic(from: .now, by: 1)) { timeline in
-                                    Text(compactStatus(for: call, at: timeline.date))
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                        .monospacedDigit()
-                                }
-                            }
-                        }
-                        Spacer(minLength: 0)
-                    }
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
-                .highPriorityGesture(dragGesture)
-                .accessibilityLabel("Return to call with \(call.participantName)")
-                .accessibilityValue(compactStatus(for: call))
-
-                // Mute and hang up without reopening the call, the way the system and WhatsApp
-                // banners behave. Their hit regions are siblings of the return button, so their
-                // actions cannot also reopen the full call surface.
-                minimizedControl(
-                    icon: media.isMicrophoneEnabled ? "mic.fill" : "mic.slash.fill",
-                    label: media.isMicrophoneEnabled ? "Mute" : "Unmute",
-                    foreground: media.isMicrophoneEnabled ? KitColor.primaryText : .white,
-                    background: media.isMicrophoneEnabled
-                        ? AnyShapeStyle(.thinMaterial)
-                        : AnyShapeStyle(KitColor.navy),
-                    enabled: CallControlAvailabilityPolicy.microphoneControlIsEnabled(
-                        isConnected: coordinator.state == .connected,
-                        isReconnecting: coordinator.state == .reconnecting
-                    )
-                ) {
-                    coordinator.requestMuted(media.isMicrophoneEnabled)
-                }
-                minimizedControl(
-                    icon: "phone.down.fill",
-                    label: "End call",
-                    foreground: .white,
-                    background: AnyShapeStyle(Color(red: 0.98, green: 0.02, blue: 0.25)),
-                    enabled: coordinator.state != .ending
-                ) {
-                    coordinator.requestEnd()
-                }
-            }
-            .padding(.horizontal, 12)
-            .background {
-                RoundedRectangle(cornerRadius: 36, style: .continuous)
-                    .fill(
-                        reduceTransparency
-                            ? Color(UIColor.secondarySystemBackground)
-                            : Color.clear
-                    )
-                    .background {
-                        if !reduceTransparency {
-                            RoundedRectangle(cornerRadius: 36, style: .continuous)
-                                .fill(.regularMaterial)
-                        }
-                    }
-            }
-            .overlay {
-                RoundedRectangle(cornerRadius: 36, style: .continuous)
-                    .stroke(.white.opacity(0.54), lineWidth: 0.8)
-                    .allowsHitTesting(false)
-            }
-            .shadow(color: .black.opacity(0.22), radius: 16, y: 8)
         }
     }
 
@@ -2128,6 +2186,42 @@ private enum CallDurationFormatter {
             return String(format: "%d:%02d:%02d", hours, minutes, remainingSeconds)
         }
         return String(format: "%02d:%02d", minutes, remainingSeconds)
+    }
+}
+
+/// Voice-weighted wave inside the full-width call strip: bar heights follow the live audio
+/// level and settle into a soft heart-pulse when the line is quiet. Static under Reduce Motion.
+private struct CallBannerVoiceWave: View {
+    let level: Float
+    let isConnected: Bool
+    let animated: Bool
+
+    private static let barShape: [CGFloat] = [0.4, 0.7, 1.0, 0.72, 0.5, 0.86, 0.42]
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 0.12, paused: !animated || !isConnected)) { timeline in
+            let phase = timeline.date.timeIntervalSinceReferenceDate
+            HStack(spacing: 2.6) {
+                ForEach(Self.barShape.indices, id: \.self) { index in
+                    Capsule()
+                        .fill(KitColor.green.opacity(0.55 + 0.45 * Double(min(1, max(0, level)))))
+                        .frame(width: 3, height: barHeight(index: index, phase: phase))
+                }
+            }
+        }
+        .accessibilityHidden(true)
+    }
+
+    private func barHeight(index: Int, phase: TimeInterval) -> CGFloat {
+        let base: CGFloat = 5
+        guard isConnected else { return base }
+        let shape = Self.barShape[index]
+        if level > 0.02 {
+            return base + shape * CGFloat(min(1, max(0, level))) * 15
+        }
+        guard animated else { return base + shape * 3 }
+        let beat = pow(max(0, sin(phase * 2.2 + Double(index) * 0.7)), 6)
+        return base + shape * CGFloat(beat) * 7
     }
 }
 

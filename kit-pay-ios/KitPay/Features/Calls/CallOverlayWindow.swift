@@ -58,6 +58,7 @@ final class CallOverlayWindowController {
     private var window: CallOverlayPassthroughWindow?
     private let pictureInPicture = CallPictureInPictureCoordinator()
     private var remoteVideoTrackObservation: AnyCancellable?
+    private var audioRouteObservation: AnyCancellable?
 
     private init() {
         pictureInPicture.onDeferredInvalidationCompleted = { [weak self] in
@@ -71,6 +72,17 @@ final class CallOverlayWindowController {
                 Task { @MainActor [weak self] in
                     CallMediaCoordinator.shared.refreshCallKitVideoState()
                     self?.refreshPictureInPicture()
+                }
+            }
+        audioRouteObservation = CallMediaCoordinator.shared.media.$audioRoute
+            .removeDuplicates()
+            .sink { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    let coordinator = CallMediaCoordinator.shared
+                    self.applyScreenWakePolicy(
+                        hasActiveCall: coordinator.activeCall != nil && self.window != nil
+                    )
                 }
             }
     }
@@ -101,9 +113,29 @@ final class CallOverlayWindowController {
         if !showsMinimizedSurface {
             presenter.hitRegion.frame = .zero
         }
+        applyScreenWakePolicy(hasActiveCall: true)
         guard let window = ensureWindow() else { return }
         window.isHidden = false
         refreshPictureInPicture()
+    }
+
+    /// Keeps the screen awake for video and arms the ear-proximity blanking for audio. Runs on
+    /// every call/camera transition through `update`/`refreshPictureInPicture`/`hide`.
+    /// `hasActiveCall` is passed in (not derived) so a call concealed behind the privacy shield
+    /// releases the wake locks even though the coordinator still holds the call.
+    private func applyScreenWakePolicy(hasActiveCall: Bool) {
+        let coordinator = CallMediaCoordinator.shared
+        let carriesVideo = coordinator.callCarriesVideo
+        UIApplication.shared.isIdleTimerDisabled = CallScreenWakePolicy.idleTimerDisabled(
+            hasActiveCall: hasActiveCall,
+            carriesVideo: carriesVideo
+        )
+        UIDevice.current.isProximityMonitoringEnabled =
+            CallScreenWakePolicy.proximityMonitoringEnabled(
+                hasActiveCall: hasActiveCall,
+                carriesVideo: carriesVideo,
+                audioRoute: coordinator.media.audioRoute
+            )
     }
 
     /// Arms or disarms Picture in Picture for the current call. Audio calls deliberately never
@@ -112,6 +144,8 @@ final class CallOverlayWindowController {
     /// audio to video gains the hand-off without restarting.
     func refreshPictureInPicture() {
         let coordinator = CallMediaCoordinator.shared
+        // `window == nil` after hide() covers the concealed state without re-deriving it here.
+        applyScreenWakePolicy(hasActiveCall: coordinator.activeCall != nil && window != nil)
         guard coordinator.callCarriesVideo,
               let sourceView = window?.rootViewController?.view
         else {
@@ -134,6 +168,8 @@ final class CallOverlayWindowController {
         window?.rootViewController = nil
         window?.windowScene = nil
         window = nil
+        UIApplication.shared.isIdleTimerDisabled = false
+        UIDevice.current.isProximityMonitoringEnabled = false
     }
 
     private func ensureWindow() -> CallOverlayPassthroughWindow? {

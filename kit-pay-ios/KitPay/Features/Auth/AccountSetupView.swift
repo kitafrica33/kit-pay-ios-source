@@ -32,9 +32,8 @@ private struct ProfileSetupView: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
-                    Image(systemName: "person.crop.circle.badge.checkmark")
-                        .font(.system(size: 54, weight: .semibold))
-                        .foregroundStyle(KitColor.green)
+                    KitAuthLogoBadge(size: 72)
+                        .frame(maxWidth: .infinity)
 
                     Text("Choose your username and Kit Pay tag")
                         .font(.largeTitle.bold())
@@ -99,7 +98,7 @@ private struct ProfileSetupView: View {
                 }
                 .padding(24)
             }
-            .background(KitColor.canvas)
+            .background(KitAuthBackground())
             .onAppear(perform: initializeFromProfile)
             .onChange(of: model.profile) { _, _ in initializeFromProfile() }
         }
@@ -128,97 +127,81 @@ private struct ProfileSetupView: View {
 }
 
 private struct PaymentPinSetupView: View {
+    private enum Stage {
+        case create
+        case confirm
+    }
+
     @EnvironmentObject private var model: AppModel
     // Deliberately plain @State: payment credentials must never enter scene/app restoration.
+    @State private var stage: Stage = .create
     @State private var pin = ""
-    @State private var confirmation = ""
+    @State private var firstEntry = ""
     @State private var validationError: String?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
-                    Image(systemName: "lock.shield.fill")
-                        .font(.system(size: 54, weight: .semibold))
-                        .foregroundStyle(KitColor.green)
-
-                    Text("Create a wallet PIN")
-                        .font(.largeTitle.bold())
-                        .foregroundStyle(KitColor.primaryText)
-
-                    Text("Your PIN approves payments and unlocks Kit Pay.")
-                        .foregroundStyle(KitColor.secondaryText)
-
-                    pinField("Four-digit PIN", text: $pin)
-                    pinField("Confirm PIN", text: $confirmation)
-
-                    Label(
-                        "This PIN authorizes the exact amount and recipient for each payment.",
-                        systemImage: "lock"
-                    )
-                    .font(.footnote)
-                    .foregroundStyle(KitColor.secondaryText)
-
-                    if let validationError {
-                        Text(validationError)
-                            .font(.footnote)
-                            .foregroundStyle(.red)
-                    }
-
-                    Button {
-                        save()
-                    } label: {
-                        Group {
-                            if model.isCompletingAccountSetup {
-                                ProgressView().tint(.white)
-                            } else {
-                                Text("Set wallet PIN")
-                            }
-                        }
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 15)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .buttonBorderShape(.roundedRectangle(radius: 18))
-                    .tint(KitColor.green)
-                    .disabled(model.isCompletingAccountSetup || pin.count != 4 || confirmation.count != 4)
-                }
-                .padding(24)
-            }
-            .background(KitColor.canvas)
-        }
-    }
-
-    private func pinField(_ title: String, text: Binding<String>) -> some View {
-        SecureField(title, text: text)
-            .keyboardType(.numberPad)
+        KitPinEntryPage(
+            title: stage == .create ? "Create your wallet PIN" : "Confirm your PIN",
+            subtitle: stage == .create
+                ? "This four-digit PIN approves payments and unlocks Kit Pay. Never share it."
+                : "Enter the same four digits once more.",
+            pin: $pin,
+            errorMessage: validationError,
+            isBusy: model.isCompletingAccountSetup,
+            accessory: stage == .confirm
+                ? .action(title: "Start over", action: { restart() })
+                : .none,
+            onFilled: handleFilled
+        ) {
+            Label(
+                "Your PIN authorizes the exact amount and recipient of each payment.",
+                systemImage: "lock"
+            )
+            .font(.footnote)
+            .foregroundStyle(KitColor.secondaryText)
             .multilineTextAlignment(.center)
-            .font(.system(size: 26, weight: .bold, design: .monospaced))
-            .privacySensitive()
-            .padding(16)
-            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 18))
-            .onChange(of: text.wrappedValue) { _, value in
-                let filtered = String(value.filter { $0 >= "0" && $0 <= "9" }.prefix(4))
-                if filtered != value { text.wrappedValue = filtered }
-                validationError = nil
-            }
+            .padding(.horizontal, 32)
+        }
+        .privacySensitive()
+        .onChange(of: pin) { _, value in
+            // Clear the error once the user starts typing again — not when a stage reset
+            // empties the digits, or the mismatch message would vanish unread.
+            if !value.isEmpty { validationError = nil }
+        }
     }
 
-    private func save() {
-        guard isValidPaymentPin(pin) else {
-            validationError = "Enter a four-digit wallet PIN."
-            return
-        }
-        guard pin == confirmation else {
-            validationError = "The PINs did not match. Start again."
+    private func handleFilled(_ filled: String) {
+        switch stage {
+        case .create:
+            guard isValidPaymentPin(filled) else {
+                validationError = "Enter a four-digit wallet PIN."
+                pin = ""
+                return
+            }
+            firstEntry = filled
             pin = ""
-            confirmation = ""
-            return
+            withAnimation(reduceMotion ? nil : .snappy) { stage = .confirm }
+        case .confirm:
+            guard filled == firstEntry else {
+                validationError = "The PINs did not match. Start again."
+                restart(keepingError: true)
+                return
+            }
+            let confirmedPin = filled
+            pin = ""
+            // Keep the original entry until setup succeeds (and this view is dismissed). If the
+            // request fails or the device goes offline, the confirmation page remains usable and
+            // the user can retry without being forced through a guaranteed mismatch first.
+            Task { await model.completePaymentPinSetup(pin: confirmedPin) }
         }
-        let confirmedPin = pin
+    }
+
+    private func restart(keepingError: Bool = false) {
         pin = ""
-        confirmation = ""
-        Task { await model.completePaymentPinSetup(pin: confirmedPin) }
+        firstEntry = ""
+        if !keepingError { validationError = nil }
+        withAnimation(reduceMotion ? nil : .snappy) { stage = .create }
     }
 }
 
@@ -232,124 +215,120 @@ private struct LoginUnlockView: View {
     // the PIN is never requested. Terminal biometric failures disable the enrollment in AppModel,
     // which flips `loginUnlockSupportsBiometrics` and legitimately reveals the PIN path.
     var body: some View {
-        NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
-                    Image(systemName: model.loginUnlockSupportsBiometrics
-                        ? model.biometricSymbolName
-                        : "lock.shield.fill")
-                        .font(.system(size: 54, weight: .semibold))
-                        .foregroundStyle(KitColor.green)
-
-                    Text("Unlock Kit Pay")
-                        .font(.largeTitle.bold())
-                        .foregroundStyle(KitColor.primaryText)
-
-                    Text("Confirm it is you to finish this sign-in.")
-                        .foregroundStyle(KitColor.secondaryText)
-
-                    if model.loginUnlockSupportsBiometrics {
-                        if let biometricError = model.biometricErrorMessage {
-                            Label(biometricError, systemImage: "exclamationmark.triangle.fill")
-                                .font(.footnote)
-                                .foregroundStyle(.red)
-                        }
-
-                        Button {
-                            Task { await model.unlockSessionWithBiometrics() }
-                        } label: {
-                            Group {
-                                if model.isCompletingAccountSetup {
-                                    ProgressView().tint(.white)
-                                } else {
-                                    Label(
-                                        "Continue with \(model.biometricDisplayName)",
-                                        systemImage: model.biometricSymbolName
-                                    )
-                                }
-                            }
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 15)
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .buttonBorderShape(.roundedRectangle(radius: 18))
-                        .tint(KitColor.green)
-                        .disabled(model.isCompletingAccountSetup || !model.isOnline)
-
-                        Label(
-                            "\(model.biometricDisplayName) replaces your PIN on this iPhone.",
-                            systemImage: "lock"
-                        )
-                        .font(.footnote)
-                        .foregroundStyle(KitColor.secondaryText)
-                    } else {
-                        SecureField("Four-digit PIN", text: $pin)
-                            .keyboardType(.numberPad)
-                            .multilineTextAlignment(.center)
-                            .font(.system(size: 28, weight: .bold, design: .monospaced))
-                            .privacySensitive()
-                            .padding(16)
-                            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 18))
-                            .onChange(of: pin) { _, value in
-                                let filtered = String(value.filter { $0 >= "0" && $0 <= "9" }.prefix(4))
-                                if filtered != value { pin = filtered }
-                                validationError = nil
-                            }
-
-                        if let validationError {
-                            Text(validationError)
-                                .font(.footnote)
-                                .foregroundStyle(.red)
-                        }
-
-                        Button {
-                            submitPIN()
-                        } label: {
-                            Group {
-                                if model.isCompletingAccountSetup {
-                                    ProgressView().tint(.white)
-                                } else {
-                                    Text("Unlock with PIN")
-                                }
-                            }
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 15)
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .buttonBorderShape(.roundedRectangle(radius: 18))
-                        .tint(KitColor.green)
-                        .disabled(model.isCompletingAccountSetup || pin.count != 4)
-
-                        Label(
-                            "Your PIN is verified by Kit and is never stored in this app.",
-                            systemImage: "lock"
-                        )
-                        .font(.footnote)
-                        .foregroundStyle(KitColor.secondaryText)
-                    }
+        Group {
+            if model.loginUnlockSupportsBiometrics {
+                biometricUnlock
+            } else {
+                KitPinEntryPage(
+                    title: "Enter your PIN",
+                    subtitle: "Confirm it is you to finish this sign-in.",
+                    pin: $pin,
+                    errorMessage: validationError,
+                    isBusy: model.isCompletingAccountSetup,
+                    onFilled: submitPIN
+                ) {
+                    Label(
+                        "Your PIN is verified by Kit and is never stored in this app.",
+                        systemImage: "lock"
+                    )
+                    .font(.footnote)
+                    .foregroundStyle(KitColor.secondaryText)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 32)
                 }
-                .padding(24)
+                .privacySensitive()
+                .onChange(of: pin) { _, value in
+                    if !value.isEmpty { validationError = nil }
+                }
             }
-            .background(KitColor.canvas)
-            .task {
-                // Lead with the enrolled biometric so returning users never reach for a PIN.
-                guard model.loginUnlockSupportsBiometrics,
-                      model.isOnline,
-                      !didAttemptAutomaticBiometric
-                else { return }
-                didAttemptAutomaticBiometric = true
-                await model.unlockSessionWithBiometrics()
-            }
+        }
+        .task {
+            // Lead with the enrolled biometric so returning users never reach for a PIN.
+            guard model.loginUnlockSupportsBiometrics,
+                  model.isOnline,
+                  !didAttemptAutomaticBiometric
+            else { return }
+            didAttemptAutomaticBiometric = true
+            await model.unlockSessionWithBiometrics()
         }
     }
 
-    private func submitPIN() {
-        guard isValidPaymentPin(pin) else {
+    private var biometricUnlock: some View {
+        ZStack {
+            KitAuthBackground()
+            VStack(spacing: 0) {
+                Spacer(minLength: 24)
+                KitAuthLogoBadge()
+                Spacer(minLength: 16)
+                Text("Unlock Kit Pay")
+                    .font(.title2.bold())
+                    .foregroundStyle(KitColor.primaryText)
+                    .multilineTextAlignment(.center)
+                Text("Confirm it is you to finish this sign-in.")
+                    .font(.subheadline)
+                    .foregroundStyle(KitColor.secondaryText)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 36)
+                    .padding(.top, 6)
+
+                if let biometricError = model.biometricErrorMessage {
+                    Label(biometricError, systemImage: "exclamationmark.triangle.fill")
+                        .font(.footnote.weight(.medium))
+                        .foregroundStyle(.red)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 32)
+                        .padding(.top, 14)
+                }
+
+                Spacer(minLength: 24)
+
+                Button {
+                    Task { await model.unlockSessionWithBiometrics() }
+                } label: {
+                    Group {
+                        if model.isCompletingAccountSetup {
+                            ProgressView().tint(.white)
+                        } else {
+                            Label(
+                                "Continue with \(model.biometricDisplayName)",
+                                systemImage: model.biometricSymbolName
+                            )
+                            .font(.body.weight(.semibold))
+                        }
+                    }
+                    .foregroundStyle(.white)
+                    .frame(maxWidth: .infinity, minHeight: 54)
+                    .background(KitColor.green, in: Capsule())
+                }
+                .buttonStyle(.plain)
+                .disabled(model.isCompletingAccountSetup || !model.isOnline)
+                .opacity(model.isCompletingAccountSetup || !model.isOnline ? 0.6 : 1)
+                .padding(.horizontal, 32)
+
+                Label(
+                    "\(model.biometricDisplayName) replaces your PIN on this iPhone.",
+                    systemImage: "lock"
+                )
+                .font(.footnote)
+                .foregroundStyle(KitColor.secondaryText)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 32)
+                .padding(.top, 14)
+
+                Spacer(minLength: 40)
+            }
+            .frame(maxWidth: 430)
+            .frame(maxWidth: .infinity)
+        }
+    }
+
+    private func submitPIN(_ filled: String) {
+        guard isValidPaymentPin(filled) else {
             validationError = "Enter your four-digit Kit Pay PIN."
+            pin = ""
             return
         }
-        let submittedPIN = pin
         pin = ""
-        Task { await model.unlockSessionWithPIN(submittedPIN) }
+        Task { await model.unlockSessionWithPIN(filled) }
     }
 }
