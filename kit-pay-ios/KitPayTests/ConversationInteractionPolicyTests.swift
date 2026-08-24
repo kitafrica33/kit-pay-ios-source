@@ -87,6 +87,58 @@ final class ConversationInteractionPolicyTests: XCTestCase {
         )
     }
 
+    func testCameraPullEligibilityRequiresScrollableIdleTimeline() {
+        XCTAssertTrue(ConversationCameraPullPolicy.isEligible(
+            contentHeight: 700,
+            viewportHeight: 600,
+            isSelectingMessages: false,
+            isSearchingMessages: false,
+            isRecordingVoiceNote: false,
+            isComposerFocused: false
+        ))
+
+        XCTAssertFalse(ConversationCameraPullPolicy.isEligible(
+            contentHeight: 500,
+            viewportHeight: 600,
+            isSelectingMessages: false,
+            isSearchingMessages: false,
+            isRecordingVoiceNote: false,
+            isComposerFocused: false
+        ), "A short timeline must not offer the camera pull gesture")
+        XCTAssertFalse(ConversationCameraPullPolicy.isEligible(
+            contentHeight: 700,
+            viewportHeight: 600,
+            isSelectingMessages: true,
+            isSearchingMessages: false,
+            isRecordingVoiceNote: false,
+            isComposerFocused: false
+        ), "Message selection must own the conversation gesture")
+        XCTAssertFalse(ConversationCameraPullPolicy.isEligible(
+            contentHeight: 700,
+            viewportHeight: 600,
+            isSelectingMessages: false,
+            isSearchingMessages: true,
+            isRecordingVoiceNote: false,
+            isComposerFocused: false
+        ), "Search must not advertise or open the camera")
+        XCTAssertFalse(ConversationCameraPullPolicy.isEligible(
+            contentHeight: 700,
+            viewportHeight: 600,
+            isSelectingMessages: false,
+            isSearchingMessages: false,
+            isRecordingVoiceNote: true,
+            isComposerFocused: false
+        ), "Voice recording must not be interrupted by the camera")
+        XCTAssertFalse(ConversationCameraPullPolicy.isEligible(
+            contentHeight: 700,
+            viewportHeight: 600,
+            isSelectingMessages: false,
+            isSearchingMessages: false,
+            isRecordingVoiceNote: false,
+            isComposerFocused: true
+        ), "Composer and keyboard focus must suppress the camera pull gesture")
+    }
+
     func testAttachmentStagingCapAllowsAlbums() {
         XCTAssertGreaterThanOrEqual(
             ConversationAttachmentStagingPolicy.maximumStagedAttachments,

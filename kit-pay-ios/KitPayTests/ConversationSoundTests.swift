@@ -720,6 +720,12 @@ final class ConversationSoundTests: XCTestCase {
             descriptor,
             actionIdentifier: MessageNotificationContract.replyActionIdentifier,
             userInfo: exact,
+            userText: "  KITPAY1:v=1&a=sent"
+        ))
+        XCTAssertNil(notificationAction(
+            descriptor,
+            actionIdentifier: MessageNotificationContract.replyActionIdentifier,
+            userInfo: exact,
             userText: String(
                 repeating: "a",
                 count: MessageNotificationContract.maximumReplyBytes + 1

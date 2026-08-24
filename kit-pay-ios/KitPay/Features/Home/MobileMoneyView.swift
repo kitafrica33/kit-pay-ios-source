@@ -916,6 +916,9 @@ struct MobileMoneyView: View {
 
     private var permitted: Bool { app.capabilities?.enablesMobileMoney == true }
     private var supportsPayouts: Bool { model.networks.supportsMobileMoneyPayouts }
+    private var savedMobileMoneyAccounts: [MobileMoneyAccountDTO] {
+        MobileMoneySavedAccountRailPolicy.mobileMoneyAccounts(model.accounts)
+    }
 
     var body: some View {
         NavigationStack {
@@ -1051,9 +1054,9 @@ struct MobileMoneyView: View {
                     .font(.subheadline.bold()).foregroundStyle(KitColor.green)
                     .disabled(!permitted || !app.isOnline || model.isSubmitting)
             }
-            if model.isLoading && model.accounts.isEmpty {
+            if model.isLoading && savedMobileMoneyAccounts.isEmpty {
                 ProgressView("Loading mobile money…").frame(maxWidth: .infinity).padding(20)
-            } else if model.accounts.isEmpty {
+            } else if savedMobileMoneyAccounts.isEmpty {
                 ContentUnavailableView(
                     "No saved account",
                     systemImage: "plus.circle",
@@ -1065,7 +1068,7 @@ struct MobileMoneyView: View {
                 )
                 .frame(maxWidth: .infinity).padding(16).kitGlass(cornerRadius: 22)
             } else {
-                ForEach(model.accounts) { account in
+                ForEach(savedMobileMoneyAccounts) { account in
                     NavigationLink {
                         MobileMoneySavedAccountDetailView(
                             model: model,
@@ -1096,6 +1099,7 @@ struct MobileMoneyView: View {
                                 .foregroundStyle(.tertiary)
                         }
                         .padding(14).kitGlass(cornerRadius: 20, shadow: false)
+                        .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                 }
@@ -1572,6 +1576,7 @@ private struct MobileMoneySavedAccountDetailView: View {
         }
         .padding(14)
         .kitGlass(cornerRadius: 20, shadow: false)
+        .contentShape(Rectangle())
     }
 
     private func inlineError(_ message: String) -> some View {
@@ -1853,7 +1858,8 @@ private struct MobileMoneyOperationView: View {
 
     private var payoutNetworks: [MobileMoneyNetworkDTO] {
         model.networks.filter {
-            ["MTN", "AIRTEL"].contains($0.code.uppercased())
+            MobileMoneySavedAccountRailPolicy.isMobileMoneyRailDestination($0)
+                && ["MTN", "AIRTEL"].contains($0.code.uppercased())
                 && $0.canVerifyAccount
                 && $0.canPayout
         }

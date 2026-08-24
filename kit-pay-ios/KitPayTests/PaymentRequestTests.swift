@@ -179,6 +179,18 @@ final class PaymentRequestTests: XCTestCase {
         XCTAssertEqual(descriptor.decimalAmount, "25000.00")
     }
 
+    func testUserAuthoredTextCannotEnterThePaymentEventNamespace() {
+        XCTAssertFalse(SecureMessageReservedPrefixPolicy.allowsUserAuthoredText(
+            "KITPAY1:v=1&a=sent&id=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa&amt=1&cur=UGX&sc=0"
+        ))
+        XCTAssertFalse(SecureMessageReservedPrefixPolicy.allowsUserAuthoredText(
+            "  \nKITPAY1:not-even-a-valid-descriptor"
+        ))
+        XCTAssertTrue(SecureMessageReservedPrefixPolicy.allowsUserAuthoredText(
+            "Please review KITPAY1: after lunch"
+        ))
+    }
+
     func testKitPaymentMessageUsesAndroidUTF8FormEncodingWithoutPlusSpaces() throws {
         let descriptor = try XCTUnwrap(KitPaymentMessage(
             action: .request,
@@ -356,6 +368,36 @@ final class PaymentRequestTests: XCTestCase {
             policy: policy,
             isOnline: true
         ).title, "Payment received")
+    }
+
+    func testPaymentRequestThreadOutcomeIsLastWinsAndDirectionBound() throws {
+        let id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        let request = try XCTUnwrap(KitPaymentMessage(
+            action: .request,
+            paymentRequestId: id,
+            amountMinor: 500,
+            currencyCode: "UGX",
+            currencyScale: 0,
+            note: nil
+        ))
+        let declined = try XCTUnwrap(request.changingAction(to: .declined))
+        let paid = try XCTUnwrap(request.changingAction(to: .paid))
+        let forgedCancel = try XCTUnwrap(request.changingAction(to: .cancelled))
+        let messages = [
+            localMessage(request.encoded, isOutgoing: true),
+            localMessage(declined.encoded, isOutgoing: false),
+            localMessage(forgedCancel.encoded, isOutgoing: false),
+            localMessage(paid.encoded, isOutgoing: false),
+        ]
+
+        XCTAssertEqual(
+            KitPaymentRequestThreadStatePolicy.latestLocalOutcome(
+                forRequestID: id.uppercased(),
+                requestIsOutgoing: true,
+                messages: messages
+            ),
+            KitPaymentThreadOutcome(action: .paid, reason: nil)
+        )
     }
 
     func testAuthoritativeChatRequestMismatchPreventsResolution() throws {
@@ -585,6 +627,22 @@ final class PaymentRequestTests: XCTestCase {
             balances: WalletBalances(available: "100.00", ledger: "100.00"),
             status: status,
             isPrimary: true
+        )
+    }
+
+    private func localMessage(_ body: String, isOutgoing: Bool) -> LocalMessage {
+        LocalMessage(
+            id: UUID(),
+            conversationId: "conversation",
+            senderId: "sender",
+            body: body,
+            createdAt: Date(),
+            sentAt: nil,
+            state: .sent,
+            failureReason: nil,
+            isOutgoing: isOutgoing,
+            attachmentData: nil,
+            pendingAttachment: nil
         )
     }
 }

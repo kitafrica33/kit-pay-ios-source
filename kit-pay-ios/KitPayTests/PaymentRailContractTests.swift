@@ -65,6 +65,15 @@ final class PaymentRailContractTests: XCTestCase {
         XCTAssertFalse([MobileMoneyNetworkDTO]().supportsMobileMoneyPayouts)
         XCTAssertFalse([collectionOnly, omittedPayout].supportsMobileMoneyPayouts)
         XCTAssertTrue([collectionOnly, payoutEnabled].supportsMobileMoneyPayouts)
+
+        let ambiguous = MobileMoneyNetworkDTO(
+            id: "network-ambiguous",
+            code: "MTN",
+            name: "Ambiguous shared-store row",
+            currency: currency,
+            capabilities: ["payouts": true, "transfers": true]
+        )
+        XCTAssertFalse([ambiguous].supportsMobileMoneyPayouts)
     }
 
     func testSendAndWithdrawUsePayoutContractButKeepAccountOwnershipDistinct() {
@@ -110,6 +119,105 @@ final class PaymentRailContractTests: XCTestCase {
         XCTAssertTrue(recipient.isEligible(for: .send))
         XCTAssertFalse(recipient.isEligible(for: .withdraw))
         XCTAssertFalse(recipient.isEligible(for: .addMoney))
+    }
+
+    func testSavedAccountRailPolicyKeepsBankDestinationsOffTheMobileMoneySurface() {
+        let currency = CurrencyDTO(code: "UGX", scale: "2")
+        let mobileNetwork = MobileMoneyNetworkDTO(
+            id: "network-mtn",
+            code: "MTN",
+            name: "MTN Mobile Money",
+            currency: currency,
+            capabilities: ["collections": true, "payouts": true, "account_verification": true]
+        )
+        let bankAsNetwork = MobileMoneyNetworkDTO(
+            id: "bank-stanbic",
+            code: "040147",
+            name: "Stanbic Bank Uganda",
+            currency: currency,
+            capabilities: ["account_verification": true, "transfers": true]
+        )
+        let mixedRailSignals = MobileMoneyNetworkDTO(
+            id: "network-ambiguous",
+            code: "AIRTEL",
+            name: "Airtel Money",
+            currency: currency,
+            capabilities: ["payouts": true, "transfers": true]
+        )
+        let missingCode = MobileMoneyNetworkDTO(
+            id: "network-unlabelled",
+            code: " ",
+            name: "Unlabelled",
+            currency: currency,
+            capabilities: ["collections": true]
+        )
+
+        XCTAssertTrue(
+            MobileMoneySavedAccountRailPolicy.isMobileMoneyRailDestination(mobileNetwork)
+        )
+        XCTAssertFalse(
+            MobileMoneySavedAccountRailPolicy.isMobileMoneyRailDestination(bankAsNetwork)
+        )
+        XCTAssertFalse(
+            MobileMoneySavedAccountRailPolicy.isMobileMoneyRailDestination(mixedRailSignals)
+        )
+        XCTAssertFalse(
+            MobileMoneySavedAccountRailPolicy.isMobileMoneyRailDestination(missingCode)
+        )
+
+        let mobileAccount = MobileMoneyAccountDTO(
+            id: "mobile-account",
+            kind: "own",
+            label: "My MTN",
+            network: mobileNetwork,
+            accountName: "Kit Customer",
+            phoneNumberMasked: "+256 7•• ••• 002",
+            status: "active"
+        )
+        let bankAccount = MobileMoneyAccountDTO(
+            id: "bank-account",
+            kind: "third_party",
+            label: "Bank beneficiary",
+            network: bankAsNetwork,
+            accountName: "EXAMPLE CONTACT",
+            phoneNumberMasked: "••••5678",
+            status: "active"
+        )
+        let ambiguousPayoutAccount = MobileMoneyAccountDTO(
+            id: "ambiguous-payout-account",
+            kind: "third_party",
+            label: "Ambiguous payout",
+            network: mixedRailSignals,
+            accountName: "Ambiguous Recipient",
+            phoneNumberMasked: "+256 7•• ••• 003",
+            status: "active"
+        )
+        let ambiguousOwnAccount = MobileMoneyAccountDTO(
+            id: "ambiguous-own-account",
+            kind: "own",
+            label: "Ambiguous own account",
+            network: mixedRailSignals,
+            accountName: "Kit Customer",
+            phoneNumberMasked: "+256 7•• ••• 004",
+            status: "active"
+        )
+
+        XCTAssertEqual(
+            MobileMoneySavedAccountRailPolicy.mobileMoneyAccounts(
+                [bankAccount, mobileAccount]
+            ).map(\.id),
+            ["mobile-account"]
+        )
+        XCTAssertFalse(ambiguousPayoutAccount.isPayoutCapable)
+        XCTAssertTrue(
+            MobileMoneyPayoutSavedAccountPolicy.eligibleAccounts(
+                from: [ambiguousPayoutAccount],
+                ownership: .someoneElse
+            ).isEmpty
+        )
+        XCTAssertFalse(ambiguousOwnAccount.isEligible(for: .addMoney))
+        XCTAssertFalse(MobileMoneySavedAccountActionPolicy.canCollect(from: ambiguousOwnAccount))
+        XCTAssertNil(MobileMoneySavedAccountActionPolicy.payoutFlow(for: ambiguousOwnAccount))
     }
 
     func testSavedAccountOwnershipUsesOnlyTheTwoBackendClassifications() {

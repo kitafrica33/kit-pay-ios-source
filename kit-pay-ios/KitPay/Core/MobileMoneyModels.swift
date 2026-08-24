@@ -172,7 +172,10 @@ extension Collection where Element == MobileMoneyNetworkDTO {
     /// Payout entry points fail closed until at least one returned network explicitly
     /// advertises the capability. An empty or collection-only catalog must not expose cash out.
     var supportsMobileMoneyPayouts: Bool {
-        contains { $0.canPayout }
+        contains {
+            MobileMoneySavedAccountRailPolicy.isMobileMoneyRailDestination($0)
+                && $0.canPayout
+        }
     }
 }
 
@@ -729,7 +732,8 @@ enum MobileMoneyPayoutSavedAccountPolicy {
         ownership: MobileMoneyRecipientOwnership
     ) -> [MobileMoneyAccountDTO] {
         accounts.filter {
-            $0.isPayoutCapable
+            MobileMoneySavedAccountRailPolicy.isMobileMoneyRailDestination($0.network)
+                && $0.isPayoutCapable
                 && $0.hasConfirmedPayoutIdentity
                 && $0.hasPreferredPayoutOwnership(ownership)
         }
@@ -746,15 +750,37 @@ enum MobileMoneyPayoutSavedAccountPolicy {
     }
 }
 
+/// The counterpart of `BankBeneficiaryRailPolicy` for the shared backend beneficiary store:
+/// mobile-money rows carry no explicit rail field either, so bank-rail rows are kept off the
+/// mobile-money surface using the strongest signals available. Only banks advertise a
+/// `transfers` capability and only banks use numeric institution codes; a row showing either
+/// bank signal — or an empty code — is excluded here, and rows mixing both rails' signals are
+/// also excluded from the bank surface, so ambiguous records fail closed on both rails.
+enum MobileMoneySavedAccountRailPolicy {
+    static func isMobileMoneyRailDestination(_ network: MobileMoneyNetworkDTO) -> Bool {
+        guard network.capabilities?["transfers"] != true else { return false }
+        let code = network.code.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !code.isEmpty && !code.allSatisfy(\.isNumber)
+    }
+
+    static func mobileMoneyAccounts(
+        _ accounts: [MobileMoneyAccountDTO]
+    ) -> [MobileMoneyAccountDTO] {
+        accounts.filter { isMobileMoneyRailDestination($0.network) }
+    }
+}
+
 enum MobileMoneySavedAccountActionPolicy {
     static func canCollect(from account: MobileMoneyAccountDTO) -> Bool {
-        account.isActive
+        MobileMoneySavedAccountRailPolicy.isMobileMoneyRailDestination(account.network)
+            && account.isActive
             && account.isOwnAccount
             && account.network.canCollect
     }
 
     static func payoutFlow(for account: MobileMoneyAccountDTO) -> MobileMoneyFlow? {
-        guard account.isPayoutCapable,
+        guard MobileMoneySavedAccountRailPolicy.isMobileMoneyRailDestination(account.network),
+              account.isPayoutCapable,
               account.hasConfirmedPayoutIdentity
         else { return nil }
         if account.isOwnAccount { return .withdraw }
@@ -765,7 +791,9 @@ enum MobileMoneySavedAccountActionPolicy {
 
 extension MobileMoneyAccountDTO {
     func isEligible(for flow: MobileMoneyFlow) -> Bool {
-        guard isActive else { return false }
+        guard MobileMoneySavedAccountRailPolicy.isMobileMoneyRailDestination(network),
+              isActive
+        else { return false }
         switch flow {
         case .addMoney:
             return MobileMoneySavedAccountActionPolicy.canCollect(from: self)
@@ -778,6 +806,7 @@ extension MobileMoneyAccountDTO {
 
     var isPayoutCapable: Bool {
         isActive
+            && MobileMoneySavedAccountRailPolicy.isMobileMoneyRailDestination(network)
             && network.canPayout
             && ["MTN", "AIRTEL"].contains(network.code.uppercased())
     }

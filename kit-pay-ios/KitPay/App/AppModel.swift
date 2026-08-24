@@ -5495,6 +5495,12 @@ final class AppModel: ObservableObject {
               let clientMessageID = action.replyClientMessageID,
               let currentSession = await sessions.current()
         else { return false }
+        guard SecureMessageReservedPrefixPolicy.allowsUserAuthoredText(text) else {
+            if UIApplication.shared.applicationState == .active {
+                lastError = "Messages can't start with Kit Pay's reserved payment prefix."
+            }
+            return false
+        }
         let expectedAccountEpoch = accountEpoch
         let snapshot = await store.snapshot()
         guard let currentUserID = snapshot.profile?.id,
@@ -7186,8 +7192,58 @@ final class AppModel: ObservableObject {
         clientMessageID: UUID? = nil,
         draftClearVersion: ConversationDraftWriteVersion? = nil
     ) async -> Bool {
+        await queueValidatedMessage(
+            conversationId: conversationId,
+            title: title,
+            recipientId: recipientId,
+            body: body,
+            clientMessageID: clientMessageID,
+            draftClearVersion: draftClearVersion,
+            trustedPaymentEvent: false
+        )
+    }
+
+    /// Queues a canonical payment event produced by a server-confirmed payment flow. This is the
+    /// only bypass for the user-text `KITPAY1:` reservation and rejects noncanonical descriptors.
+    @discardableResult
+    func queuePaymentEvent(
+        conversationId: String,
+        title: String,
+        recipientId: String,
+        body: String,
+        clientMessageID: UUID? = nil
+    ) async -> Bool {
+        await queueValidatedMessage(
+            conversationId: conversationId,
+            title: title,
+            recipientId: recipientId,
+            body: body,
+            clientMessageID: clientMessageID,
+            draftClearVersion: nil,
+            trustedPaymentEvent: true
+        )
+    }
+
+    private func queueValidatedMessage(
+        conversationId: String,
+        title: String,
+        recipientId: String?,
+        body: String,
+        clientMessageID: UUID?,
+        draftClearVersion: ConversationDraftWriteVersion?,
+        trustedPaymentEvent: Bool
+    ) async -> Bool {
         let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
+        if trustedPaymentEvent {
+            guard KitPaymentMessage.parse(trimmed) != nil else {
+                lastError = "Kit Pay could not validate this payment event."
+                return false
+            }
+        } else if !SecureMessageReservedPrefixPolicy.allowsUserAuthoredText(trimmed) {
+            lastError = "Messages can't start with Kit Pay's reserved payment prefix."
+            return false
+        }
         guard let cleanConversationId = OutboxPolicy.canonicalConversationID(conversationId) else {
             lastError = "This conversation is no longer available. Your message was not sent."
             return false
@@ -7279,7 +7335,7 @@ final class AppModel: ObservableObject {
         guard lease.authorizes(share) else { return false }
         let queued: Bool
         if let conversationId {
-            queued = await queueMessage(
+            queued = await queuePaymentEvent(
                 conversationId: conversationId,
                 title: share.recipientName,
                 recipientId: share.recipientUserID,
@@ -7287,7 +7343,7 @@ final class AppModel: ObservableObject {
                 clientMessageID: share.clientMessageID
             )
         } else {
-            queued = await queueDirectMessage(
+            queued = await queueDirectPaymentEvent(
                 recipientId: share.recipientUserID,
                 title: share.recipientName,
                 body: share.descriptor.encoded,
@@ -7305,6 +7361,64 @@ final class AppModel: ObservableObject {
             paymentRequestChatShareLeases.removeValue(forKey: leaseKey)
         }
         return true
+    }
+
+    /// Shares a just-completed Kit Pay → Kit Pay transfer into the conversation as an encrypted
+    /// `KITPAY1` transfer event. A held transfer is keyed by the server's claim id; an immediate
+    /// transfer uses the transaction id and the distinct `sent` action. The chosen reference also
+    /// doubles as the client message id so a retry cannot produce a duplicate chat event.
+    @discardableResult
+    func queueTransferChatEvent(
+        transaction: WalletTransaction,
+        recipientId: String,
+        title: String,
+        conversationId: String? = nil
+    ) async -> Bool {
+        let claim = transaction.claim
+        let referenceID = claim?.id ?? transaction.id
+        let currency = claim?.currency ?? transaction.currency
+        let rawAmount = claim?.amount ?? transaction.amount
+        let positiveAmount = rawAmount.hasPrefix("-") ? String(rawAmount.dropFirst()) : rawAmount
+        let note = claim?.note ?? transaction.note
+        guard let referenceUUID = UUID(uuidString: referenceID),
+              let scale = Int(currency.scale),
+              let amountMinor = KitPaymentMessage.minorUnits(
+                  for: positiveAmount,
+                  scale: scale
+              )
+        else { return false }
+        // The note is optional garnish; a note the wire cannot carry must not block the event.
+        let descriptor = KitPaymentMessage(
+            action: claim == nil ? .sent : .transfer,
+            paymentRequestId: referenceUUID.uuidString.lowercased(),
+            amountMinor: amountMinor,
+            currencyCode: currency.code,
+            currencyScale: scale,
+            note: note
+        ) ?? KitPaymentMessage(
+            action: claim == nil ? .sent : .transfer,
+            paymentRequestId: referenceUUID.uuidString.lowercased(),
+            amountMinor: amountMinor,
+            currencyCode: currency.code,
+            currencyScale: scale,
+            note: nil
+        )
+        guard let descriptor else { return false }
+        if let conversationId {
+            return await queuePaymentEvent(
+                conversationId: conversationId,
+                title: title,
+                recipientId: recipientId,
+                body: descriptor.encoded,
+                clientMessageID: referenceUUID
+            )
+        }
+        return await queueDirectPaymentEvent(
+            recipientId: recipientId,
+            title: title,
+            body: descriptor.encoded,
+            clientMessageID: referenceUUID
+        )
     }
 
     /// Sends any allowed media kind (photo, voice note, video, document) end-to-end encrypted.
@@ -7539,8 +7653,48 @@ final class AppModel: ObservableObject {
         body: String,
         clientMessageID: UUID? = nil
     ) async -> SecureMessagingQueueResult? {
+        await queueValidatedDirectMessageResult(
+            recipientId: recipientId,
+            title: title,
+            body: body,
+            clientMessageID: clientMessageID,
+            trustedPaymentEvent: false
+        )
+    }
+
+    private func queueDirectPaymentEvent(
+        recipientId: String,
+        title: String,
+        body: String,
+        clientMessageID: UUID
+    ) async -> Bool {
+        await queueValidatedDirectMessageResult(
+            recipientId: recipientId,
+            title: title,
+            body: body,
+            clientMessageID: clientMessageID,
+            trustedPaymentEvent: true
+        ) != nil
+    }
+
+    private func queueValidatedDirectMessageResult(
+        recipientId: String,
+        title: String,
+        body: String,
+        clientMessageID: UUID?,
+        trustedPaymentEvent: Bool
+    ) async -> SecureMessagingQueueResult? {
         let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
+        if trustedPaymentEvent {
+            guard KitPaymentMessage.parse(trimmed) != nil else {
+                lastError = "Kit Pay could not validate this payment event."
+                return nil
+            }
+        } else if !SecureMessageReservedPrefixPolicy.allowsUserAuthoredText(trimmed) {
+            lastError = "Messages can't start with Kit Pay's reserved payment prefix."
+            return nil
+        }
         guard let recipientUUID = UUID(
             uuidString: recipientId.trimmingCharacters(in: .whitespacesAndNewlines)
         ),

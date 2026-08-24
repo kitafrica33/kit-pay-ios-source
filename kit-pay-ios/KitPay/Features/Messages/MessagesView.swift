@@ -98,6 +98,9 @@ struct MessagesView: View {
                     }
                 }
                 .navigationTitle(isSelectingChats ? "Select chats" : "Chats")
+                // Inline keeps the title up in the bar: the large collapsing variant scrolls
+                // beneath the pinned opaque search header and reads as a hidden title.
+                .navigationBarTitleDisplayMode(.inline)
                 .toolbar { listToolbar }
                 .navigationDestination(for: Conversation.self) { conversation in
                     ConversationView(conversation: conversation)
@@ -1293,6 +1296,7 @@ struct ConversationView: View {
     @State private var unseenIncomingCount = 0
     @State private var cameraPullProgress: CGFloat = 0
     @State private var didTriggerCameraPull = false
+    @State private var conversationContentHeight: CGFloat = 0
     @State private var conversationViewportHeight: CGFloat = 0
     @State private var pendingScrollTargetMessageID: UUID?
     @State private var galleryTarget: ConversationGalleryTarget?
@@ -1307,6 +1311,9 @@ struct ConversationView: View {
     /// can never share contacts, errors, or submission state.
     @StateObject private var sendMoneyFlow = WalletFlowModel()
     @StateObject private var chatPaymentRequests = PaymentRequestsViewModel()
+    @StateObject private var chatTransfers = ChatTransfersViewModel()
+    @State private var transferReverseTarget: ChatTransferReverseTarget?
+    @State private var transferRejectTarget: ChatTransferRejectTarget?
     @StateObject private var voiceRecorder = VoiceNoteRecorder()
     @FocusState private var isComposerFocused: Bool
 
@@ -1392,6 +1399,17 @@ struct ConversationView: View {
             && (hasAttachment || !trimmedDraft.isEmpty)
     }
 
+    private var cameraPullIsEligible: Bool {
+        ConversationCameraPullPolicy.isEligible(
+            contentHeight: conversationContentHeight,
+            viewportHeight: conversationViewportHeight,
+            isSelectingMessages: isSelectingMessages,
+            isSearchingMessages: isSearchingMessages,
+            isRecordingVoiceNote: voiceRecorder.isRecording,
+            isComposerFocused: isComposerFocused
+        )
+    }
+
     private var paymentRequestPolicy: PaymentRequestPolicy {
         PaymentRequestPolicy(
             features: model.capabilities?.features,
@@ -1400,21 +1418,66 @@ struct ConversationView: View {
         )
     }
 
-    private var incomingPaymentEvents: [(message: LocalMessage, descriptor: KitPaymentMessage)] {
+    private var paymentRequestEvents: [(message: LocalMessage, descriptor: KitPaymentMessage)] {
         timelineItems.compactMap { item in
             guard case .payment(let message, let descriptor) = item,
-                  !message.isOutgoing,
                   descriptor.isRequest
             else { return nil }
             return (message, descriptor)
         }
     }
 
+    private var incomingPaymentEvents: [(message: LocalMessage, descriptor: KitPaymentMessage)] {
+        paymentRequestEvents.filter { !$0.message.isOutgoing }
+    }
+
     private var incomingPaymentRequestLoadID: String {
-        let descriptorMessageIDs = incomingPaymentEvents.map {
+        let descriptorMessageIDs = paymentRequestEvents.map {
             $0.message.id.uuidString.lowercased()
         }
         return "\(model.isOnline):\(descriptorMessageIDs.joined(separator: ","))"
+    }
+
+    /// The signed-in user and this conversation's peer — the only accounts a transfer event in
+    /// this thread may bind to.
+    private var transferPartyBinding: KitTransferPartyBinding? {
+        KitTransferPartyBinding(
+            currentUserID: model.profile?.id,
+            peerUserID: paymentRecipientUserID
+        )
+    }
+
+    private var transferAcceptanceEnabled: Bool {
+        TransferAcceptancePolicy(features: model.capabilities?.features).acceptanceEnabled
+    }
+
+    /// Reloads transfer-acceptance authority whenever the set of transfer events changes (a new
+    /// transfer arriving, a RESPONSE landing — which is exactly when a pending bubble's buttons
+    /// go stale), capabilities arrive, or connectivity returns.
+    private var transferEventLoadID: String {
+        let transferMessageIDs = timelineItems.compactMap { item -> String? in
+            guard case .payment(let message, let descriptor) = item,
+                  descriptor.action.isTransferEvent
+            else { return nil }
+            return message.id.uuidString.lowercased()
+        }
+        return "\(model.isOnline):\(transferAcceptanceEnabled):\(transferMessageIDs.joined(separator: ","))"
+    }
+
+    private var conversationHasTransferEvents: Bool {
+        timelineItems.contains { item in
+            guard case .payment(_, let descriptor) = item else { return false }
+            return descriptor.action == .transfer
+        }
+    }
+
+    private var conversationTransferIDs: [String] {
+        timelineItems.compactMap { item in
+            guard case .payment(_, let descriptor) = item,
+                  descriptor.action == .transfer
+            else { return nil }
+            return descriptor.paymentRequestId
+        }
     }
 
     var body: some View {
@@ -1445,6 +1508,9 @@ struct ConversationView: View {
                             .accessibilityLabel(CustomerFacingMessagingCopy.encryptionAssurance)
                         if let paymentError = chatPaymentRequests.errorMessage {
                             paymentErrorBanner(paymentError)
+                        }
+                        if let transferError = chatTransfers.errorMessage {
+                            paymentErrorBanner(transferError)
                         }
                         ForEach(timelineItems) { item in
                             switch item {
@@ -1516,7 +1582,7 @@ struct ConversationView: View {
                     pendingScrollTargetMessageID = nil
                 }
                 .overlay(alignment: .bottom) {
-                    if cameraPullProgress > 6, !isSelectingMessages {
+                    if cameraPullIsEligible, cameraPullProgress > 2 {
                         cameraPullIndicator
                     }
                 }
@@ -1620,7 +1686,16 @@ struct ConversationView: View {
                     flow: sendMoneyFlow,
                     preselectedContact: recipientContact,
                     preselectedRecipientUserID: paymentRecipientUserID,
-                    locksRecipientSelection: true
+                    locksRecipientSelection: true,
+                    shareTransferInChat: { transaction in
+                        guard let paymentRecipientUserID else { return false }
+                        return await model.queueTransferChatEvent(
+                            transaction: transaction,
+                            recipientId: paymentRecipientUserID,
+                            title: recipientDisplayName,
+                            conversationId: conversation.id
+                        )
+                    }
                 )
                 .environmentObject(model)
             }
@@ -1680,6 +1755,60 @@ struct ConversationView: View {
             .environmentObject(model)
             .presentationBackground(.ultraThinMaterial)
         }
+        .sheet(item: $transferReverseTarget) { target in
+            TransferReverseApprovalView(
+                descriptor: target.descriptor,
+                recipientName: recipientDisplayName,
+                isSubmitting: chatTransfers.actionTransferId != nil,
+                errorMessage: chatTransfers.errorMessage
+            ) { reason, pin in
+                guard transferAcceptanceEnabled else { return false }
+                let reversed = await chatTransfers.reverse(
+                    target.descriptor,
+                    binding: transferPartyBinding,
+                    reason: reason,
+                    acceptanceEnabled: transferAcceptanceEnabled,
+                    pin: pin,
+                    isOnline: model.isOnline,
+                    authorize: model.authorizeFinancialStepUp
+                )
+                guard reversed else { return false }
+                await queueTransferResponse(
+                    target.descriptor,
+                    action: .reversed,
+                    reason: reason
+                )
+                await model.refresh()
+                return true
+            }
+            .environmentObject(model)
+            .presentationBackground(.ultraThinMaterial)
+        }
+        .sheet(item: $transferRejectTarget) { target in
+            TransferRejectApprovalView(
+                descriptor: target.descriptor,
+                isSubmitting: chatTransfers.actionTransferId != nil,
+                errorMessage: chatTransfers.errorMessage
+            ) { reason in
+                guard transferAcceptanceEnabled else { return false }
+                let rejected = await chatTransfers.reject(
+                    target.descriptor,
+                    binding: transferPartyBinding,
+                    reason: reason,
+                    acceptanceEnabled: transferAcceptanceEnabled,
+                    isOnline: model.isOnline
+                )
+                guard rejected else { return false }
+                await queueTransferResponse(
+                    target.descriptor,
+                    action: .rejected,
+                    reason: reason
+                )
+                await model.refresh()
+                return true
+            }
+            .presentationBackground(.ultraThinMaterial)
+        }
         .sheet(item: $chatPaymentApproval) { approval in
             PaymentRequestPINView(
                 request: approval.request,
@@ -1698,7 +1827,7 @@ struct ConversationView: View {
                 guard paid else { return false }
                 if let paymentRecipientUserID,
                    let paidDescriptor = approval.descriptor.changingAction(to: .paid) {
-                    _ = await model.queueMessage(
+                    _ = await model.queuePaymentEvent(
                         conversationId: conversation.id,
                         title: recipientDisplayName,
                         recipientId: paymentRecipientUserID,
@@ -1748,10 +1877,22 @@ struct ConversationView: View {
         .task(id: incomingPaymentRequestLoadID) {
             guard paymentRecipientUserID != nil,
                   model.isOnline,
-                  !incomingPaymentEvents.isEmpty
+                  !paymentRequestEvents.isEmpty
             else { return }
             await chatPaymentRequests.load(isOnline: true)
             validateLoadedChatPaymentRequests()
+        }
+        .task(id: transferEventLoadID) {
+            guard paymentRecipientUserID != nil,
+                  model.isOnline,
+                  conversationHasTransferEvents,
+                  transferAcceptanceEnabled
+            else { return }
+            await chatTransfers.load(
+                isOnline: true,
+                transferIds: conversationTransferIDs
+            )
+            await documentObservedAutoReversals()
         }
         .task(id: draftPersistenceTaskKey) {
             guard draftPersistenceTaskKey.didRestore,
@@ -2667,7 +2808,7 @@ struct ConversationView: View {
         HStack {
             if message.isOutgoing { Spacer(minLength: 52) }
             VStack(alignment: message.isOutgoing ? .trailing : .leading, spacing: 5) {
-                paymentMessageContent(message: message, descriptor: descriptor)
+                paymentEventContent(message: message, descriptor: descriptor)
                 messageMetadata(message)
             }
             .padding(.horizontal, 14)
@@ -2714,11 +2855,251 @@ struct ConversationView: View {
             .accessibilityLabel(separator.accessibilityLabel)
     }
 
+    /// Routes every KITPAY1 chat event to its renderer: requests/paid keep the existing card,
+    /// transfers and their responses use the acceptance-aware card.
+    @ViewBuilder
+    private func paymentEventContent(
+        message: LocalMessage,
+        descriptor: KitPaymentMessage
+    ) -> some View {
+        switch descriptor.action {
+        case .request, .paid, .declined, .cancelled:
+            paymentMessageContent(message: message, descriptor: descriptor)
+        case .transfer, .sent, .accepted, .rejected, .reversed, .expired:
+            transferMessageContent(message: message, descriptor: descriptor)
+        }
+    }
+
+    private func transferMessageContent(
+        message: LocalMessage,
+        descriptor: KitPaymentMessage
+    ) -> some View {
+        let binding = transferPartyBinding
+        let authoritativeTransfer = chatTransfers.authoritativeTransfer(
+            for: descriptor,
+            binding: binding
+        )
+        let presentation = KitTransferMessagePresentationPolicy.presentation(
+            for: descriptor,
+            isOutgoing: message.isOutgoing,
+            authoritativeTransfer: authoritativeTransfer,
+            localOutcome: KitTransferThreadStatePolicy.latestLocalOutcome(
+                forTransferID: descriptor.paymentRequestId,
+                transferIsOutgoing: message.isOutgoing,
+                messages: messages
+            ),
+            binding: binding,
+            acceptanceEnabled: transferAcceptanceEnabled,
+            isOnline: model.isOnline
+        )
+        let foreground = message.isOutgoing ? Color.white : KitColor.primaryText
+        let secondary = message.isOutgoing
+            ? Color.white.opacity(0.76)
+            : KitColor.secondaryText
+        let isActing = chatTransfers.actionTransferId == descriptor.paymentRequestId
+
+        return VStack(alignment: .leading, spacing: 8) {
+            Label(
+                presentation.title,
+                systemImage: transferEventSymbol(for: descriptor, isOutgoing: message.isOutgoing)
+            )
+            .font(.caption.bold())
+            .foregroundStyle(message.isOutgoing ? Color.white.opacity(0.82) : KitColor.green)
+            Text("\(descriptor.currencyCode) \(descriptor.decimalAmount)")
+                .font(.title3.bold())
+                .foregroundStyle(foreground)
+            // The transfer's own note, or — on response receipts — the documented reason
+            // (e.g. why a payment was reversed).
+            if let note = descriptor.note {
+                Text(note)
+                    .font(.subheadline)
+                    .foregroundStyle(secondary)
+            }
+            if let reason = descriptor.reason ?? authoritativeTransfer?.reason {
+                Text("Reason: \(reason)")
+                    .font(.subheadline)
+                    .foregroundStyle(secondary)
+            }
+            if !presentation.statusText.isEmpty {
+                Text(presentation.statusText)
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(secondary)
+            }
+
+            if presentation.showsAccept || presentation.showsReject {
+                HStack(spacing: 8) {
+                    if presentation.showsAccept {
+                        Button {
+                            Task { await acceptTransfer(descriptor) }
+                        } label: {
+                            if isActing {
+                                ProgressView()
+                                    .tint(message.isOutgoing ? .white : KitColor.green)
+                                    .frame(maxWidth: .infinity)
+                            } else {
+                                Label("Accept", systemImage: "checkmark.circle.fill")
+                                    .frame(maxWidth: .infinity)
+                            }
+                        }
+                        .buttonStyle(KitSecondaryButtonStyle())
+                        .disabled(chatTransfers.actionTransferId != nil)
+                    }
+                    if presentation.showsReject {
+                        Button {
+                            transferRejectTarget = ChatTransferRejectTarget(
+                                descriptor: descriptor
+                            )
+                        } label: {
+                            Label("Decline", systemImage: "xmark.circle")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(KitSecondaryButtonStyle())
+                        .disabled(chatTransfers.actionTransferId != nil)
+                    }
+                }
+            }
+            if presentation.showsReverse {
+                Button {
+                    transferReverseTarget = ChatTransferReverseTarget(descriptor: descriptor)
+                } label: {
+                    if isActing {
+                        ProgressView()
+                            .tint(message.isOutgoing ? .white : KitColor.green)
+                            .frame(maxWidth: .infinity)
+                    } else {
+                        Label("Reverse", systemImage: "arrow.uturn.backward")
+                            .frame(maxWidth: .infinity)
+                    }
+                }
+                .buttonStyle(KitSecondaryButtonStyle())
+                .disabled(chatTransfers.actionTransferId != nil)
+            }
+        }
+        .frame(maxWidth: 270, alignment: .leading)
+        .accessibilityElement(children: .combine)
+    }
+
+    private func transferEventSymbol(
+        for descriptor: KitPaymentMessage,
+        isOutgoing: Bool
+    ) -> String {
+        switch descriptor.action {
+        case .transfer:
+            isOutgoing ? "arrow.up.circle.fill" : "arrow.down.circle.fill"
+        case .sent:
+            "checkmark.circle.fill"
+        case .accepted:
+            "checkmark.circle.fill"
+        case .rejected:
+            "xmark.circle"
+        case .reversed:
+            "arrow.uturn.backward.circle"
+        case .expired:
+            "clock.arrow.circlepath"
+        case .request, .paid, .declined, .cancelled:
+            "banknote"
+        }
+    }
+
+    /// Recipient accepts a pending transfer, then tells the sender inside the conversation.
+    private func acceptTransfer(_ descriptor: KitPaymentMessage) async {
+        guard transferAcceptanceEnabled else { return }
+        let accepted = await chatTransfers.accept(
+            descriptor,
+            binding: transferPartyBinding,
+            acceptanceEnabled: transferAcceptanceEnabled,
+            isOnline: model.isOnline
+        )
+        guard accepted else { return }
+        await queueTransferResponse(descriptor, action: .accepted, reason: nil)
+        await model.refresh()
+    }
+
+    /// When the acceptance window lapsed server-side, the SENDER's device documents the
+    /// auto-reversal in the conversation exactly once: the receipt's message id derives
+    /// deterministically from the transfer id, so retries and multiple devices converge on one
+    /// chat event stating that the payment was reversed and why.
+    private func documentObservedAutoReversals() async {
+        guard let binding = transferPartyBinding,
+              let paymentRecipientUserID
+        else { return }
+        for message in messages where message.isOutgoing {
+            guard let descriptor = KitPaymentMessage.parse(message.body),
+                  descriptor.action == .transfer,
+                  let transfer = chatTransfers.authoritativeTransfer(
+                      for: descriptor,
+                      binding: binding
+                  ),
+                  transfer.knownStatus == .expired
+            else { continue }
+            let receiptID = TransferAcceptanceWindowPolicy.autoReversalReceiptMessageID(
+                forTransferID: descriptor.paymentRequestId
+            )
+            guard !messages.contains(where: { $0.id == receiptID }),
+                  let receipt = KitPaymentMessage(
+                      action: .expired,
+                      paymentRequestId: descriptor.paymentRequestId,
+                      amountMinor: descriptor.amountMinor,
+                      currencyCode: descriptor.currencyCode,
+                      currencyScale: descriptor.currencyScale,
+                      note: nil,
+                      reason: ChatTransfersViewModel.autoReversalReceiptReason(transfer.reason)
+                  )
+            else { continue }
+            _ = await model.queuePaymentEvent(
+                conversationId: conversation.id,
+                title: recipientDisplayName,
+                recipientId: paymentRecipientUserID,
+                body: receipt.encoded,
+                clientMessageID: receiptID
+            )
+        }
+    }
+
+    /// The response event is best-effort: the money already moved authoritatively, and the
+    /// other side's bubble also resolves against the server, so a failed queue only loses the
+    /// cosmetic receipt.
+    private func queueTransferResponse(
+        _ descriptor: KitPaymentMessage,
+        action: KitPaymentMessageAction,
+        reason: String?
+    ) async {
+        guard let paymentRecipientUserID,
+              let receiptID = TransferAcceptanceWindowPolicy.resolutionReceiptMessageID(
+                  forTransferID: descriptor.paymentRequestId,
+                  action: action
+              ),
+              let response = KitPaymentMessage(
+                  action: action,
+                  paymentRequestId: descriptor.paymentRequestId,
+                  amountMinor: descriptor.amountMinor,
+                  currencyCode: descriptor.currencyCode,
+                  currencyScale: descriptor.currencyScale,
+                  note: nil,
+                  reason: ChatTransfersViewModel.canonicalReason(reason)
+              )
+        else { return }
+        _ = await model.queuePaymentEvent(
+            conversationId: conversation.id,
+            title: recipientDisplayName,
+            recipientId: paymentRecipientUserID,
+            body: response.encoded,
+            clientMessageID: receiptID
+        )
+    }
+
     private func paymentMessageContent(
         message: LocalMessage,
         descriptor: KitPaymentMessage
     ) -> some View {
         let authoritativeRequest = authoritativeRequest(for: descriptor)
+        let localOutcome = descriptor.isRequest
+            ? KitPaymentRequestThreadStatePolicy.latestLocalOutcome(
+                forRequestID: descriptor.paymentRequestId,
+                requestIsOutgoing: message.isOutgoing,
+                messages: messages
+            )
+            : nil
         let presentation = KitPaymentMessagePresentationPolicy.presentation(
             for: descriptor,
             isOutgoing: message.isOutgoing,
@@ -2731,9 +3112,28 @@ struct ConversationView: View {
         let secondary = message.isOutgoing
             ? Color.white.opacity(0.76)
             : KitColor.secondaryText
+        let outcomeTitle: String? = switch localOutcome?.action {
+        case .some(.paid): "Payment request · Paid"
+        case .some(.declined): "Payment request · Declined"
+        case .some(.cancelled): "Payment request · Cancelled"
+        case .none: nil
+        default: "Payment request · Closed"
+        }
+        let canCancel = descriptor.isRequest
+            && message.isOutgoing
+            && localOutcome == nil
+            && authoritativeRequest.map { paymentRequestPolicy.canCancel($0) } == true
+            && model.isOnline
+        let canDecline = descriptor.isRequest
+            && !message.isOutgoing
+            && localOutcome == nil
+            && model.secureMessagingAvailable
 
         return VStack(alignment: .leading, spacing: 8) {
-            Label(presentation.title, systemImage: descriptor.isRequest ? "banknote" : "checkmark.circle.fill")
+            Label(
+                outcomeTitle ?? presentation.title,
+                systemImage: descriptor.isRequest ? "banknote" : "checkmark.circle.fill"
+            )
                 .font(.caption.bold())
                 .foregroundStyle(message.isOutgoing ? Color.white.opacity(0.82) : KitColor.green)
             Text("\(descriptor.currencyCode) \(descriptor.decimalAmount)")
@@ -2745,30 +3145,47 @@ struct ConversationView: View {
                     .foregroundStyle(secondary)
             }
 
-            if presentation.showsPayAction {
-                Button {
-                    Task { await prepareChatPayment(descriptor) }
-                } label: {
-                    if resolvingPaymentRequestID == descriptor.paymentRequestId {
-                        ProgressView()
-                            .tint(message.isOutgoing ? .white : KitColor.green)
-                            .frame(maxWidth: .infinity)
-                    } else {
-                        Label(
-                            "Pay \(descriptor.currencyCode) \(descriptor.decimalAmount)",
-                            systemImage: "lock.shield.fill"
+            if localOutcome == nil && (presentation.showsPayAction || canDecline) {
+                HStack(spacing: 8) {
+                    if presentation.showsPayAction {
+                        Button {
+                            Task { await prepareChatPayment(descriptor) }
+                        } label: {
+                            if resolvingPaymentRequestID == descriptor.paymentRequestId {
+                                ProgressView()
+                                    .tint(message.isOutgoing ? .white : KitColor.green)
+                                    .frame(maxWidth: .infinity)
+                            } else {
+                                Label(
+                                    "Pay \(descriptor.currencyCode) \(descriptor.decimalAmount)",
+                                    systemImage: "lock.shield.fill"
+                                )
+                                .frame(maxWidth: .infinity)
+                            }
+                        }
+                        .buttonStyle(KitSecondaryButtonStyle())
+                        .disabled(
+                            chatPaymentRequests.isLoading
+                                || chatPaymentRequests.actionRequestId != nil
+                                || resolvingPaymentRequestID != nil
                         )
-                        .frame(maxWidth: .infinity)
+                    }
+                    if canDecline {
+                        Button("Decline") {
+                            Task { await declineChatPaymentRequest(descriptor) }
+                        }
+                        .buttonStyle(KitSecondaryButtonStyle())
+                        .disabled(isSending)
                     }
                 }
+            } else if canCancel {
+                Button("Cancel request") {
+                    Task { await cancelChatPaymentRequest(descriptor) }
+                }
                 .buttonStyle(KitSecondaryButtonStyle())
-                .disabled(
-                    chatPaymentRequests.isLoading
-                        || chatPaymentRequests.actionRequestId != nil
-                        || resolvingPaymentRequestID != nil
-                )
+                .disabled(chatPaymentRequests.actionRequestId != nil)
             } else {
-                Text(presentation.statusText)
+                Text(outcomeTitle == nil ? presentation.statusText : "Closed")
                     .font(.caption2.weight(.semibold))
                     .foregroundStyle(secondary)
             }
@@ -2790,7 +3207,12 @@ struct ConversationView: View {
               !chatPaymentRequests.isLoading,
               chatPaymentRequests.errorMessage == nil
         else { return }
-        for (_, descriptor) in incomingPaymentEvents {
+        for (message, descriptor) in incomingPaymentEvents {
+            guard KitPaymentRequestThreadStatePolicy.latestLocalOutcome(
+                forRequestID: descriptor.paymentRequestId,
+                requestIsOutgoing: message.isOutgoing,
+                messages: messages
+            ) == nil else { continue }
             switch KitPaymentRequestResolutionPolicy.resolve(
                 descriptor,
                 in: chatPaymentRequests.items
@@ -2832,6 +3254,41 @@ struct ConversationView: View {
             return
         }
         chatPaymentApproval = ChatPaymentApproval(request: request, descriptor: descriptor)
+    }
+
+    private func declineChatPaymentRequest(_ descriptor: KitPaymentMessage) async {
+        guard descriptor.isRequest,
+              let paymentRecipientUserID,
+              let declined = descriptor.changingAction(to: .declined)
+        else { return }
+        _ = await model.queuePaymentEvent(
+            conversationId: conversation.id,
+            title: recipientDisplayName,
+            recipientId: paymentRecipientUserID,
+            body: declined.encoded
+        )
+    }
+
+    private func cancelChatPaymentRequest(_ descriptor: KitPaymentMessage) async {
+        guard descriptor.isRequest,
+              let paymentRecipientUserID,
+              let request = authoritativeRequest(for: descriptor),
+              paymentRequestPolicy.canCancel(request)
+        else { return }
+        let cancelled = await chatPaymentRequests.cancel(
+            request,
+            policy: paymentRequestPolicy,
+            isOnline: model.isOnline
+        )
+        guard cancelled,
+              let receipt = descriptor.changingAction(to: .cancelled)
+        else { return }
+        _ = await model.queuePaymentEvent(
+            conversationId: conversation.id,
+            title: recipientDisplayName,
+            recipientId: paymentRecipientUserID,
+            body: receipt.encoded
+        )
     }
 
     private func callBubble(_ call: CallRecord) -> some View {
@@ -3000,6 +3457,15 @@ struct ConversationView: View {
         guard canSendMessage else { return }
         let submittedDraft = draft
         let submittedText = submittedDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Typed text must never impersonate a payment event: the KITPAY1 wire is written only
+        // by the payment flows themselves (a pasted descriptor could forge "Accepted · Final").
+        if SecureMessageReservedPrefixPolicy.beginsWithReservedPrefix(
+            submittedText,
+            prefix: KitPaymentMessage.prefix
+        ) {
+            model.lastError = "Messages can't start with Kit Pay's reserved payment prefix."
+            return
+        }
         let submittedAttachments = stagedAttachments
         let persistenceVersion = model.nextConversationDraftWriteVersion()
         immediateDraftPersistenceTask?.cancel()
@@ -3415,6 +3881,9 @@ struct ConversationView: View {
     // MARK: Reading position, jump-to-latest, and the pull-past-the-end camera
 
     private func handleScrollMetrics(_ metrics: ConversationScrollMetrics) {
+        if conversationContentHeight != metrics.contentHeight {
+            conversationContentHeight = metrics.contentHeight
+        }
         guard conversationViewportHeight > 0 else { return }
         let distanceFromLatest = metrics.contentMaxY - conversationViewportHeight
         let nearLatest = distanceFromLatest < ConversationCameraPullPolicy.nearLatestDistance
@@ -3423,17 +3892,16 @@ struct ConversationView: View {
             if nearLatest { unseenIncomingCount = 0 }
         }
 
-        // The camera pull only makes sense when the timeline can actually scroll; a short
-        // conversation leaves a gap under the content that is not a gesture.
-        guard metrics.contentHeight > conversationViewportHeight else {
+        guard cameraPullIsEligible else {
             if cameraPullProgress != 0 { cameraPullProgress = 0 }
             return
         }
         let overscroll = max(0, -distanceFromLatest)
-        cameraPullProgress = overscroll
+        if cameraPullProgress != overscroll {
+            cameraPullProgress = overscroll
+        }
         if overscroll >= ConversationCameraPullPolicy.triggerDistance {
-            if !didTriggerCameraPull, !isComposerFocused, !isSelectingMessages,
-               !isSearchingMessages, !voiceRecorder.isRecording {
+            if !didTriggerCameraPull {
                 didTriggerCameraPull = true
                 UIImpactFeedbackGenerator(style: .medium).impactOccurred()
                 showCameraCapture = true
@@ -3541,12 +4009,34 @@ enum ConversationMessageSearchPolicy {
 }
 
 /// How far past the last message the user must pull before the camera opens.
+///
+/// The distances are measured in CONTENT displacement, which iOS rubber-band damping roughly
+/// halves relative to finger travel — a 60pt trigger needs about 120pt of actual pull, which is
+/// a deliberate but easy gesture. (110pt required ~250pt of finger travel and read as broken.)
 enum ConversationCameraPullPolicy {
-    static let triggerDistance: CGFloat = 110
+    static let triggerDistance: CGFloat = 60
     /// Overscroll must fall back under this before another pull can fire.
-    static let rearmDistance: CGFloat = 8
+    static let rearmDistance: CGFloat = 6
     /// Within this distance of the latest message the user counts as "caught up".
     static let nearLatestDistance: CGFloat = 56
+
+    /// The indicator and camera launch must use this same gate so the UI never advertises an
+    /// action that the current conversation interaction would reject.
+    static func isEligible(
+        contentHeight: CGFloat,
+        viewportHeight: CGFloat,
+        isSelectingMessages: Bool,
+        isSearchingMessages: Bool,
+        isRecordingVoiceNote: Bool,
+        isComposerFocused: Bool
+    ) -> Bool {
+        viewportHeight > 0
+            && contentHeight > viewportHeight
+            && !isSelectingMessages
+            && !isSearchingMessages
+            && !isRecordingVoiceNote
+            && !isComposerFocused
+    }
 }
 
 private struct ConversationScrollMetrics: Equatable {
@@ -3596,6 +4086,16 @@ private struct ConversationGalleryTarget: Identifiable {
 private struct MediaEditorSession: Identifiable {
     let id = UUID()
     let input: KitMediaEditorInput
+}
+
+private struct ChatTransferReverseTarget: Identifiable {
+    let descriptor: KitPaymentMessage
+    var id: String { descriptor.paymentRequestId }
+}
+
+private struct ChatTransferRejectTarget: Identifiable {
+    let descriptor: KitPaymentMessage
+    var id: String { descriptor.paymentRequestId }
 }
 
 enum AttachmentImageDecoder {
@@ -4025,6 +4525,7 @@ private extension String {
 enum ChatMessagePresentationPolicy {
     static let paymentRequestPreview = "💰 Payment request"
     static let paymentPreview = "💸 Payment"
+    static let heldPaymentPreview = "💸 Payment awaiting acceptance"
 
     static func previewText(for message: LocalMessage) -> String {
         presentation(for: message).previewText
@@ -4047,8 +4548,21 @@ enum ChatMessagePresentationPolicy {
         }
 
         if let payment = KitPaymentMessage.parse(message.body) {
-            let label = payment.action == .request ? paymentRequestPreview : paymentPreview
-            let searchable = payment.note.map { "\(label) · \($0)" } ?? label
+            let label = switch payment.action {
+            case .request: paymentRequestPreview
+            case .paid, .sent: paymentPreview
+            case .declined: "↩️ Payment request declined"
+            case .cancelled: "↩️ Payment request cancelled"
+            case .transfer: heldPaymentPreview
+            case .accepted: "✅ Payment accepted"
+            case .rejected: "↩️ Payment declined and returned"
+            case .reversed: "↩️ Payment reversed"
+            case .expired: "↩️ Payment returned"
+            }
+            let searchableParts = [payment.note, payment.reason].compactMap { $0 }
+            let searchable = searchableParts.isEmpty
+                ? label
+                : "\(label) · \(searchableParts.joined(separator: " · "))"
             return (label, searchable)
         }
         // A future or malformed encrypted payment card must never expose its wire representation.

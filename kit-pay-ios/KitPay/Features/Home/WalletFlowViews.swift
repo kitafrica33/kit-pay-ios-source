@@ -235,6 +235,9 @@ struct SendMoneyView: View {
     @State private var showingConfirmation = false
     private let preselectedRecipientUserID: String?
     private let locksRecipientSelection: Bool
+    /// Set by chat: after a confirmed transfer, shares the transaction into the conversation as
+    /// an encrypted payment event. Best-effort — a failed share never affects the transfer.
+    private let shareTransferInChat: ((WalletTransaction) async -> Bool)?
 
     /// Chat opens this flow with the conversation's recipient already chosen, mirroring
     /// `RequestMoneyView`: the amount step comes first and the recipient cannot be swapped.
@@ -242,7 +245,8 @@ struct SendMoneyView: View {
         flow: WalletFlowModel,
         preselectedContact: WalletContactDTO? = nil,
         preselectedRecipientUserID: String? = nil,
-        locksRecipientSelection: Bool = false
+        locksRecipientSelection: Bool = false,
+        shareTransferInChat: ((WalletTransaction) async -> Bool)? = nil
     ) {
         self.flow = flow
         self.preselectedRecipientUserID = preselectedRecipientUserID
@@ -250,6 +254,7 @@ struct SendMoneyView: View {
                 ContactRecipientDirectory.recipientUserId(for: $0)
             }
         self.locksRecipientSelection = locksRecipientSelection
+        self.shareTransferInChat = shareTransferInChat
         let initialContact = preselectedContact?.canReceiveTransfer == true
             ? preselectedContact
             : nil
@@ -612,6 +617,24 @@ struct SendMoneyView: View {
                         ) {
                             showingConfirmation = false
                             step = .success
+                            // Every Kit Pay → Kit Pay transfer documents itself as an encrypted
+                            // chat event; the transfer's success never depends on it (the event
+                            // queues durably offline-first). Chat-initiated sends share into
+                            // their conversation; standalone sends go as a direct message.
+                            if let transaction = flow.sentTransaction {
+                                if let shareTransferInChat {
+                                    _ = await shareTransferInChat(transaction)
+                                } else if let recipientUserID = preselectedRecipientUserID
+                                    ?? ContactRecipientDirectory.recipientUserId(
+                                        for: selectedContact
+                                    ) {
+                                    _ = await model.queueTransferChatEvent(
+                                        transaction: transaction,
+                                        recipientId: recipientUserID,
+                                        title: selectedContact.name
+                                    )
+                                }
+                            }
                             await model.refresh()
                         }
                     }

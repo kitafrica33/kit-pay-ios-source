@@ -110,7 +110,9 @@ final class BankTransferViewModel: ObservableObject {
     }
 
     var transferableBeneficiaries: [BankBeneficiaryDTO] {
-        beneficiaries.filter { $0.isActive && $0.bank.canTransfer }
+        BankBeneficiaryRailPolicy.bankRailBeneficiaries(
+            beneficiaries.filter(\.isActive)
+        )
     }
 
     func load(country: String, permitted: Bool?, online: Bool) async {
@@ -829,6 +831,7 @@ struct BankTransferView: View {
         }
         .padding(14)
         .kitGlass(cornerRadius: 20, shadow: false)
+        .contentShape(Rectangle())
     }
 
     private var transfersSection: some View {
@@ -884,7 +887,7 @@ private struct AddBankBeneficiaryView: View {
     @State private var beneficiaryKey = BankTransferIdempotency.key(prefix: "ios-bank-beneficiary")
 
     private var eligibleBanks: [BankDTO] {
-        model.banks.filter { $0.canVerifyAccount && $0.canTransfer }
+        BankBeneficiaryRailPolicy.bankRailBanks(model.banks).filter(\.canVerifyAccount)
     }
 
     private var selectedBank: BankDTO? {

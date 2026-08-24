@@ -2157,10 +2157,12 @@ struct WalletTransaction: Codable, Hashable, Identifiable {
     let status: String
     let counterparty: Counterparty?
     let note: String?
+    /// Present when a Kit Pay → Kit Pay transfer is held for recipient acceptance.
+    var claim: TransferAcceptanceDTO? = nil
     let occurredAt: String
 
     enum CodingKeys: String, CodingKey {
-        case id, reference, amount, currency, type, direction, status, counterparty, note
+        case id, reference, amount, currency, type, direction, status, counterparty, note, claim
         case walletId = "wallet_id"
         case occurredAt = "occurred_at"
     }

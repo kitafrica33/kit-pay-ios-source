@@ -9,6 +9,12 @@ enum SecureMessageReservedPrefixPolicy {
     static func beginsWithReservedPrefix(_ text: String, prefix: String) -> Bool {
         text.drop(while: { $0.isWhitespace }).hasPrefix(prefix)
     }
+
+    /// User-authored text must never enter the trusted payment-event namespace. This check is
+    /// shared by every composer, forwarding and notification-reply boundary.
+    static func allowsUserAuthoredText(_ text: String) -> Bool {
+        !beginsWithReservedPrefix(text, prefix: KitPaymentMessage.prefix)
+    }
 }
 
 /// Ciphertext-only wire constants for Kit's reviewed secure-messaging v2 protocol.

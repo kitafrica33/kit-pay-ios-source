@@ -150,6 +150,67 @@ final class BankTransferContractTests: XCTestCase {
         XCTAssertEqual(Set(object.keys), ["verification_id", "kind", "label"])
     }
 
+    func testBeneficiaryRailPolicyKeepsMobileMoneyDestinationsOffTheBankSurface() {
+        let bank = BankDTO(
+            id: "11111111-1111-4111-8111-111111111111",
+            code: "040147",
+            name: "Stanbic Bank Uganda",
+            countryCode: "UG",
+            currency: "UGX",
+            capabilities: ["account_verification": true, "transfers": true]
+        )
+        let mobileMoneyNetwork = BankDTO(
+            id: "77777777-7777-4777-8777-777777777777",
+            code: "MTN",
+            name: "MTN Mobile Money",
+            countryCode: "UG",
+            currency: "UGX",
+            capabilities: [
+                "account_verification": true,
+                "transfers": true,
+                "collections": true,
+                "payouts": true,
+            ]
+        )
+        let mixedRailSignals = BankDTO(
+            id: "88888888-8888-4888-8888-888888888888",
+            code: "010147",
+            name: "Centenary Bank",
+            countryCode: "UG",
+            currency: "UGX",
+            capabilities: ["transfers": true, "payouts": true]
+        )
+        let transfersDisabled = BankDTO(
+            id: "99999999-9999-4999-8999-999999999999",
+            code: "030233",
+            name: "Deposit-only bank",
+            countryCode: "UG",
+            currency: "UGX",
+            capabilities: ["account_verification": true]
+        )
+
+        XCTAssertTrue(BankBeneficiaryRailPolicy.isBankRailDestination(bank))
+        XCTAssertFalse(BankBeneficiaryRailPolicy.isBankRailDestination(mobileMoneyNetwork))
+        XCTAssertFalse(BankBeneficiaryRailPolicy.isBankRailDestination(mixedRailSignals))
+        XCTAssertFalse(BankBeneficiaryRailPolicy.isBankRailDestination(transfersDisabled))
+
+        XCTAssertEqual(
+            BankBeneficiaryRailPolicy.bankRailBanks([
+                mobileMoneyNetwork, bank, mixedRailSignals, transfersDisabled,
+            ]).map(\.id),
+            [bank.id]
+        )
+
+        XCTAssertEqual(
+            BankBeneficiaryRailPolicy.bankRailBeneficiaries([
+                bankBeneficiary(id: "beneficiary-mobile", bank: mobileMoneyNetwork),
+                bankBeneficiary(id: "beneficiary-bank", bank: bank),
+                bankBeneficiary(id: "beneficiary-ambiguous", bank: mixedRailSignals),
+            ]).map(\.id),
+            ["beneficiary-bank"]
+        )
+    }
+
     func testWholeUGXAmountNeverRoundsOrSendsDecimals() {
         XCTAssertEqual(BankTransferMoney.wholeUGXAmount("1,250"), "1250")
         XCTAssertEqual(BankTransferMoney.wholeUGXAmount("000500"), "500")
@@ -595,6 +656,18 @@ final class BankTransferContractTests: XCTestCase {
 
     private func decode<Value: Decodable>(_ json: String) throws -> Value {
         try JSONDecoder().decode(Value.self, from: Data(json.utf8))
+    }
+
+    private func bankBeneficiary(id: String, bank: BankDTO) -> BankBeneficiaryDTO {
+        BankBeneficiaryDTO(
+            id: id,
+            kind: "third_party",
+            label: "ExampleContact",
+            bank: bank,
+            accountName: "EXAMPLE CONTACT",
+            accountNumberMasked: "••••5678",
+            status: "active"
+        )
     }
 
     private func bankListFixture() throws -> BankListDTO {

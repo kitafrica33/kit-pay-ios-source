@@ -235,6 +235,37 @@ struct BankBeneficiaryDTO: Decodable, Hashable, Identifiable {
     var isActive: Bool { status.caseInsensitiveCompare("active") == .orderedSame }
 }
 
+/// `banking/beneficiaries` is served from the shared banking beneficiary store, which also
+/// holds mobile-money destinations: the backend models each mobile-money network as a bank
+/// record (mobile-money verifications and operations both carry a `bank_id`). Beneficiary
+/// rows carry no explicit rail field, so the bank surface keys off the strongest signals it
+/// has: only mobile-money networks advertise `collections`/`payouts` capabilities or use an
+/// MTN/AIRTEL code, and only transfer banks advertise `transfers`. Rows mixing both rails'
+/// signals are ambiguous and are excluded here (fail closed).
+enum BankBeneficiaryRailPolicy {
+    private static let mobileMoneyNetworkCodes: Set<String> = ["MTN", "AIRTEL"]
+
+    static func isBankRailDestination(_ bank: BankDTO) -> Bool {
+        guard bank.canTransfer,
+              bank.capabilities?["collections"] != true,
+              bank.capabilities?["payouts"] != true
+        else { return false }
+        return !mobileMoneyNetworkCodes.contains(
+            bank.code.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        )
+    }
+
+    static func bankRailBanks(_ banks: [BankDTO]) -> [BankDTO] {
+        banks.filter(isBankRailDestination)
+    }
+
+    static func bankRailBeneficiaries(
+        _ beneficiaries: [BankBeneficiaryDTO]
+    ) -> [BankBeneficiaryDTO] {
+        beneficiaries.filter { isBankRailDestination($0.bank) }
+    }
+}
+
 struct BankingOperationDTO: Decodable, Hashable, Identifiable {
     let id: String
     let reference: String

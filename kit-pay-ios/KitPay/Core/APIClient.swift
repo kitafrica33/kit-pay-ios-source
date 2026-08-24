@@ -1133,7 +1133,7 @@ enum APIEndpointPolicy {
 }
 
 enum APIClientIdentity {
-    private static let fallbackVersion = "0.2.6"
+    private static let fallbackVersion = "0.2.7"
 
     static var currentHeader: String {
         "ios/\(currentAppVersion)"

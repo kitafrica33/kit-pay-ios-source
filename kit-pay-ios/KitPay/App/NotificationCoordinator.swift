@@ -344,7 +344,8 @@ enum MessageNotificationResponsePolicy {
             let reply = userText.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !reply.isEmpty,
                   reply.utf8.count <= MessageNotificationContract.maximumReplyBytes,
-                  !reply.unicodeScalars.contains(where: { $0.value == 0 })
+                  !reply.unicodeScalars.contains(where: { $0.value == 0 }),
+                  SecureMessageReservedPrefixPolicy.allowsUserAuthoredText(reply)
             else { return nil }
             kind = .reply(reply)
         default:

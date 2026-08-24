@@ -56,6 +56,29 @@ and Apple Liquid Glass.
   briefly costs a low multiple of its size in RAM — acceptable on recent iPhones, but streaming
   encrypt/upload/download is the follow-up required before the cap can be considered robust on
   older, memory-constrained devices.
+- Kit Pay → Kit Pay transfers post a canonical encrypted `KITPAY1` event into the 1:1 chat. The
+  cross-platform action set is `request|paid|declined|cancelled|transfer|sent|accepted|rejected|
+  reversed|expired`; optional `note` precedes optional `rsn`, and older clients show a redacted
+  "Payment" preview. A held `transfer` references `transaction.claim.id`; an immediate `sent`
+  references the transaction id. Accept/Reject for the recipient and Reverse for the sender appear
+  only when the backend advertises `features.claimable_transfers`, the authoritative claim is
+  `pending`, the signed-in user and conversation peer match its nested `sender`/`recipient`, and
+  the viewer-specific `can_accept|can_reject|can_reverse` permits the action. The API is
+  `GET transfer-claims[/{id}]` and `POST transfer-claims/{id}/accept|reject|reverse`; reject and
+  reverse accept `{reason}` capped to the wire's 140 UTF-16 units. iOS supplies an optional
+  `X-Kit-Wallet-Step-Up` proof for reverse using purpose `wallet_transfer_reverse` and exact intent
+  `{action,claim_id,reason}`; supporting backends validate and consume supplied proofs atomically,
+  while an absent proof remains compatible with Android. Statuses are
+  `pending|accepted|rejected|reversed|expired`.
+  The backend must return all statuses when the list filter is omitted, auto-return unaccepted
+  transfers after 7 days, and push-notify both parties. The sender's device also records expiry
+  once with a deterministic encrypted receipt. Without the flag, transfers settle immediately
+  and use `sent`; no claim action is exposed.
+  Transfer and response chat cards use deterministic message IDs, so retries cannot duplicate
+  them. The post-transfer share is still best-effort across the narrow interval between the
+  server committing the money movement and iOS durably queuing its encrypted card; a process
+  termination in that interval can omit the card. Durable, bounded receipt recovery is a
+  follow-up and must not be implemented as an unrestricted transaction-history replay.
 - iCloud chat backups require the `iCloud.africa.kit.pay.ios` CloudKit container to be
   provisioned in the Apple Developer portal, an App Store profile authorizing the signed CloudKit
   entitlements, and the `KitMessageBackup` record type deployed to the production schema. Release

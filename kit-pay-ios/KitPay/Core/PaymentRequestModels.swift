@@ -38,9 +38,37 @@ struct PaymentRequestListDTO: Decodable {
     let items: [PaymentRequestDTO]
 }
 
-enum KitPaymentMessageAction: String, Equatable, Sendable {
+enum KitPaymentMessageAction: String, Equatable, Sendable, CaseIterable {
     case request
     case paid
+    /// The peer declined a payment request. No money moved.
+    case declined
+    /// The requester withdrew their own payment request. No money moved.
+    case cancelled
+    /// A held Kit Pay → Kit Pay transfer event; `id` carries the transfer claim id.
+    case transfer
+    /// A Kit Pay → Kit Pay transfer that settled immediately on a backend without acceptance.
+    case sent
+    /// Recipient accepted a pending transfer — the payment is final.
+    case accepted
+    /// Recipient rejected a pending transfer — the money returned to the sender.
+    case rejected
+    /// Sender reversed a pending transfer before it was accepted.
+    case reversed
+    /// Nobody acted before the acceptance window closed, so the server returned the money.
+    case expired
+
+    var isTransferEvent: Bool {
+        ![.request, .paid, .declined, .cancelled].contains(self)
+    }
+
+    var returnedFunds: Bool {
+        [.rejected, .reversed, .expired].contains(self)
+    }
+
+    var movesMoney: Bool {
+        ![.request, .declined, .cancelled].contains(self)
+    }
 }
 
 /// Canonical payment descriptor carried inside the end-to-end encrypted message body.
@@ -49,6 +77,7 @@ struct KitPaymentMessage: Equatable, Sendable {
     static let prefix = "KITPAY1:"
     static let maximumDescriptorLength = 1_024
     static let maximumNoteLength = 140
+    static let maximumReasonLength = 140
     static let maximumAmountMinor: Int64 = 1_000_000_000_000
 
     let action: KitPaymentMessageAction
@@ -57,6 +86,7 @@ struct KitPaymentMessage: Equatable, Sendable {
     let currencyCode: String
     let currencyScale: Int
     let note: String?
+    let reason: String?
 
     init?(
         action: KitPaymentMessageAction,
@@ -64,7 +94,8 @@ struct KitPaymentMessage: Equatable, Sendable {
         amountMinor: Int64,
         currencyCode: String,
         currencyScale: Int,
-        note: String?
+        note: String?,
+        reason: String? = nil
     ) {
         let normalizedNote: String?
         if let note, !note.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -72,11 +103,18 @@ struct KitPaymentMessage: Equatable, Sendable {
         } else {
             normalizedNote = nil
         }
+        let normalizedReason: String?
+        if let reason, !reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            normalizedReason = reason
+        } else {
+            normalizedReason = nil
+        }
         guard Self.isCanonicalUUID(paymentRequestId),
               (1 ... Self.maximumAmountMinor).contains(amountMinor),
               Self.isCurrencyCode(currencyCode),
               (0 ... 6).contains(currencyScale),
-              (normalizedNote?.utf16.count ?? 0) <= Self.maximumNoteLength
+              (normalizedNote?.utf16.count ?? 0) <= Self.maximumNoteLength,
+              (normalizedReason?.utf16.count ?? 0) <= Self.maximumReasonLength
         else { return nil }
 
         self.action = action
@@ -85,6 +123,7 @@ struct KitPaymentMessage: Equatable, Sendable {
         self.currencyCode = currencyCode
         self.currencyScale = currencyScale
         self.note = normalizedNote
+        self.reason = normalizedReason
         guard encoded.utf16.count <= Self.maximumDescriptorLength else { return nil }
     }
 
@@ -101,7 +140,8 @@ struct KitPaymentMessage: Equatable, Sendable {
             amountMinor: amountMinor,
             currencyCode: paymentRequest.currency.code,
             currencyScale: scale,
-            note: paymentRequest.note
+            note: paymentRequest.note,
+            reason: nil
         )
     }
 
@@ -116,6 +156,7 @@ struct KitPaymentMessage: Equatable, Sendable {
         value += "&cur=\(Self.percentEncode(currencyCode))"
         value += "&sc=\(currencyScale)"
         if let note { value += "&note=\(Self.percentEncode(note))" }
+        if let reason { value += "&rsn=\(Self.percentEncode(reason))" }
         return value
     }
 
@@ -136,7 +177,8 @@ struct KitPaymentMessage: Equatable, Sendable {
             amountMinor: amountMinor,
             currencyCode: currencyCode,
             currencyScale: currencyScale,
-            note: note
+            note: note,
+            reason: reason
         )
     }
 
@@ -183,7 +225,8 @@ struct KitPaymentMessage: Equatable, Sendable {
                   amountMinor: amountMinor,
                   currencyCode: currencyCode,
                   currencyScale: currencyScale,
-                  note: fields["note"]
+                  note: fields["note"],
+                  reason: fields["rsn"]
               ),
               descriptor.encoded == text
         else { return nil }
@@ -370,6 +413,41 @@ enum KitPaymentRequestResolutionPolicy {
     }
 }
 
+struct KitPaymentThreadOutcome: Equatable {
+    let action: KitPaymentMessageAction
+    let reason: String?
+}
+
+/// Folds authenticated terminal payment-request events in conversation order. Direction checks
+/// prevent either party from claiming an outcome that only the other side can produce.
+enum KitPaymentRequestThreadStatePolicy {
+    static func latestLocalOutcome(
+        forRequestID requestID: String,
+        requestIsOutgoing: Bool,
+        messages: [LocalMessage]
+    ) -> KitPaymentThreadOutcome? {
+        var outcome: KitPaymentThreadOutcome?
+        for message in messages {
+            guard let descriptor = KitPaymentMessage.parse(message.body),
+                  descriptor.paymentRequestId.caseInsensitiveCompare(requestID) == .orderedSame
+            else { continue }
+            switch descriptor.action {
+            case .paid, .declined:
+                guard message.isOutgoing != requestIsOutgoing else { continue }
+            case .cancelled:
+                guard message.isOutgoing == requestIsOutgoing else { continue }
+            case .request, .transfer, .sent, .accepted, .rejected, .reversed, .expired:
+                continue
+            }
+            outcome = KitPaymentThreadOutcome(
+                action: descriptor.action,
+                reason: descriptor.reason
+            )
+        }
+        return outcome
+    }
+}
+
 struct KitPaymentMessagePresentation: Equatable {
     let title: String
     let statusText: String
@@ -385,12 +463,40 @@ enum KitPaymentMessagePresentationPolicy {
         policy: PaymentRequestPolicy,
         isOnline: Bool
     ) -> KitPaymentMessagePresentation {
-        guard descriptor.isRequest else {
+        switch descriptor.action {
+        case .paid:
             return KitPaymentMessagePresentation(
                 title: isOutgoing ? "Payment sent" : "Payment received",
                 statusText: "Completed",
                 showsPayAction: false
             )
+        case .declined:
+            return KitPaymentMessagePresentation(
+                title: "Payment request declined",
+                statusText: "No money moved",
+                showsPayAction: false
+            )
+        case .cancelled:
+            return KitPaymentMessagePresentation(
+                title: "Payment request cancelled",
+                statusText: "No money moved",
+                showsPayAction: false
+            )
+        case .sent:
+            return KitPaymentMessagePresentation(
+                title: isOutgoing ? "Payment sent" : "Payment received",
+                statusText: "Completed",
+                showsPayAction: false
+            )
+        case .transfer, .accepted, .rejected, .reversed, .expired:
+            // Transfer-family actions are rendered by KitTransferMessagePresentationPolicy.
+            return KitPaymentMessagePresentation(
+                title: "Payment",
+                statusText: "",
+                showsPayAction: false
+            )
+        case .request:
+            break
         }
         guard !isOutgoing else {
             return KitPaymentMessagePresentation(
