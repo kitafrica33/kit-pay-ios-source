@@ -117,6 +117,19 @@
 		A21000000000000000000008 /* ChatBackupSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B21000000000000000000008 /* ChatBackupSettingsView.swift */; };
 		A22000000000000000000001 /* ChatMediaPolicyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B22000000000000000000001 /* ChatMediaPolicyTests.swift */; };
 		A22000000000000000000002 /* MessageBackupTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B22000000000000000000002 /* MessageBackupTests.swift */; };
+		A23000000000000000000001 /* KitReceiptPDF.swift in Sources */ = {isa = PBXBuildFile; fileRef = B23000000000000000000001 /* KitReceiptPDF.swift */; };
+		A23000000000000000000002 /* ForwardMessagesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B23000000000000000000002 /* ForwardMessagesView.swift */; };
+		A23000000000000000000003 /* ConversationMediaLibraryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B23000000000000000000003 /* ConversationMediaLibraryView.swift */; };
+		A23000000000000000000004 /* KitDocumentViewer.swift in Sources */ = {isa = PBXBuildFile; fileRef = B23000000000000000000004 /* KitDocumentViewer.swift */; };
+		A24000000000000000000001 /* ConversationInteractionPolicyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B24000000000000000000001 /* ConversationInteractionPolicyTests.swift */; };
+		A24000000000000000000002 /* ChatMediaAlbumPolicyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B24000000000000000000002 /* ChatMediaAlbumPolicyTests.swift */; };
+		A25000000000000000000001 /* ChatMediaAlbumPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = B25000000000000000000001 /* ChatMediaAlbumPolicy.swift */; };
+		A25000000000000000000002 /* ChatMediaThumbnails.swift in Sources */ = {isa = PBXBuildFile; fileRef = B25000000000000000000002 /* ChatMediaThumbnails.swift */; };
+		A25000000000000000000003 /* KitMediaGalleryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B25000000000000000000003 /* KitMediaGalleryView.swift */; };
+		A25000000000000000000004 /* ChatMediaAlbumGridView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B25000000000000000000004 /* ChatMediaAlbumGridView.swift */; };
+		A26000000000000000000001 /* KitCameraController.swift in Sources */ = {isa = PBXBuildFile; fileRef = B26000000000000000000001 /* KitCameraController.swift */; };
+		A26000000000000000000002 /* KitCameraView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B26000000000000000000002 /* KitCameraView.swift */; };
+		A26000000000000000000003 /* KitMediaEditorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B26000000000000000000003 /* KitMediaEditorView.swift */; };
 		AF2000000000000000000001 /* KitLogo.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF2000000000000000000001 /* KitLogo.swift */; };
 		AF2000000000000000000002 /* KitAuthDesign.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF2000000000000000000002 /* KitAuthDesign.swift */; };
 /* End PBXBuildFile section */
@@ -254,6 +267,19 @@
 		B21000000000000000000008 /* ChatBackupSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Messages/ChatBackupSettingsView.swift; sourceTree = SOURCE_ROOT; };
 		B22000000000000000000001 /* ChatMediaPolicyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/ChatMediaPolicyTests.swift; sourceTree = SOURCE_ROOT; };
 		B22000000000000000000002 /* MessageBackupTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/MessageBackupTests.swift; sourceTree = SOURCE_ROOT; };
+		B23000000000000000000001 /* KitReceiptPDF.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Home/KitReceiptPDF.swift; sourceTree = SOURCE_ROOT; };
+		B23000000000000000000002 /* ForwardMessagesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Messages/ForwardMessagesView.swift; sourceTree = SOURCE_ROOT; };
+		B23000000000000000000003 /* ConversationMediaLibraryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Messages/ConversationMediaLibraryView.swift; sourceTree = SOURCE_ROOT; };
+		B23000000000000000000004 /* KitDocumentViewer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Messages/KitDocumentViewer.swift; sourceTree = SOURCE_ROOT; };
+		B24000000000000000000001 /* ConversationInteractionPolicyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/ConversationInteractionPolicyTests.swift; sourceTree = SOURCE_ROOT; };
+		B24000000000000000000002 /* ChatMediaAlbumPolicyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/ChatMediaAlbumPolicyTests.swift; sourceTree = SOURCE_ROOT; };
+		B25000000000000000000001 /* ChatMediaAlbumPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/ChatMediaAlbumPolicy.swift; sourceTree = SOURCE_ROOT; };
+		B25000000000000000000002 /* ChatMediaThumbnails.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Messages/ChatMediaThumbnails.swift; sourceTree = SOURCE_ROOT; };
+		B25000000000000000000003 /* KitMediaGalleryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Messages/KitMediaGalleryView.swift; sourceTree = SOURCE_ROOT; };
+		B25000000000000000000004 /* ChatMediaAlbumGridView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Messages/ChatMediaAlbumGridView.swift; sourceTree = SOURCE_ROOT; };
+		B26000000000000000000001 /* KitCameraController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Messages/KitCameraController.swift; sourceTree = SOURCE_ROOT; };
+		B26000000000000000000002 /* KitCameraView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Messages/KitCameraView.swift; sourceTree = SOURCE_ROOT; };
+		B26000000000000000000003 /* KitMediaEditorView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Messages/KitMediaEditorView.swift; sourceTree = SOURCE_ROOT; };
 		BF2000000000000000000001 /* KitLogo.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Design/KitLogo.swift; sourceTree = SOURCE_ROOT; };
 		BF2000000000000000000002 /* KitAuthDesign.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Design/KitAuthDesign.swift; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
@@ -353,6 +379,17 @@
 				B21000000000000000000006 /* VoiceNoteRecorder.swift */,
 				B21000000000000000000007 /* CameraCaptureView.swift */,
 				B21000000000000000000008 /* ChatBackupSettingsView.swift */,
+				B23000000000000000000001 /* KitReceiptPDF.swift */,
+				B23000000000000000000002 /* ForwardMessagesView.swift */,
+				B23000000000000000000003 /* ConversationMediaLibraryView.swift */,
+				B23000000000000000000004 /* KitDocumentViewer.swift */,
+				B25000000000000000000001 /* ChatMediaAlbumPolicy.swift */,
+				B25000000000000000000002 /* ChatMediaThumbnails.swift */,
+				B25000000000000000000003 /* KitMediaGalleryView.swift */,
+				B25000000000000000000004 /* ChatMediaAlbumGridView.swift */,
+				B26000000000000000000001 /* KitCameraController.swift */,
+				B26000000000000000000002 /* KitCameraView.swift */,
+				B26000000000000000000003 /* KitMediaEditorView.swift */,
 			);
 			name = KitPay;
 			sourceTree = "<group>";
@@ -387,6 +424,8 @@
 				B20000000000000000000009 /* AppLifecyclePolicyTests.swift */,
 				B22000000000000000000001 /* ChatMediaPolicyTests.swift */,
 				B22000000000000000000002 /* MessageBackupTests.swift */,
+				B24000000000000000000001 /* ConversationInteractionPolicyTests.swift */,
+				B24000000000000000000002 /* ChatMediaAlbumPolicyTests.swift */,
 			);
 			name = KitPayTests;
 			sourceTree = "<group>";
@@ -535,6 +574,17 @@
 				A21000000000000000000006 /* VoiceNoteRecorder.swift in Sources */,
 				A21000000000000000000007 /* CameraCaptureView.swift in Sources */,
 				A21000000000000000000008 /* ChatBackupSettingsView.swift in Sources */,
+				A23000000000000000000001 /* KitReceiptPDF.swift in Sources */,
+				A23000000000000000000002 /* ForwardMessagesView.swift in Sources */,
+				A23000000000000000000003 /* ConversationMediaLibraryView.swift in Sources */,
+				A23000000000000000000004 /* KitDocumentViewer.swift in Sources */,
+				A25000000000000000000001 /* ChatMediaAlbumPolicy.swift in Sources */,
+				A25000000000000000000002 /* ChatMediaThumbnails.swift in Sources */,
+				A25000000000000000000003 /* KitMediaGalleryView.swift in Sources */,
+				A25000000000000000000004 /* ChatMediaAlbumGridView.swift in Sources */,
+				A26000000000000000000001 /* KitCameraController.swift in Sources */,
+				A26000000000000000000002 /* KitCameraView.swift in Sources */,
+				A26000000000000000000003 /* KitMediaEditorView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -568,6 +618,8 @@
 				A20000000000000000000009 /* AppLifecyclePolicyTests.swift in Sources */,
 				A22000000000000000000001 /* ChatMediaPolicyTests.swift in Sources */,
 				A22000000000000000000002 /* MessageBackupTests.swift in Sources */,
+				A24000000000000000000001 /* ConversationInteractionPolicyTests.swift in Sources */,
+				A24000000000000000000002 /* ChatMediaAlbumPolicyTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -597,8 +649,8 @@
 /* Begin XCBuildConfiguration section */
 		F20000000000000000000001 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {ALWAYS_SEARCH_USER_PATHS = NO; CLANG_ENABLE_MODULES = YES; CLANG_ENABLE_OBJC_ARC = YES; COPY_PHASE_STRIP = NO; DEBUG_INFORMATION_FORMAT = dwarf; ENABLE_TESTABILITY = YES; GCC_C_LANGUAGE_STANDARD = gnu17; GCC_OPTIMIZATION_LEVEL = 0; IPHONEOS_DEPLOYMENT_TARGET = 17.0; ONLY_ACTIVE_ARCH = YES; SDKROOT = iphoneos; SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)"; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; }; name = Debug; };
 		F20000000000000000000002 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {ALWAYS_SEARCH_USER_PATHS = NO; CLANG_ENABLE_MODULES = YES; CLANG_ENABLE_OBJC_ARC = YES; COPY_PHASE_STRIP = NO; DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym"; ENABLE_NS_ASSERTIONS = NO; GCC_C_LANGUAGE_STANDARD = gnu17; IPHONEOS_DEPLOYMENT_TARGET = 17.0; SDKROOT = iphoneos; SWIFT_COMPILATION_MODE = wholemodule; SWIFT_OPTIMIZATION_LEVEL = "-O"; VALIDATE_PRODUCT = YES; }; name = Release; };
-		F20000000000000000000003 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {APS_ENVIRONMENT = development; ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_ENTITLEMENTS = KitPay/KitPay.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 20; DEVELOPMENT_TEAM = AU55CKVJ55; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = KitPay/Info.plist; KIT_CORRESPONDING_SOURCE_URL = ""; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"; MARKETING_VERSION = 0.2.5; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Debug; };
-		F20000000000000000000004 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {APS_ENVIRONMENT = production; ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_ENTITLEMENTS = KitPay/KitPay.entitlements; CODE_SIGN_IDENTITY = "Apple Distribution"; CODE_SIGN_STYLE = Manual; CURRENT_PROJECT_VERSION = 20; DEVELOPMENT_TEAM = "$(KITPAY_APPLE_TEAM_ID)"; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = KitPay/Info.plist; KIT_CORRESPONDING_SOURCE_URL = ""; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"; MARKETING_VERSION = 0.2.5; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios; PRODUCT_NAME = "$(TARGET_NAME)"; PROVISIONING_PROFILE_SPECIFIER = "$(KITPAY_PROFILE_UUID)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Release; };
+		F20000000000000000000003 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {APS_ENVIRONMENT = development; ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_ENTITLEMENTS = KitPay/KitPay.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 21; DEVELOPMENT_TEAM = AU55CKVJ55; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = KitPay/Info.plist; KIT_CORRESPONDING_SOURCE_URL = ""; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"; MARKETING_VERSION = 0.2.6; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Debug; };
+		F20000000000000000000004 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {APS_ENVIRONMENT = production; ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_ENTITLEMENTS = KitPay/KitPay.entitlements; CODE_SIGN_IDENTITY = "Apple Distribution"; CODE_SIGN_STYLE = Manual; CURRENT_PROJECT_VERSION = 21; DEVELOPMENT_TEAM = "$(KITPAY_APPLE_TEAM_ID)"; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = KitPay/Info.plist; KIT_CORRESPONDING_SOURCE_URL = ""; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"; MARKETING_VERSION = 0.2.6; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios; PRODUCT_NAME = "$(TARGET_NAME)"; PROVISIONING_PROFILE_SPECIFIER = "$(KITPAY_PROFILE_UUID)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Release; };
 		F30000000000000000000001 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {BUNDLE_LOADER = "$(TEST_HOST)"; CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = AU55CKVJ55; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks @loader_path/Frameworks"; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios.tests; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_EMIT_LOC_STRINGS = NO; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/KitPay.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/KitPay"; }; name = Debug; };
 		F30000000000000000000002 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {BUNDLE_LOADER = "$(TEST_HOST)"; CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = AU55CKVJ55; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks @loader_path/Frameworks"; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios.tests; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_EMIT_LOC_STRINGS = NO; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/KitPay.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/KitPay"; }; name = Release; };
 		FF1000000000000000000001 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = AU55CKVJ55; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks @loader_path/Frameworks"; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios.uitests; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_EMIT_LOC_STRINGS = NO; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; TEST_TARGET_NAME = KitPay;}; name = Debug; };

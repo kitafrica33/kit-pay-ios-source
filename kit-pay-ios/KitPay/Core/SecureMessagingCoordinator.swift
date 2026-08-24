@@ -550,6 +550,45 @@ enum SecureMessagingHistoryContinuationPolicy {
 
 /// Owns the network/crypto transaction boundary. The release gate remains in AppModel; this actor
 /// is intentionally usable from focused tests before any production UI can enable messaging.
+/// Access to the encrypted media file cache for deferred (offline-queued) attachments whose
+/// plaintext is too large to live inline in the state file. Injected so unit tests can run the
+/// deferred pipeline against in-memory blobs.
+struct SecureMediaBlobStoreAccess {
+    var read: @Sendable (_ storageKey: String, _ userID: String) async -> Data?
+    var copy: @Sendable (_ fromKey: String, _ toKey: String, _ userID: String) async throws -> Void
+    var remove: @Sendable (_ storageKey: String, _ userID: String) async -> Void
+
+    static let fileCache = SecureMediaBlobStoreAccess(
+        read: { key, userID in
+            await SecureMediaFileCache.shared.data(forStorageKey: key, userID: userID)
+        },
+        copy: { fromKey, toKey, userID in
+            guard let data = await SecureMediaFileCache.shared.data(
+                forStorageKey: fromKey,
+                userID: userID
+            ) else { throw SecureMediaAttachmentError.invalidMedia }
+            try await SecureMediaFileCache.shared.store(
+                data,
+                forStorageKey: toKey,
+                userID: userID
+            )
+            guard let copied = await SecureMediaFileCache.shared.data(
+                forStorageKey: toKey,
+                userID: userID
+            ), copied == data else {
+                await SecureMediaFileCache.shared.remove(
+                    forStorageKey: toKey,
+                    userID: userID
+                )
+                throw SecureMediaAttachmentError.invalidMedia
+            }
+        },
+        remove: { key, userID in
+            await SecureMediaFileCache.shared.remove(forStorageKey: key, userID: userID)
+        }
+    )
+}
+
 actor SecureMessagingExchangeCoordinator {
     static let shared = SecureMessagingExchangeCoordinator(
         transport: APIClient.shared,
@@ -561,6 +600,7 @@ actor SecureMessagingExchangeCoordinator {
     private let store: SecureLocalStore
     private let engine: SecureMessagingCryptoEngine
     private let activation: SecureMessagingCoordinator
+    private let mediaBlobs: SecureMediaBlobStoreAccess
     private var syncTask: Task<SecureMessagingSyncResult, Error>?
     private var syncUserID: String?
     private var isFlushingHistory = false
@@ -574,11 +614,13 @@ actor SecureMessagingExchangeCoordinator {
         transport: any SecureMessagingExchangeTransport,
         store: SecureLocalStore,
         engine: SecureMessagingCryptoEngine,
-        provisioningPreKeyCount: Int = SecureMessagingCryptoEngine.uploadPreKeyCount
+        provisioningPreKeyCount: Int = SecureMessagingCryptoEngine.uploadPreKeyCount,
+        mediaBlobs: SecureMediaBlobStoreAccess = .fileCache
     ) {
         self.transport = transport
         self.store = store
         self.engine = engine
+        self.mediaBlobs = mediaBlobs
         activation = SecureMessagingCoordinator(
             transport: transport,
             store: store,
@@ -952,6 +994,8 @@ actor SecureMessagingExchangeCoordinator {
         mediaData: Data,
         mediaType: String,
         caption: String?,
+        localStorageKey: String? = nil,
+        clientMessageID: UUID? = nil,
         submittedDraftBody: String? = nil,
         draftClearVersion: ConversationDraftWriteVersion? = nil
     ) async throws -> SecureMessagingQueueResult {
@@ -969,9 +1013,19 @@ actor SecureMessagingExchangeCoordinator {
         let normalizedCaption = trimmedCaption?.isEmpty == false ? trimmedCaption : nil
         guard SecureMessagingWire.allowedAttachmentMediaTypes.contains(mediaType),
               !mediaData.isEmpty,
-              mediaData.count <= KitChatMediaLimits.maximumInlineCacheBytes,
+              mediaData.count <= SecureMediaAttachmentCipher.maximumPlaintextBytes,
               KitMediaMessageDescriptor.canEncodeCaption(normalizedCaption)
         else { throw SecureMediaAttachmentError.invalidMedia }
+        // Large plaintext never rides inside the encrypted state file — the caller parks it in
+        // the media file cache under a locally minted key before queueing.
+        let storesInline = mediaData.count <= KitChatMediaLimits.maximumInlineCacheBytes
+        let canonicalLocalStorageKey = localStorageKey
+            .flatMap { UUID(uuidString: $0)?.uuidString.lowercased() }
+        if !storesInline {
+            guard canonicalLocalStorageKey != nil else {
+                throw SecureMediaAttachmentError.invalidMedia
+            }
+        }
         let snapshot = await store.snapshot()
         guard snapshot.profile?.id == local,
               let enrollment = snapshot.secureMessaging?.enrollment,
@@ -982,18 +1036,26 @@ actor SecureMessagingExchangeCoordinator {
               conversation.participantUserIds.count == 2,
               Set(conversation.participantUserIds) == Set([local, recipient])
         else { throw SecureMessagingExchangeError.invalidConversation }
-        if KitChatMediaKind(mediaType: mediaType) != .image {
-            let roster = try await transport.messagingDeviceRoster(conversationId: conversationID)
-            guard MessagingRichMediaCapabilityPolicy.supports(
-                mediaType: mediaType,
-                roster: roster,
-                conversationID: conversationID,
-                currentDeviceID: enrollment.serverDeviceID,
-                recipientUserID: recipient
-            ) else { throw SecureMediaAttachmentError.incompatibleRecipient }
+        // No network at queue time: the offline path must succeed in airplane mode. The rich-media
+        // recipient-capability gate still runs authoritatively at flush (prepareDeferredMessage)
+        // and again per-encrypt in queueText before any bytes leave the device.
+        _ = enrollment
+
+        if let clientMessageID {
+            let canonicalClientID = clientMessageID
+            if let existing = snapshot.messages.first(where: { $0.id == canonicalClientID }),
+               existing.conversationId == conversationID {
+                // A retry of the same queue attempt (double-tap, caller-side retry) reuses the
+                // durable message instead of minting a duplicate — including after the flush
+                // pipeline already checkpointed it (pendingAttachment cleared).
+                return SecureMessagingQueueResult(
+                    conversation: conversation,
+                    clientMessageID: canonicalClientID
+                )
+            }
         }
 
-        let messageID = UUID()
+        let messageID = clientMessageID ?? UUID()
         let commandID = UUID()
         let createdAt = Date()
         let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1007,10 +1069,12 @@ actor SecureMessagingExchangeCoordinator {
             state: .queued,
             failureReason: nil,
             isOutgoing: true,
-            attachmentData: mediaData,
+            attachmentData: storesInline ? mediaData : nil,
             pendingAttachment: LocalPendingAttachment(
                 mediaType: mediaType,
-                caption: normalizedCaption
+                caption: normalizedCaption,
+                localStorageKey: storesInline ? nil : canonicalLocalStorageKey,
+                byteCount: mediaData.count
             )
         )
         let command = OfflineCommand(
@@ -1092,9 +1156,19 @@ actor SecureMessagingExchangeCoordinator {
             )
             var preparedMessage = message
             if let pending = message.pendingAttachment {
-                guard let mediaData = message.attachmentData,
-                      !mediaData.isEmpty,
-                      mediaData.count <= SecureMediaAttachmentCipher.maximumPlaintextBytes
+                // Plaintext lives inline for small attachments; large deferred media was parked
+                // in the encrypted media file cache under a locally minted key at queue time.
+                let mediaData: Data
+                if let inline = message.attachmentData, !inline.isEmpty {
+                    mediaData = inline
+                } else if let localKey = pending.localStorageKey,
+                          let parked = await mediaBlobs.read(localKey, local),
+                          !parked.isEmpty {
+                    mediaData = parked
+                } else {
+                    throw SecureMediaAttachmentError.invalidMedia
+                }
+                guard mediaData.count <= SecureMediaAttachmentCipher.maximumPlaintextBytes
                 else { throw SecureMediaAttachmentError.invalidMedia }
                 if KitChatMediaKind(mediaType: pending.mediaType) != .image {
                     guard let enrollment = snapshot.secureMessaging?.enrollment else {
@@ -1117,20 +1191,45 @@ actor SecureMessagingExchangeCoordinator {
                     mediaType: pending.mediaType,
                     caption: pending.caption
                 )
-                preparedMessage = try await checkpointDeferredImageDescriptor(
-                    descriptor,
-                    command: command,
-                    message: message,
-                    forUserID: local
-                )
+                if let localKey = pending.localStorageKey {
+                    // Copy-then-checkpoint-then-remove: the pending projection stays consistent
+                    // at every step, and a failed checkpoint removes the copy again so the only
+                    // blob left is the still-referenced parked original.
+                    try await mediaBlobs.copy(localKey, descriptor.storageKey, local)
+                }
+                do {
+                    preparedMessage = try await checkpointDeferredImageDescriptor(
+                        descriptor,
+                        command: command,
+                        message: message,
+                        forUserID: local
+                    )
+                } catch {
+                    if pending.localStorageKey != nil {
+                        await mediaBlobs.remove(descriptor.storageKey, local)
+                    }
+                    throw error
+                }
+                if let localKey = pending.localStorageKey {
+                    await mediaBlobs.remove(localKey, local)
+                }
                 ownedMessage = preparedMessage
             } else if let descriptor = KitMediaMessageDescriptor.parse(message.body) {
-                guard let mediaData = message.attachmentData,
-                      SecureMessagingWire.allowedAttachmentMediaTypes.contains(
-                          descriptor.mediaType
-                      ),
-                      descriptor.plaintextByteSize == mediaData.count
-                else { throw SecureMediaAttachmentError.invalidDescriptor }
+                guard SecureMessagingWire.allowedAttachmentMediaTypes.contains(
+                    descriptor.mediaType
+                ) else { throw SecureMediaAttachmentError.invalidDescriptor }
+                if let mediaData = message.attachmentData {
+                    guard descriptor.plaintextByteSize == mediaData.count else {
+                        throw SecureMediaAttachmentError.invalidDescriptor
+                    }
+                } else if let parked = await mediaBlobs.read(descriptor.storageKey, local) {
+                    guard descriptor.plaintextByteSize == parked.count else {
+                        throw SecureMediaAttachmentError.invalidDescriptor
+                    }
+                }
+                // A checkpointed large attachment already uploaded its ciphertext; the descriptor
+                // body alone is sufficient to replay the send even if the local plaintext copy
+                // was evicted.
             } else if message.attachmentData != nil {
                 throw SecureMediaAttachmentError.invalidDescriptor
             }

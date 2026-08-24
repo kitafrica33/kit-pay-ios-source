@@ -42,7 +42,7 @@ final class WalletAPIEncodingTests: XCTestCase {
         )
         XCTAssertEqual(
             APIClientIdentity.header(marketingVersion: "01.1", buildNumber: "02"),
-            "ios/0.2.5"
+            "ios/0.2.6"
         )
         XCTAssertEqual(
             APIClientIdentity.appVersion(marketingVersion: "0.2.5", buildNumber: "16"),

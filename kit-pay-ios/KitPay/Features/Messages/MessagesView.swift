@@ -167,6 +167,16 @@ struct MessagesView: View {
         }
         .onChange(of: navigationPath) { _, path in
             isConversationPresented = !path.isEmpty
+            // Opening a chat the active filter would hide (a brand-new chat under "Unread",
+            // a chat that was just read) must not make it vanish from the list on return.
+            if let current = path.last,
+               !ConversationListFilterPolicy.includes(
+                   current,
+                   in: selectedFilter,
+                   pinnedIDs: model.pinnedConversationIds
+               ) {
+                selectedFilter = .all
+            }
         }
         .onChange(of: model.messageConversationNavigationRequest) { _, _ in
             applyMessageNotificationNavigation()
@@ -1258,8 +1268,8 @@ struct ConversationView: View {
     let conversation: Conversation
     @State private var draft = ""
     @State private var showPhotoPicker = false
-    @State private var selectedPhotoItem: PhotosPickerItem?
-    @State private var stagedAttachment: ChatStagedAttachment?
+    @State private var selectedPhotoItems: [PhotosPickerItem] = []
+    @State private var stagedAttachments: [ChatStagedAttachment] = []
     @State private var isLoadingAttachment = false
     @State private var attachmentLoadGeneration = 0
     @State private var isSending = false
@@ -1277,6 +1287,20 @@ struct ConversationView: View {
     @State private var isSelectingMessages = false
     @State private var selectedMessageIDs: Set<UUID> = []
     @State private var showDeleteMessagesConfirmation = false
+    @State private var forwardItems: [ForwardPayloadItem] = []
+    @State private var showForwardSheet = false
+    @State private var isNearLatestMessage = true
+    @State private var unseenIncomingCount = 0
+    @State private var cameraPullProgress: CGFloat = 0
+    @State private var didTriggerCameraPull = false
+    @State private var conversationViewportHeight: CGFloat = 0
+    @State private var pendingScrollTargetMessageID: UUID?
+    @State private var galleryTarget: ConversationGalleryTarget?
+    @State private var editorSession: MediaEditorSession?
+    @State private var isSearchingMessages = false
+    @State private var messageSearchQuery = ""
+    @State private var searchMatchIndex = 0
+    @FocusState private var isSearchFieldFocused: Bool
     @State private var incomingSoundPolicy: VisibleConversationSoundPolicy
     @StateObject private var paymentFlow = WalletFlowModel()
     /// Separate model for in-chat transfers so a draft payment request and a draft transfer
@@ -1356,26 +1380,16 @@ struct ConversationView: View {
     }
 
     private var showsSendButton: Bool {
-        isLoadingAttachment || !trimmedDraft.isEmpty || stagedAttachment != nil
+        isLoadingAttachment || !trimmedDraft.isEmpty || !stagedAttachments.isEmpty
     }
 
     private var canSendMessage: Bool {
-        let hasAttachment = stagedAttachment != nil
+        let hasAttachment = !stagedAttachments.isEmpty
         return model.secureMessagingAvailable
             && recipientCommunicationAllowed
             && !isSending
             && !isLoadingAttachment
             && (hasAttachment || !trimmedDraft.isEmpty)
-            && stagedAttachmentCanSendWithCurrentConnection
-    }
-
-    private var stagedAttachmentCanSendWithCurrentConnection: Bool {
-        guard let stagedAttachment else { return true }
-        return model.isOnline
-            || (stagedAttachment.kind == .image
-                && KitChatMediaLimits.shouldCacheInline(
-                    byteCount: stagedAttachment.data.count
-                ))
     }
 
     private var paymentRequestPolicy: PaymentRequestPolicy {
@@ -1408,7 +1422,11 @@ struct ConversationView: View {
     }
 
     private var conversationLayout: some View {
-        VStack(spacing: 0) {
+        // One pass per render; selection mode falls back to individual bubbles so every
+        // message stays individually checkable.
+        let albumMembership: [UUID: ChatMediaAlbumMembership] =
+            isSelectingMessages ? [:] : ChatMediaAlbumPolicy.membership(for: messages)
+        return VStack(spacing: 0) {
             ScrollViewReader { scrollProxy in
                 ScrollView {
                     LazyVStack(spacing: 9) {
@@ -1431,7 +1449,11 @@ struct ConversationView: View {
                         ForEach(timelineItems) { item in
                             switch item {
                             case .message(let message):
-                                bubble(message)
+                                if case .leader(let album) = albumMembership[message.id] {
+                                    albumBubble(album)
+                                } else if albumMembership[message.id] != .follower {
+                                    bubble(message)
+                                }
                             case .payment(let message, let descriptor):
                                 paymentBubble(message, descriptor: descriptor)
                             case .call(let call):
@@ -1446,12 +1468,64 @@ struct ConversationView: View {
                     }
                     .padding(.horizontal, 14)
                     .padding(.vertical, 12)
+                    .background(
+                        GeometryReader { contentGeometry in
+                            Color.clear.preference(
+                                key: ConversationScrollMetricsKey.self,
+                                value: ConversationScrollMetrics(
+                                    contentHeight: contentGeometry.size.height,
+                                    contentMaxY: contentGeometry
+                                        .frame(in: .named("conversationScroll")).maxY
+                                )
+                            )
+                        }
+                    )
                 }
+                .coordinateSpace(name: "conversationScroll")
                 .defaultScrollAnchor(.bottom)
                 .scrollDismissesKeyboard(.interactively)
-                .onChange(of: timelineItems.last?.id) { _, _ in
-                    scrollToBottom(using: scrollProxy)
+                .background(
+                    GeometryReader { viewportGeometry in
+                        Color.clear
+                            .onAppear {
+                                conversationViewportHeight = viewportGeometry.size.height
+                            }
+                            .onChange(of: viewportGeometry.size.height) { _, height in
+                                conversationViewportHeight = height
+                            }
+                    }
+                )
+                .onPreferenceChange(ConversationScrollMetricsKey.self) { metrics in
+                    handleScrollMetrics(metrics)
                 }
+                .onChange(of: timelineItems.last?.id) { _, _ in
+                    // A message the user just sent always snaps to the latest position; an
+                    // incoming message must never yank them away from what they are reading.
+                    if messages.last?.isOutgoing == true || isNearLatestMessage {
+                        scrollToBottom(using: scrollProxy)
+                    }
+                }
+                .onChange(of: pendingScrollTargetMessageID) { _, target in
+                    guard let target else { return }
+                    withAnimation(.easeOut(duration: 0.25)) {
+                        scrollProxy.scrollTo(
+                            "message:\(target.uuidString.lowercased())",
+                            anchor: .center
+                        )
+                    }
+                    pendingScrollTargetMessageID = nil
+                }
+                .overlay(alignment: .bottom) {
+                    if cameraPullProgress > 6, !isSelectingMessages {
+                        cameraPullIndicator
+                    }
+                }
+                .overlay(alignment: .bottomTrailing) {
+                    if !isNearLatestMessage {
+                        jumpToLatestButton(scrollProxy)
+                    }
+                }
+                .animation(.snappy(duration: 0.2), value: isNearLatestMessage)
                 // Playing a bubble's media would tear the audio session out from under the
                 // live recorder and destroy the in-progress note.
                 .allowsHitTesting(!voiceRecorder.isRecording)
@@ -1460,6 +1534,8 @@ struct ConversationView: View {
 
             if isSelectingMessages {
                 messageSelectionBar
+            } else if isSearchingMessages {
+                messageSearchBar
             } else {
                 composer
             }
@@ -1474,35 +1550,35 @@ struct ConversationView: View {
         conversationLayout
         .photosPicker(
             isPresented: $showPhotoPicker,
-            selection: $selectedPhotoItem,
+            selection: $selectedPhotoItems,
+            maxSelectionCount: ConversationAttachmentStagingPolicy.maximumStagedAttachments,
             matching: .any(of: [.images, .videos])
         )
-        .onChange(of: selectedPhotoItem) { _, item in
+        .onChange(of: selectedPhotoItems) { _, items in
+            guard !items.isEmpty else { return }
             attachmentLoadGeneration &+= 1
             let generation = attachmentLoadGeneration
-            guard let item else {
-                isLoadingAttachment = false
-                return
-            }
-            Task { await loadPickedLibraryItem(item, generation: generation) }
+            Task { await loadPickedLibraryItems(items, generation: generation) }
         }
         .fullScreenCover(isPresented: $showCameraCapture) {
-            CameraCaptureView(mode: .photo) { result in
+            KitCameraView { output in
                 showCameraCapture = false
-                if case let .photo(image) = result {
-                    stageCameraPhoto(image)
-                }
+                handleCameraOutput(output)
             }
             .ignoresSafeArea()
         }
         .fullScreenCover(isPresented: $showVideoNoteCamera) {
-            CameraCaptureView(mode: .videoNote) { result in
+            KitCameraView(startInVideoMode: true) { output in
                 showVideoNoteCamera = false
-                if case let .video(url) = result {
-                    stageCapturedVideo(url)
-                }
+                handleCameraOutput(output)
             }
             .ignoresSafeArea()
+        }
+        .fullScreenCover(item: $editorSession) { session in
+            KitMediaEditorView(input: session.input) { output in
+                editorSession = nil
+                handleEditorOutput(output, original: session.input)
+            }
         }
         .fileImporter(
             isPresented: $showDocumentImporter,
@@ -1556,9 +1632,52 @@ struct ConversationView: View {
                 contact: recipientContact,
                 avatarURL: recipientPresentation.avatarURL,
                 userID: recipientUserID,
+                conversationID: conversation.id,
                 startAudioCall: { queueCall(video: false) },
-                startVideoCall: { queueCall(video: true) }
+                startVideoCall: { queueCall(video: true) },
+                searchChat: {
+                    showContactProfile = false
+                    beginMessageSearch()
+                },
+                showMessageInChat: { messageID in
+                    showContactProfile = false
+                    if galleryItems.contains(where: { $0.messageID == messageID }) {
+                        // Give the sheet a beat to dismiss before presenting the cover.
+                        Task { @MainActor in
+                            try? await Task.sleep(nanoseconds: 350_000_000)
+                            galleryTarget = ConversationGalleryTarget(id: messageID)
+                        }
+                    } else {
+                        pendingScrollTargetMessageID = messageID
+                    }
+                }
             )
+            .presentationBackground(.ultraThinMaterial)
+        }
+        .fullScreenCover(item: $galleryTarget) { target in
+            KitMediaGalleryView(
+                items: galleryItems,
+                initialItemID: target.id,
+                loadData: { item in
+                    try await model.loadSecureMedia(
+                        conversationId: item.conversationID,
+                        descriptorText: item.descriptorText
+                    )
+                },
+                showInChat: { item in
+                    pendingScrollTargetMessageID = item.messageID
+                },
+                onDismiss: { galleryTarget = nil }
+            )
+            .environmentObject(model)
+        }
+        .sheet(isPresented: $showForwardSheet) {
+            ForwardMessagesView(items: forwardItems) { sentCount in
+                showForwardSheet = false
+                forwardItems = []
+                if sentCount > 0 { finishMessageSelection() }
+            }
+            .environmentObject(model)
             .presentationBackground(.ultraThinMaterial)
         }
         .sheet(item: $chatPaymentApproval) { approval in
@@ -1667,7 +1786,19 @@ struct ConversationView: View {
                 visible: scenePhase == .active
             )
         }
-        .onChange(of: messages) { _, updatedMessages in
+        .onChange(of: messages) { previousMessages, updatedMessages in
+            if isSelectingMessages {
+                // Messages can vanish underneath a selection (remote deletion, account
+                // refresh); acting on stale IDs must be impossible.
+                selectedMessageIDs.formIntersection(Set(updatedMessages.map(\.id)))
+            }
+            if !isNearLatestMessage {
+                let previousIDs = Set(previousMessages.map(\.id))
+                let arrived = updatedMessages.filter {
+                    !$0.isOutgoing && !previousIDs.contains($0.id)
+                }.count
+                if arrived > 0 { unseenIncomingCount += arrived }
+            }
             if incomingSoundPolicy.consume(
                 updatedMessages,
                 appIsActive: scenePhase == .active
@@ -1772,6 +1903,8 @@ struct ConversationView: View {
                 .accessibilityLabel("Open \(recipientDisplayName)'s profile")
             }
             ToolbarItem(placement: .topBarTrailing) {
+                // Two lenses only: a third would push the name below its 150pt readable
+                // minimum on the narrowest supported bar. Search lives in the contact sheet.
                 KitGlassControlGroup(
                     spacing: ConversationHeaderLayoutPolicy.callControlSpacing
                 ) {
@@ -1787,8 +1920,10 @@ struct ConversationView: View {
     @ViewBuilder
     private var composer: some View {
         VStack(spacing: 8) {
-            if let stagedAttachment {
-                stagedAttachmentChip(stagedAttachment)
+            if stagedAttachments.count == 1 {
+                stagedAttachmentChip(stagedAttachments[0])
+            } else if stagedAttachments.count > 1 {
+                stagedAttachmentRow
             }
             if let recorderError = voiceRecorder.errorMessage {
                 Label(recorderError, systemImage: "exclamationmark.triangle.fill")
@@ -1821,7 +1956,7 @@ struct ConversationView: View {
                 } label: {
                     Label("Photo & video library", systemImage: "photo.on.rectangle")
                 }
-                if CameraCaptureView.isCameraAvailable {
+                if KitCameraView.isCameraAvailable {
                     Button {
                         isComposerFocused = false
                         showCameraCapture = true
@@ -1880,8 +2015,8 @@ struct ConversationView: View {
                     }
                     .buttonStyle(.plain)
                     .foregroundStyle(KitColor.green)
-                    .disabled(!model.secureMessagingAvailable || !model.isOnline)
-                    .opacity(model.secureMessagingAvailable && model.isOnline ? 1 : 0.5)
+                    .disabled(!model.secureMessagingAvailable)
+                    .opacity(model.secureMessagingAvailable ? 1 : 0.5)
                     .accessibilityLabel("Record a voice note")
                     .transition(.opacity.combined(with: .scale(scale: 0.82)))
                 }
@@ -1899,7 +2034,7 @@ struct ConversationView: View {
                         if isLoadingAttachment || isSending {
                             ProgressView().tint(.white)
                         } else {
-                            Image(systemName: stagedAttachment == nil ? "paperplane.fill" : "lock.fill")
+                            Image(systemName: stagedAttachments.isEmpty ? "paperplane.fill" : "lock.fill")
                                 .font(.headline.bold())
                         }
                     }
@@ -1910,13 +2045,11 @@ struct ConversationView: View {
                 .disabled(!canSendMessage)
                 .opacity(canSendMessage ? 1 : 0.55)
                 .accessibilityLabel(
-                    stagedAttachment == nil
+                    stagedAttachments.isEmpty
                         ? "Send message"
                         : model.isOnline
-                            ? "Send encrypted \(stagedAttachment!.kind.previewLabel.lowercased())"
-                            : stagedAttachmentCanSendWithCurrentConnection
-                                ? "Queue encrypted photo"
-                                : "Connect to send this encrypted file"
+                            ? "Send \(stagedAttachments.count == 1 ? "encrypted \(stagedAttachments[0].kind.previewLabel.lowercased())" : "\(stagedAttachments.count) encrypted attachments")"
+                            : "Queue \(stagedAttachments.count == 1 ? "encrypted \(stagedAttachments[0].kind.previewLabel.lowercased())" : "\(stagedAttachments.count) encrypted attachments") to send when connected"
                 )
                 .transition(.opacity.combined(with: .scale(scale: 0.82)))
             }
@@ -2004,18 +2137,13 @@ struct ConversationView: View {
                     .lineLimit(1)
                 Text(model.isOnline
                     ? "\(attachment.byteLabel) · End-to-end encrypted before upload."
-                    : stagedAttachmentCanSendWithCurrentConnection
-                        ? "\(attachment.byteLabel) · Will send securely when connected."
-                        : "Connect to send this encrypted file.")
+                    : "\(attachment.byteLabel) · Will send securely when connected.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
             Spacer()
             Button {
-                attachmentLoadGeneration &+= 1
-                isLoadingAttachment = false
-                stagedAttachment = nil
-                selectedPhotoItem = nil
+                removeStagedAttachment(attachment.id)
             } label: {
                 Image(systemName: "xmark.circle.fill")
                     .font(.title3)
@@ -2032,6 +2160,176 @@ struct ConversationView: View {
                 .stroke(.white.opacity(0.55), lineWidth: 0.7)
                 .allowsHitTesting(false)
         }
+    }
+
+    /// Compact tiles when several attachments are staged at once.
+    private var stagedAttachmentRow: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(stagedAttachments) { attachment in
+                    ZStack(alignment: .topTrailing) {
+                        Group {
+                            if let preview = attachment.previewImage {
+                                Image(uiImage: preview)
+                                    .resizable()
+                                    .scaledToFill()
+                            } else {
+                                Image(systemName: attachment.kind.symbolName)
+                                    .font(.system(size: 20, weight: .semibold))
+                                    .foregroundStyle(KitColor.green)
+                            }
+                        }
+                        .frame(width: 62, height: 62)
+                        .background(KitColor.paleGreen.opacity(0.4))
+                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        Button {
+                            removeStagedAttachment(attachment.id)
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.body)
+                                .foregroundStyle(.white, .black.opacity(0.55))
+                        }
+                        .padding(3)
+                        .accessibilityLabel("Remove \(attachment.displayName)")
+                    }
+                    .accessibilityElement(children: .contain)
+                    .accessibilityLabel(attachment.displayName)
+                }
+            }
+            .padding(.vertical, 2)
+        }
+        .frame(height: 68)
+    }
+
+    private func removeStagedAttachment(_ id: UUID) {
+        stagedAttachments.removeAll { $0.id == id }
+        if stagedAttachments.isEmpty {
+            attachmentLoadGeneration &+= 1
+            isLoadingAttachment = false
+            selectedPhotoItems = []
+        }
+    }
+
+    // MARK: In-chat search
+
+    private var messageSearchMatches: [UUID] {
+        ConversationMessageSearchPolicy.matchingMessageIDs(
+            query: messageSearchQuery,
+            messages: messages
+        )
+    }
+
+    private var currentSearchMatchID: UUID? {
+        let matches = messageSearchMatches
+        guard !matches.isEmpty else { return nil }
+        return matches[min(max(0, searchMatchIndex), matches.count - 1)]
+    }
+
+    private var messageSearchBar: some View {
+        HStack(spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                TextField("Search messages & documents", text: $messageSearchQuery)
+                    .focused($isSearchFieldFocused)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .submitLabel(.search)
+                    .onSubmit { stepSearchMatch(-1) }
+                if !messageSearchQuery.isEmpty {
+                    Button {
+                        messageSearchQuery = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.body)
+                            .foregroundStyle(.secondary)
+                    }
+                    .accessibilityLabel("Clear search")
+                }
+            }
+            .padding(.horizontal, 12)
+            .frame(height: 42)
+            .background(.ultraThinMaterial, in: Capsule())
+            .overlay {
+                Capsule()
+                    .stroke(.white.opacity(0.55), lineWidth: 0.7)
+                    .allowsHitTesting(false)
+            }
+
+            if !messageSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                Text(searchMatchCounterLabel)
+                    .font(.caption.weight(.semibold).monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .fixedSize()
+            }
+
+            Button { stepSearchMatch(-1) } label: {
+                Image(systemName: "chevron.up")
+                    .font(.system(size: 15, weight: .semibold))
+                    .frame(width: 34, height: 42)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(KitColor.green)
+            .disabled(messageSearchMatches.count < 2)
+            .opacity(messageSearchMatches.count < 2 ? 0.4 : 1)
+            .accessibilityLabel("Previous match")
+
+            Button { stepSearchMatch(1) } label: {
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 15, weight: .semibold))
+                    .frame(width: 34, height: 42)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(KitColor.green)
+            .disabled(messageSearchMatches.count < 2)
+            .opacity(messageSearchMatches.count < 2 ? 0.4 : 1)
+            .accessibilityLabel("Next match")
+
+            Button("Done") { finishMessageSearch() }
+                .font(.body.weight(.semibold))
+                .foregroundStyle(KitColor.green)
+        }
+        .padding(12)
+        .background(.ultraThinMaterial)
+        .overlay(alignment: .top) {
+            Divider()
+                .opacity(0.35)
+                .allowsHitTesting(false)
+        }
+        .onChange(of: messageSearchQuery) { _, _ in
+            let matches = messageSearchMatches
+            // Start from the most recent match, the same place the eye starts.
+            searchMatchIndex = max(0, matches.count - 1)
+            if let latest = matches.last {
+                pendingScrollTargetMessageID = latest
+            }
+        }
+    }
+
+    private var searchMatchCounterLabel: String {
+        let matches = messageSearchMatches
+        guard !matches.isEmpty else { return "0 results" }
+        return "\(min(searchMatchIndex, matches.count - 1) + 1) of \(matches.count)"
+    }
+
+    private func stepSearchMatch(_ delta: Int) {
+        let matches = messageSearchMatches
+        guard !matches.isEmpty else { return }
+        searchMatchIndex = (searchMatchIndex + delta + matches.count) % matches.count
+        pendingScrollTargetMessageID = matches[searchMatchIndex]
+    }
+
+    private func finishMessageSearch() {
+        withAnimation(.snappy(duration: 0.22)) {
+            isSearchingMessages = false
+        }
+        messageSearchQuery = ""
+        searchMatchIndex = 0
+        isSearchFieldFocused = false
     }
 
     private var messageSelectionBar: some View {
@@ -2051,6 +2349,24 @@ struct ConversationView: View {
             }
             .buttonStyle(.plain)
             .disabled(!selectionHasCopyableText)
+
+            Button {
+                forwardItems = forwardPayloadItems(for: selectedMessageIDs)
+                guard !forwardItems.isEmpty else { return }
+                showForwardSheet = true
+            } label: {
+                VStack(spacing: 3) {
+                    Image(systemName: "arrowshape.turn.up.right")
+                        .font(.system(size: 17, weight: .semibold))
+                    Text("Forward")
+                        .font(.caption2.weight(.semibold))
+                }
+                .foregroundStyle(KitColor.navy)
+                .frame(maxWidth: .infinity, minHeight: 48)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(forwardPayloadItems(for: selectedMessageIDs).isEmpty)
 
             Button(role: .destructive) {
                 showDeleteMessagesConfirmation = true
@@ -2105,6 +2421,13 @@ struct ConversationView: View {
             }
             if message.isOutgoing { Spacer(minLength: 44) }
             bubbleBody(message, descriptor: descriptor, mediaKind: mediaKind)
+                .overlay {
+                    if isSearchingMessages, currentSearchMatchID == message.id {
+                        RoundedRectangle(cornerRadius: 20, style: .continuous)
+                            .stroke(KitColor.green, lineWidth: 2)
+                            .allowsHitTesting(false)
+                    }
+                }
                 // While selecting, taps must toggle selection — not open viewers or players.
                 .allowsHitTesting(!isSelectingMessages)
                 .contextMenu {
@@ -2114,6 +2437,14 @@ struct ConversationView: View {
                                 UIPasteboard.general.string = copyText
                             } label: {
                                 Label("Copy", systemImage: "doc.on.doc")
+                            }
+                        }
+                        if !forwardPayloadItems(for: [message.id]).isEmpty {
+                            Button {
+                                forwardItems = forwardPayloadItems(for: [message.id])
+                                showForwardSheet = true
+                            } label: {
+                                Label("Forward", systemImage: "arrowshape.turn.up.right")
                             }
                         }
                         Button {
@@ -2144,6 +2475,64 @@ struct ConversationView: View {
         .accessibilityAddTraits(isSelectingMessages && isSelected ? .isSelected : [])
     }
 
+    /// One grid bubble for a run of consecutive captionless photos/videos. Tapping any cell
+    /// opens the shared gallery at that item.
+    private func albumBubble(_ album: ChatMediaAlbum) -> some View {
+        let isOutgoing = album.items[0].isOutgoing
+        let closingMessage = messages.first { $0.id == album.items[album.items.count - 1].messageID }
+        return HStack(alignment: .center, spacing: 8) {
+            if isOutgoing { Spacer(minLength: 44) }
+            VStack(alignment: isOutgoing ? .trailing : .leading, spacing: 0) {
+                ChatMediaAlbumGridView(
+                    album: album,
+                    isOutgoing: isOutgoing,
+                    cachedData: { item in
+                        messages.first(where: { $0.id == item.messageID })?.attachmentData
+                    },
+                    onTap: { item in openGallery(at: item.messageID) }
+                )
+                .padding(.top, 3)
+                .padding(.horizontal, 3)
+                if let closingMessage {
+                    messageMetadata(closingMessage)
+                        .padding(.horizontal, 12)
+                        .padding(.top, 5)
+                        .padding(.bottom, 7)
+                }
+            }
+            .background(
+                isOutgoing ? AnyShapeStyle(KitColor.navy) : AnyShapeStyle(.ultraThinMaterial),
+                in: RoundedRectangle(cornerRadius: 20, style: .continuous)
+            )
+            if !isOutgoing { Spacer(minLength: 44) }
+        }
+    }
+
+    /// Chronological photos/videos of this conversation for the shared gallery pager.
+    private var galleryItems: [KitGalleryItem] {
+        messages.compactMap { message in
+            guard message.pendingAttachment == nil,
+                  let descriptor = KitMediaMessageDescriptor.parse(message.body)
+            else { return nil }
+            let kind = KitChatMediaKind(mediaType: descriptor.mediaType)
+            guard kind == .image || kind == .video else { return nil }
+            return KitGalleryItem(
+                messageID: message.id,
+                conversationID: conversation.id,
+                descriptorText: message.body,
+                mediaType: descriptor.mediaType,
+                isOutgoing: message.isOutgoing,
+                createdAt: message.createdAt,
+                senderName: message.isOutgoing ? "You" : recipientDisplayName
+            )
+        }
+    }
+
+    private func openGallery(at messageID: UUID) {
+        guard galleryItems.contains(where: { $0.messageID == messageID }) else { return }
+        galleryTarget = ConversationGalleryTarget(id: messageID)
+    }
+
     @ViewBuilder
     private func bubbleBody(
         _ message: LocalMessage,
@@ -2154,10 +2543,14 @@ struct ConversationView: View {
             // Edge-to-edge media with a very slim frame at the top, left, and right;
             // the caption/time footer keeps regular padding below.
             VStack(alignment: message.isOutgoing ? .trailing : .leading, spacing: 0) {
-                SecureMediaMessageView(message: message, descriptor: descriptor)
+                SecureMediaMessageView(
+                    message: message,
+                    descriptor: descriptor,
+                    openGallery: { openGallery(at: $0) }
+                )
                     .padding(.top, 3)
                     .padding(.horizontal, 3)
-                if mediaKind == .image, let caption = descriptor.caption, !caption.isEmpty {
+                if let caption = descriptor.caption, !caption.isEmpty {
                     Text(caption)
                         .foregroundStyle(message.isOutgoing ? .white : KitColor.navy)
                         .padding(.horizontal, 12)
@@ -2226,6 +2619,30 @@ struct ConversationView: View {
         guard !texts.isEmpty else { return }
         UIPasteboard.general.string = texts.joined(separator: "\n")
         finishMessageSelection()
+    }
+
+    /// Messages the forward sheet can carry: delivered text and media with a durable
+    /// descriptor. Still-uploading and failed media cannot be re-encrypted for a new
+    /// conversation yet, so they are skipped.
+    private func forwardPayloadItems(for ids: Set<UUID>) -> [ForwardPayloadItem] {
+        messages
+            .filter { ids.contains($0.id) }
+            .compactMap { message in
+                guard message.pendingAttachment == nil, message.state != .failed else {
+                    return nil
+                }
+                if KitMediaMessageDescriptor.parse(message.body) != nil {
+                    return .media(
+                        id: message.id,
+                        sourceConversationID: conversation.id,
+                        descriptorText: message.body
+                    )
+                }
+                guard let body = message.body.nilIfBlank,
+                      KitPaymentMessage.parse(body) == nil
+                else { return nil }
+                return .text(id: message.id, body: body)
+            }
     }
 
     private func toggleMessageSelection(_ id: UUID) {
@@ -2550,6 +2967,18 @@ struct ConversationView: View {
         }
     }
 
+    private func beginMessageSearch() {
+        withAnimation(.snappy(duration: 0.22)) {
+            isSearchingMessages = true
+            isComposerFocused = false
+        }
+        // Focus after the search bar has mounted (and any sheet has dismissed).
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            isSearchFieldFocused = true
+        }
+    }
+
     private func chatCallToolbarButton(video: Bool) -> some View {
         Button { queueCall(video: video) } label: {
             Image(systemName: video ? "video" : "phone")
@@ -2571,7 +3000,7 @@ struct ConversationView: View {
         guard canSendMessage else { return }
         let submittedDraft = draft
         let submittedText = submittedDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-        let submittedAttachment = stagedAttachment
+        let submittedAttachments = stagedAttachments
         let persistenceVersion = model.nextConversationDraftWriteVersion()
         immediateDraftPersistenceTask?.cancel()
         immediateDraftPersistenceTask = nil
@@ -2579,72 +3008,30 @@ struct ConversationView: View {
         isSending = true
         isComposerFocused = false
         Task {
-            let draftWasSaved = await model.persistConversationDraft(
+            // Draft persistence is best-effort bookkeeping. The message pipeline has its own
+            // durability, so a failed draft write (for example a brand-new conversation that
+            // has not been persisted yet) must never block the send itself.
+            _ = await model.persistConversationDraft(
                 submittedDraft,
                 conversationId: conversation.id,
                 writeVersion: persistenceVersion
             )
-            guard draftWasSaved else {
-                if model.isSignedIn, !Task.isCancelled {
-                    model.lastError = CustomerFacingMessagingCopy.draftSaveFailure
-                    if scenePhase == .active { isComposerFocused = true }
-                }
-                isSending = false
-                return
-            }
             let clearVersion = model.nextConversationDraftWriteVersion()
-            var allQueued = false
-            if let submittedAttachment {
-                let caption: String?
-                let followUpText: String?
-                switch submittedAttachment.kind {
-                case .document:
-                    // The wire descriptor has no filename field; the caption carries it so
-                    // both platforms can show a named document. Typed text follows separately.
-                    caption = submittedAttachment.displayName
-                    followUpText = submittedText.nilIfBlank
-                default:
-                    caption = submittedText.nilIfBlank
-                    followUpText = nil
-                }
-                let mediaQueued = await model.queueMediaMessage(
-                    conversationId: conversation.id,
-                    title: recipientDisplayName,
-                    recipientId: recipientUserID,
-                    mediaData: submittedAttachment.data,
-                    mediaType: submittedAttachment.mediaType,
-                    caption: caption,
-                    submittedDraftBody: followUpText == nil ? submittedDraft : nil,
-                    draftClearVersion: followUpText == nil ? clearVersion : nil
-                )
-                if mediaQueued {
-                    // The attachment is already durably queued. Remove it even when the
-                    // document's separate text message fails so a retry cannot duplicate media.
-                    stagedAttachment = nil
-                    selectedPhotoItem = nil
-                }
-                if mediaQueued, let followUpText {
-                    allQueued = await model.queueMessage(
-                        conversationId: conversation.id,
-                        title: recipientDisplayName,
-                        recipientId: recipientUserID,
-                        body: followUpText,
-                        draftClearVersion: clearVersion
-                    )
-                    if !allQueued {
-                        model.lastError =
-                            "The document was queued, but its message text was not. Your draft is still here."
-                    }
-                } else {
-                    allQueued = mediaQueued
-                }
-            } else {
+            let allQueued: Bool
+            if submittedAttachments.isEmpty {
                 allQueued = await model.queueMessage(
                     conversationId: conversation.id,
                     title: recipientDisplayName,
                     recipientId: recipientUserID,
                     body: submittedDraft,
                     draftClearVersion: clearVersion
+                )
+            } else {
+                allQueued = await sendStagedAttachments(
+                    submittedAttachments,
+                    text: submittedText,
+                    submittedDraft: submittedDraft,
+                    clearVersion: clearVersion
                 )
             }
             if allQueued {
@@ -2653,6 +3040,64 @@ struct ConversationView: View {
             }
             isSending = false
         }
+    }
+
+    /// Queues every staged attachment and returns whether everything, including any typed
+    /// text, ended up durably queued.
+    private func sendStagedAttachments(
+        _ attachments: [ChatStagedAttachment],
+        text: String,
+        submittedDraft: String,
+        clearVersion: ConversationDraftWriteVersion
+    ) async -> Bool {
+        // A single non-document attachment carries the typed text as its caption. Documents
+        // keep the filename in the caption (the wire descriptor has no filename field), and
+        // multi-attachment sends stay captionless so photo runs can group into one album;
+        // both send the typed text as a separate follow-up message.
+        let textRidesOnMedia = attachments.count == 1 && attachments[0].kind != .document
+        var queuedAllMedia = true
+        for attachment in attachments {
+            let caption: String? = if attachment.kind == .document {
+                attachment.displayName
+            } else if textRidesOnMedia {
+                text.nilIfBlank
+            } else {
+                nil
+            }
+            let queued = await model.queueMediaMessage(
+                conversationId: conversation.id,
+                title: recipientDisplayName,
+                recipientId: recipientUserID,
+                mediaData: attachment.data,
+                mediaType: attachment.mediaType,
+                caption: caption,
+                submittedDraftBody: textRidesOnMedia ? submittedDraft : nil,
+                draftClearVersion: textRidesOnMedia ? clearVersion : nil
+            )
+            if queued {
+                // Durably queued: unstage it even if a later attachment fails, so a retry
+                // can never duplicate this one.
+                stagedAttachments.removeAll { $0.id == attachment.id }
+            } else {
+                queuedAllMedia = false
+            }
+        }
+        if stagedAttachments.isEmpty { selectedPhotoItems = [] }
+        guard queuedAllMedia else { return false }
+        if textRidesOnMedia { return true }
+        guard let followUp = text.nilIfBlank else { return true }
+        let textQueued = await model.queueMessage(
+            conversationId: conversation.id,
+            title: recipientDisplayName,
+            recipientId: recipientUserID,
+            body: followUp,
+            draftClearVersion: clearVersion
+        )
+        if !textQueued {
+            model.lastError =
+                "The attachments were queued, but the message text was not. Your draft is still here."
+        }
+        return textQueued
     }
 
     private func persistDraftImmediately() {
@@ -2684,13 +3129,13 @@ struct ConversationView: View {
             )
             if !queued {
                 // Never drop a recorded note on a failed send — stage it so the user can retry.
-                stagedAttachment = ChatStagedAttachment(
+                stageAttachment(ChatStagedAttachment(
                     kind: .voice,
                     data: recording.data,
                     mediaType: VoiceNoteRecorder.Recording.mediaType,
                     displayName: "Voice note",
                     previewImage: nil
-                )
+                ))
             }
             isSending = false
         }
@@ -2754,48 +3199,106 @@ struct ConversationView: View {
 
     // MARK: Attachment staging
 
+    /// Every capture flows through the creative editor before staging.
+    private func handleCameraOutput(_ output: KitCameraOutput?) {
+        guard let output else { return }
+        let input: KitMediaEditorInput
+        switch output {
+        case .photo(let image):
+            input = .photo(image)
+        case .video(let url, let mediaType):
+            input = .video(url, mediaType: mediaType)
+        }
+        // Give the camera cover a beat to dismiss before presenting the editor cover.
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            editorSession = MediaEditorSession(input: input)
+        }
+    }
+
+    private func handleEditorOutput(
+        _ output: KitMediaEditorOutput?,
+        original: KitMediaEditorInput
+    ) {
+        let originalVideoURL: URL? = if case .video(let url, _) = original { url } else { nil }
+        switch output {
+        case .photo(let image):
+            stageCameraPhoto(image)
+            if let originalVideoURL {
+                try? FileManager.default.removeItem(at: originalVideoURL)
+            }
+        case .video(let url, _):
+            // stageCapturedVideo reads and then deletes the file it is handed.
+            stageCapturedVideo(url)
+            if let originalVideoURL, originalVideoURL != url {
+                try? FileManager.default.removeItem(at: originalVideoURL)
+            }
+        case nil:
+            if let originalVideoURL {
+                try? FileManager.default.removeItem(at: originalVideoURL)
+            }
+        }
+    }
+
+    /// Appends one more attachment, keeping the staged set within the cap.
+    private func stageAttachment(_ attachment: ChatStagedAttachment) {
+        guard stagedAttachments.count < ConversationAttachmentStagingPolicy.maximumStagedAttachments
+        else {
+            model.lastError = "You can attach up to \(ConversationAttachmentStagingPolicy.maximumStagedAttachments) files per message."
+            return
+        }
+        stagedAttachments.append(attachment)
+    }
+
     @MainActor
-    private func loadPickedLibraryItem(_ item: PhotosPickerItem, generation: Int) async {
+    private func loadPickedLibraryItems(_ items: [PhotosPickerItem], generation: Int) async {
         guard generation == attachmentLoadGeneration else { return }
         isLoadingAttachment = true
-        let isVideo = item.supportedContentTypes.contains { $0.conforms(to: .movie) }
-        do {
-            guard let data = try await item.loadTransferable(type: Data.self) else {
-                throw AttachmentSelectionError.invalidImage
-            }
+        var failedCount = 0
+        for item in items {
             guard generation == attachmentLoadGeneration else { return }
-            if isVideo {
-                guard KitChatMediaLimits.fits(data.count, kind: .video) else {
-                    throw AttachmentSelectionError.fileTooLarge
+            let isVideo = item.supportedContentTypes.contains { $0.conforms(to: .movie) }
+            do {
+                guard let data = try await item.loadTransferable(type: Data.self) else {
+                    throw AttachmentSelectionError.invalidImage
                 }
-                let mediaType = libraryVideoMediaType(for: item)
-                stagedAttachment = ChatStagedAttachment(
-                    kind: .video,
-                    data: data,
-                    mediaType: mediaType,
-                    displayName: "Video",
-                    previewImage: nil
-                )
-            } else {
-                guard data.count <= 64 * 1_024 * 1_024,
-                      let prepared = AttachmentImageDecoder.secureJPEG(from: data)
-                else { throw AttachmentSelectionError.invalidImage }
                 guard generation == attachmentLoadGeneration else { return }
-                stagedAttachment = ChatStagedAttachment(
-                    kind: .image,
-                    data: prepared.data,
-                    mediaType: "image/jpeg",
-                    displayName: "Photo",
-                    previewImage: prepared.preview
-                )
+                if isVideo {
+                    guard KitChatMediaLimits.fits(data.count, kind: .video) else {
+                        throw AttachmentSelectionError.fileTooLarge
+                    }
+                    stageAttachment(ChatStagedAttachment(
+                        kind: .video,
+                        data: data,
+                        mediaType: libraryVideoMediaType(for: item),
+                        displayName: "Video",
+                        previewImage: nil
+                    ))
+                } else {
+                    guard data.count <= 64 * 1_024 * 1_024,
+                          let prepared = AttachmentImageDecoder.secureJPEG(from: data)
+                    else { throw AttachmentSelectionError.invalidImage }
+                    guard generation == attachmentLoadGeneration else { return }
+                    stageAttachment(ChatStagedAttachment(
+                        kind: .image,
+                        data: prepared.data,
+                        mediaType: "image/jpeg",
+                        displayName: "Photo",
+                        previewImage: prepared.preview
+                    ))
+                }
+            } catch {
+                failedCount += 1
+                model.lastError = error.localizedDescription
             }
-            isLoadingAttachment = false
-        } catch {
-            guard generation == attachmentLoadGeneration else { return }
-            selectedPhotoItem = nil
-            stagedAttachment = nil
-            isLoadingAttachment = false
-            model.lastError = error.localizedDescription
+        }
+        guard generation == attachmentLoadGeneration else { return }
+        selectedPhotoItems = []
+        isLoadingAttachment = false
+        if failedCount > 0, items.count > 1 {
+            model.lastError = failedCount == items.count
+                ? "The selected items could not be attached."
+                : "\(failedCount) of \(items.count) selected items could not be attached."
         }
     }
 
@@ -2813,13 +3316,13 @@ struct ConversationView: View {
             model.lastError = AttachmentSelectionError.invalidImage.localizedDescription
             return
         }
-        stagedAttachment = ChatStagedAttachment(
+        stageAttachment(ChatStagedAttachment(
             kind: .image,
             data: prepared.data,
             mediaType: "image/jpeg",
             displayName: "Photo",
             previewImage: prepared.preview
-        )
+        ))
     }
 
     private func stageCapturedVideo(_ url: URL) {
@@ -2842,13 +3345,13 @@ struct ConversationView: View {
                 let mediaType = url.pathExtension.lowercased() == "mp4"
                     ? "video/mp4"
                     : "video/quicktime"
-                stagedAttachment = ChatStagedAttachment(
+                stageAttachment(ChatStagedAttachment(
                     kind: .video,
                     data: data,
                     mediaType: mediaType,
                     displayName: "Video note",
                     previewImage: nil
-                )
+                ))
             } catch {
                 guard generation == attachmentLoadGeneration else { return }
                 model.lastError = (error as? LocalizedError)?.errorDescription
@@ -2887,13 +3390,13 @@ struct ConversationView: View {
                         ? $0.lowercased()
                         : nil
                 } ?? "application/octet-stream"
-                stagedAttachment = ChatStagedAttachment(
+                stageAttachment(ChatStagedAttachment(
                     kind: .document,
                     data: data,
                     mediaType: mediaType,
                     displayName: url.lastPathComponent,
                     previewImage: nil
-                )
+                ))
             } catch {
                 guard generation == attachmentLoadGeneration else { return }
                 model.lastError = (error as? LocalizedError)?.errorDescription
@@ -2903,9 +3406,161 @@ struct ConversationView: View {
     }
 
     private func scrollToBottom(using proxy: ScrollViewProxy) {
+        unseenIncomingCount = 0
         withAnimation(.easeOut(duration: 0.2)) {
             proxy.scrollTo(ConversationScrollAnchor.bottom, anchor: .bottom)
         }
+    }
+
+    // MARK: Reading position, jump-to-latest, and the pull-past-the-end camera
+
+    private func handleScrollMetrics(_ metrics: ConversationScrollMetrics) {
+        guard conversationViewportHeight > 0 else { return }
+        let distanceFromLatest = metrics.contentMaxY - conversationViewportHeight
+        let nearLatest = distanceFromLatest < ConversationCameraPullPolicy.nearLatestDistance
+        if nearLatest != isNearLatestMessage {
+            isNearLatestMessage = nearLatest
+            if nearLatest { unseenIncomingCount = 0 }
+        }
+
+        // The camera pull only makes sense when the timeline can actually scroll; a short
+        // conversation leaves a gap under the content that is not a gesture.
+        guard metrics.contentHeight > conversationViewportHeight else {
+            if cameraPullProgress != 0 { cameraPullProgress = 0 }
+            return
+        }
+        let overscroll = max(0, -distanceFromLatest)
+        cameraPullProgress = overscroll
+        if overscroll >= ConversationCameraPullPolicy.triggerDistance {
+            if !didTriggerCameraPull, !isComposerFocused, !isSelectingMessages,
+               !isSearchingMessages, !voiceRecorder.isRecording {
+                didTriggerCameraPull = true
+                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                showCameraCapture = true
+            }
+        } else if overscroll < ConversationCameraPullPolicy.rearmDistance {
+            didTriggerCameraPull = false
+        }
+    }
+
+    private var cameraPullIndicator: some View {
+        let progress = min(1, cameraPullProgress / ConversationCameraPullPolicy.triggerDistance)
+        return VStack(spacing: 6) {
+            Image(systemName: "camera.fill")
+                .font(.system(size: 19, weight: .semibold))
+                .foregroundStyle(KitColor.green)
+                .frame(width: 46, height: 46)
+                .background(.ultraThinMaterial, in: Circle())
+                .overlay {
+                    Circle()
+                        .trim(from: 0, to: progress)
+                        .stroke(KitColor.green, style: StrokeStyle(lineWidth: 2.4, lineCap: .round))
+                        .rotationEffect(.degrees(-90))
+                }
+                .scaleEffect(0.6 + 0.4 * progress)
+            Text(progress >= 1 ? "Release for camera" : "Keep pulling for camera")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(KitColor.secondaryText)
+        }
+        .opacity(Double(progress))
+        .padding(.bottom, 8)
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+
+    private func jumpToLatestButton(_ proxy: ScrollViewProxy) -> some View {
+        Button {
+            scrollToBottom(using: proxy)
+        } label: {
+            HStack(spacing: 6) {
+                if unseenIncomingCount > 0 {
+                    Text("\(unseenIncomingCount)")
+                        .font(.caption.bold())
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 2)
+                        .background(KitColor.green, in: Capsule())
+                }
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(KitColor.green)
+            }
+            .padding(.horizontal, 12)
+            .frame(height: 40)
+            .background(.ultraThinMaterial, in: Capsule())
+            .overlay {
+                Capsule()
+                    .stroke(.white.opacity(0.55), lineWidth: 0.7)
+                    .allowsHitTesting(false)
+            }
+            .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
+        }
+        .padding(.trailing, 14)
+        .padding(.bottom, 10)
+        .accessibilityLabel(
+            unseenIncomingCount > 0
+                ? "\(unseenIncomingCount) new messages, jump to latest"
+                : "Jump to latest message"
+        )
+        .transition(.opacity.combined(with: .scale(scale: 0.86)))
+    }
+}
+
+enum ConversationAttachmentStagingPolicy {
+    /// A send can carry several photos/videos; the album grid groups them on arrival.
+    static let maximumStagedAttachments = 8
+}
+
+/// Case- and diacritic-insensitive search across everything readable in one conversation:
+/// text bodies, media captions, and document filenames (which travel in the caption field).
+enum ConversationMessageSearchPolicy {
+    static func matchingMessageIDs(query: String, messages: [LocalMessage]) -> [UUID] {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+        return messages.compactMap { message in
+            guard let text = searchableText(for: message),
+                  text.range(
+                      of: trimmed,
+                      options: [.caseInsensitive, .diacriticInsensitive]
+                  ) != nil
+            else { return nil }
+            return message.id
+        }
+    }
+
+    static func searchableText(for message: LocalMessage) -> String? {
+        if let pending = message.pendingAttachment {
+            return pending.caption?.nilIfBlank
+        }
+        if let descriptor = KitMediaMessageDescriptor.parse(message.body) {
+            return descriptor.caption?.nilIfBlank
+        }
+        guard KitPaymentMessage.parse(message.body) == nil else { return nil }
+        return message.body.nilIfBlank
+    }
+}
+
+/// How far past the last message the user must pull before the camera opens.
+enum ConversationCameraPullPolicy {
+    static let triggerDistance: CGFloat = 110
+    /// Overscroll must fall back under this before another pull can fire.
+    static let rearmDistance: CGFloat = 8
+    /// Within this distance of the latest message the user counts as "caught up".
+    static let nearLatestDistance: CGFloat = 56
+}
+
+private struct ConversationScrollMetrics: Equatable {
+    var contentHeight: CGFloat = 0
+    var contentMaxY: CGFloat = 0
+}
+
+private struct ConversationScrollMetricsKey: PreferenceKey {
+    static var defaultValue = ConversationScrollMetrics()
+    static func reduce(
+        value: inout ConversationScrollMetrics,
+        nextValue: () -> ConversationScrollMetrics
+    ) {
+        value = nextValue()
     }
 }
 
@@ -2932,6 +3587,15 @@ private struct RecorderLevelWave: View {
 
 private enum ConversationScrollAnchor: Hashable {
     case bottom
+}
+
+private struct ConversationGalleryTarget: Identifiable {
+    let id: UUID
+}
+
+private struct MediaEditorSession: Identifiable {
+    let id = UUID()
+    let input: KitMediaEditorInput
 }
 
 enum AttachmentImageDecoder {
@@ -2977,8 +3641,13 @@ private struct ConversationContactProfileView: View {
     let contact: WalletContactDTO?
     let avatarURL: String?
     let userID: String?
+    let conversationID: String
     let startAudioCall: () -> Void
     let startVideoCall: () -> Void
+    /// Dismisses this sheet and opens the in-chat message search.
+    let searchChat: () -> Void
+    /// Dismisses this sheet and scrolls the conversation to the given message.
+    let showMessageInChat: (UUID) -> Void
 
     var body: some View {
         NavigationStack {
@@ -3019,6 +3688,12 @@ private struct ConversationContactProfileView: View {
                             disabled: !communicationAllowed,
                             action: startVideoCall
                         )
+                        profileAction(
+                            title: "Search",
+                            systemName: "magnifyingglass",
+                            disabled: false,
+                            action: searchChat
+                        )
                     }
 
                     if canSaveToContacts {
@@ -3045,6 +3720,35 @@ private struct ConversationContactProfileView: View {
                         )
                     }
                     .kitGlass(cornerRadius: 24, shadow: false)
+
+                    NavigationLink {
+                        ConversationMediaLibraryView(
+                            conversationID: conversationID,
+                            conversationTitle: displayName,
+                            openGallery: { tappedMessageID in
+                                showMessageInChat(tappedMessageID)
+                            }
+                        )
+                        .environmentObject(model)
+                    } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: "photo.on.rectangle.angled")
+                                .font(.system(size: 18, weight: .semibold))
+                                .foregroundStyle(KitColor.green)
+                            Text("Media, audio & documents")
+                                .font(.body.weight(.semibold))
+                                .foregroundStyle(.primary)
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                                .font(.footnote.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.horizontal, 18)
+                        .padding(.vertical, 15)
+                        .kitGlass(cornerRadius: 24, shadow: false)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
 
                     if canonicalUserID != nil {
                         communicationSafetyAction
@@ -3302,7 +4006,7 @@ private enum AttachmentSelectionError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .invalidImage:
-            "Choose a valid image that can be prepared securely at 10 MB or less."
+            "Choose a valid image that can be prepared securely at 10 MB or less after optimization."
         case .invalidDocument:
             "This document could not be read."
         case .fileTooLarge:

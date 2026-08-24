@@ -28,7 +28,7 @@ enum SecureMessagingWire {
     static let maximumHistoryPage = 50
     static let maximumCiphertextBytes = 1_500_000
     static let minimumAttachmentCiphertextBytes: Int64 = 64
-    static let maximumAttachmentCiphertextBytes: Int64 = 10 * 1_024 * 1_024 + 64
+    static let maximumAttachmentCiphertextBytes: Int64 = 200 * 1_024 * 1_024 + 64
 
     /// Every allowed type must be mirrored by the server's attachment upload validation and by
     /// the Android client before it ships; unknown types fail closed on both ends.
@@ -70,9 +70,9 @@ enum SecureMediaAttachmentError: LocalizedError, Equatable {
     var errorDescription: String? {
         switch self {
         case .invalidImage:
-            "Choose a JPEG, PNG, WebP, or GIF image up to 10 MB."
+            "Choose a JPEG, PNG, WebP, or GIF image up to 200 MB."
         case .invalidMedia:
-            "Choose a supported file up to 10 MB."
+            "Choose a supported file up to 200 MB."
         case .invalidDescriptor:
             "This encrypted attachment has invalid authenticated metadata."
         case .invalidCiphertext:
@@ -82,7 +82,7 @@ enum SecureMediaAttachmentError: LocalizedError, Equatable {
         case .serverMetadataMismatch:
             "Kit returned attachment metadata that does not match the encrypted message."
         case .incompatibleRecipient:
-            "Voice notes, videos, and documents require the recipient to update Kit Pay on every iPhone."
+            "Voice notes, videos, and documents require the recipient to update Kit Pay on every device."
         }
     }
 }
@@ -92,9 +92,10 @@ enum SecureMediaAttachmentError: LocalizedError, Equatable {
 /// The server receives only the framed ciphertext and its digest. The 64-byte key material is
 /// carried solely inside the per-device Signal envelope as part of `KitMediaMessageDescriptor`.
 enum SecureMediaAttachmentCipher {
-    /// The multipart transport currently materializes its body. Keep the bound conservative until
-    /// authenticated streaming upload and download are available end to end.
-    static let maximumPlaintextBytes = 10 * 1_024 * 1_024
+    /// The customer-facing media ceiling. Large plaintext never rides in the persisted state
+    /// blob — it parks in the encrypted file cache — so the bound is the transport's, and the
+    /// backend must advertise the identical value in its rich-media capability.
+    static let maximumPlaintextBytes = 200 * 1_024 * 1_024
     static let keyMaterialBytes = 64
     private static let aesKeyBytes = 32
     private static let macKeyBytes = 32
@@ -921,11 +922,16 @@ enum MessagingRichMediaCapabilityPolicy {
         return recipientDevices.allSatisfy { device in
             guard device.deviceId != currentDeviceID,
                   let client = device.client,
-                  client.platform?.lowercased() == "ios",
-                  let version = client.version,
-                  versionAtLeastMinimum(version, build: client.build),
                   client.capabilities?[deviceCapabilityKey] == true
             else { return false }
+            // The server-attested capability flag is platform-aware (Android carries the
+            // profile from 0.2.18, iOS from 0.2.5 build 16). The local iOS version floor is
+            // kept as defense in depth for a server that asserts the flag without context.
+            if client.platform?.lowercased() == "ios" {
+                guard let version = client.version,
+                      versionAtLeastMinimum(version, build: client.build)
+                else { return false }
+            }
             return true
         }
     }

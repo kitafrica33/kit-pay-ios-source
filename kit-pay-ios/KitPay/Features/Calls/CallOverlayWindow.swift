@@ -4,6 +4,41 @@ import LiveKit
 import SwiftUI
 import UIKit
 
+/// Which minimized surface the overlay window is currently drawing. `RootView` observes this to
+/// reserve the audio strip's height at the top of the app so the strip pushes content down
+/// instead of covering navigation bars.
+enum CallOverlaySurfaceStyle: Equatable {
+    case audioStrip
+    case videoTile
+}
+
+/// Tracks the one asynchronous Picture-in-Picture transition that AVKit does not expose through
+/// synchronous state: the app can become active again after `startPictureInPicture()` is requested
+/// but before `isPictureInPictureActive` flips to true.
+struct CallPictureInPictureLifecycleIntent {
+    private(set) var shouldStopAfterStart = false
+
+    mutating func willStartForBackgrounding() {
+        shouldStopAfterStart = false
+    }
+
+    /// Returns true when PiP is already active and can be stopped immediately. Otherwise records
+    /// the foreground intent for the delegate's eventual did-start callback.
+    mutating func foregroundStopRequested(isPictureInPictureActive: Bool) -> Bool {
+        shouldStopAfterStart = !isPictureInPictureActive
+        return isPictureInPictureActive
+    }
+
+    mutating func didStart() -> Bool {
+        defer { shouldStopAfterStart = false }
+        return shouldStopAfterStart
+    }
+
+    mutating func transitionFinished() {
+        shouldStopAfterStart = false
+    }
+}
+
 /// Ownership of the floating minimized-call surface.
 ///
 /// The bubble used to live in `RootView`'s overlay. UIKit places sheets and full-screen covers in
@@ -14,14 +49,24 @@ import UIKit
 /// video call keeps playing after the user leaves Kit Pay entirely.
 @MainActor
 final class CallOverlayPresenter: ObservableObject {
-    /// Which screen edge the bubble rests against. Owned here rather than in the app scene so the
-    /// resting corner survives every presentation change.
-    @Published var corner: CallFloatingCorner = .bottomTrailing
+    /// Free resting origin of the minimized video tile, in window coordinates. Owned here rather
+    /// than in the app scene so the resting spot survives every presentation change. `nil` means
+    /// the default parking spot (bottom trailing). While tucked this keeps the pre-tuck origin so
+    /// tapping the handle restores the tile to where the user left it.
+    @Published var videoTilePosition: CGPoint?
+
+    /// Which screen edge the video tile is tucked behind, or `nil` when fully on screen. Persisted
+    /// here so presentation changes don't lose the tuck; cleared when the full call UI reopens or
+    /// the call ends.
+    @Published var videoTileTuckedEdge: CallFloatingTuckEdge?
 
     /// Whether the floating bubble is drawn. The window itself stays attached for the whole call
     /// so Picture in Picture always has a live source view, including while the full-screen call
     /// UI is what the user is looking at.
-    @Published fileprivate var showsSurface = false
+    @Published fileprivate(set) var showsSurface = false
+
+    /// Which surface the window is drawing while `showsSurface` is true; `nil` otherwise.
+    @Published fileprivate(set) var surfaceStyle: CallOverlaySurfaceStyle?
 
     /// Where the bubble is drawn, in window coordinates. Written outside the SwiftUI update cycle
     /// and read by the window's hit test, so touches anywhere else reach the app underneath.
@@ -58,6 +103,7 @@ final class CallOverlayWindowController {
     private var window: CallOverlayPassthroughWindow?
     private let pictureInPicture = CallPictureInPictureCoordinator()
     private var remoteVideoTrackObservation: AnyCancellable?
+    private var localCameraObservation: AnyCancellable?
     private var audioRouteObservation: AnyCancellable?
 
     private init() {
@@ -71,6 +117,16 @@ final class CallOverlayWindowController {
                 // LiveKit publishes on the main actor, but Combine's closure is not actor-typed.
                 Task { @MainActor [weak self] in
                     CallMediaCoordinator.shared.refreshCallKitVideoState()
+                    self?.refreshPictureInPicture()
+                }
+            }
+        // The camera toggle changes whether the minimized surface is the audio strip or the video
+        // tile, and RootView reserves layout for the strip. Keep the published style honest on
+        // every escalation/de-escalation, not only when the remote track changes.
+        localCameraObservation = CallMediaCoordinator.shared.media.$isCameraEnabled
+            .removeDuplicates()
+            .sink { [weak self] _ in
+                Task { @MainActor [weak self] in
                     self?.refreshPictureInPicture()
                 }
             }
@@ -112,6 +168,10 @@ final class CallOverlayWindowController {
         }
         if !showsMinimizedSurface {
             presenter.hitRegion.frame = .zero
+            // Reopening the full call UI un-tucks the tile; the next minimize starts on screen.
+            if presenter.videoTileTuckedEdge != nil {
+                presenter.videoTileTuckedEdge = nil
+            }
         }
         applyScreenWakePolicy(hasActiveCall: true)
         guard let window = ensureWindow() else { return }
@@ -146,6 +206,7 @@ final class CallOverlayWindowController {
         let coordinator = CallMediaCoordinator.shared
         // `window == nil` after hide() covers the concealed state without re-deriving it here.
         applyScreenWakePolicy(hasActiveCall: coordinator.activeCall != nil && window != nil)
+        refreshSurfaceStyle()
         guard coordinator.callCarriesVideo,
               let sourceView = window?.rootViewController?.view
         else {
@@ -158,10 +219,48 @@ final class CallOverlayWindowController {
         )
     }
 
+    /// Starts Picture in Picture explicitly at the foreground→background transition point.
+    ///
+    /// `canStartPictureInPictureAutomaticallyFromInline` covers most hand-offs, but AVKit only
+    /// honors it when the source view is visibly rendering at the moment the app deactivates; a
+    /// programmatic start from `.inactive` is the reliable path. Audio calls deliberately stay
+    /// out of Picture in Picture, matching `refreshPictureInPicture`.
+    func startPictureInPictureForBackgroundingIfNeeded() {
+        guard CallMediaCoordinator.shared.callCarriesVideo, window != nil else { return }
+        // Ensure the controller exists and is bound to the live source view before starting.
+        refreshPictureInPicture()
+        pictureInPicture.startForBackgroundingIfNeeded()
+    }
+
+    /// `.inactive` also fires for Control Center pulls and system alerts, so a session started
+    /// there must be stopped again when the scene returns to `.active` without ever having
+    /// reached `.background` — and when the user re-enters the app while PiP is running.
+    func stopPictureInPictureForForegroundIfNeeded() {
+        pictureInPicture.stopForForegroundIfNeeded()
+    }
+
+    /// Publishes which minimized surface is on screen so `RootView` can reserve the audio strip's
+    /// height. Uses the same video definition as the surface itself (`callCarriesVideo`), so the
+    /// reservation flips together with the strip↔tile swap on escalation.
+    private func refreshSurfaceStyle() {
+        let coordinator = CallMediaCoordinator.shared
+        var style: CallOverlaySurfaceStyle?
+        if presenter.showsSurface, coordinator.activeCall != nil, window != nil {
+            style = coordinator.callCarriesVideo ? .videoTile : .audioStrip
+        }
+        if presenter.surfaceStyle != style {
+            presenter.surfaceStyle = style
+        }
+    }
+
     /// Tears the surface and any Picture in Picture session down. Called when the call ends and
     /// whenever communication surfaces are concealed.
     func hide() {
         presenter.showsSurface = false
+        presenter.surfaceStyle = nil
+        // The call is over (or concealed): the next call's tile starts from the default spot.
+        presenter.videoTileTuckedEdge = nil
+        presenter.videoTilePosition = nil
         pictureInPicture.invalidate()
         presenter.hitRegion.frame = .zero
         window?.isHidden = true
@@ -189,7 +288,8 @@ final class CallOverlayWindowController {
         let host = UIHostingController(
             rootView: CallOverlayRootView(
                 presenter: presenter,
-                coordinator: CallMediaCoordinator.shared
+                coordinator: CallMediaCoordinator.shared,
+                media: CallMediaCoordinator.shared.media
             )
         )
         host.view.backgroundColor = .clear
@@ -210,13 +310,15 @@ final class CallOverlayWindowController {
 private struct CallOverlayRootView: View {
     @ObservedObject var presenter: CallOverlayPresenter
     @ObservedObject var coordinator: CallMediaCoordinator
+    @ObservedObject var media: LiveKitCallMediaTransport
 
     var body: some View {
         Group {
             if presenter.showsSurface {
                 MinimizedCallView(
                     coordinator: coordinator,
-                    corner: $presenter.corner,
+                    position: $presenter.videoTilePosition,
+                    tuckedEdge: $presenter.videoTileTuckedEdge,
                     reopen: { presenter.reopen() },
                     onSurfaceFrameChange: { frame in
                         presenter.hitRegion.frame = frame
@@ -224,8 +326,23 @@ private struct CallOverlayRootView: View {
                 )
             } else {
                 // The window stays attached so Picture in Picture keeps a live source view, but it
-                // must draw nothing while the full-screen call UI is what the user sees.
-                Color.clear
+                // must draw (almost) nothing while the full-screen call UI is what the user sees.
+                // AVKit refuses to start Picture in Picture from a source view that renders no
+                // video, so a video call keeps a minimal live renderer mounted in a corner. It is
+                // never interactive: the window's hit region is `.zero` in this state, and hit
+                // testing is disabled besides.
+                ZStack(alignment: .bottomTrailing) {
+                    Color.clear
+                    if coordinator.callCarriesVideo,
+                       let remoteTrack = media.remoteVideoTrack {
+                        SwiftUIVideoView(remoteTrack, layoutMode: .fill, mirrorMode: .off)
+                            .frame(width: 2, height: 2)
+                            .opacity(0.02)
+                            .allowsHitTesting(false)
+                            .accessibilityHidden(true)
+                            .padding(2)
+                    }
+                }
             }
         }
         // The bubble positions itself against the full screen, including the areas behind the
@@ -251,6 +368,7 @@ private final class CallPictureInPictureCoordinator: NSObject {
     private var contentController: AVPictureInPictureVideoCallViewController?
     private var hostingController: UIViewController?
     private var releaseAfterPictureInPictureStops = false
+    private var lifecycleIntent = CallPictureInPictureLifecycleIntent()
 
     @MainActor
     func configure(sourceView: UIView, coordinator: CallMediaCoordinator) {
@@ -294,6 +412,33 @@ private final class CallPictureInPictureCoordinator: NSObject {
         hostingController = host
     }
 
+    /// Explicit start used at the foreground→background transition, where a programmatic
+    /// `startPictureInPicture()` is still permitted. No-ops unless AVKit reports the session as
+    /// possible and not already running, and never while a deferred teardown is in flight.
+    @MainActor
+    func startForBackgroundingIfNeeded() {
+        guard let controller else { return }
+        lifecycleIntent.willStartForBackgrounding()
+        guard !releaseAfterPictureInPictureStops,
+              controller.isPictureInPicturePossible,
+              !controller.isPictureInPictureActive
+        else { return }
+        controller.startPictureInPicture()
+    }
+
+    /// Stops a running session while the app is foreground, keeping the controller and its
+    /// renderer alive so the next backgrounding can start Picture in Picture again.
+    @MainActor
+    func stopForForegroundIfNeeded() {
+        guard let controller,
+              !releaseAfterPictureInPictureStops
+        else { return }
+        guard lifecycleIntent.foregroundStopRequested(
+            isPictureInPictureActive: controller.isPictureInPictureActive
+        ) else { return }
+        controller.stopPictureInPicture()
+    }
+
     @MainActor
     func invalidate() {
         guard let controller else {
@@ -319,10 +464,24 @@ private final class CallPictureInPictureCoordinator: NSObject {
         contentController = nil
         hostingController = nil
         releaseAfterPictureInPictureStops = false
+        lifecycleIntent.transitionFinished()
     }
 }
 
 extension CallPictureInPictureCoordinator: AVPictureInPictureControllerDelegate {
+    func pictureInPictureControllerDidStartPictureInPicture(
+        _ pictureInPictureController: AVPictureInPictureController
+    ) {
+        Task { @MainActor [weak self] in
+            guard let self,
+                  self.controller === pictureInPictureController,
+                  self.lifecycleIntent.didStart(),
+                  !self.releaseAfterPictureInPictureStops
+            else { return }
+            pictureInPictureController.stopPictureInPicture()
+        }
+    }
+
     func pictureInPictureController(
         _ pictureInPictureController: AVPictureInPictureController,
         restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler: @escaping (Bool) -> Void
@@ -341,12 +500,12 @@ extension CallPictureInPictureCoordinator: AVPictureInPictureControllerDelegate 
         // AVKit must never disturb the call itself, so the in-app bubble simply stays authoritative.
         Task { @MainActor [weak self] in
             CallMediaCoordinator.shared.recordControlError(error)
-            guard let self,
-                  self.controller === pictureInPictureController,
-                  self.releaseAfterPictureInPictureStops
-            else { return }
-            self.releaseResources()
-            self.onDeferredInvalidationCompleted?()
+            guard let self, self.controller === pictureInPictureController else { return }
+            self.lifecycleIntent.transitionFinished()
+            if self.releaseAfterPictureInPictureStops {
+                self.releaseResources()
+                self.onDeferredInvalidationCompleted?()
+            }
         }
     }
 
@@ -354,12 +513,12 @@ extension CallPictureInPictureCoordinator: AVPictureInPictureControllerDelegate 
         _ pictureInPictureController: AVPictureInPictureController
     ) {
         Task { @MainActor [weak self] in
-            guard let self,
-                  self.controller === pictureInPictureController,
-                  self.releaseAfterPictureInPictureStops
-            else { return }
-            self.releaseResources()
-            self.onDeferredInvalidationCompleted?()
+            guard let self, self.controller === pictureInPictureController else { return }
+            self.lifecycleIntent.transitionFinished()
+            if self.releaseAfterPictureInPictureStops {
+                self.releaseResources()
+                self.onDeferredInvalidationCompleted?()
+            }
         }
     }
 }

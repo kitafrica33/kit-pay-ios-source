@@ -622,6 +622,11 @@ struct CapabilitiesRequestResolutionTracker {
 @MainActor
 final class AppModel: ObservableObject {
     @Published private(set) var state: PersistedState = .empty
+    /// Revision of the projection currently published in `state`. Every publish must go through
+    /// `publishLatestState()`, which drops projections older than this — a snapshot captured
+    /// before a suspension point must never roll back a newer publish (that was the root cause
+    /// of sent bubbles, inbound messages, and freshly created conversations "disappearing").
+    private var publishedStateRevision: UInt64 = 0
     @Published private(set) var capabilities: CapabilitiesDTO?
     @Published private(set) var isSignedIn = false
     @Published private(set) var isOnline = false
@@ -1128,10 +1133,13 @@ final class AppModel: ObservableObject {
             return capabilities.features?["messaging"] == true
                 && capabilities.protocols?.messaging?.supportsReviewedV2 == true
         }
-        // A previously enrolled device may cold-launch without connectivity. Permit only local,
-        // encrypted-at-rest queuing until capabilities are refreshed; transport still rechecks
-        // the server and current roster before any bytes leave the device.
-        return !isOnline && state.secureMessaging?.enrollment?.userID == profile?.id
+        // Capabilities are nil while discovery is (re)loading — at session resume, after a
+        // failed reload on flaky networks, and offline. An enrolled device may keep composing
+        // and queueing locally through that window regardless of connectivity: nothing leaves
+        // the device without the transport re-verifying server capabilities and the current
+        // roster, so this only prevents the composer flapping to "temporarily unavailable"
+        // every time discovery restarts.
+        return state.secureMessaging?.enrollment?.userID == profile?.id
     }
     var messagingSendFailureMessage: String { CustomerFacingMessagingCopy.sendFailure }
     var callsFeatureEnabled: Bool { CallLifecyclePolicy.featureEnabled(capabilities) }
@@ -1546,6 +1554,19 @@ final class AppModel: ObservableObject {
         return true
     }
 
+    /// The only sanctioned way to publish store state to the UI. Fetches the latest projection
+    /// at the moment of assignment and refuses to publish anything older than what is already
+    /// on screen, so concurrent tasks that suspended between "snapshot" and "assign" can never
+    /// roll the visible chat list or conversation back to a stale projection.
+    @discardableResult
+    func publishLatestState() async -> PersistedState {
+        let projection = await store.projection()
+        guard projection.revision >= publishedStateRevision else { return state }
+        publishedStateRevision = projection.revision
+        state = projection.state
+        return projection.state
+    }
+
     /// Keeps an unresolved accepted-deletion projection inaccessible without erasing a newer,
     /// conflicting owner's durable state. Recovery may reveal it only after the marker is safely
     /// resolved; every direct store snapshot remains empty in the meantime.
@@ -1554,7 +1575,7 @@ final class AppModel: ObservableObject {
         stopVisibleConversationSync()
         await store.concealStateForUnresolvedAcceptedAccountDeletion()
         await enterCommunicationPrivacyQuarantine()
-        state = .empty
+        await publishLatestState()
         isSignedIn = false
         acceptedAccountDeletionCleanupBlocked = true
         protectedLocalStateRecoveryBlocked = false
@@ -1568,7 +1589,7 @@ final class AppModel: ObservableObject {
         stopVisibleConversationSync()
         await store.concealStateForProtectedStateRecovery()
         await enterCommunicationPrivacyQuarantine()
-        state = .empty
+        await publishLatestState()
         isSignedIn = false
         protectedLocalStateRecoveryBlocked = true
         protectedLocalStateRecoveryRequiresSupport = requiresSupport
@@ -1582,7 +1603,7 @@ final class AppModel: ObservableObject {
         stopVisibleConversationSync()
         await store.concealStateForUnresolvedAcceptedAccountDeletion()
         await enterCommunicationPrivacyQuarantine()
-        state = .empty
+        await publishLatestState()
         isSignedIn = false
         unresolvedAccountDeletionAttemptBlocked = true
         acceptedAccountDeletionCleanupBlocked = false
@@ -1800,7 +1821,7 @@ final class AppModel: ObservableObject {
                     session,
                     accountEpoch: restorationAccountEpoch
                 ) else { return }
-                state = await store.snapshot()
+                await publishLatestState()
                 _ = await reloadCapabilities()
                 lastError = "Your saved sign-in could not be verified safely. Sign in again."
                 isLoading = false
@@ -1866,7 +1887,7 @@ final class AppModel: ObservableObject {
                     session,
                     accountEpoch: restorationAccountEpoch
                 ) else { return }
-                state = await store.snapshot()
+                await publishLatestState()
                 _ = await reloadCapabilities()
                 lastError = "Your saved sign-in could not be restored safely. Sign in again."
                 isLoading = false
@@ -1892,7 +1913,7 @@ final class AppModel: ObservableObject {
                   accountEpoch == restorationAccountEpoch
             else { return }
         }
-        state = restoredState
+        await publishLatestState()
         restoreCommunicationPrivacyCache()
         locallyTerminatedCallIds.formUnion(
             state.outbox.compactMap(OutboxPolicy.terminationReplay).map(\.callId)
@@ -1960,7 +1981,7 @@ final class AppModel: ObservableObject {
                         == .orderedSame,
                       await authenticatedSecurityContextIsCurrent(restorationContext)
                 else { return }
-                state = updatedState
+                await publishLatestState()
             } catch {
                 guard await authenticatedSecurityContextIsCurrent(restorationContext) else {
                     await failRestoredSession(
@@ -2093,7 +2114,7 @@ final class AppModel: ObservableObject {
         biometricAccessState = .notRequired
         homeBiometricState = .notRequired
         locallyTerminatedCallIds.removeAll()
-        state = await store.snapshot()
+        await publishLatestState()
         rebuildCallContacts()
         _ = await reloadCapabilities()
         lastError = message
@@ -2597,7 +2618,7 @@ final class AppModel: ObservableObject {
         kycStatus = nil
         sessionAssurance = result.sessionAssurance
         contactDirectoryRevision &+= 1
-        state = await store.snapshot()
+        await publishLatestState()
         isSignedIn = true
         let authenticatedContext = AuthenticatedSecurityContext(
             accountEpoch: accountEpoch,
@@ -3082,7 +3103,7 @@ final class AppModel: ObservableObject {
                 finishAcceptedAccountDeletionLocalPurge(acceptedDeletion)
             // Publish only the post-cleanup projection; an exact-target write failure is already
             // concealed by SecureLocalStore, while an ownership conflict remains marker-blocked.
-            state = await store.snapshot()
+            await publishLatestState()
             guard acceptedDeletionLocalCleanupSucceeded else {
                 return .localCleanupFailed
             }
@@ -3232,7 +3253,7 @@ final class AppModel: ObservableObject {
         // signed-out — or deleted — customer's photo, and their contacts' photos, survived in the
         // container and could be re-displayed to whoever signed in next.
         purgeSharedResponseCache()
-        state = await store.snapshot()
+        await publishLatestState()
         isSignedIn = false
         accountSetupStep = nil
         isCompletingAccountSetup = false
@@ -3360,7 +3381,7 @@ final class AppModel: ObservableObject {
                 userID: expectedUserID,
                 sessionID: expectedSessionID
             ) else { return }
-            state = await store.snapshot()
+            await publishLatestState()
             deviceManagementErrorMessage = nil
         } catch is CancellationError {
             return
@@ -3469,7 +3490,7 @@ final class AppModel: ObservableObject {
                 userID: expectedUserID,
                 sessionID: expectedSessionID
             ) else { return }
-            state = await store.snapshot()
+            await publishLatestState()
             deviceManagementErrorMessage = nil
         } catch is CancellationError {
             return
@@ -3952,13 +3973,15 @@ final class AppModel: ObservableObject {
             guard updatedState.profile?.id.caseInsensitiveCompare(context.userID) == .orderedSame,
                   await authenticatedSecurityContextIsCurrent(context)
             else { return }
-            state = updatedState
+            await publishLatestState()
         } catch {
             // The server result remains authoritative. Keep this process accurate even if the
             // encrypted cache cannot be rewritten; the next profile refresh repairs persistence.
             guard await authenticatedSecurityContextIsCurrent(context),
                   state.profile?.id.caseInsensitiveCompare(context.userID) == .orderedSame
             else { return }
+            // Deliberate in-memory overlay: the store write failed, so the funnel has nothing
+            // newer to publish — this flag must ride on the published state directly.
             var updatedState = state
             updatedState.profile?.mfaEnabled = enabled
             state = updatedState
@@ -4700,7 +4723,7 @@ final class AppModel: ObservableObject {
                 sessionID: expectedSessionID
               )
         else { return }
-        state = resumedState
+        await publishLatestState()
         scheduleOutboxWake()
         if isOnline { await flushOutbox() }
         guard await outboxContextIsCurrent(
@@ -4839,7 +4862,7 @@ final class AppModel: ObservableObject {
                 sessionID: expectedSessionID,
                 userID: expectedUserID
             ) else { return }
-            state = await store.snapshot()
+            await publishLatestState()
             sessionAssurance = bootstrap.sessionAssurance
             accountSetupStep = AccountSetupPolicy.reconcile(
                 accountSetupStep,
@@ -4916,7 +4939,7 @@ final class AppModel: ObservableObject {
                     sessionID: expectedSessionID,
                     userID: expectedUserID
                 ) else { return }
-                state = await store.snapshot()
+                await publishLatestState()
             } catch {
                 if RefreshCancellationPolicy.shouldSuppress(
                     error,
@@ -5028,7 +5051,7 @@ final class AppModel: ObservableObject {
                !(await authenticatedSecurityContextIsCurrent(expectedContext)) {
                 return .noData
             }
-            state = latestState
+            await publishLatestState()
             lastError = secureMessagingSyncError.resolve(
                 syncAttempt,
                 visibleMessage: lastError
@@ -5250,7 +5273,7 @@ final class AppModel: ObservableObject {
                       context: context
                   )
             else { return }
-            state = latest
+            await publishLatestState()
         } catch is CancellationError {
             return
         } catch {
@@ -5352,7 +5375,7 @@ final class AppModel: ObservableObject {
                   latest.communicationOwnerUserID?.caseInsensitiveCompare(currentUserID)
                     == .orderedSame
             else { return false }
-            state = latest
+            await publishLatestState()
             guard let resolved = activeCallConversation(for: activeCall),
                   resolved.id.caseInsensitiveCompare(created.id) == .orderedSame
             else { return false }
@@ -5535,7 +5558,7 @@ final class AppModel: ObservableObject {
                !isSubmittingAccountDeletion,
                queuedState.profile?.id.caseInsensitiveCompare(currentUserID) == .orderedSame,
                await sessions.current()?.sessionId == currentSession.sessionId {
-                state = queuedState
+                await publishLatestState()
                 scheduleOutboxWake()
             }
             await NotificationCoordinator.shared.clearMessageNotifications(
@@ -5581,7 +5604,7 @@ final class AppModel: ObservableObject {
         guard latest.profile?.id.caseInsensitiveCompare(userID) == .orderedSame,
               latest.communicationOwnerUserID?.caseInsensitiveCompare(userID) == .orderedSame
         else { return }
-        state = latest
+        await publishLatestState()
         scheduleOutboxWake()
         guard ProtectedCommunicationAdmissionGate.shared.permits(admission),
               !isSubmittingAccountDeletion
@@ -5637,7 +5660,7 @@ final class AppModel: ObservableObject {
                 sessionID: expectedSessionID,
                 userID: expectedUserID
             ) else { return }
-            state = await store.snapshot()
+            await publishLatestState()
             rebuildCallContacts()
             reconcileCallWaitingAfterHistoryRefresh()
             await CallMediaCoordinator.shared.reconcileBackendCalls(state.calls)
@@ -5705,7 +5728,7 @@ final class AppModel: ObservableObject {
                 sessionID: expectedSessionID,
                 userID: expectedUserID
             ) else { return false }
-            state = await store.snapshot()
+            await publishLatestState()
             rebuildCallContacts()
             reconcileCallWaitingAfterHistoryRefresh()
             await CallMediaCoordinator.shared.reconcileBackendCalls(state.calls)
@@ -5831,7 +5854,7 @@ final class AppModel: ObservableObject {
                 throw AccountSetupError.profileStillRequired
             }
             try await store.update { persisted in persisted.profile = updated }
-            state = await store.snapshot()
+            await publishLatestState()
             accountSetupStep = AccountSetupPolicy.reconcile(
                 currentStep,
                 with: updated,
@@ -5940,7 +5963,7 @@ final class AppModel: ObservableObject {
         guard await authenticatedSecurityContextIsCurrent(context) else {
             throw APIClientError.signedOut
         }
-        state = updatedState
+        await publishLatestState()
     }
 
     private func beginProfileEmailOperation(
@@ -6085,7 +6108,7 @@ final class AppModel: ObservableObject {
                 else { throw AccountSetupError.accountChanged }
                 persisted.profile = committedProfile
             }
-            state = updatedState
+            await publishLatestState()
 
             guard let avatarJPEG else { return true }
 
@@ -6138,7 +6161,7 @@ final class AppModel: ObservableObject {
                 ) { persisted in
                     persisted.pendingProfileAvatarAttachment = pendingAttachment
                 }
-                state = updatedState
+                await publishLatestState()
             }
 
             shouldRestartInterruptedAvatarResume = false
@@ -6167,7 +6190,7 @@ final class AppModel: ObservableObject {
                 persisted.profile = committedProfile
                 persisted.pendingProfileAvatarAttachment = nil
             }
-            state = updatedState
+            await publishLatestState()
             return true
         } catch is CancellationError {
             return false
@@ -6315,7 +6338,7 @@ final class AppModel: ObservableObject {
                 persisted.profile = committedProfile
                 persisted.pendingProfileAvatarAttachment = nil
             }
-            state = updatedState
+            await publishLatestState()
         } catch is CancellationError {
             return
         } catch {
@@ -6348,7 +6371,7 @@ final class AppModel: ObservableObject {
                 else { throw CancellationError() }
                 persisted.pendingProfileAvatarAttachment = nil
             }
-            state = updatedState
+            await publishLatestState()
             return true
         } catch {
             return false
@@ -6381,7 +6404,7 @@ final class AppModel: ObservableObject {
             try await store.update { persisted in
                 persisted.profile?.paymentPinSet = true
             }
-            state = await store.snapshot()
+            await publishLatestState()
             guard let updatedProfile = state.profile else { throw AuthUIError.missingUser }
             if let assurance = status.sessionAssurance {
                 sessionAssurance = assurance
@@ -7041,7 +7064,7 @@ final class AppModel: ObservableObject {
                       refreshedState.communicationOwnerUserID
                   ) == context.userID
             else { return }
-            state = refreshedState
+            await publishLatestState()
         } catch {
             // The live block already filters every in-memory communication picker. Clearing this
             // process's freshness marker still makes the next pass re-check server discovery.
@@ -7063,10 +7086,7 @@ final class AppModel: ObservableObject {
               isSignedIn,
               !isSigningOut,
               let userID = profile?.id,
-              let canonicalConversationID = OutboxPolicy.canonicalConversationID(conversationId),
-              state.conversations.contains(where: {
-                  OutboxPolicy.canonicalConversationID($0.id) == canonicalConversationID
-              })
+              let canonicalConversationID = OutboxPolicy.canonicalConversationID(conversationId)
         else { return false }
         let boundedBody = ConversationDraftPolicy.boundedBody(body)
         do {
@@ -7077,6 +7097,12 @@ final class AppModel: ObservableObject {
                       persisted.communicationOwnerUserID?.caseInsensitiveCompare(userID)
                         == .orderedSame
                 else { throw StoreError.accountChanged }
+                // Check conversation existence against durable truth, not the published UI
+                // state: a momentarily stale publish must never block typing (or the send that
+                // follows) in a conversation that genuinely exists.
+                guard persisted.conversations.contains(where: {
+                    OutboxPolicy.canonicalConversationID($0.id) == canonicalConversationID
+                }) else { throw CancellationError() }
                 ConversationDraftPolicy.store(
                     boundedBody,
                     conversationID: canonicalConversationID,
@@ -7300,15 +7326,10 @@ final class AppModel: ObservableObject {
             return false
         }
         let kind = KitChatMediaKind(mediaType: mediaType)
-        let canQueueOffline = kind == .image
-            && KitChatMediaLimits.shouldCacheInline(byteCount: mediaData.count)
-        guard isOnline || canQueueOffline else {
-            lastError = "Connect to the internet to send this encrypted \(kind.previewLabel.lowercased())."
-            return false
-        }
-        if kind != .image, capabilities?.enablesMessagingRichMedia != true {
+        if kind != .image, isOnline, capabilities?.enablesMessagingRichMedia != true {
             // A server rollout can complete while this process still holds its launch snapshot.
-            // Refresh once at send time before presenting an unavailable result.
+            // Refresh once at send time before presenting an unavailable result. Offline, the
+            // message queues locally and the authoritative capability/roster gates run at flush.
             _ = await reloadCapabilities()
             guard capabilities?.enablesMessagingRichMedia == true else {
                 lastError =
@@ -7352,62 +7373,94 @@ final class AppModel: ObservableObject {
             lastError = denial
             return false
         }
-        do {
-            let queued: SecureMessagingQueueResult
-            if KitChatMediaLimits.shouldCacheInline(byteCount: mediaData.count) {
-                queued = try await SecureMessagingExchangeCoordinator.shared.queueDeferredImage(
-                    forUserID: userID,
-                    conversationID: cleanConversationId,
-                    expectedRecipientUserID: recipientUserID,
-                    title: title,
-                    mediaData: mediaData,
-                    mediaType: mediaType,
-                    caption: caption,
-                    submittedDraftBody: submittedDraftBody,
-                    draftClearVersion: draftClearVersion
+        // Offline-first for every kind: the message commits locally (instant bubble) and the
+        // upload/encrypt/send pipeline replays from the outbox. Large plaintext parks in the
+        // encrypted media file cache under a locally minted key so the state file stays small.
+        let storesInline = KitChatMediaLimits.shouldCacheInline(byteCount: mediaData.count)
+        var parkedLocalKey: String?
+        if !storesInline {
+            let localKey = UUID().uuidString.lowercased()
+            do {
+                try await SecureMediaFileCache.shared.store(
+                    mediaData,
+                    forStorageKey: localKey,
+                    userID: userID
                 )
-            } else {
-                queued = try await SecureMessagingExchangeCoordinator.shared.queueMediaAttachment(
-                    forUserID: userID,
-                    conversationID: cleanConversationId,
-                    expectedRecipientUserID: recipientUserID,
-                    title: title,
-                    mediaData: mediaData,
-                    mediaType: mediaType,
-                    caption: caption,
-                    storesInlineAttachment: false,
-                    submittedDraftBody: submittedDraftBody,
-                    draftClearVersion: draftClearVersion
-                )
+                parkedLocalKey = localKey
+            } catch {
+                lastError = error.localizedDescription
+                return false
             }
+        }
+        do {
+            _ = try await SecureMessagingExchangeCoordinator.shared.queueDeferredImage(
+                forUserID: userID,
+                conversationID: cleanConversationId,
+                expectedRecipientUserID: recipientUserID,
+                title: title,
+                mediaData: mediaData,
+                mediaType: mediaType,
+                caption: caption,
+                localStorageKey: parkedLocalKey,
+                submittedDraftBody: submittedDraftBody,
+                draftClearVersion: draftClearVersion
+            )
             guard await reloadOutboxStateIfCurrent(
                 accountEpoch: expectedAccountEpoch,
                 userID: userID,
                 sessionID: expectedSessionID
             ) else { return false }
-            if !KitChatMediaLimits.shouldCacheInline(byteCount: mediaData.count),
-               let descriptor = state.messages
-                   .first(where: { $0.id == queued.clientMessageID })
-                   .flatMap({ KitMediaMessageDescriptor.parse($0.body) }) {
-                try? await SecureMediaFileCache.shared.store(
-                    mediaData,
-                    forStorageKey: descriptor.storageKey,
+            // Media bytes, pending attachment metadata and the outbox command are protected by
+            // the same local commit. Upload/encryption replay continues independently from here;
+            // kick it immediately so an online send starts uploading without waiting for a wake.
+            scheduleOutboxWake()
+            if isOnline {
+                Task { [weak self] in await self?.flushOutbox() }
+            }
+            return true
+        } catch {
+            if let parkedLocalKey {
+                await SecureMediaFileCache.shared.remove(
+                    forStorageKey: parkedLocalKey,
                     userID: userID
                 )
             }
-            // Media bytes, pending attachment metadata and the outbox command are protected by
-            // the same local commit. Upload/encryption replay continues independently from here.
-            scheduleOutboxWake()
-            return true
-        } catch {
-            guard await outboxContextIsCurrent(
+            return await queueMediaMessageFailureResult(
+                error,
                 accountEpoch: expectedAccountEpoch,
                 userID: userID,
                 sessionID: expectedSessionID
-            ) else { return false }
-            lastError = error.localizedDescription
-            return false
+            )
         }
+    }
+
+    private func queueMediaMessageFailureResult(
+        _ error: Error,
+        accountEpoch expectedAccountEpoch: UUID,
+        userID: String,
+        sessionID expectedSessionID: String
+    ) async -> Bool {
+        guard await outboxContextIsCurrent(
+            accountEpoch: expectedAccountEpoch,
+            userID: userID,
+            sessionID: expectedSessionID
+        ) else { return false }
+        lastError = error.localizedDescription
+        return false
+    }
+
+    /// Plaintext bytes for a message that is still pending upload. Small media rides inline on
+    /// the message; large media is parked in the encrypted file cache under a local key.
+    func loadPendingMedia(for message: LocalMessage) async -> Data? {
+        if let inline = message.attachmentData, !inline.isEmpty {
+            return inline
+        }
+        guard let localKey = message.pendingAttachment?.localStorageKey,
+              let userID = profile?.id else { return nil }
+        return await SecureMediaFileCache.shared.data(
+            forStorageKey: localKey,
+            userID: userID
+        )
     }
 
     func loadSecureMedia(
@@ -7448,7 +7501,7 @@ final class AppModel: ObservableObject {
                 }) else { throw SecureMessagingExchangeError.invalidConversation }
                 persisted.messages[index].attachmentData = data
             }
-            state = await store.snapshot()
+            await publishLatestState()
         } else if let descriptor = KitMediaMessageDescriptor.parse(descriptorText) {
             try? await SecureMediaFileCache.shared.store(
                 data,
@@ -7596,7 +7649,7 @@ final class AppModel: ObservableObject {
                 throughServerMessageID: messageID,
                 forUserID: userID
             )
-            state = await store.snapshot()
+            await publishLatestState()
         } catch is CancellationError {
             return
         } catch {
@@ -7615,7 +7668,7 @@ final class AppModel: ObservableObject {
                     in: persisted.pinnedConversationIds
                 )
             }
-            state = await store.snapshot()
+            await publishLatestState()
         } catch {
             lastError = error.localizedDescription
         }
@@ -7629,7 +7682,7 @@ final class AppModel: ObservableObject {
                     in: persisted.mutedConversationIds
                 )
             }
-            state = await store.snapshot()
+            await publishLatestState()
         } catch {
             lastError = error.localizedDescription
         }
@@ -7645,7 +7698,7 @@ final class AppModel: ObservableObject {
                     persisted.conversations[index].unreadCount = 0
                 }
             }
-            state = await store.snapshot()
+            await publishLatestState()
         } catch {
             lastError = error.localizedDescription
             return
@@ -7663,7 +7716,16 @@ final class AppModel: ObservableObject {
         let userID = profile?.id
         let storageKeys = state.messages
             .filter { conversationIDs.contains($0.conversationId) }
-            .compactMap { KitMediaMessageDescriptor.parse($0.body)?.storageKey }
+            .flatMap { message -> [String] in
+                var keys: [String] = []
+                if let key = KitMediaMessageDescriptor.parse(message.body)?.storageKey {
+                    keys.append(key)
+                }
+                if let localKey = message.pendingAttachment?.localStorageKey {
+                    keys.append(localKey)
+                }
+                return keys
+            }
         do {
             try await store.update { persisted in
                 persisted.conversations.removeAll { conversationIDs.contains($0.id) }
@@ -7677,7 +7739,7 @@ final class AppModel: ObservableObject {
                 persisted.mutedConversationIds = persisted.mutedConversationIds?
                     .filter { !conversationIDs.contains($0) }
             }
-            state = await store.snapshot()
+            await publishLatestState()
             if let userID {
                 for storageKey in storageKeys {
                     await SecureMediaFileCache.shared.remove(
@@ -7697,7 +7759,16 @@ final class AppModel: ObservableObject {
         let userID = profile?.id
         let storageKeys = state.messages
             .filter { messageIDs.contains($0.id) && $0.conversationId == conversationId }
-            .compactMap { KitMediaMessageDescriptor.parse($0.body)?.storageKey }
+            .flatMap { message -> [String] in
+                var keys: [String] = []
+                if let key = KitMediaMessageDescriptor.parse(message.body)?.storageKey {
+                    keys.append(key)
+                }
+                if let localKey = message.pendingAttachment?.localStorageKey {
+                    keys.append(localKey)
+                }
+                return keys
+            }
         do {
             try await store.update { persisted in
                 persisted.messages.removeAll {
@@ -7708,7 +7779,7 @@ final class AppModel: ObservableObject {
                         && command.messageId.map(messageIDs.contains) == true
                 }
             }
-            state = await store.snapshot()
+            await publishLatestState()
             if let userID {
                 for storageKey in storageKeys {
                     await SecureMediaFileCache.shared.remove(
@@ -7732,7 +7803,7 @@ final class AppModel: ObservableObject {
                 preferences.frequency = frequency
                 persisted.messageBackupPreferences = preferences
             }
-            state = await store.snapshot()
+            await publishLatestState()
         } catch {
             lastError = error.localizedDescription
         }
@@ -7746,7 +7817,7 @@ final class AppModel: ObservableObject {
                 preferences.includesMedia = includesMedia
                 persisted.messageBackupPreferences = preferences
             }
-            state = await store.snapshot()
+            await publishLatestState()
         } catch {
             lastError = error.localizedDescription
         }
@@ -8313,7 +8384,7 @@ final class AppModel: ObservableObject {
                 userID: lease.userID,
                 sessionID: lease.sessionID
             ) else { return false }
-            state = await store.snapshot()
+            await publishLatestState()
             rebuildCallContacts()
             lastError = nil
             return true
@@ -8544,7 +8615,7 @@ final class AppModel: ObservableObject {
             let snapshot = await store.snapshot()
             guard waitingCallMergeOperationIsCurrent(operationID, attempt: attempt)
             else { return false }
-            state = snapshot
+            await publishLatestState()
             rebuildCallContacts()
             lastError = nil
             return true
@@ -9086,7 +9157,7 @@ final class AppModel: ObservableObject {
                 userID: attempt.lease.userID,
                 sessionID: attempt.lease.sessionID
             ) else { return }
-            state = await store.snapshot()
+            await publishLatestState()
             rebuildCallContacts()
         } catch {
             // The authenticated call is already live. A later authoritative history refresh repairs
@@ -9137,13 +9208,15 @@ final class AppModel: ObservableObject {
         guard flushingAccountEpoch != expectedAccountEpoch else { return }
         flushingAccountEpoch = expectedAccountEpoch
         var encounteredUnavailableCommunicationPrivacy = false
+        var encounteredMissingMessagingCapability = false
         defer {
             if flushingAccountEpoch == expectedAccountEpoch {
                 flushingAccountEpoch = nil
                 if accountEpoch == expectedAccountEpoch,
                    ProtectedCommunicationAdmissionGate.shared.permits(communicationAdmission),
                    !isSubmittingAccountDeletion {
-                    if encounteredUnavailableCommunicationPrivacy {
+                    if encounteredUnavailableCommunicationPrivacy
+                        || encounteredMissingMessagingCapability {
                         // A missing complete block projection must never create a zero-delay replay
                         // loop. The next authenticated refresh (or bounded background replay) first
                         // reloads privacy authority, while call terminations remain independently
@@ -9234,18 +9307,12 @@ final class AppModel: ObservableObject {
                     continue
                 }
                 guard secureMessagingAvailable else {
-                    await handleOutboxFailure(
-                        command,
-                        error: APIErrorPayload(
-                            code: "MESSAGING_UNAVAILABLE",
-                            message: messagingSendFailureMessage,
-                            httpStatus: 403
-                        ),
-                        reportFailure: reportFailures,
-                        accountEpoch: expectedAccountEpoch,
-                        userID: expectedUserID,
-                        sessionID: expectedSessionID
-                    )
+                    // A capability gap here is almost always a discovery flap (nil or briefly
+                    // missing "messaging" while reloading). Hard-failing every queued message
+                    // turned a transient blip into red bubbles; leave them queued. The defer
+                    // converts this into a bounded background retry rather than a zero-delay
+                    // wake loop — the transport still fail-closes on real server denial.
+                    encounteredMissingMessagingCapability = true
                     continue
                 }
                 do {
@@ -9519,7 +9586,9 @@ final class AppModel: ObservableObject {
                 sessionID: expectedSessionID
               )
         else { throw CancellationError() }
-        return snapshot
+        // Re-fetch monotonically at the moment of publishing: `snapshot` was captured before
+        // the context guards suspended, so assigning it directly could roll back newer commits.
+        return await publishLatestState()
     }
 
     @discardableResult
@@ -9538,7 +9607,7 @@ final class AppModel: ObservableObject {
                 sessionID: expectedSessionID
               )
         else { return false }
-        state = snapshot
+        await publishLatestState()
         return true
     }
 
@@ -9722,7 +9791,7 @@ final class AppModel: ObservableObject {
                 persisted.contactSyncSnapshotScope = nil
                 persisted.contactSyncLastCompletedAt = nil
             }
-            state = await store.snapshot()
+            await publishLatestState()
             rebuildCallContacts()
         } catch {
             // Revocation must take effect in-memory even if protected storage
@@ -9926,7 +9995,7 @@ final class AppModel: ObservableObject {
                 sessionID: expectedSessionID,
                 directoryRevision: expectedDirectoryRevision
             ) else { return false }
-            state = updatedState
+            await publishLatestState()
             refreshedContactAuthorizationRevision = max(
                 refreshedContactAuthorizationRevision,
                 expectedContactAuthorizationRevision
@@ -10954,7 +11023,7 @@ final class AppModel: ObservableObject {
                     at: Date()
                 )
             }
-            state = await store.snapshot()
+            await publishLatestState()
             scheduleOutboxWake()
             if isOnline { await flushOutbox(reportFailures: true) }
         } catch {

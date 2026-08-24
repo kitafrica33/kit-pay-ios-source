@@ -43,6 +43,8 @@
 	<string>Use Face ID to protect payments and private conversations.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Speak during secure Kit voice and video calls and record encrypted voice notes.</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>Save photos and videos from your secure chats to your photo library.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Choose photos and videos to share in secure chats or set as your Kit Pay profile photo.</string>
 	<key>UIApplicationSceneManifest</key>

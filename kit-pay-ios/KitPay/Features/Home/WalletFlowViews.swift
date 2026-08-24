@@ -666,11 +666,7 @@ struct SendMoneyView: View {
                 Text("Ref \(transaction.reference)")
                     .font(.caption.monospaced())
                     .foregroundStyle(.secondary)
-                ShareLink(item: WalletShare.receipt(transaction: transaction, recipient: selectedContact?.name)) {
-                    Label("Share receipt", systemImage: "square.and.arrow.up")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(KitSecondaryButtonStyle())
+                ShareReceiptButton(transaction: transaction, senderName: model.profile?.name)
             }
             Spacer()
             Button("Done") { dismiss() }
@@ -1244,11 +1240,7 @@ struct TransactionDetailView: View {
                 .padding(18)
                 .kitGlass(cornerRadius: 24)
 
-                ShareLink(item: WalletShare.receipt(transaction: transaction, recipient: transaction.counterparty?.name)) {
-                    Label("Share receipt", systemImage: "square.and.arrow.up")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(KitSecondaryButtonStyle())
+                ShareReceiptButton(transaction: transaction, senderName: nil)
             }
             .padding(24)
         }
@@ -1377,17 +1369,6 @@ private enum WalletShare {
         if let phone = profile?.phone?.nilIfEmpty { lines.append("Phone: \(phone)") }
         if let account = wallet?.accountNumber?.nilIfEmpty { lines.append("Account: \(account)") }
         return lines.joined(separator: "\n")
-    }
-
-    static func receipt(transaction: WalletTransaction, recipient: String?) -> String {
-        [
-            "Kit Pay receipt",
-            "Amount: \(transaction.signedDisplayAmount)",
-            "Recipient: \(recipient ?? "Kit Pay user")",
-            "Status: \(transaction.status.capitalized)",
-            "Reference: \(transaction.reference)",
-            "Date: \(transaction.occurredAt.displayDate)",
-        ].joined(separator: "\n")
     }
 }
 

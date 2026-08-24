@@ -24,10 +24,23 @@ actor SecureLocalStore {
     private let stateDataLoad: StateDataLoad
     private let keyDataLoad: KeyDataLoad
     private let stateURL: URL
-    private var state: PersistedState
-    private var stateLoadStatus: StateLoadStatus
-    private var concealsStateForAcceptedDeletion = false
-    private var concealsStateForProtectedStateRecovery = false
+    // Every stored property that feeds `snapshot()` bumps the projection revision, so a
+    // publisher can reject a projection captured before a newer commit. This is the fix for
+    // messages/conversations "disappearing": a snapshot captured, suspended across an await,
+    // and then assigned to the UI must never roll back a newer publish.
+    private var state: PersistedState {
+        didSet { projectionRevision &+= 1 }
+    }
+    private var stateLoadStatus: StateLoadStatus {
+        didSet { projectionRevision &+= 1 }
+    }
+    private var concealsStateForAcceptedDeletion = false {
+        didSet { projectionRevision &+= 1 }
+    }
+    private var concealsStateForProtectedStateRecovery = false {
+        didSet { projectionRevision &+= 1 }
+    }
+    private var projectionRevision: UInt64 = 0
 
     init(
         stateURL: URL? = nil,
@@ -75,6 +88,13 @@ actor SecureLocalStore {
               !concealsStateForProtectedStateRecovery
         else { return .empty }
         return state
+    }
+
+    /// The snapshot together with a monotonic revision. Publishers must drop projections whose
+    /// revision is older than the last one they applied — assigning a stale snapshot to the UI
+    /// silently rolls back newer commits (sent bubbles, new conversations, inbound messages).
+    func projection() -> SecureLocalStateProjection {
+        SecureLocalStateProjection(state: snapshot(), revision: projectionRevision)
     }
 
     /// Retries only failures that occurred before authenticated ciphertext could be read. File
@@ -385,6 +405,12 @@ enum AcceptedAccountDeletionProjectionPurgeResult: Equatable {
     case purged
     case alreadyEmpty
     case ownerConflict
+}
+
+/// A point-in-time view of the store plus the monotonic revision it was taken at.
+struct SecureLocalStateProjection {
+    let state: PersistedState
+    let revision: UInt64
 }
 
 enum StoreError: Error, Equatable {

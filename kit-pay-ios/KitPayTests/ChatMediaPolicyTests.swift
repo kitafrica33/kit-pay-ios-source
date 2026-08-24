@@ -28,14 +28,37 @@ final class ChatMediaPolicyTests: XCTestCase {
         XCTAssertEqual(KitChatMediaKind(mediaType: "something/unknown"), .document)
     }
 
-    func testTransferLimitIsTenMebibytes() {
-        XCTAssertEqual(SecureMediaAttachmentCipher.maximumPlaintextBytes, 10 * 1_024 * 1_024)
+    func testCaptureTempCleanupRemovesOnlyOwnedCameraAndEditorEntries() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "kit-capture-cleanup-test-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let camera = root.appendingPathComponent("kit-camera-abandoned", isDirectory: true)
+        let editor = root.appendingPathComponent("kit-trim-abandoned", isDirectory: true)
+        let unrelated = root.appendingPathComponent("other-app-data", isDirectory: true)
+        for directory in [camera, editor, unrelated] {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try Data([1, 2, 3]).write(to: directory.appendingPathComponent("clip.mov"))
+        }
+
+        KitCaptureTemporaryFileStore.removeAbandonedFiles(in: root)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: camera.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: editor.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: unrelated.path))
+    }
+
+    func testTransferLimitIsTwoHundredMebibytes() {
+        XCTAssertEqual(SecureMediaAttachmentCipher.maximumPlaintextBytes, 200 * 1_024 * 1_024)
         XCTAssertEqual(
             SecureMessagingWire.maximumAttachmentCiphertextBytes,
-            Int64(10 * 1_024 * 1_024 + 64)
+            Int64(200 * 1_024 * 1_024 + 64)
         )
-        XCTAssertTrue(KitChatMediaLimits.fits(10 * 1_024 * 1_024, kind: .video))
-        XCTAssertFalse(KitChatMediaLimits.fits(10 * 1_024 * 1_024 + 1, kind: .video))
+        XCTAssertTrue(KitChatMediaLimits.fits(200 * 1_024 * 1_024, kind: .video))
+        XCTAssertFalse(KitChatMediaLimits.fits(200 * 1_024 * 1_024 + 1, kind: .video))
         XCTAssertFalse(KitChatMediaLimits.fits(0, kind: .document))
     }
 
@@ -76,14 +99,18 @@ final class ChatMediaPolicyTests: XCTestCase {
         XCTAssertFalse(decoded.enablesMessagingRichMedia)
     }
 
-    func testRichMediaRosterRequiresIOSBuild16AtVersion025() throws {
+    func testRichMediaRosterTrustsTheServerCapabilityWithAnIOSVersionFloor() throws {
         XCTAssertFalse(try rosterSupports(version: "0.2.5", build: nil))
         XCTAssertFalse(try rosterSupports(version: "0.2.5", build: 15))
         XCTAssertTrue(try rosterSupports(version: "0.2.5", build: 16))
         XCTAssertTrue(try rosterSupports(version: "0.2.5", build: 29))
         XCTAssertTrue(try rosterSupports(version: "0.2.6", build: nil))
         XCTAssertFalse(try rosterSupports(version: "0.2.4", build: 999))
-        XCTAssertFalse(try rosterSupports(version: "0.2.5", build: 16, platform: "android"))
+        // Non-iOS recipients ride the server-attested capability flag: the backend only
+        // asserts it for Android 0.2.18+ where the shared kit-media-v1 wire is implemented.
+        XCTAssertTrue(try rosterSupports(version: "0.2.18", build: nil, platform: "android"))
+        XCTAssertTrue(try rosterSupports(version: "0.2.5", build: 16, platform: "android"))
+        XCTAssertFalse(try rosterSupports(version: "0.2.18", build: nil, platform: "android", capable: false))
         XCTAssertFalse(try rosterSupports(version: "0.2.5", build: 16, capable: false))
     }
 

@@ -4,6 +4,21 @@ import XCTest
 @testable import KitPay
 
 final class CallLifecycleTests: XCTestCase {
+    func testForegroundIntentStopsPictureInPictureThatFinishesStartingLate() {
+        var intent = CallPictureInPictureLifecycleIntent()
+
+        intent.willStartForBackgrounding()
+        XCTAssertFalse(intent.foregroundStopRequested(isPictureInPictureActive: false))
+        XCTAssertTrue(intent.shouldStopAfterStart)
+        XCTAssertTrue(intent.didStart())
+        XCTAssertFalse(intent.shouldStopAfterStart)
+
+        intent.willStartForBackgrounding()
+        XCTAssertTrue(intent.foregroundStopRequested(isPictureInPictureActive: true))
+        XCTAssertFalse(intent.shouldStopAfterStart)
+        XCTAssertFalse(intent.didStart())
+    }
+
     func testMinimizedCallControlsMeetAppleMinimumHitTarget() {
         XCTAssertGreaterThanOrEqual(
             CallFloatingSurfaceLayoutPolicy.minimizedControlDimension,

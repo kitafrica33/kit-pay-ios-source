@@ -57,7 +57,7 @@ enum KitChatMediaLimits {
     /// wallet-balance update never rewrites hundreds of megabytes.
     static let maximumInlineCacheBytes = 4 * 1_024 * 1_024
 
-    static let maximumTransferLabel = "10 MB"
+    static let maximumTransferLabel = "200 MB"
 
     static func fits(_ byteCount: Int, kind _: KitChatMediaKind) -> Bool {
         byteCount > 0 && byteCount <= maximumTransferBytes

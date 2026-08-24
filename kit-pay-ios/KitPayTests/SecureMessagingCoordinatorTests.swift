@@ -1184,7 +1184,11 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
         XCTAssertEqual(message.attachmentData, jpeg)
         XCTAssertEqual(
             message.pendingAttachment,
-            LocalPendingAttachment(mediaType: "image/jpeg", caption: "Offline receipt")
+            LocalPendingAttachment(
+                mediaType: "image/jpeg",
+                caption: "Offline receipt",
+                byteCount: jpeg.count
+            )
         )
         XCTAssertEqual(message.state, .queued)
         XCTAssertEqual(command.messageId, message.id)
@@ -1355,6 +1359,131 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
         let restored = await reopened.snapshot()
         XCTAssertNil(restored.messages.first?.pendingAttachment)
         XCTAssertEqual(restored.messages.first?.body, message.body)
+    }
+
+    func testDeferredMediaCopyFailureKeepsOriginalPendingBlobReferenced() async throws {
+        let localUserID = "10000000-0000-4000-8000-000000000019"
+        let recipientUserID = "10000000-0000-4000-8000-000000000020"
+        let conversationID = "30000000-0000-4000-8000-000000000019"
+        let localStorageKey = "70000000-0000-4000-8000-000000000019"
+        let messageID = UUID(uuidString: "80000000-0000-4000-8000-000000000019")!
+        let commandID = UUID(uuidString: "90000000-0000-4000-8000-000000000019")!
+        let media = Data([0xff, 0xd8, 0xff, 0xd9])
+        let createdAt = Date(timeIntervalSince1970: 1_755_604_800)
+        let store = try await makeStore(userID: localUserID)
+        let engine = SecureMessagingCryptoEngine()
+        let provisioned = try await engine.provision(from: .empty, preKeyCount: 1)
+        let status = enrolledStatus(bundle: provisioned.bundle)
+        let binding = try SecureMessagingMapper.enrollmentBinding(
+            from: status,
+            userID: localUserID
+        )
+        let enrolled = try await engine.bindEnrollment(binding, to: provisioned.state)
+        let localConversation = Conversation(
+            id: conversationID,
+            title: "ExampleContact",
+            participantUserIds: [localUserID, recipientUserID],
+            unreadCount: 0,
+            updatedAt: createdAt
+        )
+        let pendingMessage = LocalMessage(
+            id: messageID,
+            conversationId: conversationID,
+            senderId: localUserID,
+            body: "Photo",
+            createdAt: createdAt,
+            sentAt: nil,
+            state: .queued,
+            failureReason: nil,
+            isOutgoing: true,
+            attachmentData: nil,
+            pendingAttachment: LocalPendingAttachment(
+                mediaType: "image/jpeg",
+                caption: nil,
+                localStorageKey: localStorageKey,
+                byteCount: media.count
+            )
+        )
+        let pendingCommand = OfflineCommand(
+            id: commandID,
+            kind: .secureMessage,
+            createdAt: createdAt,
+            nextAttemptAt: createdAt,
+            attemptCount: 0,
+            conversationId: conversationID,
+            messageId: messageID,
+            recipientUserIds: [recipientUserID],
+            recipientName: "ExampleContact",
+            video: nil,
+            expiresAt: nil,
+            secureMessageFanout: nil
+        )
+        try await store.update { state in
+            state.secureMessaging = enrolled
+            state.conversations = [localConversation]
+            state.messages = [pendingMessage]
+            state.outbox = [pendingCommand]
+        }
+        let remoteConversation = MessagingConversationDTO(
+            id: conversationID,
+            type: SecureMessagingWire.directConversationType,
+            title: nil,
+            parentId: nil,
+            createdBy: localUserID,
+            role: "owner",
+            members: [
+                MessagingConversationMemberDTO(
+                    userId: localUserID,
+                    name: "Secure User",
+                    role: "owner",
+                    joinedAt: "2026-08-19T12:00:00Z"
+                ),
+                MessagingConversationMemberDTO(
+                    userId: recipientUserID,
+                    name: "ExampleContact",
+                    role: "member",
+                    joinedAt: "2026-08-19T12:00:00Z"
+                ),
+            ],
+            createdAt: "2026-08-19T12:00:00Z",
+            updatedAt: "2026-08-19T12:00:00Z"
+        )
+        let transport = DeferredImageCheckpointTransport(
+            status: status,
+            conversation: remoteConversation
+        )
+        let removals = BlobRemovalRecorder()
+        let coordinator = SecureMessagingExchangeCoordinator(
+            transport: transport,
+            store: store,
+            engine: engine,
+            provisioningPreKeyCount: 1,
+            mediaBlobs: SecureMediaBlobStoreAccess(
+                read: { key, userID in
+                    key == localStorageKey && userID == localUserID ? media : nil
+                },
+                copy: { _, _, _ in throw InjectedBlobCopyFailure.failed },
+                remove: { key, _ in await removals.record(key) }
+            )
+        )
+
+        do {
+            _ = try await coordinator.prepareDeferredMessage(
+                commandID: commandID,
+                forUserID: localUserID
+            )
+            XCTFail("A failed cache copy must stop the descriptor checkpoint")
+        } catch InjectedBlobCopyFailure.failed {
+            // Expected.
+        }
+
+        let snapshot = await store.snapshot()
+        XCTAssertEqual(snapshot.messages, [pendingMessage])
+        XCTAssertEqual(snapshot.outbox, [pendingCommand])
+        let removedKeys = await removals.keys()
+        XCTAssertTrue(removedKeys.isEmpty)
+        let uploadCount = await transport.uploadCount()
+        XCTAssertEqual(uploadCount, 1)
     }
 
     func testDeferredImageRejectsOversizedCaptionBeforeAnyNetworkOrWrite() async throws {
@@ -3102,6 +3231,22 @@ private actor DetachedEchoTransport: SecureMessagingExchangeTransport {
         conversationId: String,
         request: MarkMessagingConversationReadRequest
     ) async throws -> MessagingReadReceiptDTO { try reject() }
+}
+
+private enum InjectedBlobCopyFailure: Error {
+    case failed
+}
+
+private actor BlobRemovalRecorder {
+    private var recordedKeys: [String] = []
+
+    func record(_ key: String) {
+        recordedKeys.append(key)
+    }
+
+    func keys() -> [String] {
+        recordedKeys
+    }
 }
 
 private actor DeferredImageCheckpointTransport: SecureMessagingExchangeTransport {

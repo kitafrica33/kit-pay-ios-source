@@ -303,6 +303,120 @@ private extension ClosedRange where Bound == CGFloat {
     var center: CGFloat { (lowerBound + upperBound) / 2 }
 }
 
+/// Shared geometry of the full-width audio call strip. `MinimizedCallView` draws the strip with
+/// this height below the top safe-area inset, and `RootView` reserves exactly the same amount as
+/// a top safe-area inset so app content is pushed below the strip instead of covered by it.
+enum CallBannerMetrics {
+    /// Height of the strip's content below the top safe-area inset.
+    static let contentHeight: CGFloat = 60
+}
+
+/// Which screen edge the minimized video tile is tucked behind.
+enum CallFloatingTuckEdge: Equatable {
+    case leading
+    case trailing
+}
+
+/// Free placement and edge-tuck geometry for the minimized in-app video tile.
+///
+/// Deliberately separate from `CallFloatingSurfaceLayoutPolicy`: those corner-snapping statics are
+/// pinned by `CallLifecycleTests` and continue to serve the in-call self-preview, while the
+/// minimized tile now rests wherever the user leaves it and can be tucked off either side edge.
+enum CallFloatingTilePlacementPolicy {
+    /// Clamping margin against the screen bounds on the sides and bottom.
+    static let screenMargin: CGFloat = 8
+    /// Interactive width of the tucked-tile handle (44pt minimum touch target).
+    static let tuckHandleWidth: CGFloat = 44
+    /// Width of the visible glass capsule inside the handle's interactive frame.
+    static let tuckHandleVisibleWidth: CGFloat = 30
+    static let tuckHandleHeight: CGFloat = 64
+    /// Horizontal projection (predicted end minus current translation) treated as a strong
+    /// outward flick near an edge.
+    static let tuckProjectionThreshold: CGFloat = 180
+    /// How close the projected tile must already be to an edge for a flick to tuck it.
+    static let tuckEdgeProximity: CGFloat = 24
+
+    /// Clamps a proposed resting origin to the screen with `screenMargin` on the sides and
+    /// bottom; the only top clearance is the status-bar safe-area inset.
+    static func clampedOrigin(
+        _ proposed: CGPoint,
+        surfaceSize: CGSize,
+        container: CGSize,
+        topInset: CGFloat
+    ) -> CGPoint {
+        let minimumX = screenMargin
+        let maximumX = max(minimumX, container.width - screenMargin - surfaceSize.width)
+        let minimumY = max(screenMargin, topInset)
+        let maximumY = max(minimumY, container.height - screenMargin - surfaceSize.height)
+        return CGPoint(
+            x: min(max(proposed.x, minimumX), maximumX),
+            y: min(max(proposed.y, minimumY), maximumY)
+        )
+    }
+
+    /// Whether a drag release should tuck the tile: its projected center has crossed a side edge,
+    /// or the flick is strongly outward while the tile is already hugging that edge.
+    static func tuckedEdge(
+        forProjectedOrigin projected: CGPoint,
+        surfaceSize: CGSize,
+        container: CGSize,
+        horizontalProjection: CGFloat
+    ) -> CallFloatingTuckEdge? {
+        let centerX = projected.x + surfaceSize.width / 2
+        if centerX <= 0 { return .leading }
+        if centerX >= container.width { return .trailing }
+        if horizontalProjection <= -tuckProjectionThreshold,
+           projected.x <= tuckEdgeProximity {
+            return .leading
+        }
+        if horizontalProjection >= tuckProjectionThreshold,
+           projected.x + surfaceSize.width >= container.width - tuckEdgeProximity {
+            return .trailing
+        }
+        return nil
+    }
+
+    /// Where the tile parks while tucked: fully off-screen at its last vertical position, so the
+    /// video view stays mounted and playing.
+    static func tuckedTileOrigin(
+        edge: CallFloatingTuckEdge,
+        surfaceSize: CGSize,
+        restingOrigin: CGPoint,
+        container: CGSize,
+        topInset: CGFloat
+    ) -> CGPoint {
+        let clamped = clampedOrigin(
+            restingOrigin,
+            surfaceSize: surfaceSize,
+            container: container,
+            topInset: topInset
+        )
+        let x: CGFloat = switch edge {
+        case .leading: -surfaceSize.width - screenMargin
+        case .trailing: container.width + screenMargin
+        }
+        return CGPoint(x: x, y: clamped.y)
+    }
+
+    /// Interactive frame of the restore handle, flush against the tucked edge, vertically at the
+    /// tile's last center and clamped on screen.
+    static func handleFrame(
+        edge: CallFloatingTuckEdge,
+        tileCenterY: CGFloat,
+        container: CGSize,
+        topInset: CGFloat
+    ) -> CGRect {
+        let minimumY = max(screenMargin, topInset)
+        let maximumY = max(minimumY, container.height - screenMargin - tuckHandleHeight)
+        let y = min(max(tileCenterY - tuckHandleHeight / 2, minimumY), maximumY)
+        let x: CGFloat = switch edge {
+        case .leading: 0
+        case .trailing: container.width - tuckHandleWidth
+        }
+        return CGRect(x: x, y: y, width: tuckHandleWidth, height: tuckHandleHeight)
+    }
+}
+
 enum CallControlsVisibilityPolicy {
     static let autoHideDelayNanoseconds: UInt64 = 4_000_000_000
 
@@ -1712,9 +1826,15 @@ struct MinimizedCallView: View {
     @ObservedObject private var media: LiveKitCallMediaTransport
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
-    @Binding private var corner: CallFloatingCorner
+    /// Free resting origin of the video tile (window coordinates); `nil` means the default
+    /// bottom-trailing parking spot. Owned by the presenter so it survives presentation changes.
+    @Binding private var position: CGPoint?
+    /// Which side edge the tile is tucked behind, or `nil` when fully on screen.
+    @Binding private var tuckedEdge: CallFloatingTuckEdge?
     @State private var dragTranslation: CGSize = .zero
     @State private var isDragging = false
+    /// VoiceOver's adjustable action still moves the tile between the well-known anchors.
+    @State private var accessibilityAnchor: CallFloatingCorner = .bottomTrailing
     let reopen: () -> Void
     /// Reports where the surface is drawn, in window coordinates, so the host window can forward
     /// only the touches that land on it and let everything else reach the app underneath.
@@ -1722,13 +1842,15 @@ struct MinimizedCallView: View {
 
     init(
         coordinator: CallMediaCoordinator,
-        corner: Binding<CallFloatingCorner>,
+        position: Binding<CGPoint?>,
+        tuckedEdge: Binding<CallFloatingTuckEdge?>,
         reopen: @escaping () -> Void,
         onSurfaceFrameChange: ((CGRect) -> Void)? = nil
     ) {
         _coordinator = ObservedObject(wrappedValue: coordinator)
         _media = ObservedObject(wrappedValue: coordinator.media)
-        _corner = corner
+        _position = position
+        _tuckedEdge = tuckedEdge
         self.reopen = reopen
         self.onSurfaceFrameChange = onSurfaceFrameChange
     }
@@ -1759,67 +1881,162 @@ struct MinimizedCallView: View {
         in geometry: GeometryProxy
     ) -> some View {
         let insets = CallFloatingInsets(geometry.safeAreaInsets)
-        let isVideo = true
+        let container = geometry.size
+        // The overlay window ignores safe areas, so the status-bar clearance is read from the
+        // window rather than from this (zeroed) geometry.
+        let topInset = max(insets.top, Self.windowTopSafeAreaInset())
         let surfaceSize = CallFloatingSurfaceLayoutPolicy.minimizedSurfaceSize(
-            container: geometry.size,
-            isVideo: isVideo
+            container: container,
+            isVideo: true
         )
-                let restingOrigin = CallFloatingSurfaceLayoutPolicy.origin(
-                    for: corner,
-                    surfaceSize: surfaceSize,
-                    container: geometry.size,
-                    insets: insets,
-                    bottomClearance: CallFloatingSurfaceLayoutPolicy.rootMenuClearance
-                )
-                let displayedOrigin = CallFloatingSurfaceLayoutPolicy.rubberBandedOrigin(
-                    CGPoint(
-                        x: restingOrigin.x + dragTranslation.width,
-                        y: restingOrigin.y + dragTranslation.height
-                    ),
-                    surfaceSize: surfaceSize,
-                    container: geometry.size,
-                    insets: insets,
-                    bottomClearance: CallFloatingSurfaceLayoutPolicy.rootMenuClearance
-                )
+        let defaultOrigin = CallFloatingSurfaceLayoutPolicy.origin(
+            for: .bottomTrailing,
+            surfaceSize: surfaceSize,
+            container: container,
+            insets: insets,
+            bottomClearance: CallFloatingSurfaceLayoutPolicy.rootMenuClearance
+        )
+        // Free placement: the tile rests wherever the user left it, re-clamped for the current
+        // screen so rotations and size changes cannot strand it off screen.
+        let restingOrigin = CallFloatingTilePlacementPolicy.clampedOrigin(
+            position ?? defaultOrigin,
+            surfaceSize: surfaceSize,
+            container: container,
+            topInset: topInset
+        )
+        let baseOrigin = tuckedEdge.map { edge in
+            CallFloatingTilePlacementPolicy.tuckedTileOrigin(
+                edge: edge,
+                surfaceSize: surfaceSize,
+                restingOrigin: restingOrigin,
+                container: container,
+                topInset: topInset
+            )
+        } ?? restingOrigin
+        // The tile follows the finger exactly — including past the side edges, so a tuck reads as
+        // pushing it off the screen. Release clamps back on screen or tucks.
+        let displayedOrigin = CGPoint(
+            x: baseOrigin.x + dragTranslation.width,
+            y: baseOrigin.y + dragTranslation.height
+        )
+        let globalOrigin = geometry.frame(in: .global).origin
+        let tileWindowFrame = CGRect(
+            origin: CGPoint(
+                x: displayedOrigin.x + globalOrigin.x,
+                y: displayedOrigin.y + globalOrigin.y
+            ),
+            size: surfaceSize
+        )
+        let handleFrame = tuckedEdge.map { edge in
+            CallFloatingTilePlacementPolicy.handleFrame(
+                edge: edge,
+                tileCenterY: restingOrigin.y + surfaceSize.height / 2,
+                container: container,
+                topInset: topInset
+            )
+        }
+        // While tucked, the pass-through window must forward exactly the handle's touches and
+        // nothing else; the off-screen tile stays mounted so the video keeps playing.
+        let interactiveWindowFrame = handleFrame?
+            .offsetBy(dx: globalOrigin.x, dy: globalOrigin.y)
+            ?? tileWindowFrame
 
-                let windowFrame = CGRect(
-                    origin: CGPoint(
-                        x: displayedOrigin.x + geometry.frame(in: .global).minX,
-                        y: displayedOrigin.y + geometry.frame(in: .global).minY
-                    ),
-                    size: surfaceSize
-                )
-
-                minimizedSurface(
-                    for: call,
-                    size: surfaceSize,
-                    isVideo: isVideo,
-                    dragGesture: minimizedDragGesture(
+        ZStack(alignment: .topLeading) {
+            minimizedSurface(for: call, size: surfaceSize)
+                .frame(width: surfaceSize.width, height: surfaceSize.height)
+                .scaleEffect(isDragging && !reduceMotion ? 1.025 : 1)
+                .contentShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+                .highPriorityGesture(
+                    minimizedDragGesture(
                         restingOrigin: restingOrigin,
                         surfaceSize: surfaceSize,
-                        container: geometry.size,
-                        insets: insets
+                        container: container,
+                        topInset: topInset
                     )
                 )
-                    .frame(width: surfaceSize.width, height: surfaceSize.height)
-                    .scaleEffect(isDragging && !reduceMotion ? 1.025 : 1)
-                    .position(
-                        x: displayedOrigin.x + surfaceSize.width / 2,
-                        y: displayedOrigin.y + surfaceSize.height / 2
+                .position(
+                    x: displayedOrigin.x + surfaceSize.width / 2,
+                    y: displayedOrigin.y + surfaceSize.height / 2
+                )
+                .allowsHitTesting(tuckedEdge == nil)
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("Active call with \(call.participantName)")
+                .accessibilityValue(compactStatus(for: call))
+                .accessibilityAdjustableAction { direction in
+                    moveAnchor(
+                        direction,
+                        surfaceSize: surfaceSize,
+                        container: container,
+                        insets: insets
                     )
-                    .contentShape(RoundedRectangle(cornerRadius: isVideo ? 24 : 36))
-                    .onAppear { onSurfaceFrameChange?(windowFrame) }
-                    .onChange(of: windowFrame) { _, frame in onSurfaceFrameChange?(frame) }
-                    .accessibilityElement(children: .contain)
-                    .accessibilityLabel("Active call with \(call.participantName)")
-                    .accessibilityValue(compactStatus(for: call))
-                    .accessibilityAdjustableAction { direction in
-                        moveAnchor(direction)
+                }
+                .accessibilityHidden(tuckedEdge != nil)
+
+            if let edge = tuckedEdge, let handleFrame {
+                tuckHandle(edge: edge, for: call)
+                    .frame(width: handleFrame.width, height: handleFrame.height)
+                    .position(x: handleFrame.midX, y: handleFrame.midY)
+                    .transition(.opacity)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .onAppear { onSurfaceFrameChange?(interactiveWindowFrame) }
+        .onChange(of: interactiveWindowFrame) { _, frame in onSurfaceFrameChange?(frame) }
+        .onDisappear {
+            dragTranslation = .zero
+            isDragging = false
+        }
+    }
+
+    /// The restore handle left on screen while the tile is tucked: a glass capsule hugging the
+    /// edge with a chevron pointing the way the tile will return. The interactive frame is
+    /// 44pt wide even though only 30pt are drawn.
+    private func tuckHandle(
+        edge: CallFloatingTuckEdge,
+        for call: ActiveCallPresentation
+    ) -> some View {
+        Button {
+            UISelectionFeedbackGenerator().selectionChanged()
+            withAnimation(reduceMotion ? nil : .spring(duration: 0.32, bounce: 0.12)) {
+                tuckedEdge = nil
+            }
+        } label: {
+            let radii = edge == .leading
+                ? RectangleCornerRadii(bottomTrailing: 16, topTrailing: 16)
+                : RectangleCornerRadii(topLeading: 16, bottomLeading: 16)
+            let shape = UnevenRoundedRectangle(cornerRadii: radii, style: .continuous)
+            ZStack {
+                ZStack {
+                    if reduceTransparency {
+                        shape.fill(Color(UIColor.secondarySystemBackground))
+                    } else {
+                        shape.fill(.regularMaterial)
+                        shape.fill(KitColor.green.opacity(0.10))
                     }
-                    .onDisappear {
-                        dragTranslation = .zero
-                        isDragging = false
-                    }
+                }
+                .overlay {
+                    shape
+                        .strokeBorder(.white.opacity(0.38), lineWidth: 0.8)
+                        .allowsHitTesting(false)
+                }
+                .shadow(color: .black.opacity(0.22), radius: 9, y: 4)
+
+                Image(systemName: edge == .leading ? "chevron.right" : "chevron.left")
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundStyle(KitColor.primaryText)
+            }
+            .frame(width: CallFloatingTilePlacementPolicy.tuckHandleVisibleWidth)
+            .frame(
+                maxWidth: .infinity,
+                maxHeight: .infinity,
+                alignment: edge == .leading ? .leading : .trailing
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Show call video")
+        .accessibilityValue("Call with \(call.participantName)")
+        .accessibilityHint("Brings the minimized call video back on screen")
     }
 
     /// Full-width in-app call strip for audio calls: static, integrated with the status area and
@@ -1829,7 +2046,7 @@ struct MinimizedCallView: View {
         in geometry: GeometryProxy
     ) -> some View {
         let topInset = Self.windowTopSafeAreaInset()
-        let barContentHeight: CGFloat = 60
+        let barContentHeight = CallBannerMetrics.contentHeight
         let barFrame = CGRect(
             x: geometry.frame(in: .global).minX,
             y: geometry.frame(in: .global).minY,
@@ -1948,7 +2165,7 @@ struct MinimizedCallView: View {
         restingOrigin: CGPoint,
         surfaceSize: CGSize,
         container: CGSize,
-        insets: CallFloatingInsets
+        topInset: CGFloat
     ) -> AnyGesture<DragGesture.Value> {
         AnyGesture(
             DragGesture(minimumDistance: 8, coordinateSpace: .global)
@@ -1961,53 +2178,90 @@ struct MinimizedCallView: View {
                 dragTranslation = value.translation
             }
             .onEnded { value in
-                let proposed = CallFloatingSurfaceLayoutPolicy.projectedOrigin(
+                // Gentle momentum: the same capped projection as before, but the tile now settles
+                // wherever the projection lands (clamped to the screen) instead of snapping to
+                // the nearest corner — unless the release pushes it off a side edge, which tucks.
+                let projected = CallFloatingSurfaceLayoutPolicy.projectedOrigin(
                     restingOrigin: restingOrigin,
                     translation: value.translation,
                     predictedEndTranslation: value.predictedEndTranslation
-                )
-                let nextCorner = CallFloatingSurfaceLayoutPolicy.nearestCorner(
-                    to: proposed,
-                    surfaceSize: surfaceSize,
-                    container: container,
-                    insets: insets,
-                    bottomClearance: CallFloatingSurfaceLayoutPolicy.rootMenuClearance
                 )
                 let rawReleaseOrigin = CGPoint(
                     x: restingOrigin.x + value.translation.width,
                     y: restingOrigin.y + value.translation.height
                 )
-                let targetOrigin = CallFloatingSurfaceLayoutPolicy.origin(
-                    for: nextCorner,
+                let horizontalProjection =
+                    value.predictedEndTranslation.width - value.translation.width
+                if let edge = CallFloatingTilePlacementPolicy.tuckedEdge(
+                    forProjectedOrigin: projected,
                     surfaceSize: surfaceSize,
                     container: container,
-                    insets: insets,
-                    bottomClearance: CallFloatingSurfaceLayoutPolicy.rootMenuClearance
-                )
-                let previousCorner = corner
-                var transaction = Transaction(animation: nil)
-                transaction.disablesAnimations = true
-                withTransaction(transaction) {
-                    corner = nextCorner
-                    dragTranslation = CGSize(
-                        width: rawReleaseOrigin.x - targetOrigin.x,
-                        height: rawReleaseOrigin.y - targetOrigin.y
+                    horizontalProjection: horizontalProjection
+                ) {
+                    // Remember the on-screen spot the tile left from, so the handle restores it.
+                    let preTuckOrigin = CallFloatingTilePlacementPolicy.clampedOrigin(
+                        rawReleaseOrigin,
+                        surfaceSize: surfaceSize,
+                        container: container,
+                        topInset: topInset
                     )
-                }
-                if previousCorner != nextCorner {
-                    UISelectionFeedbackGenerator().selectionChanged()
-                }
-                withAnimation(reduceMotion ? nil : .spring(duration: 0.28, bounce: 0)) {
-                    dragTranslation = .zero
-                    isDragging = false
+                    let tuckOrigin = CallFloatingTilePlacementPolicy.tuckedTileOrigin(
+                        edge: edge,
+                        surfaceSize: surfaceSize,
+                        restingOrigin: preTuckOrigin,
+                        container: container,
+                        topInset: topInset
+                    )
+                    var transaction = Transaction(animation: nil)
+                    transaction.disablesAnimations = true
+                    withTransaction(transaction) {
+                        position = preTuckOrigin
+                        tuckedEdge = edge
+                        dragTranslation = CGSize(
+                            width: rawReleaseOrigin.x - tuckOrigin.x,
+                            height: rawReleaseOrigin.y - tuckOrigin.y
+                        )
+                    }
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    withAnimation(reduceMotion ? nil : .spring(duration: 0.3, bounce: 0)) {
+                        dragTranslation = .zero
+                        isDragging = false
+                    }
+                } else {
+                    let targetOrigin = CallFloatingTilePlacementPolicy.clampedOrigin(
+                        projected,
+                        surfaceSize: surfaceSize,
+                        container: container,
+                        topInset: topInset
+                    )
+                    var transaction = Transaction(animation: nil)
+                    transaction.disablesAnimations = true
+                    withTransaction(transaction) {
+                        position = targetOrigin
+                        dragTranslation = CGSize(
+                            width: rawReleaseOrigin.x - targetOrigin.x,
+                            height: rawReleaseOrigin.y - targetOrigin.y
+                        )
+                    }
+                    withAnimation(reduceMotion ? nil : .spring(duration: 0.28, bounce: 0)) {
+                        dragTranslation = .zero
+                        isDragging = false
+                    }
                 }
             }
         )
     }
 
-    private func moveAnchor(_ direction: AccessibilityAdjustmentDirection) {
+    /// VoiceOver's adjustable action keeps a deterministic tour of the well-known anchors, writing
+    /// each anchor's origin into the free-placement position (and un-tucking first).
+    private func moveAnchor(
+        _ direction: AccessibilityAdjustmentDirection,
+        surfaceSize: CGSize,
+        container: CGSize,
+        insets: CallFloatingInsets
+    ) {
         let anchors = CallFloatingCorner.allCases
-        guard let index = anchors.firstIndex(of: corner) else { return }
+        guard let index = anchors.firstIndex(of: accessibilityAnchor) else { return }
         let delta: Int
         switch direction {
         case .increment: delta = 1
@@ -2015,21 +2269,26 @@ struct MinimizedCallView: View {
         @unknown default: return
         }
         let next = anchors[(index + delta + anchors.count) % anchors.count]
+        let origin = CallFloatingSurfaceLayoutPolicy.origin(
+            for: next,
+            surfaceSize: surfaceSize,
+            container: container,
+            insets: insets,
+            bottomClearance: CallFloatingSurfaceLayoutPolicy.rootMenuClearance
+        )
         withAnimation(reduceMotion ? nil : .spring(duration: 0.28, bounce: 0)) {
-            corner = next
+            accessibilityAnchor = next
+            tuckedEdge = nil
+            position = origin
             dragTranslation = .zero
         }
         UISelectionFeedbackGenerator().selectionChanged()
     }
 
-    @ViewBuilder
     private func minimizedSurface(
         for call: ActiveCallPresentation,
-        size: CGSize,
-        isVideo: Bool,
-        dragGesture: AnyGesture<DragGesture.Value>
+        size: CGSize
     ) -> some View {
-        if isVideo {
             Button(action: reopen) {
                 ZStack(alignment: .bottomLeading) {
                     minimizedVideo(for: call, size: size)
@@ -2069,10 +2328,8 @@ struct MinimizedCallView: View {
                 .shadow(color: .black.opacity(0.34), radius: 18, y: 9)
             }
             .buttonStyle(.plain)
-            .highPriorityGesture(dragGesture)
             .accessibilityLabel("Return to call with \(call.participantName)")
             .accessibilityValue(compactStatus(for: call))
-        }
     }
 
     private func isVideoPresentation(for call: ActiveCallPresentation) -> Bool {
@@ -2416,10 +2673,12 @@ private struct DraggableLocalVideoPreview: View {
                 radius: isLifted ? 21 : 16,
                 y: isLifted ? 12 : 9
             )
-            .position(
-                x: displayedOrigin.x + surfaceSize.width / 2,
-                y: displayedOrigin.y + surfaceSize.height / 2
-            )
+            // The hit-test shape and the drag gesture must attach to the tile itself, BEFORE
+            // `.position` expands the layout to the full screen. Applied after `.position`, the
+            // content shape turned the entire call screen into this preview's hit region at
+            // `zIndex(4)` — above the controls panel — so the moment the camera came on (an
+            // audio→video escalation) every tap on Mute/Speaker/Video/More and on the
+            // tap-to-reveal backdrop was silently swallowed.
             .contentShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
             .simultaneousGesture(
                 DragGesture(minimumDistance: 8, coordinateSpace: .global)
@@ -2480,6 +2739,10 @@ private struct DraggableLocalVideoPreview: View {
                         }
                         finishDragInteractionAfterSettle()
                     }
+            )
+            .position(
+                x: displayedOrigin.x + surfaceSize.width / 2,
+                y: displayedOrigin.y + surfaceSize.height / 2
             )
             .animation(
                 reduceMotion ? nil : .spring(duration: 0.28, bounce: 0),

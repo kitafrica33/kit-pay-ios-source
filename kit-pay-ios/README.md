@@ -14,8 +14,11 @@ and Apple Liquid Glass.
   sync, progress reporting, regional phone matching, Kit Pay contacts first, and invites last.
 - Didit hosted identity collection. Final KYC approval remains controlled by backend compliance.
 - Encrypted offline projections, conversation drafts, and outbox state for wallet, messaging, and calls.
-- Voice notes, videos, video notes, and documents up to 10 MiB for compatible iPhone recipients,
-  plus pinned/muted chat filters, multi-select, and local deletion.
+- Voice notes, videos, video notes, and documents up to 200 MiB for compatible iPhone recipients,
+  plus pinned/muted chat filters, multi-select, message forwarding, per-chat search across text,
+  captions, and document names, and local deletion. Every message kind queues offline-first: it
+  commits locally in an instant bubble (large media parks in the encrypted file cache) and the
+  durable outbox uploads, encrypts, and delivers when connectivity returns.
 - Client support for encrypted iCloud chat backup and restore. Message content and included inline
   media are sealed with ChaChaPoly before upload and the key is stored in the user's synchronizable
   Keychain; the private CloudKit record still exposes operational metadata including its
@@ -44,9 +47,15 @@ and Apple Liquid Glass.
   authorization, webhook, settlement, reconciliation, and compliance controls.
 - APNs/PushKit server support is implemented on backend PR 18, but production credentials and
   deployment are separate operational steps.
-- Rich voice/video/document media is limited to 10 MiB and requires the server's bounded
+- Rich voice/video/document media is limited to 200 MiB and requires the server's bounded
   `kit-media-v1` capability plus an all-iOS recipient roster at version 0.2.5 build 16 or later.
-  Android and older iOS devices remain image-only; unknown types fail closed.
+  The capability handshake pins the advertised byte bounds exactly, so the backend must declare
+  `maximum_plaintext_bytes` 209715200 and `maximum_ciphertext_bytes` 209715264. Android and older
+  iOS devices remain image-only; unknown types fail closed. Caveat: the attachment cipher and the
+  multipart transport currently materialize their buffers in memory, so a transfer near the cap
+  briefly costs a low multiple of its size in RAM — acceptable on recent iPhones, but streaming
+  encrypt/upload/download is the follow-up required before the cap can be considered robust on
+  older, memory-constrained devices.
 - iCloud chat backups require the `iCloud.africa.kit.pay.ios` CloudKit container to be
   provisioned in the Apple Developer portal, an App Store profile authorizing the signed CloudKit
   entitlements, and the `KitMessageBackup` record type deployed to the production schema. Release

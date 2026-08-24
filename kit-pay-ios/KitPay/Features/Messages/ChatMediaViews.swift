@@ -205,15 +205,26 @@ private final class SecureMediaLoader: ObservableObject {
 struct SecureMediaMessageView: View {
     let message: LocalMessage
     let descriptor: KitMediaMessageDescriptor
+    /// When set, photo/video taps open the shared conversation gallery instead of the
+    /// standalone single-item viewers.
+    var openGallery: ((UUID) -> Void)? = nil
 
     var body: some View {
         switch KitChatMediaKind(mediaType: descriptor.mediaType) {
         case .image:
-            SecureImageMessageView(message: message, descriptor: descriptor)
+            SecureImageMessageView(
+                message: message,
+                descriptor: descriptor,
+                openGallery: openGallery
+            )
         case .voice:
             VoiceNoteBubbleView(message: message, descriptor: descriptor)
         case .video:
-            VideoMessageBubbleView(message: message, descriptor: descriptor)
+            VideoMessageBubbleView(
+                message: message,
+                descriptor: descriptor,
+                openGallery: openGallery
+            )
         case .document:
             DocumentMessageBubbleView(message: message, descriptor: descriptor)
         }
@@ -223,15 +234,25 @@ struct SecureMediaMessageView: View {
 /// Renders media that is durably queued locally but does not have an uploaded descriptor yet.
 /// Pending rows must use the attachment MIME type rather than assuming every queued blob is a photo.
 struct PendingSecureMediaMessageView: View {
+    @EnvironmentObject private var model: AppModel
     let message: LocalMessage
     let attachment: LocalPendingAttachment
+    /// Plaintext for large media parked in the encrypted file cache instead of inline.
+    @State private var parkedData: Data?
 
     private var kind: KitChatMediaKind {
         KitChatMediaKind(mediaType: attachment.mediaType)
     }
 
+    private var mediaData: Data? {
+        message.attachmentData ?? parkedData
+    }
+
     private var sizeLabel: String? {
-        message.attachmentData.map { ChatMediaBytes.label($0.count) }
+        if let byteCount = mediaData?.count ?? attachment.byteCount {
+            return ChatMediaBytes.label(byteCount)
+        }
+        return nil
     }
 
     private var title: String {
@@ -241,10 +262,19 @@ struct PendingSecureMediaMessageView: View {
         return "\(kind.previewLabel) queued"
     }
 
-    @ViewBuilder
     var body: some View {
+        pendingContent
+            .task(id: message.id) {
+                guard mediaData == nil, kind == .image,
+                      attachment.localStorageKey != nil else { return }
+                parkedData = await model.loadPendingMedia(for: message)
+            }
+    }
+
+    @ViewBuilder
+    private var pendingContent: some View {
         if kind == .image,
-           let data = message.attachmentData,
+           let data = mediaData,
            let image = UIImage(data: data) {
             Image(uiImage: image)
                 .resizable()
@@ -292,6 +322,7 @@ struct SecureImageMessageView: View {
     @EnvironmentObject private var model: AppModel
     let message: LocalMessage
     let descriptor: KitMediaMessageDescriptor
+    var openGallery: ((UUID) -> Void)? = nil
     @StateObject private var loader = SecureMediaLoader()
     @State private var retryGeneration = 0
     @State private var showsViewer = false
@@ -309,7 +340,13 @@ struct SecureImageMessageView: View {
                     .frame(maxWidth: 248, maxHeight: 300)
                     .clipShape(RoundedRectangle(cornerRadius: 17, style: .continuous))
                     .contentShape(RoundedRectangle(cornerRadius: 17, style: .continuous))
-                    .onTapGesture { showsViewer = true }
+                    .onTapGesture {
+                        if let openGallery {
+                            openGallery(message.id)
+                        } else {
+                            showsViewer = true
+                        }
+                    }
             } else {
                 Button { retryGeneration &+= 1 } label: {
                     mediaPlaceholder(
@@ -507,13 +544,16 @@ struct VideoMessageBubbleView: View {
     @EnvironmentObject private var model: AppModel
     let message: LocalMessage
     let descriptor: KitMediaMessageDescriptor
+    var openGallery: ((UUID) -> Void)? = nil
     @StateObject private var loader = SecureMediaLoader()
     @State private var poster: UIImage?
     @State private var playbackURL: URL?
 
     var body: some View {
         Button {
-            if let data = loader.data ?? message.attachmentData {
+            if let openGallery {
+                openGallery(message.id)
+            } else if let data = loader.data ?? message.attachmentData {
                 present(data: data)
             } else {
                 Task { await load() }
@@ -725,15 +765,20 @@ struct DocumentMessageBubbleView: View {
         .disabled(loader.isLoading)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("End-to-end encrypted document, \(fileName)")
-        .sheet(
+        .fullScreenCover(
             isPresented: Binding(
                 get: { previewURL != nil },
                 set: { if !$0 { closePreview() } }
             )
         ) {
             if let previewURL {
-                DocumentQuickLookView(fileURL: previewURL)
-                    .ignoresSafeArea()
+                KitDocumentViewerView(
+                    fileURL: previewURL,
+                    displayName: fileName,
+                    mediaType: descriptor.mediaType,
+                    byteCount: descriptor.plaintextByteSize,
+                    onClose: { closePreview() }
+                )
             }
         }
     }

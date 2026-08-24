@@ -5,9 +5,9 @@ on:
   workflow_dispatch:
     inputs:
       marketing_version:
-        description: CFBundleShortVersionString (for example 0.2.5)
+        description: CFBundleShortVersionString (for example 0.2.6)
         required: true
-        default: 0.2.5
+        default: 0.2.6
         type: string
       build_number:
         description: Monotonically increasing integer CFBundleVersion

@@ -2337,6 +2337,12 @@ struct LocalMessage: Codable, Hashable, Identifiable {
 struct LocalPendingAttachment: Codable, Hashable, Sendable {
     let mediaType: String
     let caption: String?
+    /// Locally minted storage key of a large plaintext parked in the encrypted media file cache
+    /// while the message waits offline for upload. Inline attachments leave this nil. Optional
+    /// keeps state written by earlier builds decodable.
+    var localStorageKey: String? = nil
+    /// Plaintext size for pending bubbles that carry no inline data. Optional for old state.
+    var byteCount: Int? = nil
 }
 
 struct Conversation: Codable, Hashable, Identifiable {

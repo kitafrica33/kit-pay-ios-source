@@ -8,6 +8,13 @@ struct KitPayApp: App {
     @StateObject private var callMedia = CallMediaCoordinator.shared
     @State private var isCallPresented = false
 
+    init() {
+        // Camera/editor outputs are plaintext only while being reviewed or staged. A crash can
+        // bypass their normal owner cleanup, so retire those narrowly prefixed scratch folders
+        // before any new capture session can reuse the process.
+        KitCaptureTemporaryFileStore.removeAbandonedFiles()
+    }
+
     /// The floating call surface lives in its own window rather than a `RootView` overlay, so it
     /// stays on screen above sheets, full-screen covers, and every tab, and so Picture in Picture
     /// has a stable source view to hand off from when the user leaves Kit Pay.
@@ -52,10 +59,12 @@ struct KitPayApp: App {
                         isCallPresented = false
                     } else if !model.communicationSurfacesConcealed,
                               previous == nil || previous?.id != current?.id {
-                        // A video call parks where a picture-in-picture window belongs; an audio
-                        // call parks along the top edge, where a call banner is expected.
-                        CallOverlayWindowController.shared.presenter.corner =
-                            current?.video == true ? .bottomTrailing : .topCenter
+                        // A new call's minimized video tile starts from its default parking spot
+                        // (bottom trailing), fully on screen; the audio strip is always static
+                        // along the top edge.
+                        let presenter = CallOverlayWindowController.shared.presenter
+                        presenter.videoTilePosition = nil
+                        presenter.videoTileTuckedEdge = nil
                         isCallPresented = true
                     }
                     syncMinimizedCallSurface()
@@ -70,7 +79,19 @@ struct KitPayApp: App {
                     if phase == .active {
                         Task { await model.requestContactsPermissionAtLaunch() }
                         Task { await model.applicationDidBecomeActiveSecurely() }
+                        // A transient `.inactive` (Control Center, system alert) may have
+                        // started Picture in Picture; the app is visibly foreground again, so
+                        // hand the video back to the in-app surfaces.
+                        CallOverlayWindowController.shared
+                            .stopPictureInPictureForForegroundIfNeeded()
                         syncMinimizedCallSurface()
+                    } else if phase == .inactive {
+                        // The foreground→background transition point: the last moment iOS allows
+                        // a programmatic Picture in Picture start, so an ongoing video call keeps
+                        // showing after the user leaves the app. No-op for audio calls, when
+                        // Picture in Picture is impossible, or when it is already running.
+                        CallOverlayWindowController.shared
+                            .startPictureInPictureForBackgroundingIfNeeded()
                     } else if phase == .background {
                         model.applicationDidEnterBackgroundSecurely()
                         ContactBackgroundRefreshScheduler.shared.schedule()
