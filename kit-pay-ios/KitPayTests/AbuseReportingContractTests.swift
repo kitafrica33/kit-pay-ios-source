@@ -43,7 +43,7 @@ final class AbuseReportingContractTests: XCTestCase {
         )
     }
 
-    func testContextRequiresCanonicalTwoPartyConversation() throws {
+    func testContextRequiresCanonicalConversationMembership() throws {
         let valid = try XCTUnwrap(context())
         XCTAssertEqual(valid.reportedUserID, reportedUserID)
         XCTAssertEqual(valid.conversationID, conversationID)
@@ -60,6 +60,40 @@ final class AbuseReportingContractTests: XCTestCase {
                 currentUserID: currentUserID,
                 reportedUserID: reportedUserID,
                 conversation: conversation(participants: [currentUserID, reportedUserID, reportID])
+            )
+        )
+
+        let group = try XCTUnwrap(
+            AbuseReportContext(
+                currentUserID: currentUserID,
+                reportedUserID: reportedUserID,
+                conversation: conversation(
+                    participants: [currentUserID, reportedUserID, reportID],
+                    type: "group"
+                )
+            )
+        )
+        XCTAssertEqual(group.reportedUserID, reportedUserID)
+        XCTAssertEqual(group.conversationID, conversationID)
+
+        XCTAssertNil(
+            AbuseReportContext(
+                currentUserID: currentUserID,
+                reportedUserID: reportedUserID,
+                conversation: conversation(
+                    participants: [currentUserID, reportID],
+                    type: "group"
+                )
+            )
+        )
+        XCTAssertNil(
+            AbuseReportContext(
+                currentUserID: currentUserID,
+                reportedUserID: reportedUserID,
+                conversation: conversation(
+                    participants: [currentUserID, reportedUserID, reportedUserID],
+                    type: "group"
+                )
             )
         )
         XCTAssertNil(
@@ -347,6 +381,36 @@ final class AbuseReportingContractTests: XCTestCase {
 
         let otherSender = localMessage(id: messageID, body: "Wrong sender", senderID: reportID)
         XCTAssertNil(AbuseReportTarget.message(otherSender, context: context))
+    }
+
+    func testGroupReportBindsToSelectedSenderAndExcludesOtherMembersPlaintext() throws {
+        let context = try XCTUnwrap(
+            AbuseReportContext(
+                currentUserID: currentUserID,
+                reportedUserID: reportedUserID,
+                conversation: conversation(
+                    participants: [currentUserID, reportedUserID, reportID],
+                    type: "group"
+                )
+            )
+        )
+        let target = localMessage(id: messageID, body: "Reported group message")
+        let otherMember = localMessage(
+            id: "40000000-0000-4000-8000-000000000002",
+            body: "Another member's private context",
+            senderID: reportID
+        )
+
+        XCTAssertEqual(AbuseReportTarget.message(target, context: context), .message(messageID))
+        XCTAssertNil(AbuseReportTarget.message(otherMember, context: context))
+        XCTAssertEqual(
+            AbuseReportMessageSelectionPolicy.candidates(
+                from: [target, otherMember],
+                context: context,
+                targetMessageID: messageID
+            ).map(\.id),
+            [messageID]
+        )
     }
 
     func testReceiptStrictlyValidatesShapeAndConfirmsRequest() throws {
@@ -731,13 +795,17 @@ final class AbuseReportingContractTests: XCTestCase {
         XCTAssertEqual(memory.count, 0)
     }
 
-    private func conversation(participants: [String]? = nil) -> Conversation {
+    private func conversation(
+        participants: [String]? = nil,
+        type: String? = nil
+    ) -> Conversation {
         Conversation(
             id: conversationID,
             title: "Amina",
             participantUserIds: participants ?? [currentUserID, reportedUserID],
             unreadCount: 0,
-            updatedAt: Date(timeIntervalSince1970: 1_777_000_000)
+            updatedAt: Date(timeIntervalSince1970: 1_777_000_000),
+            conversationType: type
         )
     }
 

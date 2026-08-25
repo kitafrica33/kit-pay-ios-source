@@ -204,11 +204,38 @@ final class ContactSyncTests: XCTestCase {
         // render at rather than being a larger number shrunk by a factor, which had left the
         // icons and captions smaller than the ones iOS draws in its own tab bar.
         XCTAssertEqual(RootTabBarLayoutPolicy.visualScale, 1.0, accuracy: 0.0001)
-        XCTAssertEqual(RootTabBarLayoutPolicy.iconPointSize, 21, accuracy: 0.0001)
+        XCTAssertEqual(RootTabBarLayoutPolicy.iconPointSize, 23, accuracy: 0.0001)
         XCTAssertEqual(RootTabBarLayoutPolicy.captionPointSize, 11, accuracy: 0.0001)
         XCTAssertGreaterThan(
             RootTabBarLayoutPolicy.iconPointSize,
             RootTabBarLayoutPolicy.captionPointSize
+        )
+
+        // The icon is what people aim at, so the button is sized around it rather than carrying
+        // dead height: a floating capsule reads better shorter than a docked bar, and the row is
+        // still a comfortable target.
+        XCTAssertEqual(RootTabBarLayoutPolicy.baseButtonHeight, 50, accuracy: 0.0001)
+        XCTAssertGreaterThan(
+            RootTabBarLayoutPolicy.baseButtonHeight,
+            RootTabBarLayoutPolicy.iconPointSize + RootTabBarLayoutPolicy.captionPointSize
+        )
+
+        // The capsule floats: it is inset from both screen edges and from the buttons inside it,
+        // and its assumed height is derived from those insets rather than guessed separately —
+        // a stale guess made the very first frame of every page scroll under the menu.
+        XCTAssertGreaterThan(RootTabBarLayoutPolicy.capsuleInset, 0)
+        XCTAssertGreaterThan(RootTabBarLayoutPolicy.interButtonSpacing, 0)
+        XCTAssertGreaterThan(
+            RootTabBarLayoutPolicy.regularHorizontalInset,
+            RootTabBarLayoutPolicy.compactHorizontalInset
+        )
+        XCTAssertGreaterThan(RootTabBarLayoutPolicy.compactHorizontalInset, 0)
+        XCTAssertEqual(
+            RootTabBarLayoutPolicy.estimatedBarHeight,
+            RootTabBarLayoutPolicy.baseButtonHeight
+                + (RootTabBarLayoutPolicy.capsuleInset * 2)
+                + RootTabBarLayoutPolicy.barTopPadding,
+            accuracy: 0.0001
         )
         XCTAssertGreaterThanOrEqual(
             RootTabBarLayoutPolicy.buttonMinimumHeight(accessibilitySize: false),
@@ -236,6 +263,78 @@ final class ContactSyncTests: XCTestCase {
             RootTabBarLayoutPolicy.verticalDrop,
             RootTabBarLayoutPolicy.buttonMinimumHeight(accessibilitySize: false)
         )
+    }
+
+    func testSlidingAcrossTheMenuOnlySwitchesPageOnRelease() {
+        let width: CGFloat = 320
+        let tabs = 4
+        let horizontal = CGSize(width: 90, height: 6)
+
+        // Mid-slide the menu shows where the finger is, while the selection — and so the page —
+        // is still the one the customer started on. Switching under the finger meant every tab
+        // crossed on the way to the intended one was loaded and thrown away again.
+        let underFinger = RootTabBarSlidePolicy.tabIndex(atX: 250, stripWidth: width, count: tabs)
+        XCTAssertEqual(underFinger, 3)
+        XCTAssertEqual(
+            RootTabBarSlidePolicy.highlightedIndex(selection: 0, slidingTo: underFinger),
+            3
+        )
+
+        // The release is what commits it.
+        XCTAssertEqual(
+            RootTabBarSlidePolicy.committedTabIndex(
+                translation: horizontal,
+                x: 250,
+                stripWidth: width,
+                count: tabs
+            ),
+            3
+        )
+
+        // With no finger down the menu simply shows the selection.
+        XCTAssertEqual(
+            RootTabBarSlidePolicy.highlightedIndex(selection: 2, slidingTo: nil),
+            2
+        )
+    }
+
+    func testReachingPastTheMenuIsNotASlide() {
+        // Someone swiping up over the capsule to get at the page behind it must not be treated as
+        // choosing a tab, however far across the row the finger happens to be.
+        let vertical = CGSize(width: 12, height: -140)
+        XCTAssertFalse(RootTabBarSlidePolicy.isSlide(translation: vertical))
+        XCTAssertNil(
+            RootTabBarSlidePolicy.committedTabIndex(
+                translation: vertical,
+                x: 250,
+                stripWidth: 320,
+                count: 4
+            )
+        )
+        XCTAssertTrue(
+            RootTabBarSlidePolicy.isSlide(translation: CGSize(width: 90, height: 6))
+        )
+        XCTAssertGreaterThan(RootTabBarSlidePolicy.activationDistance, 0)
+    }
+
+    func testAFingerRunningOffTheEndOfTheMenuStillPointsAtTheLastTab() {
+        XCTAssertEqual(
+            RootTabBarSlidePolicy.tabIndex(atX: 999, stripWidth: 320, count: 4),
+            3
+        )
+        XCTAssertEqual(
+            RootTabBarSlidePolicy.tabIndex(atX: -40, stripWidth: 320, count: 4),
+            0
+        )
+        // Every button owns exactly its own quarter of the row.
+        XCTAssertEqual(RootTabBarSlidePolicy.tabIndex(atX: 0, stripWidth: 320, count: 4), 0)
+        XCTAssertEqual(RootTabBarSlidePolicy.tabIndex(atX: 79, stripWidth: 320, count: 4), 0)
+        XCTAssertEqual(RootTabBarSlidePolicy.tabIndex(atX: 81, stripWidth: 320, count: 4), 1)
+        XCTAssertEqual(RootTabBarSlidePolicy.tabIndex(atX: 161, stripWidth: 320, count: 4), 2)
+
+        // Before the row has been measured there is nothing to point at.
+        XCTAssertNil(RootTabBarSlidePolicy.tabIndex(atX: 100, stripWidth: 0, count: 4))
+        XCTAssertNil(RootTabBarSlidePolicy.tabIndex(atX: 100, stripWidth: 320, count: 0))
     }
 
     func testPagesInsideATabAddNoBottomPaddingOfTheirOwn() {

@@ -53,10 +53,23 @@ struct AbuseReportContext: Equatable, Sendable {
         let members = conversation.participantUserIds.compactMap {
             CommunicationPrivacyIdentifier.canonicalUUID($0)
         }
+        let uniqueMembers = Set(members)
         guard members.count == conversation.participantUserIds.count,
-              Set(members) == Set([currentUserID, reportedUserID]),
-              members.count == 2
+              uniqueMembers.count == members.count,
+              uniqueMembers.contains(currentUserID),
+              uniqueMembers.contains(reportedUserID)
         else { return nil }
+
+        // A direct thread must remain exactly two-party. A group report instead binds the report
+        // to the authenticated sender selected from the group transcript; the backend performs
+        // the same membership check against its authoritative roster at submission time.
+        if conversation.isGroup {
+            guard members.count >= 2 else { return nil }
+        } else {
+            guard uniqueMembers == Set([currentUserID, reportedUserID]),
+                  members.count == 2
+            else { return nil }
+        }
 
         self.currentUserID = currentUserID
         self.reportedUserID = reportedUserID

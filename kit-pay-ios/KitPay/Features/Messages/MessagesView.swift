@@ -1370,7 +1370,7 @@ struct ConversationView: View {
     @State private var showGroupMemberPicker = false
     @State private var showGroupMediaLibrary = false
     @State private var groupProfileFollowUp: GroupProfileFollowUp?
-    @State private var abuseReportTarget: AbuseReportTarget?
+    @State private var abuseReportPresentation: ConversationAbuseReportPresentation?
     @State private var chatPaymentApproval: ChatPaymentApproval?
     @State private var resolvingPaymentRequestID: String?
     @State private var showCameraCapture = false
@@ -1495,17 +1495,12 @@ struct ConversationView: View {
         model.isCommunicationBlocked(userID: recipientUserID)
     }
 
-    private var abuseReportContext: AbuseReportContext? {
+    private func abuseReportContext(reportedUserID: String?) -> AbuseReportContext? {
         AbuseReportContext(
             currentUserID: model.profile?.id,
-            reportedUserID: recipientUserID,
-            conversation: conversation
+            reportedUserID: reportedUserID,
+            conversation: currentConversation
         )
-    }
-
-    private var abuseReportingAvailable: Bool {
-        AbuseReportContract.isAvailable(features: model.capabilities?.features)
-            && abuseReportContext != nil
     }
 
     private var recipientCommunicationAllowed: Bool {
@@ -2229,19 +2224,17 @@ struct ConversationView: View {
             }
             .presentationBackground(.ultraThinMaterial)
         }
-        .sheet(item: $abuseReportTarget) { target in
-            if let context = abuseReportContext {
-                NavigationStack {
-                    AbuseReportView(
-                        reportedName: recipientDisplayName,
-                        context: context,
-                        target: target,
-                        messages: messages
-                    )
-                    .environmentObject(model)
-                }
-                .presentationBackground(.ultraThinMaterial)
+        .sheet(item: $abuseReportPresentation) { presentation in
+            NavigationStack {
+                AbuseReportView(
+                    reportedName: presentation.reportedName,
+                    context: presentation.context,
+                    target: presentation.target,
+                    messages: messages
+                )
+                .environmentObject(model)
             }
+            .presentationBackground(.ultraThinMaterial)
         }
         .fullScreenCover(item: $galleryTarget) { target in
             KitMediaGalleryView(
@@ -3296,15 +3289,25 @@ struct ConversationView: View {
                             } label: {
                                 Label("Select", systemImage: "checkmark.circle")
                             }
-                            if abuseReportingAvailable,
-                               let context = abuseReportContext,
+                            if AbuseReportContract.isAvailable(
+                                features: model.capabilities?.features
+                            ),
+                               let context = abuseReportContext(
+                                   reportedUserID: message.senderId
+                               ),
                                let reportTarget = AbuseReportTarget.message(
                                    message,
                                    context: context
                                ) {
                                 Divider()
                                 Button(role: .destructive) {
-                                    abuseReportTarget = reportTarget
+                                    abuseReportPresentation = ConversationAbuseReportPresentation(
+                                        context: context,
+                                        target: reportTarget,
+                                        reportedName: isGroupConversation
+                                            ? participantDisplayName(for: message.senderId)
+                                            : recipientDisplayName
+                                    )
                                 } label: {
                                     Label("Report message", systemImage: "exclamationmark.bubble")
                                 }
@@ -4953,6 +4956,14 @@ private struct RecorderLevelWave: View {
 
 private enum ConversationScrollAnchor: Hashable {
     case bottom
+}
+
+private struct ConversationAbuseReportPresentation: Identifiable {
+    let context: AbuseReportContext
+    let target: AbuseReportTarget
+    let reportedName: String
+
+    var id: String { "\(context.reportedUserID):\(target.id)" }
 }
 
 private struct ConversationGalleryTarget: Identifiable {

@@ -165,7 +165,9 @@ struct RootView: View {
                 FloatingTabBar(
                     selection: $model.selectedTab,
                     unreadMessageCount: model.state.conversations.reduce(0) { $0 + $1.unreadCount },
-                    queuedCount: model.queuedCount
+                    queuedCount: model.queuedCount,
+                    profileName: model.profile?.identityDisplayName ?? "Kit Pay",
+                    profileAvatarURL: model.profile?.avatarURL
                 )
                 .background {
                     GeometryReader { proxy in
@@ -419,13 +421,30 @@ enum RootTabBarLayoutPolicy {
     /// a larger number shrunk by a factor, which had left the icons and captions below the size
     /// iOS uses for its own tab bars. Large accessibility sizes keep their larger hit targets.
     static let visualScale: CGFloat = 1.0
-    static let baseButtonHeight: CGFloat = 56
+    /// A floating capsule reads better shorter and lighter than a docked bar: the icons carry the
+    /// row, so the button gives them room to be large without carrying dead height around them.
+    /// Still comfortably above the 44pt minimum target.
+    static let baseButtonHeight: CGFloat = 50
     static let accessibilityButtonHeight: CGFloat = 72
 
-    /// Matched to the system tab bar rather than to the caption underneath it: a 21pt symbol next
-    /// to an 11pt label is the proportion iOS itself uses, and it stays legible at arm's length.
-    static let iconPointSize: CGFloat = 21
+    /// The icon is the thing people aim at, so it is a little larger than the system tab bar's,
+    /// with the caption held at the size iOS uses. The proportion between them is what keeps the
+    /// row legible at arm's length.
+    static let iconPointSize: CGFloat = 23
     static let captionPointSize: CGFloat = 11
+
+    /// Glass between the row of buttons and the edge of the capsule. Enough for the selected
+    /// button's own lens to sit inside the bar's without the two edges touching.
+    static let capsuleInset: CGFloat = 6
+
+    /// Gap between neighbouring buttons. Small: the buttons share the row equally and a slide
+    /// crosses the gaps, so a wide one reads as a dead zone under the finger.
+    static let interButtonSpacing: CGFloat = 4
+
+    /// Inset from the screen edges, so the capsule reads as floating over the page rather than
+    /// bridging it. Regular width has room for more.
+    static let compactHorizontalInset: CGFloat = 16
+    static let regularHorizontalInset: CGFloat = 28
 
     /// Rest the menu lower by one fifth of its original button height. The device safe area still
     /// protects the home indicator, while the scroll clearance above keeps the final page action
@@ -439,7 +458,7 @@ enum RootTabBarLayoutPolicy {
     static let scrollClearance: CGFloat = 28
 
     /// Gap between the reserved clearance and the capsule itself.
-    static let barTopPadding: CGFloat = 7 * visualScale
+    static let barTopPadding: CGFloat = 8 * visualScale
 
     /// Extra bottom padding a page inside a tab should add for the floating menu: none. The
     /// clearance is delivered as scroll content margin through `rootTabBarScrollClearance()`;
@@ -449,7 +468,7 @@ enum RootTabBarLayoutPolicy {
     /// Height assumed for the bar before its first measurement, so a page's very first frame is
     /// already inset instead of momentarily scrolling under the capsule. Button height plus the
     /// capsule's own inset on both edges plus `barTopPadding`.
-    static let estimatedBarHeight: CGFloat = 76
+    static let estimatedBarHeight: CGFloat = baseButtonHeight + (capsuleInset * 2) + barTopPadding
 
     /// Bottom scroll *content* margin a page inside a tab needs so its last row can be scrolled
     /// clear of the floating menu.
@@ -466,6 +485,47 @@ enum RootTabBarLayoutPolicy {
         accessibilitySize
             ? accessibilityButtonHeight
             : max(minimumInteractiveDimension, baseButtonHeight * visualScale)
+    }
+}
+
+/// Reading a finger travelling along the floating menu.
+///
+/// The menu is a row of equally wide buttons, so the tab under a finger is a division rather than
+/// a per-button frame lookup — which also means it still works while the row is mid-animation.
+enum RootTabBarSlidePolicy {
+    /// Far enough that a stationary tap is never mistaken for a slide, short enough that the slide
+    /// starts under the neighbouring icon rather than a whole tab later.
+    static let activationDistance: CGFloat = 10
+
+    /// A mostly-vertical drag over the menu is someone reaching past it, not sliding along it.
+    static func isSlide(translation: CGSize) -> Bool {
+        abs(translation.width) >= abs(translation.height)
+    }
+
+    /// The tab under a finger at `x`, clamped to the row: a finger that has run off the end is
+    /// still pointing at the last tab, which is where it looks like it is pointing.
+    static func tabIndex(atX x: CGFloat, stripWidth: CGFloat, count: Int) -> Int? {
+        guard stripWidth > 0, count > 0 else { return nil }
+        let segment = stripWidth / CGFloat(count)
+        return min(count - 1, max(0, Int(x / segment)))
+    }
+
+    /// The tab a finished slide switches to, or nil for a gesture that was never a slide.
+    static func committedTabIndex(
+        translation: CGSize,
+        x: CGFloat,
+        stripWidth: CGFloat,
+        count: Int
+    ) -> Int? {
+        guard isSlide(translation: translation) else { return nil }
+        return tabIndex(atX: x, stripWidth: stripWidth, count: count)
+    }
+
+    /// What the menu draws as chosen. While a finger is travelling that is the tab beneath it, so
+    /// the destination is legible before it is committed to — the selection itself, and therefore
+    /// the page, does not move until the finger lifts.
+    static func highlightedIndex(selection: Int, slidingTo: Int?) -> Int {
+        slidingTo ?? selection
     }
 }
 
@@ -554,10 +614,24 @@ private struct TabBadge {
     }
 }
 
+/// What a slide across the menu is currently pointing at.
+///
+/// Held in `@GestureState` rather than `@State` because SwiftUI restores it on its own the moment
+/// a gesture ends or is cancelled. A slide interrupted by a call banner or a system edge gesture
+/// therefore cannot leave the menu parked on a tab the app never switched to.
+private struct RootTabBarSlide: Equatable {
+    var isActive = false
+    /// `MainTab.rawValue` under the finger, or nil before the row has been measured.
+    var tab: Int?
+}
+
 private struct FloatingTabBar: View {
     @Binding var selection: Int
     let unreadMessageCount: Int
     let queuedCount: Int
+    /// The signed-in customer, for the Profile tab's own photo.
+    let profileName: String
+    let profileAvatarURL: String?
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
@@ -570,7 +644,14 @@ private struct FloatingTabBar: View {
     @Namespace private var glassNamespace
     /// Width of the row of tab buttons, used to turn a finger position into a tab.
     @State private var stripWidth: CGFloat = 0
-    @State private var isSliding = false
+    @GestureState private var slide = RootTabBarSlide()
+
+    /// What the menu is *showing* as chosen. During a slide that is the tab under the finger, so
+    /// the lens travels with it and the destination is legible before committing to it; the page
+    /// itself does not change until the finger lifts.
+    private var highlightedTab: Int {
+        RootTabBarSlidePolicy.highlightedIndex(selection: selection, slidingTo: slide.tab)
+    }
 
     var body: some View {
         Group {
@@ -581,13 +662,20 @@ private struct FloatingTabBar: View {
             }
         }
         .frame(maxWidth: 620)
-        .padding(.horizontal, horizontalSizeClass == .regular ? 28 : 12)
+        .padding(
+            .horizontal,
+            horizontalSizeClass == .regular
+                ? RootTabBarLayoutPolicy.regularHorizontalInset
+                : RootTabBarLayoutPolicy.compactHorizontalInset
+        )
         .padding(.top, RootTabBarLayoutPolicy.barTopPadding)
         .offset(y: RootTabBarLayoutPolicy.verticalDrop)
         // The bar lifts under a slide so the gesture reads as picking the bar up, not scrubbing it.
-        .scaleEffect(isSliding && !reduceMotion ? 1.02 : 1)
-        .animation(.snappy(duration: 0.18), value: isSliding)
-        .sensoryFeedback(.selection, trigger: selection)
+        .scaleEffect(slide.isActive && !reduceMotion ? 1.02 : 1)
+        .animation(.snappy(duration: 0.18), value: slide.isActive)
+        // Every icon crossed answers under the finger, which is what makes a slide feel like it is
+        // choosing rather than waiting.
+        .sensoryFeedback(.selection, trigger: highlightedTab)
     }
 
     @available(iOS 26.0, *)
@@ -596,18 +684,15 @@ private struct FloatingTabBar: View {
             tabStrip { tab in
                 liquidGlassButton(for: tab)
             }
-            .padding(5 * RootTabBarLayoutPolicy.visualScale)
-            .glassEffect(
-                .regular
-                    .tint(.white.opacity(colorScheme == .dark ? 0.04 : 0.13))
-                    .interactive(!reduceMotion),
-                in: Capsule()
-            )
+            .padding(RootTabBarLayoutPolicy.capsuleInset)
+            // Untinted. The menu takes its colour from whatever page is passing underneath it,
+            // which is the whole point of the material — a brand tint painted over the top only
+            // flattens it back into a coloured bar.
+            .glassEffect(.regular.interactive(!reduceMotion), in: Capsule())
             .overlay {
                 barHighlight
             }
             .shadow(color: .black.opacity(colorScheme == .dark ? 0.30 : 0.14), radius: 22, y: 10)
-            .shadow(color: KitColor.green.opacity(0.08), radius: 12, y: 3)
         }
     }
 
@@ -615,7 +700,7 @@ private struct FloatingTabBar: View {
         tabStrip { tab in
             materialButton(for: tab)
         }
-        .padding(5 * RootTabBarLayoutPolicy.visualScale)
+        .padding(RootTabBarLayoutPolicy.capsuleInset)
         .background {
             if reduceTransparency {
                 Capsule()
@@ -631,23 +716,28 @@ private struct FloatingTabBar: View {
             barHighlight
         }
         .shadow(color: .black.opacity(colorScheme == .dark ? 0.30 : 0.14), radius: 22, y: 10)
-        .shadow(color: KitColor.green.opacity(0.08), radius: 12, y: 3)
     }
 
     /// The row of tab buttons, plus the gesture that lets a finger slide from one to the next.
     ///
     /// The drag runs *alongside* the buttons rather than replacing them: a tap is still a tap on a
     /// real `Button`, with its own press feedback and accessibility, and only movement past
-    /// `slideActivationDistance` is read as a slide. The buttons share the row equally, so the tab
-    /// under the finger is a division rather than a per-button frame lookup.
+    /// ``RootTabBarSlidePolicy/activationDistance`` is read as a slide. While the finger travels
+    /// the lens follows it and each icon crossed answers; the page changes when the finger lifts.
     private func tabStrip<Content: View>(
         @ViewBuilder button: @escaping (MainTab) -> Content
     ) -> some View {
-        HStack(spacing: 3 * RootTabBarLayoutPolicy.visualScale) {
+        HStack(spacing: RootTabBarLayoutPolicy.interButtonSpacing) {
             ForEach(MainTab.allCases) { tab in
                 button(tab)
             }
         }
+        // The lens travels between buttons rather than cutting from one to the next. Keyed on the
+        // highlight, so it animates during a slide as well as on a tap.
+        .animation(
+            reduceMotion ? nil : .snappy(duration: 0.24, extraBounce: 0.04),
+            value: highlightedTab
+        )
         .background {
             GeometryReader { proxy in
                 Color.clear
@@ -656,43 +746,48 @@ private struct FloatingTabBar: View {
             }
         }
         .simultaneousGesture(
-            DragGesture(minimumDistance: Self.slideActivationDistance)
-                .onChanged { value in
-                    // A mostly-vertical drag over the bar is someone reaching past it, not sliding.
-                    guard abs(value.translation.width) >= abs(value.translation.height) else { return }
-                    isSliding = true
-                    guard let tab = tab(atX: value.location.x) else { return }
+            DragGesture(minimumDistance: RootTabBarSlidePolicy.activationDistance)
+                .updating($slide) { value, state, _ in
+                    guard RootTabBarSlidePolicy.isSlide(translation: value.translation) else {
+                        return
+                    }
+                    state.isActive = true
+                    state.tab = tabIndex(atX: value.location.x)
+                }
+                .onEnded { value in
+                    // The page changes on the release the moving lens promised, and only then.
+                    // Switching under the finger meant every tab crossed on the way to the one
+                    // being aimed at was loaded, appeared, and was thrown away again.
+                    guard let index = RootTabBarSlidePolicy.committedTabIndex(
+                        translation: value.translation,
+                        x: value.location.x,
+                        stripWidth: stripWidth,
+                        count: MainTab.allCases.count
+                    ), let tab = MainTab(rawValue: index) else { return }
                     select(tab, sliding: true)
                 }
-                .onEnded { _ in isSliding = false }
         )
     }
 
-    /// Far enough that a stationary tap is never mistaken for a slide, short enough that the slide
-    /// starts under the neighbouring icon rather than a whole tab later.
-    private static let slideActivationDistance: CGFloat = 10
-
-    private func tab(atX x: CGFloat) -> MainTab? {
-        let tabs = MainTab.allCases
-        guard stripWidth > 0, !tabs.isEmpty else { return nil }
-        let segment = stripWidth / CGFloat(tabs.count)
-        let index = min(tabs.count - 1, max(0, Int(x / segment)))
-        return tabs[index]
+    private func tabIndex(atX x: CGFloat) -> Int? {
+        RootTabBarSlidePolicy.tabIndex(
+            atX: x,
+            stripWidth: stripWidth,
+            count: MainTab.allCases.count
+        )
     }
 
     @available(iOS 26.0, *)
     private func liquidGlassButton(for tab: MainTab) -> some View {
         tabButton(for: tab)
             .background {
-                if selection == tab.rawValue {
+                if highlightedTab == tab.rawValue {
                     Capsule()
                         .fill(Color.primary.opacity(colorScheme == .dark ? 0.08 : 0.035))
-                        .glassEffect(
-                            .clear
-                                .tint(KitColor.green.opacity(colorScheme == .dark ? 0.13 : 0.09))
-                                .interactive(!reduceMotion),
-                            in: Capsule()
-                        )
+                        // A second, clearer lens inside the bar's own. Untinted for the same
+                        // reason the bar is: the selection should read as glass lifted out of
+                        // glass, not as a coloured chip laid on top of it.
+                        .glassEffect(.clear.interactive(!reduceMotion), in: Capsule())
                         .glassEffectID("selected-tab", in: glassNamespace)
                         .overlay { selectionHighlight }
                         .shadow(color: .black.opacity(0.09), radius: 7, y: 3)
@@ -703,13 +798,9 @@ private struct FloatingTabBar: View {
     private func materialButton(for tab: MainTab) -> some View {
         tabButton(for: tab)
             .background {
-                if selection == tab.rawValue {
+                if highlightedTab == tab.rawValue {
                     Capsule()
-                        .fill(
-                            colorScheme == .dark
-                                ? Color.white.opacity(0.11)
-                                : KitColor.navy.opacity(0.065)
-                        )
+                        .fill(Color.primary.opacity(colorScheme == .dark ? 0.11 : 0.06))
                         .overlay { selectionHighlight }
                         .shadow(color: .black.opacity(0.08), radius: 7, y: 3)
                         .matchedGeometryEffect(id: "selected-tab", in: selectionNamespace)
@@ -718,7 +809,7 @@ private struct FloatingTabBar: View {
     }
 
     private func tabButton(for tab: MainTab) -> some View {
-        let selected = selection == tab.rawValue
+        let selected = highlightedTab == tab.rawValue
         let badge = badge(for: tab)
 
         return Button {
@@ -730,11 +821,7 @@ private struct FloatingTabBar: View {
                     : 3 * RootTabBarLayoutPolicy.visualScale
             ) {
                 ZStack(alignment: .topTrailing) {
-                    Image(systemName: selected ? tab.selectedIcon : tab.icon)
-                        .font(.system(size: tabIconSize, weight: selected ? .semibold : .regular))
-                        .symbolRenderingMode(.hierarchical)
-                        .frame(minWidth: 32, minHeight: 26)
-                        .contentTransition(.symbolEffect(.replace))
+                    tabSymbol(for: tab, selected: selected)
 
                     if let badge {
                         BadgeView(badge: badge)
@@ -766,6 +853,39 @@ private struct FloatingTabBar: View {
         .accessibilityAddTraits(selected ? .isSelected : [])
     }
 
+    /// The Profile tab shows the customer's own photo rather than a generic silhouette — the same
+    /// face they see on their profile, chats and calls, drawn from the same local cache so it is
+    /// there in the first frame and offline.
+    @ViewBuilder
+    private func tabSymbol(for tab: MainTab, selected: Bool) -> some View {
+        if tab == .profile {
+            RemoteAvatarView(
+                name: profileName,
+                avatarURL: profileAvatarURL,
+                size: tabIconSize + 4,
+                ringOpacity: nil
+            )
+            .overlay {
+                Circle()
+                    .stroke(
+                        Color.primary.opacity(selected ? 0.55 : 0.22),
+                        lineWidth: selected ? 1.6 : 1
+                    )
+                    .allowsHitTesting(false)
+            }
+            .frame(minWidth: 32, minHeight: 26)
+            .accessibilityHidden(true)
+        } else {
+            Image(systemName: selected ? tab.selectedIcon : tab.icon)
+                .font(.system(size: tabIconSize, weight: selected ? .semibold : .regular))
+                .symbolRenderingMode(.hierarchical)
+                .frame(minWidth: 32, minHeight: 26)
+                .contentTransition(.symbolEffect(.replace))
+        }
+    }
+
+    /// The lit top edge and shaded underside that make a pane of glass look like one. Neutral
+    /// black and white only — a tinted rim is what makes glass look painted.
     private var barHighlight: some View {
         Capsule()
             .stroke(
@@ -773,7 +893,7 @@ private struct FloatingTabBar: View {
                     colors: [
                         .white.opacity(colorScheme == .dark ? 0.42 : 0.88),
                         .white.opacity(0.10),
-                        KitColor.navy.opacity(colorScheme == .dark ? 0.28 : 0.10)
+                        .black.opacity(colorScheme == .dark ? 0.24 : 0.08)
                     ],
                     startPoint: .topLeading,
                     endPoint: .bottomTrailing
@@ -798,8 +918,10 @@ private struct FloatingTabBar: View {
             .accessibilityHidden(true)
     }
 
+    /// Contrast against whatever is passing behind the glass, not a brand colour: the selected tab
+    /// is marked out by its own lens and by weight, so the label only has to be legible.
     private var selectedForeground: Color {
-        colorScheme == .dark ? .white : KitColor.navy
+        colorScheme == .dark ? .white : .primary
     }
 
     private func badge(for tab: MainTab) -> TabBadge? {
@@ -811,9 +933,11 @@ private struct FloatingTabBar: View {
                 accessibilityValue: "\(queuedCount) queued \(queuedCount == 1 ? "item" : "items")"
             )
         case .messages where unreadMessageCount > 0:
+            // The one thing on the bar that is deliberately not glass. A count nobody can pick out
+            // is not a count; this is the colour iOS itself uses for an unread badge.
             TabBadge(
                 count: unreadMessageCount,
-                color: KitColor.green,
+                color: .red,
                 accessibilityValue: "\(unreadMessageCount) unread \(unreadMessageCount == 1 ? "message" : "messages")"
             )
         default:
