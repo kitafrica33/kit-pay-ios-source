@@ -374,6 +374,22 @@ protocol SecureMessagingExchangeTransport: SecureMessagingActivationTransport {
     func createDirectMessagingConversation(
         _ request: CreateDirectMessagingConversationRequest
     ) async throws -> MessagingConversationDTO
+    func createGroupMessagingConversation(
+        memberIds: [String],
+        title: String
+    ) async throws -> MessagingConversationDTO
+    func renameGroupMessagingConversation(
+        conversationId: String,
+        title: String
+    ) async throws -> MessagingConversationDTO
+    func addGroupMessagingConversationMember(
+        conversationId: String,
+        userId: String
+    ) async throws -> MessagingConversationDTO
+    func removeGroupMessagingConversationMember(
+        conversationId: String,
+        userId: String
+    ) async throws -> MessagingConversationDTO
     func messagingDeviceRoster(conversationId: String) async throws -> MessagingDeviceRosterDTO
     func historicalMessagingDeviceRoster(
         conversationId: String,
@@ -418,6 +434,35 @@ protocol SecureMessagingExchangeTransport: SecureMessagingActivationTransport {
 }
 
 extension SecureMessagingExchangeTransport {
+    /// Group creation fails closed on transports (and test doubles) that predate it.
+    func createGroupMessagingConversation(
+        memberIds: [String],
+        title: String
+    ) async throws -> MessagingConversationDTO {
+        throw SecureMessagingExchangeError.invalidServerResponse
+    }
+
+    func renameGroupMessagingConversation(
+        conversationId: String,
+        title: String
+    ) async throws -> MessagingConversationDTO {
+        throw SecureMessagingExchangeError.invalidServerResponse
+    }
+
+    func addGroupMessagingConversationMember(
+        conversationId: String,
+        userId: String
+    ) async throws -> MessagingConversationDTO {
+        throw SecureMessagingExchangeError.invalidServerResponse
+    }
+
+    func removeGroupMessagingConversationMember(
+        conversationId: String,
+        userId: String
+    ) async throws -> MessagingConversationDTO {
+        throw SecureMessagingExchangeError.invalidServerResponse
+    }
+
     func messagingHistoryBackfillCandidates(
         conversationId: String,
         targetDeviceId: String,
@@ -448,6 +493,8 @@ enum SecureMessagingExchangeError: LocalizedError, Equatable {
     case unsupportedEvent(String)
     case staleOutboundFanout
     case retryLimitExceeded
+    case groupCapabilityUnavailable
+    case reactionCapabilityUnavailable
 
     var errorDescription: String? {
         switch self {
@@ -459,6 +506,10 @@ enum SecureMessagingExchangeError: LocalizedError, Equatable {
         case .unsupportedEvent: "Kit could not process a message update. Please try again."
         case .staleOutboundFanout: "The recipient's devices changed. Retry the message."
         case .retryLimitExceeded: "Messages changed while syncing. Please try again."
+        case .groupCapabilityUnavailable:
+            "Everyone in this group needs the latest Kit Pay to receive messages."
+        case .reactionCapabilityUnavailable:
+            "Everyone in this conversation needs the latest Kit Pay to use reactions."
         }
     }
 }
@@ -685,8 +736,12 @@ actor SecureMessagingExchangeCoordinator {
             let sameID = state.conversations.filter {
                 $0.id.caseInsensitiveCompare(validated.id) == .orderedSame
             }
+            // A group can legitimately contain exactly these two people; only another DIRECT
+            // thread with the same member pair is a competing duplicate.
             let competingDirectThreads = state.conversations.filter {
-                Set($0.participantUserIds.map { $0.lowercased() }) == validated.memberUserIDs
+                !$0.isGroup
+                    && Set($0.participantUserIds.map { $0.lowercased() })
+                        == validated.memberUserIDs
                     && $0.id.caseInsensitiveCompare(validated.id) != .orderedSame
             }
             guard sameID.count <= 1, competingDirectThreads.isEmpty else {
@@ -703,7 +758,9 @@ actor SecureMessagingExchangeCoordinator {
                     title: projection.title,
                     participantUserIds: projection.participantUserIds,
                     unreadCount: existing.unreadCount,
-                    updatedAt: max(existing.updatedAt, projection.updatedAt)
+                    updatedAt: max(existing.updatedAt, projection.updatedAt),
+                    conversationType: projection.conversationType,
+                    groupMemberRoles: projection.groupMemberRoles
                 )
             } else {
                 state.conversations.append(projection)
@@ -734,6 +791,402 @@ actor SecureMessagingExchangeCoordinator {
         return matches[0]
     }
 
+    /// Creates a server-authoritative GROUP thread and persists its validated local projection
+    /// before returning its id. Fail-closed: the release gate (`messaging_groups`) lives in
+    /// AppModel; this actor still re-validates the returned DTO type, size, and member set, and
+    /// every later send re-checks per-device group attestation at flush time.
+    func createGroupConversation(
+        forUserID userID: String,
+        memberUserIDs: [String],
+        title: String
+    ) async throws -> Conversation {
+        let local = try canonicalUUID(userID, error: .invalidAccount)
+        let members = try memberUserIDs.map {
+            try canonicalUUID($0, error: .invalidRecipient)
+        }
+        guard Set(members).count == members.count,
+              !members.contains(local),
+              (1 ... SecureMessagingWire.maximumGroupMembers - 1).contains(members.count)
+        else { throw SecureMessagingExchangeError.invalidRecipient }
+
+        let dto = try await transport.createGroupMessagingConversation(
+            memberIds: members.sorted(),
+            title: title
+        )
+        let validated = try validateConversation(
+            dto,
+            currentUserID: local,
+            expectedRecipientUserID: nil,
+            fallbackTitle: title
+        )
+        guard validated.isGroup,
+              Set(members + [local]) == validated.memberUserIDs
+        else { throw SecureMessagingExchangeError.invalidConversation }
+
+        let projection = validated.localProjection
+        try await store.update { state in
+            guard state.profile?.id.caseInsensitiveCompare(local) == .orderedSame,
+                  state.communicationOwnerUserID?.caseInsensitiveCompare(local) == .orderedSame,
+                  state.secureMessaging?.enrollment?.userID == local
+            else { throw SecureMessagingExchangeError.invalidAccount }
+            let sameID = state.conversations.filter {
+                $0.id.caseInsensitiveCompare(validated.id) == .orderedSame
+            }
+            guard sameID.count <= 1 else {
+                throw SecureMessagingExchangeError.invalidConversation
+            }
+            if let index = state.conversations.firstIndex(where: {
+                $0.id.caseInsensitiveCompare(validated.id) == .orderedSame
+            }) {
+                // Preserve the durable unread projection while refreshing only authenticated
+                // server-owned identity and ordering fields.
+                let existing = state.conversations[index]
+                if Self.serverProjectionIsNotOlder(
+                    conversationID: projection.id,
+                    updatedAt: projection.updatedAt,
+                    in: state
+                ) {
+                    state.conversations[index] = Conversation(
+                        id: projection.id,
+                        title: projection.title,
+                        participantUserIds: projection.participantUserIds,
+                        unreadCount: existing.unreadCount,
+                        updatedAt: max(existing.updatedAt, projection.updatedAt),
+                        conversationType: projection.conversationType,
+                        groupMemberRoles: projection.groupMemberRoles
+                    )
+                    Self.recordServerProjection(
+                        conversationID: projection.id,
+                        updatedAt: projection.updatedAt,
+                        in: &state
+                    )
+                }
+            } else {
+                state.conversations.append(projection)
+                Self.recordServerProjection(
+                    conversationID: projection.id,
+                    updatedAt: projection.updatedAt,
+                    in: &state
+                )
+            }
+        }
+
+        let snapshot = await store.snapshot()
+        guard snapshot.profile?.id.caseInsensitiveCompare(local) == .orderedSame,
+              snapshot.communicationOwnerUserID?.caseInsensitiveCompare(local) == .orderedSame,
+              snapshot.secureMessaging?.enrollment?.userID == local
+        else { throw CancellationError() }
+        let matches = snapshot.conversations.filter {
+            $0.id.caseInsensitiveCompare(validated.id) == .orderedSame
+                && Set($0.participantUserIds.map { $0.lowercased() })
+                    == validated.memberUserIDs
+                && $0.isGroup
+        }
+        guard matches.count == 1 else {
+            throw SecureMessagingExchangeError.invalidConversation
+        }
+        return matches[0]
+    }
+
+    /// Applies a server-authoritative title response. The global rollout/device-roster admission
+    /// for this expansion is enforced by AppModel and the backend; the actor still binds the
+    /// response to the exact group, active caller, and requested normalized title.
+    func renameGroupConversation(
+        forUserID userID: String,
+        conversationID rawConversationID: String,
+        title: String
+    ) async throws -> Conversation {
+        let local = try canonicalUUID(userID, error: .invalidAccount)
+        let conversationID = try canonicalUUID(
+            rawConversationID,
+            error: .invalidConversation
+        )
+        let cleanTitle = MessagingGroupTitlePolicy.normalized(title)
+        guard MessagingGroupTitlePolicy.isValid(cleanTitle) else {
+            throw SecureMessagingExchangeError.invalidConversation
+        }
+        let existing = try await localGroup(
+            conversationID: conversationID,
+            currentUserID: local,
+            requiresManagerRole: true
+        )
+        try await requireCurrentGroupCapability(existing, currentUserID: local)
+        let dto = try await transport.renameGroupMessagingConversation(
+            conversationId: conversationID,
+            title: cleanTitle
+        )
+        _ = try parseServerDate(dto.updatedAt)
+        let validated = try validateConversation(
+            dto,
+            currentUserID: local,
+            expectedRecipientUserID: nil,
+            fallbackTitle: cleanTitle
+        )
+        guard validated.isGroup,
+              validated.id == conversationID,
+              validated.title == cleanTitle
+        else { throw SecureMessagingExchangeError.invalidServerResponse }
+        return try await commitGroupProjection(validated.localProjection, currentUserID: local)
+    }
+
+    /// Adds exactly one eligible member. A fresh server DTO replaces the entire local roster so
+    /// concurrent membership changes cannot be overwritten by a stale client-side union.
+    func addGroupConversationMember(
+        forUserID userID: String,
+        conversationID rawConversationID: String,
+        memberUserID rawMemberUserID: String
+    ) async throws -> Conversation {
+        let local = try canonicalUUID(userID, error: .invalidAccount)
+        let conversationID = try canonicalUUID(
+            rawConversationID,
+            error: .invalidConversation
+        )
+        let memberUserID = try canonicalUUID(rawMemberUserID, error: .invalidRecipient)
+        let existing = try await localGroup(
+            conversationID: conversationID,
+            currentUserID: local,
+            requiresManagerRole: true
+        )
+        guard memberUserID != local,
+              !existing.participantUserIds.contains(memberUserID),
+              existing.participantUserIds.count < SecureMessagingWire.maximumGroupMembers
+        else { throw SecureMessagingExchangeError.invalidRecipient }
+        // The pre-add roster proves every existing device. The backend then performs the same
+        // check again while atomically including every device owned by the prospective member.
+        try await requireCurrentGroupCapability(existing, currentUserID: local)
+        let dto = try await transport.addGroupMessagingConversationMember(
+            conversationId: conversationID,
+            userId: memberUserID
+        )
+        _ = try parseServerDate(dto.updatedAt)
+        let validated = try validateConversation(
+            dto,
+            currentUserID: local,
+            expectedRecipientUserID: nil,
+            fallbackTitle: existing.title
+        )
+        guard validated.isGroup,
+              validated.id == conversationID,
+              validated.memberUserIDs.contains(memberUserID)
+        else { throw SecureMessagingExchangeError.invalidServerResponse }
+        return try await commitGroupProjection(validated.localProjection, currentUserID: local)
+    }
+
+    /// Removes a member or leaves the group. Deliberately contains no group feature/device
+    /// capability check: DELETE is the backend's safety path when rollout is dark or a device is
+    /// incompatible. Server role checks remain authoritative and the response replaces the
+    /// complete active roster.
+    func removeGroupConversationMember(
+        forUserID userID: String,
+        conversationID rawConversationID: String,
+        memberUserID rawMemberUserID: String
+    ) async throws -> Conversation {
+        let local = try canonicalUUID(userID, error: .invalidAccount)
+        let conversationID = try canonicalUUID(
+            rawConversationID,
+            error: .invalidConversation
+        )
+        let memberUserID = try canonicalUUID(rawMemberUserID, error: .invalidRecipient)
+        let existing = try await localGroup(
+            conversationID: conversationID,
+            currentUserID: local,
+            requiresManagerRole: memberUserID != local
+        )
+        guard existing.participantUserIds.contains(memberUserID) else {
+            throw SecureMessagingExchangeError.invalidRecipient
+        }
+        if memberUserID != local {
+            guard let actorRole = existing.groupRole(for: local),
+                  let targetRole = existing.groupRole(for: memberUserID),
+                  actorRole.canRemove(targetRole)
+            else { throw SecureMessagingExchangeError.invalidRecipient }
+        }
+
+        let dto = try await transport.removeGroupMessagingConversationMember(
+            conversationId: conversationID,
+            userId: memberUserID
+        )
+        let responseUpdatedAt = try parseServerDate(dto.updatedAt)
+        let projection: Conversation
+        if memberUserID == local {
+            projection = try validateDepartedGroupConversation(
+                dto,
+                conversationID: conversationID,
+                currentUserID: local,
+                updatedAt: responseUpdatedAt
+            )
+        } else {
+            let validated = try validateConversation(
+                dto,
+                currentUserID: local,
+                expectedRecipientUserID: nil,
+                fallbackTitle: existing.title
+            )
+            guard validated.isGroup,
+                  validated.id == conversationID,
+                  !validated.memberUserIDs.contains(memberUserID)
+            else { throw SecureMessagingExchangeError.invalidServerResponse }
+            projection = validated.localProjection
+        }
+        return try await commitGroupProjection(projection, currentUserID: local)
+    }
+
+    private func localGroup(
+        conversationID: String,
+        currentUserID: String,
+        requiresManagerRole: Bool
+    ) async throws -> Conversation {
+        let snapshot = await store.snapshot()
+        guard snapshot.profile?.id.caseInsensitiveCompare(currentUserID) == .orderedSame,
+              snapshot.communicationOwnerUserID?
+                .caseInsensitiveCompare(currentUserID) == .orderedSame,
+              snapshot.secureMessaging?.enrollment?.userID == currentUserID
+        else { throw SecureMessagingExchangeError.invalidAccount }
+        let matches = snapshot.conversations.filter { $0.id == conversationID }
+        guard matches.count == 1,
+              let conversation = matches.first,
+              conversation.isGroup,
+              conversation.participantUserIds.contains(currentUserID),
+              !requiresManagerRole
+                || conversation.groupRole(for: currentUserID)?.canManageGroup == true
+        else { throw SecureMessagingExchangeError.invalidConversation }
+        return conversation
+    }
+
+    private func requireCurrentGroupCapability(
+        _ conversation: Conversation,
+        currentUserID: String
+    ) async throws {
+        let snapshot = await store.snapshot()
+        guard let enrollment = snapshot.secureMessaging?.enrollment,
+              enrollment.userID == currentUserID
+        else { throw SecureMessagingExchangeError.invalidAccount }
+        let roster = try await transport.messagingDeviceRoster(conversationId: conversation.id)
+        guard MessagingGroupCapabilityPolicy.supports(
+            roster: roster,
+            conversationID: conversation.id,
+            currentDeviceID: enrollment.serverDeviceID,
+            memberUserIDs: Set(conversation.participantUserIds)
+        ) else { throw SecureMessagingExchangeError.groupCapabilityUnavailable }
+    }
+
+    private func commitGroupProjection(
+        _ projection: Conversation,
+        currentUserID: String
+    ) async throws -> Conversation {
+        try await store.update { state in
+            guard state.profile?.id.caseInsensitiveCompare(currentUserID) == .orderedSame,
+                  state.communicationOwnerUserID?
+                    .caseInsensitiveCompare(currentUserID) == .orderedSame,
+                  state.secureMessaging?.enrollment?.userID == currentUserID,
+                  state.conversations.filter({ $0.id == projection.id }).count == 1,
+                  let index = state.conversations.firstIndex(where: { $0.id == projection.id }),
+                  state.conversations[index].isGroup
+            else { throw SecureMessagingExchangeError.invalidAccount }
+            let existing = state.conversations[index]
+            // A mutation response can arrive after realtime sync has already committed a newer
+            // full conversation projection. Preserve that newer title, roster, and role map as
+            // one unit; combining its timestamp with fields from the older response would create
+            // a locally impossible state and could re-add a removed member.
+            if Self.serverProjectionIsNotOlder(
+                conversationID: projection.id,
+                updatedAt: projection.updatedAt,
+                in: state
+            ) {
+                state.conversations[index] = Conversation(
+                    id: projection.id,
+                    title: projection.title,
+                    participantUserIds: projection.participantUserIds,
+                    unreadCount: existing.unreadCount,
+                    updatedAt: projection.updatedAt,
+                    conversationType: SecureMessagingWire.groupConversationType,
+                    groupMemberRoles: projection.groupMemberRoles
+                )
+                Self.recordServerProjection(
+                    conversationID: projection.id,
+                    updatedAt: projection.updatedAt,
+                    in: &state
+                )
+            }
+            if !state.conversations[index].participantUserIds.contains(currentUserID) {
+                Self.abandonSecureGroupOutbox(
+                    conversationID: projection.id,
+                    in: &state
+                )
+            }
+        }
+        let snapshot = await store.snapshot()
+        guard snapshot.profile?.id.caseInsensitiveCompare(currentUserID) == .orderedSame,
+              let committed = snapshot.conversations.first(where: { $0.id == projection.id })
+        else { throw CancellationError() }
+        return committed
+    }
+
+    private nonisolated static func abandonSecureGroupOutbox(
+        conversationID: String,
+        in state: inout PersistedState
+    ) {
+        let abandonedMessageIDs = Set(state.outbox.compactMap { command -> UUID? in
+            guard command.kind == .secureMessage,
+                  command.conversationId == conversationID
+            else { return nil }
+            return command.messageId
+        })
+        state.outbox.removeAll {
+            $0.kind == .secureMessage && $0.conversationId == conversationID
+        }
+        for messageIndex in state.messages.indices
+            where abandonedMessageIDs.contains(state.messages[messageIndex].id) {
+            state.messages[messageIndex].state = .failed
+            state.messages[messageIndex].failureReason =
+                "You left this group before this message was sent."
+        }
+    }
+
+    private func validateDepartedGroupConversation(
+        _ dto: MessagingConversationDTO,
+        conversationID: String,
+        currentUserID: String,
+        updatedAt: Date
+    ) throws -> Conversation {
+        guard dto.type == SecureMessagingWire.groupConversationType,
+              let rawID = dto.id,
+              try canonicalUUID(rawID, error: .invalidConversation) == conversationID,
+              let rawTitle = dto.title,
+              MessagingGroupTitlePolicy.isValid(rawTitle),
+              let rawMembers = dto.members,
+              rawMembers.allSatisfy({ $0 != nil })
+        else { throw SecureMessagingExchangeError.invalidServerResponse }
+        let members = rawMembers.compactMap { $0 }
+        guard members.count <= SecureMessagingWire.maximumGroupMembers - 1 else {
+            throw SecureMessagingExchangeError.invalidServerResponse
+        }
+        var memberIDs: [String] = []
+        var roles: [String: MessagingGroupRole] = [:]
+        for member in members {
+            guard let userID = try? canonicalUUID(member.userId, error: .invalidConversation),
+                  let rawRole = member.role,
+                  let role = MessagingGroupRole(rawValue: rawRole),
+                  roles[userID] == nil
+            else { throw SecureMessagingExchangeError.invalidServerResponse }
+            memberIDs.append(userID)
+            roles[userID] = role
+        }
+        guard !memberIDs.contains(currentUserID),
+              let title = dto.title.map(MessagingGroupTitlePolicy.normalized),
+              MessagingGroupTitlePolicy.isValid(title)
+        else { throw SecureMessagingExchangeError.invalidServerResponse }
+        return Conversation(
+            id: conversationID,
+            title: title,
+            participantUserIds: memberIDs.sorted(),
+            unreadCount: 0,
+            updatedAt: updatedAt,
+            conversationType: SecureMessagingWire.groupConversationType,
+            groupMemberRoles: roles
+        )
+    }
+
     func queueDirectText(
         forUserID userID: String,
         recipientUserID: String,
@@ -759,7 +1212,7 @@ actor SecureMessagingExchangeCoordinator {
                in: await store.snapshot(),
                clientMessageID: clientMessageID,
                localUserID: local,
-               recipientUserID: recipient,
+               recipientUserIDs: [recipient],
                conversation: validated.localProjection,
                body: body
            ) {
@@ -806,15 +1259,20 @@ actor SecureMessagingExchangeCoordinator {
     /// Commits a plaintext projection only inside SecureLocalStore while offline. No ciphertext
     /// fanout is guessed from a stale roster; reconnect prepares it against the authoritative
     /// server roster and atomically advances the Signal ratchets before transport replay.
+    ///
+    /// `expectedRecipientUserID` is nil ONLY for group threads: the direct two-party check runs
+    /// unchanged whenever a recipient is pinned, and a nil recipient fails closed unless the
+    /// stored conversation is a validated group containing the local user.
     func queueDeferredText(
         forUserID userID: String,
         conversationID: String,
-        expectedRecipientUserID: String,
+        expectedRecipientUserID: String?,
         title: String,
         text: String,
         clientMessageID: UUID? = nil,
         submittedDraftBody: String? = nil,
         draftClearVersion: ConversationDraftWriteVersion? = nil,
+        deliverAt: Date? = nil,
         commitAdmission: ProtectedCommunicationAdmissionLease? = nil
     ) async throws -> SecureMessagingQueueResult {
         guard (submittedDraftBody == nil) == (draftClearVersion == nil) else {
@@ -822,15 +1280,21 @@ actor SecureMessagingExchangeCoordinator {
         }
         let local = try canonicalUUID(userID, error: .invalidAccount)
         let conversationID = try canonicalUUID(conversationID, error: .invalidConversation)
-        let recipient = try canonicalUUID(
-            expectedRecipientUserID,
-            error: .invalidRecipient
-        )
+        let recipient = try expectedRecipientUserID.map {
+            try canonicalUUID($0, error: .invalidRecipient)
+        }
         let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let beginsReaction = SecureMessageReservedPrefixPolicy.beginsWithReservedPrefix(
+            body,
+            prefix: KitMessageReaction.prefix
+        )
+        let reaction = KitMessageReaction.parse(body)
         guard !body.isEmpty,
               body.unicodeScalars.count <= 8_000,
               !body.unicodeScalars.contains(where: { $0.value == 0 }),
-              KitMediaMessageDescriptor.parse(body) == nil
+              KitMediaMessageDescriptor.parse(body) == nil,
+              !beginsReaction || reaction != nil,
+              reaction == nil || deliverAt == nil
         else { throw SecureMessagingCryptoError.invalidContent }
         let snapshot = await store.snapshot()
         guard snapshot.profile?.id == local,
@@ -838,15 +1302,30 @@ actor SecureMessagingExchangeCoordinator {
               let conversation = snapshot.conversations.first(where: {
                   $0.id == conversationID
               }),
-              conversation.participantUserIds.count == 2,
-              Set(conversation.participantUserIds) == Set([local, recipient])
+              Self.permitsDeferredQueue(
+                  conversation: conversation,
+                  localUserID: local,
+                  expectedRecipientUserID: recipient
+              )
         else { throw SecureMessagingExchangeError.invalidConversation }
+        if let reaction {
+            try Self.requireLocalReactionTarget(
+                reaction,
+                conversationID: conversationID,
+                in: snapshot
+            )
+        }
+        let commandRecipients = Self.deferredCommandRecipients(
+            conversation: conversation,
+            localUserID: local,
+            expectedRecipientUserID: recipient
+        )
         if let clientMessageID,
            let existing = try Self.existingDeferredTextResult(
                in: snapshot,
                clientMessageID: clientMessageID,
                localUserID: local,
-               recipientUserID: recipient,
+               recipientUserIDs: commandRecipients,
                conversation: conversation,
                body: body
            ) {
@@ -856,6 +1335,12 @@ actor SecureMessagingExchangeCoordinator {
         let messageID = clientMessageID ?? UUID()
         let commandID = UUID()
         let createdAt = Date()
+        // A Send Later item is an ordinary queued command dated forward. It is encrypted at its
+        // send time against the roster that is authoritative then, exactly like every other
+        // deferred message, so scheduling adds no second delivery path to keep idempotent.
+        let scheduledAt = deliverAt.flatMap {
+            ScheduledSendPolicy.normalize($0, now: createdAt)
+        }
         let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
         let localMessage = LocalMessage(
             id: messageID,
@@ -866,24 +1351,32 @@ actor SecureMessagingExchangeCoordinator {
             sentAt: nil,
             state: .queued,
             failureReason: nil,
-            isOutgoing: true
+            isOutgoing: true,
+            scheduledAt: scheduledAt
         )
         let command = OfflineCommand(
             id: commandID,
             kind: .secureMessage,
             createdAt: createdAt,
-            nextAttemptAt: createdAt,
+            nextAttemptAt: scheduledAt ?? createdAt,
             attemptCount: 0,
             conversationId: conversationID,
             messageId: messageID,
-            recipientUserIds: [recipient],
+            recipientUserIds: commandRecipients,
             recipientName: cleanTitle.isEmpty ? conversation.title : cleanTitle,
             video: nil,
             expiresAt: nil,
-            secureMessageFanout: nil
+            secureMessageFanout: nil,
+            scheduledAt: scheduledAt
         )
         var updatedConversation = conversation
-        updatedConversation.updatedAt = createdAt
+        // Reactions are timeline metadata, not chat activity. Keep the existing ordering date
+        // locally just as the receiving path does after decrypting the descriptor.
+        // A scheduled item is likewise not activity yet: promoting the thread hours before
+        // anything is sent would advertise the surprise the sender is arranging.
+        if reaction == nil, scheduledAt == nil {
+            updatedConversation.updatedAt = createdAt
+        }
         let queuedConversation = updatedConversation
         let commitMutation: (inout PersistedState) throws -> Void = { state in
                 guard state.profile?.id == local,
@@ -921,13 +1414,20 @@ actor SecureMessagingExchangeCoordinator {
                       let racedConversation = raced.conversations.first(where: {
                           $0.id == conversationID
                       }),
-                      racedConversation.participantUserIds.count == 2,
-                      Set(racedConversation.participantUserIds) == Set([local, recipient]),
+                      Self.permitsDeferredQueue(
+                          conversation: racedConversation,
+                          localUserID: local,
+                          expectedRecipientUserID: recipient
+                      ),
                       let existing = try Self.existingDeferredTextResult(
                           in: raced,
                           clientMessageID: clientMessageID,
                           localUserID: local,
-                          recipientUserID: recipient,
+                          recipientUserIDs: Self.deferredCommandRecipients(
+                              conversation: racedConversation,
+                              localUserID: local,
+                              expectedRecipientUserID: recipient
+                          ),
                           conversation: racedConversation,
                           body: body
                       )
@@ -940,6 +1440,91 @@ actor SecureMessagingExchangeCoordinator {
             conversation: queuedConversation,
             clientMessageID: messageID
         )
+    }
+
+    /// Direct queueing keeps its exact two-party rule; a nil pinned recipient is valid only for
+    /// a stored, validated group thread that includes the local account. Fail closed otherwise.
+    private static func permitsDeferredQueue(
+        conversation: Conversation,
+        localUserID: String,
+        expectedRecipientUserID: String?
+    ) -> Bool {
+        if let recipient = expectedRecipientUserID {
+            // A pinned single peer is exclusively a DIRECT contract — even a two-member group
+            // must be addressed as a group so its roster/attestation semantics apply.
+            return !conversation.isGroup
+                && conversation.participantUserIds.count == 2
+                && Set(conversation.participantUserIds) == Set([localUserID, recipient])
+        }
+        return conversation.isGroup
+            && (2 ... SecureMessagingWire.maximumGroupMembers)
+                .contains(conversation.participantUserIds.count)
+            && Set(conversation.participantUserIds).count
+                == conversation.participantUserIds.count
+            && conversation.participantUserIds.contains(localUserID)
+    }
+
+    /// Rich media requires EVERY receiving member's devices to be attested — one stale member
+    /// blocks the send instead of silently degrading or excluding them.
+    private static func requireRichMediaRecipientSupport(
+        mediaType: String,
+        roster: MessagingDeviceRosterDTO,
+        conversationID: String,
+        currentDeviceID: String,
+        recipientUserIDs: [String]
+    ) throws {
+        guard !recipientUserIDs.isEmpty,
+              recipientUserIDs.allSatisfy({ recipient in
+                  MessagingRichMediaCapabilityPolicy.supports(
+                      mediaType: mediaType,
+                      roster: roster,
+                      conversationID: conversationID,
+                      currentDeviceID: currentDeviceID,
+                      recipientUserID: recipient
+                  )
+              })
+        else { throw SecureMediaAttachmentError.incompatibleRecipient }
+    }
+
+    private static func requireLargeMediaRecipientSupport(
+        plaintextByteSize: Int,
+        roster: MessagingDeviceRosterDTO,
+        conversationID: String,
+        currentDeviceID: String,
+        memberUserIDs: Set<String>
+    ) throws {
+        guard MessagingRichMediaCapabilityPolicy.supportsPlaintextByteSize(
+            plaintextByteSize,
+            roster: roster,
+            conversationID: conversationID,
+            currentDeviceID: currentDeviceID,
+            memberUserIDs: memberUserIDs
+        ) else { throw SecureMediaAttachmentError.incompatibleRecipient }
+    }
+
+    /// Sorted members minus self for groups; the single pinned peer for direct threads.
+    private static func deferredCommandRecipients(
+        conversation: Conversation,
+        localUserID: String,
+        expectedRecipientUserID: String?
+    ) -> [String] {
+        if let recipient = expectedRecipientUserID { return [recipient] }
+        return conversation.participantUserIds.filter { $0 != localUserID }.sorted()
+    }
+
+    private static func requireLocalReactionTarget(
+        _ reaction: KitMessageReaction,
+        conversationID: String,
+        in state: PersistedState
+    ) throws {
+        let matches = state.messages.filter {
+            $0.conversationId == conversationID
+                && $0.serverMessageId == reaction.targetServerMessageID
+                && $0.secureMessagingHistory?.kind != .encryptedReaction
+        }
+        guard matches.count == 1 else {
+            throw SecureMessagingExchangeError.invalidConversation
+        }
     }
 
     /// Restores one commandless failed plaintext message to the encrypted outbox without network
@@ -1045,7 +1630,7 @@ actor SecureMessagingExchangeCoordinator {
         in state: PersistedState,
         clientMessageID: UUID,
         localUserID: String,
-        recipientUserID: String,
+        recipientUserIDs: [String],
         conversation: Conversation,
         body: String
     ) throws -> SecureMessagingQueueResult? {
@@ -1071,7 +1656,7 @@ actor SecureMessagingExchangeCoordinator {
         if let command = commands.first {
             guard command.kind == .secureMessage,
                   command.conversationId == conversation.id,
-                  command.recipientUserIds == [recipientUserID]
+                  command.recipientUserIds == recipientUserIDs
             else { throw SecureMessagingExchangeError.invalidConversation }
         } else {
             guard [.sent, .delivered, .read, .failed].contains(message.state) else {
@@ -1090,7 +1675,7 @@ actor SecureMessagingExchangeCoordinator {
     func queueDeferredImage(
         forUserID userID: String,
         conversationID: String,
-        expectedRecipientUserID: String,
+        expectedRecipientUserID: String?,
         title: String,
         mediaData: Data,
         mediaType: String,
@@ -1098,17 +1683,17 @@ actor SecureMessagingExchangeCoordinator {
         localStorageKey: String? = nil,
         clientMessageID: UUID? = nil,
         submittedDraftBody: String? = nil,
-        draftClearVersion: ConversationDraftWriteVersion? = nil
+        draftClearVersion: ConversationDraftWriteVersion? = nil,
+        deliverAt: Date? = nil
     ) async throws -> SecureMessagingQueueResult {
         guard (submittedDraftBody == nil) == (draftClearVersion == nil) else {
             throw SecureMessagingCryptoError.invalidContent
         }
         let local = try canonicalUUID(userID, error: .invalidAccount)
         let conversationID = try canonicalUUID(conversationID, error: .invalidConversation)
-        let recipient = try canonicalUUID(
-            expectedRecipientUserID,
-            error: .invalidRecipient
-        )
+        let recipient = try expectedRecipientUserID.map {
+            try canonicalUUID($0, error: .invalidRecipient)
+        }
         let trimmedCaption = caption?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let normalizedCaption = trimmedCaption?.isEmpty == false ? trimmedCaption : nil
@@ -1134,9 +1719,17 @@ actor SecureMessagingExchangeCoordinator {
               let conversation = snapshot.conversations.first(where: {
                   $0.id == conversationID
               }),
-              conversation.participantUserIds.count == 2,
-              Set(conversation.participantUserIds) == Set([local, recipient])
+              Self.permitsDeferredQueue(
+                  conversation: conversation,
+                  localUserID: local,
+                  expectedRecipientUserID: recipient
+              )
         else { throw SecureMessagingExchangeError.invalidConversation }
+        let commandRecipients = Self.deferredCommandRecipients(
+            conversation: conversation,
+            localUserID: local,
+            expectedRecipientUserID: recipient
+        )
         // No network at queue time: the offline path must succeed in airplane mode. The rich-media
         // recipient-capability gate still runs authoritatively at flush (prepareDeferredMessage)
         // and again per-encrypt in queueText before any bytes leave the device.
@@ -1159,6 +1752,11 @@ actor SecureMessagingExchangeCoordinator {
         let messageID = clientMessageID ?? UUID()
         let commandID = UUID()
         let createdAt = Date()
+        // The photo is already parked in the account-bound encrypted cache; scheduling only moves
+        // the upload-and-send attempt to a later minute.
+        let scheduledAt = deliverAt.flatMap {
+            ScheduledSendPolicy.normalize($0, now: createdAt)
+        }
         let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
         let localMessage = LocalMessage(
             id: messageID,
@@ -1176,24 +1774,28 @@ actor SecureMessagingExchangeCoordinator {
                 caption: normalizedCaption,
                 localStorageKey: storesInline ? nil : canonicalLocalStorageKey,
                 byteCount: mediaData.count
-            )
+            ),
+            scheduledAt: scheduledAt
         )
         let command = OfflineCommand(
             id: commandID,
             kind: .secureMessage,
             createdAt: createdAt,
-            nextAttemptAt: createdAt,
+            nextAttemptAt: scheduledAt ?? createdAt,
             attemptCount: 0,
             conversationId: conversationID,
             messageId: messageID,
-            recipientUserIds: [recipient],
+            recipientUserIds: commandRecipients,
             recipientName: cleanTitle.isEmpty ? conversation.title : cleanTitle,
             video: nil,
             expiresAt: nil,
-            secureMessageFanout: nil
+            secureMessageFanout: nil,
+            scheduledAt: scheduledAt
         )
         var updatedConversation = conversation
-        updatedConversation.updatedAt = createdAt
+        if scheduledAt == nil {
+            updatedConversation.updatedAt = createdAt
+        }
         let queuedConversation = updatedConversation
         try await store.update { state in
             guard state.profile?.id == local,
@@ -1236,20 +1838,44 @@ actor SecureMessagingExchangeCoordinator {
               let message = snapshot.messages.first(where: { $0.id == messageID }),
               let conversationID = command.conversationId,
               let recipients = command.recipientUserIds,
-              recipients.count == 1,
-              let recipient = recipients.first,
+              (1 ... SecureMessagingWire.maximumGroupMembers - 1).contains(recipients.count),
               message.conversationId == conversationID,
               message.senderId == local
         else { throw SecureMessagingExchangeError.invalidConversation }
+        // A stored group thread flushes with no pinned single recipient; every other command
+        // keeps the exact direct two-party pin (fail closed on nil).
+        let queuedAsGroup = snapshot.conversations.first(where: {
+            $0.id == conversationID
+        })?.isGroup == true
+        let expectedRecipient: String?
+        if queuedAsGroup {
+            expectedRecipient = nil
+        } else {
+            guard recipients.count == 1, let recipient = recipients.first else {
+                throw SecureMessagingExchangeError.invalidConversation
+            }
+            expectedRecipient = recipient
+        }
         var ownedMessage = message
         do {
             let dto = try await transport.messagingConversation(id: conversationID)
             let conversation = try validateConversation(
                 dto,
                 currentUserID: local,
-                expectedRecipientUserID: recipient,
+                expectedRecipientUserID: expectedRecipient,
                 fallbackTitle: command.recipientName ?? "Kit Pay contact"
             )
+            guard conversation.isGroup == queuedAsGroup else {
+                throw SecureMessagingExchangeError.invalidConversation
+            }
+            // Never widen an offline message's audience. If group membership changed after the
+            // message was queued, leave the old projection intact for an explicit user retry
+            // instead of encrypting it to a newly added member (or a now-removed member).
+            guard command.recipientUserIds == conversation.outboundRecipientUserIDs(
+                excluding: local
+            ) else {
+                throw SecureMessagingExchangeError.staleOutboundFanout
+            }
             try await requireExactPendingProjection(
                 command,
                 message: message,
@@ -1271,20 +1897,34 @@ actor SecureMessagingExchangeCoordinator {
                 }
                 guard mediaData.count <= SecureMediaAttachmentCipher.maximumPlaintextBytes
                 else { throw SecureMediaAttachmentError.invalidMedia }
-                if KitChatMediaKind(mediaType: pending.mediaType) != .image {
+                if KitChatMediaKind(mediaType: pending.mediaType) != .image
+                    || mediaData.count
+                        > MessagingRichMediaCapabilityPolicy
+                            .broadlyCompatibleMaximumPlaintextBytes {
                     guard let enrollment = snapshot.secureMessaging?.enrollment else {
                         throw SecureMessagingExchangeError.invalidAccount
                     }
                     let roster = try await transport.messagingDeviceRoster(
                         conversationId: conversationID
                     )
-                    guard MessagingRichMediaCapabilityPolicy.supports(
-                        mediaType: pending.mediaType,
+                    if KitChatMediaKind(mediaType: pending.mediaType) != .image {
+                        try Self.requireRichMediaRecipientSupport(
+                            mediaType: pending.mediaType,
+                            roster: roster,
+                            conversationID: conversationID,
+                            currentDeviceID: enrollment.serverDeviceID,
+                            recipientUserIDs: conversation.outboundRecipientUserIDs(
+                                excluding: local
+                            )
+                        )
+                    }
+                    try Self.requireLargeMediaRecipientSupport(
+                        plaintextByteSize: mediaData.count,
                         roster: roster,
                         conversationID: conversationID,
                         currentDeviceID: enrollment.serverDeviceID,
-                        recipientUserID: recipient
-                    ) else { throw SecureMediaAttachmentError.incompatibleRecipient }
+                        memberUserIDs: conversation.memberUserIDs
+                    )
                 }
                 _ = try await activation.activate(forUserID: local)
                 let descriptor = try await uploadMediaDescriptor(
@@ -1334,6 +1974,7 @@ actor SecureMessagingExchangeCoordinator {
             } else if message.attachmentData != nil {
                 throw SecureMediaAttachmentError.invalidDescriptor
             }
+            let preparedDescriptor = KitMediaMessageDescriptor.parse(preparedMessage.body)
             return try await queueText(
                 forUserID: local,
                 conversation: conversation,
@@ -1344,7 +1985,9 @@ actor SecureMessagingExchangeCoordinator {
                 expectedExistingCommand: command,
                 expectedExistingMessage: preparedMessage,
                 requiredRichMediaType: preparedMessage.pendingAttachment?.mediaType
-                    ?? KitMediaMessageDescriptor.parse(preparedMessage.body)?.mediaType
+                    ?? preparedDescriptor?.mediaType,
+                requiredPlaintextBytes: preparedMessage.pendingAttachment?.byteCount
+                    ?? preparedDescriptor?.plaintextByteSize
             )
         } catch {
             // A transport, validation, activation, roster, or crypto failure belongs only to the
@@ -1419,20 +2062,31 @@ actor SecureMessagingExchangeCoordinator {
             fallbackTitle: title
         )
         _ = try await activation.activate(forUserID: local)
-        if KitChatMediaKind(mediaType: mediaType) != .image {
+        if KitChatMediaKind(mediaType: mediaType) != .image
+            || mediaData.count
+                > MessagingRichMediaCapabilityPolicy.broadlyCompatibleMaximumPlaintextBytes {
             let snapshot = await store.snapshot()
             guard snapshot.profile?.id == local,
                   let enrollment = snapshot.secureMessaging?.enrollment,
                   enrollment.userID == local
             else { throw SecureMessagingExchangeError.invalidAccount }
             let roster = try await transport.messagingDeviceRoster(conversationId: conversationID)
-            guard MessagingRichMediaCapabilityPolicy.supports(
-                mediaType: mediaType,
+            if KitChatMediaKind(mediaType: mediaType) != .image {
+                guard MessagingRichMediaCapabilityPolicy.supports(
+                    mediaType: mediaType,
+                    roster: roster,
+                    conversationID: conversationID,
+                    currentDeviceID: enrollment.serverDeviceID,
+                    recipientUserID: recipient
+                ) else { throw SecureMediaAttachmentError.incompatibleRecipient }
+            }
+            try Self.requireLargeMediaRecipientSupport(
+                plaintextByteSize: mediaData.count,
                 roster: roster,
                 conversationID: conversationID,
                 currentDeviceID: enrollment.serverDeviceID,
-                recipientUserID: recipient
-            ) else { throw SecureMediaAttachmentError.incompatibleRecipient }
+                memberUserIDs: validated.memberUserIDs
+            )
         }
         let descriptor = try await uploadMediaDescriptor(
             mediaData: mediaData,
@@ -1446,7 +2100,8 @@ actor SecureMessagingExchangeCoordinator {
             attachmentData: storesInlineAttachment ? mediaData : nil,
             submittedDraftBody: submittedDraftBody,
             draftClearVersion: draftClearVersion,
-            requiredRichMediaType: mediaType
+            requiredRichMediaType: mediaType,
+            requiredPlaintextBytes: mediaData.count
         )
     }
 
@@ -1552,10 +2207,19 @@ actor SecureMessagingExchangeCoordinator {
         expectedExistingMessage: LocalMessage? = nil,
         submittedDraftBody: String? = nil,
         draftClearVersion: ConversationDraftWriteVersion? = nil,
-        requiredRichMediaType: String? = nil
+        requiredRichMediaType: String? = nil,
+        requiredPlaintextBytes: Int? = nil
     ) async throws -> SecureMessagingQueueResult {
         let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !body.isEmpty else { throw SecureMessagingCryptoError.invalidContent }
+        let beginsReaction = SecureMessageReservedPrefixPolicy.beginsWithReservedPrefix(
+            body,
+            prefix: KitMessageReaction.prefix
+        )
+        let reaction = KitMessageReaction.parse(body)
+        guard !body.isEmpty,
+              !beginsReaction || reaction != nil,
+              (requiredRichMediaType == nil) == (requiredPlaintextBytes == nil)
+        else { throw SecureMessagingCryptoError.invalidContent }
         guard (existingCommandID == nil) == (existingMessageID == nil),
               newClientMessageID == nil || existingMessageID == nil,
               (expectedExistingCommand == nil) == (existingCommandID == nil),
@@ -1587,12 +2251,22 @@ actor SecureMessagingExchangeCoordinator {
                   let enrollment = initialCrypto.enrollment,
                   enrollment.userID == userID
             else { throw SecureMessagingExchangeError.invalidAccount }
+            let outboundRecipientUserIDs = conversation.outboundRecipientUserIDs(
+                excluding: userID
+            )
+            if let reaction {
+                try Self.requireLocalReactionTarget(
+                    reaction,
+                    conversationID: conversation.id,
+                    in: snapshot
+                )
+            }
             if let newClientMessageID,
                let existing = try Self.existingDeferredTextResult(
                    in: snapshot,
                    clientMessageID: newClientMessageID,
                    localUserID: userID,
-                   recipientUserID: conversation.recipientUserID,
+                   recipientUserIDs: outboundRecipientUserIDs,
                    conversation: conversation.localProjection,
                    body: body
                ) {
@@ -1602,16 +2276,44 @@ actor SecureMessagingExchangeCoordinator {
             let rosterDTO = try await transport.messagingDeviceRoster(
                 conversationId: conversation.id
             )
-            if let requiredRichMediaType,
-               KitChatMediaKind(mediaType: requiredRichMediaType) != .image,
-               !MessagingRichMediaCapabilityPolicy.supports(
-                   mediaType: requiredRichMediaType,
+            if conversation.isGroup,
+               !MessagingGroupCapabilityPolicy.supports(
                    roster: rosterDTO,
                    conversationID: conversation.id,
                    currentDeviceID: enrollment.serverDeviceID,
-                   recipientUserID: conversation.recipientUserID
+                   memberUserIDs: conversation.memberUserIDs
                ) {
-                throw SecureMediaAttachmentError.incompatibleRecipient
+                // Fail closed: group ciphertext never leaves this device unless every member
+                // device is server-attested for the group protocol.
+                throw SecureMessagingExchangeError.groupCapabilityUnavailable
+            }
+            if reaction != nil,
+               !MessagingReactionCapabilityPolicy.supports(
+                   roster: rosterDTO,
+                   conversationID: conversation.id,
+                   currentDeviceID: enrollment.serverDeviceID,
+                   memberUserIDs: conversation.memberUserIDs
+               ) {
+                throw SecureMessagingExchangeError.reactionCapabilityUnavailable
+            }
+            if let requiredRichMediaType,
+               KitChatMediaKind(mediaType: requiredRichMediaType) != .image {
+                try Self.requireRichMediaRecipientSupport(
+                    mediaType: requiredRichMediaType,
+                    roster: rosterDTO,
+                    conversationID: conversation.id,
+                    currentDeviceID: enrollment.serverDeviceID,
+                    recipientUserIDs: outboundRecipientUserIDs
+                )
+            }
+            if let requiredPlaintextBytes {
+                try Self.requireLargeMediaRecipientSupport(
+                    plaintextByteSize: requiredPlaintextBytes,
+                    roster: rosterDTO,
+                    conversationID: conversation.id,
+                    currentDeviceID: enrollment.serverDeviceID,
+                    memberUserIDs: conversation.memberUserIDs
+                )
             }
             let roster = try SecureMessagingMapper.roster(
                 from: rosterDTO,
@@ -1657,7 +2359,7 @@ actor SecureMessagingExchangeCoordinator {
                 conversationID: conversation.id,
                 clientMessageID: canonicalClientMessageID,
                 rosterRevision: roster.rosterRevision,
-                replyToMessageID: nil,
+                replyToMessageID: reaction?.targetServerMessageID,
                 text: body,
                 recipients: recipients
             )
@@ -1704,7 +2406,7 @@ actor SecureMessagingExchangeCoordinator {
                 attemptCount: existingCommand?.attemptCount ?? 0,
                 conversationId: conversation.id,
                 messageId: clientMessageID,
-                recipientUserIds: [conversation.recipientUserID],
+                recipientUserIds: outboundRecipientUserIDs,
                 recipientName: conversation.title,
                 video: nil,
                 expiresAt: nil,
@@ -1787,12 +2489,14 @@ actor SecureMessagingExchangeCoordinator {
                 conversationId: fanout.conversationID,
                 request: try SecureMessagingMapper.sendRequest(
                     from: fanout,
+                    plaintext: localMessage.body,
                     attachments: attachments
                 )
             )
             let outbound = try validateOutboundResponse(
                 response,
                 fanout: fanout,
+                expectedPlaintext: localMessage.body,
                 expectedAttachments: attachments,
                 userID: userID,
                 enrollment: snapshot.secureMessaging?.enrollment
@@ -1909,7 +2613,9 @@ actor SecureMessagingExchangeCoordinator {
                     if message.conversationId == conversationID,
                        !message.isOutgoing,
                        message.serverMessageId != nil,
-                       message.state == .received {
+                       message.state == .received,
+                       // Reaction events are metadata and never count as unread.
+                       message.secureMessagingHistory?.kind != .encryptedReaction {
                         count += 1
                     }
                 }
@@ -2401,7 +3107,11 @@ actor SecureMessagingExchangeCoordinator {
             guard seenConversationIDs.insert(conversationID).inserted else {
                 throw SecureMessagingExchangeError.invalidServerResponse
             }
-            guard type == SecureMessagingWire.directConversationType else { continue }
+            // Direct and group threads are protocol-known; anything else is skipped silently so
+            // a server-side conversation-type rollout cannot break same-account history repair.
+            guard type == SecureMessagingWire.directConversationType
+                    || type == SecureMessagingWire.groupConversationType
+            else { continue }
             conversations.append(try validateConversation(
                 dto,
                 currentUserID: userID,
@@ -2556,6 +3266,31 @@ actor SecureMessagingExchangeCoordinator {
         return next
     }
 
+    private func loadHistoricalRoster(
+        revision: String,
+        conversation: ValidatedDirectConversation,
+        enrollment: SecureMessagingEnrollmentBinding,
+        allowMissingCurrentDevice: Bool
+    ) async throws -> SecureMessagingRosterSnapshot {
+        guard SecureMessagingValidation.isRosterRevision(revision) else {
+            throw SecureMessagingCryptoError.invalidContent
+        }
+        let dto = try await transport.historicalMessagingDeviceRoster(
+            conversationId: conversation.id,
+            rosterRevision: revision
+        )
+        return try SecureMessagingMapper.roster(
+            from: dto,
+            use: .historical,
+            expectedConversationID: conversation.id,
+            currentDeviceID: enrollment.serverDeviceID,
+            currentUserID: enrollment.userID,
+            expectedMemberUserIDs: conversation.memberUserIDs,
+            allowHistoricalGroupMembershipChurn: conversation.isGroup,
+            allowMissingCurrentDeviceInHistoricalRoster: allowMissingCurrentDevice
+        )
+    }
+
     private func loadHistoryBackfillPage(
         task: SecureMessagingHistoryBackfillTask,
         userID: String,
@@ -2622,22 +3357,44 @@ actor SecureMessagingExchangeCoordinator {
         else { throw SecureMessagingExchangeError.invalidServerResponse }
 
         var seen: Set<String> = []
-        let candidates = try rawMessages.compactMap { raw -> ValidatedHistoryCandidate? in
-            guard let raw, let rawSentAt = raw.sentAt else {
+        var originalRostersByRevision: [String: SecureMessagingRosterSnapshot] = [:]
+        var candidates: [ValidatedHistoryCandidate] = []
+        for rawValue in rawMessages {
+            try Task.checkCancellation()
+            guard let raw = rawValue, let rawSentAt = raw.sentAt else {
                 throw SecureMessagingExchangeError.invalidServerResponse
             }
             let identity = try SecureMessagingMapper.historyCandidateIdentity(
                 from: raw,
                 expectedConversationID: conversation.id
             )
-            guard conversation.memberUserIDs.contains(identity.senderUserID),
-                  seen.insert(identity.messageID).inserted
-            else { throw SecureMessagingExchangeError.invalidServerResponse }
-            return ValidatedHistoryCandidate(
+            guard seen.insert(identity.messageID).inserted else {
+                throw SecureMessagingExchangeError.invalidServerResponse
+            }
+            let originalRoster: SecureMessagingRosterSnapshot
+            if let cached = originalRostersByRevision[identity.rosterRevision] {
+                originalRoster = cached
+            } else {
+                let loaded = try await loadHistoricalRoster(
+                    revision: identity.rosterRevision,
+                    conversation: conversation,
+                    enrollment: enrollment,
+                    allowMissingCurrentDevice: true
+                )
+                originalRostersByRevision[identity.rosterRevision] = loaded
+                originalRoster = loaded
+            }
+            let validatedSender = try SecureMessagingMapper.validatedHistoricalSender(
+                from: raw,
+                identity: identity,
+                roster: originalRoster
+            )
+            candidates.append(ValidatedHistoryCandidate(
                 dto: raw,
                 identity: identity,
+                validatedSender: validatedSender,
                 rawSentAt: rawSentAt
-            )
+            ))
         }
         return ValidatedHistoryBackfillPage(
             conversation: conversation,
@@ -2661,10 +3418,11 @@ actor SecureMessagingExchangeCoordinator {
         guard let retained = matches.first else { return nil }
         guard let metadata = retained.secureMessagingHistory else { return nil }
         let expectedAttachments = KitMediaMessageDescriptor.attachments(for: retained.body)
-        let expectedKind: SecureMessagingMessageKind = expectedAttachments.isEmpty
-            ? .encrypted
-            : .encryptedAttachment
-        guard metadata == candidate.identity.retainedMetadata,
+        guard SecureMessagingMapper.retainedMetadataMatches(
+                  metadata,
+                  identity: candidate.identity,
+                  validatedSender: candidate.validatedSender
+              ),
               retained.conversationId == candidate.identity.conversationID,
               retained.senderId == candidate.identity.senderUserID,
               retained.isOutgoing == (candidate.identity.senderUserID == currentUserID),
@@ -2673,9 +3431,11 @@ actor SecureMessagingExchangeCoordinator {
                   sentAt,
                   candidate.identity.sentAt
               ),
-              expectedKind == candidate.identity.kind,
-              (!retained.body.hasPrefix(KitMediaMessageDescriptor.prefix)
-                  || !expectedAttachments.isEmpty),
+              SecureMessagingContentBindingPolicy.kind(
+                  for: retained.body,
+                  replyToMessageID: candidate.identity.replyToMessageID,
+                  attachments: expectedAttachments
+              ) == candidate.identity.kind,
               KitMediaMessageDescriptor.validates(
                   candidate.dto.attachments,
                   against: expectedAttachments
@@ -2730,6 +3490,11 @@ actor SecureMessagingExchangeCoordinator {
             guard initialCrypto.historyOutboundEnvelopes.count < 10_000 else {
                 throw SecureMessagingCryptoError.recordLimitExceeded
             }
+            // Upgrade legacy in-memory metadata only for descriptor validation. The stored
+            // record remains untouched; `validatedHistorySource` already bound its omitted
+            // sender to the original historical roster through `candidate.validatedSender`.
+            var retainedForEncoding = currentRetained
+            retainedForEncoding.secureMessagingHistory = candidate.identity.retainedMetadata
             let descriptor = try SecureMessagingHistoryBackfillCodec.encode(
                 transferClientMessageID: transferID,
                 targetDeviceID: task.targetDeviceID,
@@ -2737,7 +3502,7 @@ actor SecureMessagingExchangeCoordinator {
                 transferRosterRevision: page.roster.rosterRevision,
                 candidate: candidate.identity,
                 rawSentAt: candidate.rawSentAt,
-                retained: currentRetained
+                retained: retainedForEncoding
             )
             var preparedCrypto = initialCrypto
             let missing = try await engine.recipientsRequiringSession(
@@ -2991,10 +3756,17 @@ actor SecureMessagingExchangeCoordinator {
         incoming: SecureMessagingHistoryInboundEnvelope
     ) throws -> SecureMessagingHistoryDescriptorDisposition {
         do {
-            return .authenticated(try SecureMessagingHistoryBackfillCodec.authenticate(
+            let authenticated = try SecureMessagingHistoryBackfillCodec.authenticate(
                 descriptor,
                 incoming: incoming
-            ))
+            )
+            guard !SecureMessageReservedPrefixPolicy.beginsWithReservedPrefix(
+                authenticated.text,
+                prefix: KitSystemMessage.prefix
+            ) else {
+                return .suppressed(acknowledgementMessageID: incoming.original.messageID)
+            }
+            return .authenticated(authenticated)
         } catch let error as SecureMessagingCryptoError where error == .invalidContent {
             return .suppressed(acknowledgementMessageID: incoming.original.messageID)
         } catch let error as SecureMessagingCryptoError {
@@ -3030,14 +3802,19 @@ actor SecureMessagingExchangeCoordinator {
         else { throw SecureMessagingCryptoError.invalidContent }
 
         let attachments = KitMediaMessageDescriptor.attachments(for: plaintext)
-        let isAttachment = !attachments.isEmpty
-        guard dto.kind == (isAttachment
-                  ? SecureMessagingMessageKind.encryptedAttachment.rawValue
-                  : SecureMessagingMessageKind.encrypted.rawValue),
-              (!SecureMessageReservedPrefixPolicy.beginsWithReservedPrefix(
+        guard let rawKind = dto.kind,
+              let kind = SecureMessagingMessageKind(rawValue: rawKind),
+              SecureMessagingContentBindingPolicy.kind(
+                  for: plaintext,
+                  replyToMessageID: envelope.replyToMessageID,
+                  attachments: attachments
+              ) == kind,
+              // Lifecycle notices are server-authored local projections. No encrypted
+              // user-authored payload may enter their trusted display namespace.
+              !SecureMessageReservedPrefixPolicy.beginsWithReservedPrefix(
                   plaintext,
-                  prefix: KitMediaMessageDescriptor.prefix
-              ) || isAttachment),
+                  prefix: KitSystemMessage.prefix
+              ),
               KitMediaMessageDescriptor.validates(dto.attachments, against: attachments)
         else { return nil }
 
@@ -3055,11 +3832,12 @@ actor SecureMessagingExchangeCoordinator {
             isOutgoing: authoredOnCurrentAccount,
             secureMessagingHistory: SecureMessagingRetainedMessageMetadata(
                 clientMessageID: envelope.clientMessageID,
+                senderUserID: envelope.sender.address.userID,
                 senderDeviceID: envelope.sender.address.serverDeviceID,
                 senderEnrollmentEpoch: senderEnrollmentEpoch,
                 senderSignalDeviceID: envelope.sender.address.signalDeviceID,
                 rosterRevision: envelope.rosterRevision,
-                kind: isAttachment ? .encryptedAttachment : .encrypted,
+                kind: kind,
                 replyToMessageID: envelope.replyToMessageID
             )
         )
@@ -3072,7 +3850,9 @@ actor SecureMessagingExchangeCoordinator {
     ) {
         guard SecureMessagingValidation.isCanonicalUUID(currentDeviceID) else { return }
         for message in recovered {
-            guard let historyMetadata = message.secureMessagingHistory else { continue }
+            guard let historyMetadata = message.secureMessagingHistory,
+                  historyMetadata.senderUserID == message.senderId
+            else { continue }
             let serverMatches = state.messages.indices.filter {
                 state.messages[$0].serverMessageId == message.serverMessageId
             }
@@ -3086,9 +3866,11 @@ actor SecureMessagingExchangeCoordinator {
                           state.messages[index].sentAt ?? state.messages[index].createdAt,
                           message.sentAt ?? message.createdAt
                       ),
-                      state.messages[index].secureMessagingHistory.map({
-                          $0 == historyMetadata
-                      }) ?? true
+                      Self.recoveredHistoryMetadataIsCompatible(
+                          state.messages[index].secureMessagingHistory,
+                          authenticated: historyMetadata,
+                          senderUserID: message.senderId
+                      )
                 else { continue }
                 state.messages[index].secureMessagingHistory = historyMetadata
                 continue
@@ -3113,9 +3895,11 @@ actor SecureMessagingExchangeCoordinator {
                               message.sentAt ?? message.createdAt
                           )
                       }) ?? true,
-                      state.messages[index].secureMessagingHistory.map({
-                          $0 == historyMetadata
-                      }) ?? true
+                      Self.recoveredHistoryMetadataIsCompatible(
+                          state.messages[index].secureMessagingHistory,
+                          authenticated: historyMetadata,
+                          senderUserID: message.senderId
+                      )
                 else { continue }
                 state.messages[index].serverMessageId = message.serverMessageId
                 state.messages[index].sentAt = message.sentAt
@@ -3132,9 +3916,10 @@ actor SecureMessagingExchangeCoordinator {
                             || $0.secureMessageFanout?.clientMessageID
                                 == message.id.uuidString.lowercased())
                 }
-                if let conversationIndex = state.conversations.firstIndex(where: {
-                    $0.id == message.conversationId
-                }) {
+                if historyMetadata.kind != .encryptedReaction,
+                   let conversationIndex = state.conversations.firstIndex(where: {
+                       $0.id == message.conversationId
+                   }) {
                     state.conversations[conversationIndex].updatedAt = max(
                         state.conversations[conversationIndex].updatedAt,
                         message.createdAt
@@ -3145,15 +3930,38 @@ actor SecureMessagingExchangeCoordinator {
 
             guard clientMatches.isEmpty else { continue }
             state.messages.append(message)
-            if let index = state.conversations.firstIndex(where: {
-                $0.id == message.conversationId
-            }) {
+            if historyMetadata.kind != .encryptedReaction,
+               let index = state.conversations.firstIndex(where: {
+                   $0.id == message.conversationId
+               }) {
                 state.conversations[index].updatedAt = max(
                     state.conversations[index].updatedAt,
                     message.createdAt
                 )
             }
         }
+    }
+
+    /// `authenticated` is produced only after the receiver has bound the original sender to its
+    /// historical roster. A stored pre-field metadata record may omit that sender, but every
+    /// legacy field must still match and an explicitly persisted sender may never be replaced.
+    nonisolated static func recoveredHistoryMetadataIsCompatible(
+        _ stored: SecureMessagingRetainedMessageMetadata?,
+        authenticated: SecureMessagingRetainedMessageMetadata,
+        senderUserID: String
+    ) -> Bool {
+        guard SecureMessagingValidation.isCanonicalUUID(senderUserID),
+              authenticated.senderUserID == senderUserID
+        else { return false }
+        guard let stored else { return true }
+        return stored.clientMessageID == authenticated.clientMessageID
+            && (stored.senderUserID == nil || stored.senderUserID == senderUserID)
+            && stored.senderDeviceID == authenticated.senderDeviceID
+            && stored.senderEnrollmentEpoch == authenticated.senderEnrollmentEpoch
+            && stored.senderSignalDeviceID == authenticated.senderSignalDeviceID
+            && stored.rosterRevision == authenticated.rosterRevision
+            && stored.kind == authenticated.kind
+            && stored.replyToMessageID == authenticated.replyToMessageID
     }
 
     private nonisolated static func validHistoryCursor(_ cursor: String) -> Bool {
@@ -3205,22 +4013,69 @@ actor SecureMessagingExchangeCoordinator {
             var outboundEchoes: [OutboundEcho] = []
             var deliveryTransitions: [DeliveryTransition] = []
             var readTransitions: [ReadTransition] = []
+            var groupMemberTransitions: [GroupMemberTransition] = []
             var acknowledgementIDs: [String] = []
             var transitionCount = 0
             var shouldReconcileHistoryTargets = false
+            var originalHistoryRosters: [String: SecureMessagingRosterSnapshot] = [:]
 
             for event in events {
                 let type = try validateEvent(event)
                 switch type {
-                case "conversation.created":
-                    guard let conversationID = event.conversationId else {
+                case "conversation.created", "conversation.updated":
+                    guard let conversationID = event.conversationId,
+                          event.resourceType == "conversation",
+                          event.resourceId == conversationID
+                    else {
                         throw SecureMessagingExchangeError.invalidServerResponse
                     }
-                    let validated = try await loadConversation(
+                    if let validated = try await loadSyncConversationIfAvailable(
                         id: conversationID,
                         currentUserID: userID
+                    ) {
+                        conversations.append(validated.localProjection)
+                    }
+                    transitionCount += 1
+
+                case "membership.added", "membership.removed":
+                    let transition = try validatedGroupMemberTransition(
+                        event,
+                        type: type,
+                        currentUserID: userID
                     )
-                    conversations.append(validated.localProjection)
+                    if transition.kind == .memberAdded,
+                       transition.subjectUserID == userID {
+                        // Being added to a group this device has never seen must materialize
+                        // the thread itself — the membership commit below needs a target even
+                        // when the server sends no separate conversation.created. If this account
+                        // has already been removed again, skip the stale add transition as well.
+                        if let validated = try await loadSyncConversationIfAvailable(
+                            id: transition.conversationID,
+                            currentUserID: userID
+                        ) {
+                            conversations.append(validated.localProjection)
+                            groupMemberTransitions.append(transition)
+                        }
+                    } else {
+                        // Another member's transition mutates only a locally known group. It must
+                        // not resurrect a thread that this user deleted from this installation.
+                        groupMemberTransitions.append(transition)
+                    }
+                    transitionCount += 1
+
+                case "membership.role_changed":
+                    let roleChange = try validatedGroupRoleChange(event, type: type)
+                    // Role changes do not create timeline notices, but they must replace the
+                    // authenticated role map (and any concurrent title/roster changes) before
+                    // advancing the cursor. Never resurrect a thread deleted from this device.
+                    if snapshot.conversations.contains(where: {
+                        $0.id == roleChange.conversationID && $0.isGroup
+                    }), let validated = try await loadSyncConversationIfAvailable(
+                        id: roleChange.conversationID,
+                        currentUserID: userID
+                    ) {
+                        conversations.append(validated.localProjection)
+                    }
                     transitionCount += 1
 
                 case "message.created":
@@ -3232,18 +4087,16 @@ actor SecureMessagingExchangeCoordinator {
                     guard let conversationID = dto.conversationId,
                           event.conversationId == conversationID
                     else { throw SecureMessagingExchangeError.invalidServerResponse }
-                    let conversation = try await loadConversation(
+                    guard let conversation = try await loadSyncConversationIfAvailable(
                         id: conversationID,
                         currentUserID: userID
-                    )
+                    ) else { continue }
                     conversations.append(conversation.localProjection)
                     if dto.envelope?.isHistoryBackfill == true {
-                        guard [
-                            SecureMessagingMessageKind.encrypted.rawValue,
-                            SecureMessagingMessageKind.encryptedAttachment.rawValue,
-                        ].contains(dto.kind),
+                        guard dto.kind.flatMap(SecureMessagingMessageKind.init(rawValue:)) != nil,
                               dto.revokedAt == nil,
-                              let transferRevision = dto.envelope?.transferRosterRevision
+                              let transferRevision = dto.envelope?.transferRosterRevision,
+                              let originalRevision = dto.rosterRevision
                         else { throw SecureMessagingCryptoError.invalidContent }
                         let rosterDTO = try await transport.historicalMessagingDeviceRoster(
                             conversationId: conversation.id,
@@ -3255,13 +4108,33 @@ actor SecureMessagingExchangeCoordinator {
                             expectedConversationID: conversation.id,
                             currentDeviceID: enrollment.serverDeviceID,
                             currentUserID: userID,
-                            expectedMemberUserIDs: conversation.memberUserIDs
+                            expectedMemberUserIDs: conversation.memberUserIDs,
+                            allowHistoricalGroupMembershipChurn: conversation.isGroup
                         )
+                        let originalRoster: SecureMessagingRosterSnapshot
+                        if originalRevision == transferRoster.rosterRevision {
+                            originalRoster = transferRoster
+                        } else {
+                            let cacheKey = "\(conversation.id):\(originalRevision)"
+                            if let cached = originalHistoryRosters[cacheKey] {
+                                originalRoster = cached
+                            } else {
+                                let loaded = try await loadHistoricalRoster(
+                                    revision: originalRevision,
+                                    conversation: conversation,
+                                    enrollment: enrollment,
+                                    allowMissingCurrentDevice: true
+                                )
+                                originalHistoryRosters[cacheKey] = loaded
+                                originalRoster = loaded
+                            }
+                        }
                         let historyEnvelope = try SecureMessagingMapper.historyInboundEnvelope(
                             from: dto,
                             localRecipient: enrollment.address,
                             localEnrollment: enrollment,
-                            transferRoster: transferRoster
+                            transferRoster: transferRoster,
+                            originalMessageRoster: originalRoster
                         )
                         let decrypted = try await engine.decryptText(
                             currentState: crypto,
@@ -3322,6 +4195,7 @@ actor SecureMessagingExchangeCoordinator {
                                 dto,
                                 conversation: conversation,
                                 enrollment: enrollment,
+                                expectedPlaintext: localMessage.body,
                                 expectedAttachments: KitMediaMessageDescriptor.attachments(
                                     for: localMessage.body
                                 ),
@@ -3342,10 +4216,7 @@ actor SecureMessagingExchangeCoordinator {
                             )
                         }
                     } else {
-                        guard [
-                            SecureMessagingMessageKind.encrypted.rawValue,
-                            SecureMessagingMessageKind.encryptedAttachment.rawValue,
-                        ].contains(dto.kind),
+                        guard dto.kind.flatMap(SecureMessagingMessageKind.init(rawValue:)) != nil,
                               dto.revokedAt == nil,
                               let revision = dto.rosterRevision
                         else { throw SecureMessagingCryptoError.invalidContent }
@@ -3359,7 +4230,8 @@ actor SecureMessagingExchangeCoordinator {
                             expectedConversationID: conversation.id,
                             currentDeviceID: enrollment.serverDeviceID,
                             currentUserID: userID,
-                            expectedMemberUserIDs: conversation.memberUserIDs
+                            expectedMemberUserIDs: conversation.memberUserIDs,
+                            allowHistoricalGroupMembershipChurn: conversation.isGroup
                         )
                         let envelope = try SecureMessagingMapper.inboundEnvelope(
                             from: dto,
@@ -3508,13 +4380,34 @@ actor SecureMessagingExchangeCoordinator {
             }
             crypto.syncCursor = nextCursor
 
+            // Reactions are metadata for an ordinary message, never independent timeline rows.
+            // Authenticate/decrypt first so their server events can be acknowledged, then retain
+            // only targets visible in the same conversation across existing and this-page state.
+            let reactionTargetCorpus = snapshot.messages
+                + incomingMessages
+                + recoveredHistoryMessages
+            incomingMessages = MessageReactionAggregationPolicy.retainingValidReactionTargets(
+                incomingMessages,
+                among: reactionTargetCorpus
+            )
+            recoveredHistoryMessages =
+                MessageReactionAggregationPolicy.retainingValidReactionTargets(
+                    recoveredHistoryMessages,
+                    among: reactionTargetCorpus
+                )
+
             do {
                 try await store.commitSecureMessaging(
                     forUserID: userID,
                     expectedState: initialCrypto,
                     nextState: crypto
                 ) { state in
-                    conversations.forEach { Self.upsert(conversation: $0, in: &state) }
+                    // Server conversation timestamps can advance for reaction-only events. Sync
+                    // the title/roster here, then derive visible activity exclusively from the
+                    // decrypted non-reaction messages and lifecycle events below.
+                    conversations.forEach {
+                        Self.upsert(conversation: $0, in: &state, advancesActivity: false)
+                    }
                     for echo in outboundEchoes {
                         if let index = state.messages.firstIndex(where: {
                             $0.id.uuidString.lowercased() == echo.clientMessageID
@@ -3539,13 +4432,19 @@ actor SecureMessagingExchangeCoordinator {
                         if let index = state.conversations.firstIndex(where: {
                             $0.id == message.conversationId
                         }) {
-                            if !message.isOutgoing {
+                            // Reaction events are metadata, not messages: they must never
+                            // bump the unread badge or resort the chat list.
+                            let isReactionEvent = message.secureMessagingHistory?.kind
+                                == .encryptedReaction
+                            if !message.isOutgoing, !isReactionEvent {
                                 state.conversations[index].unreadCount += 1
                             }
-                            state.conversations[index].updatedAt = max(
-                                state.conversations[index].updatedAt,
-                                message.createdAt
-                            )
+                            if !isReactionEvent {
+                                state.conversations[index].updatedAt = max(
+                                    state.conversations[index].updatedAt,
+                                    message.createdAt
+                                )
+                            }
                         }
                     }
                     Self.reconcileRecoveredHistoryMessages(
@@ -3571,6 +4470,75 @@ actor SecureMessagingExchangeCoordinator {
                             && state.messages[index].createdAt <= boundary.createdAt {
                             state.messages[index].state = .read
                         }
+                    }
+                    for transition in groupMemberTransitions {
+                        // Membership is mutable only on a locally known GROUP thread. A locally
+                        // deleted thread or a direct thread ignores the event (cursor still
+                        // advances); direct participant pairs must never be rewritten by sync.
+                        guard let index = state.conversations.firstIndex(where: {
+                            $0.id == transition.conversationID
+                        }), state.conversations[index].isGroup else { continue }
+                        let transitionDate = transition.systemMessage.createdAt
+                        if Self.serverProjectionIsNotOlder(
+                            conversationID: transition.conversationID,
+                            updatedAt: transitionDate,
+                            in: state
+                        ) {
+                            var participants = state.conversations[index].participantUserIds
+                            switch transition.kind {
+                            case .memberAdded:
+                                if !participants.contains(transition.subjectUserID) {
+                                    guard participants.count
+                                        < SecureMessagingWire.maximumGroupMembers
+                                    else {
+                                        throw SecureMessagingExchangeError.invalidServerResponse
+                                    }
+                                    participants.append(transition.subjectUserID)
+                                    participants.sort()
+                                    if var roles = state.conversations[index].groupMemberRoles,
+                                       let role = transition.role {
+                                        roles[transition.subjectUserID] = role
+                                        state.conversations[index].groupMemberRoles = roles
+                                    }
+                                }
+                            case .memberRemoved, .memberLeft:
+                                participants.removeAll { $0 == transition.subjectUserID }
+                                state.conversations[index].groupMemberRoles?
+                                    .removeValue(forKey: transition.subjectUserID)
+                            }
+                            state.conversations[index].participantUserIds = participants
+                            state.conversations[index].updatedAt = max(
+                                state.conversations[index].updatedAt,
+                                transitionDate
+                            )
+                            Self.recordServerProjection(
+                                conversationID: transition.conversationID,
+                                updatedAt: transitionDate,
+                                in: &state
+                            )
+                        }
+                        // The deterministic/resource-derived id makes a replayed page converge
+                        // on one system notice.
+                        if !state.messages.contains(where: {
+                            $0.id == transition.systemMessage.id
+                        }) {
+                            state.messages.append(transition.systemMessage)
+                        }
+                    }
+                    // Lifecycle pages can be delayed. Replay their ordered notices/transitions,
+                    // then let the current server projection win for title, roster and roles.
+                    conversations.forEach {
+                        Self.upsert(conversation: $0, in: &state, advancesActivity: false)
+                    }
+                    for conversationID in Set(groupMemberTransitions.map(\.conversationID)) {
+                        guard let conversation = state.conversations.first(where: {
+                            $0.id == conversationID && $0.isGroup
+                        }), !conversation.participantUserIds.contains(userID)
+                        else { continue }
+                        Self.abandonSecureGroupOutbox(
+                            conversationID: conversationID,
+                            in: &state
+                        )
                     }
                 }
                 // A history wrapper can reveal plaintext after an earlier donor pass skipped it.
@@ -3649,16 +4617,36 @@ actor SecureMessagingExchangeCoordinator {
         )
     }
 
+    /// Sync rows can outlive this account's active membership. The authenticated conversation
+    /// endpoint deliberately hides both missing threads and inactive membership behind one exact
+    /// structured 404. Only that documented response is skippable; malformed DTOs, unstructured
+    /// 404s, authentication failures, and transient transport failures must retain the cursor.
+    private func loadSyncConversationIfAvailable(
+        id: String,
+        currentUserID: String
+    ) async throws -> ValidatedDirectConversation? {
+        do {
+            return try await loadConversation(id: id, currentUserID: currentUserID)
+        } catch {
+            guard Self.isUnavailableConversationError(error) else { throw error }
+            return nil
+        }
+    }
+
+    private nonisolated static func isUnavailableConversationError(_ error: Error) -> Bool {
+        guard let payload = error as? APIErrorPayload else { return false }
+        return payload.httpStatus == 404 && payload.code == "CONVERSATION_NOT_FOUND"
+    }
+
     private func validateConversation(
         _ dto: MessagingConversationDTO,
         currentUserID: String,
         expectedRecipientUserID: String?,
         fallbackTitle: String
     ) throws -> ValidatedDirectConversation {
-        guard dto.type == SecureMessagingWire.directConversationType,
+        guard let type = dto.type,
               let rawID = dto.id,
               let members = dto.members,
-              members.count == 2,
               members.allSatisfy({ $0 != nil })
         else { throw SecureMessagingExchangeError.invalidConversation }
         let id = try canonicalUUID(rawID, error: .invalidConversation)
@@ -3666,37 +4654,105 @@ actor SecureMessagingExchangeCoordinator {
         let memberIDs = try Set(values.map {
             try canonicalUUID($0.userId, error: .invalidConversation)
         })
-        guard memberIDs.count == 2,
-              memberIDs.contains(currentUserID),
-              let recipient = memberIDs.first(where: { $0 != currentUserID }),
-              expectedRecipientUserID.map({ $0 == recipient }) ?? true
-        else { throw SecureMessagingExchangeError.invalidConversation }
-        let serverTitle = dto.title?.trimmingCharacters(in: .whitespacesAndNewlines)
-        // Direct titles are server-null by contract; prefer the viewer-scoped peer alias.
-        let peerName = values.first(where: { $0.userId == recipient })?.name?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let fallback = fallbackTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-        let title = [peerName, serverTitle, fallback, "Kit Pay contact"]
-            .compactMap { $0 }
-            .first(where: { !$0.isEmpty })!
-        let updatedAt = (try? parseServerDate(dto.updatedAt)) ?? Date()
-        return ValidatedDirectConversation(
-            id: id,
-            recipientUserID: recipient,
-            memberUserIDs: memberIDs,
-            title: title,
-            updatedAt: updatedAt
-        )
+        let parsedUpdatedAt = try? parseServerDate(dto.updatedAt)
+
+        switch type {
+        case SecureMessagingWire.directConversationType:
+            guard members.count == 2,
+                  memberIDs.count == 2,
+                  memberIDs.contains(currentUserID),
+                  let recipient = memberIDs.first(where: { $0 != currentUserID }),
+                  expectedRecipientUserID.map({ $0 == recipient }) ?? true
+            else { throw SecureMessagingExchangeError.invalidConversation }
+            let serverTitle = dto.title?.trimmingCharacters(in: .whitespacesAndNewlines)
+            // Direct titles are server-null by contract; prefer the viewer-scoped peer alias.
+            let peerName = values.first(where: { $0.userId == recipient })?.name?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let fallback = fallbackTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+            let title = [peerName, serverTitle, fallback, "Kit Pay contact"]
+                .compactMap { $0 }
+                .first(where: { !$0.isEmpty })!
+            return ValidatedDirectConversation(
+                id: id,
+                recipientUserID: recipient,
+                memberUserIDs: memberIDs,
+                title: title,
+                updatedAt: parsedUpdatedAt ?? Date(),
+                conversationType: type,
+                groupMemberRoles: nil
+            )
+
+        case SecureMessagingWire.groupConversationType:
+            // A group has no single peer; any caller pinning an expected direct recipient must
+            // fail closed rather than address one member of a wider roster.
+            guard expectedRecipientUserID == nil,
+                  memberIDs.count == values.count,
+                  (1 ... SecureMessagingWire.maximumGroupMembers).contains(memberIDs.count),
+                  memberIDs.contains(currentUserID),
+                  let updatedAt = parsedUpdatedAt
+            else { throw SecureMessagingExchangeError.invalidConversation }
+            // Group titles are server-owned: the server title wins for every member; the
+            // neutral fallback never leaks a per-viewer alias into a shared thread name.
+            guard let title = dto.title?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  MessagingGroupTitlePolicy.isValid(title)
+            else { throw SecureMessagingExchangeError.invalidConversation }
+            let rawRoles = values.map(\.role)
+            let memberRoles: [String: MessagingGroupRole]?
+            if rawRoles.allSatisfy({ $0 == nil }) {
+                memberRoles = nil
+            } else {
+                guard rawRoles.allSatisfy({ $0 != nil }) else {
+                    throw SecureMessagingExchangeError.invalidConversation
+                }
+                var roles: [String: MessagingGroupRole] = [:]
+                for member in values {
+                    guard let rawUserID = member.userId,
+                          let userID = try? canonicalUUID(
+                              rawUserID,
+                              error: .invalidConversation
+                          ),
+                          let rawRole = member.role,
+                          let role = MessagingGroupRole(rawValue: rawRole),
+                          roles[userID] == nil
+                    else { throw SecureMessagingExchangeError.invalidConversation }
+                    roles[userID] = role
+                }
+                memberRoles = roles
+            }
+            if let rawViewerRole = dto.role {
+                guard let viewerRole = MessagingGroupRole(rawValue: rawViewerRole),
+                      memberRoles?[currentUserID] == viewerRole
+                else { throw SecureMessagingExchangeError.invalidConversation }
+            }
+            return ValidatedDirectConversation(
+                id: id,
+                recipientUserID: nil,
+                memberUserIDs: memberIDs,
+                title: title,
+                updatedAt: updatedAt,
+                conversationType: type,
+                groupMemberRoles: memberRoles
+            )
+
+        default:
+            throw SecureMessagingExchangeError.invalidConversation
+        }
     }
 
     private func validateOutboundResponse(
         _ dto: EncryptedMessageDTO,
         fanout: SecureMessagingCommittedFanout,
+        expectedPlaintext: String,
         expectedAttachments: [EncryptedAttachmentRequest],
         userID: String,
         enrollment: SecureMessagingEnrollmentBinding?
     ) throws -> OutboundEcho {
-        guard let enrollment,
+        guard let expectedKind = SecureMessagingContentBindingPolicy.kind(
+                  for: expectedPlaintext,
+                  replyToMessageID: fanout.replyToMessageID,
+                  attachments: expectedAttachments
+              ),
+              let enrollment,
               let id = dto.id,
               SecureMessagingValidation.isCanonicalUUID(id),
               dto.clientMessageId == fanout.clientMessageID,
@@ -3710,15 +4766,16 @@ actor SecureMessagingExchangeCoordinator {
               dto.senderProtocolVersion == SecureMessagingWire.protocolVersion,
               dto.senderBundleVersion == enrollment.bundleVersion,
               dto.senderIdentityKeySha256 == enrollment.identityKeySHA256,
-              dto.kind == (expectedAttachments.isEmpty
-                  ? SecureMessagingMessageKind.encrypted.rawValue
-                  : SecureMessagingMessageKind.encryptedAttachment.rawValue),
+              dto.kind == expectedKind.rawValue,
               dto.replyToMessageId == fanout.replyToMessageID,
               dto.envelope == nil,
+              let rawAttachments = dto.attachments,
+              rawAttachments.allSatisfy({ $0 != nil }),
               KitMediaMessageDescriptor.validates(
-                  dto.attachments,
+                  rawAttachments,
                   against: expectedAttachments
               ),
+              dto.reactions?.isEmpty == true,
               dto.revokedAt == nil
         else { throw SecureMessagingExchangeError.invalidServerResponse }
         return OutboundEcho(
@@ -3727,11 +4784,12 @@ actor SecureMessagingExchangeCoordinator {
             sentAt: try parseServerDate(dto.sentAt),
             historyMetadata: SecureMessagingRetainedMessageMetadata(
                 clientMessageID: fanout.clientMessageID,
+                senderUserID: userID,
                 senderDeviceID: enrollment.serverDeviceID,
                 senderEnrollmentEpoch: enrollment.enrollmentEpoch,
                 senderSignalDeviceID: enrollment.signalDeviceID,
                 rosterRevision: fanout.rosterRevision,
-                kind: expectedAttachments.isEmpty ? .encrypted : .encryptedAttachment,
+                kind: expectedKind,
                 replyToMessageID: fanout.replyToMessageID
             )
         )
@@ -3741,10 +4799,16 @@ actor SecureMessagingExchangeCoordinator {
         _ dto: EncryptedMessageDTO,
         conversation: ValidatedDirectConversation,
         enrollment: SecureMessagingEnrollmentBinding,
+        expectedPlaintext: String,
         expectedAttachments: [EncryptedAttachmentRequest],
         userID: String
     ) throws -> OutboundEcho {
-        guard let serverID = dto.id,
+        guard let expectedKind = SecureMessagingContentBindingPolicy.kind(
+                  for: expectedPlaintext,
+                  replyToMessageID: dto.replyToMessageId,
+                  attachments: expectedAttachments
+              ),
+              let serverID = dto.id,
               SecureMessagingValidation.isCanonicalUUID(serverID),
               let clientID = dto.clientMessageId,
               SecureMessagingValidation.isCanonicalUUID(clientID),
@@ -3758,13 +4822,13 @@ actor SecureMessagingExchangeCoordinator {
               dto.senderBundleVersion == enrollment.bundleVersion,
               dto.senderIdentityKeySha256 == enrollment.identityKeySHA256,
               dto.rosterRevision.map(SecureMessagingWirePolicy.isRosterRevision) == true,
-              dto.kind == (expectedAttachments.isEmpty
-                  ? SecureMessagingMessageKind.encrypted.rawValue
-                  : SecureMessagingMessageKind.encryptedAttachment.rawValue),
+              dto.kind == expectedKind.rawValue,
               dto.replyToMessageId.map(SecureMessagingWirePolicy.isCanonicalUUID) ?? true,
               dto.envelope == nil,
+              let rawAttachments = dto.attachments,
+              rawAttachments.allSatisfy({ $0 != nil }),
               KitMediaMessageDescriptor.validates(
-                  dto.attachments,
+                  rawAttachments,
                   against: expectedAttachments
               ),
               dto.reactions?.isEmpty == true,
@@ -3776,11 +4840,12 @@ actor SecureMessagingExchangeCoordinator {
             sentAt: try parseServerDate(dto.sentAt),
             historyMetadata: SecureMessagingRetainedMessageMetadata(
                 clientMessageID: clientID,
+                senderUserID: userID,
                 senderDeviceID: enrollment.serverDeviceID,
                 senderEnrollmentEpoch: enrollment.enrollmentEpoch,
                 senderSignalDeviceID: enrollment.signalDeviceID,
                 rosterRevision: dto.rosterRevision!,
-                kind: expectedAttachments.isEmpty ? .encrypted : .encryptedAttachment,
+                kind: expectedKind,
                 replyToMessageID: dto.replyToMessageId
             )
         )
@@ -3837,10 +4902,13 @@ actor SecureMessagingExchangeCoordinator {
         }
         guard Set(attachments.map { $0.id }).count == attachments.count,
               Set(attachments.map { $0.storageKey }).count == attachments.count,
-              (dto.kind == SecureMessagingMessageKind.encrypted.rawValue
-                  && attachments.isEmpty)
-                || (dto.kind == SecureMessagingMessageKind.encryptedAttachment.rawValue
-                    && attachments.count == 1),
+              let rawKind = dto.kind,
+              let kind = SecureMessagingMessageKind(rawValue: rawKind),
+              SecureMessagingContentBindingPolicy.validatesOuterEnvelope(
+                  kind: kind,
+                  replyToMessageID: dto.replyToMessageId,
+                  attachmentCount: attachments.count
+              ),
               parseServerDateIfValid(dto.sentAt)
         else { throw SecureMessagingExchangeError.invalidServerResponse }
     }
@@ -3861,6 +4929,100 @@ actor SecureMessagingExchangeCoordinator {
               event.conversationId.map(SecureMessagingValidation.isCanonicalUUID) ?? true
         else { throw SecureMessagingExchangeError.invalidServerResponse }
         return type
+    }
+
+    /// Validates a group membership lifecycle event and pre-builds its thread-documenting system
+    /// notice. The notice id derives from the full event identity so server replays deduplicate
+    /// without colliding with another lifecycle event for the same membership resource.
+    private func validatedGroupMemberTransition(
+        _ event: MessagingSyncEventDTO,
+        type: String,
+        currentUserID: String
+    ) throws -> GroupMemberTransition {
+        guard let conversationID = event.conversationId,
+              event.resourceType == "conversation_member",
+              let resourceID = event.resourceId,
+              let eventID = event.id,
+              let data = event.data,
+              let subjectUserID = data.userId,
+              SecureMessagingValidation.isCanonicalUUID(subjectUserID),
+              data.actorUserId == nil
+        else { throw SecureMessagingExchangeError.invalidServerResponse }
+        let occurredAt = try parseServerDate(event.occurredAt)
+        let kind: KitSystemMessage.Kind
+        switch type {
+        case "membership.added": kind = .memberAdded
+        case "membership.removed": kind = .memberRemoved
+        default: throw SecureMessagingExchangeError.invalidServerResponse
+        }
+        let role: MessagingGroupRole?
+        if kind == .memberAdded {
+            guard let rawRole = data.role,
+                  let parsedRole = MessagingGroupRole(rawValue: rawRole)
+            else { throw SecureMessagingExchangeError.invalidServerResponse }
+            role = parsedRole
+        } else {
+            guard data.role == nil else {
+                throw SecureMessagingExchangeError.invalidServerResponse
+            }
+            role = nil
+        }
+        let actorUserID = data.actorUserId?.lowercased()
+        guard let descriptor = KitSystemMessage(
+            kind: kind,
+            subjectUserID: subjectUserID.lowercased(),
+            actorUserID: actorUserID
+        ) else { throw SecureMessagingExchangeError.invalidServerResponse }
+        // ALWAYS derive the notice id from the full event identity. Using the raw resource
+        // UUID would collide when the server reuses one conversation_member resource across
+        // lifecycle events (added then removed) — the second notice would silently dedup away
+        // — and could even collide with a real message id.
+        let messageID = KitSystemMessage.deterministicMessageID(
+            namespace: "kit-group-member-event:\(conversationID):\(type):\(resourceID):\(eventID)"
+        )
+        // The backup contract requires isOutgoing to agree with local authorship, so a change
+        // performed by this account (possibly from a companion device) is projected as outgoing.
+        let senderID = actorUserID ?? subjectUserID.lowercased()
+        let authoredOnCurrentAccount = senderID == currentUserID
+        let systemMessage = LocalMessage(
+            id: messageID,
+            conversationId: conversationID,
+            senderId: senderID,
+            body: descriptor.encoded,
+            createdAt: occurredAt,
+            sentAt: occurredAt,
+            state: authoredOnCurrentAccount ? .sent : .received,
+            failureReason: nil,
+            isOutgoing: authoredOnCurrentAccount
+        )
+        return GroupMemberTransition(
+            conversationID: conversationID,
+            subjectUserID: subjectUserID.lowercased(),
+            role: role,
+            kind: kind,
+            systemMessage: systemMessage
+        )
+    }
+
+    private func validatedGroupRoleChange(
+        _ event: MessagingSyncEventDTO,
+        type: String
+    ) throws -> (
+        conversationID: String,
+        subjectUserID: String,
+        role: MessagingGroupRole
+    ) {
+        guard type == "membership.role_changed",
+              let conversationID = event.conversationId,
+              event.resourceType == "conversation_member",
+              event.resourceId?.isEmpty == false,
+              let data = event.data,
+              let userID = data.userId,
+              SecureMessagingValidation.isCanonicalUUID(userID),
+              let role = data.role.flatMap(MessagingGroupRole.init(rawValue:)),
+              data.actorUserId == nil
+        else { throw SecureMessagingExchangeError.invalidServerResponse }
+        return (conversationID, userID.lowercased(), role)
     }
 
     private func validateDeviceLifecycle(
@@ -4046,17 +5208,67 @@ actor SecureMessagingExchangeCoordinator {
         return formatter.date(from: rawValue)
     }
 
-    private static func upsert(conversation: Conversation, in state: inout PersistedState) {
+    private static func upsert(
+        conversation: Conversation,
+        in state: inout PersistedState,
+        advancesActivity: Bool = true
+    ) {
+        if conversation.isGroup {
+            guard serverProjectionIsNotOlder(
+                conversationID: conversation.id,
+                updatedAt: conversation.updatedAt,
+                in: state
+            ) else { return }
+        }
         if let index = state.conversations.firstIndex(where: { $0.id == conversation.id }) {
             state.conversations[index].title = conversation.title
             state.conversations[index].participantUserIds = conversation.participantUserIds
-            state.conversations[index].updatedAt = max(
-                state.conversations[index].updatedAt,
-                conversation.updatedAt
-            )
+            if let conversationType = conversation.conversationType {
+                state.conversations[index].conversationType = conversationType
+            }
+            state.conversations[index].groupMemberRoles = conversation.groupMemberRoles
+            if advancesActivity {
+                state.conversations[index].updatedAt = max(
+                    state.conversations[index].updatedAt,
+                    conversation.updatedAt
+                )
+            }
         } else {
             state.conversations.append(conversation)
         }
+        if conversation.isGroup {
+            recordServerProjection(
+                conversationID: conversation.id,
+                updatedAt: conversation.updatedAt,
+                in: &state
+            )
+        }
+    }
+
+    /// `Conversation.updatedAt` is visible activity and deliberately does not advance for
+    /// reaction-only sync. This separate group clock makes title/roster replacement monotonic
+    /// without moving a quiet thread in the chat list. A missing clock is a pre-Build-24 state and
+    /// accepts its first authenticated projection; every later writer compares atomically inside
+    /// the same encrypted-store transaction.
+    private static func serverProjectionIsNotOlder(
+        conversationID: String,
+        updatedAt: Date,
+        in state: PersistedState
+    ) -> Bool {
+        guard let current = state.groupProjectionUpdatedAt?[conversationID] else {
+            return true
+        }
+        return updatedAt >= current
+    }
+
+    private static func recordServerProjection(
+        conversationID: String,
+        updatedAt: Date,
+        in state: inout PersistedState
+    ) {
+        var timestamps = state.groupProjectionUpdatedAt ?? [:]
+        timestamps[conversationID] = max(timestamps[conversationID] ?? updatedAt, updatedAt)
+        state.groupProjectionUpdatedAt = timestamps
     }
 }
 
@@ -4066,12 +5278,27 @@ private struct FailedTextRetryCandidate {
     let alreadyQueued: Bool
 }
 
+/// Validated projection of a direct OR group conversation DTO. Minimal-ripple design: the struct
+/// keeps its historical name and shape; `recipientUserID` became Optional and is nil ONLY for
+/// groups, so every direct-only consumer must `guard let` it (fail closed) while group-capable
+/// paths address the full `memberUserIDs` set instead.
 private struct ValidatedDirectConversation {
     let id: String
-    let recipientUserID: String
+    /// The single peer of a direct thread. Always nil for groups — a group has no "the" recipient.
+    let recipientUserID: String?
     let memberUserIDs: Set<String>
     let title: String
     let updatedAt: Date
+    let conversationType: String
+    let groupMemberRoles: [String: MessagingGroupRole]?
+
+    var isGroup: Bool { conversationType == SecureMessagingWire.groupConversationType }
+
+    /// Canonical outbox recipient list: the single direct peer, or every group member but self.
+    func outboundRecipientUserIDs(excluding localUserID: String) -> [String] {
+        if let recipientUserID { return [recipientUserID] }
+        return memberUserIDs.filter { $0 != localUserID }.sorted()
+    }
 
     var localProjection: Conversation {
         Conversation(
@@ -4079,7 +5306,9 @@ private struct ValidatedDirectConversation {
             title: title,
             participantUserIds: memberUserIDs.sorted(),
             unreadCount: 0,
-            updatedAt: updatedAt
+            updatedAt: updatedAt,
+            conversationType: conversationType,
+            groupMemberRoles: groupMemberRoles
         )
     }
 }
@@ -4087,6 +5316,7 @@ private struct ValidatedDirectConversation {
 private struct ValidatedHistoryCandidate {
     let dto: EncryptedMessageDTO
     let identity: SecureMessagingHistoryMessageIdentity
+    let validatedSender: SecureMessagingValidatedHistoricalSender
     let rawSentAt: String
 }
 
@@ -4115,6 +5345,14 @@ private struct ReadTransition {
     let conversationID: String
     let messageID: String
     let readAt: Date
+}
+
+private struct GroupMemberTransition {
+    let conversationID: String
+    let subjectUserID: String
+    let role: MessagingGroupRole?
+    let kind: KitSystemMessage.Kind
+    let systemMessage: LocalMessage
 }
 
 private struct ValidatedDeviceLifecycle {

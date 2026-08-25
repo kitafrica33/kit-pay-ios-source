@@ -81,6 +81,11 @@ final class ChatMediaPolicyTests: XCTestCase {
                         "minimum_ciphertext_bytes": SecureMessagingWire.minimumAttachmentCiphertextBytes,
                         "maximum_plaintext_bytes": SecureMediaAttachmentCipher.maximumPlaintextBytes,
                         "maximum_ciphertext_bytes": SecureMessagingWire.maximumAttachmentCiphertextBytes,
+                        "large_attachment_capability": MessagingRichMediaCapabilityPolicy
+                            .extendedSizeDeviceCapabilityKey,
+                        "large_attachment_supported_platforms": ["ios"],
+                        "large_attachment_minimum_ios_version": MessagingRichMediaCapabilityPolicy
+                            .extendedSizeMinimumIOSRelease,
                         "media_types": SecureMessagingWire.allowedAttachmentMediaTypes.sorted(),
                     ],
                 ],
@@ -88,6 +93,42 @@ final class ChatMediaPolicyTests: XCTestCase {
         ])
         let decoded = try JSONDecoder().decode(CapabilitiesDTO.self, from: data)
         XCTAssertTrue(decoded.enablesMessagingRichMedia)
+        XCTAssertEqual(
+            MessagingRichMediaCapabilityPolicy.extendedSizeMinimumIOSRelease,
+            "1.0.16-r24"
+        )
+    }
+
+    func testNestedServerCapabilityRejectsARegressiveLargeAttachmentIOSFloor() throws {
+        let data = try JSONSerialization.data(withJSONObject: [
+            "api_version": "v1",
+            "currency": ["code": "UGX", "scale": "2"],
+            "protocols": [
+                "messaging": [
+                    "ready": true,
+                    "version": SecureMessagingWire.protocolVersion,
+                    "suite": SecureMessagingWire.protocolSuite,
+                    "post_quantum": true,
+                    "rich_media": [
+                        "ready": true,
+                        "profile": MessagingRichMediaCapabilityPolicy.profile,
+                        "supported_platforms": ["ios"],
+                        "minimum_ios_version": MessagingRichMediaCapabilityPolicy.minimumIOSRelease,
+                        "minimum_ciphertext_bytes": SecureMessagingWire.minimumAttachmentCiphertextBytes,
+                        "maximum_plaintext_bytes": SecureMediaAttachmentCipher.maximumPlaintextBytes,
+                        "maximum_ciphertext_bytes": SecureMessagingWire.maximumAttachmentCiphertextBytes,
+                        "large_attachment_capability": MessagingRichMediaCapabilityPolicy
+                            .extendedSizeDeviceCapabilityKey,
+                        "large_attachment_supported_platforms": ["ios"],
+                        "large_attachment_minimum_ios_version": "1.0.15-r23",
+                        "media_types": SecureMessagingWire.allowedAttachmentMediaTypes.sorted(),
+                    ],
+                ],
+            ],
+        ])
+
+        let decoded = try JSONDecoder().decode(CapabilitiesDTO.self, from: data)
+        XCTAssertFalse(decoded.enablesMessagingRichMedia)
     }
 
     func testLegacyFlatFeatureCannotEnableRichMedia() throws {

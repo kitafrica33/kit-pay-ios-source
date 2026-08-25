@@ -101,6 +101,92 @@ final class MessageBackupTests: XCTestCase {
         XCTAssertEqual(payload.messages.map(\.body), ["hello"])
     }
 
+    func testSnapshotExcludesServerLifecycleNoticesWithoutRestorableProvenance() throws {
+        var state = makeState()
+        state.messages.append(LocalMessage(
+            id: UUID(uuidString: "0a1b2c3d-0000-4000-8000-00000000eeee")!,
+            conversationId: conversationID,
+            senderId: otherUserID,
+            body: try XCTUnwrap(KitSystemMessage(
+                kind: .memberLeft,
+                subjectUserID: otherUserID,
+                actorUserID: nil
+            )).encoded,
+            createdAt: Date(timeIntervalSince1970: 1_700_000_100),
+            sentAt: Date(timeIntervalSince1970: 1_700_000_100),
+            state: .received,
+            failureReason: nil,
+            isOutgoing: false
+        ))
+
+        let payload = MessageBackupPayload.snapshot(
+            of: state,
+            userID: userID,
+            deviceName: "Kit iPhone",
+            includesMedia: false
+        )
+
+        XCTAssertEqual(payload.messages.map(\.body), ["hello"])
+    }
+
+    func testSnapshotOmitsLegacyDepartedGroupMessageThatCannotBeRestored() throws {
+        let departedUserID = "0a1b2c3d-0000-4000-8000-00000000dddd"
+        var state = makeState()
+        state.conversations[0].conversationType = SecureMessagingWire.groupConversationType
+        var legacyMessage = authenticatedDepartedMemberMessage(senderID: departedUserID)
+        let metadata = try XCTUnwrap(legacyMessage.secureMessagingHistory)
+        legacyMessage.secureMessagingHistory = SecureMessagingRetainedMessageMetadata(
+            clientMessageID: metadata.clientMessageID,
+            senderUserID: nil,
+            senderDeviceID: metadata.senderDeviceID,
+            senderEnrollmentEpoch: metadata.senderEnrollmentEpoch,
+            senderSignalDeviceID: metadata.senderSignalDeviceID,
+            rosterRevision: metadata.rosterRevision,
+            kind: metadata.kind,
+            replyToMessageID: metadata.replyToMessageID
+        )
+        state.messages.append(legacyMessage)
+
+        let payload = MessageBackupPayload.snapshot(
+            of: state,
+            userID: userID,
+            deviceName: "Kit iPhone",
+            includesMedia: false,
+            createdAt: Date(timeIntervalSince1970: 1_700_001_000)
+        )
+
+        XCTAssertEqual(payload.messages.map(\.body), ["hello"])
+        XCTAssertNoThrow(try MessageBackupValidationPolicy.validate(
+            payload,
+            expectedUserID: userID,
+            now: validationNow
+        ))
+    }
+
+    func testSnapshotRetainsSenderBoundReadMessageFromDepartedGroupMember() throws {
+        let departedUserID = "0a1b2c3d-0000-4000-8000-00000000dddd"
+        var state = makeState()
+        state.conversations[0].conversationType = SecureMessagingWire.groupConversationType
+        var authenticatedMessage = authenticatedDepartedMemberMessage(senderID: departedUserID)
+        authenticatedMessage.state = .read
+        state.messages.append(authenticatedMessage)
+
+        let payload = MessageBackupPayload.snapshot(
+            of: state,
+            userID: userID,
+            deviceName: "Kit iPhone",
+            includesMedia: false,
+            createdAt: Date(timeIntervalSince1970: 1_700_001_000)
+        )
+
+        XCTAssertTrue(payload.messages.contains { $0.id == authenticatedMessage.id })
+        XCTAssertNoThrow(try MessageBackupValidationPolicy.validate(
+            payload,
+            expectedUserID: userID,
+            now: validationNow
+        ))
+    }
+
     func testValidationRejectsNonterminalMessagesFromAnOlderArchive() {
         var state = makeState()
         state.messages[0].state = .queued
@@ -162,6 +248,233 @@ final class MessageBackupTests: XCTestCase {
         XCTAssertThrowsError(
             try MessageBackupCrypto.decrypt(Data(repeating: 0, count: 128), key: key)
         ) { error in
+            XCTAssertEqual(error as? MessageBackupError, .invalidBackup)
+        }
+    }
+
+    // MARK: Validation policy
+
+    func testValidationAcceptsRetainedGroupAfterOwnerRemoval() throws {
+        let retainedGroup = Conversation(
+            id: conversationID,
+            title: "Retained group",
+            participantUserIds: [otherUserID],
+            unreadCount: 0,
+            updatedAt: Date(timeIntervalSince1970: 1_700_000_500),
+            conversationType: SecureMessagingWire.groupConversationType
+        )
+        // The owner's already-sent history remains valid even though the current group roster
+        // no longer contains the owner; older projections may not have retained E2E metadata.
+        let payload = backupPayload(
+            conversation: retainedGroup,
+            messages: [makeState().messages[0]]
+        )
+
+        XCTAssertNoThrow(try MessageBackupValidationPolicy.validate(
+            payload,
+            expectedUserID: userID,
+            now: validationNow
+        ))
+    }
+
+    func testValidationRejectsDirectConversationWithInvalidCardinality() {
+        let thirdUserID = "0a1b2c3d-0000-4000-8000-00000000cccc"
+        for participants in [
+            [userID],
+            [userID, otherUserID, thirdUserID],
+        ] {
+            let direct = Conversation(
+                id: conversationID,
+                title: "Invalid direct",
+                participantUserIds: participants,
+                unreadCount: 0,
+                updatedAt: Date(timeIntervalSince1970: 1_700_000_500)
+            )
+
+            XCTAssertThrowsError(try MessageBackupValidationPolicy.validate(
+                backupPayload(conversation: direct),
+                expectedUserID: userID,
+                now: validationNow
+            )) { error in
+                XCTAssertEqual(error as? MessageBackupError, .invalidBackup)
+            }
+        }
+    }
+
+    func testValidationRejectsUnknownConversationType() {
+        let unknown = Conversation(
+            id: conversationID,
+            title: "Unknown",
+            participantUserIds: [userID, otherUserID],
+            unreadCount: 0,
+            updatedAt: Date(timeIntervalSince1970: 1_700_000_500),
+            conversationType: "channel"
+        )
+
+        XCTAssertThrowsError(try MessageBackupValidationPolicy.validate(
+            backupPayload(conversation: unknown),
+            expectedUserID: userID,
+            now: validationNow
+        )) { error in
+            XCTAssertEqual(error as? MessageBackupError, .invalidBackup)
+        }
+    }
+
+    func testValidationRejectsGroupAboveProtocolMemberLimit() {
+        let oversizedParticipants = (0 ... SecureMessagingWire.maximumGroupMembers).map {
+            String(format: "10000000-0000-4000-8000-%012d", $0)
+        }
+        XCTAssertEqual(
+            oversizedParticipants.count,
+            SecureMessagingWire.maximumGroupMembers + 1
+        )
+        let oversizedGroup = Conversation(
+            id: conversationID,
+            title: "Oversized group",
+            participantUserIds: oversizedParticipants,
+            unreadCount: 0,
+            updatedAt: Date(timeIntervalSince1970: 1_700_000_500),
+            conversationType: SecureMessagingWire.groupConversationType
+        )
+
+        XCTAssertThrowsError(try MessageBackupValidationPolicy.validate(
+            backupPayload(conversation: oversizedGroup),
+            expectedUserID: userID,
+            now: validationNow
+        )) { error in
+            XCTAssertEqual(error as? MessageBackupError, .invalidBackup)
+        }
+    }
+
+    func testValidationAcceptsAuthenticatedHistoryFromDepartedGroupMember() throws {
+        let departedUserID = "0a1b2c3d-0000-4000-8000-00000000dddd"
+        let group = Conversation(
+            id: conversationID,
+            title: "Current group",
+            participantUserIds: [userID, otherUserID],
+            unreadCount: 0,
+            updatedAt: Date(timeIntervalSince1970: 1_700_000_500),
+            conversationType: SecureMessagingWire.groupConversationType
+        )
+        let message = authenticatedDepartedMemberMessage(senderID: departedUserID)
+
+        XCTAssertNoThrow(try MessageBackupValidationPolicy.validate(
+            backupPayload(conversation: group, messages: [message]),
+            expectedUserID: userID,
+            now: validationNow
+        ))
+    }
+
+    func testValidationRejectsUnprovenOrPartialDepartedGroupSender() {
+        let departedUserID = "0a1b2c3d-0000-4000-8000-00000000dddd"
+        let group = Conversation(
+            id: conversationID,
+            title: "Current group",
+            participantUserIds: [userID, otherUserID],
+            unreadCount: 0,
+            updatedAt: Date(timeIntervalSince1970: 1_700_000_500),
+            conversationType: SecureMessagingWire.groupConversationType
+        )
+        let authenticated = authenticatedDepartedMemberMessage(senderID: departedUserID)
+        var candidates: [LocalMessage] = []
+
+        var missingHistory = authenticated
+        missingHistory.secureMessagingHistory = nil
+        candidates.append(missingHistory)
+
+        var missingServerID = authenticated
+        missingServerID.serverMessageId = nil
+        candidates.append(missingServerID)
+
+        var missingServerTime = authenticated
+        missingServerTime.sentAt = nil
+        candidates.append(missingServerTime)
+
+        var missingSenderBinding = authenticated
+        if let metadata = authenticated.secureMessagingHistory {
+            missingSenderBinding.secureMessagingHistory = SecureMessagingRetainedMessageMetadata(
+                clientMessageID: metadata.clientMessageID,
+                senderUserID: nil,
+                senderDeviceID: metadata.senderDeviceID,
+                senderEnrollmentEpoch: metadata.senderEnrollmentEpoch,
+                senderSignalDeviceID: metadata.senderSignalDeviceID,
+                rosterRevision: metadata.rosterRevision,
+                kind: metadata.kind,
+                replyToMessageID: metadata.replyToMessageID
+            )
+        }
+        candidates.append(missingSenderBinding)
+
+        var mismatchedSenderBinding = authenticated
+        if let metadata = authenticated.secureMessagingHistory {
+            mismatchedSenderBinding.secureMessagingHistory =
+                SecureMessagingRetainedMessageMetadata(
+                    clientMessageID: metadata.clientMessageID,
+                    senderUserID: otherUserID,
+                    senderDeviceID: metadata.senderDeviceID,
+                    senderEnrollmentEpoch: metadata.senderEnrollmentEpoch,
+                    senderSignalDeviceID: metadata.senderSignalDeviceID,
+                    rosterRevision: metadata.rosterRevision,
+                    kind: metadata.kind,
+                    replyToMessageID: metadata.replyToMessageID
+                )
+        }
+        candidates.append(mismatchedSenderBinding)
+
+        var malformedHistory = authenticated
+        malformedHistory.secureMessagingHistory = SecureMessagingRetainedMessageMetadata(
+            clientMessageID: "not-a-uuid",
+            senderUserID: departedUserID,
+            senderDeviceID: "0a1b2c3d-0000-4000-8000-00000000eeee",
+            senderEnrollmentEpoch: 1,
+            senderSignalDeviceID: 2,
+            rosterRevision: "v1:sha256:\(String(repeating: "a", count: 64))",
+            kind: .encrypted,
+            replyToMessageID: nil
+        )
+        candidates.append(malformedHistory)
+
+        for candidate in candidates {
+            XCTAssertThrowsError(try MessageBackupValidationPolicy.validate(
+                backupPayload(conversation: group, messages: [candidate]),
+                expectedUserID: userID,
+                now: validationNow
+            )) { error in
+                XCTAssertEqual(error as? MessageBackupError, .invalidBackup)
+            }
+        }
+    }
+
+    func testValidationRejectsSystemNoticeWithoutServerEventProvenance() throws {
+        let group = Conversation(
+            id: conversationID,
+            title: "Current group",
+            participantUserIds: [userID, otherUserID],
+            unreadCount: 0,
+            updatedAt: Date(timeIntervalSince1970: 1_700_000_500),
+            conversationType: SecureMessagingWire.groupConversationType
+        )
+        let notice = LocalMessage(
+            id: UUID(uuidString: "0a1b2c3d-0000-4000-8000-00000000eeee")!,
+            conversationId: conversationID,
+            senderId: otherUserID,
+            body: try XCTUnwrap(KitSystemMessage(
+                kind: .memberLeft,
+                subjectUserID: otherUserID,
+                actorUserID: nil
+            )).encoded,
+            createdAt: Date(timeIntervalSince1970: 1_700_000_000),
+            sentAt: Date(timeIntervalSince1970: 1_700_000_001),
+            state: .received,
+            failureReason: nil,
+            isOutgoing: false
+        )
+
+        XCTAssertThrowsError(try MessageBackupValidationPolicy.validate(
+            backupPayload(conversation: group, messages: [notice]),
+            expectedUserID: userID,
+            now: validationNow
+        )) { error in
             XCTAssertEqual(error as? MessageBackupError, .invalidBackup)
         }
     }
@@ -268,6 +581,135 @@ final class MessageBackupTests: XCTestCase {
         XCTAssertEqual(merged.messages.first?.state, .read)
         XCTAssertEqual(merged.messages.first?.serverMessageId, original.messages[0].serverMessageId)
         XCTAssertEqual(merged.messages, reverseMerged.messages)
+    }
+
+    func testConflictMergePrefersSenderBoundHistoryForSameServerMessage() throws {
+        let departedUserID = "0a1b2c3d-0000-4000-8000-00000000dddd"
+        let legacyConversation = Conversation(
+            id: conversationID,
+            title: "Current group",
+            participantUserIds: [userID, otherUserID, departedUserID],
+            unreadCount: 0,
+            updatedAt: Date(timeIntervalSince1970: 1_700_000_400),
+            conversationType: SecureMessagingWire.groupConversationType
+        )
+        let currentConversation = Conversation(
+            id: conversationID,
+            title: "Current group",
+            participantUserIds: [userID, otherUserID, departedUserID],
+            unreadCount: 0,
+            updatedAt: Date(timeIntervalSince1970: 1_700_000_500),
+            conversationType: SecureMessagingWire.groupConversationType
+        )
+        let collisionBody = "history before departure 3"
+        let senderBoundMessage = authenticatedDepartedMemberMessage(
+            senderID: departedUserID,
+            body: collisionBody
+        )
+        var legacyMessage = authenticatedDepartedMemberMessage(
+            senderID: departedUserID,
+            id: UUID(uuidString: "0a1b2c3d-0000-4000-8000-00000000eeed")!,
+            body: collisionBody
+        )
+        let metadata = try XCTUnwrap(senderBoundMessage.secureMessagingHistory)
+        legacyMessage.secureMessagingHistory = SecureMessagingRetainedMessageMetadata(
+            clientMessageID: metadata.clientMessageID,
+            senderUserID: nil,
+            senderDeviceID: metadata.senderDeviceID,
+            senderEnrollmentEpoch: metadata.senderEnrollmentEpoch,
+            senderSignalDeviceID: metadata.senderSignalDeviceID,
+            rosterRevision: metadata.rosterRevision,
+            kind: metadata.kind,
+            replyToMessageID: metadata.replyToMessageID
+        )
+        let legacy = backupPayload(
+            conversation: legacyConversation,
+            messages: [legacyMessage]
+        )
+        let current = backupPayload(
+            conversation: currentConversation,
+            messages: [senderBoundMessage]
+        )
+
+        let merged = try MessageBackupConflictPolicy.merge(legacy, current)
+        let reverseMerged = try MessageBackupConflictPolicy.merge(current, legacy)
+
+        XCTAssertEqual(merged, reverseMerged)
+        XCTAssertEqual(
+            merged.conversations.first?.participantUserIds,
+            [userID, otherUserID, departedUserID]
+        )
+        XCTAssertEqual(
+            merged.messages.first?.secureMessagingHistory?.senderUserID,
+            departedUserID
+        )
+    }
+
+    func testConflictMergeDropsOnlyUnboundHistoryInvalidatedByNewerGroupRoster() throws {
+        let departedUserID = "0a1b2c3d-0000-4000-8000-00000000dddd"
+        let legacyConversation = Conversation(
+            id: conversationID,
+            title: "Current group",
+            participantUserIds: [userID, otherUserID, departedUserID],
+            unreadCount: 0,
+            updatedAt: Date(timeIntervalSince1970: 1_700_000_400),
+            conversationType: SecureMessagingWire.groupConversationType
+        )
+        let currentConversation = Conversation(
+            id: conversationID,
+            title: "Current group",
+            participantUserIds: [userID, otherUserID],
+            unreadCount: 0,
+            updatedAt: Date(timeIntervalSince1970: 1_700_000_500),
+            conversationType: SecureMessagingWire.groupConversationType
+        )
+        let senderBoundMessage = authenticatedDepartedMemberMessage(senderID: departedUserID)
+        var legacyMessage = senderBoundMessage
+        let metadata = try XCTUnwrap(senderBoundMessage.secureMessagingHistory)
+        legacyMessage.secureMessagingHistory = SecureMessagingRetainedMessageMetadata(
+            clientMessageID: metadata.clientMessageID,
+            senderUserID: nil,
+            senderDeviceID: metadata.senderDeviceID,
+            senderEnrollmentEpoch: metadata.senderEnrollmentEpoch,
+            senderSignalDeviceID: metadata.senderSignalDeviceID,
+            rosterRevision: metadata.rosterRevision,
+            kind: metadata.kind,
+            replyToMessageID: metadata.replyToMessageID
+        )
+        let oldUnbound = backupPayload(
+            conversation: legacyConversation,
+            messages: [legacyMessage]
+        )
+        let oldBound = backupPayload(
+            conversation: legacyConversation,
+            messages: [senderBoundMessage]
+        )
+        let currentWithoutMessage = backupPayload(conversation: currentConversation)
+
+        for merged in [
+            try MessageBackupConflictPolicy.merge(oldUnbound, currentWithoutMessage),
+            try MessageBackupConflictPolicy.merge(currentWithoutMessage, oldUnbound),
+        ] {
+            XCTAssertEqual(merged.conversations.first?.participantUserIds, [userID, otherUserID])
+            XCTAssertTrue(merged.messages.isEmpty)
+            XCTAssertNoThrow(try MessageBackupValidationPolicy.validate(
+                merged,
+                expectedUserID: userID,
+                now: validationNow
+            ))
+        }
+
+        for merged in [
+            try MessageBackupConflictPolicy.merge(oldBound, currentWithoutMessage),
+            try MessageBackupConflictPolicy.merge(currentWithoutMessage, oldBound),
+        ] {
+            XCTAssertEqual(merged.messages, [senderBoundMessage])
+            XCTAssertNoThrow(try MessageBackupValidationPolicy.validate(
+                merged,
+                expectedUserID: userID,
+                now: validationNow
+            ))
+        }
     }
 
     // MARK: Restore merge
@@ -414,5 +856,204 @@ final class MessageBackupTests: XCTestCase {
         XCTAssertNil(decoded.messageBackupPreferences)
         XCTAssertNil(decoded.pinnedConversationIds)
         XCTAssertNil(decoded.mutedConversationIds)
+    }
+
+    func testRetainedHistoryMetadataWithoutSenderBindingStillDecodes() throws {
+        let legacy = Data(#"{"clientMessageID":"0a1b2c3d-0000-4000-8000-00000000ffff","senderDeviceID":"0a1b2c3d-0000-4000-8000-00000000eeee","senderEnrollmentEpoch":1,"senderSignalDeviceID":2,"rosterRevision":"v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","kind":"encrypted","replyToMessageID":null}"#.utf8)
+
+        let decoded = try JSONDecoder().decode(
+            SecureMessagingRetainedMessageMetadata.self,
+            from: legacy
+        )
+
+        XCTAssertNil(decoded.senderUserID)
+        XCTAssertEqual(decoded.senderSignalDeviceID, 2)
+    }
+
+    func testBackupRequiresReactionKindAndTargetToMatchAuthenticatedHistory() throws {
+        let target = "0a1b2c3d-0000-4000-8000-00000000dddd"
+        let reaction = try XCTUnwrap(KitMessageReaction(
+            operation: .add,
+            targetServerMessageID: target,
+            emoji: "👍"
+        ))
+        let messageID = UUID(uuidString: "0a1b2c3d-0000-4000-8000-00000000eeee")!
+        var message = LocalMessage(
+            id: messageID,
+            serverMessageId: messageID.uuidString.lowercased(),
+            conversationId: conversationID,
+            senderId: otherUserID,
+            body: reaction.encoded,
+            createdAt: Date(timeIntervalSince1970: 1_700_000_000),
+            sentAt: Date(timeIntervalSince1970: 1_700_000_001),
+            state: .received,
+            failureReason: nil,
+            isOutgoing: false,
+            secureMessagingHistory: SecureMessagingRetainedMessageMetadata(
+                clientMessageID: "0a1b2c3d-0000-4000-8000-00000000ffff",
+                senderUserID: otherUserID,
+                senderDeviceID: "0a1b2c3d-0000-4000-8000-000000000001",
+                senderEnrollmentEpoch: 1,
+                senderSignalDeviceID: 2,
+                rosterRevision: "v1:sha256:" + String(repeating: "a", count: 64),
+                kind: .encryptedReaction,
+                replyToMessageID: target
+            )
+        )
+        let conversation = makeState().conversations[0]
+        let targetMessage = authenticatedDepartedMemberMessage(
+            senderID: otherUserID,
+            id: UUID(uuidString: target)!,
+            serverMessageID: target,
+            clientMessageID: "0a1b2c3d-0000-4000-8000-00000000cccc",
+            body: "Message with a reaction"
+        )
+        XCTAssertNoThrow(try MessageBackupValidationPolicy.validate(
+            backupPayload(conversation: conversation, messages: [targetMessage, message]),
+            expectedUserID: userID,
+            now: validationNow
+        ))
+        XCTAssertThrowsError(try MessageBackupValidationPolicy.validate(
+            backupPayload(conversation: conversation, messages: [message]),
+            expectedUserID: userID,
+            now: validationNow
+        ), "A committed reaction cannot outlive its target")
+
+        let metadata = try XCTUnwrap(message.secureMessagingHistory)
+        message.secureMessagingHistory = SecureMessagingRetainedMessageMetadata(
+            clientMessageID: metadata.clientMessageID,
+            senderUserID: metadata.senderUserID,
+            senderDeviceID: metadata.senderDeviceID,
+            senderEnrollmentEpoch: metadata.senderEnrollmentEpoch,
+            senderSignalDeviceID: metadata.senderSignalDeviceID,
+            rosterRevision: metadata.rosterRevision,
+            kind: .encrypted,
+            replyToMessageID: nil
+        )
+        XCTAssertThrowsError(try MessageBackupValidationPolicy.validate(
+            backupPayload(conversation: conversation, messages: [targetMessage, message]),
+            expectedUserID: userID,
+            now: validationNow
+        ))
+        message.secureMessagingHistory = nil
+        XCTAssertThrowsError(try MessageBackupValidationPolicy.validate(
+            backupPayload(conversation: conversation, messages: [targetMessage, message]),
+            expectedUserID: userID,
+            now: validationNow
+        ))
+    }
+
+    func testBackupRejectsReactionWithoutServerIDOrExactSenderProvenance() throws {
+        let target = "0a1b2c3d-0000-4000-8000-00000000dddd"
+        let reaction = try XCTUnwrap(KitMessageReaction(
+            operation: .add,
+            targetServerMessageID: target,
+            emoji: "👍"
+        ))
+        let reactionID = UUID(uuidString: "0a1b2c3d-0000-4000-8000-00000000eeee")!
+        let targetMessage = authenticatedDepartedMemberMessage(
+            senderID: otherUserID,
+            id: UUID(uuidString: target)!,
+            serverMessageID: target,
+            clientMessageID: "0a1b2c3d-0000-4000-8000-00000000cccc",
+            body: "Message with a reaction"
+        )
+        let metadata = SecureMessagingRetainedMessageMetadata(
+            clientMessageID: "0a1b2c3d-0000-4000-8000-00000000ffff",
+            senderUserID: otherUserID,
+            senderDeviceID: "0a1b2c3d-0000-4000-8000-000000000001",
+            senderEnrollmentEpoch: 1,
+            senderSignalDeviceID: 2,
+            rosterRevision: "v1:sha256:" + String(repeating: "a", count: 64),
+            kind: .encryptedReaction,
+            replyToMessageID: target
+        )
+        func candidate(
+            serverMessageID: String?,
+            senderUserID: String?
+        ) -> LocalMessage {
+            LocalMessage(
+                id: reactionID,
+                serverMessageId: serverMessageID,
+                conversationId: conversationID,
+                senderId: otherUserID,
+                body: reaction.encoded,
+                createdAt: Date(timeIntervalSince1970: 1_700_000_000),
+                sentAt: Date(timeIntervalSince1970: 1_700_000_001),
+                state: .received,
+                failureReason: nil,
+                isOutgoing: false,
+                secureMessagingHistory: SecureMessagingRetainedMessageMetadata(
+                    clientMessageID: metadata.clientMessageID,
+                    senderUserID: senderUserID,
+                    senderDeviceID: metadata.senderDeviceID,
+                    senderEnrollmentEpoch: metadata.senderEnrollmentEpoch,
+                    senderSignalDeviceID: metadata.senderSignalDeviceID,
+                    rosterRevision: metadata.rosterRevision,
+                    kind: metadata.kind,
+                    replyToMessageID: metadata.replyToMessageID
+                )
+            )
+        }
+        let conversation = makeState().conversations[0]
+        for invalid in [
+            candidate(serverMessageID: nil, senderUserID: otherUserID),
+            candidate(serverMessageID: reactionID.uuidString.lowercased(), senderUserID: nil),
+            candidate(serverMessageID: reactionID.uuidString.lowercased(), senderUserID: userID),
+        ] {
+            XCTAssertThrowsError(try MessageBackupValidationPolicy.validate(
+                backupPayload(conversation: conversation, messages: [targetMessage, invalid]),
+                expectedUserID: userID,
+                now: validationNow
+            ))
+        }
+    }
+
+    private var validationNow: Date {
+        Date(timeIntervalSince1970: 1_800_000_000)
+    }
+
+    private func backupPayload(
+        conversation: Conversation,
+        messages: [LocalMessage] = []
+    ) -> MessageBackupPayload {
+        MessageBackupPayload(
+            userID: userID,
+            createdAt: Date(timeIntervalSince1970: 1_700_001_000),
+            deviceName: "Kit iPhone",
+            conversations: [conversation],
+            messages: messages
+        )
+    }
+
+    private func authenticatedDepartedMemberMessage(
+        senderID: String,
+        id: UUID = UUID(uuidString: "0a1b2c3d-0000-4000-8000-00000000eeee")!,
+        serverMessageID: String = "0a1b2c3d-0000-4000-8000-00000000eeee",
+        clientMessageID: String = "0a1b2c3d-0000-4000-8000-00000000ffff",
+        body: String = "history before departure"
+    ) -> LocalMessage {
+        LocalMessage(
+            id: id,
+            serverMessageId: serverMessageID,
+            conversationId: conversationID,
+            senderId: senderID,
+            body: body,
+            createdAt: Date(timeIntervalSince1970: 1_700_000_000),
+            sentAt: Date(timeIntervalSince1970: 1_700_000_001),
+            state: .received,
+            failureReason: nil,
+            isOutgoing: false,
+            secureMessagingHistory: SecureMessagingRetainedMessageMetadata(
+                clientMessageID: clientMessageID,
+                senderUserID: senderID,
+                senderDeviceID: "0a1b2c3d-0000-4000-8000-00000000eeee",
+                senderEnrollmentEpoch: 1,
+                senderSignalDeviceID: 2,
+                rosterRevision: "v1:sha256:\(String(repeating: "a", count: 64))",
+                kind: .encrypted,
+                replyToMessageID: nil
+            )
+        )
     }
 }

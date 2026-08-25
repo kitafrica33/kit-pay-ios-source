@@ -497,8 +497,11 @@ struct ForwardMessagesView: View {
         let directParticipants = Set([localUserID, recipientUserID])
         return model.state.conversations
             .filter { conversation in
-                Set(conversation.participantUserIds.compactMap { forwardCanonicalUserID($0) })
-                    == directParticipants
+                // A two-member GROUP must never absorb a forward addressed to the person.
+                !conversation.isGroup
+                    && Set(conversation.participantUserIds.compactMap {
+                        forwardCanonicalUserID($0)
+                    }) == directParticipants
             }
             .max { $0.updatedAt < $1.updatedAt }
     }

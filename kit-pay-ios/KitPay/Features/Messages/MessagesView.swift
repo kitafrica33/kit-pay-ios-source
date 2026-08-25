@@ -52,6 +52,7 @@ struct MessagesView: View {
     @Environment(\.rootTabBarClearance) private var rootTabBarClearance
     @StateObject private var callMedia = CallMediaCoordinator.shared
     @ObservedObject private var callTransport = CallMediaCoordinator.shared.media
+    @ObservedObject private var presence = KitPresenceCenter.shared
     @Binding var isConversationPresented: Bool
     @State private var navigationPath: [Conversation] = []
     @State private var showNewMessage = false
@@ -63,6 +64,7 @@ struct MessagesView: View {
     @State private var pendingSearchContact: WalletContactDTO?
     @State private var selectedFilter: ConversationListFilter = .all
     @State private var showBackupSettings = false
+    @State private var showGroupCreate = false
     @State private var isSelectingChats = false
     @State private var selectedConversationIDs: Set<String> = []
     @State private var confirmDeleteConversationIDs: Set<String>?
@@ -120,11 +122,32 @@ struct MessagesView: View {
                         queuedNewMessageConversation = conversation
                         showNewMessage = false
                     }
+                    .environmentObject(model)
                 }
                 .sheet(isPresented: $showBackupSettings) {
                     NavigationStack { ChatBackupSettingsView() }
                         .environmentObject(model)
                         .presentationBackground(.ultraThinMaterial)
+                }
+                .sheet(isPresented: $showGroupCreate) {
+                    GroupCreateView(
+                        createGroup: { name, memberUserIDs in
+                            await model.createGroupConversation(
+                                name: name,
+                                memberUserIDs: memberUserIDs
+                            )
+                        },
+                        onCreated: { conversationID in
+                            showGroupCreate = false
+                            if let created = model.state.conversations.first(where: {
+                                $0.id.caseInsensitiveCompare(conversationID) == .orderedSame
+                            }) {
+                                navigationPath.append(created)
+                            }
+                        }
+                    )
+                    .environmentObject(model)
+                    .presentationBackground(.ultraThinMaterial)
                 }
                 .fullScreenCover(
                     isPresented: $showGlobalSearch,
@@ -266,7 +289,10 @@ struct MessagesView: View {
                                     isConnected: callMedia.state == .connected,
                                     hasRemoteParticipant: callTransport.hasRemoteParticipant
                                 ),
-                                isVideoCall: callMedia.activeCall?.video == true
+                                isVideoCall: callMedia.activeCall?.video == true,
+                                typingLabel: presence.typingUserIDs(
+                                    in: conversation.id
+                                ).isEmpty ? nil : "typing…"
                             )
                             chatRow(conversation, context: context)
                             if conversation.id != visibleConversations.last?.id {
@@ -451,11 +477,19 @@ struct MessagesView: View {
             }
             ToolbarItemGroup(placement: .topBarTrailing) {
                 Menu {
+                    if model.messagingGroupsEnabled {
+                        Button {
+                            showGroupCreate = true
+                        } label: {
+                            Label("New group", systemImage: "person.3")
+                        }
+                    }
                     Button {
                         withAnimation(.snappy(duration: 0.22)) { isSelectingChats = true }
                     } label: {
                         Label("Select chats", systemImage: "checkmark.circle")
                     }
+                    .disabled(!model.appReviewDemoMutationsAllowed)
                     Button {
                         showBackupSettings = true
                     } label: {
@@ -472,6 +506,10 @@ struct MessagesView: View {
                 GlassIconButton(systemName: "square.and.pencil", inBar: true) {
                     openNewMessage()
                 }
+                .disabled(!model.appReviewDemoMutationsAllowed)
+                .accessibilityValue(
+                    model.appReviewDemoMutationsAllowed ? "" : "Unavailable in read-only demo"
+                )
             }
         }
     }
@@ -488,6 +526,7 @@ struct MessagesView: View {
         let isSelected: Bool
         let activeCallLabel: String?
         let isVideoCall: Bool
+        var typingLabel: String? = nil
     }
 
     @ViewBuilder
@@ -599,6 +638,11 @@ struct MessagesView: View {
                             .font(.caption2)
                             .foregroundStyle(KitColor.green)
                         Text(activeCallLabel)
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(KitColor.green)
+                            .lineLimit(1)
+                    } else if let typingLabel = context.typingLabel {
+                        Text(typingLabel)
                             .font(.subheadline.weight(.semibold))
                             .foregroundStyle(KitColor.green)
                             .lineLimit(1)
@@ -791,6 +835,10 @@ struct MessagesView: View {
     }
 
     private func openNewMessage(contact: WalletContactDTO? = nil) {
+        guard model.appReviewDemoMutationsAllowed else {
+            model.lastError = AppReviewDemoMutationPolicy.readOnlyMessage
+            return
+        }
         newMessagePresentationID = UUID()
         queuedNewMessageConversation = nil
         newMessageContact = contact
@@ -824,8 +872,11 @@ struct MessagesView: View {
         let directParticipants = Set([localUserID, recipientUserID])
         return model.state.conversations
             .filter { conversation in
-                Set(conversation.participantUserIds.compactMap { canonicalUserID($0) })
-                    == directParticipants
+                // A group that shrank to these two members is still a group thread and must
+                // never masquerade as the direct conversation.
+                !conversation.isGroup
+                    && Set(conversation.participantUserIds.compactMap { canonicalUserID($0) })
+                        == directParticipants
             }
             .max { $0.updatedAt < $1.updatedAt }
     }
@@ -1279,9 +1330,27 @@ private struct ConversationDraftPersistenceTaskKey: Hashable {
     let isSending: Bool
 }
 
+/// What the schedule sheet is being opened for. `existingItem` is nil when the composer is
+/// arranging a new send and set when an already-scheduled item is being moved.
+private struct ChatScheduleRequest: Identifiable {
+    let id: UUID
+    let existingItem: ScheduledChatItem?
+    let preview: String
+
+    var title: String { existingItem == nil ? "Send later" : "Edit schedule" }
+    var confirmTitle: String { existingItem == nil ? "Schedule" : "Save" }
+}
+
+private enum GroupProfileFollowUp {
+    case addMember
+    case mediaLibrary
+    case leaveCompleted
+}
+
 struct ConversationView: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.dismiss) private var dismissConversation
     let conversation: Conversation
     @State private var draft = ""
     @State private var showPhotoPicker = false
@@ -1290,6 +1359,7 @@ struct ConversationView: View {
     @State private var isLoadingAttachment = false
     @State private var attachmentLoadGeneration = 0
     @State private var isSending = false
+    @State private var scheduleRequest: ChatScheduleRequest?
     @State private var retryingMessageIDs: Set<UUID> = []
     @State private var didRestoreDraft = false
     @State private var draftWriteVersion: ConversationDraftWriteVersion?
@@ -1297,6 +1367,9 @@ struct ConversationView: View {
     @State private var showPaymentRequest = false
     @State private var showSendMoney = false
     @State private var showContactProfile = false
+    @State private var showGroupMemberPicker = false
+    @State private var showGroupMediaLibrary = false
+    @State private var groupProfileFollowUp: GroupProfileFollowUp?
     @State private var abuseReportTarget: AbuseReportTarget?
     @State private var chatPaymentApproval: ChatPaymentApproval?
     @State private var resolvingPaymentRequestID: String?
@@ -1311,12 +1384,14 @@ struct ConversationView: View {
     @State private var isNearLatestMessage = true
     @State private var unseenIncomingCount = 0
     @State private var cameraPullProgress: CGFloat = 0
-    @State private var didTriggerCameraPull = false
+    @State private var cameraPull = ConversationCameraPullGesture()
     @State private var conversationContentHeight: CGFloat = 0
     @State private var conversationViewportHeight: CGFloat = 0
     @State private var pendingScrollTargetMessageID: UUID?
     @State private var galleryTarget: ConversationGalleryTarget?
     @State private var editorSession: MediaEditorSession?
+    @State private var reactionPickerTarget: LocalMessage?
+    @State private var reactionDetailTarget: LocalMessage?
     @State private var isSearchingMessages = false
     @State private var messageSearchQuery = ""
     @State private var searchMatchIndex = 0
@@ -1328,6 +1403,7 @@ struct ConversationView: View {
     @StateObject private var sendMoneyFlow = WalletFlowModel()
     @StateObject private var chatPaymentRequests = PaymentRequestsViewModel()
     @StateObject private var chatTransfers = ChatTransfersViewModel()
+    @ObservedObject private var presence = KitPresenceCenter.shared
     @State private var transferReverseTarget: ChatTransferReverseTarget?
     @State private var transferRejectTarget: ChatTransferRejectTarget?
     @StateObject private var voiceRecorder = VoiceNoteRecorder()
@@ -1341,9 +1417,34 @@ struct ConversationView: View {
     }
 
     private var messages: [LocalMessage] {
-        model.state.messages
-            .filter { $0.conversationId == conversation.id }
-            .sorted { $0.createdAt < $1.createdAt }
+        // A Send Later message is shown in its own section under the timeline, not inline: it has
+        // not happened yet, and a bubble sitting among sent messages would read as if it had.
+        let waiting = scheduledMessageIDs
+        return model.state.messages
+            .filter { $0.conversationId == conversation.id && !waiting.contains($0.id) }
+            .sorted { $0.timelineDate < $1.timelineDate }
+    }
+
+    private var currentConversation: Conversation {
+        model.state.conversations.first(where: {
+            $0.id.caseInsensitiveCompare(conversation.id) == .orderedSame
+        }) ?? conversation
+    }
+
+    private var scheduledItems: [ScheduledChatItem] {
+        model.scheduledChatItems(
+            conversationID: conversation.id,
+            at: AppPresentationClock.now
+        )
+    }
+
+    private var scheduledMessageIDs: Set<UUID> {
+        Set(
+            scheduledItems.compactMap {
+                if case .message(let id) = $0.content { return id }
+                return nil
+            }
+        )
     }
 
     private var timelineItems: [ConversationTimelineItem] {
@@ -1408,7 +1509,27 @@ struct ConversationView: View {
     }
 
     private var recipientCommunicationAllowed: Bool {
-        model.communicationPrivacyAllowsOutbound(to: recipientUserID)
+        // Group sends have no single peer to gate on; per-member policy runs server-side and
+        // at the encrypted fanout. Blocking still bites in 1:1 threads.
+        if isGroupConversation { return true }
+        return model.communicationPrivacyAllowsOutbound(to: recipientUserID)
+    }
+
+    /// Existing group history remains readable when the rollout gate is absent or withdrawn,
+    /// but every local mutation stays disabled until the server advertises the protocol again.
+    private var conversationMessagingAvailable: Bool {
+        guard MessagingGroupCapabilityPolicy.allowsConversationMutation(
+            isGroup: isGroupConversation,
+            groupCapabilityEnabled: model.messagingGroupsEnabled
+        ) else { return false }
+        return !isGroupConversation || currentUserIsGroupMember
+    }
+
+    private var currentUserIsGroupMember: Bool {
+        guard let currentUserID = canonicalUserID(model.profile?.id) else { return false }
+        return conversation.participantUserIds.contains {
+            canonicalUserID($0) == currentUserID
+        }
     }
 
     private var isReadOnlyAppReviewPreview: Bool {
@@ -1427,6 +1548,7 @@ struct ConversationView: View {
         let hasAttachment = !stagedAttachments.isEmpty
         return !isReadOnlyAppReviewPreview
             && model.secureMessagingAvailable
+            && conversationMessagingAvailable
             && recipientCommunicationAllowed
             && !isSending
             && !isLoadingAttachment
@@ -1434,7 +1556,8 @@ struct ConversationView: View {
     }
 
     private var cameraPullIsEligible: Bool {
-        !isReadOnlyAppReviewPreview && ConversationCameraPullPolicy.isEligible(
+        !isReadOnlyAppReviewPreview && conversationMessagingAvailable
+            && ConversationCameraPullPolicy.isEligible(
             contentHeight: conversationContentHeight,
             viewportHeight: conversationViewportHeight,
             isSelectingMessages: isSelectingMessages,
@@ -1519,11 +1642,191 @@ struct ConversationView: View {
         conversationLifecycle
     }
 
+    // MARK: Presence & typing
+
+    private var isGroupConversation: Bool { conversation.isGroup }
+
+    /// "typing…" (or names in groups) — sourced from the realtime presence center; empty until
+    /// the realtime transport is connected, never guessed.
+    private var conversationTypingLabel: String? {
+        guard model.messagingPresenceEnabled, presence.broadcastsPresence else { return nil }
+        let selfID = model.profile?.id.lowercased()
+        let typingIDs = presence.typingUserIDs(in: conversation.id)
+            .filter { $0 != selfID }
+        guard !typingIDs.isEmpty else { return nil }
+        if isGroupConversation {
+            return KitPresencePolicy.typingLabel(
+                names: typingIDs.map { participantDisplayName(for: $0) }
+            )
+        }
+        return "typing…"
+    }
+
+    private var presenceSubtitle: String? {
+        if let typing = conversationTypingLabel { return typing }
+        if isGroupConversation {
+            let count = conversation.participantUserIds.count
+            return "\(count) member\(count == 1 ? "" : "s")"
+        }
+        guard model.messagingPresenceEnabled, presence.broadcastsPresence else { return nil }
+        guard let peer = recipientUserID else { return nil }
+        return KitPresencePolicy.lastSeenLabel(
+            for: presence.presenceState(for: peer),
+            now: Date()
+        )
+    }
+
+    private var presenceSubtitleIsLive: Bool {
+        guard model.messagingPresenceEnabled, presence.broadcastsPresence else { return false }
+        if conversationTypingLabel != nil { return true }
+        return presence.isPeerOnline(recipientUserID)
+    }
+
+    /// Group lifecycle notices render as centered chips, mirroring the date separators.
+    private func systemEventChip(_ event: KitSystemMessage) -> some View {
+        Text(systemEventText(event))
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(KitColor.secondaryText)
+            .multilineTextAlignment(.center)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(.ultraThinMaterial, in: Capsule())
+            .frame(maxWidth: .infinity, alignment: .center)
+            .accessibilityLabel(systemEventText(event))
+    }
+
+    private func systemEventText(_ event: KitSystemMessage) -> String {
+        let subject = participantDisplayName(for: event.subjectUserID)
+        let actor = event.actorUserID.map { participantDisplayName(for: $0) }
+        switch event.kind {
+        case .memberAdded:
+            if let actor, actor != subject {
+                return "\(actor) added \(subject)"
+            }
+            return "\(subject) joined the group"
+        case .memberRemoved:
+            if let actor, actor != subject {
+                return "\(actor) removed \(subject)"
+            }
+            return "\(subject) was removed"
+        case .memberLeft:
+            return "\(subject) left the group"
+        }
+    }
+
+    // MARK: Reactions
+
+    /// Aggregated tallies keyed by the target's lowercase server message id.
+    private var reactionTallies: [String: [MessageReactionTally]] {
+        MessageReactionAggregationPolicy.tallies(
+            in: messages,
+            currentUserID: model.profile?.id
+        )
+    }
+
+    private func reactionChips(
+        _ tallies: [MessageReactionTally],
+        for message: LocalMessage
+    ) -> some View {
+        HStack(spacing: 4) {
+            ForEach(tallies) { tally in
+                HStack(spacing: 3) {
+                    Text(tally.emoji)
+                        .font(.footnote)
+                    if tally.count > 1 {
+                        Text("\(tally.count)")
+                            .font(.caption2.weight(.semibold).monospacedDigit())
+                            .foregroundStyle(KitColor.primaryText)
+                    }
+                }
+                .padding(.horizontal, 8)
+                .frame(height: 26)
+                .background(.ultraThinMaterial, in: Capsule())
+                .overlay {
+                    Capsule()
+                        .stroke(
+                            tally.includesCurrentUser
+                                ? KitColor.green
+                                : Color.white.opacity(0.4),
+                            lineWidth: tally.includesCurrentUser ? 1.2 : 0.6
+                        )
+                        .allowsHitTesting(false)
+                }
+                .contentShape(Capsule())
+                // Tap toggles; long-press ONLY opens the detail sheet. (The previous Button +
+                // simultaneous long-press fired BOTH: the toggle mutated the user's reaction
+                // while they were just looking at who reacted.) Tap is attached first so the
+                // long-press recognizer cannot delay ordinary taps.
+                .onTapGesture {
+                    guard conversationMessagingAvailable else { return }
+                    Task { await toggleReaction(tally.emoji, on: message) }
+                }
+                .onLongPressGesture {
+                    reactionDetailTarget = message
+                }
+                .accessibilityLabel(
+                    "\(tally.emoji), \(tally.count) reaction\(tally.count == 1 ? "" : "s")"
+                        + (tally.includesCurrentUser ? ", including yours" : "")
+                )
+                .accessibilityAddTraits(.isButton)
+            }
+        }
+        .padding(.horizontal, 2)
+    }
+
+    /// One reaction per person per message: tapping the emoji you already hold removes it;
+    /// any other emoji replaces it. Sends ride the same offline-first encrypted queue as text.
+    private func toggleReaction(_ emoji: String, on message: LocalMessage) async {
+        guard conversationMessagingAvailable,
+              let target = message.serverMessageId?.lowercased()
+        else { return }
+        let current = MessageReactionAggregationPolicy.currentUserReaction(
+            to: target,
+            in: messages,
+            currentUserID: model.profile?.id
+        )
+        let operation: KitMessageReactionOperation = current == emoji ? .remove : .add
+        guard let reaction = KitMessageReaction(
+            operation: operation,
+            targetServerMessageID: target,
+            emoji: emoji
+        ) else { return }
+        _ = await model.queueReactionEvent(
+            conversationId: conversation.id,
+            title: recipientDisplayName,
+            recipientId: recipientUserID,
+            reaction: reaction
+        )
+    }
+
+    /// Resolves a display name for a reactor or group member: "You", a synced contact's name,
+    /// or a neutral fallback that never guesses.
+    private func participantDisplayName(for userID: String) -> String {
+        let canonical = userID.lowercased()
+        if canonical == model.profile?.id.lowercased() { return "You" }
+        if let contact = model.contactDirectory.first(where: {
+            ContactRecipientDirectory.recipientUserId(for: $0) == canonical
+        }) {
+            return contact.name
+        }
+        if canonical == recipientUserID?.lowercased() { return recipientDisplayName }
+        return "Kit Pay user"
+    }
+
     private var conversationLayout: some View {
-        // One pass per render; selection mode falls back to individual bubbles so every
-        // message stays individually checkable.
+        // One pass per render for every whole-thread fold (albums, reaction suppression,
+        // reaction tallies): computing these per bubble would be quadratic in long threads
+        // and re-trigger on every keystroke.
+        let timelineSnapshot = messages
         let albumMembership: [UUID: ChatMediaAlbumMembership] =
-            isSelectingMessages ? [:] : ChatMediaAlbumPolicy.membership(for: messages)
+            isSelectingMessages ? [:] : ChatMediaAlbumPolicy.membership(for: timelineSnapshot)
+        let suppressedReactionIDs = MessageReactionAggregationPolicy.suppressedMessageIDs(
+            in: timelineSnapshot
+        )
+        let hoistedTallies = MessageReactionAggregationPolicy.tallies(
+            in: timelineSnapshot,
+            currentUserID: model.profile?.id
+        )
         return VStack(spacing: 0) {
             ScrollViewReader { scrollProxy in
                 ScrollView {
@@ -1550,10 +1853,28 @@ struct ConversationView: View {
                         ForEach(timelineItems) { item in
                             switch item {
                             case .message(let message):
-                                if case .leader(let album) = albumMembership[message.id] {
+                                if let systemEvent = KitSystemMessage.parse(message.body) {
+                                    // Only the coordinator authors system notices (no server
+                                    // message id); an inbound peer-authored KITSYS1 body is a
+                                    // forgery attempt and renders nothing — never a chip that
+                                    // impersonates authoritative membership history.
+                                    if message.serverMessageId == nil {
+                                        systemEventChip(systemEvent)
+                                    } else {
+                                        EmptyView()
+                                    }
+                                } else if suppressedReactionIDs.contains(message.id)
+                                    || SecureMessageReservedPrefixPolicy.beginsWithReservedPrefix(
+                                        message.body,
+                                        prefix: KitSystemMessage.prefix
+                                    ) {
+                                    // Reaction events render as chips on their target bubble;
+                                    // malformed system wire stays invisible rather than raw.
+                                    EmptyView()
+                                } else if case .leader(let album) = albumMembership[message.id] {
                                     albumBubble(album)
                                 } else if albumMembership[message.id] != .follower {
-                                    bubble(message)
+                                    bubble(message, reactionTallies: hoistedTallies)
                                 }
                             case .payment(let message, let descriptor):
                                 paymentBubble(message, descriptor: descriptor)
@@ -1562,6 +1883,26 @@ struct ConversationView: View {
                             case .dateSeparator(let separator):
                                 dateSeparator(separator)
                             }
+                        }
+                        if !scheduledItems.isEmpty {
+                            ScheduledSendSection(
+                                items: scheduledItems,
+                                isOnline: model.isOnline,
+                                failureReason: { model.scheduledItemFailureReason($0) },
+                                onSendNow: { item in
+                                    Task { await model.sendScheduledItemNow(item.id) }
+                                },
+                                onEditSchedule: { item in
+                                    scheduleRequest = ChatScheduleRequest(
+                                        id: item.id,
+                                        existingItem: item,
+                                        preview: item.preview
+                                    )
+                                },
+                                onCancel: { item in
+                                    Task { await cancelScheduledItem(item) }
+                                }
+                            )
                         }
                         Color.clear
                             .frame(height: 1)
@@ -1599,6 +1940,14 @@ struct ConversationView: View {
                 .onPreferenceChange(ConversationScrollMetricsKey.self) { metrics in
                     handleScrollMetrics(metrics)
                 }
+                // The only signal available on iOS 17 for "the finger came up". It runs alongside
+                // the scroll rather than competing with it, and the minimum distance keeps taps
+                // and the bubbles' own long-press menus out of it entirely.
+                .simultaneousGesture(
+                    DragGesture(minimumDistance: 12)
+                        .onChanged { _ in updateCameraPullArming() }
+                        .onEnded { _ in releaseCameraPull() }
+                )
                 .onChange(of: timelineItems.last?.id) { _, _ in
                     // A message the user just sent always snaps to the latest position; an
                     // incoming message must never yank them away from what they are reading.
@@ -1639,6 +1988,8 @@ struct ConversationView: View {
                 messageSelectionBar
             } else if isSearchingMessages {
                 messageSearchBar
+            } else if !conversationMessagingAvailable {
+                groupMessagingReadOnlyFooter
             } else {
                 composer
             }
@@ -1711,11 +2062,38 @@ struct ConversationView: View {
                             title: paymentRecipientName,
                             conversationId: conversation.id
                         )
+                    },
+                    scheduleRequest: { draft in
+                        await model.schedulePaymentRequest(
+                            destinationWalletID: draft.destinationWalletID,
+                            requestedFromUserID: draft.recipientUserID,
+                            amount: draft.amount,
+                            currencyCode: draft.currencyCode,
+                            note: draft.note,
+                            recipientName: draft.recipientName,
+                            conversationID: conversation.id,
+                            deliverAt: draft.deliverAt
+                        )
                     }
                 )
                 .environmentObject(model)
             }
             .presentationBackground(.ultraThinMaterial)
+        }
+        .sheet(item: $scheduleRequest) { request in
+            ScheduleSendSheet(
+                title: request.title,
+                confirmTitle: request.confirmTitle,
+                preview: request.preview,
+                initialDate: request.existingItem?.scheduledAt,
+                onSchedule: { date in
+                    if let item = request.existingItem {
+                        Task { await model.rescheduleScheduledItem(item.id, to: date) }
+                    } else {
+                        sendDraft(deliverAt: date)
+                    }
+                }
+            )
         }
         .sheet(isPresented: $showSendMoney) {
             NavigationStack {
@@ -1738,7 +2116,53 @@ struct ConversationView: View {
             }
             .presentationBackground(.ultraThinMaterial)
         }
-        .sheet(isPresented: $showContactProfile) {
+        .sheet(isPresented: $showContactProfile, onDismiss: finishGroupProfilePresentation) {
+            if isGroupConversation {
+                let group = currentConversation
+                GroupProfileView(
+                    conversationID: group.id,
+                    title: group.title,
+                    members: group.participantUserIds.map { userID in
+                        GroupMemberPresentation(
+                            userID: userID,
+                            displayName: participantDisplayName(for: userID),
+                            isCurrentUser: userID.lowercased()
+                                == model.profile?.id.lowercased(),
+                            role: group.groupRole(for: userID)?.rawValue,
+                            avatarURL: model.contactAvatarURL(forUserID: userID)
+                        )
+                    },
+                    renameGroup: model.canRenameGroupConversation(group.id) ? { title in
+                        await model.renameGroupConversation(group.id, title: title)
+                    } : nil,
+                    addMembers: model.canAddGroupConversationMember(group.id) ? {
+                        groupProfileFollowUp = .addMember
+                        showContactProfile = false
+                    } : nil,
+                    canRemoveMember: { memberUserID in
+                        model.canRemoveGroupConversationMember(
+                            memberUserID,
+                            from: group.id
+                        )
+                    },
+                    removeMember: { memberUserID in
+                        await model.removeGroupConversationMember(
+                            memberUserID,
+                            from: group.id
+                        )
+                    },
+                    leaveGroup: model.canLeaveGroupConversation(group.id) ? {
+                        let left = await model.leaveGroupConversation(group.id)
+                        if left { groupProfileFollowUp = .leaveCompleted }
+                        return left
+                    } : nil,
+                    openMediaLibrary: {
+                        groupProfileFollowUp = .mediaLibrary
+                        showContactProfile = false
+                    }
+                )
+                .presentationBackground(.ultraThinMaterial)
+            } else {
             ConversationContactProfileView(
                 name: recipientDisplayName,
                 contact: recipientContact,
@@ -1766,6 +2190,43 @@ struct ConversationView: View {
                     }
                 }
             )
+            .environmentObject(model)
+            .presentationBackground(.ultraThinMaterial)
+            }
+        }
+        .sheet(isPresented: $showGroupMemberPicker) {
+            GroupMemberPickerView(
+                existingMemberUserIDs: Set(currentConversation.participantUserIds),
+                addMember: { memberUserID in
+                    await model.addGroupConversationMember(
+                        memberUserID,
+                        to: conversation.id
+                    )
+                }
+            )
+            .environmentObject(model)
+            .presentationBackground(.ultraThinMaterial)
+        }
+        .sheet(isPresented: $showGroupMediaLibrary) {
+            NavigationStack {
+                ConversationMediaLibraryView(
+                    conversationID: conversation.id,
+                    conversationTitle: currentConversation.title,
+                    openGallery: { messageID in
+                        showGroupMediaLibrary = false
+                        Task { @MainActor in
+                            try? await Task.sleep(nanoseconds: 350_000_000)
+                            galleryTarget = ConversationGalleryTarget(id: messageID)
+                        }
+                    }
+                )
+                .environmentObject(model)
+                .toolbar {
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Done") { showGroupMediaLibrary = false }
+                    }
+                }
+            }
             .presentationBackground(.ultraThinMaterial)
         }
         .sheet(item: $abuseReportTarget) { target in
@@ -1798,6 +2259,22 @@ struct ConversationView: View {
                 onDismiss: { galleryTarget = nil }
             )
             .environmentObject(model)
+        }
+        .sheet(item: $reactionPickerTarget) { target in
+            ReactionPickerSheet { emoji in
+                reactionPickerTarget = nil
+                Task { await toggleReaction(emoji, on: target) }
+            }
+            .presentationDetents([.medium, .large])
+            .presentationBackground(.ultraThinMaterial)
+        }
+        .sheet(item: $reactionDetailTarget) { target in
+            ReactionDetailSheet(
+                tallies: reactionTallies[target.serverMessageId?.lowercased() ?? ""] ?? [],
+                nameForUserID: { participantDisplayName(for: $0) }
+            )
+            .presentationDetents([.medium])
+            .presentationBackground(.ultraThinMaterial)
         }
         .sheet(isPresented: $showForwardSheet) {
             ForwardMessagesView(items: forwardItems) { sentCount in
@@ -1891,7 +2368,21 @@ struct ConversationView: View {
                 await chatPaymentRequests.load(isOnline: model.isOnline)
                 return true
             }
+            .environmentObject(model)
             .presentationBackground(.ultraThinMaterial)
+        }
+    }
+
+    private func finishGroupProfilePresentation() {
+        guard let followUp = groupProfileFollowUp else { return }
+        groupProfileFollowUp = nil
+        switch followUp {
+        case .addMember:
+            showGroupMemberPicker = true
+        case .mediaLibrary:
+            showGroupMediaLibrary = true
+        case .leaveCompleted:
+            dismissConversation()
         }
     }
 
@@ -2016,6 +2507,18 @@ struct ConversationView: View {
                 return
             }
             draftWriteVersion = model.nextConversationDraftWriteVersion()
+            // Throttled inside the presence center (≥4s between sends, auto-stop on idle);
+            // never one event per keystroke, and a no-op until the realtime transport lands.
+            // Requires composer focus: the programmatic draft RESTORE on appear also fires
+            // this onChange and must never broadcast a false "typing…".
+            if !value.isEmpty,
+               isComposerFocused,
+               conversationMessagingAvailable,
+               recipientCommunicationAllowed {
+                presence.recordLocalTyping(conversationID: conversation.id)
+            } else {
+                presence.stopLocalTyping(conversationID: conversation.id)
+            }
         }
         .onChange(of: scenePhase) { _, phase in
             guard !isReadOnlyAppReviewPreview else { return }
@@ -2028,6 +2531,14 @@ struct ConversationView: View {
                 persistDraftImmediately()
             }
         }
+        .onChange(of: model.messagingGroupsEnabled) { _, enabled in
+            guard isGroupConversation, !enabled else { return }
+            stopReadOnlyGroupInteractions()
+        }
+        .onChange(of: currentUserIsGroupMember) { _, isMember in
+            guard isGroupConversation, !isMember else { return }
+            stopReadOnlyGroupInteractions()
+        }
         .onDisappear {
             incomingSoundPolicy.endVisibility()
             if !isReadOnlyAppReviewPreview {
@@ -2037,6 +2548,7 @@ struct ConversationView: View {
             isLoadingAttachment = false
             isComposerFocused = false
             voiceRecorder.cancel()
+            presence.stopLocalTyping(conversationID: conversation.id)
             if !isReadOnlyAppReviewPreview, !isSending { persistDraftImmediately() }
         }
     }
@@ -2081,6 +2593,17 @@ struct ConversationView: View {
                     .kitBarControlGlass(
                         diameter: ConversationHeaderLayoutPolicy.avatarControlDiameter
                     )
+                    .overlay(alignment: .bottomTrailing) {
+                        if presence.isPeerOnline(recipientUserID) {
+                            Circle()
+                                .fill(KitColor.green)
+                                .frame(width: 10, height: 10)
+                                .overlay {
+                                    Circle().stroke(.white, lineWidth: 1.5)
+                                }
+                                .accessibilityLabel("Online")
+                        }
+                    }
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("Open \(recipientDisplayName)'s profile")
@@ -2092,28 +2615,45 @@ struct ConversationView: View {
             // an ellipsis when it is too long.
             ToolbarItem(placement: .principal) {
                 Button { showContactProfile = true } label: {
-                    Text(recipientDisplayName)
-                        .font(.headline)
-                        .foregroundStyle(.primary)
-                        .lineLimit(ConversationHeaderLayoutPolicy.nameLineLimit)
-                        .truncationMode(.tail)
-                        .frame(
-                            maxWidth: ConversationHeaderLayoutPolicy.maximumNameWidth,
-                            alignment: .leading
-                        )
-                        .contentShape(Rectangle())
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(recipientDisplayName)
+                            .font(.headline)
+                            .foregroundStyle(.primary)
+                            .lineLimit(ConversationHeaderLayoutPolicy.nameLineLimit)
+                            .truncationMode(.tail)
+                        if let presenceSubtitle {
+                            Text(presenceSubtitle)
+                                .font(.caption2)
+                                .foregroundStyle(
+                                    presenceSubtitleIsLive ? KitColor.green : .secondary
+                                )
+                                .lineLimit(1)
+                                .transition(.opacity)
+                        }
+                    }
+                    .frame(
+                        maxWidth: ConversationHeaderLayoutPolicy.maximumNameWidth,
+                        alignment: .leading
+                    )
+                    .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel("Open \(recipientDisplayName)'s profile")
+                .accessibilityLabel(
+                    "Open \(recipientDisplayName)'s profile"
+                        + (presenceSubtitle.map { ", \($0)" } ?? "")
+                )
             }
             ToolbarItem(placement: .topBarTrailing) {
                 // Two lenses only: a third would push the name below its 150pt readable
                 // minimum on the narrowest supported bar. Search lives in the contact sheet.
-                KitGlassControlGroup(
-                    spacing: ConversationHeaderLayoutPolicy.callControlSpacing
-                ) {
-                    chatCallToolbarButton(video: false)
-                    chatCallToolbarButton(video: true)
+                // Group calls are not part of the calling product yet, so groups show none.
+                if !isGroupConversation {
+                    KitGlassControlGroup(
+                        spacing: ConversationHeaderLayoutPolicy.callControlSpacing
+                    ) {
+                        chatCallToolbarButton(video: false)
+                        chatCallToolbarButton(video: true)
+                    }
                 }
             }
         }
@@ -2133,6 +2673,35 @@ struct ConversationView: View {
                 Divider().opacity(0.35).allowsHitTesting(false)
             }
             .accessibilityHint("Sample content cannot send messages, payments, or calls")
+    }
+
+    private var groupMessagingReadOnlyFooter: some View {
+        Label(
+            currentUserIsGroupMember
+                ? "Group messaging is unavailable right now. You can still read this conversation."
+                : "You are no longer a member. You can still read this conversation.",
+            systemImage: "lock.fill"
+        )
+        .font(.footnote.weight(.semibold))
+        .foregroundStyle(KitColor.secondaryText)
+        .frame(maxWidth: .infinity)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 14)
+        .background(.ultraThinMaterial)
+        .overlay(alignment: .top) {
+            Divider().opacity(0.35).allowsHitTesting(false)
+        }
+        .accessibilityLabel("Group conversation is read-only.")
+    }
+
+    private func stopReadOnlyGroupInteractions() {
+        isComposerFocused = false
+        voiceRecorder.cancel()
+        presence.stopLocalTyping(conversationID: conversation.id)
+        showPhotoPicker = false
+        showCameraCapture = false
+        showVideoNoteCamera = false
+        showDocumentImporter = false
     }
 
     @ViewBuilder
@@ -2194,11 +2763,13 @@ struct ConversationView: View {
                 } label: {
                     Label("Document", systemImage: "doc")
                 }
-                Button { openSendMoney() } label: {
-                    Label("Send money", systemImage: "arrow.up.circle")
-                }
-                Button { openPaymentRequest() } label: {
-                    Label("Payment request", systemImage: "banknote")
+                if !isGroupConversation {
+                    Button { openSendMoney() } label: {
+                        Label("Send money", systemImage: "arrow.up.circle")
+                    }
+                    Button { openPaymentRequest() } label: {
+                        Label("Payment request", systemImage: "banknote")
+                    }
                 }
             } label: {
                 Image(systemName: "plus")
@@ -2207,17 +2778,19 @@ struct ConversationView: View {
                     .frame(width: 42, height: 42)
                     .background(.ultraThinMaterial, in: Circle())
             }
-            .accessibilityLabel("Attachments and payments")
+            .accessibilityLabel(isGroupConversation ? "Attachments" : "Attachments and payments")
 
             HStack(alignment: .bottom, spacing: 4) {
                 TextField(
-                    model.secureMessagingAvailable ? "Message" : "Messages temporarily unavailable",
+                    model.secureMessagingAvailable && conversationMessagingAvailable
+                        ? "Message"
+                        : "Messages temporarily unavailable",
                     text: $draft,
                     axis: .vertical
                 )
                 .lineLimit(1...5)
                 .focused($isComposerFocused)
-                .disabled(!model.secureMessagingAvailable || isSending)
+                .disabled(!model.secureMessagingAvailable || !conversationMessagingAvailable || isSending)
                 .padding(.leading, 14)
                 .padding(.vertical, 10)
 
@@ -2233,8 +2806,8 @@ struct ConversationView: View {
                     }
                     .buttonStyle(.plain)
                     .foregroundStyle(KitColor.green)
-                    .disabled(!model.secureMessagingAvailable)
-                    .opacity(model.secureMessagingAvailable ? 1 : 0.5)
+                    .disabled(!model.secureMessagingAvailable || !conversationMessagingAvailable)
+                    .opacity(model.secureMessagingAvailable && conversationMessagingAvailable ? 1 : 0.5)
                     .accessibilityLabel("Record a voice note")
                     .transition(.opacity.combined(with: .scale(scale: 0.82)))
                 }
@@ -2247,7 +2820,9 @@ struct ConversationView: View {
             }
 
             if showsSendButton {
-                Button(action: sendDraft) {
+                Button {
+                    sendDraft()
+                } label: {
                     Group {
                         if isLoadingAttachment || isSending {
                             ProgressView().tint(.white)
@@ -2270,6 +2845,20 @@ struct ConversationView: View {
                             : "Queue \(stagedAttachments.count == 1 ? "encrypted \(stagedAttachments[0].kind.previewLabel.lowercased())" : "\(stagedAttachments.count) encrypted attachments") to send when connected"
                 )
                 .transition(.opacity.combined(with: .scale(scale: 0.82)))
+                // Long press is the discoverable place people already look for send options.
+                // The menu still offers "Send now" so the gesture never becomes a trap.
+                .contextMenu {
+                    Button {
+                        sendDraft()
+                    } label: {
+                        Label("Send now", systemImage: "paperplane.fill")
+                    }
+                    Button {
+                        openScheduleSheetForDraft()
+                    } label: {
+                        Label("Send later", systemImage: "clock")
+                    }
+                }
             }
         }
         .animation(.snappy(duration: 0.22), value: showsSendButton)
@@ -2625,7 +3214,10 @@ struct ConversationView: View {
     // MARK: Bubbles
 
     @ViewBuilder
-    private func bubble(_ message: LocalMessage) -> some View {
+    private func bubble(
+        _ message: LocalMessage,
+        reactionTallies: [String: [MessageReactionTally]]
+    ) -> some View {
         let descriptor = KitMediaMessageDescriptor.parse(message.body)
         let mediaKind = descriptor.map { KitChatMediaKind(mediaType: $0.mediaType) }
         let isSelected = selectedMessageIDs.contains(message.id)
@@ -2638,6 +3230,13 @@ struct ConversationView: View {
                     .accessibilityHidden(true)
             }
             if message.isOutgoing { Spacer(minLength: 44) }
+            VStack(alignment: message.isOutgoing ? .trailing : .leading, spacing: 3) {
+            if isGroupConversation, !message.isOutgoing {
+                Text(participantDisplayName(for: message.senderId))
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(KitColor.green)
+                    .padding(.horizontal, 4)
+            }
             bubbleBody(message, descriptor: descriptor, mediaKind: mediaKind)
                 .overlay {
                     if isSearchingMessages, currentSearchMatchID == message.id {
@@ -2650,6 +3249,27 @@ struct ConversationView: View {
                 .allowsHitTesting(!isSelectingMessages)
                 .contextMenu {
                     if !isSelectingMessages {
+                        if !isReadOnlyAppReviewPreview,
+                           conversationMessagingAvailable,
+                           message.serverMessageId != nil,
+                           model.messagingReactionsEnabled {
+                            ControlGroup {
+                                ForEach(
+                                    MessageReactionAggregationPolicy.quickReactions,
+                                    id: \.self
+                                ) { emoji in
+                                    Button(emoji) {
+                                        Task { await toggleReaction(emoji, on: message) }
+                                    }
+                                }
+                                Button {
+                                    reactionPickerTarget = message
+                                } label: {
+                                    Label("More reactions", systemImage: "plus.circle")
+                                }
+                            }
+                            .controlGroupStyle(.palette)
+                        }
                         if let copyText = copyableText(for: message) {
                             Button {
                                 UIPasteboard.general.string = copyText
@@ -2699,6 +3319,12 @@ struct ConversationView: View {
                         }
                     }
                 }
+            if let serverID = message.serverMessageId?.lowercased(),
+               let tallies = reactionTallies[serverID],
+               !tallies.isEmpty {
+                reactionChips(tallies, for: message)
+            }
+            }
             if !message.isOutgoing { Spacer(minLength: 44) }
         }
         .contentShape(Rectangle())
@@ -2757,7 +3383,11 @@ struct ConversationView: View {
                 mediaType: descriptor.mediaType,
                 isOutgoing: message.isOutgoing,
                 createdAt: message.createdAt,
-                senderName: message.isOutgoing ? "You" : recipientDisplayName
+                senderName: message.isOutgoing
+                    ? "You"
+                    : isGroupConversation
+                        ? participantDisplayName(for: message.senderId)
+                        : recipientDisplayName
             )
         }
     }
@@ -2873,7 +3503,12 @@ struct ConversationView: View {
                     )
                 }
                 guard let body = message.body.nilIfBlank,
-                      KitPaymentMessage.parse(body) == nil
+                      KitPaymentMessage.parse(body) == nil,
+                      !KitMessageReaction.isReactionText(body),
+                      !SecureMessageReservedPrefixPolicy.beginsWithReservedPrefix(
+                          body,
+                          prefix: KitSystemMessage.prefix
+                      )
                 else { return nil }
                 return .text(id: message.id, body: body)
             }
@@ -2919,6 +3554,7 @@ struct ConversationView: View {
             Text(AppPresentationClock.shortTime(message.createdAt))
             if message.isOutgoing,
                message.state == .failed,
+               conversationMessagingAvailable,
                model.canRetryMessage(
                    message.id,
                    conversationID: conversation.id,
@@ -3015,7 +3651,7 @@ struct ConversationView: View {
             )
             .font(.caption.bold())
             .foregroundStyle(message.isOutgoing ? Color.white.opacity(0.82) : KitColor.green)
-            Text("\(descriptor.currencyCode) \(descriptor.decimalAmount)")
+            Text(KitMoney.formatted(descriptor.decimalAmount, code: descriptor.currencyCode, scale: descriptor.currencyScale))
                 .font(.title3.bold())
                 .foregroundStyle(foreground)
             // The transfer's own note, or — on response receipts — the documented reason
@@ -3036,7 +3672,7 @@ struct ConversationView: View {
                     .foregroundStyle(secondary)
             }
 
-            if presentation.showsAccept || presentation.showsReject {
+            if !isGroupConversation && (presentation.showsAccept || presentation.showsReject) {
                 HStack(spacing: 8) {
                     if presentation.showsAccept {
                         Button {
@@ -3068,7 +3704,7 @@ struct ConversationView: View {
                     }
                 }
             }
-            if presentation.showsReverse {
+            if !isGroupConversation && presentation.showsReverse {
                 Button {
                     transferReverseTarget = ChatTransferReverseTarget(descriptor: descriptor)
                 } label: {
@@ -3230,11 +3866,13 @@ struct ConversationView: View {
         default: "Payment request · Closed"
         }
         let canCancel = descriptor.isRequest
+            && !isGroupConversation
             && message.isOutgoing
             && localOutcome == nil
             && authoritativeRequest.map { paymentRequestPolicy.canCancel($0) } == true
             && model.isOnline
         let canDecline = descriptor.isRequest
+            && !isGroupConversation
             && !message.isOutgoing
             && localOutcome == nil
             && model.secureMessagingAvailable
@@ -3246,7 +3884,7 @@ struct ConversationView: View {
             )
                 .font(.caption.bold())
                 .foregroundStyle(message.isOutgoing ? Color.white.opacity(0.82) : KitColor.green)
-            Text("\(descriptor.currencyCode) \(descriptor.decimalAmount)")
+            Text(KitMoney.formatted(descriptor.decimalAmount, code: descriptor.currencyCode, scale: descriptor.currencyScale))
                 .font(.title3.bold())
                 .foregroundStyle(foreground)
             if let note = descriptor.note {
@@ -3255,7 +3893,9 @@ struct ConversationView: View {
                     .foregroundStyle(secondary)
             }
 
-            if localOutcome == nil && (presentation.showsPayAction || canDecline) {
+            if !isGroupConversation
+                && localOutcome == nil
+                && (presentation.showsPayAction || canDecline) {
                 HStack(spacing: 8) {
                     if presentation.showsPayAction {
                         Button {
@@ -3267,7 +3907,7 @@ struct ConversationView: View {
                                     .frame(maxWidth: .infinity)
                             } else {
                                 Label(
-                                    "Pay \(descriptor.currencyCode) \(descriptor.decimalAmount)",
+                                    "Pay \(KitMoney.formatted(descriptor.decimalAmount, code: descriptor.currencyCode, scale: descriptor.currencyScale))",
                                     systemImage: "lock.shield.fill"
                                 )
                                 .frame(maxWidth: .infinity)
@@ -3568,7 +4208,39 @@ struct ConversationView: View {
 
     // MARK: Sending
 
-    private func sendDraft() {
+    /// Opens the Send Later picker for whatever is in the composer right now.
+    private func openScheduleSheetForDraft() {
+        guard !isReadOnlyAppReviewPreview, canSendMessage else { return }
+        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let preview: String
+        if !stagedAttachments.isEmpty, text.isEmpty {
+            preview = stagedAttachments.count == 1
+                ? stagedAttachments[0].kind.previewLabel
+                : "\(stagedAttachments.count) attachments"
+        } else {
+            preview = text
+        }
+        isComposerFocused = false
+        scheduleRequest = ChatScheduleRequest(
+            id: UUID(),
+            existingItem: nil,
+            preview: preview
+        )
+    }
+
+    private func cancelScheduledItem(_ item: ScheduledChatItem) async {
+        let restored = await model.cancelScheduledItem(item.id)
+        // The words someone wrote come back to the composer rather than disappearing with the
+        // schedule — cancelling a time should not also mean losing the message.
+        guard let restored, !restored.isEmpty else { return }
+        if draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            draft = restored
+        } else {
+            draft += "\n" + restored
+        }
+    }
+
+    private func sendDraft(deliverAt: Date? = nil) {
         guard !isReadOnlyAppReviewPreview else { return }
         guard canSendMessage else { return }
         let submittedDraft = draft
@@ -3578,8 +4250,12 @@ struct ConversationView: View {
         if SecureMessageReservedPrefixPolicy.beginsWithReservedPrefix(
             submittedText,
             prefix: KitPaymentMessage.prefix
-        ) {
-            model.lastError = "Messages can't start with Kit Pay's reserved payment prefix."
+        ) || KitMessageReaction.isReactionText(submittedText)
+            || SecureMessageReservedPrefixPolicy.beginsWithReservedPrefix(
+                submittedText,
+                prefix: KitSystemMessage.prefix
+            ) {
+            model.lastError = "Messages can't start with Kit Pay's reserved prefixes."
             return
         }
         let submittedAttachments = stagedAttachments
@@ -3589,6 +4265,7 @@ struct ConversationView: View {
         draftWriteVersion = persistenceVersion
         isSending = true
         isComposerFocused = false
+        presence.stopLocalTyping(conversationID: conversation.id)
         Task {
             // Draft persistence is best-effort bookkeeping. The message pipeline has its own
             // durability, so a failed draft write (for example a brand-new conversation that
@@ -3606,14 +4283,16 @@ struct ConversationView: View {
                     title: recipientDisplayName,
                     recipientId: recipientUserID,
                     body: submittedDraft,
-                    draftClearVersion: clearVersion
+                    draftClearVersion: clearVersion,
+                    deliverAt: deliverAt
                 )
             } else {
                 allQueued = await sendStagedAttachments(
                     submittedAttachments,
                     text: submittedText,
                     submittedDraft: submittedDraft,
-                    clearVersion: clearVersion
+                    clearVersion: clearVersion,
+                    deliverAt: deliverAt
                 )
             }
             if allQueued {
@@ -3630,7 +4309,8 @@ struct ConversationView: View {
         _ attachments: [ChatStagedAttachment],
         text: String,
         submittedDraft: String,
-        clearVersion: ConversationDraftWriteVersion
+        clearVersion: ConversationDraftWriteVersion,
+        deliverAt: Date? = nil
     ) async -> Bool {
         // A single non-document attachment carries the typed text as its caption. Documents
         // keep the filename in the caption (the wire descriptor has no filename field), and
@@ -3654,7 +4334,8 @@ struct ConversationView: View {
                 mediaType: attachment.mediaType,
                 caption: caption,
                 submittedDraftBody: textRidesOnMedia ? submittedDraft : nil,
-                draftClearVersion: textRidesOnMedia ? clearVersion : nil
+                draftClearVersion: textRidesOnMedia ? clearVersion : nil,
+                deliverAt: deliverAt
             )
             if queued {
                 // Durably queued: unstage it even if a later attachment fails, so a retry
@@ -3673,7 +4354,8 @@ struct ConversationView: View {
             title: recipientDisplayName,
             recipientId: recipientUserID,
             body: followUp,
-            draftClearVersion: clearVersion
+            draftClearVersion: clearVersion,
+            deliverAt: deliverAt
         )
         if !textQueued {
             model.lastError =
@@ -3729,6 +4411,10 @@ struct ConversationView: View {
             model.lastError = "This App Review preview is read-only."
             return
         }
+        guard !isGroupConversation else {
+            model.lastError = "Payment requests are available only in one-to-one Kit Pay chats."
+            return
+        }
         guard recipientCommunicationAllowed else {
             model.lastError = recipientIsBlocked
                 ? "Unblock this account before sending a payment request."
@@ -3762,14 +4448,18 @@ struct ConversationView: View {
             model.lastError = "This App Review preview is read-only."
             return
         }
+        guard !isGroupConversation else {
+            model.lastError = "Sending money is available only in one-to-one Kit Pay chats."
+            return
+        }
         guard recipientCommunicationAllowed else {
             model.lastError = recipientIsBlocked
                 ? "Unblock this account before sending money."
                 : "Communication privacy is still loading. Refresh and try again."
             return
         }
-        guard model.capabilities?.features?["wallets"] == true,
-              model.capabilities?.features?["internal_transfers"] == true
+        guard model.capabilities?.supportsFeature("wallets") == true,
+              model.capabilities?.supportsFeature("internal_transfers") == true
         else {
             model.lastError = "Sending money is not available for this account."
             return
@@ -4017,23 +4707,34 @@ struct ConversationView: View {
             if nearLatest { unseenIncomingCount = 0 }
         }
 
+        // Each of these writes back into `@State`, so they are only made when they change
+        // something: an unconditional write here re-runs layout, which re-delivers the metrics.
         guard cameraPullIsEligible else {
             if cameraPullProgress != 0 { cameraPullProgress = 0 }
+            if cameraPull.isArmed { cameraPull.cancel() }
             return
         }
         let overscroll = max(0, -distanceFromLatest)
         if cameraPullProgress != overscroll {
             cameraPullProgress = overscroll
         }
-        if overscroll >= ConversationCameraPullPolicy.triggerDistance {
-            if !didTriggerCameraPull {
-                didTriggerCameraPull = true
-                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                showCameraCapture = true
-            }
-        } else if overscroll < ConversationCameraPullPolicy.rearmDistance {
-            didTriggerCameraPull = false
+        guard !cameraPull.isArmed,
+              overscroll >= ConversationCameraPullPolicy.triggerDistance
+        else { return }
+        if cameraPull.overscrolled(to: overscroll) {
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
         }
+    }
+
+    private func updateCameraPullArming() {
+        guard cameraPull.isArmed else { return }
+        cameraPull.dragged(progress: cameraPullProgress)
+    }
+
+    /// Opens the camera on the release the indicator promised, and only then.
+    private func releaseCameraPull() {
+        guard cameraPull.isArmed, cameraPull.released(), cameraPullIsEligible else { return }
+        showCameraCapture = true
     }
 
     private var cameraPullIndicator: some View {
@@ -4051,7 +4752,7 @@ struct ConversationView: View {
                         .rotationEffect(.degrees(-90))
                 }
                 .scaleEffect(0.6 + 0.4 * progress)
-            Text(progress >= 1 ? "Release for camera" : "Keep pulling for camera")
+            Text(cameraPull.isArmed ? "Release for camera" : "Keep pulling for camera")
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(KitColor.secondaryText)
         }
@@ -4128,7 +4829,13 @@ enum ConversationMessageSearchPolicy {
         if let descriptor = KitMediaMessageDescriptor.parse(message.body) {
             return descriptor.caption?.nilIfBlank
         }
-        guard KitPaymentMessage.parse(message.body) == nil else { return nil }
+        guard KitPaymentMessage.parse(message.body) == nil,
+              !KitMessageReaction.isReactionText(message.body),
+              !SecureMessageReservedPrefixPolicy.beginsWithReservedPrefix(
+                  message.body,
+                  prefix: KitSystemMessage.prefix
+              )
+        else { return nil }
         return message.body.nilIfBlank
     }
 }
@@ -4161,6 +4868,50 @@ enum ConversationCameraPullPolicy {
             && !isSearchingMessages
             && !isRecordingVoiceNote
             && !isComposerFocused
+    }
+}
+
+/// The pull-past-the-end camera gesture, as the two-step promise the indicator makes: pulling far
+/// enough *arms* the camera ("Release for camera"), and the release opens it.
+///
+/// It used to open the moment the threshold was crossed — the chat was snatched away mid-drag,
+/// while the label was still telling the customer to let go first, and a pull they wanted to take
+/// back could not be taken back.
+struct ConversationCameraPullGesture: Equatable {
+    private(set) var isArmed = false
+
+    /// Reports the pull distance. Returns true on the transition into the armed state, which is
+    /// the single moment the haptic should fire.
+    mutating func overscrolled(to overscroll: CGFloat) -> Bool {
+        guard overscroll >= ConversationCameraPullPolicy.triggerDistance, !isArmed else {
+            return false
+        }
+        isArmed = true
+        return true
+    }
+
+    /// Reports the pull distance while the finger is still moving, which is the only place an
+    /// armed pull is taken back.
+    ///
+    /// Deliberately not driven by the scroll metrics: the release *also* drops the overscroll back
+    /// under the threshold as the list bounces to rest, so disarming from that would race
+    /// `released()` and swallow the camera the customer just asked for. Reading it during the drag
+    /// covers both cases that should cancel — pulling back before letting go, and an armed pull
+    /// left over from a gesture that ended without ever delivering its release.
+    mutating func dragged(progress: CGFloat) {
+        guard isArmed, progress < ConversationCameraPullPolicy.rearmDistance else { return }
+        isArmed = false
+    }
+
+    /// Returns true if this release is the one the indicator promised would open the camera.
+    mutating func released() -> Bool {
+        defer { isArmed = false }
+        return isArmed
+    }
+
+    /// The conversation stopped accepting the gesture (selection, search, recording, composing).
+    mutating func cancel() {
+        isArmed = false
     }
 }
 
@@ -4211,6 +4962,90 @@ private struct ConversationGalleryTarget: Identifiable {
 private struct MediaEditorSession: Identifiable {
     let id = UUID()
     let input: KitMediaEditorInput
+}
+
+/// Full emoji picker for reactions, grouped by the curated catalog sections.
+private struct ReactionPickerSheet: View {
+    let onPick: (String) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    private let columns = [GridItem(.adaptive(minimum: 44), spacing: 6)]
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 14, pinnedViews: [.sectionHeaders]) {
+                    ForEach(MessageReactionCatalog.sections, id: \.title) { section in
+                        Section {
+                            LazyVGrid(columns: columns, spacing: 6) {
+                                ForEach(section.emojis, id: \.self) { emoji in
+                                    Button {
+                                        onPick(emoji)
+                                    } label: {
+                                        Text(emoji)
+                                            .font(.system(size: 30))
+                                            .frame(width: 44, height: 44)
+                                            .contentShape(Rectangle())
+                                    }
+                                    .buttonStyle(.plain)
+                                    .accessibilityLabel("React with \(emoji)")
+                                }
+                            }
+                        } header: {
+                            Text(section.title)
+                                .font(.footnote.weight(.semibold))
+                                .foregroundStyle(KitColor.secondaryText)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.vertical, 4)
+                                .background(.ultraThinMaterial)
+                        }
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.bottom, 20)
+            }
+            .navigationTitle("React")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+            }
+        }
+    }
+}
+
+/// Who reacted with what, for one message.
+private struct ReactionDetailSheet: View {
+    let tallies: [MessageReactionTally]
+    let nameForUserID: (String) -> String
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            List {
+                ForEach(tallies) { tally in
+                    Section {
+                        ForEach(tally.reactorUserIDs, id: \.self) { userID in
+                            Text(nameForUserID(userID))
+                                .font(.body)
+                        }
+                    } header: {
+                        Text("\(tally.emoji)  \(tally.count)")
+                            .font(.headline)
+                    }
+                }
+            }
+            .scrollContentBackground(.hidden)
+            .navigationTitle("Reactions")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+    }
 }
 
 private struct ChatTransferReverseTarget: Identifiable {
@@ -4546,7 +5381,8 @@ private struct ConversationContactProfileView: View {
     }
 
     private var canSaveToContacts: Bool {
-        contact?.contactId?.nilIfBlank == nil
+        !isReadOnlyPreview
+            && contact?.contactId?.nilIfBlank == nil
             && contact?.phone.nilIfBlank != nil
             && !contactWasSaved
     }
@@ -4650,40 +5486,14 @@ private struct NewSystemContactView: UIViewControllerRepresentable {
     }
 }
 
+/// A conversation row's photo, ringless because the row already sits inside a glass lens.
 private struct ConversationAvatarView: View {
     let name: String
     let avatarURL: String?
     let size: CGFloat
 
-    private var validatedURL: URL? {
-        guard let avatarURL,
-              let url = URL(string: avatarURL),
-              url.scheme?.lowercased() == "https",
-              url.host?.isEmpty == false
-        else { return nil }
-        return url
-    }
-
     var body: some View {
-        Group {
-            if let validatedURL {
-                AsyncImage(url: validatedURL) { phase in
-                    if case let .success(image) = phase {
-                        image
-                            .resizable()
-                            .scaledToFill()
-                            .frame(width: size, height: size)
-                            .clipShape(Circle())
-                    } else {
-                        AvatarView(name: name, size: size, showsRing: false)
-                    }
-                }
-            } else {
-                AvatarView(name: name, size: size, showsRing: false)
-            }
-        }
-        .frame(width: size, height: size, alignment: .center)
-        .clipShape(Circle())
+        RemoteAvatarView(name: name, avatarURL: avatarURL, size: size, ringOpacity: nil)
     }
 }
 
@@ -4734,6 +5544,28 @@ enum ChatMessagePresentationPolicy {
                 mediaPreview(mediaType: pending.mediaType, caption: pending.caption),
                 nil
             )
+        }
+
+        if let reaction = KitMessageReaction.parse(message.body) {
+            let label = reaction.operation == .add
+                ? "Reacted \(reaction.emoji) to a message"
+                : "Removed a reaction"
+            return (label, nil)
+        }
+        // Malformed or future reaction wire text must never surface raw.
+        if SecureMessageReservedPrefixPolicy.beginsWithReservedPrefix(
+            message.body,
+            prefix: KitMessageReaction.prefix
+        ) {
+            return ("Reaction", nil)
+        }
+
+        // Group lifecycle notices (and any future system wire) stay friendly in previews.
+        if SecureMessageReservedPrefixPolicy.beginsWithReservedPrefix(
+            message.body,
+            prefix: KitSystemMessage.prefix
+        ) {
+            return ("Group updated", nil)
         }
 
         if let payment = KitPaymentMessage.parse(message.body) {
@@ -4992,6 +5824,7 @@ private struct NewMessageSheet: View {
                         }
                         .disabled(
                             submissionGate.isSubmitting
+                                || !model.appReviewDemoMutationsAllowed
                                 || !model.secureMessagingAvailable
                                 || message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                         )
@@ -5008,6 +5841,10 @@ private struct NewMessageSheet: View {
 
     @MainActor
     private func submit(to contact: WalletContactDTO) {
+        guard model.appReviewDemoMutationsAllowed else {
+            model.lastError = AppReviewDemoMutationPolicy.readOnlyMessage
+            return
+        }
         guard let key = NewMessageSubmissionKey(
             recipientUserID: contact.id,
             body: message

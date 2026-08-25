@@ -2828,41 +2828,15 @@ private struct DraggableLocalVideoPreview: View {
     }
 }
 
+/// A participant's photo over the call's dark backdrop, where a full-strength white ring would
+/// glare, so the outline is dialled down to a hairline.
 private struct CallParticipantAvatarView: View {
     let name: String
     let avatarURL: String?
     let size: CGFloat
 
-    private var validatedURL: URL? {
-        guard let avatarURL,
-              let url = URL(string: avatarURL),
-              url.scheme?.lowercased() == "https",
-              url.host != nil
-        else { return nil }
-        return url
-    }
-
     var body: some View {
-        Group {
-            if let validatedURL {
-                AsyncImage(url: validatedURL) { image in
-                    image
-                        .resizable()
-                        .scaledToFill()
-                } placeholder: {
-                    AvatarView(name: name, size: size)
-                }
-            } else {
-                AvatarView(name: name, size: size)
-            }
-        }
-        .frame(width: size, height: size)
-        .clipShape(Circle())
-        .overlay {
-            Circle()
-                .stroke(.white.opacity(0.22), lineWidth: 1)
-                .allowsHitTesting(false)
-        }
+        RemoteAvatarView(name: name, avatarURL: avatarURL, size: size, ringOpacity: 0.22)
     }
 }
 
@@ -2979,14 +2953,9 @@ private struct LiquidCallBackdrop: View {
     let name: String
     let avatarURL: String?
 
-    private var validatedURL: URL? {
-        guard let avatarURL,
-              let url = URL(string: avatarURL),
-              url.scheme?.lowercased() == "https",
-              url.host != nil
-        else { return nil }
-        return url
-    }
+    /// Shares `ProfileAvatarCache` with the avatar in the foreground, so the backdrop costs no
+    /// second download and is already there when a call starts with no network.
+    @State private var backdropImage: UIImage?
 
     private var accent: Color {
         let scalarTotal = name.unicodeScalars.reduce(0) { $0 + Int($1.value) }
@@ -3007,18 +2976,17 @@ private struct LiquidCallBackdrop: View {
                 endPoint: .bottomTrailing
             )
 
-            if !reduceTransparency, let validatedURL {
-                AsyncImage(url: validatedURL) { phase in
-                    if case .success(let image) = phase {
-                        image
-                            .resizable()
-                            .scaledToFill()
-                            .saturation(0.88)
-                            .blur(radius: 36)
-                            .scaleEffect(1.24)
-                    } else {
-                        Color.clear
-                    }
+            if !reduceTransparency, let backdropImage {
+                // Through ``KitFillingBackdrop``, never placed in the stack directly: a photo
+                // asked to fill reports a size wider than the screen, and this stack would hand
+                // that size to the whole call screen.
+                KitFillingBackdrop {
+                    Image(uiImage: backdropImage)
+                        .resizable()
+                        .scaledToFill()
+                        .saturation(0.88)
+                        .blur(radius: 36)
+                        .scaleEffect(1.24)
                 }
             }
 
@@ -3046,5 +3014,12 @@ private struct LiquidCallBackdrop: View {
             )
         }
         .clipped()
+        .task(id: avatarURL) {
+            backdropImage = ProfileAvatarCache.cachedImage(for: avatarURL)
+            guard backdropImage == nil, let avatarURL else { return }
+            let loaded = await ProfileAvatarCache.shared.image(for: avatarURL)
+            guard !Task.isCancelled else { return }
+            backdropImage = loaded
+        }
     }
 }

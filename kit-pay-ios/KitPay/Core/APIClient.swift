@@ -47,12 +47,57 @@ actor APIClient {
     private let decoder: JSONDecoder
     private let encoder: JSONEncoder
     private var refreshFlight: SessionRefreshFlight?
+    /// Bound to exact authenticated sessions. Keeping the fence in the transport makes every
+    /// feature-specific client fail closed, including views that call `APIClient.shared` directly
+    /// instead of routing through `AppModel`. A set prevents a stale capability task from
+    /// replacing or clearing the fence installed for a newer session.
+    private var appReviewDemoReadOnlySessionIDs: Set<String> = []
 
     init(sessionStore: SessionStore, session: URLSession = .shared) {
         self.sessionStore = sessionStore
         self.session = session
         decoder = JSONDecoder()
         encoder = JSONEncoder()
+    }
+
+    func setAppReviewDemoReadOnly(_ enabled: Bool, sessionID: String?) {
+        guard let sessionID = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !sessionID.isEmpty
+        else { return }
+        if enabled {
+            appReviewDemoReadOnlySessionIDs.insert(sessionID.lowercased())
+        } else {
+            appReviewDemoReadOnlySessionIDs.remove(sessionID.lowercased())
+        }
+    }
+
+    func appReviewDemoReadOnlyApplies(to sessionID: String?) -> Bool {
+        guard let sessionID else { return false }
+        return appReviewDemoReadOnlySessionIDs.contains(sessionID.lowercased())
+    }
+
+    private func requireAppReviewDemoRequestPermission(
+        path: String,
+        method: String,
+        sessionID: String?
+    ) throws {
+        guard AppReviewDemoMutationPolicy.allowsAuthenticatedRequest(
+            method: method,
+            path: path,
+            isDemoSession: appReviewDemoReadOnlyApplies(to: sessionID)
+        ) else { throw AppReviewDemoMutationError.readOnly }
+    }
+
+    func requireAppReviewDemoAbuseReportPermission(
+        conversationID: String,
+        reportedUserID: String
+    ) async throws {
+        let currentSessionID = await sessionStore.current()?.sessionId
+        guard AppReviewDemoMutationPolicy.allowsAbuseReport(
+            conversationID: conversationID,
+            reportedUserID: reportedUserID,
+            isDemoSession: appReviewDemoReadOnlyApplies(to: currentSessionID)
+        ) else { throw AppReviewDemoMutationError.readOnly }
     }
 
     func capabilities() async throws -> CapabilitiesDTO {
@@ -258,7 +303,9 @@ actor APIClient {
         )
     }
 
-    func updateProfile(name: String, tag: String) async throws -> UserProfile {
+    /// `tag` is optional: an account whose legal name is verified may go without a chosen
+    /// username, and omitting the field leaves whatever the server already holds untouched.
+    func updateProfile(name: String?, tag: String?) async throws -> UserProfile {
         try await send(
             path: "profile",
             method: "PATCH",
@@ -608,6 +655,121 @@ actor APIClient {
         )
     }
 
+    func realtimeChannelAuthorization(
+        path: String,
+        socketID: String,
+        channelName: String,
+        boundSessionID: String
+    ) async throws -> KitRealtimeAuthorization {
+        guard path == "messaging/realtime/auth",
+              KitRealtimeIdentifierPolicy.validSocketID(socketID),
+              !channelName.isEmpty,
+              channelName.utf8.count <= 160
+        else { throw APIClientError.invalidURL }
+        let data = try await sendRealtimeRequest(
+            path: path,
+            body: RealtimeChannelAuthorizationRequest(
+                socketId: socketID,
+                channelName: channelName
+            ),
+            boundSessionID: boundSessionID
+        )
+        guard !data.isEmpty, data.count <= 16 * 1_024 else {
+            throw APIClientError.invalidResponse
+        }
+        do {
+            return try decoder.decode(KitRealtimeAuthorization.self, from: data)
+        } catch {
+            throw APIClientError.invalidPayload(status: 200)
+        }
+    }
+
+    func sendRealtimeTyping(
+        conversationID: String,
+        state: String,
+        socketID: String,
+        boundSessionID: String
+    ) async throws {
+        guard let conversationID = KitRealtimeIdentifierPolicy.canonicalConversationID(
+            conversationID
+        ),
+              ["start", "stop"].contains(state),
+              KitRealtimeIdentifierPolicy.validSocketID(socketID)
+        else { throw APIClientError.invalidURL }
+        _ = try await sendRealtimeRequest(
+            path: "messaging/conversations/\(conversationID)/typing",
+            body: RealtimeTypingRequest(state: state),
+            headers: ["X-Socket-Id": socketID],
+            boundSessionID: boundSessionID
+        )
+    }
+
+    /// Reverb authorization and typing endpoints intentionally return direct Pusher JSON or an
+    /// empty 204 rather than Kit Pay's normal API envelope. This narrow lane still uses the same
+    /// credential binding and single-flight 401 refresh as every other authenticated request.
+    private func sendRealtimeRequest<Body: Encodable>(
+        path: String,
+        body: Body,
+        headers: [String: String] = [:],
+        boundSessionID: String,
+        allowRefresh: Bool = true
+    ) async throws -> Data {
+        let inheritedSessionID = APIClientSessionBinding.sessionID
+        if let inheritedSessionID,
+           !SessionRefreshPolicy.matchesSessionID(boundSessionID, current: inheritedSessionID) {
+            throw APIClientError.signedOut
+        }
+        guard SessionRefreshPolicy.isValidSessionID(boundSessionID),
+              let currentSession = await sessionStore.current(),
+              SessionRefreshPolicy.matchesSessionID(
+                  boundSessionID,
+                  current: currentSession.sessionId
+              )
+        else { throw APIClientError.signedOut }
+        try requireAppReviewDemoRequestPermission(
+            path: path,
+            method: "POST",
+            sessionID: currentSession.sessionId
+        )
+
+        var request = URLRequest(url: try endpoint(path, queryItems: []))
+        request.httpMethod = "POST"
+        request.timeoutInterval = 15
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(APIClientIdentity.currentHeader, forHTTPHeaderField: "X-Kit-Wallet-Client")
+        request.setValue(UUID().uuidString.lowercased(), forHTTPHeaderField: "X-Request-ID")
+        request.setValue("Bearer \(currentSession.accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue(currentSession.sessionId, forHTTPHeaderField: "X-Kit-Wallet-Session-ID")
+        request.httpBody = try encoder.encode(body)
+        for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw APIClientError.invalidResponse
+        }
+        if http.statusCode == 401, allowRefresh {
+            try await refreshSession(afterRejectedSession: currentSession)
+            return try await sendRealtimeRequest(
+                path: path,
+                body: body,
+                headers: headers,
+                boundSessionID: boundSessionID,
+                allowRefresh: false
+            )
+        }
+        guard (200 ... 299).contains(http.statusCode) else {
+            throw KitRealtimeRequestError(
+                status: http.statusCode,
+                retryAfter: HTTPRetryAfterParser.delay(from: http)
+            )
+        }
+        guard data.count <= 16 * 1_024 else {
+            throw APIClientError.invalidPayload(status: http.statusCode)
+        }
+        return data
+    }
+
     func send<Response: Decodable, Body: Encodable>(
         path: String,
         method: String,
@@ -639,6 +801,11 @@ actor APIClient {
            }) != true {
             throw APIClientError.signedOut
         }
+        try requireAppReviewDemoRequestPermission(
+            path: path,
+            method: method,
+            sessionID: currentSession?.sessionId
+        )
 
         var request = URLRequest(url: try endpoint(path, queryItems: queryItems))
         request.httpMethod = method
@@ -724,6 +891,11 @@ actor APIClient {
 
         try Task.checkCancellation()
         try await requireCurrentProfileAvatarSession(boundSessionID)
+        try requireAppReviewDemoRequestPermission(
+            path: "profile/avatar-upload-bytes",
+            method: "PUT",
+            sessionID: boundSessionID
+        )
 
         var request = URLRequest(url: url)
         request.httpMethod = "PUT"
@@ -805,6 +977,11 @@ actor APIClient {
            ) {
             throw APIClientError.signedOut
         }
+        try requireAppReviewDemoRequestPermission(
+            path: path,
+            method: "POST",
+            sessionID: currentSession.sessionId
+        )
 
         let boundary = "KitPay-\(UUID().uuidString.lowercased())"
         let body = try MultipartFormDataBody.make(
@@ -1229,6 +1406,20 @@ extension Notification.Name {
 private struct EmptyBody: Encodable {}
 
 private struct EmptyResponse: Decodable {}
+
+private struct RealtimeChannelAuthorizationRequest: Encodable {
+    let socketId: String
+    let channelName: String
+
+    private enum CodingKeys: String, CodingKey {
+        case socketId = "socket_id"
+        case channelName = "channel_name"
+    }
+}
+
+private struct RealtimeTypingRequest: Encodable {
+    let state: String
+}
 
 struct LogoutRequest: Encodable, Equatable {
     let allDevices: Bool

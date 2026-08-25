@@ -27,6 +27,10 @@ final class WalletFlowModel: ObservableObject {
     @Published private(set) var sentTransaction: WalletTransaction?
     @Published private(set) var createdRequest: PaymentRequestDTO?
     @Published private(set) var paymentPinConfigured = false
+    /// The debit the server refused for want of funds. The device's own balance can be a moment
+    /// stale — an unrelated payment posting between the review and the approval is enough — so the
+    /// shortfall is worked out again from a fresh balance rather than assumed.
+    @Published var insufficientFundsDebitAmount: String?
     @Published var errorMessage: String?
 
     private let api: APIClient
@@ -63,6 +67,7 @@ final class WalletFlowModel: ObservableObject {
 
         isSubmitting = true
         errorMessage = nil
+        insufficientFundsDebitAmount = nil
         defer { isSubmitting = false }
 
         let cleanNote = note.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
@@ -78,7 +83,7 @@ final class WalletFlowModel: ObservableObject {
                 "wallet_transfer",
                 intent,
                 pin,
-                "Approve sending \(wallet.currency.code) \(amount) to \(contact.name)"
+                "Approve sending \(KitMoney.formatted(amount, currency: wallet.currency)) to \(contact.name)"
             )
             sentTransaction = try await api.transfer(
                 walletId: wallet.id,
@@ -90,6 +95,9 @@ final class WalletFlowModel: ObservableObject {
             )
             return true
         } catch {
+            if WalletTopUpPolicy.isInsufficientFunds(error) {
+                insufficientFundsDebitAmount = amount
+            }
             errorMessage = message(for: error)
             return false
         }
@@ -233,6 +241,8 @@ struct SendMoneyView: View {
     @State private var setupPin = ""
     @State private var setupPinConfirmation = ""
     @State private var showingConfirmation = false
+    /// Non-nil while the customer is topping up to cover this very payment.
+    @State private var topUpRequest: WalletTopUpRequirement?
     private let preselectedRecipientUserID: String?
     private let locksRecipientSelection: Bool
     /// Set by chat: after a confirmed transfer, shares the transaction into the conversation as
@@ -327,6 +337,15 @@ struct SendMoneyView: View {
             updateContacts(contacts)
         }
         .sheet(isPresented: $showingConfirmation) { confirmationSheet }
+        .sheet(item: $topUpRequest) { requirement in
+            WalletTopUpView(requirement: requirement) { covered in
+                // Straight back to the approval the customer was already committed to.
+                guard covered else { return }
+                WalletTopUpPresentation.afterDismissal { showingConfirmation = true }
+            }
+            .environmentObject(model)
+            .presentationBackground(.ultraThinMaterial)
+        }
     }
 
     /// Resolves the chat-provided recipient once the synced directory is available. The chat
@@ -422,7 +441,12 @@ struct SendMoneyView: View {
                     }
                 }
                 .buttonStyle(KitPrimaryButtonStyle())
-                .disabled(setupPin.count != 4 || setupPinConfirmation.count != 4 || flow.isSubmitting)
+                .disabled(
+                    !model.appReviewDemoMutationsAllowed
+                        || setupPin.count != 4
+                        || setupPinConfirmation.count != 4
+                        || flow.isSubmitting
+                )
             }
             .padding(24)
         }
@@ -468,7 +492,7 @@ struct SendMoneyView: View {
             step = .amount
         } label: {
             HStack(spacing: 14) {
-                AvatarView(name: contact.name, size: 46)
+                RemoteAvatarView(name: contact.name, avatarURL: contact.avatarURL, size: 46)
                 VStack(alignment: .leading, spacing: 3) {
                     MarqueeText(text: contact.name, font: .headline)
                     Text(contact.tag?.nilIfEmpty ?? contact.phone)
@@ -490,7 +514,11 @@ struct SendMoneyView: View {
             VStack(spacing: 22) {
                 if let selectedContact {
                     HStack(spacing: 10) {
-                        AvatarView(name: selectedContact.name, size: 38)
+                        RemoteAvatarView(
+                            name: selectedContact.name,
+                            avatarURL: selectedContact.avatarURL,
+                            size: 38
+                        )
                         VStack(alignment: .leading) {
                             Text(selectedContact.name).font(.headline)
                             Text(selectedContact.phone).font(.caption).foregroundStyle(KitColor.secondaryText)
@@ -504,23 +532,16 @@ struct SendMoneyView: View {
                         Text(model.selectedWallet?.currency.code ?? "UGX")
                             .font(.title3.bold())
                             .foregroundStyle(KitColor.green)
-                        TextField("0", text: Binding(
-                            get: {
-                                PaymentInputFormatting.groupedDecimalInput(
-                                    amount,
-                                    maximumFractionDigits: model.selectedWallet?.currency.decimalScale ?? 2
-                                )
-                            },
-                            set: {
-                                amount = PaymentInputFormatting.normalizedDecimalInput(
-                                    $0,
-                                    maximumFractionDigits: model.selectedWallet?.currency.decimalScale ?? 2
-                                )
-                            }
-                        ))
-                            .font(.system(size: 44, weight: .bold, design: .rounded))
-                            .keyboardType(.decimalPad)
-                            .multilineTextAlignment(.center)
+                        KitAmountTextField(
+                            "0",
+                            value: $amount,
+                            mode: .decimal(
+                                maximumFractionDigits:
+                                    model.selectedWallet?.currency.decimalScale ?? 2
+                            ),
+                            textStyle: .hero,
+                            textAlignment: .center
+                        )
                             .frame(maxWidth: 230)
                     }
                     Text("Balance: \(availableBalance) · No transaction fee")
@@ -536,20 +557,37 @@ struct SendMoneyView: View {
                     .padding(17)
                     .kitGlass(cornerRadius: 18)
 
+                if let requirement = topUpRequirement {
+                    shortfallNotice(requirement)
+                }
+
                 inlineError
 
                 Button {
-                    if model.isOnline {
-                        showingConfirmation = true
-                    } else {
+                    guard model.isOnline else {
                         flow.errorMessage = "Connect to the internet to send money."
+                        return
+                    }
+                    if let requirement = topUpRequirement {
+                        topUpRequest = requirement
+                    } else {
+                        showingConfirmation = true
                     }
                 } label: {
-                    Label("Review & send", systemImage: "arrow.up.right")
-                        .frame(maxWidth: .infinity)
+                    Label(
+                        topUpRequirement == nil ? "Review & send" : "Top up to send",
+                        systemImage: topUpRequirement == nil ? "arrow.up.right" : "plus.circle"
+                    )
+                    .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(KitPrimaryButtonStyle())
-                .disabled(WalletMoney.apiAmount(amount, scale: model.selectedWallet?.currency.decimalScale ?? 2) == nil)
+                .disabled(
+                    !model.appReviewDemoMutationsAllowed
+                        || WalletMoney.apiAmount(
+                            amount,
+                            scale: model.selectedWallet?.currency.decimalScale ?? 2
+                        ) == nil
+                )
             }
             .padding(20)
         }
@@ -559,7 +597,11 @@ struct SendMoneyView: View {
         NavigationStack {
             VStack(spacing: 18) {
                 if let selectedContact {
-                    AvatarView(name: selectedContact.name, size: 70)
+                    RemoteAvatarView(
+                        name: selectedContact.name,
+                        avatarURL: selectedContact.avatarURL,
+                        size: 70
+                    )
                     Text(selectedContact.name).font(.title2.bold())
                     Text(displayedAmount)
                         .font(.system(size: 38, weight: .heavy, design: .rounded))
@@ -636,6 +678,8 @@ struct SendMoneyView: View {
                                 }
                             }
                             await model.refresh()
+                        } else {
+                            await handleServerInsufficientFunds()
                         }
                     }
                 } label: {
@@ -653,7 +697,9 @@ struct SendMoneyView: View {
                 }
                 .buttonStyle(KitPrimaryButtonStyle())
                 .disabled(
-                    (!model.financialApprovalUsesBiometrics && pin.count != 4) || flow.isSubmitting
+                    !model.appReviewDemoMutationsAllowed
+                        || (!model.financialApprovalUsesBiometrics && pin.count != 4)
+                        || flow.isSubmitting
                 )
                 Spacer()
             }
@@ -714,8 +760,39 @@ struct SendMoneyView: View {
 
     private var availableBalance: String {
         guard let wallet = model.selectedWallet else { return "UGX 0" }
-        let number = Decimal(string: wallet.balances.available, locale: Locale(identifier: "en_US_POSIX")) ?? 0
-        return "\(wallet.currency.code) \(NSDecimalNumber(decimal: number).stringValue)"
+        return KitMoney.formatted(wallet.balances.available, currency: wallet.currency)
+    }
+
+    private func shortfallNotice(_ requirement: WalletTopUpRequirement) -> some View {
+        WalletShortfallNotice(requirement: requirement) { topUpRequest = requirement }
+            .padding(17)
+            .kitGlass(cornerRadius: 18)
+    }
+
+    /// Kit Pay → Kit Pay transfers carry no transaction fee, so the wallet debit is the amount
+    /// entered and the shortfall can be shown while the customer is still typing.
+    private var topUpRequirement: WalletTopUpRequirement? {
+        WalletTopUpPolicy.requirement(
+            wallet: model.selectedWallet,
+            debitAPIAmount: WalletMoney.apiAmount(
+                amount,
+                scale: model.selectedWallet?.currency.decimalScale ?? 2
+            )
+        )
+    }
+
+    /// The server refused for want of funds. Re-read the balance before saying by how much.
+    @MainActor
+    private func handleServerInsufficientFunds() async {
+        guard let debit = flow.insufficientFundsDebitAmount else { return }
+        flow.insufficientFundsDebitAmount = nil
+        await model.refresh()
+        guard let requirement = WalletTopUpPolicy.requirement(
+            wallet: model.selectedWallet,
+            debitAPIAmount: debit
+        ) else { return }
+        showingConfirmation = false
+        topUpRequest = requirement
     }
 }
 
@@ -731,16 +808,22 @@ struct RequestMoneyView: View {
     @State private var completed = false
     @State private var isSharingCreatedRequest = false
     @State private var secureShareNeedsRetry = false
+    @State private var isPickingScheduledTime = false
+    @State private var scheduledFor: Date?
     private let preselectedRecipientUserID: String?
     private let locksRecipientSelection: Bool
     private let shareCreatedRequest: ((PaymentRequestDTO) async -> Bool)?
+    /// Provided only where a scheduled request has somewhere to land — today, a chat. Absent, the
+    /// screen shows no Send Later affordance at all rather than one that quietly does nothing.
+    private let scheduleRequest: ((PaymentRequestScheduleDraft) async -> Bool)?
 
     init(
         flow: WalletFlowModel,
         preselectedContact: WalletContactDTO? = nil,
         preselectedRecipientUserID: String? = nil,
         locksRecipientSelection: Bool = false,
-        shareCreatedRequest: ((PaymentRequestDTO) async -> Bool)? = nil
+        shareCreatedRequest: ((PaymentRequestDTO) async -> Bool)? = nil,
+        scheduleRequest: ((PaymentRequestScheduleDraft) async -> Bool)? = nil
     ) {
         self.flow = flow
         self.preselectedRecipientUserID = preselectedRecipientUserID
@@ -749,6 +832,7 @@ struct RequestMoneyView: View {
             }
         self.locksRecipientSelection = locksRecipientSelection
         self.shareCreatedRequest = shareCreatedRequest
+        self.scheduleRequest = scheduleRequest
         _selectedContact = State(
             initialValue: preselectedContact?.canReceivePaymentRequest == true
                 ? preselectedContact
@@ -820,7 +904,11 @@ struct RequestMoneyView: View {
                                     selectedContact = contact
                                 } label: {
                                     VStack(spacing: 8) {
-                                        AvatarView(name: contact.name, size: 50)
+                                        RemoteAvatarView(
+                                            name: contact.name,
+                                            avatarURL: contact.avatarURL,
+                                            size: 50
+                                        )
                                         // A tile this narrow cannot show most full names, and a
                                         // first name alone is ambiguous between contacts. Long
                                         // names scroll past instead of being cut short.
@@ -846,22 +934,15 @@ struct RequestMoneyView: View {
                 Text("Amount").font(.headline).foregroundStyle(KitColor.primaryText)
                 HStack {
                     Text(model.selectedWallet?.currency.code ?? "UGX").bold().foregroundStyle(KitColor.green)
-                    TextField("0", text: Binding(
-                        get: {
-                            PaymentInputFormatting.groupedDecimalInput(
-                                amount,
-                                maximumFractionDigits: model.selectedWallet?.currency.decimalScale ?? 2
-                            )
-                        },
-                        set: {
-                            amount = PaymentInputFormatting.normalizedDecimalInput(
-                                $0,
-                                maximumFractionDigits: model.selectedWallet?.currency.decimalScale ?? 2
-                            )
-                        }
-                    ))
-                        .keyboardType(.decimalPad)
-                        .font(.title.bold())
+                    KitAmountTextField(
+                        "0",
+                        value: $amount,
+                        mode: .decimal(
+                            maximumFractionDigits:
+                                model.selectedWallet?.currency.decimalScale ?? 2
+                        ),
+                        textStyle: .title
+                    )
                         .disabled(secureShareNeedsRetry)
                 }
                 .padding(18)
@@ -903,7 +984,8 @@ struct RequestMoneyView: View {
                 }
                 .buttonStyle(KitPrimaryButtonStyle())
                 .disabled(
-                    flow.isSubmitting
+                    !model.appReviewDemoMutationsAllowed
+                        || flow.isSubmitting
                         || isSharingCreatedRequest
                         || (!secureShareNeedsRetry && (
                             selectedContact == nil
@@ -913,24 +995,127 @@ struct RequestMoneyView: View {
                                 ) == nil
                         ))
                 )
+                .contextMenu {
+                    if canScheduleRequest {
+                        Button {
+                            submitRequest()
+                        } label: {
+                            Label("Send now", systemImage: "paperplane.fill")
+                        }
+                        Button {
+                            isPickingScheduledTime = true
+                        } label: {
+                            Label("Send later", systemImage: "clock")
+                        }
+                    }
+                }
+
+                if canScheduleRequest {
+                    Button {
+                        isPickingScheduledTime = true
+                    } label: {
+                        Label("Send later", systemImage: "clock")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(KitSecondaryButtonStyle())
+                    .disabled(flow.isSubmitting || isSharingCreatedRequest)
+                }
             }
             .padding(20)
+        }
+        .sheet(isPresented: $isPickingScheduledTime) {
+            ScheduleSendSheet(
+                title: "Send later",
+                confirmTitle: "Schedule",
+                preview: schedulePreview,
+                initialDate: nil,
+                onSchedule: { date in scheduleSubmission(at: date) }
+            )
+        }
+    }
+
+    /// Send Later is offered only once the request is otherwise ready to go, so the option never
+    /// appears next to an amount the screen would refuse anyway.
+    private var canScheduleRequest: Bool {
+        guard scheduleRequest != nil, !secureShareNeedsRetry, selectedContact != nil else {
+            return false
+        }
+        return WalletMoney.apiAmount(
+            amount,
+            scale: model.selectedWallet?.currency.decimalScale ?? 2
+        ) != nil
+    }
+
+    private var schedulePreview: String {
+        let name = selectedContact?.name ?? "your contact"
+        return "Request \(successAmount) from \(name)"
+    }
+
+    private func scheduleSubmission(at date: Date) {
+        guard let scheduleRequest else { return }
+        guard let wallet = model.selectedWallet,
+              let selectedContact,
+              let recipientUserID = ContactRecipientDirectory.recipientUserId(
+                  for: selectedContact
+              ),
+              let apiAmount = WalletMoney.apiAmount(
+                  amount,
+                  scale: wallet.currency.decimalScale
+              ),
+              canEncodeSecureRequest(
+                  amount: amount,
+                  note: note,
+                  currency: wallet.currency
+              )
+        else {
+            flow.errorMessage = "Use a valid amount and a note that fits the secure payment card."
+            return
+        }
+        guard !isSharingCreatedRequest, !flow.isSubmitting else { return }
+        isSharingCreatedRequest = true
+        Task {
+            defer { isSharingCreatedRequest = false }
+            // Approved now, raised later. The person arranging the request is present for this
+            // check; the queue re-tests the session's authorization again before it acts.
+            guard await authorizeSubmission() else { return }
+            let scheduled = await scheduleRequest(
+                PaymentRequestScheduleDraft(
+                    destinationWalletID: wallet.id,
+                    recipientUserID: recipientUserID,
+                    recipientName: selectedContact.name,
+                    amount: apiAmount,
+                    currencyCode: wallet.currency.code,
+                    note: note.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty,
+                    deliverAt: date
+                )
+            )
+            guard scheduled else {
+                if flow.errorMessage == nil {
+                    flow.errorMessage = model.lastError
+                        ?? "Kit Pay could not schedule this request. Please try again."
+                }
+                return
+            }
+            scheduledFor = date
+            completed = true
         }
     }
 
     private var successView: some View {
         VStack(spacing: 20) {
             Spacer()
-            Image(systemName: "paperplane.fill")
+            Image(systemName: scheduledFor == nil ? "paperplane.fill" : "clock.badge.checkmark")
                 .font(.system(size: 38))
                 .foregroundStyle(.white)
                 .frame(width: 88, height: 88)
                 .background(KitColor.green.gradient, in: Circle())
-            Text("Request sent").font(.largeTitle.bold()).foregroundStyle(KitColor.primaryText)
-            Text("\(selectedContact?.name ?? "Your contact") will receive your request for \(successAmount).")
+            Text(scheduledFor == nil ? "Request sent" : "Request scheduled")
+                .font(.largeTitle.bold())
+                .foregroundStyle(KitColor.primaryText)
+            Text(successDetail)
                 .multilineTextAlignment(.center)
                 .foregroundStyle(KitColor.secondaryText)
-            if let id = flow.createdRequest?.id {
+            if scheduledFor == nil, let id = flow.createdRequest?.id {
                 Text("Request \(id)").font(.caption.monospaced()).foregroundStyle(.secondary)
             }
             Spacer()
@@ -939,6 +1124,23 @@ struct RequestMoneyView: View {
                 .buttonStyle(KitPrimaryButtonStyle())
         }
         .padding(28)
+    }
+
+    private var successDetail: String {
+        let name = selectedContact?.name ?? "Your contact"
+        guard let scheduledFor else {
+            return "\(name) will receive your request for \(successAmount)."
+        }
+        let when = ScheduledSendPolicy.label(
+            for: scheduledFor,
+            now: AppPresentationClock.now,
+            calendar: AppPresentationClock.calendar,
+            time: ScheduleSendSheet.timeLabel,
+            day: ScheduleSendSheet.dayLabel
+        )
+        // Deliberately not "will be sent": nothing exists on the server yet, and the request is
+        // raised only when the queue reaches it.
+        return "Kit sends this request to \(name) \(when.lowercased()). Nothing has been sent yet."
     }
 
     private var successAmount: String {
@@ -1128,6 +1330,7 @@ struct ReceiveMoneyView: View {
                         Label("My QR", systemImage: "qrcode").frame(maxWidth: .infinity)
                     }
                     .buttonStyle(KitSecondaryButtonStyle())
+                    .disabled(!model.appReviewDemoMutationsAllowed)
 
                     if canRequestMoney {
                         NavigationLink {
@@ -1136,6 +1339,7 @@ struct ReceiveMoneyView: View {
                             Label("Request", systemImage: "doc.text").frame(maxWidth: .infinity)
                         }
                         .buttonStyle(KitSecondaryButtonStyle())
+                        .disabled(!model.appReviewDemoMutationsAllowed)
                     } else {
                         Button { comingSoonMessage = "Coming soon: Request amount." } label: {
                             Label("Request", systemImage: "doc.text").frame(maxWidth: .infinity)
@@ -1148,6 +1352,7 @@ struct ReceiveMoneyView: View {
                     Label("Set amount", systemImage: "number").frame(maxWidth: .infinity)
                 }
                 .buttonStyle(KitSecondaryButtonStyle())
+                .disabled(!model.appReviewDemoMutationsAllowed)
 
                 ShareLink(item: shareText) {
                     Label("Share my details", systemImage: "square.and.arrow.up")
@@ -1186,6 +1391,10 @@ struct ReceiveMoneyView: View {
     }
 
     private func openMerchantQR() {
+        guard model.appReviewDemoMutationsAllowed else {
+            comingSoonMessage = AppReviewDemoMutationPolicy.readOnlyMessage
+            return
+        }
         guard model.capabilities?.enablesMerchantQRPayments == true else {
             comingSoonMessage = "Merchant QR payments are not enabled for this Kit Pay account."
             return
@@ -1230,12 +1439,19 @@ struct TransactionsView: View {
 
 struct TransactionDetailView: View {
     @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var model: AppModel
     let transaction: WalletTransaction
 
     var body: some View {
         ScrollView {
             VStack(spacing: 18) {
-                AvatarView(name: transaction.counterparty?.name ?? "Kit Pay", size: 68)
+                // The ledger carries the counterparty's id but not their photo, so the face comes
+                // from the contact directory — which is persisted, so this still resolves offline.
+                RemoteAvatarView(
+                    name: transaction.counterparty?.name ?? "Kit Pay",
+                    avatarURL: model.contactAvatarURL(forUserID: transaction.counterparty?.id),
+                    size: 68
+                )
                 Text(transaction.counterparty?.name ?? transaction.type.displayLabel)
                     .font(.title2.bold())
                     .foregroundStyle(KitColor.primaryText)
@@ -1375,12 +1591,7 @@ private enum WalletMoney {
     /// Renders a canonical amount the way the amount field renders it, so the review step, the
     /// confirm button and the receipt cannot disagree with what the customer typed.
     static func displayAmount(_ raw: String, currency: String, scale: Int = 2) -> String {
-        let cleaned = raw.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty ?? "0"
-        let grouped = PaymentInputFormatting.groupedDecimalInput(
-            cleaned,
-            maximumFractionDigits: scale
-        )
-        return "\(currency) \(grouped)"
+        KitMoney.formatted(raw, code: currency, scale: scale)
     }
 }
 
@@ -1417,14 +1628,9 @@ extension WalletContactDTO {
     }
 }
 
-extension CurrencyDTO {
-    var decimalScale: Int { Int(scale) ?? 2 }
-}
-
 private extension WalletTransaction {
     var signedDisplayAmount: String {
-        let sign = direction == "credit" ? "+" : direction == "debit" ? "−" : ""
-        return "\(sign)\(currency.code) \(amount)"
+        KitMoney.signed(amount, currency: currency, direction: direction)
     }
 }
 

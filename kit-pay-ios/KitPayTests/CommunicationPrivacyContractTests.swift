@@ -19,6 +19,7 @@ final class CommunicationPrivacyContractTests: XCTestCase {
         XCTAssertTrue(preferences.phoneDiscoverable)
         XCTAssertFalse(preferences.directMessageRequestsEnabled)
         XCTAssertTrue(preferences.incomingCallsEnabled)
+        XCTAssertTrue(preferences.messagingPresenceVisible)
         XCTAssertEqual(preferences.updatedAt, "2026-08-20T08:30:00.125Z")
     }
 
@@ -32,6 +33,10 @@ final class CommunicationPrivacyContractTests: XCTestCase {
         var missingPreference = preferenceObject()
         missingPreference.removeValue(forKey: "phone_discoverable")
         invalidObjects.append(missingPreference)
+
+        var missingPresencePreference = preferenceObject()
+        missingPresencePreference.removeValue(forKey: "messaging_presence_visible")
+        invalidObjects.append(missingPresencePreference)
 
         var nonBooleanPreference = preferenceObject()
         nonBooleanPreference["direct_message_requests_enabled"] = 1
@@ -73,17 +78,22 @@ final class CommunicationPrivacyContractTests: XCTestCase {
         let request = try UpdateCommunicationPreferencesRequest(
             version: 7,
             phoneDiscoverable: false,
-            directMessageRequestsEnabled: true
+            directMessageRequestsEnabled: true,
+            messagingPresenceVisible: false
         )
         let encoded = try jsonObject(request)
 
         XCTAssertEqual(
             Set(encoded.keys),
-            ["version", "phone_discoverable", "direct_message_requests_enabled"]
+            [
+                "version", "phone_discoverable", "direct_message_requests_enabled",
+                "messaging_presence_visible",
+            ]
         )
         XCTAssertEqual(encoded["version"] as? Int, 7)
         XCTAssertEqual(encoded["phone_discoverable"] as? Bool, false)
         XCTAssertEqual(encoded["direct_message_requests_enabled"] as? Bool, true)
+        XCTAssertEqual(encoded["messaging_presence_visible"] as? Bool, false)
         XCTAssertNil(encoded["incoming_calls_enabled"])
 
         let compatibilityRequest = try UpdateCommunicationPreferencesRequest(
@@ -145,6 +155,23 @@ final class CommunicationPrivacyContractTests: XCTestCase {
         XCTAssertEqual(
             Set(try jsonObject(noOp.request(version: current.version)).keys),
             ["version", "direct_message_requests_enabled"]
+        )
+
+        let presenceChange = CommunicationPreferenceChange.presenceVisibility(false)
+        let presenceUpdated = try decode(
+            CommunicationPreferencesDTO.self,
+            from: preferenceObject(
+                version: 8,
+                phoneDiscoverable: false,
+                directMessageRequestsEnabled: true,
+                incomingCallsEnabled: true,
+                messagingPresenceVisible: false
+            )
+        )
+        XCTAssertTrue(presenceChange.isValidTransition(from: current, to: presenceUpdated))
+        XCTAssertEqual(
+            Set(try jsonObject(presenceChange.request(version: current.version)).keys),
+            ["version", "messaging_presence_visible"]
         )
     }
 
@@ -601,6 +628,28 @@ final class CommunicationPrivacyContractTests: XCTestCase {
         ))
     }
 
+    func testEncryptedCacheMigratesMissingPresencePreferenceToBackendDefault() throws {
+        let legacyObject: [String: Any] = [
+            "owner_user_id": currentUserId,
+            "preferences": [
+                "version": 7,
+                "phone_discoverable": true,
+                "direct_message_requests_enabled": false,
+                "incoming_calls_enabled": true,
+                "updated_at": "2026-08-20T08:30:00.125Z",
+            ],
+            "blocks": [],
+            "refreshed_at": 777_777_777,
+        ]
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .secondsSince1970
+        let cache = try decoder.decode(
+            CommunicationPrivacyCache.self,
+            from: JSONSerialization.data(withJSONObject: legacyObject)
+        )
+        XCTAssertTrue(cache.preferences.messagingPresenceVisible)
+    }
+
     func testOutboundAccessFailsClosedWithoutCompleteAccountBoundProjection() throws {
         let preferences = try decode(
             CommunicationPreferencesDTO.self,
@@ -784,13 +833,15 @@ final class CommunicationPrivacyContractTests: XCTestCase {
         version: Int = 7,
         phoneDiscoverable: Bool = true,
         directMessageRequestsEnabled: Bool = false,
-        incomingCallsEnabled: Bool = true
+        incomingCallsEnabled: Bool = true,
+        messagingPresenceVisible: Bool = true
     ) -> [String: Any] {
         [
             "version": version,
             "phone_discoverable": phoneDiscoverable,
             "direct_message_requests_enabled": directMessageRequestsEnabled,
             "incoming_calls_enabled": incomingCallsEnabled,
+            "messaging_presence_visible": messagingPresenceVisible,
             "updated_at": "2026-08-20T08:30:00.125Z",
         ]
     }

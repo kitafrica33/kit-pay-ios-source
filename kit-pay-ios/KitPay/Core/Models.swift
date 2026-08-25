@@ -136,8 +136,23 @@ struct CapabilitiesDTO: Decodable {
     var supportsPhoneOTP: Bool { authentication?["phone_otp"] == true }
     var supportsEmailPassword: Bool { authentication?["email_password"] == true }
     var supportsMFA: Bool { authentication?["mfa"] == true }
-    var supportsEmailRegistration: Bool { features?["email_registration"] == true }
-    var supportsEmailRecovery: Bool { features?["email_recovery"] == true }
+    var supportsEmailRegistration: Bool { supportsFeature("email_registration") }
+    var supportsEmailRecovery: Bool { supportsFeature("email_recovery") }
+
+    /// Feature flags fail closed identically: a missing key, an explicit null and `false` all mean
+    /// off. Reading through here also keeps call sites out of the three-deep optional comparison
+    /// (`capabilities?.features?[key] == true`) that the type checker struggles with.
+    func supportsFeature(_ key: String) -> Bool {
+        guard let features, let value = features[key] else { return false }
+        return value == true
+    }
+
+    /// Distinguishes "the server says no" from "the server has not said". Used by surfaces that
+    /// stay available until they are explicitly withdrawn.
+    func featureIsWithdrawn(_ key: String) -> Bool {
+        guard let features, let value = features[key] else { return false }
+        return value == false
+    }
 }
 
 enum EmailAccountScreen: Equatable {
@@ -450,9 +465,9 @@ extension CapabilitiesDTO {
     var enablesProfileAvatars: Bool {
         guard let features else { return false }
         if features.keys.contains("profile_avatars") {
-            return features["profile_avatars"] == true
+            return supportsFeature("profile_avatars")
         }
-        return features["media"] == true
+        return supportsFeature("media")
     }
 
     /// Rich chat media is independently deployable from the reviewed Signal text/image wire.
@@ -465,6 +480,168 @@ extension CapabilitiesDTO {
 
 struct CapabilityProtocolsDTO: Decodable {
     let messaging: MessagingProtocolCapabilityDTO?
+    /// Realtime is an additive transport hint. A malformed advertisement must disable only the
+    /// socket path rather than making the entire capabilities response unusable.
+    var realtime: RealtimeProtocolCapabilityDTO? = nil
+
+    private enum CodingKeys: String, CodingKey {
+        case messaging, realtime
+    }
+
+    init(
+        messaging: MessagingProtocolCapabilityDTO?,
+        realtime: RealtimeProtocolCapabilityDTO? = nil
+    ) {
+        self.messaging = messaging
+        self.realtime = realtime
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        messaging = try values.decodeIfPresent(
+            MessagingProtocolCapabilityDTO.self,
+            forKey: .messaging
+        )
+        realtime = try? values.decodeIfPresent(
+            RealtimeProtocolCapabilityDTO.self,
+            forKey: .realtime
+        )
+    }
+}
+
+struct RealtimeProtocolCapabilityDTO: Decodable {
+    let version: Int?
+    let scheme: String?
+    let host: String?
+    let port: Int?
+    let path: String?
+    let key: String?
+    let protocolVersion: Int?
+    let authPath: String?
+    let activityTimeout: Int?
+    let maximumConnectionSeconds: Int?
+    let channels: RealtimeChannelTemplatesDTO?
+    let presence: Bool?
+    let typing: Bool?
+
+    private enum CodingKeys: String, CodingKey {
+        case version = "v"
+        case scheme, host, port, path, key, channels, presence, typing
+        case protocolVersion = "protocol"
+        case authPath = "auth_path"
+        case activityTimeout = "activity_timeout"
+        case maximumConnectionSeconds = "max_connection_seconds"
+    }
+
+    var validatedConfiguration: KitRealtimeConfiguration? {
+        KitRealtimeConfiguration(capability: self)
+    }
+}
+
+struct RealtimeChannelTemplatesDTO: Decodable {
+    let user: String?
+    let conversation: String?
+}
+
+/// A completely validated protocol-v1 advertisement. No network code consumes the permissive
+/// wire DTO directly, so an omitted, mistyped, downgraded, or redirected member fails closed.
+struct KitRealtimeConfiguration: Equatable, Hashable, Sendable {
+    static let expectedUserChannelTemplate = "private-kit.user.{user}"
+    static let expectedConversationChannelTemplate = "presence-kit.conv.{conversation}"
+    static let expectedAuthPath = "/api/kit-wallet/v1/messaging/realtime/auth"
+    /// The backend withholds this protocol block from older sessions.
+    static let minimumIOSRelease = MessagingBuild24CompatibilityPolicy.minimumIOSRelease
+
+    let host: String
+    let port: Int
+    let path: String
+    let key: String
+    let authPath: String
+    let activityTimeout: TimeInterval
+    let maximumConnectionSeconds: TimeInterval
+    let userChannelTemplate: String
+    let conversationChannelTemplate: String
+    let presenceEnabled: Bool
+    let typingEnabled: Bool
+
+    init?(capability: RealtimeProtocolCapabilityDTO) {
+        guard capability.version == 1,
+              capability.protocolVersion == 7,
+              capability.scheme?.lowercased() == "wss",
+              let rawHost = capability.host?.lowercased(),
+              rawHost == "pay.kit.africa",
+              capability.port == 443,
+              let path = capability.path,
+              let key = capability.key,
+              (1 ... 128).contains(key.utf8.count),
+              key.unicodeScalars.allSatisfy({
+                  CharacterSet.alphanumerics.contains($0)
+                      || $0.value == 0x2D
+                      || $0.value == 0x5F
+              }),
+              path == "/app/\(key)",
+              capability.authPath == Self.expectedAuthPath,
+              let activityTimeout = capability.activityTimeout,
+              (10 ... 120).contains(activityTimeout),
+              let maximumConnectionSeconds = capability.maximumConnectionSeconds,
+              (60 ... 1_800).contains(maximumConnectionSeconds),
+              capability.channels?.user == Self.expectedUserChannelTemplate,
+              capability.channels?.conversation == Self.expectedConversationChannelTemplate,
+              let presenceEnabled = capability.presence,
+              let typingEnabled = capability.typing,
+              !typingEnabled || presenceEnabled
+        else { return nil }
+
+        host = rawHost
+        port = 443
+        self.path = path
+        self.key = key
+        authPath = Self.expectedAuthPath
+        self.activityTimeout = TimeInterval(activityTimeout)
+        self.maximumConnectionSeconds = TimeInterval(maximumConnectionSeconds)
+        userChannelTemplate = Self.expectedUserChannelTemplate
+        conversationChannelTemplate = Self.expectedConversationChannelTemplate
+        self.presenceEnabled = presenceEnabled
+        self.typingEnabled = typingEnabled
+    }
+
+    var socketURL: URL? {
+        var components = URLComponents()
+        components.scheme = "wss"
+        components.host = host
+        components.port = port
+        components.path = path
+        components.queryItems = [
+            URLQueryItem(name: "protocol", value: "7"),
+            URLQueryItem(name: "client", value: "kit-ios"),
+            URLQueryItem(name: "version", value: "1"),
+            URLQueryItem(name: "flash", value: "false"),
+        ]
+        return components.url
+    }
+
+    var relativeAuthPath: String {
+        String(authPath.dropFirst("/api/kit-wallet/v1/".count))
+    }
+
+    func userChannel(userID: String) -> String {
+        userChannelTemplate.replacingOccurrences(of: "{user}", with: userID)
+    }
+
+    func conversationChannel(conversationID: String) -> String {
+        conversationChannelTemplate.replacingOccurrences(
+            of: "{conversation}",
+            with: conversationID
+        )
+    }
+
+    /// Stable identity for SwiftUI task invalidation. It contains no credential material.
+    var lifecycleIdentity: String {
+        [
+            host, String(port), path, key, String(Int(activityTimeout)),
+            String(Int(maximumConnectionSeconds)), String(presenceEnabled), String(typingEnabled),
+        ].joined(separator: "|")
+    }
 }
 
 struct MessagingProtocolCapabilityDTO: Decodable {
@@ -496,6 +673,9 @@ struct MessagingRichMediaProtocolCapabilityDTO: Decodable {
     let minimumCiphertextBytes: Int64?
     let maximumPlaintextBytes: Int?
     let maximumCiphertextBytes: Int64?
+    let largeAttachmentCapability: String?
+    let largeAttachmentSupportedPlatforms: [String?]?
+    let largeAttachmentMinimumIOSVersion: String?
     let mediaTypes: [String?]?
 
     enum CodingKeys: String, CodingKey {
@@ -505,6 +685,9 @@ struct MessagingRichMediaProtocolCapabilityDTO: Decodable {
         case minimumCiphertextBytes = "minimum_ciphertext_bytes"
         case maximumPlaintextBytes = "maximum_plaintext_bytes"
         case maximumCiphertextBytes = "maximum_ciphertext_bytes"
+        case largeAttachmentCapability = "large_attachment_capability"
+        case largeAttachmentSupportedPlatforms = "large_attachment_supported_platforms"
+        case largeAttachmentMinimumIOSVersion = "large_attachment_minimum_ios_version"
         case mediaTypes = "media_types"
     }
 
@@ -516,6 +699,11 @@ struct MessagingRichMediaProtocolCapabilityDTO: Decodable {
               minimumCiphertextBytes == SecureMessagingWire.minimumAttachmentCiphertextBytes,
               maximumPlaintextBytes == SecureMediaAttachmentCipher.maximumPlaintextBytes,
               maximumCiphertextBytes == SecureMessagingWire.maximumAttachmentCiphertextBytes,
+              largeAttachmentCapability
+                == MessagingRichMediaCapabilityPolicy.extendedSizeDeviceCapabilityKey,
+              largeAttachmentSupportedPlatforms?.compactMap({ $0 }) == ["ios"],
+              largeAttachmentMinimumIOSVersion
+                == MessagingRichMediaCapabilityPolicy.extendedSizeMinimumIOSRelease,
               let advertisedMediaTypes = mediaTypes?.compactMap({ $0 })
         else { return false }
         return Set(advertisedMediaTypes).isSuperset(
@@ -1471,6 +1659,10 @@ enum ProfileEmailVerificationResponsePolicy {
         merged.phoneVerified = response.phoneVerified ?? currentProfile.phoneVerified
         merged.profileSetupRequired = response.profileSetupRequired
             ?? currentProfile.profileSetupRequired
+        merged.legalName = response.legalName ?? currentProfile.legalName
+        merged.legalNameVerifiedAt = response.legalNameVerifiedAt
+            ?? currentProfile.legalNameVerifiedAt
+        merged.usernameRequired = response.usernameRequired ?? currentProfile.usernameRequired
         return merged
     }
 }
@@ -1792,6 +1984,16 @@ struct BiometricKeyStatusDTO: Decodable, Hashable, Sendable {
     }
 }
 
+/// A Kit Pay account carries two deliberately separate names.
+///
+/// `legalName` is read off the identity document during verification and is never replaced by
+/// anything the user types — it is the name that governs compliance, payouts and every other
+/// place Kit Pay has to know who somebody legally is. `name` and `tag` are the chosen, public
+/// identity: a display name and an optional `@username`. Keeping them in different fields is
+/// what stops a chosen handle from ever being mistaken for verified identity.
+///
+/// `legalName` and `usernameRequired` are absent on deployments that predate the split; Swift's
+/// synthesized decoder ignores unknown keys, so this stays compatible in both directions.
 struct UserProfile: Codable, Hashable, Identifiable, Sendable {
     let id: String
     var name: String?
@@ -1806,6 +2008,13 @@ struct UserProfile: Codable, Hashable, Identifiable, Sendable {
     var emailVerified: Bool? = nil
     var phoneVerified: Bool? = nil
     var profileSetupRequired: Bool?
+    /// The name on the verified identity document. Server-owned and never writable by the client.
+    var legalName: String? = nil
+    /// When that document was accepted. Absent means the legal name is not (or not yet) verified.
+    var legalNameVerifiedAt: String? = nil
+    /// Whether this account still has to choose an `@username` before it can use Kit Pay. Servers
+    /// that predate the split omit it; `nil` reads as "required", which is the old behaviour.
+    var usernameRequired: Bool? = nil
 
     enum CodingKeys: String, CodingKey {
         case id, name, email, phone, tag
@@ -1817,6 +2026,33 @@ struct UserProfile: Codable, Hashable, Identifiable, Sendable {
         case emailVerified = "email_verified"
         case phoneVerified = "phone_verified"
         case profileSetupRequired = "profile_setup_required"
+        case legalName = "legal_name"
+        case legalNameVerifiedAt = "legal_name_verified_at"
+        case usernameRequired = "username_required"
+    }
+
+    /// The verified legal name, or nil when identity verification has not produced one.
+    var verifiedLegalName: String? {
+        guard let legalName else { return nil }
+        let trimmed = legalName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    /// The chosen `@username`, or nil while the account still carries a server-issued provisional
+    /// tag. A provisional tag is an allocation detail, not a name the user picked.
+    var chosenUsername: String? {
+        let normalized = normalizeProfileTag(tag ?? "")
+        guard !normalized.isEmpty, !isProvisionalProfileTag(normalized) else { return nil }
+        return normalized
+    }
+
+    /// The name to lead with in secure and financial contexts: the verified identity if there is
+    /// one, otherwise whatever display name the account has.
+    var identityDisplayName: String? {
+        verifiedLegalName ?? {
+            let normalized = normalizeProfileName(name ?? "")
+            return isPlaceholderProfileName(normalized) ? nil : normalized
+        }()
     }
 }
 
@@ -1846,6 +2082,11 @@ enum UserProfileMutationMergePolicy {
         merged.phoneVerified = response.phoneVerified ?? current.phoneVerified
         merged.profileSetupRequired = response.profileSetupRequired
             ?? ((requestedName != nil || requestedTag != nil) ? false : current.profileSetupRequired)
+        // The legal name is server-owned: a profile PATCH neither carries nor may clear it, so an
+        // omitted field always means "unchanged", never "removed".
+        merged.legalName = response.legalName ?? current.legalName
+        merged.legalNameVerifiedAt = response.legalNameVerifiedAt ?? current.legalNameVerifiedAt
+        merged.usernameRequired = response.usernameRequired ?? current.usernameRequired
         return merged
     }
 }
@@ -2301,6 +2542,10 @@ struct ConversationDraft: Codable, Hashable, Sendable {
 /// files readable; messages that predate this record simply cannot be used as backfill sources.
 struct SecureMessagingRetainedMessageMetadata: Codable, Hashable, Sendable {
     let clientMessageID: String
+    /// Authenticated sender bound to this metadata when the envelope was decrypted. Optional so
+    /// pre-field local state remains decodable; security-sensitive departed-member recovery must
+    /// require it rather than inferring attribution from the surrounding mutable projection.
+    let senderUserID: String?
     let senderDeviceID: String
     let senderEnrollmentEpoch: Int64
     let senderSignalDeviceID: UInt32
@@ -2334,6 +2579,15 @@ struct LocalMessage: Codable, Hashable, Identifiable {
     /// protocol. A missing value is fail-closed: the message remains visible locally but is never
     /// offered as a trusted history source to another enrollment.
     var secureMessagingHistory: SecureMessagingRetainedMessageMetadata? = nil
+    /// When the sender asked for this message to leave the device. `nil` is an ordinary send.
+    /// It survives delivery on purpose: a message that went out at its scheduled minute belongs
+    /// at that minute in the timeline, not at the minute it was composed. Optional keeps state
+    /// written by earlier builds decodable.
+    var scheduledAt: Date? = nil
+
+    /// Position in the conversation. A scheduled message sits at the moment it is promised for,
+    /// which is also where it will read correctly once it has been sent.
+    var timelineDate: Date { scheduledAt ?? createdAt }
 }
 
 struct LocalPendingAttachment: Codable, Hashable, Sendable {
@@ -2353,6 +2607,20 @@ struct Conversation: Codable, Hashable, Identifiable {
     var participantUserIds: [String]
     var unreadCount: Int
     var updatedAt: Date
+    /// Server conversation type ("direct"/"group"). Optional keeps encrypted state written by
+    /// earlier builds decodable — a non-Optional addition would silently reset the whole
+    /// protected state on upgrade. `nil` is treated as a direct thread everywhere.
+    var conversationType: String? = nil
+    /// Authenticated server roles for the active group roster. Optional keeps protected state
+    /// written before group management backward-decodable; missing roles expose only self-leave.
+    var groupMemberRoles: [String: MessagingGroupRole]? = nil
+
+    var isGroup: Bool { conversationType == SecureMessagingWire.groupConversationType }
+
+    func groupRole(for userID: String?) -> MessagingGroupRole? {
+        guard let userID else { return nil }
+        return groupMemberRoles?[userID.lowercased()]
+    }
 }
 
 enum CallState: String, Codable, Hashable, Sendable {
@@ -2449,6 +2717,28 @@ enum OfflineCommandKind: String, Codable {
     case secureMessage
     case callAttempt
     case callTermination
+    /// A payment request the sender asked Kit to raise later. Unlike a scheduled message there is
+    /// nothing to hold back locally: the request must not exist on the server — and must not be
+    /// visible to the person being asked — until its moment arrives, so creation itself is what
+    /// gets deferred.
+    case scheduledPaymentRequest
+}
+
+/// Everything needed to raise one payment request at its scheduled time. Held in the account-bound
+/// encrypted state, like every other pending command.
+struct ScheduledPaymentRequestPayload: Codable, Hashable, Sendable {
+    let destinationWalletID: String
+    let requestedFromUserID: String
+    let amount: String
+    /// Only for the scheduled card's preview. The authoritative currency is the destination
+    /// wallet's, re-checked against the server's response when the request is finally created.
+    let currencyCode: String
+    let note: String?
+    /// Reused on every attempt, so a retry after a timeout can never raise a second request.
+    let idempotencyKey: String
+    let recipientName: String
+    /// The chat the confirmed request should be shared into, when it was scheduled from one.
+    let conversationID: String?
 }
 
 enum OfflineCommandFailureDisposition: String, Codable, Hashable {
@@ -2482,6 +2772,20 @@ struct OfflineCommand: Codable, Hashable, Identifiable {
     /// Optional fields keep state written by earlier TestFlight builds decodable.
     var failureDisposition: OfflineCommandFailureDisposition? = nil
     var lastFailureReason: String? = nil
+    /// The minute the sender chose in Send Later. It is the same value as the first
+    /// `nextAttemptAt`, kept separately because `nextAttemptAt` moves with every backoff and the
+    /// promise shown in the conversation must not move with it.
+    var scheduledAt: Date? = nil
+    /// Present only on `.scheduledPaymentRequest`.
+    var scheduledPaymentRequest: ScheduledPaymentRequestPayload? = nil
+
+    /// Waiting for its moment rather than for the network. Such a command is deliberately not
+    /// runnable yet, and — unlike a message backing off after a failure — it must not hold up the
+    /// messages composed after it.
+    func isAwaitingScheduledTime(at now: Date) -> Bool {
+        guard scheduledAt != nil, failureDisposition == nil else { return false }
+        return nextAttemptAt > now
+    }
 }
 
 struct PersistedState: Codable {
@@ -2509,10 +2813,23 @@ struct PersistedState: Codable {
     var contactSyncFingerprint: String?
     var contactSyncSnapshotScope: ContactSyncSnapshotScope?
     var contactSyncLastCompletedAt: Date?
+    /// Whether this installation may upload its address book for contact matching. Device-local
+    /// because the server carries no such field and `CommunicationPreferencesDTO` rejects unknown
+    /// keys — see [[AccountDiscoveryControl]]. `nil` means the user has never chosen, which reads
+    /// as enabled. Optional also keeps encrypted state written by older builds decodable.
+    var contactDiscoveryEnabled: Bool?
+    /// Server-backed discoverability choices made during account setup, held until the session is
+    /// authorized enough to PATCH them. Optional for the same backward-decodability reason.
+    var pendingAccountDiscoveryChoice: PendingAccountDiscoveryChoice?
     /// Last server-confirmed privacy settings and outgoing blocks. The enclosing state file is
     /// encrypted and account-bound; optional keeps projections from older builds decodable.
     var communicationPrivacy: CommunicationPrivacyCache?
     var conversations: [Conversation] = []
+    /// Freshness clock for server-owned group fields (title, roster, and roles).
+    /// Conversation.updatedAt remains the visible-activity clock, so reaction-only sync can
+    /// advance this map without incorrectly moving a thread to the top of the chat list.
+    /// Optional keeps protected state written by earlier builds backward-decodable.
+    var groupProjectionUpdatedAt: [String: Date]?
     /// Unsent composer text is encrypted with the rest of the account-bound communication state.
     /// Optional keeps state written by earlier TestFlight builds backward-decodable.
     var conversationDrafts: [String: ConversationDraft]?
@@ -2548,9 +2865,12 @@ struct PersistedState: Codable {
             || contactSyncFingerprint != nil
             || contactSyncSnapshotScope != nil
             || contactSyncLastCompletedAt != nil
+            || contactDiscoveryEnabled != nil
+            || pendingAccountDiscoveryChoice != nil
             || communicationPrivacy != nil
             || sessionAssurance != nil
             || !conversations.isEmpty
+            || groupProjectionUpdatedAt?.isEmpty == false
             || conversationDrafts?.isEmpty == false
             || !messages.isEmpty
             || !calls.isEmpty

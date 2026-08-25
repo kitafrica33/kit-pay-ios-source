@@ -6,7 +6,9 @@ struct CallsView: View {
     @State private var missedOnly = false
 
     private var canStartNewCall: Bool {
-        model.mayCreateCall && model.hasUsableCommunicationPrivacyProjection
+        model.appReviewDemoMutationsAllowed
+            && model.mayCreateCall
+            && model.hasUsableCommunicationPrivacyProjection
     }
 
     private var allCalls: [CallRecord] {
@@ -83,7 +85,10 @@ struct CallsView: View {
                 }
             }
             .refreshable { await model.refresh(userInitiated: true) }
-            .sheet(isPresented: $showNewCall) { NewCallSheet() }
+            .sheet(isPresented: $showNewCall) {
+                NewCallSheet()
+                    .environmentObject(model)
+            }
         }
     }
 
@@ -100,7 +105,11 @@ struct CallsView: View {
             && model.mayCreateCall
             && recipientCommunicationAllowed
         return HStack(spacing: 13) {
-            AvatarView(name: call.name, size: 56)
+            RemoteAvatarView(
+                name: call.name,
+                avatarURL: model.contactAvatarURL(forUserID: recipientUserID),
+                size: 56
+            )
             VStack(alignment: .leading, spacing: 5) {
                 Text(call.name)
                     .font(.headline)
@@ -306,7 +315,8 @@ private struct NewCallSheet: View {
         }
         .buttonStyle(.borderless)
         .disabled(
-            !model.mayCreateCall
+            !model.appReviewDemoMutationsAllowed
+                || !model.mayCreateCall
                 || !model.communicationPrivacyAllowsOutbound(to: contact.id)
         )
         .accessibilityLabel("\(video ? "Video" : "Voice") call \(contact.name)")

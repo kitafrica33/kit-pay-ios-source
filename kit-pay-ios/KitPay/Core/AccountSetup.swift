@@ -80,7 +80,10 @@ enum AccountSetupPolicy {
         guard let user else { return true }
         return user.profileSetupRequired == true || profileIdentityValidationError(
             name: user.name ?? "",
-            tag: user.tag
+            tag: user.tag,
+            verifiedLegalName: user.verifiedLegalName,
+            // Absent on servers that predate the split, where the username is still mandatory.
+            usernameRequired: user.usernameRequired ?? true
         ) != nil
     }
 
@@ -107,9 +110,29 @@ enum AccountSetupPolicy {
     }
 }
 
+/// A profile PATCH carries only the chosen identity. The legal name is server-owned and is
+/// deliberately absent from this request: nothing the client sends may overwrite it.
+///
+/// Both fields are omitted-if-nil rather than sent as null, so "the user did not choose a
+/// username" reads as *unchanged* to the server instead of *clear it*.
 struct UpdateProfileRequest: Encodable, Equatable {
-    let name: String
-    let tag: String
+    let name: String?
+    let tag: String?
+
+    init(name: String?, tag: String?) {
+        self.name = name
+        self.tag = tag
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(name, forKey: .name)
+        try container.encodeIfPresent(tag, forKey: .tag)
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case name, tag
+    }
 }
 
 struct SetPaymentPinRequest: Encodable, Equatable {
@@ -142,28 +165,52 @@ func normalizeProfileTag(_ value: String) -> String {
     return String(trimmed).dropFirstIfAtSign.lowercased()
 }
 
-func profileIdentityValidationError(name: String, tag: String?) -> String? {
+/// Validates the *chosen* half of an account's identity: a display name and an `@username`.
+///
+/// Neither is the user's legal name. When identity verification has already produced a verified
+/// legal name, pass it as `verifiedLegalName` and the display name becomes optional — the app
+/// shows the verified name instead of forcing the user to retype it. When the server reports that
+/// the username is optional, an unset or still-provisional tag is likewise accepted. Anything the
+/// user *does* type is validated either way, so an optional field can never be saved half-formed.
+///
+/// The defaults reproduce the original required-both behaviour, which is what deployments that
+/// predate the legal-name split still expect.
+func profileIdentityValidationError(
+    name: String,
+    tag: String?,
+    verifiedLegalName: String? = nil,
+    usernameRequired: Bool = true
+) -> String? {
     let normalizedName = normalizeProfileName(name)
     let normalizedTag = normalizeProfileTag(tag ?? "")
-    switch normalizedName.unicodeScalars.count {
-    case 2...120: break
-    default: return "Enter a username / display name (2–120 characters)."
+    let hasVerifiedLegalName = !normalizeProfileName(verifiedLegalName ?? "").isEmpty
+    let displayNameIsUnset = normalizedName.isEmpty || isPlaceholderProfileName(normalizedName)
+    let usernameIsUnset = normalizedTag.isEmpty || isProvisionalProfileTag(normalizedTag)
+
+    if !(hasVerifiedLegalName && displayNameIsUnset) {
+        switch normalizedName.unicodeScalars.count {
+        case 2...120: break
+        default: return "Enter a display name (2–120 characters)."
+        }
+        if isPlaceholderProfileName(normalizedName) {
+            return "Choose the display name people should see."
+        }
     }
-    if isPlaceholderProfileName(normalizedName) {
-        return "Choose the username / display name people should see."
-    }
-    switch normalizedTag.unicodeScalars.count {
-    case 3...32: break
-    default: return "Your Kit Pay tag must be 3 to 32 characters."
-    }
-    if isProvisionalProfileTag(normalizedTag) {
-        return "Choose your own Kit Pay tag."
-    }
-    if normalizedTag.hasPrefix("deleted_") || reservedProfileTags.contains(normalizedTag) {
-        return "This Kit Pay tag is reserved."
-    }
-    if normalizedTag.range(of: "^[a-z0-9_]{3,32}$", options: .regularExpression) == nil {
-        return "Use only lowercase letters, numbers, and underscores in your Kit Pay tag."
+
+    if !(!usernameRequired && usernameIsUnset) {
+        switch normalizedTag.unicodeScalars.count {
+        case 3...32: break
+        default: return "Your username must be 3 to 32 characters."
+        }
+        if isProvisionalProfileTag(normalizedTag) {
+            return "Choose your own username."
+        }
+        if normalizedTag.hasPrefix("deleted_") || reservedProfileTags.contains(normalizedTag) {
+            return "This username is reserved."
+        }
+        if normalizedTag.range(of: "^[a-z0-9_]{3,32}$", options: .regularExpression) == nil {
+            return "Use only lowercase letters, numbers, and underscores in your username."
+        }
     }
     return nil
 }

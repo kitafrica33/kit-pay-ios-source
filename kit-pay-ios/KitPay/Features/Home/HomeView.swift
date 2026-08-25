@@ -58,6 +58,17 @@ struct HomeView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 22) {
                     header
+                    if model.appReviewDemoIsActive {
+                        Label(
+                            "App Review demo is read-only. Payment and account changes are disabled.",
+                            systemImage: "eye.fill"
+                        )
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(KitColor.secondaryText)
+                        .padding(14)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .kitGlass(cornerRadius: 20, shadow: false)
+                    }
                     balanceCard
                     quickServices
                     recentActivity
@@ -183,6 +194,15 @@ struct HomeView: View {
                 .foregroundStyle(.white)
         }
         .buttonStyle(.plain)
+        .disabled(
+            !available
+                || (!model.appReviewDemoMutationsAllowed && destination.isAppReviewDemoMutation)
+        )
+        .opacity(
+            !available
+                || (!model.appReviewDemoMutationsAllowed && destination.isAppReviewDemoMutation)
+                ? 0.55 : 1
+        )
     }
 
     private var quickServices: some View {
@@ -233,6 +253,8 @@ struct HomeView: View {
             .kitGlass(cornerRadius: 22)
         }
         .buttonStyle(.plain)
+        .disabled(!available || !model.appReviewDemoMutationsAllowed)
+        .opacity(!available || !model.appReviewDemoMutationsAllowed ? 0.55 : 1)
     }
 
     private var recentActivity: some View {
@@ -295,8 +317,13 @@ struct HomeView: View {
                     .lineLimit(1)
             }
             Spacer()
-            Text("\(transaction.direction == "credit" ? "+" : "−")\(transaction.currency.code) \(transaction.amount)")
+            Text(KitMoney.signed(
+                transaction.amount,
+                currency: transaction.currency,
+                direction: transaction.direction
+            ))
                 .font(.subheadline.bold())
+                .monospacedDigit()
                 .foregroundStyle(transaction.direction == "credit" ? KitColor.green : KitColor.primaryText)
         }
         .padding(14)
@@ -305,11 +332,7 @@ struct HomeView: View {
 
     private var formattedBalance: String {
         guard let wallet = model.selectedWallet else { return "UGX 0" }
-        let value = Decimal(string: wallet.balances.available) ?? 0
-        let formatter = NumberFormatter()
-        formatter.numberStyle = .decimal
-        formatter.maximumFractionDigits = Int(wallet.currency.scale) ?? 0
-        return "\(wallet.currency.code) \(formatter.string(from: value as NSDecimalNumber) ?? wallet.balances.available)"
+        return KitMoney.formatted(wallet.balances.available, currency: wallet.currency)
     }
 
     private var greeting: String {
@@ -366,6 +389,10 @@ struct HomeView: View {
         available: Bool,
         needsInternet: Bool
     ) {
+        guard model.appReviewDemoMutationsAllowed || !destination.isAppReviewDemoMutation else {
+            model.lastError = AppReviewDemoMutationPolicy.readOnlyMessage
+            return
+        }
         guard available else {
             model.lastError = "\(title) is not enabled for this Kit Pay account."
             return
@@ -382,6 +409,10 @@ struct HomeView: View {
         title: String,
         available: Bool
     ) {
+        guard model.appReviewDemoMutationsAllowed else {
+            model.lastError = AppReviewDemoMutationPolicy.readOnlyMessage
+            return
+        }
         guard available else {
             model.lastError = "\(title) is not enabled for this Kit Pay account."
             return
@@ -398,6 +429,10 @@ struct HomeView: View {
         title: String,
         available: Bool
     ) {
+        guard model.appReviewDemoMutationsAllowed else {
+            model.lastError = AppReviewDemoMutationPolicy.readOnlyMessage
+            return
+        }
         guard available else {
             model.lastError = "\(title) is not enabled for this Kit Pay account."
             return
@@ -410,6 +445,17 @@ struct HomeView: View {
         case .mobileMoney: modal = .mobileMoney
         case .bankTransfer: modal = .bankTransfer
         case .scanQR: modal = .scanQR
+        }
+    }
+}
+
+private extension WalletDestination {
+    var isAppReviewDemoMutation: Bool {
+        switch self {
+        case .send, .request:
+            true
+        case .receive, .transactions, .transaction:
+            false
         }
     }
 }

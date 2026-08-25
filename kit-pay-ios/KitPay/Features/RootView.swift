@@ -51,6 +51,54 @@ struct RootView: View {
             else { return }
             await model.homeDidBecomeActive()
         }
+        .task(id: accountDiscoveryDrainTrigger) {
+            // The discoverability choices made during setup could not be sent then:
+            // `communicationPrivacyContext()` refuses to run until setup is finished and the
+            // session grants full access. This is the first moment both are true.
+            await model.applyPendingAccountDiscoveryChoiceIfPossible()
+        }
+        .task(id: model.messagingRealtimeLifecycleIdentity) {
+            guard !Task.isCancelled else { return }
+            let center = KitPresenceCenter.shared
+            let appModel = model
+            center.syncRequestHandler = { [weak appModel] userID, sessionID in
+                appModel?.requestRealtimeMessagingSync(
+                    userID: userID,
+                    sessionID: sessionID
+                )
+            }
+            center.connectionStateHandler = { [weak appModel] isLive in
+                appModel?.realtimeMessagingConnectionDidChange(isLive: isLive)
+            }
+            center.setForeground(
+                UIApplication.shared.applicationState == .active
+                    && !model.requiresBiometricSignIn
+            )
+            guard !Task.isCancelled else { return }
+            guard model.isSignedIn,
+                  model.accountSetupStep == nil,
+                  model.sessionAssurance?.grantsFullAccess == true,
+                  !model.requiresBiometricSignIn,
+                  let configuration = model.messagingRealtimeConfiguration,
+                  let userID = model.profile?.id,
+                  let sessionID = await model.realtimeSessionID(for: userID)
+            else {
+                guard !Task.isCancelled else { return }
+                center.reset()
+                return
+            }
+            guard !Task.isCancelled else { return }
+            center.broadcastsPresence =
+                model.communicationPreferences?.messagingPresenceVisible ?? false
+            center.start(
+                userID: userID,
+                sessionID: sessionID,
+                configuration: configuration
+            )
+            if let conversationID = model.realtimeVisibleConversationID {
+                center.observeConversation(conversationID)
+            }
+        }
         .alert(
             "Kit Pay",
             isPresented: Binding(
@@ -72,6 +120,16 @@ struct RootView: View {
             String(model.accountSetupStep == nil),
             String(model.selectedTab),
             model.profile?.id ?? "none",
+        ].joined(separator: ":")
+    }
+
+    private var accountDiscoveryDrainTrigger: String {
+        [
+            model.profile?.id ?? "none",
+            String(model.isSignedIn),
+            String(model.accountSetupStep == nil),
+            String(model.sessionAssurance?.grantsFullAccess == true),
+            String(model.isOnline),
         ].joined(separator: ":")
     }
 
@@ -356,11 +414,18 @@ enum RootTabBarPolicy {
 enum RootTabBarLayoutPolicy {
     static let minimumInteractiveDimension: CGFloat = 44
 
-    /// The requested compact treatment applies to the visual menu at standard text sizes. Large
-    /// accessibility sizes keep their larger hit targets instead of being mechanically shrunk.
-    static let visualScale: CGFloat = 0.90
-    static let baseButtonHeight: CGFloat = 52
-    static let accessibilityButtonHeight: CGFloat = 65
+    /// Global trim applied to the menu's own metrics at standard text sizes. It is now neutral:
+    /// the sizes below are stated directly at the value they should render at, rather than being
+    /// a larger number shrunk by a factor, which had left the icons and captions below the size
+    /// iOS uses for its own tab bars. Large accessibility sizes keep their larger hit targets.
+    static let visualScale: CGFloat = 1.0
+    static let baseButtonHeight: CGFloat = 56
+    static let accessibilityButtonHeight: CGFloat = 72
+
+    /// Matched to the system tab bar rather than to the caption underneath it: a 21pt symbol next
+    /// to an 11pt label is the proportion iOS itself uses, and it stays legible at arm's length.
+    static let iconPointSize: CGFloat = 21
+    static let captionPointSize: CGFloat = 11
 
     /// Rest the menu lower by one fifth of its original button height. The device safe area still
     /// protects the home indicator, while the scroll clearance above keeps the final page action
@@ -382,8 +447,9 @@ enum RootTabBarLayoutPolicy {
     static let pageBottomPadding: CGFloat = 0
 
     /// Height assumed for the bar before its first measurement, so a page's very first frame is
-    /// already inset instead of momentarily scrolling under the capsule.
-    static let estimatedBarHeight: CGFloat = 78
+    /// already inset instead of momentarily scrolling under the capsule. Button height plus the
+    /// capsule's own inset on both edges plus `barTopPadding`.
+    static let estimatedBarHeight: CGFloat = 76
 
     /// Bottom scroll *content* margin a page inside a tab needs so its last row can be scrolled
     /// clear of the floating menu.
@@ -498,10 +564,13 @@ private struct FloatingTabBar: View {
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
-    @ScaledMetric(relativeTo: .body) private var tabIconSize: CGFloat = 18 * RootTabBarLayoutPolicy.visualScale
-    @ScaledMetric(relativeTo: .caption2) private var tabCaptionSize: CGFloat = 11 * RootTabBarLayoutPolicy.visualScale
+    @ScaledMetric(relativeTo: .body) private var tabIconSize: CGFloat = RootTabBarLayoutPolicy.iconPointSize
+    @ScaledMetric(relativeTo: .caption2) private var tabCaptionSize: CGFloat = RootTabBarLayoutPolicy.captionPointSize
     @Namespace private var selectionNamespace
     @Namespace private var glassNamespace
+    /// Width of the row of tab buttons, used to turn a finger position into a tab.
+    @State private var stripWidth: CGFloat = 0
+    @State private var isSliding = false
 
     var body: some View {
         Group {
@@ -515,15 +584,17 @@ private struct FloatingTabBar: View {
         .padding(.horizontal, horizontalSizeClass == .regular ? 28 : 12)
         .padding(.top, RootTabBarLayoutPolicy.barTopPadding)
         .offset(y: RootTabBarLayoutPolicy.verticalDrop)
+        // The bar lifts under a slide so the gesture reads as picking the bar up, not scrubbing it.
+        .scaleEffect(isSliding && !reduceMotion ? 1.02 : 1)
+        .animation(.snappy(duration: 0.18), value: isSliding)
+        .sensoryFeedback(.selection, trigger: selection)
     }
 
     @available(iOS 26.0, *)
     private var liquidGlassBar: some View {
         GlassEffectContainer(spacing: 9) {
-            HStack(spacing: 3 * RootTabBarLayoutPolicy.visualScale) {
-                ForEach(MainTab.allCases) { tab in
-                    liquidGlassButton(for: tab)
-                }
+            tabStrip { tab in
+                liquidGlassButton(for: tab)
             }
             .padding(5 * RootTabBarLayoutPolicy.visualScale)
             .glassEffect(
@@ -541,10 +612,8 @@ private struct FloatingTabBar: View {
     }
 
     private var materialBar: some View {
-        HStack(spacing: 3 * RootTabBarLayoutPolicy.visualScale) {
-            ForEach(MainTab.allCases) { tab in
-                materialButton(for: tab)
-            }
+        tabStrip { tab in
+            materialButton(for: tab)
         }
         .padding(5 * RootTabBarLayoutPolicy.visualScale)
         .background {
@@ -563,6 +632,52 @@ private struct FloatingTabBar: View {
         }
         .shadow(color: .black.opacity(colorScheme == .dark ? 0.30 : 0.14), radius: 22, y: 10)
         .shadow(color: KitColor.green.opacity(0.08), radius: 12, y: 3)
+    }
+
+    /// The row of tab buttons, plus the gesture that lets a finger slide from one to the next.
+    ///
+    /// The drag runs *alongside* the buttons rather than replacing them: a tap is still a tap on a
+    /// real `Button`, with its own press feedback and accessibility, and only movement past
+    /// `slideActivationDistance` is read as a slide. The buttons share the row equally, so the tab
+    /// under the finger is a division rather than a per-button frame lookup.
+    private func tabStrip<Content: View>(
+        @ViewBuilder button: @escaping (MainTab) -> Content
+    ) -> some View {
+        HStack(spacing: 3 * RootTabBarLayoutPolicy.visualScale) {
+            ForEach(MainTab.allCases) { tab in
+                button(tab)
+            }
+        }
+        .background {
+            GeometryReader { proxy in
+                Color.clear
+                    .onAppear { stripWidth = proxy.size.width }
+                    .onChange(of: proxy.size.width) { _, width in stripWidth = width }
+            }
+        }
+        .simultaneousGesture(
+            DragGesture(minimumDistance: Self.slideActivationDistance)
+                .onChanged { value in
+                    // A mostly-vertical drag over the bar is someone reaching past it, not sliding.
+                    guard abs(value.translation.width) >= abs(value.translation.height) else { return }
+                    isSliding = true
+                    guard let tab = tab(atX: value.location.x) else { return }
+                    select(tab, sliding: true)
+                }
+                .onEnded { _ in isSliding = false }
+        )
+    }
+
+    /// Far enough that a stationary tap is never mistaken for a slide, short enough that the slide
+    /// starts under the neighbouring icon rather than a whole tab later.
+    private static let slideActivationDistance: CGFloat = 10
+
+    private func tab(atX x: CGFloat) -> MainTab? {
+        let tabs = MainTab.allCases
+        guard stripWidth > 0, !tabs.isEmpty else { return nil }
+        let segment = stripWidth / CGFloat(tabs.count)
+        let index = min(tabs.count - 1, max(0, Int(x / segment)))
+        return tabs[index]
     }
 
     @available(iOS 26.0, *)
@@ -616,18 +731,14 @@ private struct FloatingTabBar: View {
             ) {
                 ZStack(alignment: .topTrailing) {
                     Image(systemName: selected ? tab.selectedIcon : tab.icon)
-                        .font(.system(size: tabIconSize, weight: selected ? .bold : .semibold))
-                        .frame(
-                            minWidth: 27 * RootTabBarLayoutPolicy.visualScale,
-                            minHeight: 23 * RootTabBarLayoutPolicy.visualScale
-                        )
+                        .font(.system(size: tabIconSize, weight: selected ? .semibold : .regular))
+                        .symbolRenderingMode(.hierarchical)
+                        .frame(minWidth: 32, minHeight: 26)
+                        .contentTransition(.symbolEffect(.replace))
 
                     if let badge {
                         BadgeView(badge: badge)
-                            .offset(
-                                x: 12 * RootTabBarLayoutPolicy.visualScale,
-                                y: -8 * RootTabBarLayoutPolicy.visualScale
-                            )
+                            .offset(x: 14, y: -7)
                     }
                 }
                 Text(tab.title)
@@ -716,10 +827,16 @@ private struct FloatingTabBar: View {
             .joined(separator: ", ")
     }
 
-    private func select(_ tab: MainTab) {
+    /// A slide crosses several tabs in one gesture, so it gets a shorter, bounce-free spring: the
+    /// tap animation's settle would still be running when the finger reaches the next icon.
+    private func select(_ tab: MainTab, sliding: Bool = false) {
         guard selection != tab.rawValue else { return }
         if reduceMotion {
             selection = tab.rawValue
+        } else if sliding {
+            withAnimation(.snappy(duration: 0.20)) {
+                selection = tab.rawValue
+            }
         } else {
             withAnimation(.snappy(duration: 0.34, extraBounce: 0.05)) {
                 selection = tab.rawValue

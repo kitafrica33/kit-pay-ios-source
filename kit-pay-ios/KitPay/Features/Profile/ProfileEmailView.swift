@@ -279,7 +279,11 @@ struct ProfileEmailView: View {
         .buttonStyle(.borderedProminent)
         .buttonBorderShape(.roundedRectangle(radius: 18))
         .tint(KitColor.green)
-        .disabled(!canSubmit || model.isManagingProfileEmail)
+        .disabled(
+            !model.appReviewDemoMutationsAllowed
+                || !canSubmit
+                || model.isManagingProfileEmail
+        )
     }
 
     private var canSubmit: Bool {
@@ -309,7 +313,9 @@ struct ProfileEmailView: View {
 
     @MainActor
     private func requestCode(resending: Bool = false) async {
-        guard !model.isManagingProfileEmail else { return }
+        guard model.appReviewDemoMutationsAllowed,
+              !model.isManagingProfileEmail
+        else { return }
         let submittedEmail = ProfileEmailChallengePolicy.normalizedEmail(
             resending ? (challenge?.requestedEmail ?? email) : email
         )

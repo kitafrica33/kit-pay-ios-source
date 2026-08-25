@@ -903,6 +903,72 @@ final class PendingCallEventCache: @unchecked Sendable {
     }
 }
 
+/// Retires call records that still claim to be live but that this device can no longer act on.
+///
+/// `queued`, `ringing`, and `active` are process truths as much as server truths: the outgoing
+/// attempt gate, CallKit, and the media coordinator all hold the live call in memory, and every
+/// path that ends one runs inside this process. A crash — or a termination that never reached the
+/// server — therefore leaves the encrypted projection asserting a call is in progress with nothing
+/// left to end it. Without this reaper that residue is permanent, and because starting a call
+/// refuses while any record looks live, the user is told to "finish or cancel the current call
+/// attempt" with no call on screen to finish or cancel.
+///
+/// Reaping to `failed` is the same disposition sign-out already applies to interrupted calls, and
+/// it yields to the server: `completed`, `missed`, and `declined` all beat a local `failed` in
+/// `CallLifecyclePolicy.mergeHistory`, so the next history refresh restores the real outcome.
+enum AbandonedCallRecordPolicy {
+    /// Comfortably past the backend ring window, so a slow pickup is never mistaken for a crash.
+    static let ringGrace: TimeInterval = 3 * 60
+
+    /// `hostedCallIDs` are the calls this process is currently hosting in any form — a presented
+    /// media session, a provisional outgoing attempt, or a CallKit waiting record. Anything in
+    /// there is live by definition and is never reaped.
+    static func isAbandoned(
+        _ call: CallRecord,
+        hostedCallIDs: Set<String>,
+        now: Date
+    ) -> Bool {
+        guard !hostedCallIDs.contains(call.id.lowercased()) else { return false }
+        switch call.state {
+        case .queued, .ringing:
+            // Still inside the ring window: a live call whose media has simply not landed yet.
+            return now.timeIntervalSince(call.startedAt) > ringGrace
+        case .active:
+            // An answered call that no media session owns cannot be ended from this device, so it
+            // must not be allowed to block one either.
+            return true
+        case .completed, .missed, .declined, .failed:
+            return false
+        }
+    }
+
+    static func reaping(
+        _ calls: [CallRecord],
+        hostedCallIDs: Set<String>,
+        now: Date = Date()
+    ) -> [CallRecord] {
+        calls.map { call in
+            guard isAbandoned(call, hostedCallIDs: hostedCallIDs, now: now) else { return call }
+            var reaped = call
+            reaped.state = .failed
+            reaped.endedAt = call.endedAt ?? now
+            return reaped
+        }
+    }
+
+    /// Whether any record genuinely stands between the user and a new call.
+    static func blocksNewCall(
+        _ calls: [CallRecord],
+        hostedCallIDs: Set<String>,
+        now: Date = Date()
+    ) -> Bool {
+        calls.contains { call in
+            [.ringing, .active].contains(call.state)
+                && !isAbandoned(call, hostedCallIDs: hostedCallIDs, now: now)
+        }
+    }
+}
+
 enum CallLifecyclePolicy {
     private static let serverTimestampFormat = Date.ISO8601FormatStyle(
         includingFractionalSeconds: false
@@ -928,7 +994,7 @@ enum CallLifecyclePolicy {
     }
 
     static func featureEnabled(_ capabilities: CapabilitiesDTO?) -> Bool {
-        capabilities?.features?["calls"] == true
+        capabilities?.supportsFeature("calls") == true
     }
 
     static func mayCreateCall(
@@ -938,7 +1004,7 @@ enum CallLifecyclePolicy {
     ) -> Bool {
         guard signedIn else { return false }
         if online { return featureEnabled(capabilities) }
-        return capabilities?.features?["calls"] != false
+        return capabilities?.featureIsWithdrawn("calls") != true
     }
 
     static func mappedState(_ rawValue: String) -> CallState {
@@ -1323,8 +1389,11 @@ enum ConversationTimelineItem: Identifiable, Equatable {
 
     var occurredAt: Date {
         switch self {
-        case .message(let message): message.createdAt
-        case .payment(let message, _): message.createdAt
+        // `timelineDate`, not `createdAt`: a Send Later message belongs at the minute it was
+        // promised for, which is also the minute it went out — putting it back at composition
+        // time would file it under yesterday's date separator.
+        case .message(let message): message.timelineDate
+        case .payment(let message, _): message.timelineDate
         case .call(let call): call.startedAt
         case .dateSeparator(let separator): separator.day
         }
@@ -1495,6 +1564,7 @@ enum ConversationTimelinePolicy {
         currentUserID: String?
     ) -> String? {
         guard canonicalUUID(conversation.id) != nil,
+              !conversation.isGroup,
               let currentUserID = canonicalUUID(currentUserID),
               conversation.participantUserIds.count == 2,
               var participants = canonicalParticipants(conversation.participantUserIds),

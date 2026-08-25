@@ -642,7 +642,8 @@ enum ConversationContactPresentationPolicy {
                   participantIDs.insert(participantID).inserted
             else { return fallback(name: fallbackName) }
         }
-        guard participantIDs.count == 2,
+        guard !conversation.isGroup,
+              participantIDs.count == 2,
               participantIDs.remove(currentUserID) != nil,
               let recipientUserID = participantIDs.first
         else { return fallback(name: fallbackName) }

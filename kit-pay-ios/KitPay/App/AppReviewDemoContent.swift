@@ -38,6 +38,98 @@ enum AppReviewDemoAccessPolicy {
     }
 }
 
+enum AppReviewDemoMutationError: LocalizedError, Equatable {
+    case readOnly
+
+    var errorDescription: String? {
+        "This App Review account is read-only."
+    }
+}
+
+/// One fail-closed policy shared by UI guards and the authenticated HTTP boundary. The reviewer
+/// may inspect live GET projections, sign out, and submit an abuse report for the one provisioned
+/// Amina conversation. Every other authenticated write stays blocked even if a stale sheet,
+/// notification action, or background task tries to bypass the visible controls.
+enum AppReviewDemoMutationPolicy {
+    static let readOnlyMessage = "This App Review account is read-only."
+
+    static func allowsAccountMutation(
+        isSignedIn: Bool,
+        hasAuthenticatedCapabilities: Bool,
+        isDemoActive: Bool
+    ) -> Bool {
+        isSignedIn && hasAuthenticatedCapabilities && !isDemoActive
+    }
+
+    static func conversationIsReadOnly(
+        _ conversationID: String,
+        isDemoActive: Bool
+    ) -> Bool {
+        isDemoActive || AppReviewDemoContent.isSyntheticConversationID(conversationID)
+    }
+
+    static func callIsReadOnly(_ callID: String, isDemoActive: Bool) -> Bool {
+        isDemoActive || AppReviewDemoContent.isSyntheticCallID(callID)
+    }
+
+    static func peerIsReadOnly(_ peerID: String, isDemoActive: Bool) -> Bool {
+        isDemoActive || AppReviewDemoContent.isSyntheticPeerID(peerID)
+    }
+
+    static func allowsAuthenticatedRequest(
+        method rawMethod: String,
+        path rawPath: String,
+        isDemoSession: Bool
+    ) -> Bool {
+        guard isDemoSession else { return true }
+        let method = rawMethod.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        if ["GET", "HEAD", "OPTIONS"].contains(method) { return true }
+
+        let path = rawPath
+            .split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false)[0]
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            .lowercased()
+        return (method == "POST" && path == AbuseReportAPIEndpoint.path)
+            || (method == "POST" && path == "auth/logout")
+            || (method == "POST" && path == "auth/refresh")
+            || (method == "DELETE" && path == "devices/current/push-token")
+    }
+
+    static func allowsAbuseReport(
+        conversationID: String,
+        reportedUserID: String,
+        isDemoSession: Bool
+    ) -> Bool {
+        !isDemoSession || AppReviewDemoContent.isProvisionedReportingTarget(
+            conversationID: conversationID,
+            peerID: reportedUserID
+        )
+    }
+}
+
+/// Models the capability transition separately so a transient failure cannot silently turn a
+/// protected or not-yet-classified authenticated session writable. A successful non-demo result
+/// is the sole transition that permits the transport fence to be removed, and callers do that
+/// only after replacing any synthetic projection.
+struct AppReviewDemoCapabilityFenceDecision: Equatable {
+    let projectedOwnerID: String?
+    let keepsTransportFenceAfterProjection: Bool
+
+    static func resolved(ownerID: String?) -> Self {
+        Self(
+            projectedOwnerID: ownerID,
+            keepsTransportFenceAfterProjection: ownerID != nil
+        )
+    }
+
+    static func failed(previousOwnerID: String?) -> Self {
+        Self(
+            projectedOwnerID: previousOwnerID,
+            keepsTransportFenceAfterProjection: true
+        )
+    }
+}
+
 /// In-memory, non-financial sample content for the authenticated App Review account. It never
 /// enters SecureLocalStore, never changes the profile/wallet/transaction projection, and uses a
 /// reserved set of synthetic identifiers so actions can remain read-only.

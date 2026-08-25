@@ -58,6 +58,7 @@ struct SecureMessagingHistoryMessageIdentity: Equatable, Sendable {
     var retainedMetadata: SecureMessagingRetainedMessageMetadata {
         SecureMessagingRetainedMessageMetadata(
             clientMessageID: clientMessageID,
+            senderUserID: senderUserID,
             senderDeviceID: senderDeviceID,
             senderEnrollmentEpoch: senderEnrollmentEpoch,
             senderSignalDeviceID: senderSignalDeviceID,
@@ -81,6 +82,13 @@ struct SecureMessagingHistoryInboundEnvelope {
 struct SecureMessagingAuthenticatedHistory {
     let original: SecureMessagingHistoryMessageIdentity
     let text: String
+}
+
+/// Proof that the complete outer sender tuple was bound to the hash-validated historical roster
+/// for the original message revision. Its initializer is file-private so callers cannot opt into
+/// legacy sender compatibility without first completing that validation.
+struct SecureMessagingValidatedHistoricalSender: Equatable, Sendable {
+    fileprivate let identity: SecureMessagingHistoryMessageIdentity
 }
 
 /// Cross-platform authenticated wrapper used by Android and iOS history donors. The server can
@@ -162,11 +170,12 @@ enum SecureMessagingHistoryBackfillCodec {
               !retained.body.isEmpty,
               !retained.body.unicodeScalars.contains(where: { $0.value == 0 })
         else { throw SecureMessagingCryptoError.invalidContent }
-        let authenticatedKind: SecureMessagingMessageKind =
-            KitMediaMessageDescriptor.attachments(for: retained.body).isEmpty
-                ? .encrypted
-                : .encryptedAttachment
-        guard authenticatedKind == candidate.kind else {
+        let authenticatedAttachments = KitMediaMessageDescriptor.attachments(for: retained.body)
+        guard SecureMessagingContentBindingPolicy.kind(
+            for: retained.body,
+            replyToMessageID: candidate.replyToMessageID,
+            attachments: authenticatedAttachments
+        ) == candidate.kind else {
             throw SecureMessagingCryptoError.invalidContent
         }
 
@@ -268,17 +277,21 @@ enum SecureMessagingHistoryBackfillCodec {
               targetDeviceID == incoming.targetDeviceID,
               targetEnrollmentEpoch == incoming.targetEnrollmentEpoch,
               transferRosterRevision == incoming.transferRosterRevision,
-              decoded == incoming.original
+              decoded == incoming.original,
+              let rawAttachments = incoming.rawAttachments,
+              rawAttachments.count <= SecureMessagingWire.maximumAttachments,
+              rawAttachments.allSatisfy({ $0 != nil })
         else { throw SecureMessagingCryptoError.invalidContent }
         let authenticatedAttachments = KitMediaMessageDescriptor.attachments(for: text)
-        let authenticatedKind: SecureMessagingMessageKind = authenticatedAttachments.isEmpty
-            ? .encrypted
-            : .encryptedAttachment
-        guard authenticatedKind == decoded.kind,
+        guard SecureMessagingContentBindingPolicy.kind(
+                  for: text,
+                  replyToMessageID: decoded.replyToMessageID,
+                  attachments: authenticatedAttachments
+              ) == decoded.kind,
               (!text.hasPrefix(KitMediaMessageDescriptor.prefix)
                   || !authenticatedAttachments.isEmpty),
               KitMediaMessageDescriptor.validates(
-                  incoming.rawAttachments,
+                  rawAttachments,
                   against: authenticatedAttachments
               )
         else { throw SecureMessagingCryptoError.invalidContent }
@@ -294,7 +307,8 @@ enum SecureMessagingHistoryBackfillCodec {
               identity.senderEnrollmentEpoch > 0,
               (1...127).contains(identity.senderSignalDeviceID),
               SecureMessagingValidation.isRosterRevision(identity.rosterRevision),
-              identity.replyToMessageID.map(SecureMessagingValidation.isCanonicalUUID) ?? true
+              identity.replyToMessageID.map(SecureMessagingValidation.isCanonicalUUID) ?? true,
+              identity.kind != .encryptedReaction || identity.replyToMessageID != nil
         else { throw SecureMessagingCryptoError.invalidContent }
     }
 
@@ -522,13 +536,20 @@ enum SecureMessagingMapper {
         expectedConversationID: String,
         currentDeviceID: String,
         currentUserID: String,
-        expectedMemberUserIDs: Set<String>
+        expectedMemberUserIDs: Set<String>,
+        allowHistoricalGroupMembershipChurn: Bool = false,
+        allowMissingCurrentDeviceInHistoricalRoster: Bool = false
     ) throws -> SecureMessagingRosterSnapshot {
+        let minimumMemberCount = use == .historical && allowHistoricalGroupMembershipChurn
+            ? 1
+            : 2
         guard dto.conversationId == expectedConversationID,
               SecureMessagingValidation.isCanonicalUUID(expectedConversationID),
               SecureMessagingValidation.isCanonicalUUID(currentDeviceID),
               SecureMessagingValidation.isCanonicalUUID(currentUserID),
-              expectedMemberUserIDs.count == 2,
+              !allowMissingCurrentDeviceInHistoricalRoster || use == .historical,
+              (minimumMemberCount ... SecureMessagingWire.maximumGroupMembers)
+                .contains(expectedMemberUserIDs.count),
               expectedMemberUserIDs.contains(currentUserID),
               expectedMemberUserIDs.allSatisfy(SecureMessagingValidation.isCanonicalUUID),
               let revision = dto.rosterRevision,
@@ -538,7 +559,7 @@ enum SecureMessagingMapper {
               SecureMessagingValidation.isSHA256(rosterHash),
               revision == "v1:sha256:\(rosterHash)",
               let rawDevices = dto.devices,
-              rawDevices.count >= 2,
+              rawDevices.count >= minimumMemberCount,
               rawDevices.count <= 100
         else { throw SecureMessagingCryptoError.staleRoster }
         var canonicalDeviceRows: [CanonicalRosterDevice] = []
@@ -622,13 +643,27 @@ enum SecureMessagingMapper {
                 identityKeySHA256: identityKeySHA256
             ).validated()
         }
+        let rosterMemberUserIDs = Set(devices.map(\.address.userID))
+        let currentDeviceRows = devices.filter {
+            $0.address.serverDeviceID == currentDeviceID
+        }
+        let currentDeviceIsValid = currentDeviceRows.count == 1
+            && currentDeviceRows[0].address.userID == currentUserID
+        let missingCurrentDeviceIsValid = use == .historical
+            && allowMissingCurrentDeviceInHistoricalRoster
+            && currentDeviceRows.isEmpty
         guard Set(devices.map(\.address.serverDeviceID)).count == devices.count,
               Set(devices.map { "\($0.address.userID):\($0.address.signalDeviceID)" }).count
                 == devices.count,
-              Set(devices.map(\.address.userID)) == expectedMemberUserIDs,
-              devices.filter({ $0.address.serverDeviceID == currentDeviceID }).count == 1,
-              devices.first(where: { $0.address.serverDeviceID == currentDeviceID })?.address.userID
-                == currentUserID,
+              rosterMembershipIsValid(
+                  rosterMemberUserIDs,
+                  use: use,
+                  currentUserID: currentUserID,
+                  expectedCurrentMemberUserIDs: expectedMemberUserIDs,
+                  allowHistoricalGroupMembershipChurn:
+                    allowHistoricalGroupMembershipChurn
+              ),
+              currentDeviceIsValid || missingCurrentDeviceIsValid,
               frozenDevices.count == devices.count,
               Set(frozenDevices.keys) == Set(devices.map(\.address.serverDeviceID)),
               devices == devices.sorted(by: canonicalRosterOrder),
@@ -646,6 +681,42 @@ enum SecureMessagingMapper {
             devices: devices,
             frozenDevices: frozenDevices
         )
+    }
+
+    /// Current rosters are authorization inputs for new fanout and must match the server's live
+    /// conversation projection exactly. A historical group roster is instead an authenticated
+    /// snapshot from an earlier revision, so additions and removals since that revision are
+    /// expected; it still has to be a bounded, canonical roster containing the local account.
+    static func rosterMembershipIsValid(
+        _ rosterMemberUserIDs: Set<String>,
+        use: SecureMessagingRosterUse,
+        currentUserID: String,
+        expectedCurrentMemberUserIDs: Set<String>,
+        allowHistoricalGroupMembershipChurn: Bool
+    ) -> Bool {
+        let minimumMemberCount = use == .historical && allowHistoricalGroupMembershipChurn
+            ? 1
+            : 2
+        guard SecureMessagingValidation.isCanonicalUUID(currentUserID),
+              (minimumMemberCount ... SecureMessagingWire.maximumGroupMembers)
+                .contains(rosterMemberUserIDs.count),
+              rosterMemberUserIDs.contains(currentUserID),
+              rosterMemberUserIDs.allSatisfy(SecureMessagingValidation.isCanonicalUUID),
+              (minimumMemberCount ... SecureMessagingWire.maximumGroupMembers)
+                .contains(expectedCurrentMemberUserIDs.count),
+              expectedCurrentMemberUserIDs.contains(currentUserID),
+              expectedCurrentMemberUserIDs.allSatisfy(
+                  SecureMessagingValidation.isCanonicalUUID
+              )
+        else { return false }
+
+        switch use {
+        case .current:
+            return rosterMemberUserIDs == expectedCurrentMemberUserIDs
+        case .historical:
+            return allowHistoricalGroupMembershipChurn
+                || rosterMemberUserIDs == expectedCurrentMemberUserIDs
+        }
     }
 
     static func remoteBundles(
@@ -754,12 +825,18 @@ enum SecureMessagingMapper {
 
     static func sendRequest(
         from fanout: SecureMessagingCommittedFanout,
+        plaintext: String,
         attachments: [EncryptedAttachmentRequest] = []
     ) throws -> SendEncryptedMessageRequest {
-        try SendEncryptedMessageRequest(
+        guard let kind = SecureMessagingContentBindingPolicy.kind(
+            for: plaintext,
+            replyToMessageID: fanout.replyToMessageID,
+            attachments: attachments
+        ) else { throw SecureMessagingCryptoError.invalidContent }
+        return try SendEncryptedMessageRequest(
             clientMessageId: fanout.clientMessageID,
             rosterRevision: fanout.rosterRevision,
-            kind: attachments.isEmpty ? .encrypted : .encryptedAttachment,
+            kind: kind,
             replyToMessageId: fanout.replyToMessageID,
             envelopes: try fanout.envelopes.map { envelope in
                 guard let type = SecureMessagingEnvelopeType(rawValue: envelope.envelopeType) else {
@@ -809,10 +886,8 @@ enum SecureMessagingMapper {
               let rosterRevision = dto.rosterRevision,
               conversationID == roster.conversationID,
               rosterRevision == roster.rosterRevision,
-              [
-                  SecureMessagingMessageKind.encrypted.rawValue,
-                  SecureMessagingMessageKind.encryptedAttachment.rawValue,
-              ].contains(dto.kind),
+              let rawKind = dto.kind,
+              let kind = SecureMessagingMessageKind(rawValue: rawKind),
               let senderDeviceID = dto.senderDeviceId,
               senderDeviceID != localRecipient.serverDeviceID,
               let senderEnrollmentEpoch = dto.senderEnrollmentEpoch,
@@ -844,6 +919,15 @@ enum SecureMessagingMapper {
               SecureMessagingValidation.isRosterRevision(rosterRevision),
               SecureMessagingValidation.isSHA256(identityKeySHA256),
               dto.replyToMessageId.map(SecureMessagingValidation.isCanonicalUUID) ?? true,
+              dto.reactions?.isEmpty == true,
+              let rawAttachments = dto.attachments,
+              rawAttachments.count <= SecureMessagingWire.maximumAttachments,
+              rawAttachments.allSatisfy({ $0 != nil }),
+              SecureMessagingContentBindingPolicy.validatesOuterEnvelope(
+                  kind: kind,
+                  replyToMessageID: dto.replyToMessageId,
+                  attachmentCount: rawAttachments.count
+              ),
               envelope.ciphertextSha256?.lowercased()
                 == SecureMessagingValidation.sha256Hex(ciphertext)
         else { throw SecureMessagingCryptoError.invalidContent }
@@ -899,6 +983,22 @@ enum SecureMessagingMapper {
         localEnrollment: SecureMessagingEnrollmentBinding,
         transferRoster: SecureMessagingRosterSnapshot
     ) throws -> SecureMessagingHistoryInboundEnvelope {
+        try historyInboundEnvelope(
+            from: dto,
+            localRecipient: localRecipient,
+            localEnrollment: localEnrollment,
+            transferRoster: transferRoster,
+            originalMessageRoster: transferRoster
+        )
+    }
+
+    static func historyInboundEnvelope(
+        from dto: EncryptedMessageDTO,
+        localRecipient: SecureMessagingAddress,
+        localEnrollment: SecureMessagingEnrollmentBinding,
+        transferRoster: SecureMessagingRosterSnapshot,
+        originalMessageRoster: SecureMessagingRosterSnapshot
+    ) throws -> SecureMessagingHistoryInboundEnvelope {
         let devicesByID = try validatedRosterDevices(in: transferRoster)
         try validate(localEnrollment: localEnrollment)
         let enrollmentAddress = SecureMessagingAddress(
@@ -940,6 +1040,11 @@ enum SecureMessagingMapper {
               let rawAttachments = dto.attachments,
               rawAttachments.count <= SecureMessagingWire.maximumAttachments,
               rawAttachments.allSatisfy({ $0 != nil }),
+              SecureMessagingContentBindingPolicy.validatesOuterEnvelope(
+                  kind: kind,
+                  replyToMessageID: dto.replyToMessageId,
+                  attachmentCount: rawAttachments.count
+              ),
               let envelope = dto.envelope,
               envelope.recipientDeviceId == localRecipient.serverDeviceID,
               envelope.recipientEnrollmentEpoch == localEnrollment.enrollmentEpoch,
@@ -975,8 +1080,7 @@ enum SecureMessagingMapper {
                 == SecureMessagingValidation.sha256Hex(ciphertext),
               SecureMessagingValidation.isCanonicalUUID(transferClientMessageID),
               SecureMessagingValidation.isRosterRevision(transferRosterRevision),
-              SecureMessagingValidation.isRosterRevision(originalRosterRevision),
-              Set(transferRoster.devices.map(\.address.userID)).contains(senderUserID)
+              SecureMessagingValidation.isRosterRevision(originalRosterRevision)
         else { throw SecureMessagingCryptoError.invalidContent }
 
         let original = SecureMessagingHistoryMessageIdentity(
@@ -993,6 +1097,11 @@ enum SecureMessagingMapper {
             sentAt: sentAt
         )
         try SecureMessagingHistoryBackfillCodec.validate(original)
+        _ = try validatedHistoricalSender(
+            from: dto,
+            identity: original,
+            roster: originalMessageRoster
+        )
         let donor = try SecureMessagingRosterDevice(
             address: SecureMessagingAddress(
                 userID: localEnrollment.userID,
@@ -1053,7 +1162,12 @@ enum SecureMessagingMapper {
               dto.reactions?.isEmpty == true,
               let rawAttachments = dto.attachments,
               rawAttachments.count <= SecureMessagingWire.maximumAttachments,
-              rawAttachments.allSatisfy({ $0 != nil })
+              rawAttachments.allSatisfy({ $0 != nil }),
+              SecureMessagingContentBindingPolicy.validatesOuterEnvelope(
+                  kind: kind,
+                  replyToMessageID: dto.replyToMessageId,
+                  attachmentCount: rawAttachments.count
+              )
         else { throw SecureMessagingCryptoError.invalidContent }
         let identity = SecureMessagingHistoryMessageIdentity(
             messageID: messageID,
@@ -1070,6 +1184,61 @@ enum SecureMessagingMapper {
         )
         try SecureMessagingHistoryBackfillCodec.validate(identity)
         return identity
+    }
+
+    /// Binds every server-visible sender field to the original historical roster. The roster is
+    /// hash-validated before this snapshot is created; the later decrypted descriptor must still
+    /// agree byte-for-byte with `identity` before any plaintext is materialized.
+    static func validatedHistoricalSender(
+        from dto: EncryptedMessageDTO,
+        identity: SecureMessagingHistoryMessageIdentity,
+        roster: SecureMessagingRosterSnapshot
+    ) throws -> SecureMessagingValidatedHistoricalSender {
+        let devicesByID = try validatedRosterDevices(in: roster)
+        guard roster.use == .historical,
+              roster.conversationID == identity.conversationID,
+              roster.rosterRevision == identity.rosterRevision,
+              dto.conversationId == identity.conversationID,
+              dto.rosterRevision == identity.rosterRevision,
+              dto.sender?.id == identity.senderUserID,
+              dto.senderDeviceId == identity.senderDeviceID,
+              (dto.senderEnrollmentEpoch ?? 1) == identity.senderEnrollmentEpoch,
+              dto.senderSignalDeviceId == Int(identity.senderSignalDeviceID),
+              let registrationID = dto.senderRegistrationId,
+              let canonicalRegistrationID = UInt32(exactly: registrationID),
+              dto.senderProtocolVersion == SecureMessagingWire.protocolVersion,
+              let bundleVersion = dto.senderBundleVersion,
+              bundleVersion > 0,
+              let identityKeySHA256 = dto.senderIdentityKeySha256,
+              SecureMessagingValidation.isSHA256(identityKeySHA256),
+              let rosterSender = devicesByID[identity.senderDeviceID],
+              rosterSender.address.userID == identity.senderUserID,
+              rosterSender.address.signalDeviceID == identity.senderSignalDeviceID,
+              rosterSender.registrationID == canonicalRegistrationID,
+              rosterSender.identityKeySHA256 == identityKeySHA256,
+              roster.frozenDevice(identity.senderDeviceID)?.bundleVersion == bundleVersion
+        else { throw SecureMessagingCryptoError.identityChanged }
+        return SecureMessagingValidatedHistoricalSender(identity: identity)
+    }
+
+    /// Older persisted metadata has no `senderUserID`. That omission is accepted only when the
+    /// caller supplies a proof produced by `validatedHistoricalSender`; every legacy field still
+    /// has to match and an explicitly stored sender can never disagree.
+    static func retainedMetadataMatches(
+        _ metadata: SecureMessagingRetainedMessageMetadata,
+        identity: SecureMessagingHistoryMessageIdentity,
+        validatedSender: SecureMessagingValidatedHistoricalSender
+    ) -> Bool {
+        validatedSender.identity == identity
+            && metadata.clientMessageID == identity.clientMessageID
+            && (metadata.senderUserID == nil
+                || metadata.senderUserID == identity.senderUserID)
+            && metadata.senderDeviceID == identity.senderDeviceID
+            && metadata.senderEnrollmentEpoch == identity.senderEnrollmentEpoch
+            && metadata.senderSignalDeviceID == identity.senderSignalDeviceID
+            && metadata.rosterRevision == identity.rosterRevision
+            && metadata.kind == identity.kind
+            && metadata.replyToMessageID == identity.replyToMessageID
     }
 
     fileprivate static func validatedRosterDevices(

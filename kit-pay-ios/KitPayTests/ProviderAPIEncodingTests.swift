@@ -321,6 +321,20 @@ final class ProviderAPIEncodingTests: XCTestCase {
         XCTAssertFalse(ProviderMoney.isWithinProductRange("10000.01", product: product))
     }
 
+    func testProviderAmountRangeCopyGroupsDigitsAndTrimsInsignificantZeros() {
+        let product = providerProduct(
+            providerCode: "rukapay",
+            serviceType: "bill",
+            minimumAmount: "1768.80",
+            maximumAmount: "1856.84"
+        )
+
+        XCTAssertEqual(
+            ProviderAmountRangeCopy.text(for: product),
+            "Available from UGX 1,768.8 to 1,856.84"
+        )
+    }
+
     func testProviderCapabilitiesFailClosedAndRequireWallets() {
         let available = CapabilitiesDTO(
             apiVersion: "1",
@@ -358,7 +372,9 @@ final class ProviderAPIEncodingTests: XCTestCase {
         serviceType: String,
         id: String = "product-1",
         code: String = "PRODUCT",
-        name: String = "Provider product"
+        name: String = "Provider product",
+        minimumAmount: String? = "500.00",
+        maximumAmount: String? = "5000000.00"
     ) -> ProviderProductDTO {
         ProviderProductDTO(
             id: id,
@@ -379,8 +395,8 @@ final class ProviderAPIEncodingTests: XCTestCase {
                 displayOrder: nil
             ),
             currency: CurrencyDTO(code: "UGX", scale: "2"),
-            minimumAmount: "500.00",
-            maximumAmount: "5000000.00"
+            minimumAmount: minimumAmount,
+            maximumAmount: maximumAmount
         )
     }
 

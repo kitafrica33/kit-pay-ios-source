@@ -970,10 +970,98 @@ final class AccountSetupPolicyTests: XCTestCase {
         XCTAssertNil(profileIdentityValidationError(name: "😀😀", tag: "emoji_name"))
         XCTAssertEqual(
             profileIdentityValidationError(name: "Amina", tag: "deleted_user"),
-            "This Kit Pay tag is reserved."
+            "This username is reserved."
         )
         XCTAssertFalse(isValidPaymentPin("１２３４"))
         XCTAssertTrue(isValidPaymentPin("2580"))
+    }
+
+    func testVerifiedLegalNameMakesTheDisplayNameOptional() {
+        // Nothing typed: the verified identity already names the account.
+        XCTAssertNil(
+            profileIdentityValidationError(
+                name: "",
+                tag: "amina_01",
+                verifiedLegalName: "Amina Yusuf"
+            )
+        )
+        // The server's placeholder counts as "not chosen", not as a bad entry.
+        XCTAssertNil(
+            profileIdentityValidationError(
+                name: "Kit Pay User",
+                tag: "amina_01",
+                verifiedLegalName: "Amina Yusuf"
+            )
+        )
+        // Anything actually typed is still validated.
+        XCTAssertEqual(
+            profileIdentityValidationError(
+                name: "A",
+                tag: "amina_01",
+                verifiedLegalName: "Amina Yusuf"
+            ),
+            "Enter a display name (2–120 characters)."
+        )
+        // Without a verified legal name the display name stays mandatory.
+        XCTAssertEqual(
+            profileIdentityValidationError(name: "", tag: "amina_01"),
+            "Enter a display name (2–120 characters)."
+        )
+    }
+
+    func testOptionalUsernameAcceptsAnUnsetOrProvisionalTag() {
+        XCTAssertNil(
+            profileIdentityValidationError(
+                name: "Amina Yusuf",
+                tag: nil,
+                usernameRequired: false
+            )
+        )
+        XCTAssertNil(
+            profileIdentityValidationError(
+                name: "Amina Yusuf",
+                tag: "kit_ab12cd34ef",
+                usernameRequired: false
+            )
+        )
+        // A username the user did choose must still be usable.
+        XCTAssertEqual(
+            profileIdentityValidationError(
+                name: "Amina Yusuf",
+                tag: "no",
+                usernameRequired: false
+            ),
+            "Your username must be 3 to 32 characters."
+        )
+        // Default behaviour is unchanged for servers that predate the split.
+        XCTAssertEqual(
+            profileIdentityValidationError(name: "Amina Yusuf", tag: "kit_ab12cd34ef"),
+            "Choose your own username."
+        )
+    }
+
+    func testRequiresProfileSetupHonoursTheVerifiedLegalNameAndOptionalUsername() {
+        var verified = UserProfile(id: "u-1", name: "Kit Pay User", tag: "kit_ab12cd34ef")
+        verified.profileSetupRequired = false
+        verified.legalName = "Amina Yusuf"
+        verified.legalNameVerifiedAt = "2026-08-25T10:00:00Z"
+        verified.usernameRequired = false
+        XCTAssertFalse(AccountSetupPolicy.requiresProfileSetup(verified))
+
+        // A server that still requires a username keeps the old gate.
+        var requiresUsername = verified
+        requiresUsername.usernameRequired = true
+        XCTAssertTrue(AccountSetupPolicy.requiresProfileSetup(requiresUsername))
+
+        // A server that predates the split omits the flag entirely; fail closed to the old rule.
+        var legacy = verified
+        legacy.usernameRequired = nil
+        XCTAssertTrue(AccountSetupPolicy.requiresProfileSetup(legacy))
+
+        // The server's own instruction still wins outright.
+        var serverDemandsSetup = verified
+        serverDemandsSetup.profileSetupRequired = true
+        XCTAssertTrue(AccountSetupPolicy.requiresProfileSetup(serverDemandsSetup))
     }
 
     func testKYCVerificationURLPolicyAcceptsOnlyTheDiditHTTPSBoundary() {
@@ -1002,6 +1090,99 @@ final class AccountSetupPolicyTests: XCTestCase {
             KYCVerificationURLPolicy.validatedURL(
                 from: "https://user:password@verify.didit.me/session/valid-token"
             )
+        )
+    }
+
+    func testKYCPollingStopsOnceTheDecisionIsIn() {
+        for settled in ["verified", "approved", "rejected", "declined", "failed", "VERIFIED"] {
+            XCTAssertTrue(KYCStatusPollingPolicy.isSettled(settled), settled)
+            XCTAssertFalse(KYCStatusPollingPolicy.isAwaitingDecision(settled), settled)
+            // Not even a customer who has just come back from the hosted check is polled once
+            // the answer is already on the screen.
+            XCTAssertFalse(
+                KYCStatusPollingPolicy.shouldPoll(
+                    status: settled,
+                    returnedFromVerification: true,
+                    isOnline: true
+                ),
+                settled
+            )
+        }
+    }
+
+    func testKYCPollingRunsWhileACaseIsUnderReview() {
+        // The same status arrives spelled several ways depending on which service answered.
+        for pending in ["pending", "in_review", "In Review", " REVIEWING ", "submitted", "processing"] {
+            XCTAssertTrue(KYCStatusPollingPolicy.isAwaitingDecision(pending), pending)
+            XCTAssertTrue(
+                KYCStatusPollingPolicy.shouldPoll(
+                    status: pending,
+                    returnedFromVerification: false,
+                    isOnline: true
+                ),
+                pending
+            )
+        }
+    }
+
+    func testKYCPollingWatchesForACaseAfterTheHostedCheckCloses() {
+        // Coming back from Didit, the status has usually not moved off not_started yet: the case
+        // is created server-side moments later. Waiting for it is the whole point of the poll.
+        XCTAssertFalse(KYCStatusPollingPolicy.isAwaitingDecision("not_started"))
+        XCTAssertTrue(
+            KYCStatusPollingPolicy.shouldPoll(
+                status: "not_started",
+                returnedFromVerification: true,
+                isOnline: true
+            )
+        )
+        XCTAssertFalse(
+            KYCStatusPollingPolicy.shouldPoll(
+                status: "not_started",
+                returnedFromVerification: false,
+                isOnline: true
+            )
+        )
+        XCTAssertFalse(
+            KYCStatusPollingPolicy.shouldPoll(
+                status: nil,
+                returnedFromVerification: false,
+                isOnline: true
+            )
+        )
+        XCTAssertGreaterThan(KYCStatusPollingPolicy.graceAttemptsAfterVerification, 0)
+    }
+
+    func testKYCPollingNeverRunsOffline() {
+        for status in ["pending", "not_started", "in_review"] {
+            XCTAssertFalse(
+                KYCStatusPollingPolicy.shouldPoll(
+                    status: status,
+                    returnedFromVerification: true,
+                    isOnline: false
+                ),
+                status
+            )
+        }
+    }
+
+    func testKYCPollingBacksOffFromSecondsToHalfAMinute() {
+        // The first check is quick because the decision often lands seconds after the check
+        // closes; from there the interval grows so a screen left open all afternoon is not
+        // hammering the server.
+        XCTAssertEqual(KYCStatusPollingPolicy.interval(attempt: 0), 4, accuracy: 0.0001)
+        XCTAssertEqual(KYCStatusPollingPolicy.interval(attempt: -1), 4, accuracy: 0.0001)
+        var previous = KYCStatusPollingPolicy.interval(attempt: 0)
+        for attempt in 1...5 {
+            let interval = KYCStatusPollingPolicy.interval(attempt: attempt)
+            XCTAssertGreaterThan(interval, previous, "attempt \(attempt)")
+            XCTAssertLessThanOrEqual(interval, KYCStatusPollingPolicy.maximumInterval)
+            previous = interval
+        }
+        XCTAssertEqual(
+            KYCStatusPollingPolicy.interval(attempt: 40),
+            KYCStatusPollingPolicy.maximumInterval,
+            accuracy: 0.0001
         )
     }
 

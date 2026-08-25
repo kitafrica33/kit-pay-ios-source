@@ -293,7 +293,8 @@ struct AccountDeletionView: View {
     }
 
     private func canSubmit(_ details: AccountDeletionPreflightDTO) -> Bool {
-        !isSubmitting
+        model.appReviewDemoMutationsAllowed
+            && !isSubmitting
             && !model.isSubmittingAccountDeletion
             && !submissionOutcomeUncertain
             && confirmation == details.confirmationText

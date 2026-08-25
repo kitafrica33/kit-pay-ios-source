@@ -43,6 +43,34 @@ struct MessagingAPIEndpoint {
         )
     }
 
+    static func updateConversation(_ conversationId: String) throws -> MessagingAPIEndpoint {
+        try requireUUID(conversationId, field: "conversation ID")
+        return MessagingAPIEndpoint(
+            path: "messaging/conversations/\(conversationId)",
+            method: "PATCH"
+        )
+    }
+
+    static func conversationMembers(_ conversationId: String) throws -> MessagingAPIEndpoint {
+        try requireUUID(conversationId, field: "conversation ID")
+        return MessagingAPIEndpoint(
+            path: "messaging/conversations/\(conversationId)/members",
+            method: "POST"
+        )
+    }
+
+    static func conversationMember(
+        conversationId: String,
+        userId: String
+    ) throws -> MessagingAPIEndpoint {
+        try requireUUID(conversationId, field: "conversation ID")
+        try requireUUID(userId, field: "group member ID")
+        return MessagingAPIEndpoint(
+            path: "messaging/conversations/\(conversationId)/members/\(userId)",
+            method: "DELETE"
+        )
+    }
+
     static func roster(_ conversationId: String) throws -> MessagingAPIEndpoint {
         try requireUUID(conversationId, field: "conversation ID")
         return MessagingAPIEndpoint(
@@ -193,6 +221,60 @@ extension APIClient {
     ) async throws -> MessagingConversationDTO {
         let endpoint = MessagingAPIEndpoint.createConversation
         return try await send(path: endpoint.path, method: endpoint.method, body: request)
+    }
+
+    func createGroupMessagingConversation(
+        memberIds: [String],
+        title: String
+    ) async throws -> MessagingConversationDTO {
+        let endpoint = MessagingAPIEndpoint.createConversation
+        let request = try CreateDirectMessagingConversationRequest(
+            groupMemberIds: memberIds,
+            title: title
+        )
+        return try await send(path: endpoint.path, method: endpoint.method, body: request)
+    }
+
+    func renameGroupMessagingConversation(
+        conversationId: String,
+        title: String
+    ) async throws -> MessagingConversationDTO {
+        let endpoint = try MessagingAPIEndpoint.updateConversation(conversationId)
+        return try await send(
+            path: endpoint.path,
+            method: endpoint.method,
+            body: try RenameMessagingGroupRequest(title: title)
+        )
+    }
+
+    func addGroupMessagingConversationMember(
+        conversationId: String,
+        userId: String
+    ) async throws -> MessagingConversationDTO {
+        let endpoint = try MessagingAPIEndpoint.conversationMembers(conversationId)
+        return try await send(
+            path: endpoint.path,
+            method: endpoint.method,
+            body: try AddMessagingGroupMemberRequest(userId: userId)
+        )
+    }
+
+    /// The backend deliberately admits this DELETE when the group rollout flag is dark or a
+    /// roster device is incompatible. It is the safety exit for both self-leave and moderation,
+    /// and APIClient's DELETE policy guarantees the request has no JSON body.
+    func removeGroupMessagingConversationMember(
+        conversationId: String,
+        userId: String
+    ) async throws -> MessagingConversationDTO {
+        let endpoint = try MessagingAPIEndpoint.conversationMember(
+            conversationId: conversationId,
+            userId: userId
+        )
+        return try await send(
+            path: endpoint.path,
+            method: endpoint.method,
+            body: MessagingEmptyBody()
+        )
     }
 
     func messagingDeviceRoster(conversationId: String) async throws -> MessagingDeviceRosterDTO {

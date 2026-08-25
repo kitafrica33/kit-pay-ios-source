@@ -10,10 +10,96 @@ enum SecureMessageReservedPrefixPolicy {
         text.drop(while: { $0.isWhitespace }).hasPrefix(prefix)
     }
 
-    /// User-authored text must never enter the trusted payment-event namespace. This check is
-    /// shared by every composer, forwarding and notification-reply boundary.
+    /// User-authored text must never enter a trusted event namespace (payment events, group
+    /// system notices, reactions). This check is shared by every composer, forwarding and
+    /// notification-reply boundary.
     static func allowsUserAuthoredText(_ text: String) -> Bool {
         !beginsWithReservedPrefix(text, prefix: KitPaymentMessage.prefix)
+            && !beginsWithReservedPrefix(text, prefix: KitSystemMessage.prefix)
+            && !beginsWithReservedPrefix(text, prefix: KitMessageReaction.prefix)
+    }
+}
+
+/// Canonical local system-notice descriptor documenting group lifecycle changes inside a thread
+/// (`KITSYS1:v=1&k=member_added&u=<subject>&a=<actor>`). Like `KITPAY1`, the parse is strict:
+/// fixed field order, canonical UUIDs, and byte-exact re-encoding; anything else is plain text.
+struct KitSystemMessage: Equatable, Sendable {
+    static let prefix = "KITSYS1:"
+    static let maximumDescriptorLength = 256
+
+    enum Kind: String, Equatable, Sendable, CaseIterable {
+        case memberAdded = "member_added"
+        case memberRemoved = "member_removed"
+        case memberLeft = "member_left"
+    }
+
+    let kind: Kind
+    let subjectUserID: String
+    let actorUserID: String?
+
+    init?(kind: Kind, subjectUserID: String, actorUserID: String?) {
+        guard SecureMessagingWirePolicy.isCanonicalUUID(subjectUserID),
+              actorUserID.map(SecureMessagingWirePolicy.isCanonicalUUID) ?? true
+        else { return nil }
+        self.kind = kind
+        self.subjectUserID = subjectUserID
+        self.actorUserID = actorUserID
+    }
+
+    var encoded: String {
+        var value = Self.prefix
+        value += "v=1"
+        value += "&k=\(kind.rawValue)"
+        value += "&u=\(subjectUserID)"
+        if let actorUserID { value += "&a=\(actorUserID)" }
+        return value
+    }
+
+    static func isSystemText(_ text: String) -> Bool {
+        text.hasPrefix(prefix)
+    }
+
+    /// Deterministic local message id for a lifecycle event whose resource id is not itself a
+    /// UUID, so a replayed sync page converges on one system notice instead of duplicating it.
+    static func deterministicMessageID(namespace: String) -> UUID {
+        let digest = SHA256.hash(data: Data(namespace.utf8))
+        let bytes = Array(digest.prefix(16))
+        return UUID(uuid: (
+            bytes[0], bytes[1], bytes[2], bytes[3],
+            bytes[4], bytes[5], bytes[6], bytes[7],
+            bytes[8], bytes[9], bytes[10], bytes[11],
+            bytes[12], bytes[13], bytes[14], bytes[15]
+        ))
+    }
+
+    static func parse(_ text: String) -> KitSystemMessage? {
+        guard text.hasPrefix(prefix), text.utf16.count <= maximumDescriptorLength else {
+            return nil
+        }
+        var fields: [String: String] = [:]
+        for pair in text.dropFirst(prefix.count).split(
+            separator: "&",
+            omittingEmptySubsequences: false
+        ) {
+            guard let separator = pair.firstIndex(of: "="), separator != pair.startIndex else {
+                return nil
+            }
+            let key = String(pair[..<separator])
+            let value = String(pair[pair.index(after: separator)...])
+            guard fields[key] == nil else { return nil }
+            fields[key] = value
+        }
+        guard fields["v"] == "1",
+              let kind = fields["k"].flatMap(Kind.init(rawValue:)),
+              let subjectUserID = fields["u"],
+              let descriptor = KitSystemMessage(
+                  kind: kind,
+                  subjectUserID: subjectUserID,
+                  actorUserID: fields["a"]
+              ),
+              descriptor.encoded == text
+        else { return nil }
+        return descriptor
     }
 }
 
@@ -26,6 +112,10 @@ enum SecureMessagingWire {
     static let protocolVersion = "v2"
     static let protocolSuite = "signal-pqxdh-kyber1024-double-ratchet-v2"
     static let directConversationType = "direct"
+    static let groupConversationType = "group"
+    /// 32 people total, including self. Bounded well under the 99-device fanout cap so every member can
+    /// still enroll a companion device without stranding queued group ciphertext.
+    static let maximumGroupMembers = 32
     static let maximumKeyBatch = 100
     static let maximumRecipientDevices = 99
     static let maximumAttachments = 20
@@ -472,6 +562,59 @@ enum SecureMessagingEnvelopeType: String, Codable, CaseIterable, Sendable {
 enum SecureMessagingMessageKind: String, Codable, Sendable {
     case encrypted
     case encryptedAttachment = "encrypted_attachment"
+    case encryptedReaction = "encrypted_reaction"
+}
+
+/// Binds the authenticated plaintext namespace to the server-visible routing metadata. This is
+/// deliberately shared by first-send, sync, history backfill, and backup validation so no path
+/// can reinterpret an ordinary message as a reaction (or vice versa).
+enum SecureMessagingContentBindingPolicy {
+    static func kind(
+        for plaintext: String,
+        replyToMessageID: String?,
+        attachments: [EncryptedAttachmentRequest]
+    ) -> SecureMessagingMessageKind? {
+        if SecureMessageReservedPrefixPolicy.beginsWithReservedPrefix(
+            plaintext,
+            prefix: KitMessageReaction.prefix
+        ) {
+            guard KitMessageReaction.isReactionText(plaintext),
+                  let reaction = KitMessageReaction.parse(plaintext),
+                  replyToMessageID == reaction.targetServerMessageID,
+                  attachments.isEmpty
+            else { return nil }
+            return .encryptedReaction
+        }
+
+        let mediaAttachments = KitMediaMessageDescriptor.attachments(for: plaintext)
+        if SecureMessageReservedPrefixPolicy.beginsWithReservedPrefix(
+            plaintext,
+            prefix: KitMediaMessageDescriptor.prefix
+        ) {
+            guard !mediaAttachments.isEmpty else { return nil }
+        }
+        if !mediaAttachments.isEmpty {
+            guard attachments == mediaAttachments else { return nil }
+            return .encryptedAttachment
+        }
+        guard attachments.isEmpty else { return nil }
+        return .encrypted
+    }
+
+    static func validatesOuterEnvelope(
+        kind: SecureMessagingMessageKind,
+        replyToMessageID: String?,
+        attachmentCount: Int
+    ) -> Bool {
+        switch kind {
+        case .encrypted:
+            return attachmentCount == 0
+        case .encryptedAttachment:
+            return attachmentCount > 0
+        case .encryptedReaction:
+            return attachmentCount == 0 && replyToMessageID != nil
+        }
+    }
 }
 
 enum SecureMessagingContractError: LocalizedError, Equatable {
@@ -809,9 +952,80 @@ struct MessagingConversationListDTO: Decodable, Equatable, Sendable {
     let items: [MessagingConversationDTO?]?
 }
 
+enum MessagingGroupRole: String, Codable, CaseIterable, Sendable {
+    case owner
+    case admin
+    case moderator
+    case member
+
+    var canManageGroup: Bool { self == .owner || self == .admin }
+
+    func canRemove(_ target: MessagingGroupRole) -> Bool {
+        switch self {
+        case .owner:
+            return true
+        case .admin:
+            return target == .moderator || target == .member
+        case .moderator, .member:
+            return false
+        }
+    }
+}
+
+enum MessagingGroupTitlePolicy {
+    static let characterRange = 1 ... 64
+    static let maximumUTF8Bytes = 120
+
+    static func normalized(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    static func isValid(_ value: String) -> Bool {
+        let clean = normalized(value)
+        return characterRange.contains(clean.unicodeScalars.count)
+            && clean.utf8.count <= maximumUTF8Bytes
+            && !clean.unicodeScalars.contains(where: { $0.value == 0 })
+    }
+}
+
+struct RenameMessagingGroupRequest: Encodable, Equatable, Sendable {
+    let title: String
+
+    init(title: String) throws {
+        let clean = MessagingGroupTitlePolicy.normalized(title)
+        guard MessagingGroupTitlePolicy.isValid(clean) else {
+            throw SecureMessagingContractError.invalid("group-conversation title")
+        }
+        self.title = clean
+    }
+}
+
+struct AddMessagingGroupMemberRequest: Encodable, Equatable, Sendable {
+    let userId: String
+    let role: MessagingGroupRole?
+
+    init(userId: String, role: MessagingGroupRole? = nil) throws {
+        guard SecureMessagingWirePolicy.isCanonicalUUID(userId) else {
+            throw SecureMessagingContractError.invalid("group member ID")
+        }
+        self.userId = userId
+        self.role = role
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case userId = "user_id"
+        case role
+    }
+}
+
 struct CreateDirectMessagingConversationRequest: Encodable, Equatable, Sendable {
+    static let maximumGroupTitleUTF8Bytes = MessagingGroupTitlePolicy.maximumUTF8Bytes
+
     let memberIds: [String]
     let type: String
+    /// Present only for group creation. Synthesized `encodeIfPresent` keeps the direct-creation
+    /// wire body byte-identical to earlier builds (no `title` key at all).
+    let title: String?
 
     init(memberId: String) throws {
         guard SecureMessagingWirePolicy.isCanonicalUUID(memberId) else {
@@ -819,11 +1033,28 @@ struct CreateDirectMessagingConversationRequest: Encodable, Equatable, Sendable 
         }
         memberIds = [memberId]
         type = SecureMessagingWire.directConversationType
+        title = nil
+    }
+
+    /// Group creation lists every OTHER member (the server adds the creator). Bounded to
+    /// `maximumGroupMembers` including the creator and requires a canonical unique member set.
+    init(groupMemberIds: [String], title: String) throws {
+        guard (1 ... SecureMessagingWire.maximumGroupMembers - 1).contains(groupMemberIds.count),
+              Set(groupMemberIds).count == groupMemberIds.count,
+              groupMemberIds.allSatisfy(SecureMessagingWirePolicy.isCanonicalUUID)
+        else { throw SecureMessagingContractError.invalid("group-conversation member IDs") }
+        let cleanTitle = MessagingGroupTitlePolicy.normalized(title)
+        guard MessagingGroupTitlePolicy.isValid(cleanTitle)
+        else { throw SecureMessagingContractError.invalid("group-conversation title") }
+        memberIds = groupMemberIds
+        type = SecureMessagingWire.groupConversationType
+        self.title = cleanTitle
     }
 
     enum CodingKeys: String, CodingKey {
         case memberIds = "member_ids"
         case type
+        case title
     }
 }
 
@@ -902,12 +1133,56 @@ struct MessagingDeviceRosterDTO: Decodable, Equatable, Sendable {
     }
 }
 
+/// The first iOS release that implements the Build-24 messaging additions. Keep this as one
+/// contract so groups, reactions, large attachments and Reverb cannot drift to different floors.
+enum MessagingBuild24CompatibilityPolicy {
+    static let minimumIOSVersion = [1, 0, 16]
+    static let minimumIOSBuild = 24
+    static let minimumIOSRelease = "1.0.16-r24"
+
+    static func supportsIOS(version: String?, build: Int?) -> Bool {
+        guard let version else { return false }
+        return supportsIOS(
+            version: version,
+            build: build,
+            minimumVersion: minimumIOSVersion,
+            minimumBuild: minimumIOSBuild
+        )
+    }
+
+    static func supportsIOS(
+        version value: String,
+        build: Int?,
+        minimumVersion: [Int],
+        minimumBuild: Int
+    ) -> Bool {
+        let components = value.split(separator: ".", omittingEmptySubsequences: false)
+        guard components.count == 3,
+              minimumVersion.count == 3,
+              let major = Int(components[0]),
+              let minor = Int(components[1]),
+              let patch = Int(components[2]),
+              [major, minor, patch].allSatisfy({ $0 >= 0 }),
+              minimumVersion.allSatisfy({ $0 >= 0 })
+        else { return false }
+        let version = [major, minor, patch]
+        if minimumVersion.lexicographicallyPrecedes(version) { return true }
+        return version == minimumVersion && (build ?? -1) >= minimumBuild
+    }
+}
+
 enum MessagingRichMediaCapabilityPolicy {
     static let profile = "kit-media-v1"
     static let deviceCapabilityKey = "messaging_rich_media_v1"
+    static let extendedSizeDeviceCapabilityKey = "messaging_rich_media_200m_v1"
+    /// Android's currently shipped decoder cap. Payloads above it require a separate attested
+    /// capability on every destination device; the iOS/server 200 MiB cap does not imply support.
+    static let broadlyCompatibleMaximumPlaintextBytes = 10 * 1_024 * 1_024
     static let minimumIOSVersion = [0, 2, 5]
     static let minimumIOSBuild = 16
     static let minimumIOSRelease = "0.2.5-r16"
+    static let extendedSizeMinimumIOSRelease =
+        MessagingBuild24CompatibilityPolicy.minimumIOSRelease
 
     static func supports(
         mediaType: String,
@@ -935,25 +1210,130 @@ enum MessagingRichMediaCapabilityPolicy {
             // kept as defense in depth for a server that asserts the flag without context.
             if client.platform?.lowercased() == "ios" {
                 guard let version = client.version,
-                      versionAtLeastMinimum(version, build: client.build)
+                      MessagingBuild24CompatibilityPolicy.supportsIOS(
+                          version: version,
+                          build: client.build,
+                          minimumVersion: minimumIOSVersion,
+                          minimumBuild: minimumIOSBuild
+                      )
                 else { return false }
             }
             return true
         }
     }
 
-    private static func versionAtLeastMinimum(_ value: String, build: Int?) -> Bool {
-        let components = value.split(separator: ".", omittingEmptySubsequences: false)
-        guard components.count == 3,
-              let major = Int(components[0]),
-              let minor = Int(components[1]),
-              let patch = Int(components[2]),
-              [major, minor, patch].allSatisfy({ $0 >= 0 })
+    static func supportsPlaintextByteSize(
+        _ plaintextByteSize: Int,
+        roster: MessagingDeviceRosterDTO,
+        conversationID: String,
+        currentDeviceID: String,
+        memberUserIDs: Set<String>
+    ) -> Bool {
+        guard (1 ... SecureMediaAttachmentCipher.maximumPlaintextBytes)
+            .contains(plaintextByteSize)
         else { return false }
-        let version = [major, minor, patch]
-        if minimumIOSVersion.lexicographicallyPrecedes(version) { return true }
-        guard version == minimumIOSVersion, let build else { return false }
-        return build >= minimumIOSBuild
+        guard plaintextByteSize > broadlyCompatibleMaximumPlaintextBytes else { return true }
+        guard MessagingRosterCapabilityPolicy.supports(
+            deviceCapabilityKey: extendedSizeDeviceCapabilityKey,
+            roster: roster,
+            conversationID: conversationID,
+            currentDeviceID: currentDeviceID,
+            memberUserIDs: memberUserIDs,
+            currentDeviceSelfAttests: false
+        ), let devices = roster.devices?.compactMap({ $0 }) else { return false }
+        return devices.allSatisfy { device in
+            guard device.client?.platform?.lowercased() == "ios" else { return true }
+            return MessagingBuild24CompatibilityPolicy.supportsIOS(
+                version: device.client?.version,
+                build: device.client?.build
+            )
+        }
+    }
+}
+
+/// Fail-closed attestation gate for group conversations. Group ciphertext leaves this device
+/// only when the server capability is advertised (`featureKey`) AND every enrolled device of
+/// every member carries the server-attested per-device capability. A single stale device in the
+/// roster blocks the send rather than silently excluding that device from the fanout.
+enum MessagingGroupCapabilityPolicy {
+    static let featureKey = "messaging_groups"
+    static let deviceCapabilityKey = "messaging_groups_v1"
+    static let minimumIOSRelease = MessagingBuild24CompatibilityPolicy.minimumIOSRelease
+
+    /// Direct chats are unaffected by the group rollout. Group mutations fail closed whenever
+    /// the capability is missing or withdrawn, while their already-decrypted history stays usable.
+    static func allowsConversationMutation(
+        isGroup: Bool,
+        groupCapabilityEnabled: Bool
+    ) -> Bool {
+        !isGroup || groupCapabilityEnabled
+    }
+
+    static func supports(
+        roster: MessagingDeviceRosterDTO,
+        conversationID: String,
+        currentDeviceID: String,
+        memberUserIDs: Set<String>
+    ) -> Bool {
+        guard (1 ... SecureMessagingWire.maximumGroupMembers).contains(memberUserIDs.count),
+              MessagingRosterCapabilityPolicy.supports(
+                deviceCapabilityKey: deviceCapabilityKey,
+                roster: roster,
+                conversationID: conversationID,
+                currentDeviceID: currentDeviceID,
+                memberUserIDs: memberUserIDs
+              ),
+              let devices = roster.devices?.compactMap({ $0 })
+        else { return false }
+        return devices.allSatisfy { device in
+            guard device.deviceId != currentDeviceID,
+                  device.client?.platform?.lowercased() == "ios"
+            else { return true }
+            return MessagingBuild24CompatibilityPolicy.supportsIOS(
+                version: device.client?.version,
+                build: device.client?.build
+            )
+        }
+    }
+}
+
+/// Exact server-attested roster check shared by independently gated secure-message extensions.
+/// The running device is the only allowed exception because this binary itself is its
+/// attestation; every other enrolled destination device must advertise the requested capability.
+enum MessagingRosterCapabilityPolicy {
+    static func supports(
+        deviceCapabilityKey: String,
+        roster: MessagingDeviceRosterDTO,
+        conversationID: String,
+        currentDeviceID: String,
+        memberUserIDs: Set<String>,
+        currentDeviceSelfAttests: Bool = true
+    ) -> Bool {
+        guard !deviceCapabilityKey.isEmpty,
+              roster.conversationId == conversationID,
+              SecureMessagingWirePolicy.isCanonicalUUID(conversationID),
+              SecureMessagingWirePolicy.isCanonicalUUID(currentDeviceID),
+              !memberUserIDs.isEmpty,
+              memberUserIDs.count <= SecureMessagingWire.maximumGroupMembers,
+              memberUserIDs.allSatisfy(SecureMessagingWirePolicy.isCanonicalUUID),
+              let rawDevices = roster.devices,
+              !rawDevices.isEmpty,
+              rawDevices.count <= SecureMessagingWire.maximumRecipientDevices + 1
+        else { return false }
+        let devices = rawDevices.compactMap { $0 }
+        guard devices.count == rawDevices.count,
+              devices.allSatisfy({
+                  $0.deviceId.map(SecureMessagingWirePolicy.isCanonicalUUID) == true
+                      && $0.userId.map(SecureMessagingWirePolicy.isCanonicalUUID) == true
+              }),
+              Set(devices.compactMap(\.deviceId)).count == devices.count,
+              Set(devices.compactMap(\.userId)) == memberUserIDs,
+              devices.filter({ $0.deviceId == currentDeviceID }).count == 1
+        else { return false }
+        return devices.allSatisfy { device in
+            if currentDeviceSelfAttests, device.deviceId == currentDeviceID { return true }
+            return device.client?.capabilities?[deviceCapabilityKey] == true
+        }
     }
 }
 
@@ -1131,7 +1511,11 @@ struct SendEncryptedMessageRequest: Encodable, Equatable, Sendable {
               attachments.count <= SecureMessagingWire.maximumAttachments,
               Set(attachments.map(\.id)).count == attachments.count,
               Set(attachments.map(\.storageKey)).count == attachments.count,
-              (kind == .encryptedAttachment) == !attachments.isEmpty
+              SecureMessagingContentBindingPolicy.validatesOuterEnvelope(
+                  kind: kind,
+                  replyToMessageID: replyToMessageId,
+                  attachmentCount: attachments.count
+              )
         else { throw SecureMessagingContractError.invalid("encrypted-message request") }
         self.clientMessageId = clientMessageId
         self.rosterRevision = rosterRevision
@@ -1310,9 +1694,13 @@ struct MessagingSyncEventDataDTO: Decodable, Equatable, Sendable {
     let messageId: String?
     let deliveryState: String?
     let deliveredAt: String?
+    let role: String?
+    /// Reserved for older event families. Build-24 membership events carry only the subject and
+    /// optional role; an actor is not part of the authenticated lifecycle contract.
+    let actorUserId: String?
 
     enum CodingKeys: String, CodingKey {
-        case id, sender, kind, envelope, attachments, reactions
+        case id, sender, kind, envelope, attachments, reactions, role
         case conversationId = "conversation_id"
         case clientMessageId = "client_message_id"
         case senderDeviceId = "sender_device_id"
@@ -1346,6 +1734,7 @@ struct MessagingSyncEventDataDTO: Decodable, Equatable, Sendable {
         case messageId = "message_id"
         case deliveryState = "delivery_state"
         case deliveredAt = "delivered_at"
+        case actorUserId = "actor_user_id"
     }
 }
 

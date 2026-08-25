@@ -551,6 +551,9 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
     private var mediaIntent = CallMediaIntentState(video: false)
     private var mediaIntentRevision: UInt64 = 0
     private var deferredInitialCameraCallId: String?
+    /// The video call that is connected but whose camera has not been published yet. Kept off the
+    /// connect path so answering is not held up by the capture session starting.
+    private var pendingInitialCameraCallId: String?
     /// CallKit can deliver mute before the authenticated media handoff creates a room. Bind that
     /// intent to its backend call so a canceled call can never mute a later replacement call.
     private var pendingCallKitMicrophoneIntent: PendingCallKitMicrophoneIntent?
@@ -658,7 +661,7 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
             else {
                 throw LiveKitCallMediaError.mediaUnavailable
             }
-            let appliedIntent = try await applyMediaIntent(
+            let appliedIntent = try await publishMicrophoneIntent(
                 in: connectionRoom,
                 expectedGeneration: expectedGeneration
             )
@@ -668,11 +671,17 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
                 throw LiveKitCallMediaError.mediaUnavailable
             }
             connectedCallId = callId
+            CallMediaPrewarmer.shared.rememberConnectedMediaURL(handoff.url)
             updateRemoteParticipantPresence(in: connectionRoom)
             refreshRemoteParticipantSurfaces(in: connectionRoom)
             isMicrophoneEnabled = appliedIntent.microphoneEnabled
-            isCameraEnabled = appliedIntent.cameraEnabled
             isFrontCamera = appliedIntent.frontCamera
+            // The camera has not been published yet. Reporting it as on before the preview exists
+            // would show the user a video control that does not match what is being sent.
+            isCameraEnabled = false
+            canSwitchCamera = false
+            localVideoTrack = nil
+            pendingInitialCameraCallId = appliedIntent.cameraEnabled ? callId : nil
         } catch {
             connectionRoom.remove(delegate: self)
             if connectionGeneration == expectedGeneration,
@@ -689,11 +698,17 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
         }
     }
 
-    /// Replays one stable snapshot of the user's media choices. If a control changes while an SDK
-    /// operation is suspended, the revision changes and the replacement room is reconciled again
+    /// Replays one stable snapshot of the user's microphone choice. If the control changes while an
+    /// SDK operation is suspended, the revision changes and the replacement room is reconciled again
     /// before it is exposed as connected.
+    ///
+    /// The camera is deliberately not published here. Starting a capture session, and then asking
+    /// the hardware whether it can switch position, costs hundreds of milliseconds — and it spends
+    /// them after the user has already answered, which is exactly where a call feels slow. Voice is
+    /// what makes a call feel connected, so the call goes live as soon as the microphone is
+    /// published and the camera follows through `publishPendingInitialCamera`.
     @MainActor
-    private func applyMediaIntent(
+    private func publishMicrophoneIntent(
         in connectionRoom: Room,
         expectedGeneration: UInt64
     ) async throws -> CallMediaIntentState {
@@ -709,31 +724,25 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
             else { throw LiveKitCallMediaError.mediaUnavailable }
             localAudioTrack = microphonePublication?.track as? LocalAudioTrack
             try? applyMicrophoneMode(to: localAudioTrack)
-
-            if intended.cameraEnabled {
-                try await ensurePermission(for: .video, label: "camera")
-            }
-            try await connectionRoom.localParticipant.setCamera(
-                enabled: intended.cameraEnabled,
-                captureOptions: intended.cameraEnabled
-                    ? CameraCaptureOptions(position: intended.frontCamera ? .front : .back)
-                    : nil
-            )
-            guard connectionGeneration == expectedGeneration,
-                  room === connectionRoom
-            else { throw LiveKitCallMediaError.mediaUnavailable }
-
-            let cameraCanSwitch = intended.cameraEnabled
-                ? ((try? await CameraCapturer.canSwitchPosition()) ?? false)
-                : false
-            guard connectionGeneration == expectedGeneration,
-                  room === connectionRoom
-            else { throw LiveKitCallMediaError.mediaUnavailable }
             guard intendedRevision == mediaIntentRevision else { continue }
-            if !intended.cameraEnabled { localVideoTrack = nil }
-            canSwitchCamera = cameraCanSwitch
             return intended
         }
+    }
+
+    /// Publishes the camera a video call was answered with, once the call is already live. Returns
+    /// false when there is nothing left to publish, so the caller only performs the video-call side
+    /// effects it actually caused. A rejoin republishes through this same path.
+    @MainActor
+    func publishPendingInitialCamera(callId: String) async throws -> Bool {
+        let canonicalCallID = callId.lowercased()
+        guard pendingInitialCameraCallId?.caseInsensitiveCompare(canonicalCallID) == .orderedSame,
+              mediaIntentCallId?.caseInsensitiveCompare(canonicalCallID) == .orderedSame,
+              connectedCallId?.caseInsensitiveCompare(canonicalCallID) == .orderedSame
+        else { return false }
+        // Consumed before suspension so a repeated call cannot publish the camera twice.
+        pendingInitialCameraCallId = nil
+        try await setCamera(enabled: true)
+        return true
     }
 
     @MainActor
@@ -1064,6 +1073,7 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
         mediaIntentCallId = nil
         mediaIntent = CallMediaIntentState(video: false)
         deferredInitialCameraCallId = nil
+        pendingInitialCameraCallId = nil
         pendingCallKitMicrophoneIntent = nil
         mediaIntentRevision &+= 1
     }
@@ -1503,9 +1513,12 @@ final class CallMediaCoordinator: ObservableObject {
         state = .idle
         retireCallPresentationSurfaces()
         await session.reset()
-        if accountLeaseGate.authorizedLease == nil,
-           let disconnectedCallID {
-            media.clearDisconnectedCallIntent(callId: disconnectedCallID)
+        if accountLeaseGate.authorizedLease == nil {
+            // A signed-out device keeps no warm path to a media server it can no longer join.
+            CallMediaPrewarmer.shared.forget()
+            if let disconnectedCallID {
+                media.clearDisconnectedCallIntent(callId: disconnectedCallID)
+            }
         }
     }
 
@@ -1557,6 +1570,7 @@ final class CallMediaCoordinator: ObservableObject {
                 throw CancellationError()
             }
             state = .connected
+            startPendingInitialCamera(callId: handoff.callId)
         } catch is CancellationError {
             clearPresentation(callId: handoff.callId)
             throw CancellationError()
@@ -1572,6 +1586,30 @@ final class CallMediaCoordinator: ObservableObject {
 
     func prepareMicrophonePermission() async throws {
         try await media.prepareMicrophonePermission()
+    }
+
+    /// Starts the camera of a video call that is already connected and audible. Deliberately not
+    /// awaited by the connect path: the user is in the call while this runs, and a camera that
+    /// cannot start leaves a working voice call with the Video button as the retry.
+    private func startPendingInitialCamera(callId: String) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                guard try await media.publishPendingInitialCamera(callId: callId) else { return }
+                try media.activateAudioSession(
+                    AVAudioSession.sharedInstance(),
+                    video: callCarriesVideo
+                )
+                refreshCallKitVideoState()
+                CallOverlayWindowController.shared.refreshPictureInPicture()
+                controlError = nil
+            } catch is CancellationError {
+                return
+            } catch {
+                guard activeCall?.id.caseInsensitiveCompare(callId) == .orderedSame else { return }
+                controlError = error.localizedDescription
+            }
+        }
     }
 
     /// Completes a video answer that intentionally joined audio-first while iOS could not show its
@@ -1618,6 +1656,9 @@ final class CallMediaCoordinator: ObservableObject {
         activeCall = presentation
         state = .connecting
         controlError = nil
+        // The dial is still in flight. Resolving the media host now overlaps with it instead of
+        // being paid for after the server answers.
+        CallMediaPrewarmer.shared.prewarm()
         return true
     }
 
@@ -1689,6 +1730,7 @@ final class CallMediaCoordinator: ObservableObject {
         activeCall = presentation
         state = .connecting
         controlError = nil
+        CallMediaPrewarmer.shared.prewarm()
     }
 
     func disconnectFromCallKit(callId: String) async {
@@ -2016,6 +2058,7 @@ final class CallMediaCoordinator: ObservableObject {
                 }
                 activeHandoff = refreshedHandoff
                 state = .connected
+                startPendingInitialCamera(callId: callId)
                 controlError = nil
                 reconnectTask = nil
                 scheduleReconnectBudgetReset(callId: callId)

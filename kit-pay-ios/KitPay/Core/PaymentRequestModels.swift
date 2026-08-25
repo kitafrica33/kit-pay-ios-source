@@ -160,14 +160,9 @@ struct KitPaymentMessage: Equatable, Sendable {
         return value
     }
 
+    /// The canonical `.`-separated amount. Display goes through `KitMoney`, which groups it.
     var decimalAmount: String {
-        guard currencyScale > 0 else { return String(amountMinor) }
-        var digits = String(amountMinor)
-        if digits.count <= currencyScale {
-            digits = String(repeating: "0", count: currencyScale - digits.count + 1) + digits
-        }
-        let separator = digits.index(digits.endIndex, offsetBy: -currencyScale)
-        return "\(digits[..<separator]).\(digits[separator...])"
+        KitMoney.decimal(minorUnits: amountMinor, scale: currencyScale)
     }
 
     func changingAction(to action: KitPaymentMessageAction) -> KitPaymentMessage? {

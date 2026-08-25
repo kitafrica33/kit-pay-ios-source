@@ -10,13 +10,24 @@ struct CommunicationPrivacyView: View {
             VStack(spacing: 18) {
                 introduction
 
+                if model.appReviewDemoIsActive {
+                    Label(
+                        "Privacy changes are disabled for this read-only App Review account.",
+                        systemImage: "eye.fill"
+                    )
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(KitColor.secondaryText)
+                }
+
                 if let errorMessage = model.communicationPrivacyErrorMessage {
                     errorCard(errorMessage)
                 }
 
                 preferenceCard
+                    .disabled(!model.appReviewDemoMutationsAllowed)
                 callsCard
                 blockedAccountsCard
+                    .disabled(!model.appReviewDemoMutationsAllowed)
             }
             .padding(18)
         }
@@ -64,7 +75,7 @@ struct CommunicationPrivacyView: View {
                 Text("Choose how people find you")
                     .font(.headline)
                     .foregroundStyle(KitColor.primaryText)
-                Text("Your choices apply across every device signed in to your Kit Pay account.")
+                Text("These choices apply across every device signed in to your Kit Pay account, except where a setting says it is limited to this iPhone.")
                     .font(.subheadline)
                     .foregroundStyle(KitColor.secondaryText)
             }
@@ -76,10 +87,10 @@ struct CommunicationPrivacyView: View {
 
     private var preferenceCard: some View {
         VStack(spacing: 0) {
-            privacyToggle(
-                title: "Find me by phone number",
-                subtitle: "People who have your number in their contacts can find you on Kit Pay.",
-                systemName: "phone.badge.checkmark",
+            // The same three controls, in the same words, that account setup offered — so a user
+            // returning here recognizes the choice they already made rather than a new one.
+            discoveryToggle(
+                .phoneNumber,
                 isOn: model.communicationPreferences?.phoneDiscoverable ?? false
             ) { enabled in
                 Task { await model.setPhoneDiscoverable(enabled) }
@@ -87,13 +98,37 @@ struct CommunicationPrivacyView: View {
 
             Divider().padding(.leading, 68)
 
-            privacyToggle(
-                title: "Allow message requests",
-                subtitle: "Verified Kit Pay users who know your @tag can start a new chat.",
-                systemName: "message.badge",
+            // Device-local, and deliberately not gated on the server projection: it governs
+            // whether *this* iPhone uploads its address book, so it must stay usable offline and
+            // while the preferences request is in flight.
+            discoveryToggle(
+                .contacts,
+                isOn: model.contactDiscoveryEnabled,
+                requiresServerPreferences: false
+            ) { enabled in
+                Task { await model.setContactDiscoveryEnabled(enabled) }
+            }
+
+            Divider().padding(.leading, 68)
+
+            discoveryToggle(
+                .messageRequests,
                 isOn: model.communicationPreferences?.directMessageRequestsEnabled ?? false
             ) { enabled in
                 Task { await model.setDirectMessageRequestsEnabled(enabled) }
+            }
+
+            if model.messagingRealtimeAvailable {
+                Divider().padding(.leading, 68)
+
+                privacyToggle(
+                    title: "Show my online status",
+                    subtitle: "People you chat with can see when you are online or typing. Turning this off also hides their status on this device.",
+                    systemName: "dot.radiowaves.left.and.right",
+                    isOn: model.communicationPreferences?.messagingPresenceVisible ?? false
+                ) { enabled in
+                    Task { await model.setMessagingPresenceVisible(enabled) }
+                }
             }
         }
         .overlay {
@@ -101,6 +136,9 @@ struct CommunicationPrivacyView: View {
                 ProgressView("Loading privacy choices")
                     .padding()
                     .background(.ultraThinMaterial, in: Capsule())
+                    // The device-local toggles in this card stay usable while the server
+                    // projection loads, so the spinner must not swallow their taps.
+                    .allowsHitTesting(false)
             }
         }
         .kitGlass(cornerRadius: 26, shadow: false)
@@ -238,11 +276,29 @@ struct CommunicationPrivacyView: View {
         .padding(.vertical, 12)
     }
 
+    private func discoveryToggle(
+        _ control: AccountDiscoveryControl,
+        isOn: Bool,
+        requiresServerPreferences: Bool = true,
+        changed: @escaping (Bool) -> Void
+    ) -> some View {
+        privacyToggle(
+            title: control.title,
+            subtitle: control.subtitle,
+            systemName: control.systemImage,
+            isOn: isOn,
+            requiresServerPreferences: requiresServerPreferences,
+            changed: changed
+        )
+        .accessibilityIdentifier(control.accessibilityIdentifier)
+    }
+
     private func privacyToggle(
         title: String,
         subtitle: String,
         systemName: String,
         isOn: Bool,
+        requiresServerPreferences: Bool = true,
         changed: @escaping (Bool) -> Void
     ) -> some View {
         Toggle(isOn: Binding(get: { isOn }, set: changed)) {
@@ -265,9 +321,12 @@ struct CommunicationPrivacyView: View {
         }
         .tint(KitColor.green)
         .disabled(
-            model.communicationPreferences == nil
-                || model.isCommunicationPrivacyBusy
-                || !model.isOnline
+            !model.appReviewDemoMutationsAllowed
+                || (requiresServerPreferences && (
+                    model.communicationPreferences == nil
+                        || model.isCommunicationPrivacyBusy
+                        || !model.isOnline
+                ))
         )
         .accessibilityLabel(title)
         .accessibilityValue(isOn ? "On" : "Off")

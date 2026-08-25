@@ -268,7 +268,7 @@ struct TransferReverseApprovalView: View {
                     Text("Reverse this payment")
                         .font(.title2.bold())
                         .foregroundStyle(KitColor.primaryText)
-                    Text("\(descriptor.currencyCode) \(descriptor.decimalAmount)")
+                    Text(KitMoney.formatted(descriptor.decimalAmount, code: descriptor.currencyCode, scale: descriptor.currencyScale))
                         .font(.system(size: 34, weight: .heavy, design: .rounded))
                         .foregroundStyle(KitColor.primaryText)
                     Text("\(recipientName) has not accepted it yet, so the money returns to your wallet. Once they accept, a payment can no longer be reversed.")
@@ -331,7 +331,7 @@ struct TransferReverseApprovalView: View {
                                 .frame(maxWidth: .infinity)
                         } else {
                             Label(
-                                "Reverse \(descriptor.currencyCode) \(descriptor.decimalAmount)",
+                                "Reverse \(KitMoney.formatted(descriptor.decimalAmount, code: descriptor.currencyCode, scale: descriptor.currencyScale))",
                                 systemImage: model.financialApprovalUsesBiometrics
                                     ? model.biometricSymbolName
                                     : "lock.fill"

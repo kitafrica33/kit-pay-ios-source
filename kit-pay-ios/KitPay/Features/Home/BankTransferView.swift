@@ -91,6 +91,9 @@ final class BankTransferViewModel: ObservableObject {
     @Published private(set) var verification: BankAccountVerificationDTO?
     @Published private(set) var isLoading = false
     @Published private(set) var isSubmitting = false
+    /// The wallet debit the server refused for want of funds, so the screen can offer a top-up
+    /// instead of only reporting the refusal.
+    @Published var insufficientFundsDebitAmount: String?
     @Published var errorMessage: String?
 
     private let api: APIClient
@@ -524,15 +527,21 @@ final class BankTransferViewModel: ObservableObject {
 
         isSubmitting = true
         errorMessage = nil
+        insufficientFundsDebitAmount = nil
         defer { isSubmitting = false }
 
         var transferSubmissionStarted = false
         do {
+            let received = KitMoney.formatted(
+                quote.recipientAmount, currency: quote.currency, trimZeroFraction: true)
+            let debit = KitMoney.formatted(
+                quote.customerDebit, currency: quote.currency, trimZeroFraction: true)
             let approval = try await authorization(
                 quote.stepUp.purpose,
                 quote.stepUp.authorizationIntent,
                 pin,
-                "Approve sending to \(beneficiary.accountName); they receive \(quote.currency.code) \(quote.recipientAmount) and your Kit Pay wallet debit is \(quote.currency.code) \(quote.customerDebit)"
+                "Approve sending to \(beneficiary.accountName); they receive \(received) "
+                    + "and your Kit Pay wallet debit is \(debit)"
             )
             guard !approval.stepUpToken.isEmpty else {
                 throw BankTransferFlowError.invalidStepUp
@@ -556,6 +565,9 @@ final class BankTransferViewModel: ObservableObject {
             pollOperation(operation.id)
             return operation
         } catch {
+            if WalletTopUpPolicy.isInsufficientFunds(error) {
+                insufficientFundsDebitAmount = quote.customerDebit
+            }
             errorMessage = BankTransferActionErrorCopy.message(
                 for: error,
                 context: BankTransferActionErrorCopy.transferContext(
@@ -659,6 +671,9 @@ struct BankTransferView: View {
     @State private var addingBeneficiary = false
     @State private var selectedBeneficiary: BankBeneficiaryDTO?
     @State private var selectedOperation: BankingOperationDTO?
+    /// Built once per directory change: the rows below would otherwise rescan every synced contact
+    /// on each redraw.
+    @State private var contactIndex = BeneficiaryContactIndex()
 
     private var permission: Bool? { app.capabilities?.enablesBankTransfers }
     private var permitted: Bool { permission == true }
@@ -709,6 +724,10 @@ struct BankTransferView: View {
             }
             .task(id: loadTrigger) {
                 await model.load(country: country, permitted: permission, online: app.isOnline)
+            }
+            .onAppear { rebuildContactIndex(app.contactDirectory) }
+            .onChange(of: app.contactDirectory) { _, contacts in
+                rebuildContactIndex(contacts)
             }
             .refreshable {
                 await model.load(country: country, permitted: permission, online: app.isOnline)
@@ -825,13 +844,40 @@ struct BankTransferView: View {
         }
     }
 
+    private func rebuildContactIndex(_ contacts: [WalletContactDTO]) {
+        contactIndex = BeneficiaryContactIndex(contacts: contacts)
+    }
+
     private func beneficiaryRow(_ beneficiary: BankBeneficiaryDTO) -> some View {
-        HStack(spacing: 13) {
-            Image(systemName: "building.columns")
-                .font(.headline)
-                .foregroundStyle(.primary)
-                .frame(width: 46, height: 46)
-                .background(KitColor.paleGreen, in: Circle())
+        let contact = contactIndex.contact(forAccountName: beneficiary.accountName)
+        return HStack(spacing: 13) {
+            Group {
+                if let contact {
+                    // This destination belongs to someone already on Kit Pay, so show the person
+                    // rather than the institution — the account details underneath still say
+                    // exactly where the money lands.
+                    RemoteAvatarView(
+                        name: contact.name,
+                        avatarURL: contact.avatarURL,
+                        size: 46,
+                        ringOpacity: nil
+                    )
+                    .overlay(alignment: .bottomTrailing) {
+                        Image(systemName: "building.columns.fill")
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundStyle(KitColor.primaryText)
+                            .padding(3)
+                            .background(KitColor.paleGreen, in: Circle())
+                            .overlay(Circle().stroke(KitColor.canvas, lineWidth: 1))
+                    }
+                } else {
+                    Image(systemName: "building.columns")
+                        .font(.headline)
+                        .foregroundStyle(.primary)
+                        .frame(width: 46, height: 46)
+                        .background(KitColor.paleGreen, in: Circle())
+                }
+            }
             VStack(alignment: .leading, spacing: 3) {
                 Text(beneficiary.label)
                     .font(.body.bold())
@@ -1118,6 +1164,16 @@ private struct BankTransferPaymentView: View {
     @State private var selectedFeeMode: BankTransferFeeMode = .senderAbsorbs
     @State private var submittedOperation: BankingOperationDTO?
     @State private var idempotencyKey = BankTransferIdempotency.key(prefix: "ios-bank-transfer")
+    /// Non-nil while the customer is topping up to cover this transfer.
+    @State private var topUpRequest: WalletTopUpRequirement?
+
+    /// The full wallet debit, transaction fee included, against the balance as it stands now.
+    private func topUpRequirement(for quote: BankTransferQuoteDTO) -> WalletTopUpRequirement? {
+        WalletTopUpPolicy.requirement(
+            wallet: app.selectedWallet,
+            debitAPIAmount: quote.customerDebit
+        )
+    }
 
     private var currentOperation: BankingOperationDTO? {
         guard let submittedOperation else { return nil }
@@ -1147,7 +1203,49 @@ private struct BankTransferPaymentView: View {
                 }
             }
             .interactiveDismissDisabled(model.isSubmitting)
+            .sheet(item: $topUpRequest) { requirement in
+                WalletTopUpView(requirement: requirement) { covered in
+                    guard covered else { return }
+                    WalletTopUpPresentation.afterDismissal { requoteAfterTopUp() }
+                }
+                .environmentObject(app)
+                .presentationBackground(.ultraThinMaterial)
+            }
         }
+    }
+
+    /// A quote reviewed before a top-up has expired by the time the money lands, so a fresh one is
+    /// fetched for the same amount — the customer returns to a ready approval, not a blank form.
+    @MainActor
+    private func requoteAfterTopUp() {
+        guard submittedOperation == nil else { return }
+        model.errorMessage = nil
+        pin = ""
+        idempotencyKey = BankTransferIdempotency.key(prefix: "ios-bank-transfer")
+        Task {
+            quote = await model.createTransferQuote(
+                beneficiary: beneficiary,
+                wallet: app.selectedWallet,
+                enteredAmount: amount,
+                feeMode: feeMode,
+                permitted: permitted,
+                online: online
+            )
+        }
+    }
+
+    /// The balance on the device can be a moment behind the ledger. When the server is the one to
+    /// find it short, the same top-up is offered rather than a bare refusal.
+    @MainActor
+    private func offerTopUpIfServerFoundBalanceShort() async {
+        guard let debit = model.insufficientFundsDebitAmount else { return }
+        model.insufficientFundsDebitAmount = nil
+        await app.refresh()
+        guard let requirement = WalletTopUpPolicy.requirement(
+            wallet: app.selectedWallet,
+            debitAPIAmount: debit
+        ) else { return }
+        topUpRequest = requirement
     }
 
     private var transferForm: some View {
@@ -1163,17 +1261,13 @@ private struct BankTransferPaymentView: View {
                         Text("UGX")
                             .font(.headline.bold())
                             .foregroundStyle(KitColor.green)
-                        TextField("0", text: Binding(
-                            get: { PaymentInputFormatting.groupedWholeInput(amount) },
-                            set: { value in
-                                if let normalized = BankTransferMoney.editableWholeUGXInput(value) {
-                                    amount = normalized
-                                }
-                            }
-                        ))
-                        .keyboardType(.numberPad)
-                        .font(.system(size: 32, weight: .bold, design: .rounded))
-                        .multilineTextAlignment(.trailing)
+                        KitAmountTextField(
+                            "0",
+                            value: $amount,
+                            mode: .whole,
+                            textStyle: .large,
+                            textAlignment: .right
+                        )
                         .onChange(of: amount) { _, _ in
                             guard !model.isSubmitting else { return }
                             quote = nil
@@ -1192,7 +1286,7 @@ private struct BankTransferPaymentView: View {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 9) {
                         ForEach(["20000", "50000", "100000", "500000"], id: \.self) { value in
-                            Button("UGX \(PaymentInputFormatting.groupedWholeInput(value))") {
+                            Button("UGX \(KitMoney.amount(value, scale: 0))") {
                                 amount = value
                             }
                             .font(.caption.bold())
@@ -1335,6 +1429,14 @@ private struct BankTransferPaymentView: View {
                     )
                 }
 
+                if let requirement = topUpRequirement(for: quote) {
+                    WalletShortfallNotice(requirement: requirement) {
+                        topUpRequest = requirement
+                    }
+                    .padding(18)
+                    .kitGlass(cornerRadius: 22)
+                }
+
                 approvalControl
 
                 if let error = model.errorMessage {
@@ -1363,6 +1465,8 @@ private struct BankTransferPaymentView: View {
                             submittedOperation = operation
                             self.quote = nil
                             await app.refresh()
+                        } else {
+                            await offerTopUpIfServerFoundBalanceShort()
                         }
                     }
                 } label: {
@@ -1381,6 +1485,7 @@ private struct BankTransferPaymentView: View {
                 .buttonStyle(KitPrimaryButtonStyle())
                 .disabled(
                     model.isSubmitting || quote.isExpired || !permitted || !online
+                        || topUpRequirement(for: quote) != nil
                         || (!app.financialApprovalUsesBiometrics && pin.count != 4)
                 )
 
@@ -1426,7 +1531,7 @@ private struct BankTransferPaymentView: View {
             Text(title)
                 .foregroundStyle(emphasized ? .primary : .secondary)
             Spacer(minLength: 16)
-            Text(BankTransferDisplay.amount(value, currency: currency.code))
+            Text(BankTransferDisplay.amount(value, currency: currency))
                 .fontWeight(emphasized ? .bold : .semibold)
                 .foregroundStyle(emphasized ? KitColor.green : .primary)
                 .multilineTextAlignment(.trailing)
@@ -1480,7 +1585,7 @@ private struct BankTransferPaymentView: View {
                 Text(presentation.title)
                     .font(.largeTitle.bold())
                     .foregroundStyle(.primary)
-                Text(BankTransferDisplay.amount(operation.amount, currency: operation.currency.code))
+                Text(BankTransferDisplay.amount(operation.amount, currency: operation.currency))
                     .font(.system(size: 34, weight: .heavy, design: .rounded))
                     .foregroundStyle(.primary)
                 Text(presentation.message)
@@ -1497,14 +1602,14 @@ private struct BankTransferPaymentView: View {
                             CustomerFacingPaymentCopy.transactionFeeTitle,
                             BankTransferDisplay.amount(
                                 pricing.processingFee,
-                                currency: operation.currency.code
+                                currency: operation.currency
                             )
                         )
                         receiptRow(
                             "Total from wallet",
                             BankTransferDisplay.amount(
                                 pricing.customerDebit,
-                                currency: operation.currency.code
+                                currency: operation.currency
                             )
                         )
                         receiptRow(
@@ -1575,7 +1680,7 @@ private struct BankTransferOperationRow: View {
                     .foregroundStyle(presentation.color)
             }
             Spacer()
-            Text(BankTransferDisplay.amount(operation.amount, currency: operation.currency.code))
+            Text(BankTransferDisplay.amount(operation.amount, currency: operation.currency))
                 .font(.subheadline.bold())
                 .foregroundStyle(.primary)
         }
@@ -1617,7 +1722,7 @@ private struct BankTransferHistoryReceiptView: View {
                     Text(presentation.title)
                         .font(.largeTitle.bold())
                         .foregroundStyle(.primary)
-                    Text(BankTransferDisplay.amount(operation.amount, currency: operation.currency.code))
+                    Text(BankTransferDisplay.amount(operation.amount, currency: operation.currency))
                         .font(.system(size: 34, weight: .heavy, design: .rounded))
                         .foregroundStyle(.primary)
                     Text(presentation.message)
@@ -1639,14 +1744,14 @@ private struct BankTransferHistoryReceiptView: View {
                                 CustomerFacingPaymentCopy.transactionFeeTitle,
                                 BankTransferDisplay.amount(
                                     pricing.processingFee,
-                                    currency: operation.currency.code
+                                    currency: operation.currency
                                 )
                             )
                             receiptRow(
                                 "Total from wallet",
                                 BankTransferDisplay.amount(
                                     pricing.customerDebit,
-                                    currency: operation.currency.code
+                                    currency: operation.currency
                                 )
                             )
                             receiptRow(
@@ -1772,14 +1877,8 @@ private struct BankTransferStatusPresentation {
 }
 
 private enum BankTransferDisplay {
-    static func amount(_ value: String, currency: String) -> String {
-        let pieces = value.split(separator: ".", omittingEmptySubsequences: false)
-        let whole = String(pieces.first ?? "0")
-        let fraction = pieces.count == 2 ? String(pieces[1]) : ""
-        let display = fraction.allSatisfy { $0 == "0" }
-            ? PaymentInputFormatting.groupedWholeInput(whole)
-            : PaymentInputFormatting.groupedDecimalInput(value, maximumFractionDigits: 2)
-        return "\(currency) \(display)"
+    static func amount(_ value: String, currency: CurrencyDTO) -> String {
+        KitMoney.formatted(value, currency: currency, trimZeroFraction: true)
     }
 }
 

@@ -15,6 +15,23 @@ enum ProviderFlowEntry: String, Identifiable {
     }
 }
 
+enum ProviderAmountRangeCopy {
+    static func text(for product: ProviderProductDTO) -> String {
+        switch (product.minimumAmount, product.maximumAmount) {
+        case let (minimum?, maximum?):
+            let lowerBound = KitMoney.formatted(minimum, currency: product.currency)
+            let upperBound = KitMoney.amount(maximum, scale: product.currency.decimalScale)
+            return "Available from \(lowerBound) to \(upperBound)"
+        case let (minimum?, nil):
+            return "Minimum \(KitMoney.formatted(minimum, currency: product.currency))"
+        case let (nil, maximum?):
+            return "Maximum \(KitMoney.formatted(maximum, currency: product.currency))"
+        default:
+            return ""
+        }
+    }
+}
+
 @MainActor
 final class ProviderFlowModel: ObservableObject {
     @Published private(set) var products: [ProviderProductDTO] = []
@@ -24,6 +41,9 @@ final class ProviderFlowModel: ObservableObject {
     @Published private(set) var operationUpdates: [String: ProviderOperationDTO] = [:]
     @Published private(set) var pollingOperationIDs: Set<String> = []
     @Published var errorMessage: String?
+    /// The wallet debit the server refused for want of balance, so the screen can offer the same
+    /// top-up it would have offered had the device's own balance been current.
+    @Published var insufficientFundsDebitAmount: String?
 
     private let api: APIClient
     private var operationPollTasks: [String: Task<Void, Never>] = [:]
@@ -196,6 +216,7 @@ final class ProviderFlowModel: ObservableObject {
 
         isSubmitting = true
         errorMessage = nil
+        insufficientFundsDebitAmount = nil
         defer { isSubmitting = false }
 
         do {
@@ -207,12 +228,12 @@ final class ProviderFlowModel: ObservableObject {
             )
             let feeCopy = ProviderMoney.amountsMatch(quote.fee, "0")
                 ? "with no transaction fee"
-                : "including a \(quote.currency.code) \(quote.fee) transaction fee"
+                : "including a \(KitMoney.formatted(quote.fee, currency: quote.currency, trimZeroFraction: true)) transaction fee"
             let verification = try await authorization(
                 service.operationType,
                 binding.stepUpIntent,
                 pin,
-                "Approve the quoted total of \(quote.currency.code) \(quote.total) for \(product.customerFacingName), \(feeCopy)"
+                "Approve the quoted total of \(KitMoney.formatted(quote.total, currency: quote.currency, trimZeroFraction: true)) for \(product.customerFacingName), \(feeCopy)"
             )
             guard !verification.stepUpToken.isEmpty else {
                 throw ProviderFlowError.invalidStepUp
@@ -254,6 +275,11 @@ final class ProviderFlowModel: ObservableObject {
             return created
         } catch {
             errorMessage = message(for: error)
+            if WalletTopUpPolicy.isInsufficientFunds(error) {
+                // The total, not the amount: a balance that covers the airtime but not the
+                // transaction fee is refused all the same.
+                insufficientFundsDebitAmount = quote.total
+            }
             return nil
         }
     }
@@ -326,11 +352,15 @@ final class ProviderFlowModel: ObservableObject {
     private func amountRangeMessage(for product: ProviderProductDTO) -> String {
         switch (product.minimumAmount, product.maximumAmount) {
         case let (minimum?, maximum?):
-            "Enter an amount from \(product.currency.code) \(minimum) to \(maximum)."
+            """
+            Enter an amount from \
+            \(KitMoney.formatted(minimum, currency: product.currency, trimZeroFraction: true)) to \
+            \(KitMoney.amount(maximum, scale: product.currency.decimalScale, trimZeroFraction: true)).
+            """
         case let (minimum?, nil):
-            "The minimum is \(product.currency.code) \(minimum)."
+            "The minimum is \(KitMoney.formatted(minimum, currency: product.currency, trimZeroFraction: true))."
         case let (nil, maximum?):
-            "The maximum is \(product.currency.code) \(maximum)."
+            "The maximum is \(KitMoney.formatted(maximum, currency: product.currency, trimZeroFraction: true))."
         default:
             "That amount is not available for this provider."
         }
@@ -580,6 +610,7 @@ private struct ProviderPaymentForm: View {
     @State private var quote: ProviderQuoteDTO?
     @State private var clientReference = ""
     @State private var operation: ProviderOperationDTO?
+    @State private var topUpRequest: WalletTopUpRequirement?
 
     init(
         flow: ProviderFlowModel,
@@ -624,6 +655,64 @@ private struct ProviderPaymentForm: View {
         .onDisappear {
             if let id = operation?.id { flow.cancelOperationPolling(id: id) }
         }
+        .sheet(item: $topUpRequest) { requirement in
+            WalletTopUpView(requirement: requirement) { covered in
+                guard covered else { return }
+                WalletTopUpPresentation.afterDismissal { requoteAfterTopUp() }
+            }
+            .environmentObject(app)
+            .presentationBackground(.ultraThinMaterial)
+        }
+    }
+
+    /// Everything the wallet has to cover for this quote, or nil once it does.
+    private func topUpRequirement(for quote: ProviderQuoteDTO) -> WalletTopUpRequirement? {
+        WalletTopUpPolicy.requirement(
+            wallet: app.selectedWallet,
+            debitAPIAmount: quote.total
+        )
+    }
+
+    /// A quote reviewed before a top-up has expired by the time the money lands, so a fresh one is
+    /// fetched for the same payment — the customer comes back to a ready approval, not a blank form.
+    @MainActor
+    private func requoteAfterTopUp() {
+        guard operation == nil else { return }
+        flow.clearPaymentError()
+        pin = ""
+        Task {
+            let refreshed = await flow.createQuote(
+                service: service,
+                product: product,
+                wallet: app.selectedWallet,
+                account: account,
+                enteredAmount: amount,
+                permitted: permitted,
+                online: app.isOnline
+            )
+            guard let refreshed else {
+                // The re-quote failed, so the stale one is dropped rather than left on screen
+                // promising a total the server would now refuse.
+                resetReview()
+                return
+            }
+            quote = refreshed
+            clientReference = "ios-provider-\(UUID().uuidString.lowercased())"
+        }
+    }
+
+    /// The balance on the device can be a moment behind the ledger. When the server is the one to
+    /// find it short, the same top-up is offered rather than a bare refusal.
+    @MainActor
+    private func offerTopUpIfServerFoundBalanceShort() async {
+        guard let debit = flow.insufficientFundsDebitAmount else { return }
+        flow.insufficientFundsDebitAmount = nil
+        await app.refresh()
+        guard let requirement = WalletTopUpPolicy.requirement(
+            wallet: app.selectedWallet,
+            debitAPIAmount: debit
+        ) else { return }
+        topUpRequest = requirement
     }
 
     private var paymentEntry: some View {
@@ -743,7 +832,7 @@ private struct ProviderPaymentForm: View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 9) {
                 ForEach(["1000", "2000", "5000", "10000", "20000"], id: \.self) { value in
-                    Button(PaymentInputFormatting.groupedWholeInput(value)) {
+                    Button(KitMoney.amount(value, scale: 0)) {
                         amount = value
                         flow.clearPaymentError()
                     }
@@ -758,31 +847,14 @@ private struct ProviderPaymentForm: View {
     }
 
     private var amountField: some View {
-        TextField("Amount (\(product.currency.code))", text: Binding(
-            get: {
-                if product.requiresWholeUGXRukaPayAmount {
-                    return PaymentInputFormatting.groupedWholeInput(amount)
-                }
-                return PaymentInputFormatting.groupedDecimalInput(
-                    amount,
-                    maximumFractionDigits: Int(product.currency.scale) ?? 2
-                )
-            },
-            set: { value in
-                if product.requiresWholeUGXRukaPayAmount {
-                    if let normalized = ProviderMoney.normalizedWholeUGXInput(value) {
-                        amount = normalized
-                    }
-                } else {
-                    amount = PaymentInputFormatting.normalizedDecimalInput(
-                        value,
-                        maximumFractionDigits: Int(product.currency.scale) ?? 2
-                    )
-                }
-                flow.clearPaymentError()
-            }
-        ))
-        .keyboardType(product.requiresWholeUGXRukaPayAmount ? .numberPad : .decimalPad)
+        KitAmountTextField(
+            "Amount (\(product.currency.code))",
+            value: $amount,
+            mode: product.requiresWholeUGXRukaPayAmount
+                ? .whole
+                : .decimal(maximumFractionDigits: Int(product.currency.scale) ?? 2)
+        )
+        .onChange(of: amount) { _, _ in flow.clearPaymentError() }
         .padding(17)
         .kitGlass(cornerRadius: 18)
     }
@@ -824,6 +896,14 @@ private struct ProviderPaymentForm: View {
                     .foregroundStyle(KitColor.secondaryText)
                     .frame(maxWidth: .infinity, alignment: .leading)
 
+                if let requirement = topUpRequirement(for: quote) {
+                    WalletShortfallNotice(requirement: requirement) {
+                        topUpRequest = requirement
+                    }
+                    .padding(18)
+                    .kitGlass(cornerRadius: 22)
+                }
+
                 approvalControl
 
                 if quote.isExpired {
@@ -854,6 +934,8 @@ private struct ProviderPaymentForm: View {
                         ) {
                             operation = created
                             await app.refresh()
+                        } else {
+                            await offerTopUpIfServerFoundBalanceShort()
                         }
                     }
                 } label: {
@@ -873,6 +955,7 @@ private struct ProviderPaymentForm: View {
                 .disabled(
                     flow.isSubmitting || quote.isExpired || !permitted || !app.isOnline
                         || clientReference.isEmpty
+                        || topUpRequirement(for: quote) != nil
                         || (!app.financialApprovalUsesBiometrics && pin.count != 4)
                 )
 
@@ -992,12 +1075,7 @@ private struct ProviderPaymentForm: View {
     }
 
     private func displayAmount(_ amount: String, currency: CurrencyDTO) -> String {
-        let scale = Int(currency.scale) ?? 2
-        let grouped = PaymentInputFormatting.trimmingZeroFraction(
-            PaymentInputFormatting.groupedDecimalInput(amount, maximumFractionDigits: scale),
-            maximumFractionDigits: scale
-        )
-        return "\(currency.code) \(grouped)"
+        KitMoney.formatted(amount, currency: currency, trimZeroFraction: true)
     }
 
     private func resetReview() {
@@ -1008,12 +1086,7 @@ private struct ProviderPaymentForm: View {
     }
 
     private var productRange: String {
-        switch (product.minimumAmount, product.maximumAmount) {
-        case let (minimum?, maximum?): "Available from \(minimum) to \(maximum) \(product.currency.code)"
-        case let (minimum?, nil): "Minimum \(minimum) \(product.currency.code)"
-        case let (nil, maximum?): "Maximum \(maximum) \(product.currency.code)"
-        default: ""
-        }
+        ProviderAmountRangeCopy.text(for: product)
     }
 }
 

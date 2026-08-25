@@ -15,27 +15,50 @@ enum OutboxPolicy {
     }
 
     static func readyCommands(_ commands: [OfflineCommand], at now: Date) -> [OfflineCommand] {
-        orderedStreamHeads(commands)
+        orderedStreamHeads(commands, at: now)
             .filter { $0.nextAttemptAt <= now }
     }
 
     /// Returns the next command that can make transport progress. A secure-message row without a
     /// fanout is now an intentional offline draft: the online replay first commits fresh Signal
     /// ciphertext against the authoritative roster and then sends those exact bytes.
-    static func nextWakeDate(_ commands: [OfflineCommand]) -> Date? {
-        orderedStreamHeads(commands).lazy.map(\.nextAttemptAt).min()
+    ///
+    /// Send Later items are added back in explicitly. They are excluded from the head selection so
+    /// they cannot block the conversation, but the timer and the background task still have to be
+    /// armed for them, otherwise a scheduled message would only leave the device the next time
+    /// something else happened to wake the outbox.
+    static func nextWakeDate(_ commands: [OfflineCommand], at now: Date = Date()) -> Date? {
+        let runnable = orderedStreamHeads(commands, at: now).lazy.map(\.nextAttemptAt).min()
+        let scheduled = commands.lazy
+            .filter { $0.kind != .callAttempt && $0.isAwaitingScheduledTime(at: now) }
+            .map(\.nextAttemptAt)
+            .min()
+        switch (runnable, scheduled) {
+        case let (runnable?, scheduled?): return min(runnable, scheduled)
+        case let (runnable?, nil): return runnable
+        case let (nil, scheduled?): return scheduled
+        case (nil, nil): return nil
+        }
     }
 
     /// Only the oldest pending message in each conversation may become runnable. A newer message
     /// must not overtake an older row merely because the older row is backing off after a
     /// transport failure. Other conversations and call lifecycle commands remain independent.
+    ///
+    /// A Send Later item that has not come due is the one exception: it is waiting on the clock
+    /// rather than on the network, so holding the conversation's head slot for it would silently
+    /// freeze every message typed after it until its send time arrived. Once its minute passes it
+    /// takes part in the ordinary ordering again — by `createdAt`, so it still goes out ahead of
+    /// anything composed after it.
     private static func orderedStreamHeads(
-        _ commands: [OfflineCommand]
+        _ commands: [OfflineCommand],
+        at now: Date
     ) -> [OfflineCommand] {
         let ordered = commands
             // `.callAttempt` remains decodable only to migrate older encrypted state. New calls
             // are process-memory-only and legacy rows must never reach timers or background work.
             .filter { $0.failureDisposition == nil && $0.kind != .callAttempt }
+            .filter { !$0.isAwaitingScheduledTime(at: now) }
             .sorted {
             if $0.createdAt != $1.createdAt { return $0.createdAt < $1.createdAt }
             return $0.id.uuidString < $1.id.uuidString
@@ -167,7 +190,7 @@ enum OutboxPolicy {
         in state: inout PersistedState
     ) {
         guard let index = state.outbox.firstIndex(where: { $0.id == command.id }) else { return }
-        if command.kind == .secureMessage {
+        if command.kind == .secureMessage || command.kind == .scheduledPaymentRequest {
             state.outbox[index].failureDisposition = .requiresUserRetry
             state.outbox[index].lastFailureReason = reason
             if let messageID = command.messageId,
@@ -229,6 +252,135 @@ enum OutboxPolicy {
         return true
     }
 
+    // MARK: - Send Later
+
+    /// Commands still waiting for their send time, oldest promise first.
+    static func pendingScheduledCommands(
+        _ commands: [OfflineCommand],
+        at now: Date
+    ) -> [OfflineCommand] {
+        commands
+            .filter { $0.isAwaitingScheduledTime(at: now) }
+            .sorted {
+                if $0.nextAttemptAt != $1.nextAttemptAt { return $0.nextAttemptAt < $1.nextAttemptAt }
+                return $0.id.uuidString < $1.id.uuidString
+            }
+    }
+
+    /// Releases a scheduled item early. The command keeps its identity, its committed fanout and
+    /// its idempotency key, so this is a change of date and nothing else — the send that follows
+    /// is the same send that was scheduled, never a second one.
+    /// A command still carrying a promised time has not been sent: the send that succeeds removes
+    /// its command. Matching on that — rather than on "still waiting" — lets the same actions work
+    /// for an item whose attempt already failed and is sitting there needing a nudge.
+    private static func unsentScheduledIndex(
+        _ commandID: UUID,
+        in state: PersistedState
+    ) -> Int? {
+        state.outbox.firstIndex { $0.id == commandID && $0.scheduledAt != nil }
+    }
+
+    @discardableResult
+    static func releaseScheduledCommand(
+        _ commandID: UUID,
+        in state: inout PersistedState,
+        at now: Date
+    ) -> Bool {
+        guard let index = unsentScheduledIndex(commandID, in: state) else { return false }
+
+        state.outbox[index].failureDisposition = nil
+        state.outbox[index].lastFailureReason = nil
+        state.outbox[index].nextAttemptAt = now
+        state.outbox[index].attemptCount = 0
+        // Kept, set to now: the timeline sorts on it, and an item released early belongs at the
+        // moment it was actually released rather than back where it was composed.
+        state.outbox[index].scheduledAt = now
+        if let messageID = state.outbox[index].messageId,
+           let messageIndex = state.messages.firstIndex(where: { $0.id == messageID }) {
+            state.messages[messageIndex].scheduledAt = now
+            state.messages[messageIndex].state = .queued
+            state.messages[messageIndex].failureReason = nil
+        }
+        touchConversation(state.outbox[index].conversationId, in: &state, at: now)
+        return true
+    }
+
+    /// Moves a scheduled item to a new minute. Rejects a date that is no longer schedulable so a
+    /// stale picker cannot park an item in the past, where it would send immediately and surprise
+    /// the person who was editing the schedule.
+    @discardableResult
+    static func rescheduleCommand(
+        _ commandID: UUID,
+        to date: Date,
+        in state: inout PersistedState,
+        at now: Date
+    ) -> Bool {
+        guard ScheduledSendPolicy.isSchedulable(date, now: now) else { return false }
+        guard let index = unsentScheduledIndex(commandID, in: state) else { return false }
+
+        state.outbox[index].failureDisposition = nil
+        state.outbox[index].lastFailureReason = nil
+        state.outbox[index].attemptCount = 0
+        state.outbox[index].nextAttemptAt = date
+        state.outbox[index].scheduledAt = date
+        if let messageID = state.outbox[index].messageId,
+           let messageIndex = state.messages.firstIndex(where: { $0.id == messageID }) {
+            state.messages[messageIndex].scheduledAt = date
+        }
+        return true
+    }
+
+    /// How long a scheduled item waits when its send time arrives but the app is not authorized to
+    /// act yet. Long enough not to spin, short enough that unlocking the phone sends it promptly.
+    static let scheduledAuthorizationRecheckDelay: TimeInterval = 120
+
+    /// Pushes a due scheduled command to the next check without spending an attempt. The promised
+    /// time is deliberately left alone: it is what the sender was shown, and the item stays "not
+    /// sent yet" rather than becoming a failure that nobody asked for.
+    @discardableResult
+    static func deferScheduledCommand(
+        _ commandID: UUID,
+        in state: inout PersistedState,
+        at now: Date,
+        by delay: TimeInterval = scheduledAuthorizationRecheckDelay
+    ) -> Bool {
+        guard let index = state.outbox.firstIndex(where: { $0.id == commandID }) else { return false }
+        state.outbox[index].nextAttemptAt = now.addingTimeInterval(max(1, delay))
+        return true
+    }
+
+    /// Removes a scheduled item that has not been sent. Returns the message it was carrying so the
+    /// caller can offer the text back to the composer instead of destroying what someone wrote.
+    @discardableResult
+    static func cancelScheduledCommand(
+        _ commandID: UUID,
+        in state: inout PersistedState,
+        at now: Date
+    ) -> LocalMessage? {
+        guard let index = unsentScheduledIndex(commandID, in: state) else { return nil }
+
+        let command = state.outbox.remove(at: index)
+        guard let messageID = command.messageId,
+              let messageIndex = state.messages.firstIndex(where: { $0.id == messageID })
+        else { return nil }
+        return state.messages.remove(at: messageIndex)
+    }
+
+    /// A scheduled item must not reorder the chat list while it waits, so its conversation is only
+    /// touched when it is actually released.
+    private static func touchConversation(
+        _ conversationID: String?,
+        in state: inout PersistedState,
+        at now: Date
+    ) {
+        guard let conversationID,
+              let index = state.conversations.firstIndex(where: {
+                  $0.id.caseInsensitiveCompare(conversationID) == .orderedSame
+              })
+        else { return }
+        state.conversations[index].updatedAt = max(state.conversations[index].updatedAt, now)
+    }
+
     static func canRetryMessage(_ messageID: UUID, in commands: [OfflineCommand]) -> Bool {
         commands.contains {
             $0.kind == .secureMessage
@@ -277,7 +429,8 @@ enum OutboxPolicy {
 
         if let exchangeError = error as? SecureMessagingExchangeError {
             switch exchangeError {
-            case .retryLimitExceeded:
+            case .retryLimitExceeded, .groupCapabilityUnavailable,
+                    .reactionCapabilityUnavailable:
                 return .retry(after: nil)
             case .invalidAccount:
                 return .permanent

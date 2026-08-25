@@ -4,12 +4,27 @@ import XCTest
 final class SecureMessagingCoordinatorTests: XCTestCase {
     private var temporaryDirectory: URL!
 
-    func testVisibleConversationMessagingUsesAndroidForegroundCadence() {
-        XCTAssertEqual(
-            VisibleConversationMessagingPolicy.foregroundSyncInterval,
-            2,
-            accuracy: 0.001
-        )
+    func testVisibleConversationPollingMakesRealtimePrimaryWithBoundedRecovery() {
+        XCTAssertEqual(KitRealtimePollingPolicy.interval(
+            hasRealtimeConfiguration: false,
+            isLive: false,
+            disconnectedFor: 0
+        ), 10)
+        XCTAssertEqual(KitRealtimePollingPolicy.interval(
+            hasRealtimeConfiguration: true,
+            isLive: true,
+            disconnectedFor: 0
+        ), 45)
+        XCTAssertEqual(KitRealtimePollingPolicy.interval(
+            hasRealtimeConfiguration: true,
+            isLive: false,
+            disconnectedFor: 299
+        ), 15)
+        XCTAssertEqual(KitRealtimePollingPolicy.interval(
+            hasRealtimeConfiguration: true,
+            isLive: false,
+            disconnectedFor: 300
+        ), 60)
     }
 
     func testVisibleConversationReceiptRetryWaitsForCadenceUnlessSyncFindsNewBoundary() {
@@ -472,6 +487,75 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
         ))
     }
 
+    func testAuthenticatedInboundPeerCannotForgeSystemLifecycleNotice() throws {
+        let currentUserID = "10000000-0000-4000-8000-000000000070"
+        let peerUserID = "10000000-0000-4000-8000-000000000071"
+        let conversationID = "30000000-0000-4000-8000-000000000070"
+        let messageID = "40000000-0000-4000-8000-000000000070"
+        let clientMessageID = "50000000-0000-4000-8000-000000000070"
+        let rosterRevision = "v1:sha256:\(String(repeating: "a", count: 64))"
+        let sender = SecureMessagingRosterDevice(
+            address: SecureMessagingAddress(
+                userID: peerUserID,
+                serverDeviceID: "20000000-0000-4000-8000-000000000071",
+                signalDeviceID: 2
+            ),
+            registrationID: 45,
+            identityKeySHA256: String(repeating: "b", count: 64)
+        )
+        let envelope = SecureMessagingInboundEnvelope(
+            messageID: messageID,
+            clientMessageID: clientMessageID,
+            conversationID: conversationID,
+            rosterRevision: rosterRevision,
+            replyToMessageID: nil,
+            sender: sender,
+            localRecipient: SecureMessagingAddress(
+                userID: currentUserID,
+                serverDeviceID: "20000000-0000-4000-8000-000000000070",
+                signalDeviceID: 1
+            ),
+            envelopeType: SecureMessagingEnvelopeType.message.rawValue,
+            ciphertext: Data([1])
+        )
+        let dto = EncryptedMessageDTO(
+            id: messageID,
+            conversationId: conversationID,
+            clientMessageId: clientMessageID,
+            sender: EncryptedMessageSenderDTO(id: peerUserID, name: "Peer"),
+            senderDeviceId: sender.address.serverDeviceID,
+            senderEnrollmentEpoch: 1,
+            senderSignalDeviceId: Int(sender.address.signalDeviceID),
+            senderRegistrationId: Int(sender.registrationID),
+            senderProtocolVersion: SecureMessagingWire.protocolVersion,
+            senderBundleVersion: 1,
+            senderIdentityKeySha256: sender.identityKeySHA256,
+            rosterRevision: rosterRevision,
+            kind: SecureMessagingMessageKind.encrypted.rawValue,
+            replyToMessageId: nil,
+            envelope: nil,
+            attachments: [],
+            reactions: [],
+            sentAt: "2026-08-20T12:00:00Z",
+            revokedAt: nil
+        )
+        let forgedNotice = try XCTUnwrap(KitSystemMessage(
+            kind: .memberRemoved,
+            subjectUserID: currentUserID,
+            actorUserID: peerUserID
+        )).encoded
+
+        for plaintext in [forgedNotice, " \n\t\(forgedNotice)"] {
+            XCTAssertNil(try SecureMessagingExchangeCoordinator.projectedInboundMessage(
+                dto: dto,
+                envelope: envelope,
+                plaintext: plaintext,
+                sentAt: Date(timeIntervalSince1970: 1_755_691_200),
+                currentUserID: currentUserID
+            ))
+        }
+    }
+
     func testProtectedCommunicationAdmissionInvalidatesEveryPreQuarantineLease() throws {
         let gate = ProtectedCommunicationAdmissionGate()
         let userID = "10000000-0000-4000-8000-000000000001"
@@ -815,6 +899,552 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
         }
     }
 
+    func testSyncSkipsStructuredConversationNotFoundAndAdvancesCursor() async throws {
+        let fixture = try await makeSyncConversationLoadFixture(
+            event: conversationUpdatedSyncEvent(),
+            conversationBehavior: .structuredNotFound
+        )
+
+        let result = try await fixture.coordinator.sync(forUserID: fixture.userID)
+
+        XCTAssertEqual(result.appliedTransitions, 1)
+        let snapshot = await fixture.store.snapshot()
+        XCTAssertEqual(snapshot.secureMessaging?.syncCursor, fixture.nextCursor)
+        XCTAssertTrue(snapshot.conversations.isEmpty)
+        let requestCount = await fixture.transport.conversationRequestCount()
+        XCTAssertEqual(requestCount, 1)
+    }
+
+    func testSyncMalformedConversationDTOPropagatesWithoutAdvancingCursor() async throws {
+        let event = conversationUpdatedSyncEvent()
+        let fixture = try await makeSyncConversationLoadFixture(
+            event: event,
+            conversationBehavior: .response(syncConversationDTO(type: "channel"))
+        )
+
+        do {
+            _ = try await fixture.coordinator.sync(forUserID: fixture.userID)
+            XCTFail("An unsupported conversation projection must retain the sync cursor")
+        } catch let error as SecureMessagingExchangeError {
+            XCTAssertEqual(error, .invalidConversation)
+        }
+
+        let snapshot = await fixture.store.snapshot()
+        XCTAssertNil(snapshot.secureMessaging?.syncCursor)
+        XCTAssertTrue(snapshot.conversations.isEmpty)
+    }
+
+    func testSyncConversationTransport503PropagatesWithoutAdvancingCursor() async throws {
+        let fixture = try await makeSyncConversationLoadFixture(
+            event: conversationUpdatedSyncEvent(),
+            conversationBehavior: .temporaryUnavailable
+        )
+
+        do {
+            _ = try await fixture.coordinator.sync(forUserID: fixture.userID)
+            XCTFail("A temporary conversation load failure must retain the sync cursor")
+        } catch let error as APIErrorPayload {
+            XCTAssertEqual(error.code, "MESSAGING_TEMPORARILY_UNAVAILABLE")
+            XCTAssertEqual(error.httpStatus, 503)
+        }
+
+        let snapshot = await fixture.store.snapshot()
+        XCTAssertNil(snapshot.secureMessaging?.syncCursor)
+    }
+
+    func testSyncUnstructuredConversation404PropagatesWithoutAdvancingCursor() async throws {
+        let fixture = try await makeSyncConversationLoadFixture(
+            event: conversationUpdatedSyncEvent(),
+            conversationBehavior: .unstructuredNotFound
+        )
+
+        do {
+            _ = try await fixture.coordinator.sync(forUserID: fixture.userID)
+            XCTFail("An unstructured 404 must not be mistaken for inactive membership")
+        } catch APIClientError.httpResponse(let status, let retryAfter) {
+            XCTAssertEqual(status, 404)
+            XCTAssertNil(retryAfter)
+        }
+
+        let snapshot = await fixture.store.snapshot()
+        XCTAssertNil(snapshot.secureMessaging?.syncCursor)
+    }
+
+    func testSyncRejectsMismatchedConversationEventResourceWithoutLoading() async throws {
+        var event = conversationUpdatedSyncEvent()
+        event["resource_type"] = "message"
+        let fixture = try await makeSyncConversationLoadFixture(
+            event: event,
+            conversationBehavior: .unexpected
+        )
+
+        do {
+            _ = try await fixture.coordinator.sync(forUserID: fixture.userID)
+            XCTFail("A conversation event must bind its resource to the conversation")
+        } catch let error as SecureMessagingExchangeError {
+            XCTAssertEqual(error, .invalidServerResponse)
+        }
+
+        let snapshot = await fixture.store.snapshot()
+        XCTAssertNil(snapshot.secureMessaging?.syncCursor)
+        let requestCount = await fixture.transport.conversationRequestCount()
+        XCTAssertEqual(requestCount, 0)
+    }
+
+    func testSyncSkipsMessageForStructuredMissingConversation() async throws {
+        let fixture = try await makeSyncConversationLoadFixture(
+            event: messageCreatedSyncEvent(),
+            conversationBehavior: .structuredNotFound
+        )
+
+        let result = try await fixture.coordinator.sync(forUserID: fixture.userID)
+
+        XCTAssertEqual(result.receivedMessages, 0)
+        let snapshot = await fixture.store.snapshot()
+        XCTAssertEqual(snapshot.secureMessaging?.syncCursor, fixture.nextCursor)
+        XCTAssertTrue(snapshot.conversations.isEmpty)
+        XCTAssertTrue(snapshot.messages.isEmpty)
+        XCTAssertTrue(snapshot.secureMessaging?.pendingDeliveryAcknowledgementIDs.isEmpty == true)
+    }
+
+    func testOlderRenameResponseCannotOverwriteNewerSyncedGroupProjection() async throws {
+        let fixture = try await makeGroupRenameFixture(fails: false)
+        let rename = Task {
+            try await fixture.coordinator.renameGroupConversation(
+                forUserID: fixture.userID,
+                conversationID: fixture.conversationID,
+                title: "Requested rename"
+            )
+        }
+        try await fixture.transport.waitUntilRenameStarted()
+
+        let newer = Conversation(
+            id: fixture.conversationID,
+            title: "Newer synced title",
+            participantUserIds: [fixture.userID, fixture.peerUserID, fixture.thirdUserID],
+            unreadCount: 7,
+            updatedAt: fixture.responseUpdatedAt.addingTimeInterval(60),
+            conversationType: SecureMessagingWire.groupConversationType,
+            groupMemberRoles: [
+                fixture.userID: .owner,
+                fixture.peerUserID: .admin,
+                fixture.thirdUserID: .member,
+            ]
+        )
+        try await fixture.store.update { state in
+            state.conversations = [newer]
+            state.groupProjectionUpdatedAt = [
+                fixture.conversationID: newer.updatedAt,
+            ]
+        }
+
+        await fixture.transport.releaseRename()
+        let committed = try await rename.value
+
+        XCTAssertEqual(committed, newer)
+        let snapshot = await fixture.store.snapshot()
+        XCTAssertEqual(snapshot.conversations, [newer])
+    }
+
+    func testCurrentRenameResponseAtomicallyReplacesGroupProjection() async throws {
+        let fixture = try await makeGroupRenameFixture(fails: false)
+        let rename = Task {
+            try await fixture.coordinator.renameGroupConversation(
+                forUserID: fixture.userID,
+                conversationID: fixture.conversationID,
+                title: "Requested rename"
+            )
+        }
+        try await fixture.transport.waitUntilRenameStarted()
+        await fixture.transport.releaseRename()
+
+        let committed = try await rename.value
+        XCTAssertEqual(committed.title, "Requested rename")
+        XCTAssertEqual(committed.participantUserIds, [fixture.userID, fixture.peerUserID])
+        XCTAssertEqual(committed.unreadCount, fixture.initialConversation.unreadCount)
+        XCTAssertEqual(committed.updatedAt, fixture.responseUpdatedAt)
+        let snapshot = await fixture.store.snapshot()
+        XCTAssertEqual(snapshot.conversations, [committed])
+        XCTAssertEqual(
+            snapshot.groupProjectionUpdatedAt?[fixture.conversationID],
+            fixture.responseUpdatedAt
+        )
+    }
+
+    func testFailedRenameDoesNotOptimisticallyChangeGroupProjection() async throws {
+        let fixture = try await makeGroupRenameFixture(fails: true)
+        let rename = Task {
+            try await fixture.coordinator.renameGroupConversation(
+                forUserID: fixture.userID,
+                conversationID: fixture.conversationID,
+                title: "Requested rename"
+            )
+        }
+        try await fixture.transport.waitUntilRenameStarted()
+
+        var snapshot = await fixture.store.snapshot()
+        XCTAssertEqual(snapshot.conversations, [fixture.initialConversation])
+
+        await fixture.transport.releaseRename()
+        do {
+            _ = try await rename.value
+            XCTFail("A failed mutation must not commit its requested title")
+        } catch is SuspendedGroupRenameTransport.Failure {
+            // Expected.
+        }
+
+        snapshot = await fixture.store.snapshot()
+        XCTAssertEqual(snapshot.conversations, [fixture.initialConversation])
+        XCTAssertNil(snapshot.groupProjectionUpdatedAt)
+    }
+
+    func testOlderSyncProjectionCannotOverwriteNewerGroupMutation() async throws {
+        let newerUpdatedAt = try XCTUnwrap(
+            ISO8601DateFormatter().date(from: "2026-08-24T12:01:00Z")
+        )
+        let newer = Conversation(
+            id: syncConversationID,
+            title: "Newer mutation title",
+            participantUserIds: [syncUserID],
+            unreadCount: 4,
+            updatedAt: newerUpdatedAt,
+            conversationType: SecureMessagingWire.groupConversationType,
+            groupMemberRoles: [syncUserID: .owner]
+        )
+        let fixture = try await makeSyncConversationLoadFixture(
+            event: conversationUpdatedSyncEvent(),
+            conversationBehavior: .response(syncConversationDTO(
+                type: SecureMessagingWire.groupConversationType,
+                title: "Older synced title"
+            )),
+            localConversations: [newer],
+            groupProjectionUpdatedAt: [syncConversationID: newerUpdatedAt]
+        )
+
+        _ = try await fixture.coordinator.sync(forUserID: fixture.userID)
+
+        let snapshot = await fixture.store.snapshot()
+        XCTAssertEqual(snapshot.conversations, [newer])
+        XCTAssertEqual(
+            snapshot.groupProjectionUpdatedAt?[syncConversationID],
+            newerUpdatedAt
+        )
+        XCTAssertEqual(snapshot.secureMessaging?.syncCursor, fixture.nextCursor)
+    }
+
+    func testSyncSelfMemberAddedMaterializesGroup() async throws {
+        let fixture = try await makeSyncConversationLoadFixture(
+            event: memberAddedSyncEvent(subjectUserID: syncUserID),
+            conversationBehavior: .response(syncConversationDTO(
+                type: SecureMessagingWire.groupConversationType
+            ))
+        )
+
+        _ = try await fixture.coordinator.sync(forUserID: fixture.userID)
+
+        let snapshot = await fixture.store.snapshot()
+        XCTAssertEqual(snapshot.secureMessaging?.syncCursor, fixture.nextCursor)
+        XCTAssertEqual(snapshot.conversations.map(\.id), [fixture.conversationID])
+        XCTAssertTrue(snapshot.conversations.first?.isGroup == true)
+        XCTAssertEqual(snapshot.messages.count, 1)
+        let requestCount = await fixture.transport.conversationRequestCount()
+        XCTAssertEqual(requestCount, 1)
+    }
+
+    func testSyncMissingSelfMemberAddDoesNotReenableRetainedGroup() async throws {
+        let retained = Conversation(
+            id: syncConversationID,
+            title: "Weekend Trip",
+            participantUserIds: [
+                syncPeerUserID,
+                "10000000-0000-4000-8000-000000000103",
+            ],
+            unreadCount: 0,
+            updatedAt: Date(timeIntervalSince1970: 1_777_200_000),
+            conversationType: SecureMessagingWire.groupConversationType
+        )
+        let fixture = try await makeSyncConversationLoadFixture(
+            event: memberAddedSyncEvent(subjectUserID: syncUserID),
+            conversationBehavior: .structuredNotFound,
+            localConversations: [retained]
+        )
+
+        _ = try await fixture.coordinator.sync(forUserID: fixture.userID)
+
+        let snapshot = await fixture.store.snapshot()
+        XCTAssertEqual(snapshot.secureMessaging?.syncCursor, fixture.nextCursor)
+        XCTAssertEqual(snapshot.conversations, [retained])
+        XCTAssertTrue(snapshot.messages.isEmpty)
+        let requestCount = await fixture.transport.conversationRequestCount()
+        XCTAssertEqual(requestCount, 1)
+    }
+
+    func testSyncNonSelfMemberAddedDoesNotResurrectMissingLocalGroup() async throws {
+        let fixture = try await makeSyncConversationLoadFixture(
+            event: memberAddedSyncEvent(subjectUserID: syncPeerUserID),
+            conversationBehavior: .unexpected
+        )
+
+        _ = try await fixture.coordinator.sync(forUserID: fixture.userID)
+
+        let snapshot = await fixture.store.snapshot()
+        XCTAssertEqual(snapshot.secureMessaging?.syncCursor, fixture.nextCursor)
+        XCTAssertTrue(snapshot.conversations.isEmpty)
+        XCTAssertTrue(snapshot.messages.isEmpty)
+        let requestCount = await fixture.transport.conversationRequestCount()
+        XCTAssertEqual(requestCount, 0)
+    }
+
+    func testMembershipRoleChangeRefreshesAuthoritativeGroupProjection() async throws {
+        let retained = Conversation(
+            id: syncConversationID,
+            title: "Old title",
+            participantUserIds: [syncUserID, syncPeerUserID],
+            unreadCount: 4,
+            updatedAt: Date(timeIntervalSince1970: 1_777_200_000),
+            conversationType: SecureMessagingWire.groupConversationType,
+            groupMemberRoles: [syncUserID: .owner, syncPeerUserID: .member]
+        )
+        let fixture = try await makeSyncConversationLoadFixture(
+            event: memberRoleChangedSyncEvent(subjectUserID: syncPeerUserID, role: "admin"),
+            conversationBehavior: .response(syncConversationDTO(
+                type: SecureMessagingWire.groupConversationType,
+                title: "Current title",
+                peerRole: "admin"
+            )),
+            localConversations: [retained]
+        )
+
+        _ = try await fixture.coordinator.sync(forUserID: fixture.userID)
+
+        let snapshot = await fixture.store.snapshot()
+        XCTAssertEqual(snapshot.secureMessaging?.syncCursor, fixture.nextCursor)
+        XCTAssertEqual(snapshot.conversations.first?.title, "Current title")
+        XCTAssertEqual(snapshot.conversations.first?.unreadCount, 4)
+        XCTAssertEqual(snapshot.conversations.first?.updatedAt, retained.updatedAt)
+        XCTAssertEqual(snapshot.conversations.first?.groupRole(for: syncPeerUserID), .admin)
+        XCTAssertEqual(
+            snapshot.groupProjectionUpdatedAt?[syncConversationID],
+            ISO8601DateFormatter().date(from: "2026-08-24T12:00:00Z")
+        )
+        XCTAssertTrue(snapshot.messages.isEmpty)
+        let roleChangeRequestCount = await fixture.transport.conversationRequestCount()
+        XCTAssertEqual(roleChangeRequestCount, 1)
+    }
+
+    func testDelayedSelfAddThenPromotionUsesCurrentAuthoritativeRole() async throws {
+        let fixture = try await makeSyncConversationLoadFixture(
+            events: [
+                memberAddedSyncEvent(
+                    subjectUserID: syncUserID,
+                    role: "member",
+                    eventID: "106"
+                ),
+                memberRoleChangedSyncEvent(
+                    subjectUserID: syncUserID,
+                    role: "admin",
+                    eventID: "107"
+                ),
+            ],
+            conversationBehavior: .response(syncConversationDTO(
+                type: SecureMessagingWire.groupConversationType,
+                localRole: "admin"
+            ))
+        )
+
+        _ = try await fixture.coordinator.sync(forUserID: fixture.userID)
+
+        let snapshot = await fixture.store.snapshot()
+        XCTAssertEqual(snapshot.conversations.first?.groupRole(for: syncUserID), .admin)
+        XCTAssertEqual(snapshot.messages.count, 1)
+        let requestCount = await fixture.transport.conversationRequestCount()
+        XCTAssertEqual(requestCount, 1)
+    }
+
+    func testDelayedRoleChangeThenRemovalKeepsLatestServerRoster() async throws {
+        let retained = Conversation(
+            id: syncConversationID,
+            title: "Old title",
+            participantUserIds: [syncUserID, syncPeerUserID],
+            unreadCount: 2,
+            updatedAt: Date(timeIntervalSince1970: 1_777_200_000),
+            conversationType: SecureMessagingWire.groupConversationType,
+            groupMemberRoles: [syncUserID: .owner, syncPeerUserID: .member]
+        )
+        let fixture = try await makeSyncConversationLoadFixture(
+            events: [
+                memberRoleChangedSyncEvent(
+                    subjectUserID: syncPeerUserID,
+                    role: "admin",
+                    eventID: "108"
+                ),
+                memberRemovedSyncEvent(subjectUserID: syncPeerUserID, eventID: "109"),
+            ],
+            conversationBehavior: .response(syncConversationDTO(
+                type: SecureMessagingWire.groupConversationType,
+                title: "Current title",
+                includePeer: false
+            )),
+            localConversations: [retained]
+        )
+
+        _ = try await fixture.coordinator.sync(forUserID: fixture.userID)
+
+        let snapshot = await fixture.store.snapshot()
+        XCTAssertEqual(snapshot.conversations.first?.title, "Current title")
+        XCTAssertEqual(snapshot.conversations.first?.participantUserIds, [syncUserID])
+        XCTAssertNil(snapshot.conversations.first?.groupRole(for: syncPeerUserID))
+        XCTAssertEqual(snapshot.conversations.first?.unreadCount, 2)
+        XCTAssertEqual(snapshot.messages.count, 1)
+    }
+
+    func testDelayedRoleChangesConvergeToCurrentServerRole() async throws {
+        let retained = Conversation(
+            id: syncConversationID,
+            title: "Weekend Trip",
+            participantUserIds: [syncUserID, syncPeerUserID],
+            unreadCount: 0,
+            updatedAt: Date(timeIntervalSince1970: 1_777_200_000),
+            conversationType: SecureMessagingWire.groupConversationType,
+            groupMemberRoles: [syncUserID: .owner, syncPeerUserID: .member]
+        )
+        let fixture = try await makeSyncConversationLoadFixture(
+            events: [
+                memberRoleChangedSyncEvent(
+                    subjectUserID: syncPeerUserID,
+                    role: "admin",
+                    eventID: "110"
+                ),
+                memberRoleChangedSyncEvent(
+                    subjectUserID: syncPeerUserID,
+                    role: "member",
+                    eventID: "111"
+                ),
+            ],
+            conversationBehavior: .response(syncConversationDTO(
+                type: SecureMessagingWire.groupConversationType,
+                peerRole: "member"
+            )),
+            localConversations: [retained]
+        )
+
+        _ = try await fixture.coordinator.sync(forUserID: fixture.userID)
+
+        let snapshot = await fixture.store.snapshot()
+        XCTAssertEqual(snapshot.conversations.first?.groupRole(for: syncPeerUserID), .member)
+        let requestCount = await fixture.transport.conversationRequestCount()
+        XCTAssertEqual(requestCount, 2)
+    }
+
+    func testMembershipRemovalUpdatesRosterWithoutGroupRolloutAdmission() async throws {
+        let retained = Conversation(
+            id: syncConversationID,
+            title: "Weekend Trip",
+            participantUserIds: [syncUserID, syncPeerUserID],
+            unreadCount: 0,
+            updatedAt: Date(timeIntervalSince1970: 1_777_200_000),
+            conversationType: SecureMessagingWire.groupConversationType,
+            groupMemberRoles: [syncUserID: .owner, syncPeerUserID: .member]
+        )
+        let fixture = try await makeSyncConversationLoadFixture(
+            event: memberRemovedSyncEvent(subjectUserID: syncPeerUserID),
+            conversationBehavior: .unexpected,
+            localConversations: [retained]
+        )
+
+        _ = try await fixture.coordinator.sync(forUserID: fixture.userID)
+
+        let snapshot = await fixture.store.snapshot()
+        XCTAssertEqual(snapshot.conversations.first?.participantUserIds, [syncUserID])
+        XCTAssertNil(snapshot.conversations.first?.groupRole(for: syncPeerUserID))
+        XCTAssertEqual(snapshot.messages.count, 1)
+        let removalRequestCount = await fixture.transport.conversationRequestCount()
+        XCTAssertEqual(removalRequestCount, 0)
+    }
+
+    func testRemoteSelfRemovalAbandonsQueuedGroupCommandsAndClearsFanout() async throws {
+        let retained = Conversation(
+            id: syncConversationID,
+            title: "Weekend Trip",
+            participantUserIds: [syncUserID, syncPeerUserID],
+            unreadCount: 0,
+            updatedAt: Date(timeIntervalSince1970: 1_777_200_000),
+            conversationType: SecureMessagingWire.groupConversationType,
+            groupMemberRoles: [syncUserID: .owner, syncPeerUserID: .member]
+        )
+        let fixture = try await makeSyncConversationLoadFixture(
+            event: memberRemovedSyncEvent(subjectUserID: syncUserID),
+            conversationBehavior: .unexpected,
+            localConversations: [retained]
+        )
+        let messageID = UUID(uuidString: "80000000-0000-4000-8000-000000000101")!
+        let createdAt = Date(timeIntervalSince1970: 1_777_200_001)
+        let fanout = SecureMessagingCommittedFanout(
+            clientMessageID: messageID.uuidString.lowercased(),
+            conversationID: syncConversationID,
+            rosterRevision: "v1:sha256:" + String(repeating: "a", count: 64),
+            replyToMessageID: nil,
+            rosterDevices: [],
+            envelopes: []
+        )
+        try await fixture.store.update { state in
+            state.messages = [LocalMessage(
+                id: messageID,
+                conversationId: syncConversationID,
+                senderId: syncUserID,
+                body: "Queued before removal",
+                createdAt: createdAt,
+                sentAt: nil,
+                state: .queued,
+                failureReason: nil,
+                isOutgoing: true
+            )]
+            state.outbox = [OfflineCommand(
+                id: UUID(uuidString: "90000000-0000-4000-8000-000000000101")!,
+                kind: .secureMessage,
+                createdAt: createdAt,
+                nextAttemptAt: createdAt,
+                attemptCount: 0,
+                conversationId: syncConversationID,
+                messageId: messageID,
+                recipientUserIds: [syncPeerUserID],
+                recipientName: "Weekend Trip",
+                video: nil,
+                expiresAt: nil,
+                secureMessageFanout: fanout
+            )]
+        }
+
+        _ = try await fixture.coordinator.sync(forUserID: fixture.userID)
+
+        let snapshot = await fixture.store.snapshot()
+        XCTAssertEqual(snapshot.conversations.first?.participantUserIds, [syncPeerUserID])
+        XCTAssertTrue(snapshot.outbox.isEmpty)
+        XCTAssertEqual(snapshot.messages.first?.state, .failed)
+        XCTAssertEqual(
+            snapshot.messages.first?.failureReason,
+            "You left this group before this message was sent."
+        )
+    }
+
+    func testLegacyConversationMemberEventNameDoesNotAdvanceCursor() async throws {
+        var event = memberAddedSyncEvent(subjectUserID: syncPeerUserID)
+        event["type"] = "conversation.member.added"
+        let fixture = try await makeSyncConversationLoadFixture(
+            event: event,
+            conversationBehavior: .unexpected
+        )
+
+        do {
+            _ = try await fixture.coordinator.sync(forUserID: fixture.userID)
+            XCTFail("An obsolete membership event name must fail closed")
+        } catch let error as SecureMessagingExchangeError {
+            XCTAssertEqual(error, .unsupportedEvent("conversation.member.added"))
+        }
+        let snapshot = await fixture.store.snapshot()
+        XCTAssertNil(snapshot.secureMessaging?.syncCursor)
+    }
+
     func testMessagingWakeAcceptsOnlyTheOpaqueBackendShape() throws {
         let notificationID = "50000000-0000-0000-0000-000000000001"
         let backgroundAPS: [AnyHashable: Any] = [
@@ -1051,6 +1681,162 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
             abs(restoredConversation.updatedAt.timeIntervalSince(conversation.updatedAt)),
             1
         )
+    }
+
+    func testDeferredReactionDoesNotAdvanceConversationActivity() async throws {
+        let localUserID = "10000000-0000-0000-0000-000000000019"
+        let recipientUserID = "10000000-0000-0000-0000-000000000020"
+        let conversationID = "30000000-0000-0000-0000-000000000019"
+        let targetMessageID = "40000000-0000-0000-0000-000000000019"
+        let originalDate = Date(timeIntervalSince1970: 1_700_000_000)
+        let store = try await makeStore(userID: localUserID)
+        var crypto = SecureMessagingPersistentState.empty
+        crypto.enrollment = raceEnrollment(
+            userID: localUserID,
+            serverDeviceID: "20000000-0000-4000-8000-000000000019"
+        )
+        try await store.update { state in
+            state.communicationOwnerUserID = localUserID
+            state.secureMessaging = crypto
+            state.conversations = [Conversation(
+                id: conversationID,
+                title: "ExampleContact",
+                participantUserIds: [localUserID, recipientUserID],
+                unreadCount: 0,
+                updatedAt: originalDate
+            )]
+            state.messages = [LocalMessage(
+                id: UUID(),
+                serverMessageId: targetMessageID,
+                conversationId: conversationID,
+                senderId: recipientUserID,
+                body: "Original message",
+                createdAt: originalDate,
+                sentAt: originalDate,
+                state: .received,
+                failureReason: nil,
+                isOutgoing: false
+            )]
+        }
+        let coordinator = SecureMessagingExchangeCoordinator(
+            transport: OfflineExchangeTransport(),
+            store: store,
+            engine: SecureMessagingCryptoEngine(),
+            provisioningPreKeyCount: 1
+        )
+        let reaction = try XCTUnwrap(KitMessageReaction(
+            operation: .add,
+            targetServerMessageID: targetMessageID,
+            emoji: "👍"
+        ))
+
+        _ = try await coordinator.queueDeferredText(
+            forUserID: localUserID,
+            conversationID: conversationID,
+            expectedRecipientUserID: recipientUserID,
+            title: "ExampleContact",
+            text: reaction.encoded
+        )
+
+        let snapshot = await store.snapshot()
+        XCTAssertEqual(snapshot.conversations.first?.updatedAt, originalDate)
+        XCTAssertTrue(snapshot.messages.contains(where: { $0.body == reaction.encoded }))
+    }
+
+    func testGroupDeferredTextQueuesForEveryOtherMemberAndFailsClosedElsewhere() async throws {
+        let localUserID = "10000000-0000-0000-0000-000000000031"
+        let memberB = "10000000-0000-0000-0000-000000000032"
+        let memberC = "10000000-0000-0000-0000-000000000033"
+        let groupConversationID = "30000000-0000-0000-0000-000000000031"
+        let directConversationID = "30000000-0000-0000-0000-000000000032"
+        let store = try await makeStore(userID: localUserID)
+        var crypto = SecureMessagingPersistentState.empty
+        crypto.enrollment = SecureMessagingEnrollmentBinding(
+            userID: localUserID,
+            serverDeviceID: "20000000-0000-0000-0000-000000000031",
+            signalDeviceID: 1,
+            registrationID: 42,
+            enrollmentEpoch: 1,
+            identityKeySHA256: String(repeating: "a", count: 64),
+            bundleVersion: 1,
+            signedPreKeyID: 5,
+            signedPreKeySHA256: String(repeating: "b", count: 64),
+            pqLastResortPreKeyID: 6,
+            pqLastResortPreKeySHA256: String(repeating: "c", count: 64)
+        )
+        try await store.update { state in
+            state.communicationOwnerUserID = localUserID
+            state.secureMessaging = crypto
+            state.conversations = [
+                Conversation(
+                    id: groupConversationID,
+                    title: "Weekend Trip",
+                    participantUserIds: [localUserID, memberB, memberC],
+                    unreadCount: 0,
+                    updatedAt: Date(timeIntervalSince1970: 1_700_000_000),
+                    conversationType: SecureMessagingWire.groupConversationType
+                ),
+                Conversation(
+                    id: directConversationID,
+                    title: "ExampleContact",
+                    participantUserIds: [localUserID, memberB],
+                    unreadCount: 0,
+                    updatedAt: Date(timeIntervalSince1970: 1_700_000_000)
+                ),
+            ]
+        }
+        let transport = OfflineExchangeTransport()
+        let coordinator = SecureMessagingExchangeCoordinator(
+            transport: transport,
+            store: store,
+            engine: SecureMessagingCryptoEngine(),
+            provisioningPreKeyCount: 1
+        )
+
+        let result = try await coordinator.queueDeferredText(
+            forUserID: localUserID,
+            conversationID: groupConversationID,
+            expectedRecipientUserID: nil,
+            title: "Weekend Trip",
+            text: "hello group"
+        )
+        let snapshot = await store.snapshot()
+        let command = try XCTUnwrap(snapshot.outbox.first)
+        XCTAssertEqual(result.conversation.id, groupConversationID)
+        XCTAssertEqual(command.conversationId, groupConversationID)
+        XCTAssertEqual(command.recipientUserIds, [memberB, memberC].sorted())
+        let transportCallCount = await transport.networkCallCount()
+        XCTAssertEqual(transportCallCount, 0)
+
+        // A nil recipient into a DIRECT thread fails closed…
+        do {
+            _ = try await coordinator.queueDeferredText(
+                forUserID: localUserID,
+                conversationID: directConversationID,
+                expectedRecipientUserID: nil,
+                title: "ExampleContact",
+                text: "must not queue"
+            )
+            XCTFail("A direct thread must always pin its single recipient")
+        } catch let error as SecureMessagingExchangeError {
+            XCTAssertEqual(error, .invalidConversation)
+        }
+        // …and a pinned direct recipient into a GROUP thread fails closed too.
+        do {
+            _ = try await coordinator.queueDeferredText(
+                forUserID: localUserID,
+                conversationID: groupConversationID,
+                expectedRecipientUserID: memberB,
+                title: "Weekend Trip",
+                text: "must not queue"
+            )
+            XCTFail("A group thread has no single pinned recipient")
+        } catch let error as SecureMessagingExchangeError {
+            XCTAssertEqual(error, .invalidConversation)
+        }
+        let finalSnapshot = await store.snapshot()
+        XCTAssertEqual(finalSnapshot.messages.count, 1)
+        XCTAssertEqual(finalSnapshot.outbox.count, 1)
     }
 
     func testFailedDurableQueueKeepsDraftAndDoesNotCreateMessageOrOutboxCommand() async throws {
@@ -2406,6 +3192,193 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
         XCTAssertTrue(completed.historyBackfillTasks.isEmpty)
     }
 
+    func testHistoricalGroupRosterPolicyAllowsMembershipChurnButCurrentRosterStaysExact() {
+        let currentUserID = "10000000-0000-4000-8000-000000000081"
+        let departedUserID = "10000000-0000-4000-8000-000000000082"
+        let addedUserID = "10000000-0000-4000-8000-000000000083"
+        let historicalMembers: Set<String> = [currentUserID, departedUserID]
+        let currentMembers: Set<String> = [currentUserID, addedUserID]
+
+        XCTAssertTrue(SecureMessagingMapper.rosterMembershipIsValid(
+            historicalMembers,
+            use: .historical,
+            currentUserID: currentUserID,
+            expectedCurrentMemberUserIDs: currentMembers,
+            allowHistoricalGroupMembershipChurn: true
+        ))
+        XCTAssertFalse(SecureMessagingMapper.rosterMembershipIsValid(
+            historicalMembers,
+            use: .historical,
+            currentUserID: currentUserID,
+            expectedCurrentMemberUserIDs: currentMembers,
+            allowHistoricalGroupMembershipChurn: false
+        ), "A direct conversation's historical roster must remain exact")
+        XCTAssertFalse(SecureMessagingMapper.rosterMembershipIsValid(
+            historicalMembers,
+            use: .current,
+            currentUserID: currentUserID,
+            expectedCurrentMemberUserIDs: currentMembers,
+            allowHistoricalGroupMembershipChurn: true
+        ), "The group-history allowance must never relax a live fanout roster")
+        XCTAssertFalse(SecureMessagingMapper.rosterMembershipIsValid(
+            [departedUserID, addedUserID],
+            use: .historical,
+            currentUserID: currentUserID,
+            expectedCurrentMemberUserIDs: currentMembers,
+            allowHistoricalGroupMembershipChurn: true
+        ), "Even an old group roster must contain the local account")
+        XCTAssertTrue(SecureMessagingMapper.rosterMembershipIsValid(
+            [currentUserID],
+            use: .historical,
+            currentUserID: currentUserID,
+            expectedCurrentMemberUserIDs: [currentUserID],
+            allowHistoricalGroupMembershipChurn: true
+        ), "A retained group can have one-member current and historical snapshots")
+        XCTAssertTrue(SecureMessagingMapper.rosterMembershipIsValid(
+            [currentUserID],
+            use: .historical,
+            currentUserID: currentUserID,
+            expectedCurrentMemberUserIDs: currentMembers,
+            allowHistoricalGroupMembershipChurn: true
+        ), "The historical roster itself may predate every other active member")
+        XCTAssertTrue(SecureMessagingMapper.rosterMembershipIsValid(
+            historicalMembers,
+            use: .historical,
+            currentUserID: currentUserID,
+            expectedCurrentMemberUserIDs: [currentUserID],
+            allowHistoricalGroupMembershipChurn: true
+        ), "The current retained group may have shrunk to one member")
+        XCTAssertFalse(SecureMessagingMapper.rosterMembershipIsValid(
+            [currentUserID],
+            use: .current,
+            currentUserID: currentUserID,
+            expectedCurrentMemberUserIDs: [currentUserID],
+            allowHistoricalGroupMembershipChurn: true
+        ), "A live outbound roster still requires at least two members")
+    }
+
+    func testHistoricalOriginalRosterBindsDepartedSenderAndAllowsLegacyMetadata() throws {
+        let fixture = try makeHistoricalSenderBindingFixture()
+        let currentGroupMembers: Set<String> = [
+            "10000000-0000-4000-8000-000000000091",
+            "10000000-0000-4000-8000-000000000092",
+        ]
+        XCTAssertFalse(currentGroupMembers.contains(fixture.identity.senderUserID))
+        let validatedSender = try SecureMessagingMapper.validatedHistoricalSender(
+            from: fixture.dto,
+            identity: fixture.identity,
+            roster: fixture.roster
+        )
+        let legacyMetadata = SecureMessagingRetainedMessageMetadata(
+            clientMessageID: fixture.identity.clientMessageID,
+            senderUserID: nil,
+            senderDeviceID: fixture.identity.senderDeviceID,
+            senderEnrollmentEpoch: fixture.identity.senderEnrollmentEpoch,
+            senderSignalDeviceID: fixture.identity.senderSignalDeviceID,
+            rosterRevision: fixture.identity.rosterRevision,
+            kind: fixture.identity.kind,
+            replyToMessageID: fixture.identity.replyToMessageID
+        )
+
+        XCTAssertTrue(SecureMessagingMapper.retainedMetadataMatches(
+            legacyMetadata,
+            identity: fixture.identity,
+            validatedSender: validatedSender
+        ))
+        let mismatchedSenderMetadata = SecureMessagingRetainedMessageMetadata(
+            clientMessageID: legacyMetadata.clientMessageID,
+            senderUserID: "10000000-0000-4000-8000-000000000099",
+            senderDeviceID: legacyMetadata.senderDeviceID,
+            senderEnrollmentEpoch: legacyMetadata.senderEnrollmentEpoch,
+            senderSignalDeviceID: legacyMetadata.senderSignalDeviceID,
+            rosterRevision: legacyMetadata.rosterRevision,
+            kind: legacyMetadata.kind,
+            replyToMessageID: legacyMetadata.replyToMessageID
+        )
+        XCTAssertFalse(SecureMessagingMapper.retainedMetadataMatches(
+            mismatchedSenderMetadata,
+            identity: fixture.identity,
+            validatedSender: validatedSender
+        ))
+        let mismatchedLegacyMetadata = SecureMessagingRetainedMessageMetadata(
+            clientMessageID: legacyMetadata.clientMessageID,
+            senderUserID: nil,
+            senderDeviceID: "20000000-0000-4000-8000-000000000098",
+            senderEnrollmentEpoch: legacyMetadata.senderEnrollmentEpoch,
+            senderSignalDeviceID: legacyMetadata.senderSignalDeviceID,
+            rosterRevision: legacyMetadata.rosterRevision,
+            kind: legacyMetadata.kind,
+            replyToMessageID: legacyMetadata.replyToMessageID
+        )
+        XCTAssertFalse(SecureMessagingMapper.retainedMetadataMatches(
+            mismatchedLegacyMetadata,
+            identity: fixture.identity,
+            validatedSender: validatedSender
+        ), "A missing sender field must not weaken any legacy identity field")
+    }
+
+    func testHistoricalOriginalRosterRejectsForgedSenderIdentityAndDeviceFields() throws {
+        let forgedUser = try makeHistoricalSenderBindingFixture(
+            senderUserID: "10000000-0000-4000-8000-000000000099"
+        )
+        XCTAssertThrowsError(try SecureMessagingMapper.validatedHistoricalSender(
+            from: forgedUser.dto,
+            identity: forgedUser.identity,
+            roster: forgedUser.roster
+        ))
+
+        let forgedDevice = try makeHistoricalSenderBindingFixture(
+            senderDeviceID: "20000000-0000-4000-8000-000000000099"
+        )
+        XCTAssertThrowsError(try SecureMessagingMapper.validatedHistoricalSender(
+            from: forgedDevice.dto,
+            identity: forgedDevice.identity,
+            roster: forgedDevice.roster
+        ))
+
+        for forged in [
+            try makeHistoricalSenderBindingFixture(senderSignalDeviceID: 7),
+            try makeHistoricalSenderBindingFixture(senderRegistrationID: 999),
+            try makeHistoricalSenderBindingFixture(senderBundleVersion: 999),
+            try makeHistoricalSenderBindingFixture(
+                senderIdentityKeySHA256: String(repeating: "f", count: 64)
+            ),
+        ] {
+            XCTAssertThrowsError(try SecureMessagingMapper.validatedHistoricalSender(
+                from: forged.dto,
+                identity: forged.identity,
+                roster: forged.roster
+            ))
+        }
+    }
+
+    func testPeerAuthoredSystemNoticeInHistoryBackfillIsSuppressedAndAcknowledged() throws {
+        let forgedNotice = try XCTUnwrap(KitSystemMessage(
+            kind: .memberAdded,
+            subjectUserID: "10000000-0000-4000-8000-000000000095",
+            actorUserID: "10000000-0000-4000-8000-000000000054"
+        )).encoded
+        let fixture = try makeHistoryDescriptorFixture(body: forgedNotice)
+        XCTAssertEqual(
+            try SecureMessagingHistoryBackfillCodec.authenticate(
+                fixture.descriptor,
+                incoming: fixture.incoming
+            ).text,
+            forgedNotice,
+            "The reserved-text policy, not malformed history data, must cause suppression"
+        )
+
+        switch try SecureMessagingExchangeCoordinator.historyDescriptorDisposition(
+            fixture.descriptor,
+            incoming: fixture.incoming
+        ) {
+        case .suppressed(let acknowledgementMessageID):
+            XCTAssertEqual(acknowledgementMessageID, fixture.incoming.original.messageID)
+        case .authenticated:
+            XCTFail("Peer-authored history must not materialize a trusted lifecycle notice")
+        }
+    }
+
     func testMalformedPostDecryptionHistoryDescriptorIsSuppressedAndAcknowledged() throws {
         let fixture = try makeHistoryDescriptorFixture()
         let malformedDescriptor = fixture.descriptor.replacingOccurrences(
@@ -2455,6 +3428,7 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
         let sentAt = queuedAt.addingTimeInterval(2)
         let metadata = SecureMessagingRetainedMessageMetadata(
             clientMessageID: clientID,
+            senderUserID: userID,
             senderDeviceID: currentDeviceID,
             senderEnrollmentEpoch: 2,
             senderSignalDeviceID: 1,
@@ -2524,11 +3498,57 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
         XCTAssertEqual(state.messages[0].secureMessagingHistory, metadata)
         XCTAssertTrue(state.outbox.isEmpty)
 
+        let legacyMetadata = SecureMessagingRetainedMessageMetadata(
+            clientMessageID: metadata.clientMessageID,
+            senderUserID: nil,
+            senderDeviceID: metadata.senderDeviceID,
+            senderEnrollmentEpoch: metadata.senderEnrollmentEpoch,
+            senderSignalDeviceID: metadata.senderSignalDeviceID,
+            rosterRevision: metadata.rosterRevision,
+            kind: metadata.kind,
+            replyToMessageID: metadata.replyToMessageID
+        )
+        var legacyMessage = recovered
+        legacyMessage.secureMessagingHistory = legacyMetadata
+        var legacyState = PersistedState.empty
+        legacyState.messages = [legacyMessage]
+        SecureMessagingExchangeCoordinator.reconcileRecoveredHistoryMessages(
+            [recovered],
+            currentDeviceID: currentDeviceID,
+            into: &legacyState
+        )
+        XCTAssertEqual(legacyState.messages[0].secureMessagingHistory, metadata)
+
+        let wrongSenderMetadata = SecureMessagingRetainedMessageMetadata(
+            clientMessageID: metadata.clientMessageID,
+            senderUserID: "10000000-0000-4000-8000-000000000099",
+            senderDeviceID: metadata.senderDeviceID,
+            senderEnrollmentEpoch: metadata.senderEnrollmentEpoch,
+            senderSignalDeviceID: metadata.senderSignalDeviceID,
+            rosterRevision: metadata.rosterRevision,
+            kind: metadata.kind,
+            replyToMessageID: metadata.replyToMessageID
+        )
+        var wrongSenderMessage = recovered
+        wrongSenderMessage.secureMessagingHistory = wrongSenderMetadata
+        var wrongSenderState = PersistedState.empty
+        wrongSenderState.messages = [wrongSenderMessage]
+        SecureMessagingExchangeCoordinator.reconcileRecoveredHistoryMessages(
+            [recovered],
+            currentDeviceID: currentDeviceID,
+            into: &wrongSenderState
+        )
+        XCTAssertEqual(
+            wrongSenderState.messages[0].secureMessagingHistory,
+            wrongSenderMetadata
+        )
+
         var otherDeviceState = PersistedState.empty
         otherDeviceState.messages = [local]
         var otherDeviceMetadata = metadata
         otherDeviceMetadata = SecureMessagingRetainedMessageMetadata(
             clientMessageID: metadata.clientMessageID,
+            senderUserID: metadata.senderUserID,
             senderDeviceID: "20000000-0000-4000-8000-000000000058",
             senderEnrollmentEpoch: metadata.senderEnrollmentEpoch,
             senderSignalDeviceID: metadata.senderSignalDeviceID,
@@ -2594,7 +3614,7 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
         XCTAssertTrue(snapshot.conversations.isEmpty)
     }
 
-    private func makeHistoryDescriptorFixture() throws -> (
+    private func makeHistoryDescriptorFixture(body: String = "history text") throws -> (
         incoming: SecureMessagingHistoryInboundEnvelope,
         descriptor: String
     ) {
@@ -2649,7 +3669,7 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
             serverMessageId: messageID,
             conversationId: original.conversationID,
             senderId: original.senderUserID,
-            body: "history text",
+            body: body,
             createdAt: original.sentAt,
             sentAt: original.sentAt,
             state: .received,
@@ -2668,6 +3688,383 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
                 rawSentAt: "2025-08-19T12:00:00Z",
                 retained: retained
             )
+        )
+    }
+
+    private func makeHistoricalSenderBindingFixture(
+        senderUserID: String = "10000000-0000-4000-8000-000000000093",
+        senderDeviceID: String = "20000000-0000-4000-8000-000000000093",
+        senderSignalDeviceID: Int = 2,
+        senderRegistrationID: Int = 93,
+        senderBundleVersion: Int = 3,
+        senderIdentityKeySHA256: String = String(repeating: "d", count: 64)
+    ) throws -> (
+        dto: EncryptedMessageDTO,
+        identity: SecureMessagingHistoryMessageIdentity,
+        roster: SecureMessagingRosterSnapshot
+    ) {
+        let conversationID = "30000000-0000-4000-8000-000000000093"
+        let rosterRevision = "v1:sha256:\(String(repeating: "c", count: 64))"
+        let localUserID = "10000000-0000-4000-8000-000000000091"
+        let localDeviceID = "20000000-0000-4000-8000-000000000091"
+        let departedUserID = "10000000-0000-4000-8000-000000000093"
+        let departedDeviceID = "20000000-0000-4000-8000-000000000093"
+        let localIdentity = String(repeating: "b", count: 64)
+        let departedIdentity = String(repeating: "d", count: 64)
+        let localSignedPreKey = Data(
+            [UInt8(5)] + Array(repeating: UInt8(0x11), count: 32)
+        )
+        let departedSignedPreKey = Data(
+            [UInt8(5)] + Array(repeating: UInt8(0x21), count: 32)
+        )
+        let devices = [
+            SecureMessagingRosterDevice(
+                address: SecureMessagingAddress(
+                    userID: localUserID,
+                    serverDeviceID: localDeviceID,
+                    signalDeviceID: 1
+                ),
+                registrationID: 91,
+                identityKeySHA256: localIdentity
+            ),
+            SecureMessagingRosterDevice(
+                address: SecureMessagingAddress(
+                    userID: departedUserID,
+                    serverDeviceID: departedDeviceID,
+                    signalDeviceID: 2
+                ),
+                registrationID: 93,
+                identityKeySHA256: departedIdentity
+            ),
+        ]
+        let roster = SecureMessagingRosterSnapshot(
+            use: .historical,
+            conversationID: conversationID,
+            rosterRevision: rosterRevision,
+            devices: devices,
+            frozenDevices: [
+                localDeviceID: SecureMessagingFrozenRosterDevice(
+                    enrollmentEpoch: nil,
+                    bundleVersion: 2,
+                    signedPreKeyID: 1,
+                    signedPreKeyPublicKey: localSignedPreKey,
+                    signedPreKeySHA256: SecureMessagingValidation.sha256Hex(localSignedPreKey),
+                    signedPreKeySignature: Data(repeating: 0x12, count: 64)
+                ),
+                departedDeviceID: SecureMessagingFrozenRosterDevice(
+                    enrollmentEpoch: nil,
+                    bundleVersion: 3,
+                    signedPreKeyID: 2,
+                    signedPreKeyPublicKey: departedSignedPreKey,
+                    signedPreKeySHA256: SecureMessagingValidation.sha256Hex(
+                        departedSignedPreKey
+                    ),
+                    signedPreKeySignature: Data(repeating: 0x22, count: 64)
+                ),
+            ]
+        )
+        let dto = EncryptedMessageDTO(
+            id: "70000000-0000-4000-8000-000000000093",
+            conversationId: conversationID,
+            clientMessageId: "80000000-0000-4000-8000-000000000093",
+            sender: EncryptedMessageSenderDTO(id: senderUserID, name: "Former member"),
+            senderDeviceId: senderDeviceID,
+            senderEnrollmentEpoch: 4,
+            senderSignalDeviceId: senderSignalDeviceID,
+            senderRegistrationId: senderRegistrationID,
+            senderProtocolVersion: SecureMessagingWire.protocolVersion,
+            senderBundleVersion: senderBundleVersion,
+            senderIdentityKeySha256: senderIdentityKeySHA256,
+            rosterRevision: rosterRevision,
+            kind: SecureMessagingMessageKind.encrypted.rawValue,
+            replyToMessageId: nil,
+            envelope: nil,
+            attachments: [],
+            reactions: [],
+            sentAt: "2026-08-20T12:00:00Z",
+            revokedAt: nil
+        )
+        return (
+            dto,
+            try SecureMessagingMapper.historyCandidateIdentity(
+                from: dto,
+                expectedConversationID: conversationID
+            ),
+            roster
+        )
+    }
+
+    private var syncUserID: String { "10000000-0000-4000-8000-000000000101" }
+    private var syncPeerUserID: String { "10000000-0000-4000-8000-000000000102" }
+    private var syncConversationID: String { "30000000-0000-4000-8000-000000000101" }
+    private var syncNextCursor: String { "cursor-after-conversation-load" }
+
+    private func conversationUpdatedSyncEvent() -> [String: Any] {
+        [
+            "id": "101",
+            "type": "conversation.updated",
+            "conversation_id": syncConversationID,
+            "resource_type": "conversation",
+            "resource_id": syncConversationID,
+            "occurred_at": "2026-08-24T12:00:00Z",
+        ]
+    }
+
+    private func messageCreatedSyncEvent() -> [String: Any] {
+        let messageID = "70000000-0000-4000-8000-000000000101"
+        return [
+            "id": "102",
+            "type": "message.created",
+            "conversation_id": syncConversationID,
+            "resource_type": "message",
+            "resource_id": messageID,
+            "data": [
+                "id": messageID,
+                "conversation_id": syncConversationID,
+            ],
+            "occurred_at": "2026-08-24T12:00:01Z",
+        ]
+    }
+
+    private func memberAddedSyncEvent(
+        subjectUserID: String,
+        role: String? = nil,
+        eventID: String = "103"
+    ) -> [String: Any] {
+        [
+            "id": eventID,
+            "type": "membership.added",
+            "conversation_id": syncConversationID,
+            "resource_type": "conversation_member",
+            "resource_id": "60000000-0000-4000-8000-000000000101",
+            "data": [
+                "user_id": subjectUserID,
+                "role": role ?? (subjectUserID == syncUserID ? "owner" : "member"),
+            ],
+            "occurred_at": "2026-08-24T12:00:02Z",
+        ]
+    }
+
+    private func memberRoleChangedSyncEvent(
+        subjectUserID: String,
+        role: String,
+        eventID: String = "104"
+    ) -> [String: Any] {
+        [
+            "id": eventID,
+            "type": "membership.role_changed",
+            "conversation_id": syncConversationID,
+            "resource_type": "conversation_member",
+            "resource_id": "60000000-0000-4000-8000-000000000101",
+            "data": ["user_id": subjectUserID, "role": role],
+            "occurred_at": "2026-08-24T12:00:03Z",
+        ]
+    }
+
+    private func memberRemovedSyncEvent(
+        subjectUserID: String,
+        eventID: String = "105"
+    ) -> [String: Any] {
+        [
+            "id": eventID,
+            "type": "membership.removed",
+            "conversation_id": syncConversationID,
+            "resource_type": "conversation_member",
+            "resource_id": "60000000-0000-4000-8000-000000000101",
+            "data": ["user_id": subjectUserID],
+            "occurred_at": "2026-08-24T12:00:04Z",
+        ]
+    }
+
+    private func syncConversationDTO(
+        type: String,
+        title: String = "Weekend Trip",
+        localRole: String = "owner",
+        peerRole: String = "member",
+        includePeer: Bool = true
+    ) -> MessagingConversationDTO {
+        var members: [MessagingConversationMemberDTO?] = [
+            MessagingConversationMemberDTO(
+                userId: syncUserID,
+                name: "Secure User",
+                role: localRole,
+                joinedAt: "2026-08-24T11:00:00Z"
+            ),
+        ]
+        if includePeer {
+            members.append(MessagingConversationMemberDTO(
+                userId: syncPeerUserID,
+                name: "Peer",
+                role: peerRole,
+                joinedAt: "2026-08-24T11:00:00Z"
+            ))
+        }
+        return MessagingConversationDTO(
+            id: syncConversationID,
+            type: type,
+            title: type == SecureMessagingWire.groupConversationType ? title : nil,
+            parentId: nil,
+            createdBy: syncUserID,
+            role: localRole,
+            members: members,
+            createdAt: "2026-08-24T11:00:00Z",
+            updatedAt: "2026-08-24T12:00:00Z"
+        )
+    }
+
+    private func makeGroupRenameFixture(fails: Bool) async throws -> GroupRenameFixture {
+        let userID = "10000000-0000-4000-8000-000000000201"
+        let peerUserID = "10000000-0000-4000-8000-000000000202"
+        let thirdUserID = "10000000-0000-4000-8000-000000000203"
+        let conversationID = "30000000-0000-4000-8000-000000000201"
+        let localDeviceID = "20000000-0000-4000-8000-000000000201"
+        let peerDeviceID = "20000000-0000-4000-8000-000000000202"
+        let responseTimestamp = "2026-08-24T12:00:00Z"
+        let responseUpdatedAt = try XCTUnwrap(
+            ISO8601DateFormatter().date(from: responseTimestamp)
+        )
+        let initialConversation = Conversation(
+            id: conversationID,
+            title: "Original title",
+            participantUserIds: [userID, peerUserID],
+            unreadCount: 7,
+            updatedAt: responseUpdatedAt.addingTimeInterval(-60),
+            conversationType: SecureMessagingWire.groupConversationType,
+            groupMemberRoles: [userID: .owner, peerUserID: .member]
+        )
+        let response = MessagingConversationDTO(
+            id: conversationID,
+            type: SecureMessagingWire.groupConversationType,
+            title: "Requested rename",
+            parentId: nil,
+            createdBy: userID,
+            role: MessagingGroupRole.owner.rawValue,
+            members: [
+                MessagingConversationMemberDTO(
+                    userId: userID,
+                    name: "Secure User",
+                    role: MessagingGroupRole.owner.rawValue,
+                    joinedAt: "2026-08-24T11:00:00Z"
+                ),
+                MessagingConversationMemberDTO(
+                    userId: peerUserID,
+                    name: "Peer",
+                    role: MessagingGroupRole.member.rawValue,
+                    joinedAt: "2026-08-24T11:00:00Z"
+                ),
+            ],
+            createdAt: "2026-08-24T11:00:00Z",
+            updatedAt: responseTimestamp
+        )
+        let rosterData = try JSONSerialization.data(withJSONObject: [
+            "conversation_id": conversationID,
+            "devices": [
+                ["device_id": localDeviceID, "user_id": userID],
+                [
+                    "device_id": peerDeviceID,
+                    "user_id": peerUserID,
+                    "client": [
+                        "platform": "android",
+                        "capabilities": [
+                            MessagingGroupCapabilityPolicy.deviceCapabilityKey: true,
+                        ],
+                    ],
+                ],
+            ],
+        ])
+        let roster = try JSONDecoder().decode(MessagingDeviceRosterDTO.self, from: rosterData)
+        let store = try await makeStore(userID: userID)
+        var crypto = SecureMessagingPersistentState.empty
+        crypto.enrollment = raceEnrollment(
+            userID: userID,
+            serverDeviceID: localDeviceID
+        )
+        try await store.update { state in
+            state.communicationOwnerUserID = userID
+            state.secureMessaging = crypto
+            state.conversations = [initialConversation]
+        }
+        let transport = SuspendedGroupRenameTransport(
+            conversationID: conversationID,
+            expectedTitle: "Requested rename",
+            roster: roster,
+            result: fails ? .failure : .success(response)
+        )
+        return GroupRenameFixture(
+            userID: userID,
+            peerUserID: peerUserID,
+            thirdUserID: thirdUserID,
+            conversationID: conversationID,
+            responseUpdatedAt: responseUpdatedAt,
+            initialConversation: initialConversation,
+            store: store,
+            coordinator: SecureMessagingExchangeCoordinator(
+                transport: transport,
+                store: store,
+                engine: SecureMessagingCryptoEngine(),
+                provisioningPreKeyCount: 1
+            ),
+            transport: transport
+        )
+    }
+
+    private func makeSyncConversationLoadFixture(
+        event: [String: Any],
+        conversationBehavior: SyncConversationLoadTransport.ConversationBehavior,
+        localConversations: [Conversation] = [],
+        groupProjectionUpdatedAt: [String: Date]? = nil
+    ) async throws -> SyncConversationLoadFixture {
+        try await makeSyncConversationLoadFixture(
+            events: [event],
+            conversationBehavior: conversationBehavior,
+            localConversations: localConversations,
+            groupProjectionUpdatedAt: groupProjectionUpdatedAt
+        )
+    }
+
+    private func makeSyncConversationLoadFixture(
+        events: [[String: Any]],
+        conversationBehavior: SyncConversationLoadTransport.ConversationBehavior,
+        localConversations: [Conversation] = [],
+        groupProjectionUpdatedAt: [String: Date]? = nil
+    ) async throws -> SyncConversationLoadFixture {
+        let store = try await makeStore(userID: syncUserID)
+        let engine = SecureMessagingCryptoEngine()
+        let provisioned = try await engine.provision(from: .empty, preKeyCount: 1)
+        try await store.update { state in
+            state.secureMessaging = provisioned.state
+            state.conversations = localConversations
+            state.groupProjectionUpdatedAt = groupProjectionUpdatedAt
+        }
+        let responseObject: [String: Any] = [
+            "events": events,
+            "page": [
+                "next_cursor": syncNextCursor,
+                "has_more": false,
+                "limit": SecureMessagingWire.maximumSyncPage,
+            ],
+        ]
+        let response = try JSONDecoder().decode(
+            MessagingSyncDTO.self,
+            from: JSONSerialization.data(withJSONObject: responseObject)
+        )
+        let transport = SyncConversationLoadTransport(
+            status: enrolledStatus(bundle: provisioned.bundle),
+            response: response,
+            conversationBehavior: conversationBehavior
+        )
+        return SyncConversationLoadFixture(
+            userID: syncUserID,
+            conversationID: syncConversationID,
+            nextCursor: syncNextCursor,
+            store: store,
+            coordinator: SecureMessagingExchangeCoordinator(
+                transport: transport,
+                store: store,
+                engine: engine,
+                provisioningPreKeyCount: 1
+            ),
+            transport: transport
         )
     }
 
@@ -3183,6 +4580,154 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
     }
 }
 
+private struct GroupRenameFixture {
+    let userID: String
+    let peerUserID: String
+    let thirdUserID: String
+    let conversationID: String
+    let responseUpdatedAt: Date
+    let initialConversation: Conversation
+    let store: SecureLocalStore
+    let coordinator: SecureMessagingExchangeCoordinator
+    let transport: SuspendedGroupRenameTransport
+}
+
+private actor SuspendedGroupRenameTransport: SecureMessagingExchangeTransport {
+    enum Result: Sendable {
+        case success(MessagingConversationDTO)
+        case failure
+    }
+
+    enum Failure: Error {
+        case rejected
+        case unexpectedNetworkCall
+        case expectedRequestDidNotStart
+    }
+
+    private let conversationID: String
+    private let expectedTitle: String
+    private let roster: MessagingDeviceRosterDTO
+    private let result: Result
+    private var renameStarted = false
+    private var renameReleased = false
+    private var renameWaiters: [CheckedContinuation<Void, Never>] = []
+
+    init(
+        conversationID: String,
+        expectedTitle: String,
+        roster: MessagingDeviceRosterDTO,
+        result: Result
+    ) {
+        self.conversationID = conversationID
+        self.expectedTitle = expectedTitle
+        self.roster = roster
+        self.result = result
+    }
+
+    func waitUntilRenameStarted() async throws {
+        for _ in 0..<500 {
+            if renameStarted { return }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        throw Failure.expectedRequestDidNotStart
+    }
+
+    func releaseRename() {
+        renameReleased = true
+        let waiters = renameWaiters
+        renameWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
+    private func suspendRename() async {
+        renameStarted = true
+        if renameReleased { return }
+        await withCheckedContinuation { continuation in
+            renameWaiters.append(continuation)
+        }
+    }
+
+    private func reject<T>() throws -> T { throw Failure.unexpectedNetworkCall }
+
+    func renameGroupMessagingConversation(
+        conversationId: String,
+        title: String
+    ) async throws -> MessagingConversationDTO {
+        guard conversationId == conversationID, title == expectedTitle else {
+            return try reject()
+        }
+        await suspendRename()
+        switch result {
+        case .success(let response): return response
+        case .failure: throw Failure.rejected
+        }
+    }
+
+    func messagingDeviceRoster(
+        conversationId: String
+    ) async throws -> MessagingDeviceRosterDTO {
+        guard conversationId == conversationID else { return try reject() }
+        return roster
+    }
+
+    func messagingKeyStatus() async throws -> MessagingKeyStatusDTO { try reject() }
+
+    func publishMessagingKeyBundle(
+        _ request: PublishMessagingKeyBundleRequest
+    ) async throws -> MessagingKeyStatusDTO { try reject() }
+
+    func resetMessagingEnrollment(
+        _ request: ResetMessagingEnrollmentRequest
+    ) async throws -> ResetMessagingEnrollmentDTO { try reject() }
+
+    func messagingConversations() async throws -> MessagingConversationListDTO { try reject() }
+
+    func messagingConversation(id: String) async throws -> MessagingConversationDTO { try reject() }
+
+    func createDirectMessagingConversation(
+        _ request: CreateDirectMessagingConversationRequest
+    ) async throws -> MessagingConversationDTO { try reject() }
+
+    func historicalMessagingDeviceRoster(
+        conversationId: String,
+        rosterRevision: String
+    ) async throws -> MessagingDeviceRosterDTO { try reject() }
+
+    func consumeMessagingKeyBundles(
+        conversationId: String,
+        request: ConsumeMessagingKeyBundlesRequest
+    ) async throws -> ConsumedMessagingKeyBundlesDTO { try reject() }
+
+    func sendEncryptedMessage(
+        conversationId: String,
+        request: SendEncryptedMessageRequest
+    ) async throws -> EncryptedMessageDTO { try reject() }
+
+    func uploadMessagingAttachment(
+        mediaType: String,
+        ciphertext: Data
+    ) async throws -> MessagingAttachmentUploadDTO { try reject() }
+
+    func downloadMessagingAttachment(
+        storageKey: String,
+        expectedByteSize: Int64
+    ) async throws -> Data { try reject() }
+
+    func syncEncryptedMessages(
+        cursor: String?,
+        limit: Int
+    ) async throws -> MessagingSyncDTO { try reject() }
+
+    func acknowledgeMessageDelivery(
+        _ request: AcknowledgeMessageDeliveryRequest
+    ) async throws -> MessageDeliveryAcknowledgementDTO { try reject() }
+
+    func markMessagingConversationRead(
+        conversationId: String,
+        request: MarkMessagingConversationReadRequest
+    ) async throws -> MessagingReadReceiptDTO { try reject() }
+}
+
 private enum MessagingRaceResponse {
     case success
     case staleRoster
@@ -3364,6 +4909,139 @@ private actor SuspendedMessagingExchangeTransport: SecureMessagingExchangeTransp
         await suspendExpectedRequest()
         return response
     }
+}
+
+private struct SyncConversationLoadFixture {
+    let userID: String
+    let conversationID: String
+    let nextCursor: String
+    let store: SecureLocalStore
+    let coordinator: SecureMessagingExchangeCoordinator
+    let transport: SyncConversationLoadTransport
+}
+
+private actor SyncConversationLoadTransport: SecureMessagingExchangeTransport {
+    enum ConversationBehavior: Sendable {
+        case response(MessagingConversationDTO)
+        case structuredNotFound
+        case temporaryUnavailable
+        case unstructuredNotFound
+        case unexpected
+    }
+
+    enum Failure: Error {
+        case unexpectedNetworkCall
+    }
+
+    private let status: MessagingKeyStatusDTO
+    private let response: MessagingSyncDTO
+    private let conversationBehavior: ConversationBehavior
+    private var conversationRequests = 0
+
+    init(
+        status: MessagingKeyStatusDTO,
+        response: MessagingSyncDTO,
+        conversationBehavior: ConversationBehavior
+    ) {
+        self.status = status
+        self.response = response
+        self.conversationBehavior = conversationBehavior
+    }
+
+    func conversationRequestCount() -> Int { conversationRequests }
+
+    func messagingKeyStatus() async throws -> MessagingKeyStatusDTO { status }
+
+    func messagingConversation(id: String) async throws -> MessagingConversationDTO {
+        conversationRequests += 1
+        switch conversationBehavior {
+        case .response(let dto):
+            guard dto.id == id else { throw Failure.unexpectedNetworkCall }
+            return dto
+        case .structuredNotFound:
+            throw APIErrorPayload(
+                code: "CONVERSATION_NOT_FOUND",
+                message: "The conversation was not found.",
+                httpStatus: 404
+            )
+        case .temporaryUnavailable:
+            throw APIErrorPayload(
+                code: "MESSAGING_TEMPORARILY_UNAVAILABLE",
+                message: "Please retry.",
+                httpStatus: 503
+            )
+        case .unstructuredNotFound:
+            throw APIClientError.httpResponse(status: 404, retryAfter: nil)
+        case .unexpected:
+            throw Failure.unexpectedNetworkCall
+        }
+    }
+
+    func messagingConversations() async throws -> MessagingConversationListDTO {
+        MessagingConversationListDTO(items: [])
+    }
+
+    func syncEncryptedMessages(
+        cursor: String?,
+        limit: Int
+    ) async throws -> MessagingSyncDTO {
+        guard cursor == nil, limit == SecureMessagingWire.maximumSyncPage else {
+            throw Failure.unexpectedNetworkCall
+        }
+        return response
+    }
+
+    private func reject<T>() throws -> T { throw Failure.unexpectedNetworkCall }
+
+    func publishMessagingKeyBundle(
+        _ request: PublishMessagingKeyBundleRequest
+    ) async throws -> MessagingKeyStatusDTO { try reject() }
+
+    func resetMessagingEnrollment(
+        _ request: ResetMessagingEnrollmentRequest
+    ) async throws -> ResetMessagingEnrollmentDTO { try reject() }
+
+    func createDirectMessagingConversation(
+        _ request: CreateDirectMessagingConversationRequest
+    ) async throws -> MessagingConversationDTO { try reject() }
+
+    func messagingDeviceRoster(
+        conversationId: String
+    ) async throws -> MessagingDeviceRosterDTO { try reject() }
+
+    func historicalMessagingDeviceRoster(
+        conversationId: String,
+        rosterRevision: String
+    ) async throws -> MessagingDeviceRosterDTO { try reject() }
+
+    func consumeMessagingKeyBundles(
+        conversationId: String,
+        request: ConsumeMessagingKeyBundlesRequest
+    ) async throws -> ConsumedMessagingKeyBundlesDTO { try reject() }
+
+    func sendEncryptedMessage(
+        conversationId: String,
+        request: SendEncryptedMessageRequest
+    ) async throws -> EncryptedMessageDTO { try reject() }
+
+    func uploadMessagingAttachment(
+        mediaType: String,
+        ciphertext: Data
+    ) async throws -> MessagingAttachmentUploadDTO { try reject() }
+
+    func downloadMessagingAttachment(
+        storageKey: String,
+        expectedByteSize: Int64
+    ) async throws -> Data { try reject() }
+
+    func acknowledgeMessageDelivery(
+        _ request: AcknowledgeMessageDeliveryRequest
+    ) async throws -> MessageDeliveryAcknowledgementDTO { try reject() }
+
+    func markMessagingConversationRead(
+        conversationId: String,
+        request: MarkMessagingConversationReadRequest
+    ) async throws -> MessagingReadReceiptDTO { try reject() }
 }
 
 private struct DetachedEchoFixture {

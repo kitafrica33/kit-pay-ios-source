@@ -39,6 +39,9 @@ enum AutomaticContactSyncState: Equatable, Sendable {
     case idle
     case requestingPermission
     case denied
+    /// The user switched contact matching off inside Kit Pay. Distinct from `.denied`, which is
+    /// iOS withholding access and needs an Open Settings trip to recover from.
+    case disabledByPreference
     case syncing(ContactSyncProgress)
     case synced(uploaded: Int, matched: Int, limitedAccess: Bool)
     case failed(String)
@@ -67,6 +70,10 @@ enum ContactSyncRecoveryPresentation: Equatable, Sendable {
         case .failed(let message):
             .retry(message: message)
         case .idle, .requestingPermission, .syncing, .synced:
+            nil
+        case .disabledByPreference:
+            // A deliberate choice, changeable in the same place it was made. Nagging about it in
+            // every recipient picker would read as a fault rather than a setting.
             nil
         }
     }

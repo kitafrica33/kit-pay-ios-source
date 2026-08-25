@@ -5,14 +5,14 @@ on:
   workflow_dispatch:
     inputs:
       marketing_version:
-        description: CFBundleShortVersionString (for example 1.0)
+        description: CFBundleShortVersionString (for example 1.0.16)
         required: true
-        default: 1.0
+        default: 1.0.16
         type: string
       build_number:
         description: Monotonically increasing integer CFBundleVersion
         required: true
-        default: "23"
+        default: "24"
         type: string
       confirmation:
         description: Type ARCHIVE_KIT_PAY_APP_STORE
@@ -21,7 +21,7 @@ on:
       corresponding_source_url:
         description: >-
           Exact public AGPL corresponding-source release URL for this build, for example
-          https://github.com/kitafrica33/kit-pay-ios-source/releases/tag/v1.0-build23 .
+          https://github.com/kitafrica33/kit-pay-ios-source/releases/tag/v1.0.16-build24 .
           The archive is rejected unless this tagged release is already publicly available.
         required: true
         type: string

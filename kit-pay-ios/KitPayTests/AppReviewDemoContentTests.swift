@@ -134,6 +134,224 @@ final class AppReviewDemoContentTests: XCTestCase {
         )
     }
 
+    func testDemoAccountPolicyBlocksEveryAccountMutation() {
+        XCTAssertFalse(
+            AppReviewDemoMutationPolicy.allowsAccountMutation(
+                isSignedIn: true,
+                hasAuthenticatedCapabilities: true,
+                isDemoActive: true
+            )
+        )
+        XCTAssertTrue(
+            AppReviewDemoMutationPolicy.allowsAccountMutation(
+                isSignedIn: true,
+                hasAuthenticatedCapabilities: true,
+                isDemoActive: false
+            )
+        )
+        XCTAssertFalse(
+            AppReviewDemoMutationPolicy.allowsAccountMutation(
+                isSignedIn: true,
+                hasAuthenticatedCapabilities: false,
+                isDemoActive: false
+            )
+        )
+        XCTAssertFalse(
+            AppReviewDemoMutationPolicy.allowsAccountMutation(
+                isSignedIn: false,
+                hasAuthenticatedCapabilities: true,
+                isDemoActive: false
+            )
+        )
+    }
+
+    func testSyntheticRowsRemainReadOnlyAfterCapabilityWithdrawalUntilProjectionIsGone() {
+        XCTAssertTrue(
+            AppReviewDemoMutationPolicy.conversationIsReadOnly(
+                "d1000000-0000-4000-8000-000000000001",
+                isDemoActive: false
+            )
+        )
+        XCTAssertTrue(
+            AppReviewDemoMutationPolicy.callIsReadOnly(
+                "d2000000-0000-4000-8000-000000000001",
+                isDemoActive: false
+            )
+        )
+        XCTAssertTrue(
+            AppReviewDemoMutationPolicy.peerIsReadOnly(
+                "d0000000-0000-4000-8000-000000000001",
+                isDemoActive: false
+            )
+        )
+    }
+
+    func testAuthenticatedDemoTransportAllowsReadsAndRequiredCleanupOnly() {
+        XCTAssertTrue(
+            AppReviewDemoMutationPolicy.allowsAuthenticatedRequest(
+                method: "GET",
+                path: "wallets",
+                isDemoSession: true
+            )
+        )
+        XCTAssertTrue(
+            AppReviewDemoMutationPolicy.allowsAuthenticatedRequest(
+                method: "POST",
+                path: "auth/refresh",
+                isDemoSession: true
+            )
+        )
+        XCTAssertTrue(
+            AppReviewDemoMutationPolicy.allowsAuthenticatedRequest(
+                method: "POST",
+                path: "auth/logout",
+                isDemoSession: true
+            )
+        )
+        XCTAssertTrue(
+            AppReviewDemoMutationPolicy.allowsAuthenticatedRequest(
+                method: "DELETE",
+                path: "devices/current/push-token?provider=apns",
+                isDemoSession: true
+            )
+        )
+    }
+
+    func testAuthenticatedDemoTransportBlocksAllFeatureWrites() {
+        let writes = [
+            ("POST", "messaging/messages"),
+            ("POST", "messaging/realtime/auth"),
+            ("POST", "messaging/conversations/one/typing"),
+            ("POST", "calls"),
+            ("POST", "wallets/one/transfers"),
+            ("POST", "mobile-money/payouts"),
+            ("POST", "banking/transfers"),
+            ("PATCH", "communication/preferences"),
+            ("POST", "contacts/sync"),
+            ("PATCH", "profile"),
+            ("POST", "media/upload-intents"),
+        ]
+        for (method, path) in writes {
+            XCTAssertFalse(
+                AppReviewDemoMutationPolicy.allowsAuthenticatedRequest(
+                    method: method,
+                    path: path,
+                    isDemoSession: true
+                ),
+                "Unexpectedly allowed \(method) \(path)"
+            )
+            XCTAssertTrue(
+                AppReviewDemoMutationPolicy.allowsAuthenticatedRequest(
+                    method: method,
+                    path: path,
+                    isDemoSession: false
+                ),
+                "Normal accounts must retain \(method) \(path)"
+            )
+        }
+    }
+
+    func testAuthenticatedDemoTransportCleanupExceptionsRequireExactMethods() {
+        let mismatches = [
+            ("DELETE", AbuseReportAPIEndpoint.path),
+            ("PATCH", "auth/logout"),
+            ("DELETE", "auth/refresh"),
+            ("POST", "devices/current/push-token"),
+        ]
+        for (method, path) in mismatches {
+            XCTAssertFalse(
+                AppReviewDemoMutationPolicy.allowsAuthenticatedRequest(
+                    method: method,
+                    path: path,
+                    isDemoSession: true
+                ),
+                "Unexpectedly allowed \(method) \(path)"
+            )
+        }
+    }
+
+    func testDemoAbuseReportExceptionIsExactProvisionedPairOnly() {
+        XCTAssertTrue(
+            AppReviewDemoMutationPolicy.allowsAuthenticatedRequest(
+                method: "POST",
+                path: AbuseReportAPIEndpoint.path,
+                isDemoSession: true
+            )
+        )
+        XCTAssertTrue(
+            AppReviewDemoMutationPolicy.allowsAbuseReport(
+                conversationID: "d1000000-0000-4000-8000-000000000001",
+                reportedUserID: "d0000000-0000-4000-8000-000000000001",
+                isDemoSession: true
+            )
+        )
+        XCTAssertFalse(
+            AppReviewDemoMutationPolicy.allowsAbuseReport(
+                conversationID: "d1000000-0000-4000-8000-000000000002",
+                reportedUserID: "d0000000-0000-4000-8000-000000000002",
+                isDemoSession: true
+            )
+        )
+    }
+
+    func testCapabilityFailureRetainsOwnerAndTransportFence() {
+        let decision = AppReviewDemoCapabilityFenceDecision.failed(
+            previousOwnerID: ownerID
+        )
+        XCTAssertEqual(decision.projectedOwnerID, ownerID)
+        XCTAssertTrue(decision.keepsTransportFenceAfterProjection)
+
+        let unresolved = AppReviewDemoCapabilityFenceDecision.failed(previousOwnerID: nil)
+        XCTAssertNil(unresolved.projectedOwnerID)
+        XCTAssertTrue(unresolved.keepsTransportFenceAfterProjection)
+    }
+
+    func testSuccessfulFlagWithdrawalUnarmsOnlyAfterNilProjectionDecision() {
+        let enabled = AppReviewDemoCapabilityFenceDecision.resolved(ownerID: ownerID)
+        XCTAssertEqual(enabled.projectedOwnerID, ownerID)
+        XCTAssertTrue(enabled.keepsTransportFenceAfterProjection)
+
+        let withdrawn = AppReviewDemoCapabilityFenceDecision.resolved(ownerID: nil)
+        XCTAssertNil(withdrawn.projectedOwnerID)
+        XCTAssertFalse(withdrawn.keepsTransportFenceAfterProjection)
+    }
+
+    func testTransportFenceRemainsBoundAcrossRefreshForSameSessionID() async {
+        let api = APIClient(sessionStore: SessionStore())
+        await api.setAppReviewDemoReadOnly(true, sessionID: sessionID.uppercased())
+        let sameSessionStillProtected = await api.appReviewDemoReadOnlyApplies(
+            to: sessionID
+        )
+        let replacementSessionProtected = await api.appReviewDemoReadOnlyApplies(
+            to: "20000000-0000-4000-8000-000000000002"
+        )
+        XCTAssertTrue(sameSessionStillProtected)
+        XCTAssertFalse(replacementSessionProtected)
+    }
+
+    func testStaleCapabilityCompletionCannotReplaceOrClearReplacementSessionFence() async {
+        let api = APIClient(sessionStore: SessionStore())
+        let replacementSessionID = "20000000-0000-4000-8000-000000000002"
+        await api.setAppReviewDemoReadOnly(true, sessionID: replacementSessionID)
+        await api.setAppReviewDemoReadOnly(true, sessionID: sessionID)
+        let replacementFenceSurvivedStaleArm = await api.appReviewDemoReadOnlyApplies(
+            to: replacementSessionID
+        )
+        XCTAssertTrue(replacementFenceSurvivedStaleArm)
+
+        await api.setAppReviewDemoReadOnly(false, sessionID: sessionID)
+        let replacementFenceSurvived = await api.appReviewDemoReadOnlyApplies(
+            to: replacementSessionID
+        )
+        XCTAssertTrue(replacementFenceSurvived)
+
+        await api.setAppReviewDemoReadOnly(false, sessionID: replacementSessionID.uppercased())
+        let replacementFenceCleared = await api.appReviewDemoReadOnlyApplies(
+            to: replacementSessionID
+        )
+        XCTAssertFalse(replacementFenceCleared)
+    }
+
     private func financialState() -> PersistedState {
         var state = PersistedState.empty
         state.profile = UserProfile(

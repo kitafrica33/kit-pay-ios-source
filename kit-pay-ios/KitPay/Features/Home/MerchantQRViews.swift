@@ -137,7 +137,7 @@ final class MerchantQRPaymentViewModel: ObservableObject {
                 "qr_payment",
                 intent,
                 pin,
-                "Approve \(wallet.currency.code) \(amount) to \(code.merchant.displayName)"
+                "Approve \(KitMoney.formatted(amount, currency: wallet.currency)) to \(code.merchant.displayName)"
             )
             guard !verification.stepUpToken.isEmpty else {
                 throw MerchantQRFlowError.invalidStepUp
@@ -341,7 +341,7 @@ struct MerchantQRPaymentView: View {
             if code.isDynamic, let fixedAmount = code.amount, let currency = code.currency {
                 VStack(alignment: .leading, spacing: 5) {
                     Text("Amount").font(.caption).foregroundStyle(KitColor.secondaryText)
-                    Text("\(currency.code) \(fixedAmount)")
+                    Text(KitMoney.formatted(fixedAmount, currency: currency))
                         .font(.largeTitle.bold()).foregroundStyle(KitColor.primaryText)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -351,22 +351,15 @@ struct MerchantQRPaymentView: View {
                     Text("Amount").font(.headline).foregroundStyle(KitColor.primaryText)
                     HStack {
                         Text(app.selectedWallet?.currency.code ?? "UGX").bold().foregroundStyle(KitColor.green)
-                        TextField("0", text: Binding(
-                            get: {
-                                PaymentInputFormatting.groupedDecimalInput(
-                                    amount,
-                                    maximumFractionDigits: app.selectedWallet?.currency.decimalScale ?? 2
-                                )
-                            },
-                            set: {
-                                amount = PaymentInputFormatting.normalizedDecimalInput(
-                                    $0,
-                                    maximumFractionDigits: app.selectedWallet?.currency.decimalScale ?? 2
-                                )
-                            }
-                        ))
-                        .keyboardType(.decimalPad)
-                        .font(.title.bold().monospacedDigit())
+                        KitAmountTextField(
+                            "0",
+                            value: $amount,
+                            mode: .decimal(
+                                maximumFractionDigits:
+                                    app.selectedWallet?.currency.decimalScale ?? 2
+                            ),
+                            textStyle: .monospacedTitle
+                        )
                     }
                 }
                 .padding(18).kitGlass(cornerRadius: 20, tint: KitColor.paleGreen)
@@ -450,7 +443,7 @@ struct MerchantQRPaymentView: View {
                 .frame(width: 92, height: 92)
                 .background(KitColor.green.gradient, in: Circle())
             Text("Payment complete").font(.largeTitle.bold()).foregroundStyle(KitColor.primaryText)
-            Text("\(paid.currency.code) \(paid.amount) paid to \(paid.merchant.displayName).")
+            Text("\(KitMoney.formatted(paid.amount, currency: paid.currency)) paid to \(paid.merchant.displayName).")
                 .multilineTextAlignment(.center).foregroundStyle(KitColor.secondaryText)
             if let transactionID = paid.walletTransactionId {
                 Text("Transaction \(transactionID)")
@@ -931,22 +924,15 @@ struct MerchantReceiveQRView: View {
                 }
             }
             Section("Payment") {
-                TextField("Amount (optional)", text: Binding(
-                    get: {
-                        PaymentInputFormatting.groupedDecimalInput(
-                            amount,
-                            maximumFractionDigits: selectedBusinessWallet?.currency.decimalScale ?? 2
-                        )
-                    },
-                    set: {
-                        amount = PaymentInputFormatting.normalizedDecimalInput(
-                            $0,
-                            maximumFractionDigits: selectedBusinessWallet?.currency.decimalScale ?? 2
-                        )
-                    }
-                ))
-                .keyboardType(.decimalPad)
-                .font(.body.monospacedDigit())
+                KitAmountTextField(
+                    "Amount (optional)",
+                    value: $amount,
+                    mode: .decimal(
+                        maximumFractionDigits:
+                            selectedBusinessWallet?.currency.decimalScale ?? 2
+                    ),
+                    textStyle: .monospacedBody
+                )
                 Text(amount.isEmpty
                      ? "Leave blank for a reusable QR where the payer enters the amount."
                      : "A one-time dynamic QR will be bound to this amount.")
@@ -1023,7 +1009,7 @@ struct MerchantReceiveQRView: View {
                 }
                 Text(code.merchant.displayName).font(.title2.bold()).foregroundStyle(KitColor.primaryText)
                 if let amount = code.amount, let currency = code.currency {
-                    Text("\(currency.code) \(amount)").font(.largeTitle.bold()).foregroundStyle(KitColor.green)
+                    Text(KitMoney.formatted(amount, currency: currency)).font(.largeTitle.bold()).foregroundStyle(KitColor.green)
                 } else {
                     Text("Reusable merchant QR").foregroundStyle(KitColor.secondaryText)
                 }

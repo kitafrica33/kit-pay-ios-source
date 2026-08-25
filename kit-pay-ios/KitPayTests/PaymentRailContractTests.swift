@@ -691,10 +691,94 @@ final class PaymentRailContractTests: XCTestCase {
     }
 
     private let unitedStates = Locale(identifier: "en_US")
+    private let uganda = Locale(identifier: "en_UG")
     /// Comma decimal separator, period grouping separator.
     private let germany = Locale(identifier: "de_DE")
     /// Comma decimal separator, non-breaking-space grouping separator.
     private let france = Locale(identifier: "fr_FR")
+
+    /// Every amount a customer reads is grouped. A wallet balance used to render as
+    /// `UGX 1250000`, which is unreadable at a glance and easy to misjudge by a factor of ten.
+    func testDisplayedAmountsAreGrouped() {
+        XCTAssertEqual(
+            KitMoney.formatted("1250000", code: "UGX", scale: 0, locale: unitedStates),
+            "UGX 1,250,000"
+        )
+        XCTAssertEqual(
+            KitMoney.formatted("1234567.89", code: "USD", scale: 2, locale: unitedStates),
+            "USD 1,234,567.89"
+        )
+        // A blank or missing amount reads as zero rather than as an empty currency code.
+        XCTAssertEqual(
+            KitMoney.formatted("", code: "UGX", scale: 0, locale: unitedStates),
+            "UGX 0"
+        )
+    }
+
+    /// Read-only money is intentionally stable: input accepts the keyboard locale, but every
+    /// settled amount uses comma grouping and a `.` decimal mark.
+    func testDisplayedAmountsUseStableSeparatorsAcrossInputLocales() {
+        XCTAssertEqual(
+            KitMoney.amount("1234567.89", scale: 2, locale: germany),
+            "1,234,567.89"
+        )
+        XCTAssertEqual(
+            KitMoney.amount("1234567.89", scale: 2, locale: france),
+            "1,234,567.89"
+        )
+        XCTAssertEqual(
+            KitMoney.amount("1234567.89", scale: 2, locale: uganda),
+            "1,234,567.89"
+        )
+    }
+
+    func testCommittedMoneyNeverForcesZeroFractionDigits() {
+        XCTAssertEqual(
+            KitMoney.amount("1856.84", scale: 2, locale: unitedStates),
+            "1,856.84"
+        )
+        XCTAssertEqual(
+            KitMoney.amount("1768.80", scale: 2, locale: unitedStates),
+            "1,768.8"
+        )
+        XCTAssertEqual(
+            KitMoney.amount("1000.00", scale: 2, locale: unitedStates),
+            "1,000"
+        )
+    }
+
+    /// Minor units convert in integer arithmetic; `Double` loses whole minor units at this size.
+    func testMinorUnitsRenderWithoutFloatingPoint() {
+        XCTAssertEqual(KitMoney.decimal(minorUnits: 123_456_789 as Int64, scale: 2), "1234567.89")
+        XCTAssertEqual(KitMoney.decimal(minorUnits: 7 as Int64, scale: 2), "0.07")
+        XCTAssertEqual(KitMoney.decimal(minorUnits: 75_000 as Int64, scale: 0), "75000")
+        XCTAssertEqual(
+            KitMoney.formatted(
+                minorUnits: 123_456_789 as Int64,
+                code: "USD",
+                scale: 2,
+                locale: unitedStates
+            ),
+            "USD 1,234,567.89"
+        )
+    }
+
+    /// Ledger rows carry direction in the sign, using a true minus so digits stay aligned.
+    func testLedgerRowsAreSignedAndGrouped() {
+        let currency = CurrencyDTO(code: "UGX", scale: "0")
+        XCTAssertEqual(
+            KitMoney.signed("1250000", currency: currency, direction: "credit", locale: unitedStates),
+            "+UGX 1,250,000"
+        )
+        XCTAssertEqual(
+            KitMoney.signed("1250000", currency: currency, direction: "debit", locale: unitedStates),
+            "\u{2212}UGX 1,250,000"
+        )
+        XCTAssertEqual(
+            KitMoney.signed("1250000", currency: currency, direction: "hold", locale: unitedStates),
+            "UGX 1,250,000"
+        )
+    }
 
     func testAmountInputFormattingAddsCommasWithoutChangingRawValue() {
         XCTAssertEqual(PaymentInputFormatting.normalizedWholeInput("1,234,567"), "1234567")
@@ -719,6 +803,121 @@ final class PaymentRailContractTests: XCTestCase {
             ),
             "1,234.50"
         )
+    }
+
+    func testLiveAmountEditingGroupsWithoutMovingTheCaretToTheEnd() throws {
+        let appended = try XCTUnwrap(PaymentInputFormatting.applyingEdit(
+            to: "999",
+            range: NSRange(location: 3, length: 0),
+            replacement: "9",
+            currentSelection: NSRange(location: 3, length: 0),
+            mode: .whole,
+            locale: unitedStates
+        ))
+        XCTAssertEqual(appended.editingCanonicalValue, "9999")
+        XCTAssertEqual(appended.committedCanonicalValue, "9999")
+        XCTAssertEqual(appended.displayedValue, "9,999")
+        XCTAssertEqual(appended.caretUTF16Offset, 5)
+
+        let inserted = try XCTUnwrap(PaymentInputFormatting.applyingEdit(
+            to: "12,345",
+            range: NSRange(location: 2, length: 0),
+            replacement: "9",
+            currentSelection: NSRange(location: 2, length: 0),
+            mode: .whole,
+            locale: unitedStates
+        ))
+        XCTAssertEqual(inserted.editingCanonicalValue, "129345")
+        XCTAssertEqual(inserted.displayedValue, "129,345")
+        XCTAssertEqual(inserted.caretUTF16Offset, 3)
+    }
+
+    func testLiveAmountEditingDoesNotGetStuckOnGroupingComma() throws {
+        let backward = try XCTUnwrap(PaymentInputFormatting.applyingEdit(
+            to: "1,234",
+            range: NSRange(location: 1, length: 1),
+            replacement: "",
+            currentSelection: NSRange(location: 2, length: 0),
+            mode: .whole,
+            locale: unitedStates
+        ))
+        XCTAssertEqual(backward.committedCanonicalValue, "234")
+        XCTAssertEqual(backward.displayedValue, "234")
+        XCTAssertEqual(backward.caretUTF16Offset, 0)
+
+        let forward = try XCTUnwrap(PaymentInputFormatting.applyingEdit(
+            to: "1,234",
+            range: NSRange(location: 1, length: 1),
+            replacement: "",
+            currentSelection: NSRange(location: 1, length: 0),
+            mode: .whole,
+            locale: unitedStates
+        ))
+        XCTAssertEqual(forward.committedCanonicalValue, "134")
+        XCTAssertEqual(forward.displayedValue, "134")
+        XCTAssertEqual(forward.caretUTF16Offset, 1)
+    }
+
+    func testLiveDecimalEditingPreservesTransientZeroButCommitsTrimmedValue() throws {
+        let separator = try XCTUnwrap(PaymentInputFormatting.applyingEdit(
+            to: "1",
+            range: NSRange(location: 1, length: 0),
+            replacement: ",",
+            currentSelection: NSRange(location: 1, length: 0),
+            mode: .decimal(maximumFractionDigits: 2),
+            locale: germany
+        ))
+        XCTAssertEqual(separator.editingCanonicalValue, "1.")
+        XCTAssertEqual(separator.committedCanonicalValue, "1")
+        XCTAssertEqual(separator.displayedValue, "1.")
+
+        let transientZero = try XCTUnwrap(PaymentInputFormatting.applyingEdit(
+            to: separator.displayedValue,
+            range: NSRange(location: 2, length: 0),
+            replacement: "0",
+            currentSelection: NSRange(location: 2, length: 0),
+            mode: .decimal(maximumFractionDigits: 2),
+            locale: germany
+        ))
+        XCTAssertEqual(transientZero.editingCanonicalValue, "1.0")
+        XCTAssertEqual(transientZero.committedCanonicalValue, "1")
+        XCTAssertEqual(transientZero.displayedValue, "1.0")
+
+        let completed = try XCTUnwrap(PaymentInputFormatting.applyingEdit(
+            to: transientZero.displayedValue,
+            range: NSRange(location: 3, length: 0),
+            replacement: "5",
+            currentSelection: NSRange(location: 3, length: 0),
+            mode: .decimal(maximumFractionDigits: 2),
+            locale: germany
+        ))
+        XCTAssertEqual(completed.editingCanonicalValue, "1.05")
+        XCTAssertEqual(completed.committedCanonicalValue, "1.05")
+        XCTAssertEqual(completed.displayedValue, "1.05")
+    }
+
+    func testAmountPasteCanonicalizesSeparatorsAndPreservesSelection() throws {
+        let pasted = try XCTUnwrap(PaymentInputFormatting.applyingEdit(
+            to: "12,345.67",
+            range: NSRange(location: 0, length: 9),
+            replacement: "EUR 1.856,80",
+            currentSelection: NSRange(location: 0, length: 9),
+            mode: .decimal(maximumFractionDigits: 2),
+            locale: germany
+        ))
+        XCTAssertEqual(pasted.editingCanonicalValue, "1856.80")
+        XCTAssertEqual(pasted.committedCanonicalValue, "1856.8")
+        XCTAssertEqual(pasted.displayedValue, "1,856.80")
+        XCTAssertEqual(pasted.caretUTF16Offset, 8)
+
+        XCTAssertNil(PaymentInputFormatting.applyingEdit(
+            to: "1,000",
+            range: NSRange(location: 5, length: 0),
+            replacement: ".5",
+            currentSelection: NSRange(location: 5, length: 0),
+            mode: .whole,
+            locale: unitedStates
+        ))
     }
 
     /// `decimalPad` draws the locale's separator, so this is exactly what the customer typed.
@@ -795,7 +994,7 @@ final class PaymentRailContractTests: XCTestCase {
         )
     }
 
-    func testZeroFractionTrimmingFollowsTheLocaleSeparator() {
+    func testTrailingFractionZeroTrimmingFollowsTheLocaleSeparator() {
         XCTAssertEqual(
             PaymentInputFormatting.trimmingZeroFraction(
                 "1,234.00",
@@ -818,7 +1017,7 @@ final class PaymentRailContractTests: XCTestCase {
                 maximumFractionDigits: 2,
                 locale: unitedStates
             ),
-            "1,234.50"
+            "1,234.5"
         )
     }
 

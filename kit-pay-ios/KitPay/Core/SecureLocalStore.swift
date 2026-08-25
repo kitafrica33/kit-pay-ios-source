@@ -176,6 +176,9 @@ actor SecureLocalStore {
         let ownerUserID = state.communicationOwnerUserID ?? state.profile?.id
         var history = preserveCommunicationHistory ? state.messages : []
         let conversations = preserveCommunicationHistory ? state.conversations : []
+        let groupProjectionUpdatedAt = preserveCommunicationHistory
+            ? state.groupProjectionUpdatedAt
+            : nil
         let conversationDrafts = preserveCommunicationHistory ? state.conversationDrafts : nil
         var calls = preserveCommunicationHistory ? state.calls : []
         let callHistoryBackfillReceipt = preserveCommunicationHistory
@@ -198,6 +201,7 @@ actor SecureLocalStore {
         candidate.communicationOwnerUserID = preserveCommunicationHistory ? ownerUserID : nil
         candidate.messages = history
         candidate.conversations = conversations
+        candidate.groupProjectionUpdatedAt = groupProjectionUpdatedAt
         candidate.conversationDrafts = conversationDrafts
         candidate.calls = calls
         candidate.callHistoryBackfillReceipt = callHistoryBackfillReceipt
@@ -291,6 +295,7 @@ actor SecureLocalStore {
     private func containsCommunicationData(_ candidate: PersistedState) -> Bool {
         candidate.communicationOwnerUserID != nil
             || !candidate.conversations.isEmpty
+            || candidate.groupProjectionUpdatedAt?.isEmpty == false
             || candidate.conversationDrafts?.isEmpty == false
             || !candidate.messages.isEmpty
             || !candidate.calls.isEmpty

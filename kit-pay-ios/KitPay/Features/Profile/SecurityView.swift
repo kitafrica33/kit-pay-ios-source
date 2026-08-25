@@ -33,6 +33,7 @@ struct SecurityView: View {
             VStack(spacing: 20) {
                 biometricHeader
                 biometricControls
+                    .disabled(!model.appReviewDemoMutationsAllowed)
 
                 if let error = model.biometricErrorMessage {
                     Label(error, systemImage: "exclamationmark.triangle.fill")
@@ -44,6 +45,7 @@ struct SecurityView: View {
                 }
 
                 loginVerificationControls
+                    .disabled(!model.appReviewDemoMutationsAllowed)
 
                 if let error = model.securityPreferencesErrorMessage {
                     Label(error, systemImage: "exclamationmark.triangle.fill")
@@ -55,6 +57,7 @@ struct SecurityView: View {
                 }
 
                 linkedDevicesCard
+                    .disabled(!model.appReviewDemoMutationsAllowed)
 
                 if let error = model.deviceManagementErrorMessage {
                     Label(error, systemImage: "exclamationmark.triangle.fill")
@@ -66,6 +69,7 @@ struct SecurityView: View {
                 }
 
                 mfaControls
+                    .disabled(!model.appReviewDemoMutationsAllowed)
 
                 Label(
                     "Biometrics are preferred for returning sign-in and local app locks on this iPhone. Your server-verified wallet PIN remains available if biometrics are locked or unavailable. Your identity-verification preference applies only to future logins; server-side payment authorization still applies.",

@@ -416,6 +416,18 @@ final class OutboxPolicyTests: XCTestCase {
             OutboxPolicy.failureDecision(for: APIClientError.invalidURL),
             .permanent
         )
+        XCTAssertEqual(
+            OutboxPolicy.failureDecision(
+                for: SecureMessagingExchangeError.groupCapabilityUnavailable
+            ),
+            .retry(after: nil)
+        )
+        XCTAssertEqual(
+            OutboxPolicy.failureDecision(
+                for: SecureMessagingExchangeError.reactionCapabilityUnavailable
+            ),
+            .retry(after: nil)
+        )
     }
 
     func testLegacyOutboxCommandDecodesWithoutFailureDispositionFields() throws {

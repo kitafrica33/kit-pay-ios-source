@@ -52,6 +52,10 @@ final class WalletAPIEncodingTests: XCTestCase {
             APIClientIdentity.appVersion(marketingVersion: "0.2.5", buildNumber: "16"),
             "0.2.5-r16"
         )
+        XCTAssertEqual(
+            APIClientIdentity.header(marketingVersion: "1.0.16", buildNumber: "24"),
+            "ios/1.0.16-r24"
+        )
     }
 
     func testRefreshCarriesTheExistingSessionIDHeader() {

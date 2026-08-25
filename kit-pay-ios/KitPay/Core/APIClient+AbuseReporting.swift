@@ -12,6 +12,10 @@ extension APIClient {
         guard AbuseReportContract.validIdempotencyKey(idempotencyKey) else {
             throw AbuseReportContractError.invalidIdempotencyKey
         }
+        try await requireAppReviewDemoAbuseReportPermission(
+            conversationID: request.conversationID,
+            reportedUserID: request.reportedUserID
+        )
         let receipt: AbuseReportReceipt = try await send(
             path: AbuseReportAPIEndpoint.path,
             method: "POST",

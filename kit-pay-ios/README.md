@@ -52,17 +52,22 @@ and Apple Liquid Glass.
   attachments and all unselected history remain on-device. Ambiguous retries keep only an
   account-bound request digest and idempotency key in this device's Keychain; report notes and
   selected plaintext are never persisted there. Reports are never queued offline.
-  Device-local App Review/demo conversations are UI previews, not valid moderation targets: a
-  successful reviewer test requires a real direct-conversation row with exactly the reviewer and
-  an enrolled peer as active members, plus a real peer-authored message row for message reports.
+  The installation-bound App Review account is read-only except for abuse reports against its
+  provisioned Amina Demo conversation. That exception requires the exact reviewer/conversation/
+  peer tuple, a real two-party direct-conversation row, and a real peer-authored message row for
+  message reports. Every other authenticated write remains blocked at the client transport.
   The client must show the server's neutral unavailable result and must never fake acceptance.
 - APNs/PushKit server support is implemented on backend PR 18, but production credentials and
   deployment are separate operational steps.
 - Rich voice/video/document media is limited to 200 MiB and requires the server's bounded
-  `kit-media-v1` capability plus an all-iOS recipient roster at version 0.2.5 build 16 or later.
+  `kit-media-v1` capability. The baseline profile remains available when every recipient device
+  attests `messaging_rich_media_v1` (iOS 0.2.5 build 16 or later; Android 0.2.18 or later);
+  payloads above 10 MiB additionally require every device's `messaging_rich_media_200m_v1`
+  attestation, with iOS fenced at 1.0.16 build 24.
   The capability handshake pins the advertised byte bounds exactly, so the backend must declare
-  `maximum_plaintext_bytes` 209715200 and `maximum_ciphertext_bytes` 209715264. Android and older
-  iOS devices remain image-only; unknown types fail closed. Caveat: the attachment cipher and the
+  `maximum_plaintext_bytes` 209715200 and `maximum_ciphertext_bytes` 209715264. Devices without
+  the baseline capability remain image-only, while a roster missing the 200 MiB attestation is
+  capped at 10 MiB; unknown types fail closed. Caveat: the attachment cipher and the
   multipart transport currently materialize their buffers in memory, so a transfer near the cap
   briefly costs a low multiple of its size in RAM — acceptable on recent iPhones, but streaming
   encrypt/upload/download is the follow-up required before the cap can be considered robust on
@@ -90,13 +95,37 @@ and Apple Liquid Glass.
   server committing the money movement and iOS durably queuing its encrypted card; a process
   termination in that interval can omit the card. Durable, bounded receipt recovery is a
   follow-up and must not be implemented as an unrestricted transaction-history replay.
+- Group chat creation/timeline work, message reactions, and presence/typing are server-gated:
+  `features.messaging_groups` + per-device `messaging_groups_v1` attestation enable groups
+  (create via POST messaging/conversations with `member_ids`+`type:"group"`+`title`; membership
+  changes arrive as `membership.added|removed|role_changed` sync events with
+  `resource_type:"conversation_member"`, `user_id`, and the event-specific `role`), and
+  `features.messaging_reactions_e2ee_v1` enables the encrypted `KITRXN1` reaction wire. Reaction
+  events do not increment unread counts or advance a conversation's `updated_at`. CRITICAL: shipped
+  clients hard-fail the sync cursor on unknown event types, so groups, reactions, and Reverb must
+  remain fenced to iOS 1.0.16 build 24 (`1.0.16-r24`) or later, and the server must emit
+  `conversation.updated` and the member events ONLY to clients at or above this build (device
+  version fencing), and must never send `conversation.created/updated` for threads the
+  recipient was removed from. Android must mirror KITRXN1 (canonical order `v,a,t,e`, one
+  reaction per user per message, aggregation sorted by `(sent_at, server_message_id)`) and
+  KITSYS1 before cross-platform rollout. Reverb-backed authenticated user and conversation
+  channels deliver opaque sync nudges plus presence/typing events; durable message state still
+  converges only through ordinary sync. Outbound typing is throttled (≥4s, auto-expiring), and
+  the versioned `messaging_presence_visible` account preference symmetrically controls sending
+  and rendering presence while leaving private sync nudges connected.
+  Authenticated group rename, add/remove-member, and leave operations are implemented with
+  server-authoritative roster/role replacement. Group reporting remains blocked: the existing
+  abuse-report API is limited to a two-party conversation plus one reported account. Existing
+  group history becomes read-only whenever `features.messaging_groups` is absent or withdrawn;
+  queued group ciphertext remains local until the gate returns, or is failed if membership ends.
 - iCloud chat backups require the `iCloud.africa.kit.pay.ios` CloudKit container to be
   provisioned in the Apple Developer portal, an App Store profile authorizing the signed CloudKit
   entitlements, and the `KitMessageBackup` record type deployed to the production schema. Release
   also requires two-device backup/restore/delete testing and privacy-report/App Store labels
   covering both encrypted content and
-  the readable operational metadata. The entitlement and client code alone do not establish
-  production readiness.
+  the readable operational metadata. Server-authored `KITSYS1` membership notices are regenerated
+  by sync rather than included in backups, whose message schema cannot prove their event
+  provenance. The entitlement and client code alone do not establish production readiness.
 
 ### CloudKit production-schema release
 

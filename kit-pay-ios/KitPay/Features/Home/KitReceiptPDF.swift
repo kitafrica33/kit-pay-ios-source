@@ -50,12 +50,7 @@ struct KitReceiptContent {
         case .reversed: statusLabel = "Payment Reversed"
         }
 
-        let scale = Int(transaction.currency.scale) ?? 2
-        let groupedAmount = PaymentInputFormatting.groupedDecimalInput(
-            transaction.amount,
-            maximumFractionDigits: scale
-        )
-        let headlineAmount = "\(transaction.currency.code) \(groupedAmount)"
+        let headlineAmount = KitMoney.formatted(transaction.amount, currency: transaction.currency)
 
         let typeLabel = transaction.type.replacingOccurrences(of: "_", with: " ").capitalized
         let counterpartyName = trimmedNonEmpty(transaction.counterparty?.name) ?? "Kit Pay user"

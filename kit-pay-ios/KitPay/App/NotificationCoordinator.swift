@@ -301,7 +301,10 @@ enum MessageNotificationConversationPolicy {
         in conversation: Conversation,
         currentUserID: String?
     ) -> String? {
-        guard let current = MessageNotificationContract.canonicalUUID(currentUserID),
+        // A group thread has no single reply recipient; notification replies to groups stay
+        // fail-closed until group replies are wired end to end (even for two-member groups).
+        guard !conversation.isGroup,
+              let current = MessageNotificationContract.canonicalUUID(currentUserID),
               MessageNotificationContract.canonicalUUID(conversation.id) != nil
         else { return nil }
         let participants = conversation.participantUserIds.compactMap {
@@ -2693,6 +2696,9 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
             Task { @MainActor in
                 let coordinator = NotificationCoordinator.shared
                 if error == nil, coordinator.callRegistryGeneration == receivedGeneration {
+                    // The phone is now ringing. Resolving the media host during the ring removes
+                    // that handshake from the gap between answering and hearing the caller.
+                    CallMediaPrewarmer.shared.prewarm()
                     coordinator.quarantine(incoming)
                     if coordinator.registrationEnabled, !coordinator.privacyQuarantineActive {
                         coordinator.requestVerificationForQuarantinedIncomingCalls()

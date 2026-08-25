@@ -53,12 +53,10 @@ struct SecureMessagingSyncErrorOwnership {
     }
 }
 
-/// Foreground chat synchronization mirrors Android's bounded two-second cadence. The durable
-/// unread counter is the retry signal: a failed receipt leaves it untouched, while a successful
-/// receipt clears it and prevents redundant POSTs on later ticks.
+/// Visible-chat synchronization remains durable REST, but realtime becomes its primary wake-up
+/// signal when advertised. A low-frequency timer still retries read receipts and recovers from
+/// missed socket hints; legacy servers keep a bounded polling cadence.
 enum VisibleConversationMessagingPolicy {
-    static let foregroundSyncInterval: TimeInterval = 2
-
     static func newestUnreadIncomingServerMessageID(
         conversationID: String,
         conversations: [Conversation],
@@ -117,6 +115,12 @@ private struct CommunicationPrivacyAccountContext {
 private enum CommunicationPreferenceSaveResult {
     case updated(CommunicationPreferencesDTO)
     case refreshedAfterConflict(CommunicationPreferencesDTO)
+}
+
+private enum SecureMessageSubmissionKind {
+    case userText
+    case paymentEvent
+    case reactionEvent
 }
 
 private struct CommunicationPreferenceConflictRefreshFailure: Error {}
@@ -198,11 +202,11 @@ enum ActiveCallInvitationPolicy {
 
     static func accepts(
         response: CallDTO,
-        expectedCallID: String,
+        expectedContext: ActiveCallInvitationContext,
         invitedRecipientID: String,
         currentUserID: String
     ) -> Bool {
-        guard let expectedCallID = canonicalUUID(expectedCallID),
+        guard let expectedCallID = canonicalUUID(expectedContext.callID),
               canonicalUUID(response.id) == expectedCallID,
               ["ringing", "active"].contains(response.state.lowercased()),
               response.conversationId == nil,
@@ -210,11 +214,16 @@ enum ActiveCallInvitationPolicy {
               let currentUserID = canonicalUUID(currentUserID),
               let responseParticipantIDs = response.participantUserIds,
               var participantUserIDs = canonicalRoster(responseParticipantIDs),
-              participantUserIDs.contains(invitedRecipientID)
+              !participantUserIDs.contains(currentUserID),
+              participantUserIDs.contains(invitedRecipientID),
+              let expectedParticipantUserIDs = canonicalRoster(
+                  Array(expectedContext.participantUserIDs)
+              )
         else { return false }
 
         participantUserIDs.insert(currentUserID)
         return participantUserIDs.count <= maximumParticipantCount
+            && expectedParticipantUserIDs.isSubset(of: participantUserIDs)
     }
 
     private static func canonicalRoster(_ values: [String]) -> Set<String>? {
@@ -443,14 +452,14 @@ enum WaitingCallMergeInvitationReconciliationPolicy {
 
     static func accepts(
         response: CallDTO,
-        expectedCallID: String,
+        expectedContext: ActiveCallInvitationContext,
         invitedRecipientID: String,
         currentUserID: String
     ) -> Bool {
         response.state.caseInsensitiveCompare("active") == .orderedSame
             && ActiveCallInvitationPolicy.accepts(
                 response: response,
-                expectedCallID: expectedCallID,
+                expectedContext: expectedContext,
                 invitedRecipientID: invitedRecipientID,
                 currentUserID: currentUserID
             )
@@ -712,9 +721,17 @@ final class AppModel: ObservableObject {
     private var contactChangeDebounceTask: Task<Void, Never>?
     private var contactSyncNeedsAnotherPass = false
     private var didRequestContactsAtLaunch = false
+    private var isApplyingAccountDiscoveryChoice = false
     private var activeConversationID: String?
     private var visibleConversationSyncTask: Task<Void, Never>?
+    private var visibleConversationSleepTask: Task<Void, Never>?
+    private var visibleConversationSyncWakePending = false
     private var visibleConversationSyncGeneration: UInt64 = 0
+    private var visibleConversationRealtimeDisconnectedAt: Date?
+    private var realtimeMessagingSyncTask: Task<Void, Never>?
+    private var realtimeMessagingSyncNeedsRun = false
+    private var realtimeMessagingSyncGeneration: UInt64 = 0
+    private var realtimeMessagingSyncFingerprint: String?
     private var expiredBackgroundContactTasks: Set<ObjectIdentifier> = []
     private var expiredBackgroundCommunicationTasks: Set<ObjectIdentifier> = []
     private var restoreTask: Task<Void, Never>?
@@ -729,6 +746,13 @@ final class AppModel: ObservableObject {
     private var deferredInvalidatedSessionID: String?
     private var authenticatedRefreshCount = 0
     private var profileAvatarResumeRequestedAfterRefresh = false
+    /// Mirrors what `ProfileAvatarCache` was last told, so publishing state stays a cheap
+    /// comparison instead of an actor hop on every projection.
+    private var avatarCacheAccountID: String?
+    private var avatarCacheAccountSynced = false
+    /// The own-profile photo already handed to the avatar cache, so warming it is a comparison
+    /// rather than a repeated fetch on every publish.
+    private var warmedOwnAvatarURL: String?
     private var callEventDrainTask: Task<Void, Never>?
     private var callHistoryRefreshTask: Task<Void, Never>?
     private var callHistoryRefreshGeneration: UInt64 = 0
@@ -891,13 +915,20 @@ final class AppModel: ObservableObject {
                     if self.isSignedIn,
                        self.accountSetupStep == nil,
                        self.sessionAssurance?.grantsFullAccess == true {
-                        NotificationCoordinator.shared.retryRemoteRegistrationIfNeeded()
-                        NotificationCoordinator.shared.replayCurrentPushTokens()
                         await self.refresh()
-                        self.resumeEphemeralOutgoingCallIfPossible()
-                        await self.flushOutbox()
-                        self.scheduleAutomaticContactSync()
-                    } else if !self.isSignedIn {
+                        if self.appReviewDemoMutationsAllowed,
+                           self.capabilities != nil {
+                            NotificationCoordinator.shared.retryRemoteRegistrationIfNeeded()
+                            NotificationCoordinator.shared.replayCurrentPushTokens()
+                            self.resumeEphemeralOutgoingCallIfPossible()
+                            await self.flushOutbox()
+                            self.scheduleAutomaticContactSync()
+                        }
+                    } else if self.isSignedIn {
+                        // Incomplete accounts do not enter the full session-resume path, but
+                        // still need an authenticated capability decision before setup writes.
+                        _ = await self.reloadCapabilities()
+                    } else {
                         _ = await self.reloadCapabilities()
                     }
                 case .lost:
@@ -1072,12 +1103,32 @@ final class AppModel: ObservableObject {
         else { return false }
         return true
     }
+    var appReviewDemoMutationsAllowed: Bool {
+        AppReviewDemoMutationPolicy.allowsAccountMutation(
+            isSignedIn: isSignedIn,
+            hasAuthenticatedCapabilities: capabilities != nil,
+            isDemoActive: appReviewDemoIsActive
+        )
+    }
     func isReadOnlyAppReviewDemoConversation(_ conversationID: String) -> Bool {
-        appReviewDemoIsActive
-            && AppReviewDemoContent.isSyntheticConversationID(conversationID)
+        AppReviewDemoMutationPolicy.conversationIsReadOnly(
+            conversationID,
+            isDemoActive: appReviewDemoIsActive
+        )
     }
     func isReadOnlyAppReviewDemoCall(_ callID: String) -> Bool {
-        appReviewDemoIsActive && AppReviewDemoContent.isSyntheticCallID(callID)
+        AppReviewDemoMutationPolicy.callIsReadOnly(
+            callID,
+            isDemoActive: appReviewDemoIsActive
+        )
+    }
+    @discardableResult
+    private func rejectAppReviewDemoMutation() -> Bool {
+        guard appReviewDemoMutationsAllowed else {
+            lastError = AppReviewDemoMutationPolicy.readOnlyMessage
+            return true
+        }
+        return false
     }
     var waitingCall: AuthenticatedWaitingCall? { callWaitingState.waitingCall }
     var isMergingWaitingCall: Bool { callWaitingState.isMerging }
@@ -1163,7 +1214,7 @@ final class AppModel: ObservableObject {
     private var secureMessagingReleasePermitted: Bool {
         guard SecureMessagingReleaseGate.enabled else { return false }
         if let capabilities {
-            return capabilities.features?["messaging"] == true
+            return capabilities.supportsFeature("messaging")
                 && capabilities.protocols?.messaging?.supportsReviewedV2 == true
         }
         // Capabilities are nil while discovery is (re)loading — at session resume, after a
@@ -1174,10 +1225,45 @@ final class AppModel: ObservableObject {
         // every time discovery restarts.
         return state.secureMessaging?.enrollment?.userID == profile?.id
     }
+    /// Group chats stay fail-closed until the server advertises them AND this device owns the
+    /// active enrollment. Unlike composing into an existing thread, group creation is never
+    /// permitted through a capability-discovery gap.
+    var messagingGroupsEnabled: Bool {
+        secureMessagingAvailable
+            && capabilities?.supportsFeature(MessagingGroupCapabilityPolicy.featureKey) == true
+    }
+    var messagingReactionsEnabled: Bool {
+        secureMessagingAvailable
+            && MessagingReactionCapabilityPolicy.isEnabled(features: capabilities?.features)
+    }
+    var messagingRealtimeConfiguration: KitRealtimeConfiguration? {
+        guard appReviewDemoMutationsAllowed, secureMessagingAvailable else { return nil }
+        return capabilities?.protocols?.realtime?.validatedConfiguration
+    }
+    var messagingRealtimeLifecycleIdentity: String {
+        [
+            profile?.id ?? "signed-out",
+            messagingRealtimeConfiguration?.lifecycleIdentity ?? "polling",
+            String(isSignedIn),
+            String(accountSetupStep == nil),
+            String(sessionAssurance?.grantsFullAccess == true),
+            String(requiresBiometricSignIn),
+            String(communicationPreferences?.messagingPresenceVisible ?? false),
+        ].joined(separator: ":")
+    }
+    var realtimeVisibleConversationID: String? { activeConversationID }
+    var messagingRealtimeAvailable: Bool {
+        messagingRealtimeConfiguration != nil
+            && KitPresenceCenter.shared.hasProductionTransport
+    }
+    var messagingPresenceEnabled: Bool {
+        messagingRealtimeConfiguration?.presenceEnabled == true
+            && KitPresenceCenter.shared.hasProductionTransport
+    }
     var messagingSendFailureMessage: String { CustomerFacingMessagingCopy.sendFailure }
     var callsFeatureEnabled: Bool { CallLifecyclePolicy.featureEnabled(capabilities) }
     var mayCreateCall: Bool {
-        CallLifecyclePolicy.mayCreateCall(
+        appReviewDemoMutationsAllowed && CallLifecyclePolicy.mayCreateCall(
             signedIn: isSignedIn,
             online: isOnline,
             capabilities: capabilities
@@ -1186,7 +1272,9 @@ final class AppModel: ObservableObject {
 
     private func enqueueCallLifecycleEvent(_ event: CallLifecycleEvent) {
         guard receivedCallEventIds.insert(event.id).inserted else { return }
-        guard !communicationSurfacesConcealed else {
+        guard appReviewDemoMutationsAllowed,
+              !communicationSurfacesConcealed
+        else {
             NotificationCoordinator.shared.acknowledgeCallEvent(event.id)
             return
         }
@@ -1357,18 +1445,30 @@ final class AppModel: ObservableObject {
     }
 
     private func callParticipantAvatarURL(for participantUserIds: [String]?) -> String? {
-        guard let participantUserIds,
-              let remoteUserId = participantUserIds.first(where: {
-                  $0.caseInsensitiveCompare(profile?.id ?? "") != .orderedSame
-              }),
-              let rawValue = contactDirectory.first(where: {
-                  $0.id.caseInsensitiveCompare(remoteUserId) == .orderedSame
-              })?.avatarURL?.trimmingCharacters(in: .whitespacesAndNewlines),
-              let url = URL(string: rawValue),
-              url.scheme?.lowercased() == "https",
-              url.host != nil
-        else { return nil }
-        return url.absoluteString
+        guard let remoteUserId = participantUserIds?.first(where: {
+            $0.caseInsensitiveCompare(profile?.id ?? "") != .orderedSame
+        }) else { return nil }
+        return contactAvatarURL(forUserID: remoteUserId)
+    }
+
+    /// The profile photo the contact directory holds for a Kit Pay user, if any.
+    ///
+    /// The directory is part of the persisted projection, so this keeps answering offline — the
+    /// photo itself then comes from `ProfileAvatarCache`, which is why a face still appears in
+    /// call history with no network.
+    func contactAvatarURL(forUserID userID: String?) -> String? {
+        guard let userID else { return nil }
+        let rawValue: String?
+        if let profile, profile.id.caseInsensitiveCompare(userID) == .orderedSame {
+            // The signed-in customer is never in their own contact directory, so their photo has
+            // to come from the profile or a group list would show them as initials alone.
+            rawValue = profile.avatarURL
+        } else {
+            rawValue = contactDirectory.first(where: {
+                $0.id.caseInsensitiveCompare(userID) == .orderedSame
+            })?.avatarURL
+        }
+        return ProfileAvatarCache.validatedURL(rawValue)?.absoluteString
     }
 
     private func resumeAcceptedAccountDeletionCleanupBeforeRestore() async -> Bool {
@@ -1601,7 +1701,45 @@ final class AppModel: ObservableObject {
         publishedStateRevision = projection.revision
         let displayedState = appReviewDemoProjectedState(from: projection.state)
         state = displayedState
+        syncAvatarCacheAccount()
         return displayedState
+    }
+
+    /// Points the profile-photo cache at whichever account is on screen.
+    ///
+    /// Cached faces are encrypted per account, so the cache has to learn the owner before any
+    /// avatar loads — and has to forget it the moment the state stops carrying a profile, or the
+    /// next person to sign in on this device would read the previous one's photos.
+    private func syncAvatarCacheAccount() {
+        // Sign-out publishes state once more before `isSignedIn` flips, so a plain `isSignedIn`
+        // check here would hand the account back to the cache moments after it was purged.
+        let signedInForDisplay = isSignedIn && !isSigningOut && !isSubmittingAccountDeletion
+        let ownerID = signedInForDisplay ? profile?.id : nil
+        // The first publish always tells the cache, even when the answer is "nobody": until it
+        // hears that, the cache holds photo requests back waiting for an owner that would never
+        // arrive on a signed-out launch.
+        if !avatarCacheAccountSynced || ownerID != avatarCacheAccountID {
+            avatarCacheAccountSynced = true
+            avatarCacheAccountID = ownerID
+            if ownerID == nil { warmedOwnAvatarURL = nil }
+            Task { await ProfileAvatarCache.shared.setAccount(ownerID) }
+        }
+        guard signedInForDisplay else { return }
+        warmOwnAvatar()
+    }
+
+    /// Pulls the account holder's own photo into the same encrypted cache every other face uses.
+    ///
+    /// Their photo would otherwise only be fetched by whichever screen happens to draw it, which
+    /// on a cold launch is a race against the projection publishing an owner — the one avatar in
+    /// the app that could end up re-downloaded every time instead of read from disk. Warming it
+    /// here also covers the moment straight after they upload a new one.
+    private func warmOwnAvatar() {
+        guard let avatarURL = ProfileAvatarCache.validatedURL(profile?.avatarURL)?.absoluteString,
+              avatarURL != warmedOwnAvatarURL
+        else { return }
+        warmedOwnAvatarURL = avatarURL
+        Task { _ = await ProfileAvatarCache.shared.image(for: avatarURL) }
     }
 
     private func appReviewDemoProjectedState(from persisted: PersistedState) -> PersistedState {
@@ -1778,6 +1916,7 @@ final class AppModel: ObservableObject {
 
         do {
             try await SecureMediaFileCache.shared.purge(forUserID: pending.accountID)
+            try await ProfileAvatarCache.shared.purge(forUserID: pending.accountID)
             try MessageBackupKeyStore.removeKey(forUserID: pending.accountID)
         } catch {
             await concealUnresolvedAcceptedAccountDeletionProjection()
@@ -1972,6 +2111,9 @@ final class AppModel: ObservableObject {
             state.outbox.compactMap(OutboxPolicy.terminationReplay).map(\.callId)
         )
         rebuildCallContacts()
+        // Nothing in a freshly launched process is hosting a call, so any record still claiming to
+        // ring or be connected is left over from a crash and would otherwise block calling forever.
+        await reapAbandonedCallRecords()
         if let restoredSession,
            let restoredUserID = restoredSession.accountId,
            SessionAccountBindingPolicy.matches(restoredSession, profile: state.profile) {
@@ -2002,6 +2144,9 @@ final class AppModel: ObservableObject {
                 user: state.profile,
                 assurance: cachedAssurance
             )
+            capabilities = nil
+            authenticatedAppReviewDemoOwnerID = nil
+            await api.setAppReviewDemoReadOnly(true, sessionID: restoredSession.sessionId)
             isSignedIn = true
             do {
                 let liveAssurance = try await APIClientSessionBinding.$sessionID.withValue(
@@ -2067,6 +2212,10 @@ final class AppModel: ObservableObject {
                 user: state.profile,
                 assurance: sessionAssurance
             )
+            guard await reloadCapabilities() else {
+                isLoading = false
+                return
+            }
             if accountSetupStep == nil, biometricUnlockEnabled {
                 biometricAccessState = .locked
                 homeBiometricState = .locked
@@ -2645,6 +2794,10 @@ final class AppModel: ObservableObject {
             guard try await sessions.saveIfEmpty(boundSession) else {
                 throw AuthUIError.staleResponse
             }
+            // Persisting the authenticated session creates the first possible write authority.
+            // Fence it before any subsequent suspension; only a successful authenticated
+            // non-demo capability response may release the fence.
+            await api.setAppReviewDemoReadOnly(true, sessionID: boundSession.sessionId)
             try await store.update { persisted in
                 persisted.bindAuthenticatedProfile(user)
                 persisted.sessionAssurance = result.sessionAssurance
@@ -2669,6 +2822,8 @@ final class AppModel: ObservableObject {
         secureMessagingSyncError.reset()
         kycRequestGeneration &+= 1
         kycStatus = nil
+        capabilities = nil
+        authenticatedAppReviewDemoOwnerID = nil
         sessionAssurance = result.sessionAssurance
         contactDirectoryRevision &+= 1
         await publishLatestState()
@@ -2705,6 +2860,10 @@ final class AppModel: ObservableObject {
             afterAuthentication: user,
             assurance: sessionAssurance
         )
+        guard await reloadCapabilities(),
+              authenticationAttempt == attempt,
+              await authenticatedSecurityContextIsCurrent(authenticatedContext)
+        else { return }
         biometricAccessState = accountSetupStep == nil && biometricUnlockEnabled
             ? .locked
             : .authorized
@@ -2742,6 +2901,9 @@ final class AppModel: ObservableObject {
         confirmation: String,
         pin: String
     ) async throws -> AccountDeletionReceiptDTO {
+        guard appReviewDemoMutationsAllowed else {
+            throw AppReviewDemoMutationError.readOnly
+        }
         guard confirmation == AccountDeletionContract.confirmation,
               confirmation == preflight.confirmationText
         else { throw AccountDeletionContractError.invalidConfirmation }
@@ -3301,11 +3463,25 @@ final class AppModel: ObservableObject {
                 mediaCacheCleanupSucceeded = false
             }
         }
-        // Avatars are the one piece of account data that never reaches SecureLocalStore: they are
-        // fetched over HTTPS and `URLSession.shared` writes them into the shared URLCache, on disk,
-        // in the clear. Every other projection is cleared above, so leaving them behind meant a
-        // signed-out — or deleted — customer's photo, and their contacts' photos, survived in the
-        // container and could be re-displayed to whoever signed in next.
+        // Profile photos outlive a session on purpose, so faces are still there offline and on
+        // relaunch — which makes clearing them at sign-out mandatory, not optional. Both the
+        // sealed files and the account's wrapping key go, so the ciphertext left in any stale
+        // backup or snapshot is unopenable.
+        avatarCacheAccountID = nil
+        avatarCacheAccountSynced = true
+        warmedOwnAvatarURL = nil
+        await ProfileAvatarCache.shared.setAccount(nil)
+        if let signedOutUserID {
+            do {
+                try await ProfileAvatarCache.shared.purge(forUserID: signedOutUserID)
+            } catch {
+                mediaCacheCleanupSucceeded = false
+            }
+        }
+        // Builds before `ProfileAvatarCache` fetched avatars with `URLSession.shared`, which
+        // writes them into the shared URLCache on disk in the clear. Clearing it retires those
+        // copies so a signed-out — or deleted — customer's photo, and their contacts' photos,
+        // cannot be re-displayed to whoever signs in next.
         purgeSharedResponseCache()
         await publishLatestState()
         isSignedIn = false
@@ -3454,6 +3630,10 @@ final class AppModel: ObservableObject {
     }
 
     func revokeRegisteredDevice(id: String) async {
+        guard appReviewDemoMutationsAllowed else {
+            deviceManagementErrorMessage = AppReviewDemoMutationPolicy.readOnlyMessage
+            return
+        }
         guard !isRefreshingRegisteredDevices,
               revokingRegisteredDeviceID == nil,
               !isSigningOut,
@@ -3671,6 +3851,10 @@ final class AppModel: ObservableObject {
     }
 
     func setVerifyIdentityOnNewLogin(_ enabled: Bool) async {
+        guard appReviewDemoMutationsAllowed else {
+            securityPreferencesErrorMessage = AppReviewDemoMutationPolicy.readOnlyMessage
+            return
+        }
         guard !isManagingSecurityPreferences else { return }
         if securityPreferences == nil {
             await loadSecurityPreferences()
@@ -3884,6 +4068,9 @@ final class AppModel: ObservableObject {
     }
 
     func beginTOTPEnrollment() async throws -> TOTPEnrollmentDTO {
+        guard appReviewDemoMutationsAllowed else {
+            throw AppReviewDemoMutationError.readOnly
+        }
         let context = try await captureAuthenticatedSecurityContext()
         let enrollment = try await APIClientSessionBinding.$sessionID.withValue(
             context.sessionID
@@ -3900,6 +4087,9 @@ final class AppModel: ObservableObject {
     }
 
     func confirmTOTPEnrollment(code: String) async throws -> [String] {
+        guard appReviewDemoMutationsAllowed else {
+            throw AppReviewDemoMutationError.readOnly
+        }
         guard let normalizedCode = MFAFactorCodePolicy.normalizedSixDigitCode(code) else {
             throw APIErrorPayload(
                 code: "MFA_CODE_INVALID",
@@ -3921,6 +4111,9 @@ final class AppModel: ObservableObject {
     }
 
     func regenerateMFARecoveryCodes(code: String) async throws -> [String] {
+        guard appReviewDemoMutationsAllowed else {
+            throw AppReviewDemoMutationError.readOnly
+        }
         guard let normalizedCode = MFAFactorCodePolicy.normalizedFactorCode(code) else {
             throw APIErrorPayload(
                 code: "MFA_CODE_INVALID",
@@ -3948,6 +4141,9 @@ final class AppModel: ObservableObject {
     }
 
     func disableTOTP(code: String) async throws {
+        guard appReviewDemoMutationsAllowed else {
+            throw AppReviewDemoMutationError.readOnly
+        }
         guard let normalizedCode = MFAFactorCodePolicy.normalizedFactorCode(code) else {
             throw APIErrorPayload(
                 code: "MFA_CODE_INVALID",
@@ -4044,6 +4240,10 @@ final class AppModel: ObservableObject {
 
     @discardableResult
     func setBiometricUnlockEnabled(_ enabled: Bool) async -> Bool {
+        guard appReviewDemoMutationsAllowed else {
+            biometricErrorMessage = AppReviewDemoMutationPolicy.readOnlyMessage
+            return false
+        }
         guard !isConfiguringBiometrics,
               isSignedIn,
               accountSetupStep == nil,
@@ -4192,6 +4392,9 @@ final class AppModel: ObservableObject {
 #if DEBUG && APP_STORE_SCREENSHOTS
         guard !AppStoreScreenshotFixture.isActive else { return }
 #endif
+        KitPresenceCenter.shared.setForeground(false)
+        stopVisibleConversationSync()
+        cancelRealtimeMessagingSync()
         suspendEphemeralOutgoingCallSubmission()
         returningSignInBiometricAuthorizationFence.invalidate()
         homeBiometricAuthorizationFence.invalidate()
@@ -4248,7 +4451,10 @@ final class AppModel: ObservableObject {
     }
 
     func authorizePaymentRequestSubmission() async -> Bool {
-        guard isSignedIn, !requiresBiometricSignIn else { return false }
+        guard appReviewDemoMutationsAllowed,
+              isSignedIn,
+              !requiresBiometricSignIn
+        else { return false }
         guard biometricUnlockEnabled else { return true }
         return await authenticateBiometrically(for: .paymentRequest)
     }
@@ -4263,6 +4469,9 @@ final class AppModel: ObservableObject {
         note: String?,
         idempotencyKey: String
     ) async throws -> PaymentRequestDTO {
+        guard appReviewDemoMutationsAllowed else {
+            throw AppReviewDemoMutationError.readOnly
+        }
         guard isSignedIn,
               isOnline,
               accountSetupStep == nil,
@@ -4327,6 +4536,9 @@ final class AppModel: ObservableObject {
         pin: String,
         reason: String
     ) async throws -> StepUpVerificationDTO {
+        guard appReviewDemoMutationsAllowed else {
+            throw AppReviewDemoMutationError.readOnly
+        }
         guard isSignedIn,
               isOnline,
               accountSetupStep == nil,
@@ -4755,10 +4967,9 @@ final class AppModel: ObservableObject {
             cancelEphemeralOutgoingCall(dismissPresentation: true)
         }
         callMediaAccountLease = lease
-        NotificationCoordinator.shared.requestAuthorizationAndRegister(
-            forAccountID: expectedUserID
-        )
-        NotificationCoordinator.shared.replayCurrentPushTokens()
+        // No authenticated write may leave the device until this session's capability cohort is
+        // known. This also covers a first launch where no previous demo fence exists yet.
+        await api.setAppReviewDemoReadOnly(true, sessionID: expectedSessionID)
         capabilities = nil
         await refresh()
         guard await outboxContextIsCurrent(
@@ -4766,6 +4977,15 @@ final class AppModel: ObservableObject {
             userID: expectedUserID,
             sessionID: expectedSessionID
         ) else { return }
+        guard appReviewDemoMutationsAllowed, capabilities != nil else {
+            didResumeAuthenticatedSession = false
+            isLoading = false
+            return
+        }
+        NotificationCoordinator.shared.requestAuthorizationAndRegister(
+            forAccountID: expectedUserID
+        )
+        NotificationCoordinator.shared.replayCurrentPushTokens()
         try? await store.update { persisted in
             guard persisted.profile?.id.caseInsensitiveCompare(expectedUserID) == .orderedSame,
                   persisted.communicationOwnerUserID?.caseInsensitiveCompare(expectedUserID)
@@ -5077,6 +5297,90 @@ final class AppModel: ObservableObject {
             && profile?.id.caseInsensitiveCompare(expectedUserID) == .orderedSame
     }
 
+    func realtimeSessionID(for userID: String) async -> String? {
+        guard isSignedIn,
+              !isSigningOut,
+              accountSetupStep == nil,
+              sessionAssurance?.grantsFullAccess == true,
+              !requiresBiometricSignIn,
+              messagingRealtimeConfiguration != nil,
+              profile?.id.caseInsensitiveCompare(userID) == .orderedSame,
+              let session = await sessions.current(),
+              session.accountId?.caseInsensitiveCompare(userID) == .orderedSame
+        else { return nil }
+        return session.sessionId
+    }
+
+    /// Conflates realtime hints to one active durable REST sync plus at most one rerun. The
+    /// socket carries no cursor or content; this remains the only path that mutates messaging
+    /// projection state, and every pass is fenced to the account/session that received the hint.
+    func requestRealtimeMessagingSync(userID: String, sessionID: String) {
+        guard UIApplication.shared.applicationState == .active,
+              KitPresenceCenter.shared.isLive,
+              messagingRealtimeConfiguration != nil,
+              profile?.id.caseInsensitiveCompare(userID) == .orderedSame
+        else { return }
+        // The visible-conversation loop performs the same account-fenced durable sync and also
+        // publishes read receipts. Wake that single owner instead of racing it with another sync.
+        if activeConversationID != nil {
+            wakeVisibleConversationSync()
+            return
+        }
+        let context = AuthenticatedSecurityContext(
+            accountEpoch: accountEpoch,
+            userID: userID,
+            sessionID: sessionID
+        )
+        let fingerprint = [accountEpoch.uuidString, userID.lowercased(), sessionID.lowercased()]
+            .joined(separator: ":")
+
+        if let existing = realtimeMessagingSyncFingerprint, existing != fingerprint {
+            realtimeMessagingSyncGeneration &+= 1
+            realtimeMessagingSyncTask?.cancel()
+            realtimeMessagingSyncTask = nil
+            realtimeMessagingSyncNeedsRun = false
+        }
+        realtimeMessagingSyncFingerprint = fingerprint
+        realtimeMessagingSyncNeedsRun = true
+        guard realtimeMessagingSyncTask == nil else { return }
+
+        realtimeMessagingSyncGeneration &+= 1
+        let generation = realtimeMessagingSyncGeneration
+        realtimeMessagingSyncTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                if self.realtimeMessagingSyncGeneration == generation {
+                    self.realtimeMessagingSyncTask = nil
+                    self.realtimeMessagingSyncNeedsRun = false
+                    self.realtimeMessagingSyncFingerprint = nil
+                }
+            }
+            while self.realtimeMessagingSyncNeedsRun {
+                self.realtimeMessagingSyncNeedsRun = false
+                guard self.realtimeMessagingSyncGeneration == generation,
+                      UIApplication.shared.applicationState == .active,
+                      KitPresenceCenter.shared.isLive,
+                      await self.authenticatedSecurityContextIsCurrent(context)
+                else { return }
+                _ = await APIClientSessionBinding.$sessionID.withValue(context.sessionID) {
+                    await self.syncSecureMessagingIfPermitted(
+                        presentsVisibleMessageNotifications: true,
+                        reportsFailure: false,
+                        expectedContext: context
+                    )
+                }
+            }
+        }
+    }
+
+    private func cancelRealtimeMessagingSync() {
+        realtimeMessagingSyncGeneration &+= 1
+        realtimeMessagingSyncTask?.cancel()
+        realtimeMessagingSyncTask = nil
+        realtimeMessagingSyncNeedsRun = false
+        realtimeMessagingSyncFingerprint = nil
+    }
+
     @discardableResult
     private func syncSecureMessagingIfPermitted(
         presentsVisibleMessageNotifications: Bool = false,
@@ -5158,6 +5462,7 @@ final class AppModel: ObservableObject {
         let canonical = uuid.uuidString.lowercased()
         guard canonical.caseInsensitiveCompare(conversationID) == .orderedSame else { return }
         if visible {
+            KitPresenceCenter.shared.observeConversation(canonical)
             if activeConversationID != canonical || visibleConversationSyncTask == nil {
                 activeConversationID = canonical
                 startVisibleConversationSync(for: canonical)
@@ -5173,13 +5478,17 @@ final class AppModel: ObservableObject {
                 )
             }
         } else if activeConversationID == canonical {
+            KitPresenceCenter.shared.unobserveConversation(canonical)
             activeConversationID = nil
             stopVisibleConversationSync()
         }
     }
 
     private func startVisibleConversationSync(for conversationID: String) {
+        visibleConversationSleepTask?.cancel()
+        visibleConversationSleepTask = nil
         visibleConversationSyncTask?.cancel()
+        visibleConversationSyncWakePending = false
         visibleConversationSyncGeneration &+= 1
         let generation = visibleConversationSyncGeneration
         visibleConversationSyncTask = Task { @MainActor [weak self] in
@@ -5206,6 +5515,7 @@ final class AppModel: ObservableObject {
                 generation: generation,
                 context: context
             ) {
+                self.visibleConversationSyncWakePending = false
                 if self.isOnline {
                     // Existing unread state is published immediately on presentation. Keeping
                     // the attempted boundary lets a failed POST wait for the next cadence while
@@ -5265,23 +5575,82 @@ final class AppModel: ObservableObject {
                     generation: generation,
                     context: context
                 ) else { return }
-                do {
-                    try await Task.sleep(
-                        for: .seconds(
-                            VisibleConversationMessagingPolicy.foregroundSyncInterval
-                        )
-                    )
-                } catch {
-                    return
+                if self.visibleConversationSyncWakePending { continue }
+
+                let now = Date()
+                let hasRealtimeConfiguration = self.messagingRealtimeConfiguration != nil
+                let isRealtimeLive = hasRealtimeConfiguration
+                    && KitPresenceCenter.shared.isLive
+                self.updateVisibleConversationDisconnectClock(
+                    hasRealtimeConfiguration: hasRealtimeConfiguration,
+                    isLive: isRealtimeLive,
+                    now: now
+                )
+                let disconnectedFor = self.visibleConversationRealtimeDisconnectedAt.map {
+                    max(0, now.timeIntervalSince($0))
+                } ?? 0
+                let interval = KitRealtimePollingPolicy.interval(
+                    hasRealtimeConfiguration: hasRealtimeConfiguration,
+                    isLive: isRealtimeLive,
+                    disconnectedFor: disconnectedFor
+                )
+                let sleepTask = Task<Void, Never> {
+                    try? await Task.sleep(for: .seconds(interval))
                 }
+                self.visibleConversationSleepTask = sleepTask
+                await sleepTask.value
+                if self.visibleConversationSyncGeneration == generation {
+                    self.visibleConversationSleepTask = nil
+                }
+                guard !Task.isCancelled else { return }
             }
         }
     }
 
     private func stopVisibleConversationSync() {
         visibleConversationSyncGeneration &+= 1
+        visibleConversationSleepTask?.cancel()
+        visibleConversationSleepTask = nil
         visibleConversationSyncTask?.cancel()
         visibleConversationSyncTask = nil
+        visibleConversationSyncWakePending = false
+    }
+
+    /// Wakes a sleeping visible-chat recovery loop without cancelling an in-flight durable sync.
+    /// Repeated Reverb nudges collapse into one extra pass.
+    private func wakeVisibleConversationSync() {
+        guard let activeConversationID else { return }
+        guard visibleConversationSyncTask != nil else {
+            startVisibleConversationSync(for: activeConversationID)
+            return
+        }
+        visibleConversationSyncWakePending = true
+        visibleConversationSleepTask?.cancel()
+    }
+
+    func realtimeMessagingConnectionDidChange(isLive: Bool, now: Date = Date()) {
+        updateVisibleConversationDisconnectClock(
+            hasRealtimeConfiguration: messagingRealtimeConfiguration != nil,
+            isLive: isLive,
+            now: now
+        )
+        wakeVisibleConversationSync()
+    }
+
+    private func updateVisibleConversationDisconnectClock(
+        hasRealtimeConfiguration: Bool,
+        isLive: Bool,
+        now: Date
+    ) {
+        guard hasRealtimeConfiguration else {
+            visibleConversationRealtimeDisconnectedAt = nil
+            return
+        }
+        if isLive {
+            visibleConversationRealtimeDisconnectedAt = nil
+        } else if visibleConversationRealtimeDisconnectedAt == nil {
+            visibleConversationRealtimeDisconnectedAt = now
+        }
     }
 
     private func visibleConversationContextIsCurrent(
@@ -5349,7 +5718,8 @@ final class AppModel: ObservableObject {
 
     func canOpenConversation(for activeCall: ActiveCallPresentation?) -> Bool {
         if activeCallConversation(for: activeCall) != nil { return true }
-        guard isOnline,
+        guard appReviewDemoMutationsAllowed,
+              isOnline,
               secureMessagingAvailable,
               let target = activeCallConversationCreationTarget(for: activeCall)
         else { return false }
@@ -5395,7 +5765,8 @@ final class AppModel: ObservableObject {
             return true
         }
 
-        guard isOnline,
+        guard appReviewDemoMutationsAllowed,
+              isOnline,
               secureMessagingAvailable,
               let target = activeCallConversationCreationTarget(for: activeCall),
               communicationPrivacyDenialMessage(
@@ -5551,7 +5922,8 @@ final class AppModel: ObservableObject {
         _ text: String,
         action: MessageNotificationAction
     ) async -> Bool {
-        guard !isSigningOut,
+        guard appReviewDemoMutationsAllowed,
+              !isSigningOut,
               !isSubmittingAccountDeletion,
               !acceptedAccountDeletionCleanupBlocked,
               !protectedLocalStateRecoveryBlocked,
@@ -5884,17 +6256,83 @@ final class AppModel: ObservableObject {
         declineWaitingCallAfterActiveCallTermination()
     }
 
-    func completeProfile(name: String, tag: String) async {
+    /// Every call this process is currently hosting: the presented media session, the provisional
+    /// outgoing attempt, and the CallKit waiting record. A record named here is live by definition.
+    private func hostedCallIDs() -> Set<String> {
+        var identifiers: Set<String> = []
+        if let activeCallID = CallMediaCoordinator.shared.activeCall?.id {
+            identifiers.insert(canonicalCallID(activeCallID) ?? activeCallID.lowercased())
+        }
+        if let attempt = ephemeralOutgoingCallGate.attempt {
+            identifiers.insert(attempt.clientCallIDString.lowercased())
+        }
+        if let waiting = callWaitingState.waitingCall {
+            identifiers.insert(waiting.callID.lowercased())
+        }
+        return identifiers
+    }
+
+    /// Retires `ringing`/`active` records this process can no longer act on — the residue of a
+    /// crash, or of a termination that never reached the server. Local `failed` yields to every
+    /// terminal server state, so the next history refresh still restores the real outcome.
+    @discardableResult
+    private func reapAbandonedCallRecords(now: Date = Date()) async -> Bool {
+        let hosted = hostedCallIDs()
+        guard let ownerUserID = profile?.id,
+              state.calls.contains(where: {
+                  AbandonedCallRecordPolicy.isAbandoned($0, hostedCallIDs: hosted, now: now)
+              })
+        else { return false }
+        do {
+            try await store.update { persisted in
+                guard persisted.profile?.id.caseInsensitiveCompare(ownerUserID) == .orderedSame
+                else { throw StoreError.accountChanged }
+                persisted.calls = AbandonedCallRecordPolicy.reaping(
+                    persisted.calls,
+                    hostedCallIDs: hosted,
+                    now: now
+                )
+            }
+        } catch {
+            return false
+        }
+        await publishLatestState()
+        rebuildCallContacts()
+        return true
+    }
+
+    /// Commits the chosen half of the account's identity at the end of setup.
+    ///
+    /// `username` is optional: when the account already carries a verified legal name the server
+    /// reports `username_required = false`, and passing nil leaves the provisional tag in place
+    /// rather than forcing a handle on someone who did not want one. `displayName` is likewise
+    /// optional — nil means "keep showing my verified legal name".
+    ///
+    /// The photo is deliberately attached *after* the step advances. Uploading an avatar is a
+    /// three-leg prepare/upload/attach with its own durable retry lane, and a slow or failed
+    /// photo must never be what stands between someone and a finished account.
+    func completeProfile(
+        displayName: String?,
+        username: String?,
+        avatarJPEG: Data? = nil,
+        discovery: PendingAccountDiscoveryChoice? = nil
+    ) async {
+        guard !rejectAppReviewDemoMutation() else { return }
         guard let currentStep = accountSetupStep, case .profile = currentStep else { return }
         guard isOnline else {
             lastError = "Connect to the internet to finish setting up your profile."
             return
         }
-        let normalizedName = normalizeProfileName(name)
-        let normalizedTag = normalizeProfileTag(tag)
+        let normalizedName = displayName.map(normalizeProfileName).flatMap {
+            $0.isEmpty ? nil : $0
+        }
+        let normalizedTag = username.map(normalizeProfileTag).flatMap { $0.isEmpty ? nil : $0 }
+        let verifiedLegalName = profile?.verifiedLegalName
         if let validationError = profileIdentityValidationError(
-            name: normalizedName,
-            tag: normalizedTag
+            name: normalizedName ?? "",
+            tag: normalizedTag,
+            verifiedLegalName: verifiedLegalName,
+            usernameRequired: profile?.usernameRequired ?? true
         ) {
             lastError = validationError
             return
@@ -5905,6 +6343,12 @@ final class AppModel: ObservableObject {
         do {
             guard let expectedSessionID = await sessions.current()?.sessionId else {
                 throw APIClientError.signedOut
+            }
+            // Record the discoverability choices before the profile PATCH: they are held in
+            // encrypted state until the session is authorized to send them, so an interrupted
+            // setup still ends with the privacy the user asked for.
+            if let discovery {
+                await recordPendingAccountDiscoveryChoice(discovery)
             }
             let response = try await api.updateProfile(name: normalizedName, tag: normalizedTag)
             guard isSignedIn,
@@ -5933,11 +6377,25 @@ final class AppModel: ObservableObject {
             )
         } catch {
             lastError = error.localizedDescription
+            return
+        }
+
+        if let avatarJPEG {
+            // Reuses the hardened avatar lane rather than duplicating it. A failure here surfaces
+            // its own message and leaves the durable pending attachment to retry; setup is done.
+            await updateProfile(
+                name: normalizedName,
+                tag: normalizedTag,
+                avatarJPEG: avatarJPEG
+            )
         }
     }
 
+    /// Nil `name`/`tag` mean "leave unchanged", which is how an account without a chosen username
+    /// updates its photo without being forced to invent a handle first.
     @discardableResult
-    func updateProfile(name: String, tag: String, avatarJPEG: Data? = nil) async -> Bool {
+    func updateProfile(name: String?, tag: String?, avatarJPEG: Data? = nil) async -> Bool {
+        guard !rejectAppReviewDemoMutation() else { return false }
         guard profileUpdateTask == nil else { return false }
         let taskID = UUID()
         let task = Task { @MainActor [weak self] in
@@ -5960,6 +6418,9 @@ final class AppModel: ObservableObject {
     /// Starts (or resends) the authenticated profile-email challenge. The returned proof is
     /// process-local and bound to the exact account/session that requested it.
     func requestProfileEmailAttachment(email: String) async throws -> ProfileEmailChallenge {
+        guard appReviewDemoMutationsAllowed else {
+            throw AppReviewDemoMutationError.readOnly
+        }
         let normalizedEmail = ProfileEmailChallengePolicy.normalizedEmail(email)
         guard EmailAccountValidation.isValidEmail(normalizedEmail) else {
             throw ProfileEmailAttachmentError.invalidEmail
@@ -5991,6 +6452,9 @@ final class AppModel: ObservableObject {
         challenge: ProfileEmailChallenge,
         code: String
     ) async throws {
+        guard appReviewDemoMutationsAllowed else {
+            throw AppReviewDemoMutationError.readOnly
+        }
         guard let normalizedCode = ProfileEmailVerificationCodePolicy.normalizedCode(code) else {
             throw ProfileEmailAttachmentError.invalidCode
         }
@@ -6079,8 +6543,8 @@ final class AppModel: ObservableObject {
     }
 
     private func performProfileUpdate(
-        name: String,
-        tag: String,
+        name: String?,
+        tag: String?,
         avatarJPEG: Data?
     ) async -> Bool {
         guard !Task.isCancelled else { return false }
@@ -6098,11 +6562,13 @@ final class AppModel: ObservableObject {
             return false
         }
         guard !isUpdatingProfile else { return false }
-        let normalizedName = normalizeProfileName(name)
-        let normalizedTag = normalizeProfileTag(tag)
+        let normalizedName = name.map(normalizeProfileName).flatMap { $0.isEmpty ? nil : $0 }
+        let normalizedTag = tag.map(normalizeProfileTag).flatMap { $0.isEmpty ? nil : $0 }
         if let validationError = profileIdentityValidationError(
-            name: normalizedName,
-            tag: normalizedTag
+            name: normalizedName ?? "",
+            tag: normalizedTag,
+            verifiedLegalName: profile?.verifiedLegalName,
+            usernameRequired: profile?.usernameRequired ?? true
         ) {
             lastError = validationError
             return false
@@ -6307,7 +6773,8 @@ final class AppModel: ObservableObject {
     /// record and account epoch up front; the current session is resolved inside the task and
     /// must still exactly match before any authenticated request is sent.
     private func schedulePendingProfileAvatarResume() {
-        guard profileAvatarResumeTask == nil,
+        guard appReviewDemoMutationsAllowed,
+              profileAvatarResumeTask == nil,
               !isSigningOut,
               !isUpdatingProfile,
               isSignedIn,
@@ -6450,6 +6917,7 @@ final class AppModel: ObservableObject {
     }
 
     func completePaymentPinSetup(pin: String) async {
+        guard !rejectAppReviewDemoMutation() else { return }
         guard accountSetupStep == .paymentPin else { return }
         guard isOnline else {
             lastError = "Connect to the internet to set your wallet PIN."
@@ -6653,16 +7121,33 @@ final class AppModel: ObservableObject {
                       cancelled: false
                   )
             else { return false }
-            authenticatedAppReviewDemoOwnerID = AppReviewDemoAccessPolicy.ownerID(
-                features: discovered.features,
-                authority: .authenticatedSession,
-                isSignedIn: isSignedIn,
-                profileID: profile?.id,
-                sessionID: expectedSession?.sessionId,
-                sessionAccountID: expectedSession?.accountId
+            let demoFence = AppReviewDemoCapabilityFenceDecision.resolved(
+                ownerID: AppReviewDemoAccessPolicy.ownerID(
+                    features: discovered.features,
+                    authority: .authenticatedSession,
+                    isSignedIn: isSignedIn,
+                    profileID: profile?.id,
+                    sessionID: expectedSession?.sessionId,
+                    sessionAccountID: expectedSession?.accountId
+                )
             )
+            // Arm the transport fence before exposing demo content. When the capability is
+            // authoritatively withdrawn, keep the fence through projection replacement so stale
+            // synthetic rows and already-presented sheets never gain a writable interval.
+            if demoFence.keepsTransportFenceAfterProjection {
+                await api.setAppReviewDemoReadOnly(true, sessionID: expectedSessionID)
+                outboxWakeTask?.cancel()
+                outboxWakeTask = nil
+                communicationReplayTask?.cancel()
+                communicationReplayTask = nil
+                CommunicationBackgroundReplayScheduler.shared.cancel()
+            }
+            authenticatedAppReviewDemoOwnerID = demoFence.projectedOwnerID
             capabilities = discovered
             await publishLatestState()
+            if !demoFence.keepsTransportFenceAfterProjection {
+                await api.setAppReviewDemoReadOnly(false, sessionID: expectedSessionID)
+            }
             return true
         } catch {
             guard await capabilitiesContextIsCurrent(
@@ -6683,7 +7168,16 @@ final class AppModel: ObservableObject {
                 // overwrite a newer authoritative result.
                 return false
             }
-            authenticatedAppReviewDemoOwnerID = nil
+            // Failure is not evidence that the authenticated server withdrew the review-account
+            // policy. Retain both the in-memory owner and the transport fence until a successful,
+            // session-bound capabilities response says otherwise.
+            let demoFence = AppReviewDemoCapabilityFenceDecision.failed(
+                previousOwnerID: authenticatedAppReviewDemoOwnerID
+            )
+            authenticatedAppReviewDemoOwnerID = demoFence.projectedOwnerID
+            if demoFence.keepsTransportFenceAfterProjection {
+                await api.setAppReviewDemoReadOnly(true, sessionID: expectedSessionID)
+            }
             capabilities = nil
             await publishLatestState()
             lastError = error.localizedDescription
@@ -6738,7 +7232,8 @@ final class AppModel: ObservableObject {
     }
 
     func communicationPrivacyAllowsOutbound(to rawUserID: String?) -> Bool {
-        CommunicationPrivacyAccessPolicy.decision(
+        guard appReviewDemoMutationsAllowed else { return false }
+        return CommunicationPrivacyAccessPolicy.decision(
             ownerUserID: profile?.id,
             recipientUserID: rawUserID,
             hasLoadedCompleteProjection: hasUsableCommunicationPrivacyProjection,
@@ -6838,15 +7333,111 @@ final class AppModel: ObservableObject {
         await updateCommunicationPreference(.messageRequests(enabled))
     }
 
+    func setMessagingPresenceVisible(_ visible: Bool) async {
+        await updateCommunicationPreference(.presenceVisibility(visible))
+        guard communicationPreferences?.messagingPresenceVisible == visible else { return }
+        // Realtime capability presence is the server's effective preference/rollout projection.
+        // Refresh it after PATCH so the socket reconnects against current authority.
+        _ = await reloadCapabilities()
+    }
+
+    /// Whether this installation may upload its address book so Kit Pay can match contacts who
+    /// already have an account. Device-local: the server carries no such preference, and
+    /// `CommunicationPreferencesDTO` rejects unknown keys, so the client cannot invent a wire
+    /// field without breaking already-shipped builds. Never chosen reads as enabled, which
+    /// preserves the behaviour every existing installation already has.
+    var contactDiscoveryEnabled: Bool {
+        state.contactDiscoveryEnabled ?? true
+    }
+
+    func setContactDiscoveryEnabled(_ enabled: Bool) async {
+        guard !rejectAppReviewDemoMutation() else { return }
+        guard contactDiscoveryEnabled != enabled else { return }
+        do {
+            try await store.update { persisted in persisted.contactDiscoveryEnabled = enabled }
+            await publishLatestState()
+        } catch {
+            // A privacy choice must take effect even if protected storage is momentarily
+            // unavailable; the next successful write persists it.
+            state.contactDiscoveryEnabled = enabled
+        }
+        if enabled {
+            contactSyncState = .idle
+            scheduleAutomaticContactSync()
+        } else {
+            invalidateContactSyncForRevocation()
+            await clearLocalContacts(resultingState: .disabledByPreference)
+        }
+    }
+
+    /// Records the server-backed discoverability choices made during account setup.
+    ///
+    /// They cannot be sent yet: `communicationPrivacyContext()` deliberately refuses to run while
+    /// `accountSetupStep != nil` or before the session grants full access. Holding the intent in
+    /// the encrypted, account-bound state means an interrupted setup — a KYC review that takes
+    /// hours, or an app relaunch — still ends with the choices the user actually made.
+    func recordPendingAccountDiscoveryChoice(_ choice: PendingAccountDiscoveryChoice) async {
+        guard appReviewDemoMutationsAllowed else { return }
+        do {
+            try await store.update { persisted in
+                persisted.pendingAccountDiscoveryChoice = choice
+            }
+            await publishLatestState()
+        } catch {
+            state.pendingAccountDiscoveryChoice = choice
+        }
+    }
+
+    /// Drains the choice recorded above, the first time the session is authorized enough to
+    /// commit it. Left in place on any failure so the next opportunity retries it.
+    func applyPendingAccountDiscoveryChoiceIfPossible() async {
+        guard appReviewDemoMutationsAllowed,
+              let pending = state.pendingAccountDiscoveryChoice,
+              !isApplyingAccountDiscoveryChoice,
+              !isSigningOut,
+              isSignedIn,
+              isOnline,
+              accountSetupStep == nil,
+              sessionAssurance?.grantsFullAccess == true
+        else { return }
+        isApplyingAccountDiscoveryChoice = true
+        defer { isApplyingAccountDiscoveryChoice = false }
+
+        if communicationPreferences == nil {
+            await loadCommunicationPrivacy()
+        }
+        guard let loaded = communicationPreferences else { return }
+        for change in pending.outstandingChanges(given: loaded) {
+            await updateCommunicationPreference(change)
+            // Stop at the first write that did not land — including a conflict resolved in
+            // another device's favour — rather than fighting a newer choice.
+            guard let refreshed = communicationPreferences,
+                  change.isSatisfied(by: refreshed)
+            else { return }
+        }
+        do {
+            try await store.update { persisted in
+                persisted.pendingAccountDiscoveryChoice = nil
+            }
+            await publishLatestState()
+        } catch {
+            state.pendingAccountDiscoveryChoice = nil
+        }
+    }
+
     func setCommunicationBlocked(_ blocked: Bool, userID rawUserID: String) async -> Bool {
+        guard appReviewDemoMutationsAllowed else {
+            communicationPrivacyErrorMessage = AppReviewDemoMutationPolicy.readOnlyMessage
+            return false
+        }
         guard let userID = CommunicationPrivacyIdentifier.canonicalUUID(rawUserID),
               userID != CommunicationPrivacyIdentifier.canonicalUUID(profile?.id)
         else {
             communicationPrivacyErrorMessage = "This Kit Pay account cannot be updated."
             return false
         }
-        guard !(appReviewDemoIsActive && AppReviewDemoContent.isSyntheticPeerID(userID)) else {
-            communicationPrivacyErrorMessage = "This App Review preview is read-only."
+        guard !AppReviewDemoContent.isSyntheticPeerID(userID) else {
+            communicationPrivacyErrorMessage = AppReviewDemoMutationPolicy.readOnlyMessage
             return false
         }
         if !hasUsableCommunicationPrivacyProjection {
@@ -6911,6 +7502,10 @@ final class AppModel: ObservableObject {
     }
 
     private func updateCommunicationPreference(_ change: CommunicationPreferenceChange) async {
+        guard appReviewDemoMutationsAllowed else {
+            communicationPrivacyErrorMessage = AppReviewDemoMutationPolicy.readOnlyMessage
+            return
+        }
         if communicationPreferences == nil {
             await loadCommunicationPrivacy()
         }
@@ -7272,7 +7867,8 @@ final class AppModel: ObservableObject {
         recipientId: String? = nil,
         body: String,
         clientMessageID: UUID? = nil,
-        draftClearVersion: ConversationDraftWriteVersion? = nil
+        draftClearVersion: ConversationDraftWriteVersion? = nil,
+        deliverAt: Date? = nil
     ) async -> Bool {
         guard !isReadOnlyAppReviewDemoConversation(conversationId) else {
             lastError = "This App Review preview is read-only."
@@ -7285,7 +7881,8 @@ final class AppModel: ObservableObject {
             body: body,
             clientMessageID: clientMessageID,
             draftClearVersion: draftClearVersion,
-            trustedPaymentEvent: false
+            submissionKind: .userText,
+            deliverAt: deliverAt
         )
     }
 
@@ -7310,7 +7907,44 @@ final class AppModel: ObservableObject {
             body: body,
             clientMessageID: clientMessageID,
             draftClearVersion: nil,
-            trustedPaymentEvent: true
+            submissionKind: .paymentEvent
+        )
+    }
+
+    /// Queues a reaction only through the typed reaction boundary. Plain composers and
+    /// notification replies reserve `KITRXN1:` so pasted text cannot impersonate a reaction.
+    @discardableResult
+    func queueReactionEvent(
+        conversationId: String,
+        title: String,
+        recipientId: String?,
+        reaction: KitMessageReaction
+    ) async -> Bool {
+        guard messagingReactionsEnabled else {
+            lastError = messagingSendFailureMessage
+            return false
+        }
+        guard !isReadOnlyAppReviewDemoConversation(conversationId) else {
+            lastError = "This App Review preview is read-only."
+            return false
+        }
+        let canonicalConversationID = conversationId.lowercased()
+        guard state.messages.contains(where: { message in
+            message.conversationId.lowercased() == canonicalConversationID
+                && message.serverMessageId?.lowercased() == reaction.targetServerMessageID
+                && message.secureMessagingHistory?.kind != .encryptedReaction
+        }) else {
+            lastError = "This message is no longer available to react to."
+            return false
+        }
+        return await queueValidatedMessage(
+            conversationId: conversationId,
+            title: title,
+            recipientId: recipientId,
+            body: reaction.encoded,
+            clientMessageID: nil,
+            draftClearVersion: nil,
+            submissionKind: .reactionEvent
         )
     }
 
@@ -7321,18 +7955,27 @@ final class AppModel: ObservableObject {
         body: String,
         clientMessageID: UUID?,
         draftClearVersion: ConversationDraftWriteVersion?,
-        trustedPaymentEvent: Bool
+        submissionKind: SecureMessageSubmissionKind,
+        deliverAt: Date? = nil
     ) async -> Bool {
         let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
-        if trustedPaymentEvent {
+        switch submissionKind {
+        case .paymentEvent:
             guard KitPaymentMessage.parse(trimmed) != nil else {
                 lastError = "Kit Pay could not validate this payment event."
                 return false
             }
-        } else if !SecureMessageReservedPrefixPolicy.allowsUserAuthoredText(trimmed) {
-            lastError = "Messages can't start with Kit Pay's reserved payment prefix."
-            return false
+        case .reactionEvent:
+            guard KitMessageReaction.parse(trimmed) != nil else {
+                lastError = "Kit Pay could not validate this reaction."
+                return false
+            }
+        case .userText:
+            guard SecureMessageReservedPrefixPolicy.allowsUserAuthoredText(trimmed) else {
+                lastError = "Messages can't start with a reserved Kit Pay event prefix."
+                return false
+            }
         }
         guard let cleanConversationId = OutboxPolicy.canonicalConversationID(conversationId) else {
             lastError = "This conversation is no longer available. Your message was not sent."
@@ -7342,12 +7985,39 @@ final class AppModel: ObservableObject {
             lastError = messagingSendFailureMessage
             return false
         }
+        // A GROUP thread has no single pinned recipient: the coordinator re-validates local
+        // membership at queue time, and the per-member privacy/attestation gates run
+        // authoritatively at flush and on the server. Payment events remain strictly two-party.
+        let isGroupTarget = state.conversations.first(where: {
+            $0.id.caseInsensitiveCompare(cleanConversationId) == .orderedSame
+        })?.isGroup == true
+        guard MessagingGroupCapabilityPolicy.allowsConversationMutation(
+            isGroup: isGroupTarget,
+            groupCapabilityEnabled: messagingGroupsEnabled
+        ) else {
+            lastError = "Group messaging is not available right now. You can still read this conversation."
+            return false
+        }
+        if isGroupTarget, submissionKind == .paymentEvent {
+            lastError = "Payment events can only be sent in one-to-one chats."
+            return false
+        }
+        let recipientUserID: String?
+        if isGroupTarget {
+            recipientUserID = nil
+        } else {
+            guard let recipientId,
+                  let recipientUUID = UUID(
+                      uuidString: recipientId.trimmingCharacters(in: .whitespacesAndNewlines)
+                  )
+            else {
+                lastError = "Choose one valid Kit Pay recipient."
+                return false
+            }
+            recipientUserID = recipientUUID.uuidString.lowercased()
+        }
         guard let userID = profile?.id,
-              let expectedSessionID = await sessions.current()?.sessionId,
-              let recipientId,
-              let recipientUUID = UUID(
-                  uuidString: recipientId.trimmingCharacters(in: .whitespacesAndNewlines)
-              )
+              let expectedSessionID = await sessions.current()?.sessionId
         else {
             lastError = "Choose one valid Kit Pay recipient."
             return false
@@ -7358,12 +8028,19 @@ final class AppModel: ObservableObject {
             userID: userID,
             sessionID: expectedSessionID
         ) else { return false }
-        let recipientUserID = recipientUUID.uuidString.lowercased()
-        if let denial = communicationPrivacyDenialMessage(
-            for: recipientUserID,
-            blockedMessage: "Unblock this account before sending a message."
-        ) {
+        if let recipientUserID,
+           let denial = communicationPrivacyDenialMessage(
+               for: recipientUserID,
+               blockedMessage: "Unblock this account before sending a message."
+           ) {
             lastError = denial
+            return false
+        }
+        guard MessagingGroupCapabilityPolicy.allowsConversationMutation(
+            isGroup: isGroupTarget,
+            groupCapabilityEnabled: messagingGroupsEnabled
+        ) else {
+            lastError = "Group messaging is not available right now. You can still read this conversation."
             return false
         }
         do {
@@ -7375,7 +8052,8 @@ final class AppModel: ObservableObject {
                 text: trimmed,
                 clientMessageID: clientMessageID,
                 submittedDraftBody: draftClearVersion == nil ? nil : body,
-                draftClearVersion: draftClearVersion
+                draftClearVersion: draftClearVersion,
+                deliverAt: deliverAt
             )
             guard await reloadOutboxStateIfCurrent(
                 accountEpoch: expectedAccountEpoch,
@@ -7458,6 +8136,256 @@ final class AppModel: ObservableObject {
         return true
     }
 
+    // MARK: - Send Later
+
+    /// Items in one conversation (or every conversation, when `conversationID` is nil) that are
+    /// still waiting to be sent. Read straight from the durable outbox so what the timeline shows
+    /// and what the queue will actually do cannot drift apart.
+    func scheduledChatItems(
+        conversationID: String? = nil,
+        at now: Date = Date()
+    ) -> [ScheduledChatItem] {
+        let wanted = conversationID.map { $0.lowercased() }
+        var items: [ScheduledChatItem] = []
+        for command in state.outbox {
+            guard let commandConversation = command.conversationId?.lowercased() else { continue }
+            if let wanted, commandConversation != wanted { continue }
+            guard let scheduledAt = command.scheduledAt else { continue }
+            switch command.kind {
+            case .secureMessage:
+                guard command.isAwaitingScheduledTime(at: now),
+                      let messageID = command.messageId,
+                      let message = state.messages.first(where: { $0.id == messageID }),
+                      KitMessageReaction.parse(message.body) == nil
+                else { continue }
+                items.append(
+                    ScheduledChatItem(
+                        id: command.id,
+                        conversationID: commandConversation,
+                        scheduledAt: scheduledAt,
+                        content: .message(messageID),
+                        preview: scheduledMessagePreview(message)
+                    )
+                )
+            case .scheduledPaymentRequest:
+                // A failed request stays in the list on purpose: it is the only place the sender
+                // can find out that the request they arranged did not go out.
+                guard let payload = command.scheduledPaymentRequest else { continue }
+                items.append(
+                    ScheduledChatItem(
+                        id: command.id,
+                        conversationID: commandConversation,
+                        scheduledAt: scheduledAt,
+                        content: .paymentRequest(commandID: command.id),
+                        preview: "Request \(KitMoney.formatted(payload.amount, code: payload.currencyCode))"
+                    )
+                )
+            case .callAttempt, .callTermination:
+                continue
+            }
+        }
+        return items.sorted {
+            if $0.scheduledAt != $1.scheduledAt { return $0.scheduledAt < $1.scheduledAt }
+            return $0.id.uuidString < $1.id.uuidString
+        }
+    }
+
+    /// Why a scheduled item is still sitting there, if it is no longer simply waiting for its
+    /// minute. Returned separately from the item so the timeline can stay a plain projection.
+    func scheduledItemFailureReason(_ commandID: UUID) -> String? {
+        guard let command = state.outbox.first(where: { $0.id == commandID }),
+              command.failureDisposition != nil
+        else { return nil }
+        return command.lastFailureReason ?? messagingSendFailureMessage
+    }
+
+    private func scheduledMessagePreview(_ message: LocalMessage) -> String {
+        if let pending = message.pendingAttachment {
+            if let caption = pending.caption, !caption.isEmpty { return caption }
+            return KitChatMediaKind(mediaType: pending.mediaType).previewLabel
+        }
+        if let descriptor = KitMediaMessageDescriptor.parse(message.body) {
+            if let caption = descriptor.caption, !caption.isEmpty { return caption }
+            return KitChatMediaKind(mediaType: descriptor.mediaType).previewLabel
+        }
+        return message.body
+    }
+
+    /// Arranges a payment request for a future minute. Nothing is created on the server now: the
+    /// person being asked must not see a request before the sender meant them to, so the API call
+    /// itself is what waits in the outbox. The idempotency key is minted here and reused on every
+    /// attempt, so a retry after a timeout can never raise two requests.
+    @discardableResult
+    func schedulePaymentRequest(
+        destinationWalletID: String,
+        requestedFromUserID: String,
+        amount: String,
+        currencyCode: String,
+        note: String?,
+        recipientName: String,
+        conversationID: String,
+        deliverAt: Date
+    ) async -> Bool {
+        guard !isReadOnlyAppReviewDemoConversation(conversationID) else {
+            lastError = "This App Review preview is read-only."
+            return false
+        }
+        let now = Date()
+        guard let scheduledAt = ScheduledSendPolicy.normalize(deliverAt, now: now) else {
+            lastError = "Choose a time at least a minute from now."
+            return false
+        }
+        guard let cleanConversationID = OutboxPolicy.canonicalConversationID(conversationID) else {
+            lastError = "This conversation is no longer available. Nothing was scheduled."
+            return false
+        }
+        guard let recipientUUID = UUID(
+            uuidString: requestedFromUserID.trimmingCharacters(in: .whitespacesAndNewlines)
+        ), let expectedUserID = profile?.id,
+              recipientUUID.uuidString.caseInsensitiveCompare(expectedUserID) != .orderedSame,
+              state.wallets.contains(where: { $0.id == destinationWalletID })
+        else {
+            lastError = "Choose one valid Kit Pay recipient."
+            return false
+        }
+        if let denial = communicationPrivacyDenialMessage(
+            for: recipientUUID.uuidString.lowercased(),
+            blockedMessage: "Unblock this account before scheduling a request."
+        ) {
+            lastError = denial
+            return false
+        }
+        guard let expectedSessionID = await sessions.current()?.sessionId else { return false }
+        let expectedAccountEpoch = accountEpoch
+        let trimmedNote = note?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let command = OfflineCommand(
+            id: UUID(),
+            kind: .scheduledPaymentRequest,
+            createdAt: now,
+            nextAttemptAt: scheduledAt,
+            attemptCount: 0,
+            conversationId: cleanConversationID,
+            messageId: nil,
+            recipientUserIds: [recipientUUID.uuidString.lowercased()],
+            recipientName: recipientName,
+            video: nil,
+            expiresAt: nil,
+            scheduledAt: scheduledAt,
+            scheduledPaymentRequest: ScheduledPaymentRequestPayload(
+                destinationWalletID: destinationWalletID,
+                requestedFromUserID: recipientUUID.uuidString.lowercased(),
+                amount: amount,
+                currencyCode: currencyCode,
+                note: trimmedNote?.isEmpty == true ? nil : trimmedNote,
+                idempotencyKey: UUID().uuidString,
+                recipientName: recipientName,
+                conversationID: cleanConversationID
+            )
+        )
+        do {
+            state = try await commitAuthenticatedMutation(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            ) { persisted in
+                persisted.outbox.append(command)
+            }
+            scheduleOutboxWake()
+            return true
+        } catch {
+            lastError = "Kit Pay could not save this scheduled request. Please try again."
+            return false
+        }
+    }
+
+    /// Releases a scheduled item now. The command keeps its id, its idempotency key and any
+    /// committed ciphertext, so this is the same send happening earlier — never a second one.
+    @discardableResult
+    func sendScheduledItemNow(_ commandID: UUID) async -> Bool {
+        await mutateScheduledItem(commandID) { persisted, now in
+            OutboxPolicy.releaseScheduledCommand(commandID, in: &persisted, at: now)
+        }
+    }
+
+    @discardableResult
+    func rescheduleScheduledItem(_ commandID: UUID, to date: Date) async -> Bool {
+        let accepted = await mutateScheduledItem(commandID) { persisted, now in
+            OutboxPolicy.rescheduleCommand(commandID, to: date, in: &persisted, at: now)
+        }
+        if !accepted, lastError == nil {
+            lastError = "Choose a time at least a minute from now."
+        }
+        return accepted
+    }
+
+    /// Cancels a scheduled item before it is sent. Returns the message text so the composer can
+    /// offer it back instead of quietly discarding what someone wrote.
+    @discardableResult
+    func cancelScheduledItem(_ commandID: UUID) async -> String? {
+        guard !rejectAppReviewDemoMutation() else { return nil }
+        guard let expectedUserID = profile?.id,
+              let expectedSessionID = await sessions.current()?.sessionId
+        else { return nil }
+        let expectedAccountEpoch = accountEpoch
+        var removed: LocalMessage?
+        do {
+            state = try await commitAuthenticatedMutation(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            ) { persisted in
+                let now = Date()
+                if let command = persisted.outbox.first(where: { $0.id == commandID }),
+                   command.kind == .scheduledPaymentRequest {
+                    persisted.outbox.removeAll { $0.id == commandID }
+                    return
+                }
+                removed = OutboxPolicy.cancelScheduledCommand(
+                    commandID,
+                    in: &persisted,
+                    at: now
+                )
+            }
+        } catch {
+            lastError = "Kit Pay could not update this scheduled item. Please try again."
+            return nil
+        }
+        scheduleOutboxWake()
+        guard let removed, removed.pendingAttachment == nil,
+              KitMediaMessageDescriptor.parse(removed.body) == nil,
+              SecureMessageReservedPrefixPolicy.allowsUserAuthoredText(removed.body)
+        else { return nil }
+        return removed.body
+    }
+
+    private func mutateScheduledItem(
+        _ commandID: UUID,
+        _ mutation: @escaping (inout PersistedState, Date) -> Bool
+    ) async -> Bool {
+        guard !rejectAppReviewDemoMutation() else { return false }
+        guard let expectedUserID = profile?.id,
+              let expectedSessionID = await sessions.current()?.sessionId
+        else { return false }
+        let expectedAccountEpoch = accountEpoch
+        var applied = false
+        do {
+            state = try await commitAuthenticatedMutation(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            ) { persisted in
+                applied = mutation(&persisted, Date())
+            }
+        } catch {
+            lastError = "Kit Pay could not update this scheduled item. Please try again."
+            return false
+        }
+        guard applied else { return false }
+        scheduleOutboxWake()
+        if isOnline { await flushOutbox() }
+        return true
+    }
+
     /// Shares a just-completed Kit Pay → Kit Pay transfer into the conversation as an encrypted
     /// `KITPAY1` transfer event. A held transfer is keyed by the server's claim id; an immediate
     /// transfer uses the transaction id and the distinct `sent` action. The chosen reference also
@@ -7533,7 +8461,8 @@ final class AppModel: ObservableObject {
         mediaType: String,
         caption: String?,
         submittedDraftBody: String? = nil,
-        draftClearVersion: ConversationDraftWriteVersion? = nil
+        draftClearVersion: ConversationDraftWriteVersion? = nil,
+        deliverAt: Date? = nil
     ) async -> Bool {
         guard !isReadOnlyAppReviewDemoConversation(conversationId) else {
             lastError = "This App Review preview is read-only."
@@ -7541,6 +8470,20 @@ final class AppModel: ObservableObject {
         }
         guard (submittedDraftBody == nil) == (draftClearVersion == nil) else {
             lastError = CustomerFacingMessagingCopy.draftSaveFailure
+            return false
+        }
+        guard let cleanConversationId = OutboxPolicy.canonicalConversationID(conversationId) else {
+            lastError = "This conversation is no longer available. Nothing was sent."
+            return false
+        }
+        let isGroupTarget = state.conversations.first(where: {
+            $0.id.caseInsensitiveCompare(cleanConversationId) == .orderedSame
+        })?.isGroup == true
+        guard MessagingGroupCapabilityPolicy.allowsConversationMutation(
+            isGroup: isGroupTarget,
+            groupCapabilityEnabled: messagingGroupsEnabled
+        ) else {
+            lastError = "Group messaging is not available right now. You can still read this conversation."
             return false
         }
         let kind = KitChatMediaKind(mediaType: mediaType)
@@ -7559,20 +8502,28 @@ final class AppModel: ObservableObject {
             lastError = "\(kind.previewLabel)s can be up to \(KitChatMediaLimits.maximumTransferLabel)."
             return false
         }
-        guard let cleanConversationId = OutboxPolicy.canonicalConversationID(conversationId) else {
-            lastError = "This conversation is no longer available. Nothing was sent."
-            return false
-        }
         guard secureMessagingAvailable else {
             lastError = messagingSendFailureMessage
             return false
         }
+        // Group threads queue without a pinned single recipient; per-member privacy and group
+        // attestation run authoritatively at flush and on the server (v1 policy).
+        let recipientUserID: String?
+        if isGroupTarget {
+            recipientUserID = nil
+        } else {
+            guard let recipientId,
+                  let recipientUUID = UUID(
+                      uuidString: recipientId.trimmingCharacters(in: .whitespacesAndNewlines)
+                  )
+            else {
+                lastError = "Choose one valid Kit Pay recipient."
+                return false
+            }
+            recipientUserID = recipientUUID.uuidString.lowercased()
+        }
         guard let userID = profile?.id,
-              let expectedSessionID = await sessions.current()?.sessionId,
-              let recipientId,
-              let recipientUUID = UUID(
-                  uuidString: recipientId.trimmingCharacters(in: .whitespacesAndNewlines)
-              )
+              let expectedSessionID = await sessions.current()?.sessionId
         else {
             lastError = "Choose one valid Kit Pay recipient."
             return false
@@ -7583,11 +8534,11 @@ final class AppModel: ObservableObject {
             userID: userID,
             sessionID: expectedSessionID
         ) else { return false }
-        let recipientUserID = recipientUUID.uuidString.lowercased()
-        if let denial = communicationPrivacyDenialMessage(
-            for: recipientUserID,
-            blockedMessage: "Unblock this account before sending this attachment."
-        ) {
+        if let recipientUserID,
+           let denial = communicationPrivacyDenialMessage(
+               for: recipientUserID,
+               blockedMessage: "Unblock this account before sending this attachment."
+           ) {
             lastError = denial
             return false
         }
@@ -7610,6 +8561,19 @@ final class AppModel: ObservableObject {
                 return false
             }
         }
+        guard MessagingGroupCapabilityPolicy.allowsConversationMutation(
+            isGroup: isGroupTarget,
+            groupCapabilityEnabled: messagingGroupsEnabled
+        ) else {
+            if let parkedLocalKey {
+                await SecureMediaFileCache.shared.remove(
+                    forStorageKey: parkedLocalKey,
+                    userID: userID
+                )
+            }
+            lastError = "Group messaging is not available right now. You can still read this conversation."
+            return false
+        }
         do {
             _ = try await SecureMessagingExchangeCoordinator.shared.queueDeferredImage(
                 forUserID: userID,
@@ -7621,7 +8585,8 @@ final class AppModel: ObservableObject {
                 caption: caption,
                 localStorageKey: parkedLocalKey,
                 submittedDraftBody: submittedDraftBody,
-                draftClearVersion: draftClearVersion
+                draftClearVersion: draftClearVersion,
+                deliverAt: deliverAt
             )
             guard await reloadOutboxStateIfCurrent(
                 accountEpoch: expectedAccountEpoch,
@@ -7789,10 +8754,12 @@ final class AppModel: ObservableObject {
         trustedPaymentEvent: Bool
     ) async -> SecureMessagingQueueResult? {
         let rawRecipientID = recipientId.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !(appReviewDemoIsActive
-            && AppReviewDemoContent.isSyntheticPeerID(rawRecipientID))
+        guard !AppReviewDemoMutationPolicy.peerIsReadOnly(
+            rawRecipientID,
+            isDemoActive: appReviewDemoIsActive
+        )
         else {
-            lastError = "This App Review preview is read-only."
+            lastError = AppReviewDemoMutationPolicy.readOnlyMessage
             return nil
         }
         let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -7850,7 +8817,8 @@ final class AppModel: ObservableObject {
                 let local = UUID(uuidString: userID)?.uuidString.lowercased()
                 guard let local,
                       let conversation = state.conversations.first(where: {
-                          Set($0.participantUserIds) == Set([local, recipient])
+                          !$0.isGroup
+                              && Set($0.participantUserIds) == Set([local, recipient])
                       })
                 else {
                     lastError = "Connect to the internet once to start this conversation."
@@ -7885,6 +8853,264 @@ final class AppModel: ObservableObject {
             ) else { return nil }
             lastError = error.localizedDescription
             return nil
+        }
+    }
+
+    /// Creates a server-authoritative group thread and returns its conversation id, or nil with
+    /// `lastError` set. Fail-closed: requires the advertised `messaging_groups` capability, an
+    /// online session, and 1...31 unique Kit Pay members besides the creator.
+    func createGroupConversation(name: String, memberUserIDs: [String]) async -> String? {
+        guard !rejectAppReviewDemoMutation() else { return nil }
+        let cleanName = MessagingGroupTitlePolicy.normalized(name)
+        guard messagingGroupsEnabled, isOnline else {
+            lastError = messagingSendFailureMessage
+            return nil
+        }
+        guard MessagingGroupTitlePolicy.isValid(cleanName) else {
+            lastError = "Use 1 to 64 Unicode characters and no more than 120 UTF-8 bytes for the group name."
+            return nil
+        }
+        guard let userID = profile?.id,
+              let expectedSessionID = await sessions.current()?.sessionId
+        else {
+            lastError = messagingSendFailureMessage
+            return nil
+        }
+        let localID = userID.lowercased()
+        var seenMembers: Set<String> = []
+        var members: [String] = []
+        for raw in memberUserIDs {
+            guard let uuid = UUID(
+                uuidString: raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            ) else {
+                lastError = "Choose valid Kit Pay contacts for this group."
+                return nil
+            }
+            let member = uuid.uuidString.lowercased()
+            guard member != localID else { continue }
+            if seenMembers.insert(member).inserted {
+                members.append(member)
+            }
+        }
+        guard (1 ... SecureMessagingWire.maximumGroupMembers - 1).contains(members.count) else {
+            lastError = "Groups need 1 to 31 other people."
+            return nil
+        }
+        guard members.allSatisfy({ communicationPrivacyAllowsOutbound(to: $0) }) else {
+            lastError = "Remove blocked contacts, or refresh communication privacy, before creating this group."
+            return nil
+        }
+        let expectedAccountEpoch = accountEpoch
+        guard await outboxContextIsCurrent(
+            accountEpoch: expectedAccountEpoch,
+            userID: userID,
+            sessionID: expectedSessionID
+        ) else { return nil }
+        guard members.allSatisfy({ communicationPrivacyAllowsOutbound(to: $0) }) else {
+            lastError = "Remove blocked contacts, or refresh communication privacy, before creating this group."
+            return nil
+        }
+        guard messagingGroupsEnabled else {
+            lastError = "Group messaging is not available right now."
+            return nil
+        }
+        do {
+            let conversation = try await APIClientSessionBinding.$sessionID.withValue(
+                expectedSessionID
+            ) {
+                try await SecureMessagingExchangeCoordinator.shared.createGroupConversation(
+                    forUserID: userID,
+                    memberUserIDs: members,
+                    title: cleanName
+                )
+            }
+            guard await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: userID,
+                sessionID: expectedSessionID
+            ) else { return nil }
+            await publishLatestState()
+            return conversation.id
+        } catch is CancellationError {
+            return nil
+        } catch {
+            guard await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: userID,
+                sessionID: expectedSessionID
+            ) else { return nil }
+            lastError = error.localizedDescription
+            return nil
+        }
+    }
+
+    func canRenameGroupConversation(_ conversationID: String) -> Bool {
+        guard messagingGroupsEnabled,
+              let conversation = currentGroupConversation(conversationID),
+              let role = conversation.groupRole(for: profile?.id)
+        else { return false }
+        return role.canManageGroup
+    }
+
+    func canAddGroupConversationMember(_ conversationID: String) -> Bool {
+        guard canRenameGroupConversation(conversationID),
+              let conversation = currentGroupConversation(conversationID)
+        else { return false }
+        return conversation.participantUserIds.count < SecureMessagingWire.maximumGroupMembers
+    }
+
+    /// Removal remains available with `messaging_groups` dark: it is the safety path for an
+    /// administrator to eject a member whose incompatible device blocks encrypted group sends.
+    func canRemoveGroupConversationMember(
+        _ memberUserID: String,
+        from conversationID: String
+    ) -> Bool {
+        guard secureMessagingAvailable,
+              let conversation = currentGroupConversation(conversationID),
+              let localUserID = profile?.id.lowercased(),
+              memberUserID.lowercased() != localUserID,
+              let actorRole = conversation.groupRole(for: localUserID),
+              let targetRole = conversation.groupRole(for: memberUserID)
+        else { return false }
+        return actorRole.canRemove(targetRole)
+    }
+
+    /// Every active member may leave even if rollout has been withdrawn or another member's
+    /// device cannot attest the group protocol.
+    func canLeaveGroupConversation(_ conversationID: String) -> Bool {
+        guard secureMessagingAvailable,
+              let conversation = currentGroupConversation(conversationID),
+              let localUserID = profile?.id.lowercased()
+        else { return false }
+        return conversation.participantUserIds.contains(localUserID)
+    }
+
+    @discardableResult
+    func renameGroupConversation(_ conversationID: String, title: String) async -> Bool {
+        let cleanTitle = MessagingGroupTitlePolicy.normalized(title)
+        guard canRenameGroupConversation(conversationID),
+              MessagingGroupTitlePolicy.isValid(cleanTitle)
+        else {
+            lastError = "You cannot rename this group right now."
+            return false
+        }
+        return await performGroupMutation(conversationID: conversationID) {
+            try await SecureMessagingExchangeCoordinator.shared.renameGroupConversation(
+                forUserID: $0,
+                conversationID: conversationID,
+                title: cleanTitle
+            )
+        }
+    }
+
+    @discardableResult
+    func addGroupConversationMember(
+        _ memberUserID: String,
+        to conversationID: String
+    ) async -> Bool {
+        guard canAddGroupConversationMember(conversationID),
+              let memberUUID = UUID(
+                  uuidString: memberUserID.trimmingCharacters(in: .whitespacesAndNewlines)
+              )
+        else {
+            lastError = "You cannot add someone to this group right now."
+            return false
+        }
+        let member = memberUUID.uuidString.lowercased()
+        guard communicationPrivacyAllowsOutbound(to: member) else {
+            lastError = "Unblock this account before adding them to the group."
+            return false
+        }
+        return await performGroupMutation(conversationID: conversationID) {
+            try await SecureMessagingExchangeCoordinator.shared.addGroupConversationMember(
+                forUserID: $0,
+                conversationID: conversationID,
+                memberUserID: member
+            )
+        }
+    }
+
+    @discardableResult
+    func removeGroupConversationMember(
+        _ memberUserID: String,
+        from conversationID: String
+    ) async -> Bool {
+        guard canRemoveGroupConversationMember(memberUserID, from: conversationID) else {
+            lastError = "You cannot remove this group member."
+            return false
+        }
+        return await performGroupMutation(conversationID: conversationID) {
+            try await SecureMessagingExchangeCoordinator.shared.removeGroupConversationMember(
+                forUserID: $0,
+                conversationID: conversationID,
+                memberUserID: memberUserID
+            )
+        }
+    }
+
+    @discardableResult
+    func leaveGroupConversation(_ conversationID: String) async -> Bool {
+        guard canLeaveGroupConversation(conversationID), let localUserID = profile?.id else {
+            lastError = "You cannot leave this group right now."
+            return false
+        }
+        return await performGroupMutation(conversationID: conversationID) { userID in
+            try await SecureMessagingExchangeCoordinator.shared.removeGroupConversationMember(
+                forUserID: userID,
+                conversationID: conversationID,
+                memberUserID: localUserID
+            )
+        }
+    }
+
+    private func currentGroupConversation(_ rawConversationID: String) -> Conversation? {
+        guard let conversationID = OutboxPolicy.canonicalConversationID(rawConversationID),
+              !isReadOnlyAppReviewDemoConversation(conversationID)
+        else { return nil }
+        let matches = state.conversations.filter { $0.id == conversationID && $0.isGroup }
+        return matches.count == 1 ? matches[0] : nil
+    }
+
+    private func performGroupMutation(
+        conversationID: String,
+        operation: @escaping (String) async throws -> Conversation
+    ) async -> Bool {
+        guard isOnline,
+              secureMessagingAvailable,
+              currentGroupConversation(conversationID) != nil,
+              let userID = profile?.id,
+              let expectedSessionID = await sessions.current()?.sessionId
+        else {
+            lastError = messagingSendFailureMessage
+            return false
+        }
+        let expectedAccountEpoch = accountEpoch
+        guard await outboxContextIsCurrent(
+            accountEpoch: expectedAccountEpoch,
+            userID: userID,
+            sessionID: expectedSessionID
+        ) else { return false }
+        do {
+            _ = try await APIClientSessionBinding.$sessionID.withValue(expectedSessionID) {
+                try await operation(userID)
+            }
+            guard await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: userID,
+                sessionID: expectedSessionID
+            ) else { return false }
+            await publishLatestState()
+            return true
+        } catch is CancellationError {
+            return false
+        } catch {
+            guard await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: userID,
+                sessionID: expectedSessionID
+            ) else { return false }
+            lastError = error.localizedDescription
+            return false
         }
     }
 
@@ -8004,6 +9230,10 @@ final class AppModel: ObservableObject {
         do {
             try await store.update { persisted in
                 persisted.conversations.removeAll { writableConversationIDs.contains($0.id) }
+                persisted.groupProjectionUpdatedAt =
+                    persisted.groupProjectionUpdatedAt?.filter {
+                        !writableConversationIDs.contains($0.key)
+                    }
                 persisted.messages.removeAll {
                     writableConversationIDs.contains($0.conversationId)
                 }
@@ -8075,7 +9305,7 @@ final class AppModel: ObservableObject {
     // MARK: - End-to-end encrypted iCloud chat backups
 
     func setMessageBackupFrequency(_ frequency: MessageBackupFrequency) async {
-        guard !isDeletingMessageBackup, !appReviewDemoIsActive else { return }
+        guard !isDeletingMessageBackup, appReviewDemoMutationsAllowed else { return }
         do {
             try await store.update { persisted in
                 var preferences = persisted.messageBackupPreferences ?? .default
@@ -8089,7 +9319,7 @@ final class AppModel: ObservableObject {
     }
 
     func setMessageBackupIncludesMedia(_ includesMedia: Bool) async {
-        guard !isDeletingMessageBackup, !appReviewDemoIsActive else { return }
+        guard !isDeletingMessageBackup, appReviewDemoMutationsAllowed else { return }
         do {
             try await store.update { persisted in
                 var preferences = persisted.messageBackupPreferences ?? .default
@@ -8107,7 +9337,7 @@ final class AppModel: ObservableObject {
         guard !isBackingUpMessages,
               !isDeletingMessageBackup,
               !isRestoringMessages,
-              !appReviewDemoIsActive,
+              appReviewDemoMutationsAllowed,
               isSignedIn,
               accountSetupStep == nil,
               let userID = profile?.id,
@@ -8150,7 +9380,7 @@ final class AppModel: ObservableObject {
     @discardableResult
     func runAutomaticMessageBackupIfDue() async -> MessageBackupAutomaticRunResult {
         guard isSignedIn,
-              !appReviewDemoIsActive,
+              appReviewDemoMutationsAllowed,
               accountSetupStep == nil,
               isOnline,
               !state.messages.isEmpty,
@@ -8165,6 +9395,7 @@ final class AppModel: ObservableObject {
     /// After sign-in on a device with no local history, offer to restore the iCloud backup.
     func checkForRestorableBackup() async {
         guard isSignedIn,
+              appReviewDemoMutationsAllowed,
               !isDeletingMessageBackup,
               accountSetupStep == nil,
               state.messages.isEmpty,
@@ -8184,6 +9415,7 @@ final class AppModel: ObservableObject {
         guard !isRestoringMessages,
               !isDeletingMessageBackup,
               !isBackingUpMessages,
+              appReviewDemoMutationsAllowed,
               isSignedIn,
               let userID = profile?.id,
               let expectedSessionID = await sessions.current()?.sessionId
@@ -8221,6 +9453,7 @@ final class AppModel: ObservableObject {
         guard !isDeletingMessageBackup,
               !isBackingUpMessages,
               !isRestoringMessages,
+              appReviewDemoMutationsAllowed,
               isSignedIn,
               isOnline,
               let userID = profile?.id,
@@ -8261,10 +9494,12 @@ final class AppModel: ObservableObject {
     ) async {
         let rawRecipientId = recipientId.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !(appReviewDemoIsActive
-            && AppReviewDemoContent.isSyntheticPeerID(rawRecipientId))
+        guard !AppReviewDemoMutationPolicy.peerIsReadOnly(
+            rawRecipientId,
+            isDemoActive: appReviewDemoIsActive
+        )
         else {
-            lastError = "This App Review preview is read-only."
+            lastError = AppReviewDemoMutationPolicy.readOnlyMessage
             return
         }
         guard let recipientUUID = UUID(uuidString: rawRecipientId),
@@ -8285,9 +9520,16 @@ final class AppModel: ObservableObject {
             lastError = "Calls are not available for this account."
             return
         }
+        // A crash or a lost termination can leave a `ringing`/`active` record behind with nothing
+        // in this process able to end it. Retire that residue first, so the refusal below can only
+        // ever describe a call the user can actually see and hang up.
+        await reapAbandonedCallRecords()
         guard ephemeralOutgoingCallGate.attempt == nil,
               CallMediaCoordinator.shared.activeCall == nil,
-              !state.calls.contains(where: { [.ringing, .active].contains($0.state) })
+              !AbandonedCallRecordPolicy.blocksNewCall(
+                state.calls,
+                hostedCallIDs: hostedCallIDs()
+              )
         else {
             lastError = "Finish or cancel the current call attempt before starting another."
             return
@@ -8368,7 +9610,8 @@ final class AppModel: ObservableObject {
     private func liveCallInvitationContext(
         for activeCall: ActiveCallPresentation?
     ) -> ActiveCallInvitationContext? {
-        guard let activeCall,
+        guard appReviewDemoMutationsAllowed,
+              let activeCall,
               let coordinatorCall = CallMediaCoordinator.shared.activeCall,
               coordinatorCall.conversationId == nil,
               [.connected, .reconnecting].contains(CallMediaCoordinator.shared.state),
@@ -8385,6 +9628,7 @@ final class AppModel: ObservableObject {
     private func routeAuthenticatedIncomingCall(
         _ incoming: AuthenticatedIncomingCall
     ) {
+        guard appReviewDemoMutationsAllowed else { return }
         let route = CallWaitingRoutingPolicy.route(
             incoming: incoming,
             activeCallID: CallMediaCoordinator.shared.activeCall?.id,
@@ -8447,6 +9691,10 @@ final class AppModel: ObservableObject {
     }
 
     private func declineWaitingCallAfterActiveCallTermination() {
+        guard appReviewDemoMutationsAllowed else {
+            _ = clearAllCallWaitingState()
+            return
+        }
         guard let waiting = clearAllCallWaitingState() else { return }
         NotificationCoordinator.shared.requestDeclineIncomingCall(callId: waiting.callID)
     }
@@ -8634,12 +9882,19 @@ final class AppModel: ObservableObject {
             }
             guard ActiveCallInvitationPolicy.accepts(
                       response: response,
-                      expectedCallID: callID,
+                      expectedContext: context,
                       invitedRecipientID: recipientID,
                       currentUserID: lease.userID
                   ),
                   callMediaAccountLease == lease,
-                  liveCallInvitationContext(for: activeCall)?.callID == callID,
+                  let currentContext = liveCallInvitationContext(for: activeCall),
+                  currentContext.callID == callID,
+                  ActiveCallInvitationPolicy.accepts(
+                      response: response,
+                      expectedContext: currentContext,
+                      invitedRecipientID: recipientID,
+                      currentUserID: lease.userID
+                  ),
                   await outboxContextIsCurrent(
                     accountEpoch: lease.accountEpoch,
                     userID: lease.userID,
@@ -8655,11 +9910,18 @@ final class AppModel: ObservableObject {
                 guard persisted.profile?.id.caseInsensitiveCompare(lease.userID) == .orderedSame,
                       persisted.communicationOwnerUserID?.caseInsensitiveCompare(lease.userID)
                         == .orderedSame,
-                      ActiveCallInvitationPolicy.context(
+                      let persistedContext = ActiveCallInvitationPolicy.context(
                           for: activeCall,
                           calls: persisted.calls,
                           currentUserID: lease.userID
-                      )?.callID == callID
+                      ),
+                      persistedContext.callID == callID,
+                      ActiveCallInvitationPolicy.accepts(
+                          response: response,
+                          expectedContext: persistedContext,
+                          invitedRecipientID: recipientID,
+                          currentUserID: lease.userID
+                      )
                 else { throw StoreError.accountChanged }
                 persisted.calls = CallLifecyclePolicy.merge(
                     remote: [mapped],
@@ -8738,7 +10000,7 @@ final class AppModel: ObservableObject {
             guard waitingCallMergeOperationIsCurrent(operationID, attempt: attempt),
                   WaitingCallMergeInvitationReconciliationPolicy.accepts(
                       response: response,
-                      expectedCallID: callID,
+                      expectedContext: context,
                       invitedRecipientID: recipientID,
                       currentUserID: lease.userID
             )
@@ -8787,7 +10049,8 @@ final class AppModel: ObservableObject {
         let operationGate = waitingCallMergeOperationGate
         guard waitingCallMergeOperationIsCurrent(operationID, attempt: attempt),
               callMediaAccountLease == lease,
-              liveCallInvitationContext(for: activeCall)?.callID == callID,
+              let currentContext = liveCallInvitationContext(for: activeCall),
+              currentContext.callID == callID,
               await outboxContextIsCurrent(
                 accountEpoch: lease.accountEpoch,
                 userID: lease.userID,
@@ -8809,7 +10072,7 @@ final class AppModel: ObservableObject {
             guard waitingCallMergeOperationIsCurrent(operationID, attempt: attempt),
                   WaitingCallMergeInvitationReconciliationPolicy.accepts(
                       response: response,
-                      expectedCallID: callID,
+                      expectedContext: currentContext,
                       invitedRecipientID: recipientID,
                       currentUserID: lease.userID
                   )
@@ -8854,14 +10117,15 @@ final class AppModel: ObservableObject {
     ) async -> Bool {
         let operationGate = waitingCallMergeOperationGate
         guard waitingCallMergeOperationIsCurrent(operationID, attempt: attempt),
+              let currentContext = liveCallInvitationContext(for: activeCall),
+              currentContext.callID == callID,
               WaitingCallMergeInvitationReconciliationPolicy.accepts(
                   response: response,
-                  expectedCallID: callID,
+                  expectedContext: currentContext,
                   invitedRecipientID: recipientID,
                   currentUserID: lease.userID
               ),
               callMediaAccountLease == lease,
-              liveCallInvitationContext(for: activeCall)?.callID == callID,
               await outboxContextIsCurrent(
                 accountEpoch: lease.accountEpoch,
                 userID: lease.userID,
@@ -8877,11 +10141,18 @@ final class AppModel: ObservableObject {
                     guard persisted.profile?.id.caseInsensitiveCompare(lease.userID) == .orderedSame,
                           persisted.communicationOwnerUserID?.caseInsensitiveCompare(lease.userID)
                             == .orderedSame,
-                          ActiveCallInvitationPolicy.context(
+                          let persistedContext = ActiveCallInvitationPolicy.context(
                               for: activeCall,
                               calls: persisted.calls,
                               currentUserID: lease.userID
-                          )?.callID == callID
+                          ),
+                          persistedContext.callID == callID,
+                          WaitingCallMergeInvitationReconciliationPolicy.accepts(
+                              response: response,
+                              expectedContext: persistedContext,
+                              invitedRecipientID: recipientID,
+                              currentUserID: lease.userID
+                          )
                     else { throw StoreError.accountChanged }
                     persisted.calls = CallLifecyclePolicy.merge(
                         remote: [mapped],
@@ -8926,6 +10197,11 @@ final class AppModel: ObservableObject {
     /// Declines only the authenticated waiting call. The connected LiveKit room and its CallKit
     /// record remain untouched while the normal CallKit action owns durable backend replay.
     func declineWaitingCall() {
+        guard appReviewDemoMutationsAllowed else {
+            _ = clearAllCallWaitingState()
+            lastError = AppReviewDemoMutationPolicy.readOnlyMessage
+            return
+        }
         guard let retained = callWaitingState.waitingCall else {
             cancelWaitingCallMergeOperation()
             return
@@ -8943,6 +10219,11 @@ final class AppModel: ObservableObject {
     /// authenticated waiting initiator into the connected room, then retire and decline their
     /// separate incoming call. The initiator must accept the fresh invitation before media joins.
     func mergeWaitingCall() async {
+        guard appReviewDemoMutationsAllowed else {
+            _ = clearAllCallWaitingState()
+            lastError = AppReviewDemoMutationPolicy.readOnlyMessage
+            return
+        }
         let activeCall = CallMediaCoordinator.shared.activeCall
         switch callWaitingState.beginMerge(
             activeCallID: activeCall?.id,
@@ -9113,7 +10394,8 @@ final class AppModel: ObservableObject {
     /// Resumes only the call that is still visible in this foreground process. Nothing from this
     /// path is written to the durable outbox, scheduled as background work, or restored at launch.
     private func resumeEphemeralOutgoingCallIfPossible() {
-        guard let attempt = ephemeralOutgoingCallGate.attempt,
+        guard appReviewDemoMutationsAllowed,
+              let attempt = ephemeralOutgoingCallGate.attempt,
               isOnline,
               !isSigningOut,
               isSignedIn,
@@ -9165,13 +10447,16 @@ final class AppModel: ObservableObject {
                 lease: attempt.lease
             )
         }
-        pendingEphemeralCallCancellations[attempt.clientCallIDString] = attempt
-        scheduleEphemeralCallCancellationDrain()
+        if appReviewDemoMutationsAllowed {
+            pendingEphemeralCallCancellations[attempt.clientCallIDString] = attempt
+            scheduleEphemeralCallCancellationDrain()
+        }
         return attempt
     }
 
     private func scheduleEphemeralCallCancellationDrain() {
-        guard ephemeralCallCancellationTask == nil,
+        guard appReviewDemoMutationsAllowed,
+              ephemeralCallCancellationTask == nil,
               isOnline,
               !pendingEphemeralCallCancellations.isEmpty
         else { return }
@@ -9185,7 +10470,7 @@ final class AppModel: ObservableObject {
     private func drainEphemeralCallCancellations() async {
         defer { ephemeralCallCancellationTask = nil }
         var retryCounts: [String: Int] = [:]
-        while !Task.isCancelled, isOnline,
+        while !Task.isCancelled, appReviewDemoMutationsAllowed, isOnline,
               let attempt = pendingEphemeralCallCancellations.values.first {
             let identifier = attempt.clientCallIDString
             guard SessionRefreshPolicy.matchesSessionID(
@@ -9234,7 +10519,8 @@ final class AppModel: ObservableObject {
     private func cancelEphemeralCallOnServerOnce(
         _ attempt: EphemeralOutgoingCallAttempt
     ) async {
-        guard isOnline,
+        guard appReviewDemoMutationsAllowed,
+              isOnline,
               SessionRefreshPolicy.matchesSessionID(
                 attempt.lease.sessionID,
                 current: await sessions.current()?.sessionId ?? ""
@@ -9269,6 +10555,7 @@ final class AppModel: ObservableObject {
 
         while !Task.isCancelled {
             guard ephemeralOutgoingCallTaskID == taskID,
+                  appReviewDemoMutationsAllowed,
                   let attempt = ephemeralOutgoingCallGate.attempt,
                   isOnline,
                   !isSigningOut,
@@ -9354,6 +10641,7 @@ final class AppModel: ObservableObject {
             sessionID: attempt.lease.sessionID
         )
         guard contextIsCurrent,
+              appReviewDemoMutationsAllowed,
               isOnline,
               callsFeatureEnabled,
               UIApplication.shared.applicationState != .background,
@@ -9456,7 +10744,8 @@ final class AppModel: ObservableObject {
         _ callID: String,
         lease: CallMediaAccountLease
     ) async {
-        guard !CallMediaCoordinator.shared.ownsAuthenticatedCall(
+        guard appReviewDemoMutationsAllowed,
+              !CallMediaCoordinator.shared.ownsAuthenticatedCall(
             callID: callID,
             lease: lease
         ) else { return }
@@ -9475,6 +10764,7 @@ final class AppModel: ObservableObject {
 
     func flushOutbox(reportFailures: Bool = false) async {
         guard isOnline,
+              appReviewDemoMutationsAllowed,
               !isSigningOut,
               !isSubmittingAccountDeletion,
               !acceptedAccountDeletionCleanupBlocked,
@@ -9562,6 +10852,19 @@ final class AppModel: ObservableObject {
             else { return }
             switch command.kind {
             case .secureMessage:
+                if isReactionMessagingCommand(activeCommand), !messagingReactionsEnabled {
+                    // Reaction commands remain durable while the global rollout is withdrawn.
+                    // Never prepare or transmit their ciphertext until the server gate returns.
+                    encounteredMissingMessagingCapability = true
+                    continue
+                }
+                if isGroupMessagingCommand(activeCommand), !messagingGroupsEnabled {
+                    // Capability withdrawal makes existing groups read-only. Preserve the
+                    // encrypted command for a later authorized replay, but do not prepare or
+                    // transmit any new group ciphertext while the server gate is absent.
+                    encounteredMissingMessagingCapability = true
+                    continue
+                }
                 if !hasUsableCommunicationPrivacyProjection {
                     await loadCommunicationPrivacy()
                 }
@@ -9651,6 +10954,19 @@ final class AppModel: ObservableObject {
                         } else {
                             encounteredUnavailableCommunicationPrivacy = true
                         }
+                        continue
+                    }
+                    if isGroupMessagingCommand(activeCommand), !messagingGroupsEnabled {
+                        // Re-check after roster preparation because that awaited network work and
+                        // the authoritative capability projection may have changed meanwhile.
+                        encounteredMissingMessagingCapability = true
+                        continue
+                    }
+                    if isReactionMessagingCommand(activeCommand), !messagingReactionsEnabled {
+                        // Preparation awaited the live conversation/roster. Re-check the global
+                        // gate before the separate send request so a withdrawn rollout cannot
+                        // leak already-prepared reaction ciphertext.
+                        encounteredMissingMessagingCapability = true
                         continue
                     }
                     guard ProtectedCommunicationAdmissionGate.shared.permits(
@@ -9787,7 +11103,99 @@ final class AppModel: ObservableObject {
                         )
                     }
                 }
+            case .scheduledPaymentRequest:
+                await replayScheduledPaymentRequest(
+                    command,
+                    reportFailures: reportFailures,
+                    accountEpoch: expectedAccountEpoch,
+                    userID: expectedUserID,
+                    sessionID: expectedSessionID
+                )
             }
+        }
+    }
+
+    /// Raises one payment request that was arranged for this minute.
+    ///
+    /// Money movement needs an authorization the app may not hold right now — a locked screen, a
+    /// stepped-down session, wallets not yet loaded. None of those mean the schedule was wrong, so
+    /// the command waits instead of being spent: it is pushed to the next check rather than
+    /// attempted and permanently failed.
+    private func replayScheduledPaymentRequest(
+        _ command: OfflineCommand,
+        reportFailures: Bool,
+        accountEpoch expectedAccountEpoch: UUID,
+        userID expectedUserID: String,
+        sessionID expectedSessionID: String
+    ) async {
+        guard let payload = command.scheduledPaymentRequest else {
+            // Nothing actionable was stored. Drop the row rather than retry it forever.
+            state = (try? await commitOutboxMutation(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID,
+                command: command
+            ) { persisted in
+                persisted.outbox.removeAll { $0.id == command.id }
+            }) ?? state
+            return
+        }
+        guard accountSetupStep == nil,
+              !requiresBiometricSignIn,
+              sessionAssurance?.grantsFullAccess == true,
+              state.wallets.contains(where: { $0.id == payload.destinationWalletID })
+        else {
+            state = (try? await commitOutboxMutation(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID,
+                command: command
+            ) { persisted in
+                OutboxPolicy.deferScheduledCommand(command.id, in: &persisted, at: Date())
+            }) ?? state
+            return
+        }
+        do {
+            let request = try await createPaymentRequest(
+                destinationWalletID: payload.destinationWalletID,
+                requestedFromUserID: payload.requestedFromUserID,
+                amount: payload.amount,
+                note: payload.note,
+                idempotencyKey: payload.idempotencyKey
+            )
+            // The request exists on the server now, so the command is retired before the chat
+            // card is queued. Sharing has its own durable command; letting this one survive a
+            // sharing failure would raise the request a second time on the next flush.
+            state = try await commitOutboxMutation(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID,
+                command: command
+            ) { persisted in
+                persisted.outbox.removeAll { $0.id == command.id }
+            }
+            await queuePaymentRequest(
+                request,
+                recipientId: payload.requestedFromUserID,
+                title: payload.recipientName,
+                conversationId: payload.conversationID
+            )
+        } catch is CancellationError {
+            return
+        } catch {
+            guard await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            ) else { return }
+            await handleOutboxFailure(
+                command,
+                error: error,
+                reportFailure: reportFailures,
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            )
         }
     }
 
@@ -9796,14 +11204,40 @@ final class AppModel: ObservableObject {
     ) -> CommunicationPrivacyAccessDecision {
         guard command.kind == .secureMessage,
               let recipientUserIDs = command.recipientUserIds,
-              recipientUserIDs.count == 1
+              !recipientUserIDs.isEmpty
         else { return .unavailable }
+        // v1 group policy: per-member privacy is enforced by the server at fanout, so a queued
+        // group command is admitted whenever its thread is a locally validated group.
+        if command.conversationId.map({ conversationID in
+            state.conversations.first(where: { $0.id == conversationID })?.isGroup == true
+        }) == true,
+           recipientUserIDs.count < SecureMessagingWire.maximumGroupMembers {
+            return .allowed
+        }
+        guard recipientUserIDs.count == 1 else { return .unavailable }
         return CommunicationPrivacyAccessPolicy.decision(
             ownerUserID: profile?.id,
             recipientUserID: recipientUserIDs[0],
             hasLoadedCompleteProjection: hasUsableCommunicationPrivacyProjection,
             blocks: communicationBlocks
         )
+    }
+
+    private func isGroupMessagingCommand(_ command: OfflineCommand) -> Bool {
+        guard command.kind == .secureMessage,
+              let conversationID = command.conversationId
+        else { return false }
+        return state.conversations.contains {
+            $0.id.caseInsensitiveCompare(conversationID) == .orderedSame && $0.isGroup
+        }
+    }
+
+    private func isReactionMessagingCommand(_ command: OfflineCommand) -> Bool {
+        guard command.kind == .secureMessage,
+              let messageID = command.messageId,
+              let message = state.messages.first(where: { $0.id == messageID })
+        else { return false }
+        return KitMessageReaction.parse(message.body) != nil
     }
 
     private func outboxContextIsCurrent(
@@ -9906,7 +11340,8 @@ final class AppModel: ObservableObject {
 #endif
         guard UIApplication.shared.applicationState == .active else { return }
         if let restoreTask { await restoreTask.value }
-        guard !acceptedAccountDeletionCleanupBlocked,
+        guard appReviewDemoMutationsAllowed,
+              !acceptedAccountDeletionCleanupBlocked,
               !protectedLocalStateRecoveryBlocked,
               !unresolvedAccountDeletionAttemptBlocked
         else { return }
@@ -9915,6 +11350,13 @@ final class AppModel: ObservableObject {
             return
         }
         didRequestContactsAtLaunch = true
+
+        // Never raise the system Contacts prompt for someone who already switched contact
+        // matching off in Kit Pay.
+        guard contactDiscoveryEnabled else {
+            contactSyncState = .disabledByPreference
+            return
+        }
 
         // Unit-test hosts must never display a system privacy prompt.
         guard ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil else {
@@ -9951,8 +11393,24 @@ final class AppModel: ObservableObject {
     /// scans for changes. An unchanged encrypted fingerprint avoids needless
     /// uploads while a periodic server refresh discovers newly joined users.
     func applicationDidBecomeActive() {
+        KitPresenceCenter.shared.setForeground(true)
+        wakeVisibleConversationSync()
+        guard appReviewDemoMutationsAllowed else { return }
         resumeEphemeralOutgoingCallIfPossible()
         schedulePendingProfileAvatarResume()
+        // Returning to the foreground is the first moment after a crash at which the app can see
+        // that a call it thought was live has no session behind it any more.
+        Task { @MainActor [weak self] in await self?.reapAbandonedCallRecords() }
+        guard contactDiscoveryEnabled else {
+            if contactSyncState != .disabledByPreference {
+                contactSyncState = .disabledByPreference
+            }
+            requestCallMicrophonePermissionInForeground()
+            Task { @MainActor in
+                await CallMediaCoordinator.shared.resumeDeferredInitialCameraIfPossible()
+            }
+            return
+        }
         switch contactSource.accessState() {
         case .allowed, .limited:
             scheduleAutomaticContactSync()
@@ -9970,7 +11428,8 @@ final class AppModel: ObservableObject {
     }
 
     private func requestCallMicrophonePermissionInForeground() {
-        guard isSignedIn,
+        guard appReviewDemoMutationsAllowed,
+              isSignedIn,
               accountSetupStep == nil,
               sessionAssurance?.grantsFullAccess == true,
               callsFeatureEnabled,
@@ -9983,6 +11442,7 @@ final class AppModel: ObservableObject {
     }
 
     func retryAutomaticContactSync() {
+        guard appReviewDemoMutationsAllowed else { return }
         scheduleAutomaticContactSync()
     }
 
@@ -10074,6 +11534,13 @@ final class AppModel: ObservableObject {
     }
 
     private func clearLocalContactsAfterRevocation() async {
+        await clearLocalContacts(resultingState: .denied)
+    }
+
+    /// Drops every locally projected contact. `resultingState` distinguishes iOS revoking access
+    /// (which offers an Open Settings recovery) from the user switching contact matching off in
+    /// Kit Pay (which needs no recovery — they can switch it back on in the same place).
+    private func clearLocalContacts(resultingState: AutomaticContactSyncState) async {
         do {
             try await store.update { persisted in
                 persisted.contacts = []
@@ -10092,15 +11559,17 @@ final class AppModel: ObservableObject {
             state.contactSyncLastCompletedAt = nil
             rebuildCallContacts()
         }
-        contactSyncState = .denied
+        contactSyncState = resultingState
     }
 
     @discardableResult
     private func scheduleAutomaticContactSync() -> Task<Bool, Never>? {
-        guard isSignedIn,
+        guard appReviewDemoMutationsAllowed,
+              isSignedIn,
               isOnline,
               accountSetupStep == nil,
-              sessionAssurance?.grantsFullAccess == true
+              sessionAssurance?.grantsFullAccess == true,
+              contactDiscoveryEnabled
         else { return nil }
         guard [.allowed, .limited].contains(contactSource.accessState()) else { return nil }
         if let contactSyncTask {
@@ -10135,7 +11604,8 @@ final class AppModel: ObservableObject {
         expectedAccountEpoch: UUID,
         expectedSyncGeneration: UInt64
     ) async -> Bool {
-        guard isSignedIn, isOnline,
+        guard appReviewDemoMutationsAllowed,
+              isSignedIn, isOnline,
               accountSetupStep == nil,
               sessionAssurance?.grantsFullAccess == true,
               accountEpoch == expectedAccountEpoch,
@@ -10445,6 +11915,10 @@ final class AppModel: ObservableObject {
         guard NotificationCoordinator.shared.isAwaitingIncomingCallVerification(request) else {
             return
         }
+        guard appReviewDemoMutationsAllowed else {
+            NotificationCoordinator.shared.rejectIncomingCallVerification(request)
+            return
+        }
         guard isOnline else {
             NotificationCoordinator.shared.retryIncomingCallVerificationAfterTransientFailure(
                 request
@@ -10526,6 +12000,10 @@ final class AppModel: ObservableObject {
         _ incoming: AuthenticatedIncomingCall
     ) async {
         let record = incoming.record
+        guard appReviewDemoMutationsAllowed else {
+            NotificationCoordinator.shared.reportCallEnded(incoming.callUUID, reason: .failed)
+            return
+        }
         guard !locallyTerminatedCallIds.contains(record.id.lowercased()) else {
             NotificationCoordinator.shared.reportCallEnded(incoming.callUUID, reason: .remoteEnded)
             return
@@ -10607,6 +12085,11 @@ final class AppModel: ObservableObject {
     }
 
     func handleCallSystemAction(_ action: CallSystemAction) async {
+        guard appReviewDemoMutationsAllowed else {
+            await CallMediaCoordinator.shared.disconnectFromCallKit(callId: action.callId)
+            NotificationCoordinator.shared.reportCallEnded(action.callUUID, reason: .failed)
+            return
+        }
         guard !isSubmittingAccountDeletion,
               !acceptedAccountDeletionCleanupBlocked,
               !protectedLocalStateRecoveryBlocked,
@@ -10699,29 +12182,27 @@ final class AppModel: ObservableObject {
                     return
                 }
                 let activeRecord = mapCall(session.call, stateOverride: .active)
-                state = try await commitAuthenticatedMutation(
-                    accountEpoch: expectedAccountEpoch,
-                    userID: expectedUserID,
-                    sessionID: expectedSessionID
-                ) { persisted in
-                    let existing = persisted.calls.first {
-                        $0.id.caseInsensitiveCompare(activeRecord.id) == .orderedSame
-                    }
-                    let reconciled = CallLifecyclePolicy.mergingStartResponse(
-                        activeRecord,
-                        with: existing
-                    )
-                    persisted.calls = CallLifecyclePolicy.merge(
-                        remote: [reconciled],
-                        local: persisted.calls
-                    )
-                }
-                rebuildCallContacts()
+                // Answering must not wait on protected storage. Committing the answered row
+                // re-encrypts the whole local state, and doing it here would spend that time in the
+                // one place the user is listening for the other person. The same reconciliation is
+                // projected in memory to decide whether media may start, and the durable write
+                // follows once the call is live.
+                let projectedCalls = CallLifecyclePolicy.merge(
+                    remote: [
+                        CallLifecyclePolicy.mergingStartResponse(
+                            activeRecord,
+                            with: state.calls.first {
+                                $0.id.caseInsensitiveCompare(activeRecord.id) == .orderedSame
+                            }
+                        ),
+                    ],
+                    local: state.calls
+                )
                 guard !callActionTargetsDifferentActiveMediaCall(action),
                       !locallyTerminatedCallIds.contains(action.callId.lowercased()),
                       CallLifecyclePolicy.allowsMediaStart(
                         callID: session.call.id,
-                        in: state.calls
+                        in: projectedCalls
                       )
                 else {
                     await terminateCall(id: session.call.id, kind: .end, reason: "cancelled")
@@ -10741,6 +12222,12 @@ final class AppModel: ObservableObject {
                 case .success(let handoff):
                     await CallMediaCoordinator.shared.consumeAuthenticated(
                         AuthenticatedCallMediaHandoff(lease: mediaLease, handoff: handoff)
+                    )
+                    await persistAnsweredCall(
+                        activeRecord,
+                        accountEpoch: expectedAccountEpoch,
+                        userID: expectedUserID,
+                        sessionID: expectedSessionID
                     )
                 case .failure(let error):
                     await APIClientSessionBinding.$sessionID.withValue(expectedSessionID) {
@@ -10821,6 +12308,39 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Records an answered call after its media is already live. A protected-storage failure here
+    /// is repaired by the next authoritative history refresh; it must never interrupt a call the
+    /// user is already speaking on.
+    private func persistAnsweredCall(
+        _ activeRecord: CallRecord,
+        accountEpoch: UUID,
+        userID: String,
+        sessionID: String
+    ) async {
+        do {
+            state = try await commitAuthenticatedMutation(
+                accountEpoch: accountEpoch,
+                userID: userID,
+                sessionID: sessionID
+            ) { persisted in
+                let existing = persisted.calls.first {
+                    $0.id.caseInsensitiveCompare(activeRecord.id) == .orderedSame
+                }
+                let reconciled = CallLifecyclePolicy.mergingStartResponse(
+                    activeRecord,
+                    with: existing
+                )
+                persisted.calls = CallLifecyclePolicy.merge(
+                    remote: [reconciled],
+                    local: persisted.calls
+                )
+            }
+            rebuildCallContacts()
+        } catch {
+            // Intentionally silent: see the note above.
+        }
+    }
+
     private func retireBlockedCallActionIfOwned(_ action: CallSystemAction) async {
         guard let targetAccountID = privacyQuarantineTargetAccountID,
               callMediaAccountLease?.userID.caseInsensitiveCompare(targetAccountID)
@@ -10831,7 +12351,8 @@ final class AppModel: ObservableObject {
     }
 
     func handleCallMediaFailure(_ failure: CallMediaFailure) async {
-        guard !isSigningOut,
+        guard appReviewDemoMutationsAllowed,
+              !isSigningOut,
               callMediaAccountLease == failure.lease,
               !locallyTerminatedCallIds.contains(failure.callId.lowercased()),
               await outboxContextIsCurrent(
@@ -10845,7 +12366,8 @@ final class AppModel: ObservableObject {
     }
 
     func registerPushToken(_ token: String, provider: String = "apns") async {
-        guard !isSigningOut,
+        guard appReviewDemoMutationsAllowed,
+              !isSigningOut,
               isSignedIn,
               accountSetupStep == nil,
               sessionAssurance?.grantsFullAccess == true,
@@ -10874,7 +12396,9 @@ final class AppModel: ObservableObject {
     }
 
     func unregisterPushToken(provider: String) async {
-        guard let accountID = profile?.id else { return }
+        guard appReviewDemoMutationsAllowed,
+              let accountID = profile?.id
+        else { return }
         let expectedAccountEpoch = accountEpoch
         let expectedSessionID = await sessions.current()?.sessionId
         await pushRegistrations.reset(accountID: accountID, provider: provider)
@@ -10930,6 +12454,7 @@ final class AppModel: ObservableObject {
     }
 
     func startKYC() async -> URL? {
+        guard !rejectAppReviewDemoMutation() else { return nil }
         guard isSignedIn else {
             lastError = APIClientError.signedOut.localizedDescription
             return nil
@@ -10980,6 +12505,12 @@ final class AppModel: ObservableObject {
         kind: CallTerminationKind,
         reason: String?
     ) async {
+        guard appReviewDemoMutationsAllowed,
+              !isReadOnlyAppReviewDemoCall(id)
+        else {
+            lastError = AppReviewDemoMutationPolicy.readOnlyMessage
+            return
+        }
         if callOwnsActiveMedia(callID: id) {
             declineWaitingCallAfterActiveCallTermination()
         }
@@ -11295,7 +12826,8 @@ final class AppModel: ObservableObject {
         conversationID rawConversationID: String,
         recipientUserID rawRecipientUserID: String?
     ) -> (userID: String, conversationID: String, recipientUserID: String)? {
-        guard let rawUserID = profile?.id,
+        guard appReviewDemoMutationsAllowed,
+              let rawUserID = profile?.id,
               let userUUID = UUID(
                   uuidString: rawUserID.trimmingCharacters(in: .whitespacesAndNewlines)
               ),
@@ -11314,11 +12846,106 @@ final class AppModel: ObservableObject {
         return (userID, conversationID, recipientUserID)
     }
 
+    /// A group conversation has no single recipient to validate, so its retry is gated by the
+    /// group capability and this device's own membership instead. v1 group policy mirrors the
+    /// flush gate: per-member privacy is a server concern. Only a retained command can be
+    /// resumed this way — a group send that left no command behind is not re-derived locally.
+    private func retainedGroupMessageRetry(
+        _ messageID: UUID,
+        conversationID rawConversationID: String
+    ) -> (userID: String, conversationID: String, recipientUserIDs: [String])? {
+        guard appReviewDemoMutationsAllowed,
+              messagingGroupsEnabled,
+              let rawUserID = profile?.id,
+              let userUUID = UUID(
+                  uuidString: rawUserID.trimmingCharacters(in: .whitespacesAndNewlines)
+              ),
+              let conversationID = OutboxPolicy.canonicalConversationID(rawConversationID),
+              !isReadOnlyAppReviewDemoConversation(conversationID),
+              let conversation = state.conversations.first(where: {
+                  $0.id.caseInsensitiveCompare(conversationID) == .orderedSame
+              }),
+              conversation.isGroup,
+              OutboxPolicy.canRetryMessage(messageID, in: state.outbox)
+        else { return nil }
+        let userID = userUUID.uuidString.lowercased()
+        let commands = state.outbox.filter {
+            $0.kind == .secureMessage && $0.messageId == messageID
+        }
+        guard conversation.participantUserIds.contains(where: {
+                  $0.caseInsensitiveCompare(userID) == .orderedSame
+              }),
+              commands.count == 1,
+              commands[0].conversationId == conversationID,
+              let recipientUserIDs = commands[0].recipientUserIds,
+              !recipientUserIDs.isEmpty,
+              recipientUserIDs.count < SecureMessagingWire.maximumGroupMembers
+        else { return nil }
+        return (userID, conversationID, recipientUserIDs)
+    }
+
+    private func resumeRetainedGroupMessage(
+        _ messageID: UUID,
+        context: (userID: String, conversationID: String, recipientUserIDs: [String])
+    ) async {
+        let expectedAccountEpoch = accountEpoch
+        guard let expectedSessionID = await sessions.current()?.sessionId,
+              await outboxContextIsCurrent(
+                  accountEpoch: expectedAccountEpoch,
+                  userID: context.userID,
+                  sessionID: expectedSessionID
+              ),
+              let commitAdmission = ProtectedCommunicationAdmissionGate.shared.lease(
+                  forAccountID: context.userID
+              )
+        else { return }
+        do {
+            try await store.update(admission: commitAdmission) { persisted in
+                let commands = persisted.outbox.filter {
+                    $0.kind == .secureMessage && $0.messageId == messageID
+                }
+                guard persisted.profile?.id.caseInsensitiveCompare(context.userID)
+                        == .orderedSame,
+                      persisted.communicationOwnerUserID?.caseInsensitiveCompare(
+                          context.userID
+                      ) == .orderedSame,
+                      commands.count == 1,
+                      commands[0].conversationId == context.conversationID,
+                      commands[0].recipientUserIds == context.recipientUserIDs,
+                      OutboxPolicy.resumeFailedMessage(
+                          messageID: messageID,
+                          in: &persisted,
+                          at: Date()
+                      )
+                else { throw CancellationError() }
+            }
+            guard await reloadOutboxStateIfCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: context.userID,
+                sessionID: expectedSessionID
+            ) else { return }
+            scheduleOutboxWake()
+            if isOnline { await flushOutbox(reportFailures: true) }
+        } catch is CancellationError {
+            return
+        } catch {
+            guard await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: context.userID,
+                sessionID: expectedSessionID
+            ) else { return }
+            lastError = error.localizedDescription
+        }
+    }
+
     func canRetryMessage(
         _ messageID: UUID,
         conversationID: String,
         recipientUserID: String?
     ) -> Bool {
+        if retainedGroupMessageRetry(messageID, conversationID: conversationID) != nil {
+            return true
+        }
         guard let context = failedMessageRetryContext(
             conversationID: conversationID,
             recipientUserID: recipientUserID
@@ -11350,6 +12977,10 @@ final class AppModel: ObservableObject {
         conversationID: String,
         recipientUserID: String?
     ) async {
+        if let group = retainedGroupMessageRetry(messageID, conversationID: conversationID) {
+            await resumeRetainedGroupMessage(messageID, context: group)
+            return
+        }
         guard let context = failedMessageRetryContext(
             conversationID: conversationID,
             recipientUserID: recipientUserID
@@ -11502,6 +13133,7 @@ final class AppModel: ObservableObject {
     }
 
     private func drainReadyOutbox(maximumPasses: Int = 32) async {
+        guard appReviewDemoMutationsAllowed else { return }
         for _ in 0 ..< maximumPasses {
             guard !Task.isCancelled else { return }
             let before = state.outbox
@@ -11514,6 +13146,10 @@ final class AppModel: ObservableObject {
     private func scheduleOutboxWake() {
         outboxWakeTask?.cancel()
         outboxWakeTask = nil
+        guard appReviewDemoMutationsAllowed else {
+            CommunicationBackgroundReplayScheduler.shared.cancel()
+            return
+        }
         guard let backgroundWakeDate = OutboxPolicy.nextWakeDate(state.outbox) else {
             CommunicationBackgroundReplayScheduler.shared.cancel()
             return
@@ -11705,17 +13341,17 @@ private func emailAccountValidationMessage(
 ) -> String {
     switch error {
     case .invalidNameLength:
-        "Enter a username / display name (2–120 characters)."
+        "Enter a display name (2–120 characters)."
     case .placeholderName:
-        "Choose the username / display name people should see."
+        "Choose the display name people should see."
     case .invalidTagLength:
-        "Your Kit Pay tag must be 3 to 32 characters."
+        "Your username must be 3 to 32 characters."
     case .provisionalTag:
-        "Choose your own Kit Pay tag."
+        "Choose your own username."
     case .reservedTag:
-        "This Kit Pay tag is reserved."
+        "This username is reserved."
     case .invalidTagCharacters:
-        "Use only lowercase letters, numbers, and underscores in your Kit Pay tag."
+        "Use only lowercase letters, numbers, and underscores in your username."
     case .invalidEmail:
         "Enter a valid email address."
     case .weakPassword:

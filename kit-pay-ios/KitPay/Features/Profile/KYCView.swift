@@ -9,6 +9,9 @@ struct KYCView: View {
     @State private var consent = false
     @State private var verificationDestination: VerificationDestination?
     @State private var isLaunchingVerification = false
+    /// The customer has just come back from the hosted check, so a status that still reads
+    /// "not started" is a webhook that has not landed yet rather than a decision.
+    @State private var returnedFromVerification = false
 
     init(isRequiredForSignIn: Bool = false) {
         self.isRequiredForSignIn = isRequiredForSignIn
@@ -18,6 +21,9 @@ struct KYCView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 statusCard
+                if isWatchingForDecision {
+                    watchingNotice
+                }
                 privacyCard
                 if shouldOfferVerification {
                     if resumableVerificationURL == nil {
@@ -30,6 +36,7 @@ struct KYCView: View {
                             }
                         }
                         .tint(KitColor.green)
+                        .disabled(!model.appReviewDemoMutationsAllowed)
                         .padding(18)
                         .kitGlass(cornerRadius: 24)
                     }
@@ -51,7 +58,8 @@ struct KYCView: View {
                     .buttonBorderShape(.roundedRectangle(radius: 18))
                     .tint(KitColor.green)
                     .disabled(
-                        isLaunchingVerification
+                        !model.appReviewDemoMutationsAllowed
+                            || isLaunchingVerification
                             || (resumableVerificationURL == nil && !consent)
                             || !model.isOnline
                     )
@@ -65,15 +73,77 @@ struct KYCView: View {
         .task(id: model.isOnline) {
             if model.isOnline { await model.refreshKYC() }
         }
+        .task(id: pollingKey) { await watchForDecision() }
         .refreshable { await model.refreshKYC() }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { Task { await model.refreshKYC() } }
         }
         .sheet(item: $verificationDestination, onDismiss: {
+            returnedFromVerification = true
             Task { await model.refreshKYC() }
         }) { destination in
             SafariView(url: destination.url).ignoresSafeArea()
         }
+    }
+
+    /// Restarting the poll whenever any of these change is the point: a status transition, going
+    /// offline, or the app leaving the foreground should all take effect immediately rather than
+    /// after the current sleep expires.
+    private var pollingKey: String {
+        "\(displayedStatus)|\(model.isOnline)|\(returnedFromVerification)|\(scenePhase == .active)"
+    }
+
+    private var isWatchingForDecision: Bool {
+        scenePhase == .active
+            && KYCStatusPollingPolicy.shouldPoll(
+                status: displayedStatus,
+                returnedFromVerification: returnedFromVerification,
+                isOnline: model.isOnline
+            )
+    }
+
+    /// Keeps asking the server while a decision is outstanding, so the screen updates itself
+    /// instead of making the customer leave and come back to find out.
+    @MainActor
+    private func watchForDecision() async {
+        guard isWatchingForDecision else { return }
+        var attempt = 0
+        while true {
+            let interval = KYCStatusPollingPolicy.interval(attempt: attempt)
+            do {
+                try await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            await model.refreshKYC()
+            guard !Task.isCancelled else { return }
+            attempt += 1
+
+            if KYCStatusPollingPolicy.isSettled(displayedStatus) { return }
+            // A case genuinely under review is watched for as long as the screen is open and in
+            // front of the customer — by then the interval has settled at half a minute. Waiting
+            // on the hosted check to *become* a case is the only bounded part, because a check
+            // that was abandoned never produces one.
+            guard !KYCStatusPollingPolicy.isAwaitingDecision(displayedStatus),
+                  attempt >= KYCStatusPollingPolicy.graceAttemptsAfterVerification
+            else { continue }
+            returnedFromVerification = false
+            return
+        }
+    }
+
+    private var watchingNotice: some View {
+        HStack(spacing: 10) {
+            ProgressView()
+            Text("Checking for an update. This screen refreshes itself — you can leave it open.")
+                .font(.footnote)
+                .foregroundStyle(KitColor.secondaryText)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 4)
+        .accessibilityElement(children: .combine)
     }
 
     private func launchVerification() {
@@ -196,6 +266,61 @@ struct KYCView: View {
         case "rejected", "declined", "failed": .red
         default: .orange
         }
+    }
+}
+
+/// When the identity screen should keep asking the server, and how often.
+///
+/// A verification decision arrives from Didit and compliance out of band — there is nothing for
+/// the app to await. Without this the screen only reloaded when it was opened, pulled, or
+/// returned to, so someone watching their own review sat in front of a status that had already
+/// changed on the server.
+enum KYCStatusPollingPolicy {
+    static let firstInterval: TimeInterval = 4
+    static let maximumInterval: TimeInterval = 30
+    /// How long to keep looking when nothing is under review yet — the window in which a
+    /// just-finished hosted check should turn into a submitted case. After that the status is
+    /// taken at face value: the customer did not complete the check.
+    static let graceAttemptsAfterVerification = 15
+
+    /// Statuses the server can still move on its own.
+    static func isAwaitingDecision(_ status: String?) -> Bool {
+        guard let status = normalized(status) else { return false }
+        return ["pending", "in_review", "review", "reviewing", "submitted", "processing"]
+            .contains(status)
+    }
+
+    /// A decision that will not change without the customer doing something else.
+    static func isSettled(_ status: String?) -> Bool {
+        guard let status = normalized(status) else { return false }
+        return ["verified", "approved", "rejected", "declined", "failed"].contains(status)
+    }
+
+    /// Polls while a decision is outstanding, and for a while after the customer comes back from
+    /// the hosted check: the result reaches Kit by webhook a few seconds later, and until it does
+    /// the status still reads as though nothing was ever submitted.
+    static func shouldPoll(
+        status: String?,
+        returnedFromVerification: Bool,
+        isOnline: Bool
+    ) -> Bool {
+        guard isOnline, !isSettled(status) else { return false }
+        return returnedFromVerification || isAwaitingDecision(status)
+    }
+
+    /// Quick while a decision is likely imminent, then slower, so a screen left open all
+    /// afternoon is not a request every four seconds.
+    static func interval(attempt: Int) -> TimeInterval {
+        guard attempt > 0 else { return firstInterval }
+        let grown = firstInterval * pow(1.5, Double(attempt))
+        return min(maximumInterval, grown)
+    }
+
+    private static func normalized(_ status: String?) -> String? {
+        guard let trimmed = status?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !trimmed.isEmpty
+        else { return nil }
+        return trimmed.replacingOccurrences(of: " ", with: "_")
     }
 }
 

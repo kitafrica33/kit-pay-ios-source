@@ -90,8 +90,9 @@ class AppStoreScreenshotFixtureSourceTests(unittest.TestCase):
             app_model.count("isReadOnlyAppReviewDemoConversation"),
             12,
         )
-        self.assertIn("AppReviewDemoContent.isSyntheticPeerID", app_model)
-        self.assertIn("!appReviewDemoIsActive", app_model)
+        self.assertIn("AppReviewDemoMutationPolicy.peerIsReadOnly", app_model)
+        self.assertIn("appReviewDemoMutationsAllowed", app_model)
+        self.assertIn("hasAuthenticatedCapabilities: capabilities != nil", app_model)
         self.assertIn('Label("Read-only App Review preview"', messages)
         self.assertIn("model.isReadOnlyAppReviewDemoCall(call.id)", calls)
 

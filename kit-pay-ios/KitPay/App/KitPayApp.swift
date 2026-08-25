@@ -86,6 +86,10 @@ struct KitPayApp: App {
                             .stopPictureInPictureForForegroundIfNeeded()
                         syncMinimizedCallSurface()
                     } else if phase == .inactive {
+                        // Close authenticated signalling as soon as the app is no longer active.
+                        // Waiting for `.background` leaks a live socket while Control Center,
+                        // permission prompts, or the app switcher obscure the protected UI.
+                        KitPresenceCenter.shared.setForeground(false)
                         // The foreground→background transition point: the last moment iOS allows
                         // a programmatic Picture in Picture start, so an ongoing video call keeps
                         // showing after the user leaves the app. No-op for audio calls, when

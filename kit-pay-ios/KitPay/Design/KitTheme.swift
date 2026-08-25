@@ -595,42 +595,87 @@ struct AvatarView: View {
 
 /// Displays initials immediately, then replaces them with the immutable remote profile photo.
 /// Keeping the placeholder in the same fixed circle prevents layout shifts while the image loads.
+///
+/// This is the only profile-photo view in the app. Photos come from `ProfileAvatarCache` rather
+/// than `AsyncImage`, which means a face the customer has seen once stays visible on relaunch and
+/// with no network, and the bytes sit encrypted on disk instead of in the clear in `URLCache`.
+/// Loading is lazy by construction: the fetch starts in `.task`, so a row that never scrolls into
+/// view never downloads anything.
 struct RemoteAvatarView: View {
     let name: String
     let avatarURL: String?
     var size: CGFloat = 52
+    /// Opacity of the hairline ring, or `nil` where the avatar already sits inside a glass lens
+    /// and a second outline would only muddy the edge.
+    var ringOpacity: Double? = 0.65
 
-    private var validatedURL: URL? {
-        guard let avatarURL,
-              let url = URL(string: avatarURL),
-              url.scheme?.caseInsensitiveCompare("https") == .orderedSame,
-              url.host?.isEmpty == false
-        else { return nil }
-        return url
+    @State private var image: UIImage?
+
+    init(name: String, avatarURL: String?, size: CGFloat = 52, ringOpacity: Double? = 0.65) {
+        self.name = name
+        self.avatarURL = avatarURL
+        self.size = size
+        self.ringOpacity = ringOpacity
+        // Seeded synchronously so a row scrolling back into view draws its photo in the first
+        // frame rather than flashing initials for one hop.
+        _image = State(initialValue: ProfileAvatarCache.cachedImage(for: avatarURL))
     }
 
     var body: some View {
         ZStack {
-            AvatarView(name: name, size: size)
-            if let validatedURL {
-                AsyncImage(url: validatedURL) { phase in
-                    if case let .success(image) = phase {
-                        image
-                            .resizable()
-                            .scaledToFill()
-                            .transition(.opacity)
-                    }
-                }
+            AvatarView(name: name, size: size, showsRing: false)
+            if let image {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+                    .transition(.opacity)
             }
         }
         .frame(width: size, height: size)
         .clipShape(Circle())
         .overlay {
-            Circle()
-                .stroke(.white.opacity(0.65), lineWidth: 1)
-                .allowsHitTesting(false)
+            if let ringOpacity {
+                Circle()
+                    .stroke(.white.opacity(ringOpacity), lineWidth: 1)
+                    .allowsHitTesting(false)
+            }
         }
+        .animation(.easeOut(duration: 0.18), value: image == nil)
+        .task(id: avatarURL) { await load() }
         .accessibilityLabel("Profile photo for \(name)")
+    }
+
+    private func load() async {
+        if let cached = ProfileAvatarCache.cachedImage(for: avatarURL) {
+            image = cached
+            return
+        }
+        // A different person now occupies this row; drop the previous face before fetching so a
+        // slow download can never leave the wrong photo next to a name.
+        image = nil
+        guard let avatarURL else { return }
+        let loaded = await ProfileAvatarCache.shared.image(for: avatarURL)
+        guard !Task.isCancelled else { return }
+        image = loaded
+    }
+}
+
+/// Draws content that fills the space it is given without letting that content decide how much
+/// space there is.
+///
+/// `scaledToFill` reports the size a photo needs in order to cover its container, which for a
+/// portrait photo asked to cover a phone screen is far wider than the screen. A `ZStack` takes the
+/// size of its largest child, so that report travels upwards: on the call screen it grew the whole
+/// layout the instant a profile photo finished loading, sliding the name, the avatar and the
+/// control bar off the right edge. An overlay is positioned by its host and never sizes it, so
+/// hosting the fill on a flexible layer keeps the look and drops the report.
+struct KitFillingBackdrop<Content: View>: View {
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        Color.clear
+            .overlay { content }
+            .clipped()
     }
 }
 

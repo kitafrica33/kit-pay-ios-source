@@ -63,7 +63,10 @@ extension APIClient {
               request.directMessageRequestsEnabled.map({
                   updated.directMessageRequestsEnabled == $0
               }) ?? true,
-              request.incomingCallsEnabled.map({ updated.incomingCallsEnabled == $0 }) ?? true
+              request.incomingCallsEnabled.map({ updated.incomingCallsEnabled == $0 }) ?? true,
+              request.messagingPresenceVisible.map({
+                    updated.messagingPresenceVisible == $0
+                }) ?? true
         else { throw APIClientError.invalidResponse }
         return updated
     }

@@ -977,6 +977,7 @@ final class SecureLocalStoreTests: XCTestCase {
               "phone_discoverable": false,
               "direct_message_requests_enabled": true,
               "incoming_calls_enabled": true,
+              "messaging_presence_visible": true,
               "updated_at": "2026-08-20T08:30:00Z"
             }
             """.data(using: .utf8)

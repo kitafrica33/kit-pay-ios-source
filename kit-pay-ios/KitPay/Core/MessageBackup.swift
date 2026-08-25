@@ -130,15 +130,40 @@ struct MessageBackupPayload: Codable, Equatable, Sendable {
         includesMedia: Bool,
         createdAt: Date = Date()
     ) -> MessageBackupPayload {
+        let conversationsByID = Dictionary(
+            state.conversations.map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let ownerUserID = userID.lowercased()
         // An outbox is intentionally never part of a backup. Match that boundary by retaining
         // only messages whose server submission or receipt is already committed; restoring a
         // queued/encrypting/sending/failed local item without its command could silently strand it.
         var messages = state.messages.filter { message in
             switch message.state {
             case .sent, .delivered, .read, .received:
-                message.pendingAttachment == nil
+                guard message.pendingAttachment == nil,
+                    // Membership notices are projections of authenticated sync events, but the
+                    // local message shape does not retain that server-event provenance. Exclude
+                    // them instead of backing up a trusted namespace that restore cannot prove.
+                    !SecureMessageReservedPrefixPolicy.beginsWithReservedPrefix(
+                        message.body,
+                        prefix: KitSystemMessage.prefix
+                    )
+                else { return false }
+                // A message written before sender-bound history metadata existed remains useful
+                // while its author is in the roster. Once that member departs, however, the
+                // archive cannot prove the sender and validation would reject the whole backup.
+                // Omit only that un-restorable legacy row; current-member and owner history stays.
+                if let conversation = conversationsByID[message.conversationId] {
+                    return MessageBackupValidationPolicy.isRestorableMessageSender(
+                        message,
+                        in: conversation,
+                        ownerUserID: ownerUserID
+                    )
+                }
+                return true
             case .queued, .encrypting, .sending, .failed:
-                false
+                return false
             }
         }
         if !includesMedia {
@@ -229,18 +254,38 @@ enum MessageBackupValidationPolicy {
         }
         var aggregateTextAndMetadataBytes = payload.deviceName.utf8.count
         var participantsByConversation: [String: Set<String>] = [:]
+        var groupConversationIDs: Set<String> = []
         for conversation in payload.conversations {
             guard SecureMessagingWirePolicy.isCanonicalUUID(conversation.id),
-                  !conversation.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                  conversation.title.utf8.count <= maximumTitleUTF8Bytes,
+                  conversation.conversationType == nil
+                    || conversation.conversationType == SecureMessagingWire.directConversationType
+                    || conversation.conversationType == SecureMessagingWire.groupConversationType,
+                  (conversation.isGroup
+                    ? MessagingGroupTitlePolicy.isValid(conversation.title)
+                    : (!conversation.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        && conversation.title.utf8.count <= maximumTitleUTF8Bytes)),
                   conversation.unreadCount >= 0,
                   isValidDate(conversation.updatedAt, now: now),
-                  conversation.participantUserIds.count == 2,
-                  Set(conversation.participantUserIds).count == 2,
+                  // Direct threads keep the strict exactly-two rule. A retained GROUP may no
+                  // longer contain the archive owner after a leave/removal. The final member may
+                  // leave too, so a retained history-only group can have an empty active roster.
+                  conversation.isGroup
+                    ? (0 ... SecureMessagingWire.maximumGroupMembers)
+                        .contains(conversation.participantUserIds.count)
+                    : conversation.participantUserIds.count == 2,
+                  Set(conversation.participantUserIds).count
+                    == conversation.participantUserIds.count,
                   conversation.participantUserIds.allSatisfy(
                       SecureMessagingWirePolicy.isCanonicalUUID
                   ),
-                  conversation.participantUserIds.contains(payload.userID)
+                  conversation.groupMemberRoles.map({ roles in
+                      conversation.isGroup
+                          && Set(roles.keys) == Set(conversation.participantUserIds)
+                          && roles.keys.allSatisfy(SecureMessagingWirePolicy.isCanonicalUUID)
+                  }) ?? true,
+                  // The owner may have left/been removed from a group whose history they keep.
+                  conversation.isGroup
+                    || conversation.participantUserIds.contains(payload.userID)
             else { throw MessageBackupError.invalidBackup }
             guard addBounded(
                 conversation.title.utf8.count
@@ -251,6 +296,9 @@ enum MessageBackupValidationPolicy {
                 limit: maximumAggregateTextAndMetadataBytes
             ) else { throw MessageBackupError.invalidBackup }
             participantsByConversation[conversation.id] = Set(conversation.participantUserIds)
+            if conversation.isGroup {
+                groupConversationIDs.insert(conversation.id)
+            }
         }
 
         let messageIDs = payload.messages.map(\.id)
@@ -263,13 +311,32 @@ enum MessageBackupValidationPolicy {
         }
         var aggregateInlineBytes = 0
         for message in payload.messages {
+            let isGroup = groupConversationIDs.contains(message.conversationId)
+            // Current rosters intentionally omit people who left. Preserve their already
+            // authenticated history only when the projection carries every piece of provenance
+            // produced by secure-message decryption. Merely choosing another canonical UUID as
+            // a group sender is never enough. The archive owner is handled separately because
+            // their own pre-removal outgoing messages may predate retained history metadata.
+            let hasAuthenticatedDepartedGroupSender = isGroup
+                && isAuthenticatedDepartedGroupSender(
+                    message,
+                    ownerUserID: payload.userID
+                )
             guard let participants = participantsByConversation[message.conversationId],
                   SecureMessagingWirePolicy.isCanonicalUUID(message.conversationId),
                   SecureMessagingWirePolicy.isCanonicalUUID(message.senderId),
-                  participants.contains(message.senderId),
+                  participants.contains(message.senderId)
+                    || (isGroup && message.senderId == payload.userID)
+                    || hasAuthenticatedDepartedGroupSender,
                   message.isOutgoing == (message.senderId == payload.userID),
                   message.body.utf8.count <= maximumBodyUTF8Bytes,
                   !message.body.unicodeScalars.contains(where: { $0.value == 0 }),
+                  // KITSYS1 is server-event-authored. Backups do not carry enough event metadata
+                  // to reconstruct and verify that provenance, so restore must fail closed.
+                  !SecureMessageReservedPrefixPolicy.beginsWithReservedPrefix(
+                      message.body,
+                      prefix: KitSystemMessage.prefix
+                  ),
                   isValidDate(message.createdAt, now: now),
                   message.sentAt.map({ isValidDate($0, now: now) }) ?? true,
                   (message.failureReason?.utf8.count ?? 0) <= 4_096,
@@ -277,20 +344,25 @@ enum MessageBackupValidationPolicy {
                   message.pendingAttachment == nil,
                   message.serverMessageId.map(SecureMessagingWirePolicy.isCanonicalUUID) ?? true
             else { throw MessageBackupError.invalidBackup }
-            let historyBytes = message.secureMessagingHistory.map {
-                $0.clientMessageID.utf8.count
-                    + $0.senderDeviceID.utf8.count
-                    + $0.rosterRevision.utf8.count
-                    + ($0.replyToMessageID?.utf8.count ?? 0)
-            } ?? 0
+            // Accumulated stepwise rather than as one expression: the summed optionals are cheap
+            // at runtime but expensive to type-check as a single term.
+            var historyBytes = 0
+            if let history = message.secureMessagingHistory {
+                historyBytes += history.clientMessageID.utf8.count
+                historyBytes += history.senderUserID?.utf8.count ?? 0
+                historyBytes += history.senderDeviceID.utf8.count
+                historyBytes += history.rosterRevision.utf8.count
+                historyBytes += history.replyToMessageID?.utf8.count ?? 0
+            }
+            var messageBytes = 512
+            messageBytes += message.body.utf8.count
+            messageBytes += message.conversationId.utf8.count
+            messageBytes += message.senderId.utf8.count
+            messageBytes += message.serverMessageId?.utf8.count ?? 0
+            messageBytes += message.failureReason?.utf8.count ?? 0
+            messageBytes += historyBytes
             guard addBounded(
-                message.body.utf8.count
-                    + message.conversationId.utf8.count
-                    + message.senderId.utf8.count
-                    + (message.serverMessageId?.utf8.count ?? 0)
-                    + (message.failureReason?.utf8.count ?? 0)
-                    + historyBytes
-                    + 512,
+                messageBytes,
                 to: &aggregateTextAndMetadataBytes,
                 limit: maximumAggregateTextAndMetadataBytes
             ) else { throw MessageBackupError.invalidBackup }
@@ -316,12 +388,31 @@ enum MessageBackupValidationPolicy {
             }
             if let history = message.secureMessagingHistory {
                 guard SecureMessagingWirePolicy.isCanonicalUUID(history.clientMessageID),
+                      history.senderUserID.map(SecureMessagingWirePolicy.isCanonicalUUID) ?? true,
+                      history.senderUserID.map({ $0 == message.senderId }) ?? true,
                       SecureMessagingWirePolicy.isCanonicalUUID(history.senderDeviceID),
                       history.senderEnrollmentEpoch > 0,
+                      (1 ... 127).contains(history.senderSignalDeviceID),
                       SecureMessagingWirePolicy.isRosterRevision(history.rosterRevision),
                       history.replyToMessageID.map(SecureMessagingWirePolicy.isCanonicalUUID)
-                        ?? true
+                        ?? true,
+                      SecureMessagingContentBindingPolicy.kind(
+                          for: message.body,
+                          replyToMessageID: history.replyToMessageID,
+                          attachments: KitMediaMessageDescriptor.attachments(for: message.body)
+                      ) == history.kind,
+                      history.kind != .encryptedReaction
+                        || (message.serverMessageId != nil
+                            && history.senderUserID == message.senderId
+                            && MessageReactionAggregationPolicy.hasValidTarget(
+                                for: message,
+                                among: payload.messages
+                            ))
                 else { throw MessageBackupError.invalidBackup }
+            } else if KitMessageReaction.isReactionText(message.body) {
+                // Backups contain committed messages only; a reaction without authenticated
+                // outer kind/target metadata could be ordinary legacy text impersonating one.
+                throw MessageBackupError.invalidBackup
             }
         }
 
@@ -333,6 +424,32 @@ enum MessageBackupValidationPolicy {
             payload.mutedConversationIds,
             allowedIDs: Set(conversationIDs)
         )
+    }
+
+    static func isAuthenticatedDepartedGroupSender(
+        _ message: LocalMessage,
+        ownerUserID: String
+    ) -> Bool {
+        message.senderId != ownerUserID
+            && !message.isOutgoing
+            && [.received, .read].contains(message.state)
+            && message.serverMessageId != nil
+            && message.sentAt != nil
+            && message.secureMessagingHistory?.senderUserID == message.senderId
+    }
+
+    /// Group roster changes can make a message's sender absent from a newer conversation
+    /// projection. Only authenticated retained-history provenance can carry a non-owner sender
+    /// across that boundary. Direct-conversation integrity remains the validator's strict concern.
+    static func isRestorableMessageSender(
+        _ message: LocalMessage,
+        in conversation: Conversation,
+        ownerUserID: String
+    ) -> Bool {
+        guard conversation.isGroup else { return true }
+        return conversation.participantUserIds.contains(message.senderId)
+            || message.senderId == ownerUserID
+            || isAuthenticatedDepartedGroupSender(message, ownerUserID: ownerUserID)
     }
 
     private static func validateConversationReferences(
@@ -528,10 +645,30 @@ enum MessageBackupConflictPolicy {
                 conversations[candidate.id] = candidate
             }
         }
+        // A newer group projection may omit a member who was still present in an older valid
+        // archive. Filter against the selected roster before either identity-deduplication pass:
+        // an unbound legacy row must not displace a sender-bound copy with a different delivery
+        // state and then poison (or disappear from) the merged backup.
+        let restorableFirstMessages = first.messages.filter { message in
+            guard let conversation = conversations[message.conversationId] else { return true }
+            return MessageBackupValidationPolicy.isRestorableMessageSender(
+                message,
+                in: conversation,
+                ownerUserID: first.userID
+            )
+        }
+        let restorableSecondMessages = second.messages.filter { message in
+            guard let conversation = conversations[message.conversationId] else { return true }
+            return MessageBackupValidationPolicy.isRestorableMessageSender(
+                message,
+                in: conversation,
+                ownerUserID: first.userID
+            )
+        }
         var messagesByLocalID = Dictionary(
-            uniqueKeysWithValues: first.messages.map { ($0.id, $0) }
+            uniqueKeysWithValues: restorableFirstMessages.map { ($0.id, $0) }
         )
-        for candidate in second.messages {
+        for candidate in restorableSecondMessages {
             if let existing = messagesByLocalID[candidate.id] {
                 messagesByLocalID[candidate.id] = try preferredMessage(existing, candidate)
             } else {
@@ -615,9 +752,12 @@ enum MessageBackupConflictPolicy {
         case .delivered: deliveryRank = 6
         case .read: deliveryRank = 7
         }
-        return deliveryRank * 8
-            + (message.serverMessageId == nil ? 0 : 4)
-            + (message.secureMessagingHistory == nil ? 0 : 2)
+        return deliveryRank * 16
+            + (message.serverMessageId == nil ? 0 : 8)
+            + (message.secureMessagingHistory == nil ? 0 : 4)
+            // A sender-bound history record is strictly more useful than its otherwise identical
+            // legacy form: it remains restorable after that sender leaves a group.
+            + (message.secureMessagingHistory?.senderUserID == nil ? 0 : 2)
             + (message.pendingAttachment == nil ? 1 : 0)
     }
 

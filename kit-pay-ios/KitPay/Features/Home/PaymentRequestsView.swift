@@ -250,7 +250,11 @@ struct PaymentRequestsView: View {
             ToolbarItem(placement: .topBarLeading) { Button("Close") { dismiss() } }
             ToolbarItem(placement: .topBarTrailing) {
                 Button { showingCreate = true } label: { Image(systemName: "plus") }
-                    .disabled(!policy.paymentRequestsEnabled || !model.isOnline)
+                    .disabled(
+                        !model.appReviewDemoMutationsAllowed
+                            || !policy.paymentRequestsEnabled
+                            || !model.isOnline
+                    )
                     .accessibilityLabel("Create payment request")
             }
         }
@@ -302,7 +306,7 @@ struct PaymentRequestsView: View {
                 Task { _ = await requests.cancel(request, policy: policy, isOnline: model.isOnline) }
             }
         } message: { request in
-            Text("Cancel the request for \(request.currency.code) \(request.amount)? This cannot be undone.")
+            Text("Cancel the request for \(KitMoney.formatted(request.amount, currency: request.currency))? This cannot be undone.")
         }
     }
 
@@ -364,7 +368,7 @@ struct PaymentRequestsView: View {
                 statusBadge(request)
             }
 
-            Text("\(request.currency.code) \(request.amount)")
+            Text(KitMoney.formatted(request.amount, currency: request.currency))
                 .font(.system(size: 27, weight: .heavy, design: .rounded))
                 .foregroundStyle(KitColor.primaryText)
 
@@ -387,13 +391,21 @@ struct PaymentRequestsView: View {
                     }
                 }
                 .buttonStyle(KitPrimaryButtonStyle())
-                .disabled(!model.isOnline || requests.actionRequestId != nil)
+                .disabled(
+                    !model.appReviewDemoMutationsAllowed
+                        || !model.isOnline
+                        || requests.actionRequestId != nil
+                )
             } else if policy.canCancel(request) {
                 Button(role: .destructive) { cancellingRequest = request } label: {
                     Label("Cancel request", systemImage: "xmark.circle").frame(maxWidth: .infinity)
                 }
                 .buttonStyle(KitSecondaryButtonStyle())
-                .disabled(!model.isOnline || requests.actionRequestId != nil)
+                .disabled(
+                    !model.appReviewDemoMutationsAllowed
+                        || !model.isOnline
+                        || requests.actionRequestId != nil
+                )
             }
         }
         .padding(18)
@@ -450,6 +462,17 @@ struct PaymentRequestPINView: View {
     let errorMessage: String?
     let submit: (String) async -> Bool
     @State private var pin = ""
+    /// Non-nil while the customer is topping up to cover this request.
+    @State private var topUpRequest: WalletTopUpRequirement?
+
+    /// Paying a request moves money between Kit Pay wallets, so there is no transaction fee and
+    /// the debit is the requested amount itself.
+    private var topUpRequirement: WalletTopUpRequirement? {
+        WalletTopUpPolicy.requirement(
+            wallet: model.selectedWallet,
+            debitAPIAmount: request.amount
+        )
+    }
 
     var body: some View {
         NavigationStack {
@@ -461,7 +484,7 @@ struct PaymentRequestPINView: View {
                         .frame(width: 88, height: 88)
                         .kitGlass(cornerRadius: 28, tint: KitColor.paleGreen)
                     Text("Approve exact payment").font(.title2.bold()).foregroundStyle(KitColor.primaryText)
-                    Text("\(request.currency.code) \(request.amount)")
+                    Text(KitMoney.formatted(request.amount, currency: request.currency))
                         .font(.system(size: 34, weight: .heavy, design: .rounded))
                         .foregroundStyle(KitColor.primaryText)
                     if let note = request.note?.trimmedNonempty {
@@ -498,6 +521,13 @@ struct PaymentRequestPINView: View {
                     if let errorMessage {
                         Text(errorMessage).font(.footnote).foregroundStyle(.red).multilineTextAlignment(.center)
                     }
+                    if let requirement = topUpRequirement {
+                        WalletShortfallNotice(requirement: requirement) {
+                            topUpRequest = requirement
+                        }
+                        .padding(17)
+                        .kitGlass(cornerRadius: 18)
+                    }
                     Button {
                         Task {
                             if await submit(pin) {
@@ -510,7 +540,7 @@ struct PaymentRequestPINView: View {
                             ProgressView().tint(.white).frame(maxWidth: .infinity)
                         } else {
                             Label(
-                                "Pay \(request.currency.code) \(request.amount)",
+                                "Pay \(KitMoney.formatted(request.amount, currency: request.currency))",
                                 systemImage: model.financialApprovalUsesBiometrics
                                     ? model.biometricSymbolName
                                     : "checkmark.shield.fill"
@@ -520,7 +550,10 @@ struct PaymentRequestPINView: View {
                     }
                     .buttonStyle(KitPrimaryButtonStyle())
                     .disabled(
-                        (!model.financialApprovalUsesBiometrics && pin.count != 4) || isSubmitting
+                        !model.appReviewDemoMutationsAllowed
+                            || (!model.financialApprovalUsesBiometrics && pin.count != 4)
+                            || isSubmitting
+                            || topUpRequirement != nil
                     )
                 }
                 .padding(24)
@@ -530,6 +563,13 @@ struct PaymentRequestPINView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .topBarLeading) { Button("Cancel") { dismiss() } } }
             .interactiveDismissDisabled(isSubmitting)
+            .sheet(item: $topUpRequest) { requirement in
+                // This screen stays behind the top-up sheet, so the approval simply re-enables
+                // itself the moment the balance covers the request.
+                WalletTopUpView(requirement: requirement) { _ in }
+                    .environmentObject(model)
+                    .presentationBackground(.ultraThinMaterial)
+            }
         }
     }
 }

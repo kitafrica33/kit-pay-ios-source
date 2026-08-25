@@ -7,6 +7,7 @@ struct CommunicationPreferencesDTO: Codable, Equatable, Sendable {
     /// Retained for wire compatibility. Call admission is governed by account eligibility and
     /// directional blocks; clients must not present this value as an effective call-blocking rule.
     let incomingCallsEnabled: Bool
+    let messagingPresenceVisible: Bool
     let updatedAt: String
 
     private enum CodingKeys: String, CodingKey, CaseIterable {
@@ -14,10 +15,21 @@ struct CommunicationPreferencesDTO: Codable, Equatable, Sendable {
         case phoneDiscoverable = "phone_discoverable"
         case directMessageRequestsEnabled = "direct_message_requests_enabled"
         case incomingCallsEnabled = "incoming_calls_enabled"
+        case messagingPresenceVisible = "messaging_presence_visible"
         case updatedAt = "updated_at"
     }
 
     init(from decoder: Decoder) throws {
+        try self.init(from: decoder, allowMissingMessagingPresenceVisible: false)
+    }
+
+    /// Build 23 encrypted caches predate the server-backed presence field. The backend migration
+    /// backfilled those accounts to `true` without changing their preference version, so only the
+    /// cache decoder may supply that legacy default; live API responses remain strict.
+    fileprivate init(
+        from decoder: Decoder,
+        allowMissingMessagingPresenceVisible: Bool
+    ) throws {
         try CommunicationPrivacyDecoding.rejectUnknownKeys(
             from: decoder,
             allowed: CodingKeys.allCases.map(\.rawValue)
@@ -47,6 +59,22 @@ struct CommunicationPreferencesDTO: Codable, Equatable, Sendable {
             forKey: .directMessageRequestsEnabled
         )
         incomingCallsEnabled = try container.decode(Bool.self, forKey: .incomingCallsEnabled)
+        if container.contains(.messagingPresenceVisible) {
+            messagingPresenceVisible = try container.decode(
+                Bool.self,
+                forKey: .messagingPresenceVisible
+            )
+        } else if allowMissingMessagingPresenceVisible {
+            messagingPresenceVisible = true
+        } else {
+            throw DecodingError.keyNotFound(
+                CodingKeys.messagingPresenceVisible,
+                DecodingError.Context(
+                    codingPath: container.codingPath,
+                    debugDescription: "Communication presence visibility is required."
+                )
+            )
+        }
         self.updatedAt = updatedAt
     }
 }
@@ -57,19 +85,22 @@ struct UpdateCommunicationPreferencesRequest: Encodable, Equatable, Sendable {
     let directMessageRequestsEnabled: Bool?
     /// Compatibility-only wire field. Setting it does not create a local call-admission guarantee.
     let incomingCallsEnabled: Bool?
+    let messagingPresenceVisible: Bool?
 
     enum CodingKeys: String, CodingKey {
         case version
         case phoneDiscoverable = "phone_discoverable"
         case directMessageRequestsEnabled = "direct_message_requests_enabled"
         case incomingCallsEnabled = "incoming_calls_enabled"
+        case messagingPresenceVisible = "messaging_presence_visible"
     }
 
     init(
         version: Int,
         phoneDiscoverable: Bool? = nil,
         directMessageRequestsEnabled: Bool? = nil,
-        incomingCallsEnabled: Bool? = nil
+        incomingCallsEnabled: Bool? = nil,
+        messagingPresenceVisible: Bool? = nil
     ) throws {
         guard version >= 1 else {
             throw CommunicationPrivacyContractError.invalidPreferenceVersion
@@ -77,6 +108,7 @@ struct UpdateCommunicationPreferencesRequest: Encodable, Equatable, Sendable {
         guard phoneDiscoverable != nil
             || directMessageRequestsEnabled != nil
             || incomingCallsEnabled != nil
+            || messagingPresenceVisible != nil
         else {
             throw CommunicationPrivacyContractError.emptyPreferenceUpdate
         }
@@ -84,6 +116,7 @@ struct UpdateCommunicationPreferencesRequest: Encodable, Equatable, Sendable {
         self.phoneDiscoverable = phoneDiscoverable
         self.directMessageRequestsEnabled = directMessageRequestsEnabled
         self.incomingCallsEnabled = incomingCallsEnabled
+        self.messagingPresenceVisible = messagingPresenceVisible
     }
 }
 
@@ -93,6 +126,7 @@ struct UpdateCommunicationPreferencesRequest: Encodable, Equatable, Sendable {
 enum CommunicationPreferenceChange: Equatable, Sendable {
     case phoneDiscovery(Bool)
     case messageRequests(Bool)
+    case presenceVisibility(Bool)
 
     func request(version: Int) throws -> UpdateCommunicationPreferencesRequest {
         switch self {
@@ -106,6 +140,11 @@ enum CommunicationPreferenceChange: Equatable, Sendable {
                 version: version,
                 directMessageRequestsEnabled: enabled
             )
+        case .presenceVisibility(let visible):
+            return try UpdateCommunicationPreferencesRequest(
+                version: version,
+                messagingPresenceVisible: visible
+            )
         }
     }
 
@@ -115,6 +154,8 @@ enum CommunicationPreferenceChange: Equatable, Sendable {
             return preferences.phoneDiscoverable == enabled
         case .messageRequests(let enabled):
             return preferences.directMessageRequestsEnabled == enabled
+        case .presenceVisibility(let visible):
+            return preferences.messagingPresenceVisible == visible
         }
     }
 
@@ -140,10 +181,93 @@ enum CommunicationPreferenceChange: Equatable, Sendable {
             return updated.directMessageRequestsEnabled
                     == previous.directMessageRequestsEnabled
                 && updated.incomingCallsEnabled == previous.incomingCallsEnabled
+                && updated.messagingPresenceVisible == previous.messagingPresenceVisible
         case .messageRequests:
             return updated.phoneDiscoverable == previous.phoneDiscoverable
                 && updated.incomingCallsEnabled == previous.incomingCallsEnabled
+                && updated.messagingPresenceVisible == previous.messagingPresenceVisible
+        case .presenceVisibility:
+            return updated.phoneDiscoverable == previous.phoneDiscoverable
+                && updated.directMessageRequestsEnabled
+                    == previous.directMessageRequestsEnabled
+                && updated.incomingCallsEnabled == previous.incomingCallsEnabled
         }
+    }
+}
+
+/// The account-discovery controls Kit Pay offers, described once so account setup and
+/// Communication privacy show a user the same words for the same switch. A choice made at
+/// sign-in has to be recognisable when the user later goes looking for it.
+enum AccountDiscoveryControl: String, CaseIterable, Identifiable, Sendable {
+    /// Server-backed `phone_discoverable`.
+    case phoneNumber
+    /// Device-local: whether this iPhone uploads its address book for matching.
+    case contacts
+    /// Server-backed `direct_message_requests_enabled`.
+    case messageRequests
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .phoneNumber: "Let people find me by my phone number"
+        case .contacts: "Find people I know from my contacts"
+        case .messageRequests: "Let people find me by my @tag"
+        }
+    }
+
+    var subtitle: String {
+        switch self {
+        case .phoneNumber:
+            "People who already have your number saved can see that you are on Kit Pay and pay or "
+                + "message you. Turn this off and only people you contact first can reach you."
+        case .contacts:
+            "This iPhone uploads the names and numbers in your address book so Kit Pay can show "
+                + "which of your contacts already use it. Turning this off stops the upload and "
+                + "removes the matches from this device."
+        case .messageRequests:
+            "Verified Kit Pay users who know your @tag can start a new chat with you. You still "
+                + "choose whether to reply, and you can block anyone at any time."
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .phoneNumber: "phone.badge.checkmark"
+        case .contacts: "person.crop.circle.badge.checkmark"
+        case .messageRequests: "message.badge"
+        }
+    }
+
+    /// Where the user can change this later, named so setup and Settings agree.
+    static let settingsLocation = "Profile › Privacy › Communication privacy"
+
+    var accessibilityIdentifier: String { "account-discovery.\(rawValue)" }
+}
+
+/// Discoverability choices captured while the account is still in setup.
+///
+/// `communicationPrivacyContext()` deliberately refuses to run while `accountSetupStep != nil`
+/// or before the session grants full access, so the setup screen cannot PATCH these preferences
+/// itself. It records the user's intent here instead, inside the encrypted account-bound state,
+/// and the app commits it the first time the session is fully authorized.
+struct PendingAccountDiscoveryChoice: Codable, Equatable, Sendable {
+    var phoneDiscoverable: Bool
+    var directMessageRequestsEnabled: Bool
+
+    /// The changes still needed to make `preferences` match this choice, in commit order. An
+    /// already-matching field yields no request, so a no-op setup never burns a version bump.
+    func outstandingChanges(
+        given preferences: CommunicationPreferencesDTO
+    ) -> [CommunicationPreferenceChange] {
+        var changes: [CommunicationPreferenceChange] = []
+        if preferences.phoneDiscoverable != phoneDiscoverable {
+            changes.append(.phoneDiscovery(phoneDiscoverable))
+        }
+        if preferences.directMessageRequestsEnabled != directMessageRequestsEnabled {
+            changes.append(.messageRequests(directMessageRequestsEnabled))
+        }
+        return changes
     }
 }
 
@@ -461,9 +585,9 @@ struct CommunicationPrivacyCache: Codable, Equatable, Sendable {
         )
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let rawOwnerUserId = try container.decode(String.self, forKey: .ownerUserId)
-        let preferences = try container.decode(
-            CommunicationPreferencesDTO.self,
-            forKey: .preferences
+        let preferences = try CommunicationPreferencesDTO(
+            from: container.superDecoder(forKey: .preferences),
+            allowMissingMessagingPresenceVisible: true
         )
         let blocks = try container.decode([CommunicationBlockDTO].self, forKey: .blocks)
         let refreshedAt = try container.decode(Date.self, forKey: .refreshedAt)

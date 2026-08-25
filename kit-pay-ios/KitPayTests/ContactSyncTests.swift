@@ -196,10 +196,30 @@ final class ContactSyncTests: XCTestCase {
         )
     }
 
-    func testFloatingRootMenuIsCompactAndLowerWithoutSacrificingClearance() {
+    func testFloatingRootMenuIsLegibleAndSitsLowerWithoutSacrificingClearance() {
         XCTAssertGreaterThan(RootTabBarLayoutPolicy.scrollClearance, 0)
         XCTAssertGreaterThan(RootTabBarLayoutPolicy.barTopPadding, 0)
-        XCTAssertEqual(RootTabBarLayoutPolicy.visualScale, 0.90, accuracy: 0.0001)
+
+        // The trim is deliberately neutral: every metric below is stated at the size it should
+        // render at rather than being a larger number shrunk by a factor, which had left the
+        // icons and captions smaller than the ones iOS draws in its own tab bar.
+        XCTAssertEqual(RootTabBarLayoutPolicy.visualScale, 1.0, accuracy: 0.0001)
+        XCTAssertEqual(RootTabBarLayoutPolicy.iconPointSize, 21, accuracy: 0.0001)
+        XCTAssertEqual(RootTabBarLayoutPolicy.captionPointSize, 11, accuracy: 0.0001)
+        XCTAssertGreaterThan(
+            RootTabBarLayoutPolicy.iconPointSize,
+            RootTabBarLayoutPolicy.captionPointSize
+        )
+        XCTAssertGreaterThanOrEqual(
+            RootTabBarLayoutPolicy.buttonMinimumHeight(accessibilitySize: false),
+            RootTabBarLayoutPolicy.minimumInteractiveDimension
+        )
+        // An accessibility text size grows the hit target instead of shrinking with the rest.
+        XCTAssertGreaterThan(
+            RootTabBarLayoutPolicy.buttonMinimumHeight(accessibilitySize: true),
+            RootTabBarLayoutPolicy.buttonMinimumHeight(accessibilitySize: false)
+        )
+
         XCTAssertEqual(RootTabBarLayoutPolicy.verticalDropFraction, 0.20, accuracy: 0.0001)
         XCTAssertEqual(
             RootTabBarLayoutPolicy.verticalDrop,

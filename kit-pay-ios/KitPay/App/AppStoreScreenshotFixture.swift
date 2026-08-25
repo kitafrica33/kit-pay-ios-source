@@ -135,6 +135,7 @@ enum AppStoreScreenshotFixture {
               "phone_discoverable": true,
               "direct_message_requests_enabled": true,
               "incoming_calls_enabled": true,
+              "messaging_presence_visible": true,
               "updated_at": "2026-08-24T09:40:00Z"
             }
             """

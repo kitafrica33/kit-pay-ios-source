@@ -1,5 +1,7 @@
 import AVFoundation
 import Foundation
+import SwiftUI
+import UIKit
 import XCTest
 @testable import KitPay
 
@@ -4209,6 +4211,16 @@ final class CallLifecycleTests: XCTestCase {
         let recipientUserID = "20000000-0000-4000-8000-000000000002"
         let callID = "30000000-0000-4000-8000-000000000001"
         let participantUserIDs = [peerUserID, recipientUserID.uppercased()]
+        let expectedContext = ActiveCallInvitationContext(
+            call: record(
+                id: callID,
+                state: .active,
+                offset: 1,
+                participantUserIds: [peerUserID]
+            ),
+            callID: callID,
+            participantUserIDs: Set([currentUserID, peerUserID])
+        )
 
         for state in ["ringing", "active"] {
             XCTAssertTrue(
@@ -4218,7 +4230,7 @@ final class CallLifecycleTests: XCTestCase {
                         participantUserIds: participantUserIDs,
                         state: state
                     ),
-                    expectedCallID: callID,
+                    expectedContext: expectedContext,
                     invitedRecipientID: recipientUserID,
                     currentUserID: currentUserID
                 )
@@ -4254,6 +4266,16 @@ final class CallLifecycleTests: XCTestCase {
             ),
             callDTO(
                 id: callID,
+                participantUserIds: [recipientUserID],
+                state: "active"
+            ),
+            callDTO(
+                id: callID,
+                participantUserIds: [currentUserID, peerUserID, recipientUserID],
+                state: "active"
+            ),
+            callDTO(
+                id: callID,
                 participantUserIds: (1 ... 20).map(participantID) + [recipientUserID],
                 state: "active"
             ),
@@ -4263,7 +4285,7 @@ final class CallLifecycleTests: XCTestCase {
             XCTAssertFalse(
                 ActiveCallInvitationPolicy.accepts(
                     response: response,
-                    expectedCallID: callID,
+                    expectedContext: expectedContext,
                     invitedRecipientID: recipientUserID,
                     currentUserID: currentUserID
                 )
@@ -4323,6 +4345,16 @@ final class CallLifecycleTests: XCTestCase {
         let peerUserID = "20000000-0000-4000-8000-000000000001"
         let waitingUserID = "20000000-0000-4000-8000-000000000002"
         let callID = "30000000-0000-4000-8000-000000000001"
+        let expectedContext = ActiveCallInvitationContext(
+            call: record(
+                id: callID,
+                state: .active,
+                offset: 1,
+                participantUserIds: [peerUserID]
+            ),
+            callID: callID,
+            participantUserIDs: Set([currentUserID, peerUserID])
+        )
 
         XCTAssertTrue(
             WaitingCallMergeInvitationReconciliationPolicy.accepts(
@@ -4331,7 +4363,7 @@ final class CallLifecycleTests: XCTestCase {
                     participantUserIds: [peerUserID, waitingUserID.uppercased()],
                     state: "active"
                 ),
-                expectedCallID: callID,
+                expectedContext: expectedContext,
                 invitedRecipientID: waitingUserID,
                 currentUserID: currentUserID
             )
@@ -4343,7 +4375,7 @@ final class CallLifecycleTests: XCTestCase {
                     participantUserIds: [peerUserID, waitingUserID],
                     state: "ringing"
                 ),
-                expectedCallID: callID,
+                expectedContext: expectedContext,
                 invitedRecipientID: waitingUserID,
                 currentUserID: currentUserID
             )
@@ -4355,7 +4387,19 @@ final class CallLifecycleTests: XCTestCase {
                     participantUserIds: [peerUserID],
                     state: "active"
                 ),
-                expectedCallID: callID,
+                expectedContext: expectedContext,
+                invitedRecipientID: waitingUserID,
+                currentUserID: currentUserID
+            )
+        )
+        XCTAssertFalse(
+            WaitingCallMergeInvitationReconciliationPolicy.accepts(
+                response: callDTO(
+                    id: callID,
+                    participantUserIds: [waitingUserID],
+                    state: "active"
+                ),
+                expectedContext: expectedContext,
                 invitedRecipientID: waitingUserID,
                 currentUserID: currentUserID
             )
@@ -5099,5 +5143,49 @@ final class TransientTransportErrorPolicyTests: XCTestCase {
                 isUserInitiated: false
             )
         )
+    }
+
+    /// The call screen's backdrop is the caller's own profile photo, blurred. Portrait photos are
+    /// much taller than they are wide, so filling a phone screen with one means a drawn width far
+    /// greater than the screen's. If that width is ever reported as a layout size, the call screen
+    /// takes it: the name, the avatar and the control bar all shift off the right edge — and only
+    /// once the photo has finished loading, which is what made it look like a loading bug.
+    @MainActor
+    func testACallBackdropPhotoCannotWidenTheScreenItFills() {
+        let screen = CGSize(width: 320, height: 640)
+        let portraitPhoto = solidImage(size: CGSize(width: 1200, height: 1600))
+
+        let backdrop = UIHostingController(
+            rootView: KitFillingBackdrop {
+                Image(uiImage: portraitPhoto)
+                    .resizable()
+                    .scaledToFill()
+                    .blur(radius: 36)
+                    .scaleEffect(1.24)
+            }
+        )
+        XCTAssertEqual(backdrop.sizeThatFits(in: screen), screen)
+
+        // And in the shape the call screen actually uses it: a stack takes the size of its largest
+        // child, so the backdrop has to stay the size of the stack rather than of the photo.
+        let callScreenShape = UIHostingController(
+            rootView: ZStack {
+                Color.black
+                KitFillingBackdrop {
+                    Image(uiImage: portraitPhoto)
+                        .resizable()
+                        .scaledToFill()
+                }
+                Text("Ringing…")
+            }
+        )
+        XCTAssertEqual(callScreenShape.sizeThatFits(in: screen), screen)
+    }
+
+    private func solidImage(size: CGSize) -> UIImage {
+        UIGraphicsImageRenderer(size: size).image { context in
+            UIColor.systemTeal.setFill()
+            context.fill(CGRect(origin: .zero, size: size))
+        }
     }
 }

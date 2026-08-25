@@ -112,14 +112,14 @@ struct ChatBackupSettingsView: View {
                 model.isBackingUpMessages
                     || model.isRestoringMessages
                     || model.isDeletingMessageBackup
-                    || model.appReviewDemoIsActive
+                    || !model.appReviewDemoMutationsAllowed
                     || !model.isOnline
             )
             .opacity(
                 model.isBackingUpMessages
                     || model.isRestoringMessages
                     || model.isDeletingMessageBackup
-                    || model.appReviewDemoIsActive
+                    || !model.appReviewDemoMutationsAllowed
                     || !model.isOnline ? 0.6 : 1
             )
 
@@ -148,7 +148,7 @@ struct ChatBackupSettingsView: View {
                 }
             }
             .pickerStyle(.segmented)
-            .disabled(model.isDeletingMessageBackup || model.appReviewDemoIsActive)
+            .disabled(model.isDeletingMessageBackup || !model.appReviewDemoMutationsAllowed)
 
             Toggle(isOn: Binding(
                 get: { preferences.includesMedia },
@@ -164,7 +164,7 @@ struct ChatBackupSettingsView: View {
                 }
             }
             .tint(KitColor.green)
-            .disabled(model.isDeletingMessageBackup || model.appReviewDemoIsActive)
+            .disabled(model.isDeletingMessageBackup || !model.appReviewDemoMutationsAllowed)
 
             if preferences.frequency != .off {
                 Label(
@@ -231,6 +231,7 @@ struct ChatBackupSettingsView: View {
                     model.isRestoringMessages
                         || model.isBackingUpMessages
                         || model.isDeletingMessageBackup
+                        || !model.appReviewDemoMutationsAllowed
                         || restoreCompleted
                         || !model.isOnline
                 )
@@ -293,6 +294,7 @@ struct ChatBackupSettingsView: View {
                 model.isDeletingMessageBackup
                     || model.isBackingUpMessages
                     || model.isRestoringMessages
+                    || !model.appReviewDemoMutationsAllowed
                     || !model.isOnline
             )
         }

@@ -36,6 +36,9 @@ final class MobileMoneyViewModel: ObservableObject {
     @Published private(set) var isLoading = false
     @Published private(set) var isSubmitting = false
     @Published private(set) var isQuoting = false
+    /// The wallet debit the server refused for want of funds, so the screen can offer a top-up
+    /// instead of only reporting the refusal.
+    @Published var insufficientFundsDebitAmount: String?
     @Published var errorMessage: String?
 
     private let api: APIClient
@@ -613,11 +616,17 @@ final class MobileMoneyViewModel: ObservableObject {
         defer { isSubmitting = false }
 
         do {
+            let requested = KitMoney.formatted(
+                quote.providerAmount, currency: quote.currency, trimZeroFraction: true)
+            let credited = KitMoney.formatted(
+                quote.walletCredit, currency: quote.currency, trimZeroFraction: true)
+            let approvalReason = "Approve a \(requested) mobile money request; "
+                + "\(credited) will reach your Kit Pay wallet"
             let verification = try await authorization(
                 quote.stepUp.purpose,
                 quote.stepUp.authorizationIntent,
                 pin,
-                "Approve a \(quote.currency.code) \(quote.providerAmount) mobile money request; \(quote.currency.code) \(quote.walletCredit) will reach your Kit Pay wallet"
+                approvalReason
             )
             guard !verification.stepUpToken.isEmpty else {
                 throw MobileMoneyFlowError.invalidStepUp
@@ -705,13 +714,22 @@ final class MobileMoneyViewModel: ObservableObject {
 
         isSubmitting = true
         errorMessage = nil
+        insufficientFundsDebitAmount = nil
         defer { isSubmitting = false }
         do {
+            let received = KitMoney.formatted(
+                quote.recipientAmount, currency: quote.currency, trimZeroFraction: true)
+            let debit = KitMoney.formatted(
+                quote.customerDebit, currency: quote.currency, trimZeroFraction: true)
             let approvalReason: String
             if ownership == .myself {
-                approvalReason = "Approve a withdrawal to \(account.network.name) \(account.phoneNumberMasked); \(quote.currency.code) \(quote.recipientAmount) will be received and your Kit Pay wallet debit is \(quote.currency.code) \(quote.customerDebit)"
+                approvalReason = "Approve a withdrawal to \(account.network.name) "
+                    + "\(account.phoneNumberMasked); \(received) will be received "
+                    + "and your Kit Pay wallet debit is \(debit)"
             } else {
-                approvalReason = "Approve sending to \(account.accountName ?? account.label) on \(account.network.name); they receive \(quote.currency.code) \(quote.recipientAmount) and your Kit Pay wallet debit is \(quote.currency.code) \(quote.customerDebit)"
+                let recipient = account.accountName ?? account.label
+                approvalReason = "Approve sending to \(recipient) on \(account.network.name); "
+                    + "they receive \(received) and your Kit Pay wallet debit is \(debit)"
             }
             let verification = try await authorization(
                 quote.stepUp.purpose,
@@ -747,6 +765,9 @@ final class MobileMoneyViewModel: ObservableObject {
             pollOperation(operation.id)
             return true
         } catch {
+            if WalletTopUpPolicy.isInsufficientFunds(error) {
+                insufficientFundsDebitAmount = quote.customerDebit
+            }
             errorMessage = message(for: error)
             return false
         }
@@ -929,6 +950,9 @@ struct MobileMoneyView: View {
     @State private var addingAccount = false
     @State private var flow: MobileMoneyFlow?
     @State private var selectedTransaction: WalletTransaction?
+    /// Built once per directory change: the rows below would otherwise rescan every synced contact
+    /// on each redraw.
+    @State private var contactIndex = BeneficiaryContactIndex()
 
     private var permitted: Bool { app.capabilities?.enablesMobileMoney == true }
     private var supportsPayouts: Bool { model.networks.supportsMobileMoneyPayouts }
@@ -963,6 +987,10 @@ struct MobileMoneyView: View {
             .task(id: "\(permitted)-\(app.isOnline)") {
                 await model.load(permitted: permitted, online: app.isOnline)
             }
+            .onAppear { contactIndex = BeneficiaryContactIndex(contacts: app.contactDirectory) }
+            .onChange(of: app.contactDirectory) { _, contacts in
+                contactIndex = BeneficiaryContactIndex(contacts: contacts)
+            }
             .refreshable { await model.load(permitted: permitted, online: app.isOnline) }
             .sheet(isPresented: $addingAccount) {
                 AddMobileMoneyAccountView(
@@ -982,6 +1010,7 @@ struct MobileMoneyView: View {
                 ) {
                     await app.refresh()
                 }
+                .environmentObject(app)
                 .presentationBackground(.ultraThinMaterial)
             }
             .sheet(item: $selectedTransaction) { transaction in
@@ -1094,10 +1123,7 @@ struct MobileMoneyView: View {
                         )
                     } label: {
                         HStack(spacing: 13) {
-                            Image(systemName: "iphone.gen3")
-                                .foregroundStyle(KitColor.primaryText)
-                                .frame(width: 44, height: 44)
-                                .background(KitColor.paleGreen, in: Circle())
+                            savedAccountAvatar(account)
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(account.label).font(.headline).foregroundStyle(KitColor.primaryText)
                                 Text("\(account.network.name) • \(account.phoneNumberMasked)")
@@ -1120,6 +1146,28 @@ struct MobileMoneyView: View {
                     .buttonStyle(.plain)
                 }
             }
+        }
+    }
+
+    /// A saved mobile-money number is a phone number, so when it belongs to someone who is already
+    /// on Kit Pay the row shows their photo. The network and masked number below it are unchanged.
+    @ViewBuilder
+    private func savedAccountAvatar(_ account: MobileMoneyAccountDTO) -> some View {
+        if let contact = contactIndex.contact(
+            forMaskedPhone: account.phoneNumberMasked,
+            accountName: account.accountName ?? account.label
+        ) {
+            RemoteAvatarView(
+                name: contact.name,
+                avatarURL: contact.avatarURL,
+                size: 44,
+                ringOpacity: nil
+            )
+        } else {
+            Image(systemName: "iphone.gen3")
+                .foregroundStyle(KitColor.primaryText)
+                .frame(width: 44, height: 44)
+                .background(KitColor.paleGreen, in: Circle())
         }
     }
 
@@ -1169,7 +1217,7 @@ struct MobileMoneyView: View {
                             }
                             Spacer()
                             VStack(alignment: .trailing, spacing: 3) {
-                                Text("\(operation.currency.code) \(operation.amount)").font(.subheadline.bold())
+                                Text(KitMoney.formatted(operation.amount, currency: operation.currency)).font(.subheadline.bold())
                                 Text(operation.isSuccessful ? "Completed" : operation.isTerminal ? "Failed" : "Processing")
                                     .font(.caption2.bold())
                                     .foregroundStyle(operation.isSuccessful ? KitColor.green : operation.isTerminal ? .red : .orange)
@@ -1282,6 +1330,7 @@ private struct MobileMoneySavedAccountDetailView: View {
                 await app.refresh()
                 await refreshFromServer()
             }
+            .environmentObject(app)
             .presentationBackground(.ultraThinMaterial)
         }
         .sheet(item: $selectedTransaction) { transaction in
@@ -1716,14 +1765,7 @@ private struct MobileMoneySavedAccountDetailView: View {
     }
 
     private func displayAmount(_ amount: String, currency: CurrencyDTO) -> String {
-        let grouped = PaymentInputFormatting.trimmingZeroFraction(
-            PaymentInputFormatting.groupedDecimalInput(
-                amount,
-                maximumFractionDigits: currency.decimalScale
-            ),
-            maximumFractionDigits: currency.decimalScale
-        )
-        return "\(currency.code) \(grouped)"
+        KitMoney.formatted(amount, currency: currency, trimZeroFraction: true)
     }
 
     private func customerMessage(for error: Error) -> String {
@@ -1732,7 +1774,9 @@ private struct MobileMoneySavedAccountDetailView: View {
     }
 }
 
-private struct AddMobileMoneyAccountView: View {
+/// Also reached from the top-up sheet, where a customer who is short on balance may have no
+/// verified number saved yet.
+struct AddMobileMoneyAccountView: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var model: MobileMoneyViewModel
     let permitted: Bool
@@ -1818,7 +1862,9 @@ private struct AddMobileMoneyAccountView: View {
     }
 }
 
-private struct MobileMoneyOperationView: View {
+/// Also reached from the top-up sheet, which drives the collection half of this screen with the
+/// amount a blocked payment is short by.
+struct MobileMoneyOperationView: View {
     @EnvironmentObject private var app: AppModel
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var model: MobileMoneyViewModel
@@ -1827,6 +1873,9 @@ private struct MobileMoneyOperationView: View {
     let permitted: Bool
     let online: Bool
     private let boundInitialAccountID: String?
+    /// Explains, at the top of the form, why the customer was sent here — the payment they were
+    /// approving is short by this much.
+    private let notice: String?
     let completed: () async -> Void
     @State private var accountID = ""
     @State private var networkCode = ""
@@ -1838,6 +1887,11 @@ private struct MobileMoneyOperationView: View {
     @State private var pin = ""
     @State private var receiveFullAmount = false
     @State private var selectedPayoutFeeMode: MobileMoneyPayoutFeeMode = .senderAbsorbs
+    /// Non-nil while the customer is topping up to cover this payout.
+    @State private var topUpRequest: WalletTopUpRequirement?
+    /// Bumped after a top-up: the payout quote this screen was holding has expired by then, and
+    /// the customer should not have to retype the amount to get a fresh one.
+    @State private var quoteReloadToken = 0
 
     init(
         model: MobileMoneyViewModel,
@@ -1846,6 +1900,12 @@ private struct MobileMoneyOperationView: View {
         permitted: Bool,
         online: Bool,
         initialAccountID: String? = nil,
+        initialAmount: String? = nil,
+        /// Collections default to absorbing the transaction fee out of the amount requested. A
+        /// top-up cannot: the wallet has to be credited the full shortfall or the payment that
+        /// sent the customer here fails again, a fee short.
+        initialReceiveFullAmount: Bool = false,
+        notice: String? = nil,
         completed: @escaping () async -> Void
     ) {
         self.model = model
@@ -1853,9 +1913,16 @@ private struct MobileMoneyOperationView: View {
         self.wallet = wallet
         self.permitted = permitted
         self.online = online
+        self.notice = notice
         let boundAccountID = initialAccountID?.trimmingCharacters(
             in: .whitespacesAndNewlines
         ) ?? ""
+        _amount = State(
+            initialValue: initialAmount?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        )
+        _receiveFullAmount = State(
+            initialValue: flow == .addMoney && initialReceiveFullAmount
+        )
         boundInitialAccountID = boundAccountID.isEmpty ? nil : boundAccountID
         self.completed = completed
         _accountID = State(initialValue: flow == .addMoney ? boundAccountID : "")
@@ -1925,7 +1992,26 @@ private struct MobileMoneyOperationView: View {
             action == .collection ? feeMode.rawValue : payoutFeeMode.rawValue,
             permitted.description,
             online.description,
+            String(quoteReloadToken),
         ].joined(separator: "|")
+    }
+
+    /// The wallet as it stands now, not as it stood when this screen was presented — a top-up
+    /// lands while this sheet is open.
+    private var currentWallet: Wallet? {
+        guard let wallet else { return nil }
+        return app.state.wallets.first { $0.id == wallet.id } ?? wallet
+    }
+
+    /// Payouts debit the wallet, collections credit it, so only a payout can be short. The quote's
+    /// customer debit is the number that matters: an amount the balance covers can still fail once
+    /// the transaction fee is added.
+    private var topUpRequirement: WalletTopUpRequirement? {
+        guard action == .payout, let quote = currentPayoutQuote else { return nil }
+        return WalletTopUpPolicy.requirement(
+            wallet: currentWallet,
+            debitAPIAmount: quote.customerDebit
+        )
     }
 
     private var currentQuote: MobileMoneyCollectionQuoteDTO? {
@@ -1984,6 +2070,19 @@ private struct MobileMoneyOperationView: View {
     var body: some View {
         NavigationStack {
             Form {
+                if let notice {
+                    Section {
+                        Label {
+                            Text(notice)
+                                .font(.footnote)
+                                .foregroundStyle(KitColor.primaryText)
+                                .fixedSize(horizontal: false, vertical: true)
+                        } icon: {
+                            Image(systemName: "exclamationmark.circle.fill")
+                                .foregroundStyle(.orange)
+                        }
+                    }
+                }
                 if action == .collection {
                     Section("From mobile money") {
                         Picker("Account", selection: $accountID) {
@@ -2003,26 +2102,17 @@ private struct MobileMoneyOperationView: View {
                 Section("Amount") {
                     HStack {
                         Text(wallet?.currency.code ?? "UGX").bold()
-                        TextField("0", text: Binding(
-                            get: {
-                                action == .collection
-                                    ? PaymentInputFormatting.groupedDecimalInput(
-                                        amount,
-                                        maximumFractionDigits: wallet?.currency.decimalScale ?? 2
-                                    )
-                                    : PaymentInputFormatting.groupedWholeInput(amount)
-                            },
-                            set: { value in
-                                amount = action == .collection
-                                    ? PaymentInputFormatting.normalizedDecimalInput(
-                                        value,
-                                        maximumFractionDigits: wallet?.currency.decimalScale ?? 2
-                                    )
-                                    : PaymentInputFormatting.normalizedWholeInput(value)
-                            }
-                        ))
-                        .keyboardType(action == .collection ? .decimalPad : .numberPad)
-                        .font(.body.monospacedDigit())
+                        KitAmountTextField(
+                            "0",
+                            value: $amount,
+                            mode: action == .collection
+                                ? .decimal(
+                                    maximumFractionDigits:
+                                        wallet?.currency.decimalScale ?? 2
+                                )
+                                : .whole,
+                            textStyle: .monospacedBody
+                        )
                     }
                     Text("The exact amount and transaction fee are shown before approval.")
                         .font(.caption).foregroundStyle(.secondary)
@@ -2104,6 +2194,13 @@ private struct MobileMoneyOperationView: View {
 
                     outboundReviewSection
                 }
+                if let requirement = topUpRequirement {
+                    Section {
+                        WalletShortfallNotice(requirement: requirement) {
+                            topUpRequest = requirement
+                        }
+                    }
+                }
                 Section("Approve") {
                     if app.financialApprovalUsesBiometrics {
                         Label {
@@ -2174,6 +2271,8 @@ private struct MobileMoneyOperationView: View {
                             if succeeded {
                                 await completed()
                                 dismiss()
+                            } else {
+                                await offerTopUpIfServerFoundBalanceShort()
                             }
                         }
                     } label: {
@@ -2198,6 +2297,7 @@ private struct MobileMoneyOperationView: View {
                             || (action == .collection && accountID.isEmpty)
                             || (action == .collection && currentQuote == nil)
                             || (action == .payout && (selectedAccount == nil || currentPayoutQuote == nil))
+                            || topUpRequirement != nil
                             || (!app.financialApprovalUsesBiometrics && pin.count != 4)
                     )
                 }
@@ -2290,7 +2390,31 @@ private struct MobileMoneyOperationView: View {
                 model.clearPayoutQuote()
                 model.resetPayoutLookup()
             }
+            .sheet(item: $topUpRequest) { requirement in
+                WalletTopUpView(requirement: requirement) { covered in
+                    guard covered else { return }
+                    // The quote held here expired while the top-up was in flight; a fresh one is
+                    // fetched so the customer returns to a ready approval, not an empty review.
+                    quoteReloadToken += 1
+                }
+                .environmentObject(app)
+                .presentationBackground(.ultraThinMaterial)
+            }
         }
+    }
+
+    /// The balance on the device can be a moment behind the ledger. When the server is the one to
+    /// find it short, the same top-up is offered rather than a bare refusal.
+    @MainActor
+    private func offerTopUpIfServerFoundBalanceShort() async {
+        guard let debit = model.insufficientFundsDebitAmount else { return }
+        model.insufficientFundsDebitAmount = nil
+        await app.refresh()
+        guard let requirement = WalletTopUpPolicy.requirement(
+            wallet: currentWallet,
+            debitAPIAmount: debit
+        ) else { return }
+        topUpRequest = requirement
     }
 
     @ViewBuilder
@@ -2581,12 +2705,7 @@ private struct MobileMoneyOperationView: View {
     }
 
     private func displayAmount(_ amount: String, currency: CurrencyDTO) -> String {
-        let scale = Int(currency.scale) ?? 2
-        let grouped = PaymentInputFormatting.trimmingZeroFraction(
-            PaymentInputFormatting.groupedDecimalInput(amount, maximumFractionDigits: scale),
-            maximumFractionDigits: scale
-        )
-        return "\(currency.code) \(grouped)"
+        KitMoney.formatted(amount, currency: currency, trimZeroFraction: true)
     }
 
     private func isZero(_ amount: String) -> Bool {

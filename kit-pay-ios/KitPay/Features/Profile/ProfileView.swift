@@ -93,17 +93,24 @@ struct ProfileView: View {
     private var profileHeader: some View {
         HStack(spacing: 18) {
             RemoteAvatarView(
-                name: model.profile?.name ?? "Kit Pay",
+                name: model.profile?.identityDisplayName ?? "Kit Pay",
                 avatarURL: model.profile?.avatarURL,
                 size: 82
             )
             VStack(alignment: .leading, spacing: 5) {
-                Text(model.profile?.name ?? "Kit Pay user")
+                Text(model.profile?.identityDisplayName ?? "Kit Pay user")
                     .font(.title2.bold())
                     .foregroundStyle(KitColor.primaryText)
-                Text(profileSubtitle)
-                    .font(.subheadline)
-                    .foregroundStyle(KitColor.secondaryText)
+                if let legalName = distinctVerifiedLegalName {
+                    Label("Legal name: \(legalName)", systemImage: "checkmark.seal.fill")
+                        .font(.caption)
+                        .foregroundStyle(KitColor.secondaryText)
+                }
+                if !profileSubtitle.isEmpty {
+                    Text(profileSubtitle)
+                        .font(.subheadline)
+                        .foregroundStyle(KitColor.secondaryText)
+                }
                 if kycAvailable {
                     Label(
                         kycLabel,
@@ -117,6 +124,7 @@ struct ProfileView: View {
             GlassIconButton(systemName: "pencil") {
                 showProfileEditor = true
             }
+            .disabled(!model.appReviewDemoMutationsAllowed)
             .accessibilityLabel("Edit profile")
         }
         .padding(18)
@@ -140,8 +148,10 @@ struct ProfileView: View {
         switch row.destination {
         case .editProfile:
             Button { showProfileEditor = true } label: { settingsRow(row) }
+                .disabled(!model.appReviewDemoMutationsAllowed)
         case .profileEmail where profileEmailPresentation.canAttach:
             Button { showProfileEmail = true } label: { settingsRow(row) }
+                .disabled(!model.appReviewDemoMutationsAllowed)
         case .profileEmail:
             settingsRow(row, showsDisclosure: false)
         case .communicationPrivacy:
@@ -162,6 +172,7 @@ struct ProfileView: View {
             NavigationLink(value: ProfileDetailDestination.legalPrivacy) { settingsRow(row) }
         case .accountDeletion:
             NavigationLink(value: ProfileDetailDestination.accountDeletion) { settingsRow(row) }
+                .disabled(!model.appReviewDemoMutationsAllowed)
         }
     }
 
@@ -194,8 +205,18 @@ struct ProfileView: View {
     }
 
     private var profileSubtitle: String {
-        let tag = model.profile?.tag.map { "@\($0)" }
-        return [tag, model.profile?.phone].compactMap { $0 }.joined(separator: " · ")
+        // Only a *chosen* username is public. A provisional `kit_…` tag is an internal handle and
+        // is not shown as though the user picked it.
+        let username = model.profile?.chosenUsername.map { "@\($0)" }
+        return [username, model.profile?.phone].compactMap { $0 }.joined(separator: " · ")
+    }
+
+    /// The verified legal name, but only when it is not already the headline name — repeating it
+    /// under itself would read as a duplicate rather than as a distinction.
+    private var distinctVerifiedLegalName: String? {
+        guard let legalName = model.profile?.verifiedLegalName else { return nil }
+        let headline = model.profile?.identityDisplayName ?? ""
+        return headline.caseInsensitiveCompare(legalName) == .orderedSame ? nil : legalName
     }
 
     private var kycVerified: Bool {
@@ -217,7 +238,7 @@ struct ProfileView: View {
     }
 
     private var kycAvailable: Bool {
-        model.capabilities?.features?["kyc"] == true
+        model.capabilities?.supportsFeature("kyc") == true
     }
 
     private var identityVerificationTitle: String {
@@ -335,6 +356,23 @@ private struct ProfileEditorView: View {
             : "Change photo"
     }
 
+    private var verifiedLegalName: String? { model.profile?.verifiedLegalName }
+
+    private var usernameIsOptional: Bool { model.profile?.usernameRequired == false }
+
+    private var chosenIdentityFooter: String {
+        switch (verifiedLegalName != nil, usernameIsOptional) {
+        case (true, true):
+            "Both are optional. Leave the display name empty to be shown as your legal name, and leave the username empty if you would rather not be findable by @handle."
+        case (true, false):
+            "Your display name is optional — leave it empty to be shown as your legal name. Your username is the public @handle people use to find you."
+        case (false, true):
+            "Your display name is visible to people who pay, message, or call you. A username is an optional public @handle."
+        case (false, false):
+            "Your display name and username are visible to people who pay, message, or call you."
+        }
+    }
+
     var body: some View {
         NavigationStack {
             Form {
@@ -349,7 +387,9 @@ private struct ProfileEditorView: View {
                                     .clipShape(Circle())
                             } else {
                                 RemoteAvatarView(
-                                    name: name.isEmpty ? (model.profile?.name ?? "Kit Pay") : name,
+                                    name: name.isEmpty
+                                        ? (model.profile?.identityDisplayName ?? "Kit Pay")
+                                        : name,
                                     avatarURL: model.profile?.avatarURL,
                                     size: 112
                                 )
@@ -403,15 +443,34 @@ private struct ProfileEditorView: View {
                     Text("Kit Pay crops your photo to a square and optimizes it for fast loading before upload.")
                 }
 
+                if let verifiedLegalName {
+                    Section {
+                        LabeledContent {
+                            Image(systemName: "lock.fill")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .accessibilityHidden(true)
+                        } label: {
+                            Text(verifiedLegalName)
+                                .foregroundStyle(KitColor.primaryText)
+                        }
+                    } header: {
+                        Label("Verified legal name", systemImage: "checkmark.seal.fill")
+                            .foregroundStyle(KitColor.green)
+                    } footer: {
+                        Text("Taken from your verified ID. Kit Pay uses it for payments and security checks. To change it, verify your identity again with an updated document.")
+                    }
+                }
+
                 Section {
-                    TextField("Username / display name", text: $name)
+                    TextField(verifiedLegalName ?? "Display name", text: $name)
                         .textContentType(.name)
                         .textInputAutocapitalization(.words)
                         .autocorrectionDisabled()
                         .onChange(of: name) { _, _ in validationError = nil }
                     HStack(spacing: 4) {
                         Text("@").foregroundStyle(.secondary)
-                        TextField("unique_tag", text: $tag)
+                        TextField("username", text: $tag)
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
                             .onChange(of: tag) { _, value in
@@ -421,9 +480,9 @@ private struct ProfileEditorView: View {
                             }
                     }
                 } header: {
-                    Text("Profile")
+                    Text(verifiedLegalName == nil ? "Profile" : "Chosen identity")
                 } footer: {
-                    Text("Your name and unique tag are visible to people who pay, message, or call you.")
+                    Text(chosenIdentityFooter)
                 }
 
                 if let validationError {
@@ -450,7 +509,12 @@ private struct ProfileEditorView: View {
                             Text("Save")
                         }
                     }
-                    .disabled(model.isUpdatingProfile || isSaving || isPreparingPhoto)
+                    .disabled(
+                        !model.appReviewDemoMutationsAllowed
+                            || model.isUpdatingProfile
+                            || isSaving
+                            || isPreparingPhoto
+                    )
                 }
             }
             .interactiveDismissDisabled(model.isUpdatingProfile || isSaving)
@@ -473,8 +537,13 @@ private struct ProfileEditorView: View {
 
     private func initialize() {
         guard !initialized else { return }
-        name = normalizeProfileName(model.profile?.name ?? "")
-        tag = normalizeProfileTag(model.profile?.tag ?? "")
+        // A display name that merely echoes the verified legal name is not a chosen name; showing
+        // the field empty keeps "shown as my legal name" as the visible default.
+        let storedName = normalizeProfileName(model.profile?.name ?? "")
+        name = storedName.caseInsensitiveCompare(verifiedLegalName ?? "") == .orderedSame
+            ? ""
+            : storedName
+        tag = model.profile?.chosenUsername ?? ""
         initialized = true
     }
 
@@ -482,7 +551,12 @@ private struct ProfileEditorView: View {
         guard !isSaving, !model.isUpdatingProfile else { return }
         let normalizedName = normalizeProfileName(name)
         let normalizedTag = normalizeProfileTag(tag)
-        if let error = profileIdentityValidationError(name: normalizedName, tag: normalizedTag) {
+        if let error = profileIdentityValidationError(
+            name: normalizedName,
+            tag: normalizedTag,
+            verifiedLegalName: verifiedLegalName,
+            usernameRequired: !usernameIsOptional
+        ) {
             validationError = error
             return
         }
@@ -492,8 +566,8 @@ private struct ProfileEditorView: View {
         Task {
             defer { isSaving = false }
             if await model.updateProfile(
-                name: normalizedName,
-                tag: normalizedTag,
+                name: normalizedName.isEmpty ? nil : normalizedName,
+                tag: normalizedTag.isEmpty ? nil : normalizedTag,
                 avatarJPEG: preparedAvatarJPEG
             ) {
                 dismiss()
@@ -587,7 +661,7 @@ enum ProfileAvatarImagePreparer {
     }
 }
 
-private enum ProfileAvatarImageError: LocalizedError {
+enum ProfileAvatarImageError: LocalizedError {
     case invalidImage
 
     var errorDescription: String? {
