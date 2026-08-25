@@ -499,6 +499,7 @@ struct MessagesView: View {
                 chatRowContent(conversation, context: context)
             }
             .buttonStyle(.plain)
+            .disabled(model.isReadOnlyAppReviewDemoConversation(conversation.id))
             .accessibilityAddTraits(context.isSelected ? .isSelected : [])
         } else {
             NavigationLink(value: conversation) {
@@ -506,42 +507,46 @@ struct MessagesView: View {
             }
             .buttonStyle(.plain)
             .contextMenu {
-                Button {
-                    Task { await model.togglePinnedConversation(conversation.id) }
-                } label: {
-                    Label(
-                        context.isPinned ? "Unpin" : "Pin",
-                        systemImage: context.isPinned ? "pin.slash" : "pin"
-                    )
-                }
-                if conversation.unreadCount > 0 {
+                if model.isReadOnlyAppReviewDemoConversation(conversation.id) {
+                    Label("Read-only App Review preview", systemImage: "eye.fill")
+                } else {
                     Button {
-                        Task { await model.markConversationsRead([conversation.id]) }
+                        Task { await model.togglePinnedConversation(conversation.id) }
                     } label: {
-                        Label("Mark as read", systemImage: "checkmark.message")
+                        Label(
+                            context.isPinned ? "Unpin" : "Pin",
+                            systemImage: context.isPinned ? "pin.slash" : "pin"
+                        )
                     }
-                }
-                Button {
-                    Task { await model.toggleMutedConversation(conversation.id) }
-                } label: {
-                    Label(
-                        context.isMuted ? "Unmute" : "Mute",
-                        systemImage: context.isMuted ? "bell" : "bell.slash"
-                    )
-                }
-                Button {
-                    withAnimation(.snappy(duration: 0.22)) {
-                        isSelectingChats = true
-                        selectedConversationIDs = [conversation.id]
+                    if conversation.unreadCount > 0 {
+                        Button {
+                            Task { await model.markConversationsRead([conversation.id]) }
+                        } label: {
+                            Label("Mark as read", systemImage: "checkmark.message")
+                        }
                     }
-                } label: {
-                    Label("Select", systemImage: "checkmark.circle")
-                }
-                Divider()
-                Button(role: .destructive) {
-                    confirmDeleteConversationIDs = [conversation.id]
-                } label: {
-                    Label("Delete chat", systemImage: "trash")
+                    Button {
+                        Task { await model.toggleMutedConversation(conversation.id) }
+                    } label: {
+                        Label(
+                            context.isMuted ? "Unmute" : "Mute",
+                            systemImage: context.isMuted ? "bell" : "bell.slash"
+                        )
+                    }
+                    Button {
+                        withAnimation(.snappy(duration: 0.22)) {
+                            isSelectingChats = true
+                            selectedConversationIDs = [conversation.id]
+                        }
+                    } label: {
+                        Label("Select", systemImage: "checkmark.circle")
+                    }
+                    Divider()
+                    Button(role: .destructive) {
+                        confirmDeleteConversationIDs = [conversation.id]
+                    } label: {
+                        Label("Delete chat", systemImage: "trash")
+                    }
                 }
             }
         }
@@ -568,6 +573,12 @@ struct MessagesView: View {
                         .font(.body.weight(.semibold))
                         .foregroundStyle(KitColor.navy)
                         .lineLimit(1)
+                    if model.isReadOnlyAppReviewDemoConversation(conversation.id) {
+                        Image(systemName: "eye.fill")
+                            .font(.caption2)
+                            .foregroundStyle(KitColor.secondaryText)
+                            .accessibilityLabel("Read-only App Review preview")
+                    }
                     if context.isMuted {
                         Image(systemName: "bell.slash.fill")
                             .font(.caption2)
@@ -745,6 +756,7 @@ struct MessagesView: View {
     }
 
     private func toggleChatSelection(_ conversationID: String) {
+        guard !model.isReadOnlyAppReviewDemoConversation(conversationID) else { return }
         if selectedConversationIDs.contains(conversationID) {
             selectedConversationIDs.remove(conversationID)
         } else {
@@ -820,17 +832,19 @@ struct MessagesView: View {
 }
 
 private func chatListTimestamp(_ date: Date) -> String {
-    let calendar = Calendar.current
-    if calendar.isDateInToday(date) {
-        return date.formatted(date: .omitted, time: .shortened)
+    let calendar = AppPresentationClock.calendar
+    let now = AppPresentationClock.now
+    if calendar.isDate(date, inSameDayAs: now) {
+        return AppPresentationClock.shortTime(date)
     }
-    if calendar.isDateInYesterday(date) {
+    if let yesterday = calendar.date(byAdding: .day, value: -1, to: now),
+       calendar.isDate(date, inSameDayAs: yesterday) {
         return "Yesterday"
     }
-    if let weekAgo = calendar.date(byAdding: .day, value: -6, to: Date()), date >= weekAgo {
-        return date.formatted(.dateTime.weekday(.abbreviated))
+    if let weekAgo = calendar.date(byAdding: .day, value: -6, to: now), date >= weekAgo {
+        return AppPresentationClock.abbreviatedWeekday(date)
     }
-    return date.formatted(date: .numeric, time: .omitted)
+    return AppPresentationClock.numericDate(date)
 }
 
 // MARK: - Global search
@@ -1116,7 +1130,7 @@ private struct MessageGlobalSearchView: View {
                     .lineLimit(1)
             }
             Spacer(minLength: 8)
-            Text(hit.conversation.updatedAt.formatted(date: .abbreviated, time: .omitted))
+            Text(AppPresentationClock.abbreviatedDate(hit.conversation.updatedAt))
                 .font(.caption)
                 .foregroundStyle(KitColor.secondaryText)
         }
@@ -1139,7 +1153,7 @@ private struct MessageGlobalSearchView: View {
                         .foregroundStyle(.primary)
                         .lineLimit(1)
                     Spacer(minLength: 4)
-                    Text(hit.message.createdAt.formatted(date: .abbreviated, time: .omitted))
+                    Text(AppPresentationClock.abbreviatedDate(hit.message.createdAt))
                         .font(.caption)
                         .foregroundStyle(KitColor.secondaryText)
                 }
@@ -1276,12 +1290,14 @@ struct ConversationView: View {
     @State private var isLoadingAttachment = false
     @State private var attachmentLoadGeneration = 0
     @State private var isSending = false
+    @State private var retryingMessageIDs: Set<UUID> = []
     @State private var didRestoreDraft = false
     @State private var draftWriteVersion: ConversationDraftWriteVersion?
     @State private var immediateDraftPersistenceTask: Task<Void, Never>?
     @State private var showPaymentRequest = false
     @State private var showSendMoney = false
     @State private var showContactProfile = false
+    @State private var abuseReportTarget: AbuseReportTarget?
     @State private var chatPaymentApproval: ChatPaymentApproval?
     @State private var resolvingPaymentRequestID: String?
     @State private var showCameraCapture = false
@@ -1337,9 +1353,9 @@ struct ConversationView: View {
             currentUserID: model.profile?.id,
             messages: messages,
             calls: model.state.calls,
-            dateSeparatorsRelativeTo: Date(),
-            calendar: .autoupdatingCurrent,
-            locale: .autoupdatingCurrent
+            dateSeparatorsRelativeTo: AppPresentationClock.now,
+            calendar: AppPresentationClock.calendar,
+            locale: AppPresentationClock.locale
         )
     }
 
@@ -1378,8 +1394,25 @@ struct ConversationView: View {
         model.isCommunicationBlocked(userID: recipientUserID)
     }
 
+    private var abuseReportContext: AbuseReportContext? {
+        AbuseReportContext(
+            currentUserID: model.profile?.id,
+            reportedUserID: recipientUserID,
+            conversation: conversation
+        )
+    }
+
+    private var abuseReportingAvailable: Bool {
+        AbuseReportContract.isAvailable(features: model.capabilities?.features)
+            && abuseReportContext != nil
+    }
+
     private var recipientCommunicationAllowed: Bool {
         model.communicationPrivacyAllowsOutbound(to: recipientUserID)
+    }
+
+    private var isReadOnlyAppReviewPreview: Bool {
+        model.isReadOnlyAppReviewDemoConversation(conversation.id)
     }
 
     private var trimmedDraft: String {
@@ -1392,7 +1425,8 @@ struct ConversationView: View {
 
     private var canSendMessage: Bool {
         let hasAttachment = !stagedAttachments.isEmpty
-        return model.secureMessagingAvailable
+        return !isReadOnlyAppReviewPreview
+            && model.secureMessagingAvailable
             && recipientCommunicationAllowed
             && !isSending
             && !isLoadingAttachment
@@ -1400,7 +1434,7 @@ struct ConversationView: View {
     }
 
     private var cameraPullIsEligible: Bool {
-        ConversationCameraPullPolicy.isEligible(
+        !isReadOnlyAppReviewPreview && ConversationCameraPullPolicy.isEligible(
             contentHeight: conversationContentHeight,
             viewportHeight: conversationViewportHeight,
             isSelectingMessages: isSelectingMessages,
@@ -1412,7 +1446,7 @@ struct ConversationView: View {
 
     private var paymentRequestPolicy: PaymentRequestPolicy {
         PaymentRequestPolicy(
-            features: model.capabilities?.features,
+            features: isReadOnlyAppReviewPreview ? nil : model.capabilities?.features,
             currentUserId: model.profile?.id,
             ownedWalletIds: Set(model.state.wallets.map(\.id))
         )
@@ -1448,7 +1482,8 @@ struct ConversationView: View {
     }
 
     private var transferAcceptanceEnabled: Bool {
-        TransferAcceptancePolicy(features: model.capabilities?.features).acceptanceEnabled
+        !isReadOnlyAppReviewPreview
+            && TransferAcceptancePolicy(features: model.capabilities?.features).acceptanceEnabled
     }
 
     /// Reloads transfer-acceptance authority whenever the set of transfer events changes (a new
@@ -1598,7 +1633,9 @@ struct ConversationView: View {
             }
             .background(chatBackground)
 
-            if isSelectingMessages {
+            if isReadOnlyAppReviewPreview {
+                appReviewReadOnlyFooter
+            } else if isSelectingMessages {
                 messageSelectionBar
             } else if isSearchingMessages {
                 messageSearchBar
@@ -1707,7 +1744,9 @@ struct ConversationView: View {
                 contact: recipientContact,
                 avatarURL: recipientPresentation.avatarURL,
                 userID: recipientUserID,
-                conversationID: conversation.id,
+                conversation: conversation,
+                messages: messages,
+                isReadOnlyPreview: isReadOnlyAppReviewPreview,
                 startAudioCall: { queueCall(video: false) },
                 startVideoCall: { queueCall(video: true) },
                 searchChat: {
@@ -1728,6 +1767,20 @@ struct ConversationView: View {
                 }
             )
             .presentationBackground(.ultraThinMaterial)
+        }
+        .sheet(item: $abuseReportTarget) { target in
+            if let context = abuseReportContext {
+                NavigationStack {
+                    AbuseReportView(
+                        reportedName: recipientDisplayName,
+                        context: context,
+                        target: target,
+                        messages: messages
+                    )
+                    .environmentObject(model)
+                }
+                .presentationBackground(.ultraThinMaterial)
+            }
         }
         .fullScreenCover(item: $galleryTarget) { target in
             KitMediaGalleryView(
@@ -1872,10 +1925,12 @@ struct ConversationView: View {
         )
         return conversationDeleteConfirmation
         .task(id: messages.last?.serverMessageId) {
+            guard !isReadOnlyAppReviewPreview else { return }
             await model.markConversationRead(conversation.id)
         }
         .task(id: incomingPaymentRequestLoadID) {
-            guard paymentRecipientUserID != nil,
+            guard !isReadOnlyAppReviewPreview,
+                  paymentRecipientUserID != nil,
                   model.isOnline,
                   !paymentRequestEvents.isEmpty
             else { return }
@@ -1883,7 +1938,8 @@ struct ConversationView: View {
             validateLoadedChatPaymentRequests()
         }
         .task(id: transferEventLoadID) {
-            guard paymentRecipientUserID != nil,
+            guard !isReadOnlyAppReviewPreview,
+                  paymentRecipientUserID != nil,
                   model.isOnline,
                   conversationHasTransferEvents,
                   transferAcceptanceEnabled
@@ -1895,7 +1951,8 @@ struct ConversationView: View {
             await documentObservedAutoReversals()
         }
         .task(id: draftPersistenceTaskKey) {
-            guard draftPersistenceTaskKey.didRestore,
+            guard !isReadOnlyAppReviewPreview,
+                  draftPersistenceTaskKey.didRestore,
                   !draftPersistenceTaskKey.isSending,
                   let writeVersion = draftPersistenceTaskKey.writeVersion
             else { return }
@@ -1916,16 +1973,18 @@ struct ConversationView: View {
     private var conversationLifecycle: some View {
         conversationTasks
         .onAppear {
-            if !didRestoreDraft {
+            if !isReadOnlyAppReviewPreview, !didRestoreDraft {
                 draftWriteVersion = model.nextConversationDraftWriteVersion()
                 draft = model.conversationDraft(for: conversation.id)
                 didRestoreDraft = true
             }
             incomingSoundPolicy.beginVisibility(with: messages)
-            model.setConversationVisible(
-                conversation.id,
-                visible: scenePhase == .active
-            )
+            if !isReadOnlyAppReviewPreview {
+                model.setConversationVisible(
+                    conversation.id,
+                    visible: scenePhase == .active
+                )
+            }
         }
         .onChange(of: messages) { previousMessages, updatedMessages in
             if isSelectingMessages {
@@ -1948,6 +2007,7 @@ struct ConversationView: View {
             }
         }
         .onChange(of: draft) { _, value in
+            guard !isReadOnlyAppReviewPreview else { return }
             immediateDraftPersistenceTask?.cancel()
             immediateDraftPersistenceTask = nil
             let bounded = ConversationDraftPolicy.boundedBody(value)
@@ -1958,6 +2018,7 @@ struct ConversationView: View {
             draftWriteVersion = model.nextConversationDraftWriteVersion()
         }
         .onChange(of: scenePhase) { _, phase in
+            guard !isReadOnlyAppReviewPreview else { return }
             if phase == .active {
                 incomingSoundPolicy.beginVisibility(with: messages)
                 model.setConversationVisible(conversation.id, visible: true)
@@ -1969,12 +2030,14 @@ struct ConversationView: View {
         }
         .onDisappear {
             incomingSoundPolicy.endVisibility()
-            model.setConversationVisible(conversation.id, visible: false)
+            if !isReadOnlyAppReviewPreview {
+                model.setConversationVisible(conversation.id, visible: false)
+            }
             attachmentLoadGeneration &+= 1
             isLoadingAttachment = false
             isComposerFocused = false
             voiceRecorder.cancel()
-            if !isSending { persistDraftImmediately() }
+            if !isReadOnlyAppReviewPreview, !isSending { persistDraftImmediately() }
         }
     }
 
@@ -2057,6 +2120,20 @@ struct ConversationView: View {
     }
 
     // MARK: Composer
+
+    private var appReviewReadOnlyFooter: some View {
+        Label("Read-only App Review preview", systemImage: "eye.fill")
+            .font(.footnote.weight(.semibold))
+            .foregroundStyle(KitColor.secondaryText)
+            .frame(maxWidth: .infinity)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 14)
+            .background(.ultraThinMaterial)
+            .overlay(alignment: .top) {
+                Divider().opacity(0.35).allowsHitTesting(false)
+            }
+            .accessibilityHint("Sample content cannot send messages, payments, or calls")
+    }
 
     @ViewBuilder
     private var composer: some View {
@@ -2580,7 +2657,8 @@ struct ConversationView: View {
                                 Label("Copy", systemImage: "doc.on.doc")
                             }
                         }
-                        if !forwardPayloadItems(for: [message.id]).isEmpty {
+                        if !isReadOnlyAppReviewPreview,
+                           !forwardPayloadItems(for: [message.id]).isEmpty {
                             Button {
                                 forwardItems = forwardPayloadItems(for: [message.id])
                                 showForwardSheet = true
@@ -2588,21 +2666,36 @@ struct ConversationView: View {
                                 Label("Forward", systemImage: "arrowshape.turn.up.right")
                             }
                         }
-                        Button {
-                            withAnimation(.snappy(duration: 0.22)) {
-                                isSelectingMessages = true
-                                selectedMessageIDs = [message.id]
-                                isComposerFocused = false
+                        if !isReadOnlyAppReviewPreview {
+                            Button {
+                                withAnimation(.snappy(duration: 0.22)) {
+                                    isSelectingMessages = true
+                                    selectedMessageIDs = [message.id]
+                                    isComposerFocused = false
+                                }
+                            } label: {
+                                Label("Select", systemImage: "checkmark.circle")
                             }
-                        } label: {
-                            Label("Select", systemImage: "checkmark.circle")
-                        }
-                        Divider()
-                        Button(role: .destructive) {
-                            selectedMessageIDs = [message.id]
-                            showDeleteMessagesConfirmation = true
-                        } label: {
-                            Label("Delete for me", systemImage: "trash")
+                            if abuseReportingAvailable,
+                               let context = abuseReportContext,
+                               let reportTarget = AbuseReportTarget.message(
+                                   message,
+                                   context: context
+                               ) {
+                                Divider()
+                                Button(role: .destructive) {
+                                    abuseReportTarget = reportTarget
+                                } label: {
+                                    Label("Report message", systemImage: "exclamationmark.bubble")
+                                }
+                            }
+                            Divider()
+                            Button(role: .destructive) {
+                                selectedMessageIDs = [message.id]
+                                showDeleteMessagesConfirmation = true
+                            } label: {
+                                Label("Delete for me", systemImage: "trash")
+                            }
                         }
                     }
                 }
@@ -2739,7 +2832,7 @@ struct ConversationView: View {
 
     private func bubbleTimeRow(_ message: LocalMessage) -> some View {
         HStack(spacing: 4) {
-            Text(message.createdAt.formatted(date: .omitted, time: .shortened))
+            Text(AppPresentationClock.shortTime(message.createdAt))
             if message.isOutgoing { Image(systemName: deliveryIcon(message.state)) }
         }
         .font(.caption2)
@@ -2823,16 +2916,21 @@ struct ConversationView: View {
 
     private func messageMetadata(_ message: LocalMessage) -> some View {
         HStack(spacing: 4) {
-            Text(message.createdAt.formatted(date: .omitted, time: .shortened))
+            Text(AppPresentationClock.shortTime(message.createdAt))
             if message.isOutgoing,
                message.state == .failed,
-               model.canRetryMessage(message.id) {
+               model.canRetryMessage(
+                   message.id,
+                   conversationID: conversation.id,
+                   recipientUserID: recipientUserID
+               ) {
                 Button {
-                    Task { await model.retryFailedMessage(message.id) }
+                    retryFailedMessage(message)
                 } label: {
                     Image(systemName: deliveryIcon(message.state))
                 }
                 .buttonStyle(.plain)
+                .disabled(retryingMessageIDs.contains(message.id))
                 .accessibilityLabel("Retry sending message")
                 .accessibilityHint(message.failureReason ?? "Attempts this message again")
             } else if message.isOutgoing {
@@ -2841,6 +2939,18 @@ struct ConversationView: View {
         }
         .font(.caption2)
         .foregroundStyle(message.isOutgoing ? .white.opacity(0.72) : .secondary)
+    }
+
+    private func retryFailedMessage(_ message: LocalMessage) {
+        guard retryingMessageIDs.insert(message.id).inserted else { return }
+        Task { @MainActor in
+            await model.retryFailedMessage(
+                message.id,
+                conversationID: conversation.id,
+                recipientUserID: recipientUserID
+            )
+            retryingMessageIDs.remove(message.id)
+        }
     }
 
     private func dateSeparator(_ separator: ConversationTimelineDateSeparator) -> some View {
@@ -3294,6 +3404,7 @@ struct ConversationView: View {
     private func callBubble(_ call: CallRecord) -> some View {
         let presentation = ConversationCallPresentationPolicy.presentation(for: call)
         let callbackAvailable = presentation.callbackEnabled
+            && !isReadOnlyAppReviewPreview
             && model.mayCreateCall
             && recipientUserID != nil
             && recipientCommunicationAllowed
@@ -3403,7 +3514,7 @@ struct ConversationView: View {
     ) -> String {
         var values: [String] = []
         if let status = presentation.statusText { values.append(status) }
-        values.append(call.startedAt.formatted(date: .omitted, time: .shortened))
+        values.append(AppPresentationClock.shortTime(call.startedAt))
         if let duration = presentation.durationSeconds, duration > 0 {
             values.append(ConversationCallPresentationPolicy.durationText(duration))
         }
@@ -3411,6 +3522,10 @@ struct ConversationView: View {
     }
 
     private func queueCall(video: Bool) {
+        guard !isReadOnlyAppReviewPreview else {
+            model.lastError = "This App Review preview is read-only."
+            return
+        }
         guard let recipientUserID else {
             model.lastError = "This conversation does not have one unambiguous Kit Pay recipient."
             return
@@ -3446,14 +3561,15 @@ struct ConversationView: View {
                 )
         }
         .buttonStyle(.plain)
-        .disabled(!recipientCommunicationAllowed)
-        .opacity(recipientCommunicationAllowed ? 1 : 0.48)
+        .disabled(isReadOnlyAppReviewPreview || !recipientCommunicationAllowed)
+        .opacity(isReadOnlyAppReviewPreview || !recipientCommunicationAllowed ? 0.48 : 1)
         .accessibilityLabel(video ? "Video call" : "Audio call")
     }
 
     // MARK: Sending
 
     private func sendDraft() {
+        guard !isReadOnlyAppReviewPreview else { return }
         guard canSendMessage else { return }
         let submittedDraft = draft
         let submittedText = submittedDraft.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3582,6 +3698,7 @@ struct ConversationView: View {
     }
 
     private func sendVoiceNote() {
+        guard !isReadOnlyAppReviewPreview else { return }
         guard let recording = voiceRecorder.finish() else { return }
         isSending = true
         Task {
@@ -3608,6 +3725,10 @@ struct ConversationView: View {
     }
 
     private func openPaymentRequest() {
+        guard !isReadOnlyAppReviewPreview else {
+            model.lastError = "This App Review preview is read-only."
+            return
+        }
         guard recipientCommunicationAllowed else {
             model.lastError = recipientIsBlocked
                 ? "Unblock this account before sending a payment request."
@@ -3637,6 +3758,10 @@ struct ConversationView: View {
     /// Opens the standard transfer flow with this chat's recipient already selected, the same
     /// way payment requests start from the conversation.
     private func openSendMoney() {
+        guard !isReadOnlyAppReviewPreview else {
+            model.lastError = "This App Review preview is read-only."
+            return
+        }
         guard recipientCommunicationAllowed else {
             model.lastError = recipientIsBlocked
                 ? "Unblock this account before sending money."
@@ -4136,12 +4261,15 @@ private struct ConversationContactProfileView: View {
     @State private var showSaveContact = false
     @State private var contactWasSaved = false
     @State private var showBlockConfirmation = false
+    @State private var showAbuseReport = false
 
     let name: String
     let contact: WalletContactDTO?
     let avatarURL: String?
     let userID: String?
-    let conversationID: String
+    let conversation: Conversation
+    let messages: [LocalMessage]
+    let isReadOnlyPreview: Bool
     let startAudioCall: () -> Void
     let startVideoCall: () -> Void
     /// Dismisses this sheet and opens the in-chat message search.
@@ -4179,13 +4307,13 @@ private struct ConversationContactProfileView: View {
                         profileAction(
                             title: "Audio",
                             systemName: "phone",
-                            disabled: !communicationAllowed,
+                            disabled: isReadOnlyPreview || !communicationAllowed,
                             action: startAudioCall
                         )
                         profileAction(
                             title: "Video",
                             systemName: "video",
-                            disabled: !communicationAllowed,
+                            disabled: isReadOnlyPreview || !communicationAllowed,
                             action: startVideoCall
                         )
                         profileAction(
@@ -4194,6 +4322,12 @@ private struct ConversationContactProfileView: View {
                             disabled: false,
                             action: searchChat
                         )
+                    }
+
+                    if isReadOnlyPreview {
+                        Label("Read-only App Review preview", systemImage: "eye.fill")
+                            .font(.footnote.weight(.semibold))
+                            .foregroundStyle(KitColor.secondaryText)
                     }
 
                     if canSaveToContacts {
@@ -4223,7 +4357,7 @@ private struct ConversationContactProfileView: View {
 
                     NavigationLink {
                         ConversationMediaLibraryView(
-                            conversationID: conversationID,
+                            conversationID: conversation.id,
                             conversationTitle: displayName,
                             openGallery: { tappedMessageID in
                                 showMessageInChat(tappedMessageID)
@@ -4250,7 +4384,11 @@ private struct ConversationContactProfileView: View {
                     }
                     .buttonStyle(.plain)
 
-                    if canonicalUserID != nil {
+                    if accountReportingAvailable {
+                        reportAction
+                    }
+
+                    if canonicalUserID != nil, !isReadOnlyPreview {
                         communicationSafetyAction
                     }
 
@@ -4281,8 +4419,24 @@ private struct ConversationContactProfileView: View {
                     .ignoresSafeArea()
                 }
             }
+            .sheet(isPresented: $showAbuseReport) {
+                if let reportContext {
+                    NavigationStack {
+                        AbuseReportView(
+                            reportedName: displayName,
+                            context: reportContext,
+                            target: .account,
+                            messages: messages
+                        )
+                        .environmentObject(model)
+                    }
+                    .presentationBackground(.ultraThinMaterial)
+                }
+            }
             .task {
-                if canonicalUserID != nil, !model.hasUsableCommunicationPrivacyProjection {
+                if !isReadOnlyPreview,
+                   canonicalUserID != nil,
+                   !model.hasUsableCommunicationPrivacyProjection {
                     await model.loadCommunicationPrivacy()
                 }
             }
@@ -4306,12 +4460,47 @@ private struct ConversationContactProfileView: View {
         CommunicationPrivacyIdentifier.canonicalUUID(userID)
     }
 
+    private var reportContext: AbuseReportContext? {
+        AbuseReportContext(
+            currentUserID: model.profile?.id,
+            reportedUserID: canonicalUserID,
+            conversation: conversation
+        )
+    }
+
+    private var accountReportingAvailable: Bool {
+        guard reportContext != nil,
+              AbuseReportContract.isAvailable(features: model.capabilities?.features)
+        else { return false }
+        guard isReadOnlyPreview else { return true }
+        return AppReviewDemoContent.isProvisionedReportingTarget(
+            conversationID: conversation.id,
+            peerID: canonicalUserID
+        )
+    }
+
     private var isBlocked: Bool {
         model.isCommunicationBlocked(userID: canonicalUserID)
     }
 
     private var communicationAllowed: Bool {
         model.communicationPrivacyAllowsOutbound(to: canonicalUserID)
+    }
+
+    private var reportAction: some View {
+        Button { showAbuseReport = true } label: {
+            HStack(spacing: 11) {
+                Image(systemName: "exclamationmark.bubble.fill")
+                Text("Report account")
+                    .font(.body.weight(.semibold))
+                Spacer()
+            }
+            .foregroundStyle(.red)
+            .padding(17)
+            .kitGlass(cornerRadius: 22, shadow: false)
+        }
+        .buttonStyle(.plain)
+        .accessibilityHint("Send a private report to Kit Pay moderators")
     }
 
     private var communicationSafetyAction: some View {

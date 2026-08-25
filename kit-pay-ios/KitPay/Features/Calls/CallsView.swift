@@ -89,12 +89,16 @@ struct CallsView: View {
 
     private func callRow(_ call: CallRecord) -> some View {
         let presentation = ConversationCallPresentationPolicy.presentation(for: call)
+        let isReadOnlyPreview = model.isReadOnlyAppReviewDemoCall(call.id)
         let recipientUserID = call.participantUserIds.first(where: {
             $0.caseInsensitiveCompare(model.profile?.id ?? "") != .orderedSame
         })
         let recipientCommunicationAllowed = model.communicationPrivacyAllowsOutbound(
             to: recipientUserID
         )
+        let canRedial = !isReadOnlyPreview
+            && model.mayCreateCall
+            && recipientCommunicationAllowed
         return HStack(spacing: 13) {
             AvatarView(name: call.name, size: 56)
             VStack(alignment: .leading, spacing: 5) {
@@ -103,7 +107,13 @@ struct CallsView: View {
                     .foregroundStyle(presentation.isMissed ? .red : KitColor.primaryText)
                 HStack(spacing: 5) {
                     Image(systemName: presentation.isOutgoing ? "arrow.up.right" : "arrow.down.left")
-                    Text(call.state == .queued ? "Waiting for connection" : call.startedAt.formatted(date: .abbreviated, time: .shortened))
+                    Text(
+                        isReadOnlyPreview
+                            ? "Read-only App Review preview"
+                            : call.state == .queued
+                                ? "Waiting for connection"
+                                : AppPresentationClock.abbreviatedDateAndShortTime(call.startedAt)
+                    )
                 }
                 .font(.subheadline)
                 .foregroundStyle(call.state == .queued ? .orange : KitColor.secondaryText)
@@ -123,13 +133,13 @@ struct CallsView: View {
                         )
                     }
                 }
-                .disabled(!model.mayCreateCall || !recipientCommunicationAllowed)
-                .opacity(recipientCommunicationAllowed ? 1 : 0.48)
+                .disabled(!canRedial)
+                .opacity(canRedial ? 1 : 0.48)
                 .accessibilityLabel(
                     "\(call.isVideoCall ? "Video" : "Voice") call \(call.name)"
                 )
                 .accessibilityValue(
-                    model.mayCreateCall && recipientCommunicationAllowed ? "" : "Unavailable"
+                    canRedial ? "" : "Unavailable"
                 )
             }
         }

@@ -1735,6 +1735,7 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
 
     func testMatchingStaleRosterResponseAbandonsExactProjection() async throws {
         let fixture = try await makeSendRaceFixture(response: .staleRoster)
+        let recipientUserID = "10000000-0000-4000-8000-000000000032"
         let send = Task {
             try await fixture.coordinator.sendQueuedMessage(
                 commandID: fixture.command.id,
@@ -1759,6 +1760,183 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
             message.failureReason,
             SecureMessagingExchangeError.staleOutboundFanout.localizedDescription
         )
+
+        XCTAssertTrue(SecureMessagingExchangeCoordinator.canRetryFailedTextMessage(
+            in: snapshot,
+            messageID: message.id,
+            userID: fixture.userID,
+            conversationID: message.conversationId,
+            recipientUserID: recipientUserID
+        ))
+        let firstRetry = try await fixture.coordinator.retryFailedTextMessage(
+            messageID: message.id,
+            forUserID: fixture.userID,
+            conversationID: message.conversationId,
+            expectedRecipientUserID: recipientUserID
+        )
+        let repeatedRetry = try await fixture.coordinator.retryFailedTextMessage(
+            messageID: message.id,
+            forUserID: fixture.userID,
+            conversationID: message.conversationId,
+            expectedRecipientUserID: recipientUserID
+        )
+
+        XCTAssertEqual(repeatedRetry, firstRetry)
+        let unexpectedNetworkCallCount = await fixture.transport.unexpectedNetworkCallCount()
+        XCTAssertEqual(unexpectedNetworkCallCount, 0)
+        let retried = await fixture.store.snapshot()
+        XCTAssertEqual(retried.messages.count, 1)
+        XCTAssertEqual(retried.outbox.count, 1)
+        let retriedMessage = try XCTUnwrap(retried.messages.first)
+        let retryCommand = try XCTUnwrap(retried.outbox.first)
+        XCTAssertEqual(retriedMessage.id, message.id)
+        XCTAssertEqual(retriedMessage.body, message.body)
+        XCTAssertEqual(retriedMessage.createdAt, message.createdAt)
+        XCTAssertEqual(retriedMessage.state, .queued)
+        XCTAssertNil(retriedMessage.failureReason)
+        XCTAssertNotEqual(retryCommand.id, message.id)
+        XCTAssertEqual(retryCommand.kind, .secureMessage)
+        XCTAssertEqual(retryCommand.createdAt, message.createdAt)
+        XCTAssertEqual(retryCommand.messageId, message.id)
+        XCTAssertEqual(retryCommand.conversationId, message.conversationId)
+        XCTAssertEqual(retryCommand.recipientUserIds, [recipientUserID])
+        XCTAssertEqual(retryCommand.attemptCount, 0)
+        XCTAssertNil(retryCommand.secureMessageFanout)
+        XCTAssertNil(retryCommand.failureDisposition)
+        XCTAssertFalse(SecureMessagingExchangeCoordinator.canRetryFailedTextMessage(
+            in: retried,
+            messageID: message.id,
+            userID: fixture.userID,
+            conversationID: message.conversationId,
+            recipientUserID: recipientUserID
+        ))
+
+        let reopened = SecureLocalStore(
+            stateURL: temporaryDirectory.appendingPathComponent("state.secure"),
+            keyData: Data(repeating: 0x91, count: 32)
+        )
+        let restored = await reopened.snapshot()
+        XCTAssertEqual(restored.messages.first?.id, message.id)
+        XCTAssertEqual(restored.messages.first?.state, .queued)
+        XCTAssertEqual(restored.outbox.first?.id, retryCommand.id)
+        XCTAssertEqual(restored.outbox.first?.messageId, message.id)
+        XCTAssertNil(restored.outbox.first?.secureMessageFanout)
+    }
+
+    func testFailedTextRetryRejectsInvalidOrConflictingLocalStateWithoutNetwork() async throws {
+        let localUserID = "10000000-0000-4000-8000-000000000041"
+        let recipientUserID = "10000000-0000-4000-8000-000000000042"
+        let otherUserID = "10000000-0000-4000-8000-000000000043"
+        let conversationID = "30000000-0000-4000-8000-000000000041"
+        let otherConversationID = "30000000-0000-4000-8000-000000000042"
+        let messageID = UUID(uuidString: "40000000-0000-4000-8000-000000000041")!
+        let createdAt = Date(timeIntervalSince1970: 1_700_000_200)
+        typealias Mutation = (inout PersistedState) -> Void
+        let cases: [(
+            name: String,
+            userID: String,
+            conversationID: String,
+            recipientUserID: String,
+            mutate: Mutation
+        )] = [
+            ("wrong account", otherUserID, conversationID, recipientUserID, { _ in }),
+            ("wrong owner", localUserID, conversationID, recipientUserID, {
+                $0.communicationOwnerUserID = otherUserID
+            }),
+            ("wrong conversation", localUserID, otherConversationID, recipientUserID, { _ in }),
+            ("wrong recipient", localUserID, conversationID, otherUserID, { _ in }),
+            ("missing enrollment", localUserID, conversationID, recipientUserID, {
+                $0.secureMessaging = nil
+            }),
+            ("nonfailed message", localUserID, conversationID, recipientUserID, {
+                $0.messages[0].state = .queued
+            }),
+            ("sent message", localUserID, conversationID, recipientUserID, {
+                $0.messages[0].serverMessageId = "50000000-0000-4000-8000-000000000041"
+            }),
+            ("media message", localUserID, conversationID, recipientUserID, {
+                $0.messages[0].attachmentData = Data([0x01])
+            }),
+            ("pending media", localUserID, conversationID, recipientUserID, {
+                $0.messages[0].pendingAttachment = LocalPendingAttachment(
+                    mediaType: "image/jpeg",
+                    caption: nil,
+                    byteCount: 1
+                )
+            }),
+            ("reserved payment event", localUserID, conversationID, recipientUserID, {
+                $0.messages[0].body = "KITPAY1:untrusted"
+            }),
+            ("conflicting outbox", localUserID, conversationID, recipientUserID, {
+                $0.outbox = [OfflineCommand(
+                    id: UUID(uuidString: "50000000-0000-4000-8000-000000000042")!,
+                    kind: .secureMessage,
+                    createdAt: createdAt,
+                    nextAttemptAt: createdAt,
+                    attemptCount: 0,
+                    conversationId: conversationID,
+                    messageId: messageID,
+                    recipientUserIds: [recipientUserID],
+                    recipientName: "Peer",
+                    video: nil,
+                    expiresAt: nil,
+                    secureMessageFanout: nil
+                )]
+            }),
+        ]
+
+        for (index, testCase) in cases.enumerated() {
+            var state = failedTextRetryState(
+                localUserID: localUserID,
+                recipientUserID: recipientUserID,
+                conversationID: conversationID,
+                messageID: messageID,
+                createdAt: createdAt
+            )
+            testCase.mutate(&state)
+            let store = SecureLocalStore(
+                stateURL: temporaryDirectory.appendingPathComponent(
+                    "retry-reject-\(index).secure"
+                ),
+                keyData: Data(repeating: UInt8(0xA0 + index), count: 32)
+            )
+            try await store.replace(state)
+            let transport = OfflineExchangeTransport()
+            let coordinator = SecureMessagingExchangeCoordinator(
+                transport: transport,
+                store: store,
+                engine: SecureMessagingCryptoEngine(),
+                provisioningPreKeyCount: 1
+            )
+
+            XCTAssertFalse(
+                SecureMessagingExchangeCoordinator.canRetryFailedTextMessage(
+                    in: state,
+                    messageID: messageID,
+                    userID: testCase.userID,
+                    conversationID: testCase.conversationID,
+                    recipientUserID: testCase.recipientUserID
+                ),
+                testCase.name
+            )
+            do {
+                _ = try await coordinator.retryFailedTextMessage(
+                    messageID: messageID,
+                    forUserID: testCase.userID,
+                    conversationID: testCase.conversationID,
+                    expectedRecipientUserID: testCase.recipientUserID
+                )
+                XCTFail("Expected \(testCase.name) to be rejected")
+            } catch {
+                XCTAssertEqual(
+                    error as? SecureMessagingExchangeError,
+                    .messageNotRetryable,
+                    testCase.name
+                )
+            }
+            let networkCallCount = await transport.networkCallCount()
+            XCTAssertEqual(networkCallCount, 0, testCase.name)
+        }
     }
 
     func testDetachedCurrentDeviceEchoAdvancesCursorWithoutResurrectingMessage() async throws {
@@ -2751,7 +2929,15 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
             serverDeviceID: localDeviceID
         )
         try await store.update { state in
+            state.communicationOwnerUserID = userID
             state.secureMessaging = crypto
+            state.conversations = [Conversation(
+                id: conversationID,
+                title: "Peer",
+                participantUserIds: [userID, recipientUserID],
+                unreadCount: 0,
+                updatedAt: createdAt
+            )]
             state.messages = [message]
             state.outbox = [command]
         }
@@ -2816,6 +3002,50 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
             pqLastResortPreKeyID: 6,
             pqLastResortPreKeySHA256: String(repeating: "c", count: 64)
         )
+    }
+
+    private func failedTextRetryState(
+        localUserID: String,
+        recipientUserID: String,
+        conversationID: String,
+        messageID: UUID,
+        createdAt: Date
+    ) -> PersistedState {
+        var state = PersistedState.empty
+        state.profile = UserProfile(
+            id: localUserID,
+            name: "Secure User",
+            email: nil,
+            phone: "+256700000001",
+            tag: nil,
+            kycStatus: nil,
+            paymentPinSet: nil,
+            mfaEnabled: nil,
+            profileSetupRequired: false
+        )
+        state.communicationOwnerUserID = localUserID
+        var crypto = SecureMessagingPersistentState.empty
+        crypto.enrollment = raceEnrollment(userID: localUserID)
+        state.secureMessaging = crypto
+        state.conversations = [Conversation(
+            id: conversationID,
+            title: "Peer",
+            participantUserIds: [localUserID, recipientUserID],
+            unreadCount: 0,
+            updatedAt: createdAt.addingTimeInterval(-10)
+        )]
+        state.messages = [LocalMessage(
+            id: messageID,
+            conversationId: conversationID,
+            senderId: localUserID,
+            body: "Keep this exact body",
+            createdAt: createdAt,
+            sentAt: nil,
+            state: .failed,
+            failureReason: "The recipient's devices changed. Retry the message.",
+            isOutgoing: true
+        )]
+        return state
     }
 
     private func directConversationDTO(

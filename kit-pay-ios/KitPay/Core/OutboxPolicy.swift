@@ -281,7 +281,8 @@ enum OutboxPolicy {
                 return .retry(after: nil)
             case .invalidAccount:
                 return .permanent
-            case .invalidRecipient, .invalidConversation, .invalidServerResponse,
+            case .invalidRecipient, .invalidConversation, .messageNotRetryable,
+                    .invalidServerResponse,
                     .unsupportedEvent, .staleOutboundFanout:
                 return .permanent
             }

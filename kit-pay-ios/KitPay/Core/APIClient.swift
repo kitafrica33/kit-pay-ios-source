@@ -1133,7 +1133,7 @@ enum APIEndpointPolicy {
 }
 
 enum APIClientIdentity {
-    private static let fallbackVersion = "0.2.7"
+    private static let fallbackVersion = "1.0.0"
 
     static var currentHeader: String {
         "ios/\(currentAppVersion)"
@@ -1156,10 +1156,18 @@ enum APIClientIdentity {
 
     static func appVersion(marketingVersion: String?, buildNumber: String?) -> String {
         let rawVersion = marketingVersion?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let version = rawVersion.range(
-            of: #"\A(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\z"#,
-            options: .regularExpression
-        ) == nil ? fallbackVersion : rawVersion
+        let twoComponentPattern = #"\A(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\z"#
+        let threeComponentPattern = #"\A(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\z"#
+        let version: String
+        if rawVersion.range(of: threeComponentPattern, options: .regularExpression) != nil {
+            version = rawVersion
+        } else if rawVersion.range(of: twoComponentPattern, options: .regularExpression) != nil {
+            // App Store Connect permits a two-component marketing version, while the backend's
+            // installed-client contract is strict SemVer. Canonicalize 1.0 to 1.0.0 on the wire.
+            version = "\(rawVersion).0"
+        } else {
+            version = fallbackVersion
+        }
 
         let rawBuild = buildNumber?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let validBuild = rawBuild.range(

@@ -47,6 +47,13 @@ final class MobileMoneyViewModel: ObservableObject {
 
     init(api: APIClient = .shared) {
         self.api = api
+#if DEBUG && APP_STORE_SCREENSHOTS
+        if AppStoreScreenshotFixture.isActive {
+            networks = AppStoreScreenshotFixture.mobileMoneyNetworks
+            accounts = AppStoreScreenshotFixture.mobileMoneyAccounts
+            operations = AppStoreScreenshotFixture.mobileMoneyOperations
+        }
+#endif
     }
 
     deinit {
@@ -54,6 +61,15 @@ final class MobileMoneyViewModel: ObservableObject {
     }
 
     func load(permitted: Bool, online: Bool) async {
+#if DEBUG && APP_STORE_SCREENSHOTS
+        if AppStoreScreenshotFixture.isActive {
+            networks = AppStoreScreenshotFixture.mobileMoneyNetworks
+            accounts = AppStoreScreenshotFixture.mobileMoneyAccounts
+            operations = AppStoreScreenshotFixture.mobileMoneyOperations
+            errorMessage = nil
+            return
+        }
+#endif
         guard !isLoading else { return }
         guard permitted else {
             clear()
@@ -1683,7 +1699,7 @@ private struct MobileMoneySavedAccountDetailView: View {
         guard let raw = operation.completedAt ?? operation.createdAt,
               let date = ISO8601DateFormatter().date(from: raw)
         else { return "Date pending" }
-        return date.formatted(date: .abbreviated, time: .shortened)
+        return AppPresentationClock.abbreviatedDateAndShortTime(date)
     }
 
     private func activityStatus(_ operation: MobileMoneyOperationDTO) -> String {

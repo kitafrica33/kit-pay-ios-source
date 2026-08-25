@@ -45,6 +45,17 @@ and Apple Liquid Glass.
   behavior still require physical-device validation.
 - Provider payment rails stay disabled unless backend capabilities confirm the required provider,
   authorization, webhook, settlement, reconciliation, and compliance controls.
+- Abuse reporting appears only for a valid two-party conversation when the backend advertises
+  `features.abuse_reporting`. A report carries account/conversation/message references, the user's
+  selected reason and optional note, and no decrypted history by default. The user may separately
+  select and consent to share at most five delivered text messages; media/payment descriptors,
+  attachments and all unselected history remain on-device. Ambiguous retries keep only an
+  account-bound request digest and idempotency key in this device's Keychain; report notes and
+  selected plaintext are never persisted there. Reports are never queued offline.
+  Device-local App Review/demo conversations are UI previews, not valid moderation targets: a
+  successful reviewer test requires a real direct-conversation row with exactly the reviewer and
+  an enrolled peer as active members, plus a real peer-authored message row for message reports.
+  The client must show the server's neutral unavailable result and must never fake acceptance.
 - APNs/PushKit server support is implemented on backend PR 18, but production credentials and
   deployment are separate operational steps.
 - Rich voice/video/document media is limited to 200 MiB and requires the server's bounded

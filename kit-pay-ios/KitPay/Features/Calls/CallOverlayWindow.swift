@@ -4,8 +4,8 @@ import LiveKit
 import SwiftUI
 import UIKit
 
-/// Which minimized surface the overlay window is currently drawing. `RootView` observes this to
-/// reserve the audio strip's height at the top of the app so the strip pushes content down
+/// Which minimized surface the overlay window is currently drawing. The window controller uses
+/// this to reserve the audio strip's height in the app window so the strip pushes content down
 /// instead of covering navigation bars.
 enum CallOverlaySurfaceStyle: Equatable {
     case audioStrip
@@ -121,8 +121,8 @@ final class CallOverlayWindowController {
                 }
             }
         // The camera toggle changes whether the minimized surface is the audio strip or the video
-        // tile, and RootView reserves layout for the strip. Keep the published style honest on
-        // every escalation/de-escalation, not only when the remote track changes.
+        // tile. Keep the published style and app-window reservation honest on every
+        // escalation/de-escalation, not only when the remote track changes.
         localCameraObservation = CallMediaCoordinator.shared.media.$isCameraEnabled
             .removeDuplicates()
             .sink { [weak self] _ in
@@ -239,9 +239,9 @@ final class CallOverlayWindowController {
         pictureInPicture.stopForForegroundIfNeeded()
     }
 
-    /// Publishes which minimized surface is on screen so `RootView` can reserve the audio strip's
-    /// height. Uses the same video definition as the surface itself (`callCarriesVideo`), so the
-    /// reservation flips together with the strip↔tile swap on escalation.
+    /// Publishes which minimized surface is on screen and updates the app window's audio-strip
+    /// reservation. Uses the same video definition as the surface itself (`callCarriesVideo`),
+    /// so the reservation flips together with the strip↔tile swap on escalation.
     private func refreshSurfaceStyle() {
         let coordinator = CallMediaCoordinator.shared
         var style: CallOverlaySurfaceStyle?
@@ -251,6 +251,34 @@ final class CallOverlayWindowController {
         if presenter.surfaceStyle != style {
             presenter.surfaceStyle = style
         }
+        applyAppWindowStripReservation(for: style)
+    }
+
+    /// The audio strip must PUSH the app below it — including UIKit navigation bars, which a
+    /// SwiftUI `safeAreaInset` cannot move (the bar pins to the hosting controller's safe area,
+    /// so it stayed hidden underneath the strip). Extending the app window's own safe area is
+    /// the one mechanism every bar, scroll view, and tab respects. Applied only while the strip
+    /// is actually drawn, so no phantom gap remains when the full call UI (or no call) is up.
+    private func applyAppWindowStripReservation(for style: CallOverlaySurfaceStyle?) {
+        let reserved: CGFloat = style == .audioStrip ? CallBannerMetrics.contentHeight : 0
+        guard let scene = window?.windowScene ?? foregroundWindowScene() else { return }
+        for appWindow in scene.windows {
+            guard !(appWindow is CallOverlayPassthroughWindow),
+                  appWindow.windowLevel == .normal,
+                  let root = appWindow.rootViewController,
+                  root.additionalSafeAreaInsets.top != reserved
+            else { continue }
+
+            let updateLayout = {
+                root.additionalSafeAreaInsets.top = reserved
+                appWindow.layoutIfNeeded()
+            }
+            if UIAccessibility.isReduceMotionEnabled {
+                updateLayout()
+            } else {
+                UIView.animate(withDuration: 0.25, animations: updateLayout)
+            }
+        }
     }
 
     /// Tears the surface and any Picture in Picture session down. Called when the call ends and
@@ -258,6 +286,7 @@ final class CallOverlayWindowController {
     func hide() {
         presenter.showsSurface = false
         presenter.surfaceStyle = nil
+        applyAppWindowStripReservation(for: nil)
         // The call is over (or concealed): the next call's tile starts from the default spot.
         presenter.videoTileTuckedEdge = nil
         presenter.videoTilePosition = nil

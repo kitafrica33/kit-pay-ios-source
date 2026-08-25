@@ -8,6 +8,8 @@
 /* Begin PBXBuildFile section */
 		A10000000000000000000001 /* KitPayApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000001 /* KitPayApp.swift */; };
 		A10000000000000000000002 /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000002 /* AppModel.swift */; };
+		AF3100000000000000000001 /* AppReviewDemoContent.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF3100000000000000000001 /* AppReviewDemoContent.swift */; };
+		AF3000000000000000000001 /* AppStoreScreenshotFixture.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF3000000000000000000001 /* AppStoreScreenshotFixture.swift */; };
 		A10000000000000000000003 /* NotificationCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000003 /* NotificationCoordinator.swift */; };
 		A10000000000000000000004 /* ConnectivityMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000004 /* ConnectivityMonitor.swift */; };
 		A10000000000000000000005 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000005 /* Models.swift */; };
@@ -27,6 +29,7 @@
 		A10000000000000000000013 /* BiometricAuthentication.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000016 /* BiometricAuthentication.swift */; };
 		A10000000000000000000014 /* SecurityView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000017 /* SecurityView.swift */; };
 		AF1000000000000000000001 /* AppLaunchUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF1000000000000000000001 /* AppLaunchUITests.swift */; };
+		AF1000000000000000000002 /* AppStoreScreenshotUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF1000000000000000000003 /* AppStoreScreenshotUITests.swift */; };
 		A20000000000000000000001 /* OutboxPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000001 /* OutboxPolicy.swift */; };
 		A20000000000000000000002 /* WalletFlowViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000002 /* WalletFlowViews.swift */; };
 		A30000000000000000000001 /* SecureLocalStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B30000000000000000000001 /* SecureLocalStoreTests.swift */; };
@@ -133,7 +136,12 @@
 		A27000000000000000000001 /* TransferAcceptanceModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = B27000000000000000000001 /* TransferAcceptanceModels.swift */; };
 		A27000000000000000000002 /* APIClient+Transfers.swift in Sources */ = {isa = PBXBuildFile; fileRef = B27000000000000000000002 /* APIClient+Transfers.swift */; };
 		A27000000000000000000003 /* ChatTransferActions.swift in Sources */ = {isa = PBXBuildFile; fileRef = B27000000000000000000003 /* ChatTransferActions.swift */; };
+		A28000000000000000000001 /* AbuseReportingModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = B28000000000000000000001 /* AbuseReportingModels.swift */; };
+		A28000000000000000000002 /* APIClient+AbuseReporting.swift in Sources */ = {isa = PBXBuildFile; fileRef = B28000000000000000000002 /* APIClient+AbuseReporting.swift */; };
+		A28000000000000000000003 /* AbuseReportView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B28000000000000000000003 /* AbuseReportView.swift */; };
+		A28000000000000000000004 /* AbuseReportingContractTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B28000000000000000000004 /* AbuseReportingContractTests.swift */; };
 		A24000000000000000000003 /* TransferAcceptanceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B24000000000000000000003 /* TransferAcceptanceTests.swift */; };
+		AF3100000000000000000002 /* AppReviewDemoContentTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF3100000000000000000002 /* AppReviewDemoContentTests.swift */; };
 		AF2000000000000000000001 /* KitLogo.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF2000000000000000000001 /* KitLogo.swift */; };
 		AF2000000000000000000002 /* KitAuthDesign.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF2000000000000000000002 /* KitAuthDesign.swift */; };
 /* End PBXBuildFile section */
@@ -158,6 +166,8 @@
 /* Begin PBXFileReference section */
 		B10000000000000000000001 /* KitPayApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/App/KitPayApp.swift; sourceTree = SOURCE_ROOT; };
 		B10000000000000000000002 /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/App/AppModel.swift; sourceTree = SOURCE_ROOT; };
+		BF3100000000000000000001 /* AppReviewDemoContent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/App/AppReviewDemoContent.swift; sourceTree = SOURCE_ROOT; };
+		BF3000000000000000000001 /* AppStoreScreenshotFixture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/App/AppStoreScreenshotFixture.swift; sourceTree = SOURCE_ROOT; };
 		B10000000000000000000003 /* NotificationCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/App/NotificationCoordinator.swift; sourceTree = SOURCE_ROOT; };
 		B10000000000000000000004 /* ConnectivityMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/ConnectivityMonitor.swift; sourceTree = SOURCE_ROOT; };
 		B10000000000000000000005 /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/Models.swift; sourceTree = SOURCE_ROOT; };
@@ -260,6 +270,7 @@
 		B19000000000000000000001 /* CallOverlayWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Calls/CallOverlayWindow.swift; sourceTree = SOURCE_ROOT; };
 		B19000000000000000000002 /* KitChatWallpaper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Design/KitChatWallpaper.swift; sourceTree = SOURCE_ROOT; };
 		BF1000000000000000000001 /* AppLaunchUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayUITests/AppLaunchUITests.swift; sourceTree = SOURCE_ROOT; };
+		BF1000000000000000000003 /* AppStoreScreenshotUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayUITests/AppStoreScreenshotUITests.swift; sourceTree = SOURCE_ROOT; };
 		BF1000000000000000000002 /* KitPayUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = KitPayUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		B21000000000000000000001 /* ChatMediaPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/ChatMediaPolicy.swift; sourceTree = SOURCE_ROOT; };
 		B21000000000000000000002 /* SecureMediaFileCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/SecureMediaFileCache.swift; sourceTree = SOURCE_ROOT; };
@@ -287,7 +298,12 @@
 		B27000000000000000000001 /* TransferAcceptanceModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/TransferAcceptanceModels.swift; sourceTree = SOURCE_ROOT; };
 		B27000000000000000000002 /* APIClient+Transfers.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "KitPay/Core/APIClient+Transfers.swift"; sourceTree = SOURCE_ROOT; };
 		B27000000000000000000003 /* ChatTransferActions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Messages/ChatTransferActions.swift; sourceTree = SOURCE_ROOT; };
+		B28000000000000000000001 /* AbuseReportingModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/AbuseReportingModels.swift; sourceTree = SOURCE_ROOT; };
+		B28000000000000000000002 /* APIClient+AbuseReporting.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "KitPay/Core/APIClient+AbuseReporting.swift"; sourceTree = SOURCE_ROOT; };
+		B28000000000000000000003 /* AbuseReportView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Messages/AbuseReportView.swift; sourceTree = SOURCE_ROOT; };
+		B28000000000000000000004 /* AbuseReportingContractTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/AbuseReportingContractTests.swift; sourceTree = SOURCE_ROOT; };
 		B24000000000000000000003 /* TransferAcceptanceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/TransferAcceptanceTests.swift; sourceTree = SOURCE_ROOT; };
+		BF3100000000000000000002 /* AppReviewDemoContentTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/AppReviewDemoContentTests.swift; sourceTree = SOURCE_ROOT; };
 		BF2000000000000000000001 /* KitLogo.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Design/KitLogo.swift; sourceTree = SOURCE_ROOT; };
 		BF2000000000000000000002 /* KitAuthDesign.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Design/KitAuthDesign.swift; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
@@ -313,6 +329,8 @@
 			isa = PBXGroup;
 			children = (
 				B10000000000000000000001, B10000000000000000000002, B10000000000000000000003,
+				BF3100000000000000000001 /* AppReviewDemoContent.swift */,
+				BF3000000000000000000001 /* AppStoreScreenshotFixture.swift */,
 				B10000000000000000000004, B10000000000000000000005, B10000000000000000000006,
 				B10000000000000000000007, B10000000000000000000008, B10000000000000000000009,
 				B1000000000000000000000A, B1000000000000000000000B, B1000000000000000000000C,
@@ -401,6 +419,9 @@
 				B27000000000000000000001 /* TransferAcceptanceModels.swift */,
 				B27000000000000000000002 /* APIClient+Transfers.swift */,
 				B27000000000000000000003 /* ChatTransferActions.swift */,
+				B28000000000000000000001 /* AbuseReportingModels.swift */,
+				B28000000000000000000002 /* APIClient+AbuseReporting.swift */,
+				B28000000000000000000003 /* AbuseReportView.swift */,
 			);
 			name = KitPay;
 			sourceTree = "<group>";
@@ -438,6 +459,8 @@
 				B24000000000000000000001 /* ConversationInteractionPolicyTests.swift */,
 				B24000000000000000000002 /* ChatMediaAlbumPolicyTests.swift */,
 				B24000000000000000000003 /* TransferAcceptanceTests.swift */,
+				B28000000000000000000004 /* AbuseReportingContractTests.swift */,
+				BF3100000000000000000002 /* AppReviewDemoContentTests.swift */,
 			);
 			name = KitPayTests;
 			sourceTree = "<group>";
@@ -446,6 +469,7 @@
 			isa = PBXGroup;
 			children = (
 				BF1000000000000000000001 /* AppLaunchUITests.swift */,
+				BF1000000000000000000003 /* AppStoreScreenshotUITests.swift */,
 			);
 			name = KitPayUITests;
 			sourceTree = "<group>";
@@ -518,6 +542,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				A10000000000000000000001, A10000000000000000000002, A10000000000000000000003,
+				AF3100000000000000000001 /* AppReviewDemoContent.swift in Sources */,
+				AF3000000000000000000001 /* AppStoreScreenshotFixture.swift in Sources */,
 				A10000000000000000000004, A10000000000000000000005, A10000000000000000000006,
 				A10000000000000000000007, A10000000000000000000008, A10000000000000000000009,
 				A1000000000000000000000A, A1000000000000000000000B, A1000000000000000000000C,
@@ -600,6 +626,9 @@
 				A27000000000000000000001 /* TransferAcceptanceModels.swift in Sources */,
 				A27000000000000000000002 /* APIClient+Transfers.swift in Sources */,
 				A27000000000000000000003 /* ChatTransferActions.swift in Sources */,
+				A28000000000000000000001 /* AbuseReportingModels.swift in Sources */,
+				A28000000000000000000002 /* APIClient+AbuseReporting.swift in Sources */,
+				A28000000000000000000003 /* AbuseReportView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -636,6 +665,8 @@
 				A24000000000000000000001 /* ConversationInteractionPolicyTests.swift in Sources */,
 				A24000000000000000000002 /* ChatMediaAlbumPolicyTests.swift in Sources */,
 				A24000000000000000000003 /* TransferAcceptanceTests.swift in Sources */,
+				A28000000000000000000004 /* AbuseReportingContractTests.swift in Sources */,
+				AF3100000000000000000002 /* AppReviewDemoContentTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -644,6 +675,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				AF1000000000000000000001 /* AppLaunchUITests.swift in Sources */,
+				AF1000000000000000000002 /* AppStoreScreenshotUITests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -665,8 +697,8 @@
 /* Begin XCBuildConfiguration section */
 		F20000000000000000000001 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {ALWAYS_SEARCH_USER_PATHS = NO; CLANG_ENABLE_MODULES = YES; CLANG_ENABLE_OBJC_ARC = YES; COPY_PHASE_STRIP = NO; DEBUG_INFORMATION_FORMAT = dwarf; ENABLE_TESTABILITY = YES; GCC_C_LANGUAGE_STANDARD = gnu17; GCC_OPTIMIZATION_LEVEL = 0; IPHONEOS_DEPLOYMENT_TARGET = 17.0; ONLY_ACTIVE_ARCH = YES; SDKROOT = iphoneos; SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)"; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; }; name = Debug; };
 		F20000000000000000000002 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {ALWAYS_SEARCH_USER_PATHS = NO; CLANG_ENABLE_MODULES = YES; CLANG_ENABLE_OBJC_ARC = YES; COPY_PHASE_STRIP = NO; DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym"; ENABLE_NS_ASSERTIONS = NO; GCC_C_LANGUAGE_STANDARD = gnu17; IPHONEOS_DEPLOYMENT_TARGET = 17.0; SDKROOT = iphoneos; SWIFT_COMPILATION_MODE = wholemodule; SWIFT_OPTIMIZATION_LEVEL = "-O"; VALIDATE_PRODUCT = YES; }; name = Release; };
-		F20000000000000000000003 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {APS_ENVIRONMENT = development; ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_ENTITLEMENTS = KitPay/KitPay.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 22; DEVELOPMENT_TEAM = AU55CKVJ55; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = KitPay/Info.plist; KIT_CORRESPONDING_SOURCE_URL = ""; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"; MARKETING_VERSION = 0.2.7; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Debug; };
-		F20000000000000000000004 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {APS_ENVIRONMENT = production; ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_ENTITLEMENTS = KitPay/KitPay.entitlements; CODE_SIGN_IDENTITY = "Apple Distribution"; CODE_SIGN_STYLE = Manual; CURRENT_PROJECT_VERSION = 22; DEVELOPMENT_TEAM = "$(KITPAY_APPLE_TEAM_ID)"; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = KitPay/Info.plist; KIT_CORRESPONDING_SOURCE_URL = ""; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"; MARKETING_VERSION = 0.2.7; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios; PRODUCT_NAME = "$(TARGET_NAME)"; PROVISIONING_PROFILE_SPECIFIER = "$(KITPAY_PROFILE_UUID)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Release; };
+		F20000000000000000000003 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {APS_ENVIRONMENT = development; ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_ENTITLEMENTS = KitPay/KitPay.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 23; DEVELOPMENT_TEAM = AU55CKVJ55; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = KitPay/Info.plist; KIT_CORRESPONDING_SOURCE_URL = ""; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"; MARKETING_VERSION = 1.0; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Debug; };
+		F20000000000000000000004 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {APS_ENVIRONMENT = production; ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_ENTITLEMENTS = KitPay/KitPay.entitlements; CODE_SIGN_IDENTITY = "Apple Distribution"; CODE_SIGN_STYLE = Manual; CURRENT_PROJECT_VERSION = 23; DEVELOPMENT_TEAM = "$(KITPAY_APPLE_TEAM_ID)"; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = KitPay/Info.plist; KIT_CORRESPONDING_SOURCE_URL = ""; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"; MARKETING_VERSION = 1.0; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios; PRODUCT_NAME = "$(TARGET_NAME)"; PROVISIONING_PROFILE_SPECIFIER = "$(KITPAY_PROFILE_UUID)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Release; };
 		F30000000000000000000001 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {BUNDLE_LOADER = "$(TEST_HOST)"; CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = AU55CKVJ55; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks @loader_path/Frameworks"; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios.tests; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_EMIT_LOC_STRINGS = NO; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/KitPay.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/KitPay"; }; name = Debug; };
 		F30000000000000000000002 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {BUNDLE_LOADER = "$(TEST_HOST)"; CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = AU55CKVJ55; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks @loader_path/Frameworks"; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios.tests; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_EMIT_LOC_STRINGS = NO; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/KitPay.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/KitPay"; }; name = Release; };
 		FF1000000000000000000001 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = AU55CKVJ55; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks @loader_path/Frameworks"; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios.uitests; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_EMIT_LOC_STRINGS = NO; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; TEST_TARGET_NAME = KitPay;}; name = Debug; };

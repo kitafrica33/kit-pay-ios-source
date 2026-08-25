@@ -3088,6 +3088,9 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
+#if DEBUG && APP_STORE_SCREENSHOTS
+        guard !AppStoreScreenshotFixture.isActive else { return true }
+#endif
         ContactBackgroundRefreshScheduler.shared.register()
         CommunicationBackgroundReplayScheduler.shared.register()
         MessageBackupRefreshScheduler.shared.register()

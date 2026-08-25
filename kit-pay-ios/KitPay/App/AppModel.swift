@@ -775,6 +775,9 @@ final class AppModel: ObservableObject {
     private var conversationDraftWriteSequence: UInt64 = 0
     private var deviceManagementGeneration: UInt64 = 0
     private var securityPreferencesRequestGeneration: UInt64 = 0
+    /// Process-only authority established from a capability response bound to the current signed-
+    /// in session. Demo content is projected in memory and is never written to protected storage.
+    private var authenticatedAppReviewDemoOwnerID: String?
 
     var phoneOTPAvailable: Bool {
         capabilities?.supportsPhoneOTP == true
@@ -812,6 +815,22 @@ final class AppModel: ObservableObject {
         self.acceptedAccountDeletionPurges = acceptedAccountDeletionPurges
         self.accountDeletionAttempts = accountDeletionAttempts
         self.contactSource = contactSource
+
+#if DEBUG && APP_STORE_SCREENSHOTS
+        if AppStoreScreenshotFixture.isActive {
+            state = AppStoreScreenshotFixture.state
+            publishedStateRevision = 1
+            capabilities = AppStoreScreenshotFixture.capabilities
+            communicationPreferences = AppStoreScreenshotFixture.communicationPreferences
+            communicationBlocks = []
+            hasLoadedCommunicationPrivacy = true
+            callContacts = AppStoreScreenshotFixture.callContacts
+            isSignedIn = true
+            isOnline = true
+            isLoading = false
+            return
+        }
+#endif
 
         ContactBackgroundRefreshScheduler.shared.installHandler { [weak self] task in
             Task { @MainActor in await self?.handleBackgroundContactRefresh(task) }
@@ -1046,6 +1065,20 @@ final class AppModel: ObservableObject {
     }
 
     var profile: UserProfile? { state.profile }
+    var appReviewDemoIsActive: Bool {
+        guard let ownerID = authenticatedAppReviewDemoOwnerID,
+              isSignedIn,
+              profile?.id.caseInsensitiveCompare(ownerID) == .orderedSame
+        else { return false }
+        return true
+    }
+    func isReadOnlyAppReviewDemoConversation(_ conversationID: String) -> Bool {
+        appReviewDemoIsActive
+            && AppReviewDemoContent.isSyntheticConversationID(conversationID)
+    }
+    func isReadOnlyAppReviewDemoCall(_ callID: String) -> Bool {
+        appReviewDemoIsActive && AppReviewDemoContent.isSyntheticCallID(callID)
+    }
     var waitingCall: AuthenticatedWaitingCall? { callWaitingState.waitingCall }
     var isMergingWaitingCall: Bool { callWaitingState.isMerging }
     var communicationSurfacesConcealed: Bool {
@@ -1560,11 +1593,30 @@ final class AppModel: ObservableObject {
     /// roll the visible chat list or conversation back to a stale projection.
     @discardableResult
     func publishLatestState() async -> PersistedState {
+#if DEBUG && APP_STORE_SCREENSHOTS
+        if AppStoreScreenshotFixture.isActive { return state }
+#endif
         let projection = await store.projection()
         guard projection.revision >= publishedStateRevision else { return state }
         publishedStateRevision = projection.revision
-        state = projection.state
-        return projection.state
+        let displayedState = appReviewDemoProjectedState(from: projection.state)
+        state = displayedState
+        return displayedState
+    }
+
+    private func appReviewDemoProjectedState(from persisted: PersistedState) -> PersistedState {
+        guard let ownerID = authenticatedAppReviewDemoOwnerID,
+              isSignedIn,
+              !isSigningOut,
+              !isSubmittingAccountDeletion,
+              !acceptedAccountDeletionCleanupBlocked,
+              !protectedLocalStateRecoveryBlocked,
+              !unresolvedAccountDeletionAttemptBlocked
+        else { return persisted }
+        return AppReviewDemoContent.projectedState(
+            from: persisted,
+            authenticatedOwnerID: ownerID
+        )
     }
 
     /// Keeps an unresolved accepted-deletion projection inaccessible without erasing a newer,
@@ -1614,6 +1666,7 @@ final class AppModel: ObservableObject {
     }
 
     private func enterCommunicationPrivacyQuarantine() async {
+        authenticatedAppReviewDemoOwnerID = nil
         let targetAccountID = privacyQuarantineTargetAccountID
         clearAllCallWaitingState()
         NotificationCoordinator.shared.beginPrivacyQuarantine(
@@ -3094,6 +3147,7 @@ final class AppModel: ObservableObject {
         // are cleared.
         accountEpoch = UUID()
         capabilitiesRequestTracker.invalidate()
+        authenticatedAppReviewDemoOwnerID = nil
         capabilities = nil
         resetCommunicationPrivacyState()
         resetSecurityPreferencesState()
@@ -4135,6 +4189,9 @@ final class AppModel: ObservableObject {
     }
 
     func applicationDidEnterBackgroundSecurely() {
+#if DEBUG && APP_STORE_SCREENSHOTS
+        guard !AppStoreScreenshotFixture.isActive else { return }
+#endif
         suspendEphemeralOutgoingCallSubmission()
         returningSignInBiometricAuthorizationFence.invalidate()
         homeBiometricAuthorizationFence.invalidate()
@@ -4145,6 +4202,9 @@ final class AppModel: ObservableObject {
     }
 
     func applicationDidBecomeActiveSecurely() async {
+#if DEBUG && APP_STORE_SCREENSHOTS
+        guard !AppStoreScreenshotFixture.isActive else { return }
+#endif
         if let restoreTask { await restoreTask.value }
         if protectedLocalStateRecoveryBlocked {
             await retryProtectedLocalStateRecovery()
@@ -5090,6 +5150,10 @@ final class AppModel: ObservableObject {
     }
 
     func setConversationVisible(_ conversationID: String, visible: Bool) {
+#if DEBUG && APP_STORE_SCREENSHOTS
+        guard !AppStoreScreenshotFixture.isActive else { return }
+#endif
+        guard !isReadOnlyAppReviewDemoConversation(conversationID) else { return }
         guard let uuid = UUID(uuidString: conversationID) else { return }
         let canonical = uuid.uuidString.lowercased()
         guard canonical.caseInsensitiveCompare(conversationID) == .orderedSame else { return }
@@ -5238,7 +5302,8 @@ final class AppModel: ObservableObject {
         generation: UInt64,
         context: AuthenticatedSecurityContext
     ) async {
-        guard secureMessagingAvailable,
+        guard !isReadOnlyAppReviewDemoConversation(conversationID),
+              secureMessagingAvailable,
               isOnline,
               let conversation = MessageNotificationConversationPolicy.conversation(
                   id: conversationID,
@@ -6571,7 +6636,8 @@ final class AppModel: ObservableObject {
         // provide the last confirmed value.
         let requestGeneration = capabilitiesRequestTracker.begin()
         let expectedAccountEpoch = accountEpoch
-        let expectedSessionID = await sessions.current()?.sessionId
+        let expectedSession = await sessions.current()
+        let expectedSessionID = expectedSession?.sessionId
         do {
             let discovered = try await APIClientSessionBinding.$sessionID.withValue(
                 expectedSessionID
@@ -6587,7 +6653,16 @@ final class AppModel: ObservableObject {
                       cancelled: false
                   )
             else { return false }
+            authenticatedAppReviewDemoOwnerID = AppReviewDemoAccessPolicy.ownerID(
+                features: discovered.features,
+                authority: .authenticatedSession,
+                isSignedIn: isSignedIn,
+                profileID: profile?.id,
+                sessionID: expectedSession?.sessionId,
+                sessionAccountID: expectedSession?.accountId
+            )
             capabilities = discovered
+            await publishLatestState()
             return true
         } catch {
             guard await capabilitiesContextIsCurrent(
@@ -6608,7 +6683,9 @@ final class AppModel: ObservableObject {
                 // overwrite a newer authoritative result.
                 return false
             }
+            authenticatedAppReviewDemoOwnerID = nil
             capabilities = nil
+            await publishLatestState()
             lastError = error.localizedDescription
             return false
         }
@@ -6766,6 +6843,10 @@ final class AppModel: ObservableObject {
               userID != CommunicationPrivacyIdentifier.canonicalUUID(profile?.id)
         else {
             communicationPrivacyErrorMessage = "This Kit Pay account cannot be updated."
+            return false
+        }
+        guard !(appReviewDemoIsActive && AppReviewDemoContent.isSyntheticPeerID(userID)) else {
+            communicationPrivacyErrorMessage = "This App Review preview is read-only."
             return false
         }
         if !hasUsableCommunicationPrivacyProjection {
@@ -7087,6 +7168,7 @@ final class AppModel: ObservableObject {
         conversationId: String,
         writeVersion: ConversationDraftWriteVersion
     ) async -> Bool {
+        guard !isReadOnlyAppReviewDemoConversation(conversationId) else { return false }
         let expectedAccountEpoch = accountEpoch
         guard !Task.isCancelled,
               isSignedIn,
@@ -7192,7 +7274,11 @@ final class AppModel: ObservableObject {
         clientMessageID: UUID? = nil,
         draftClearVersion: ConversationDraftWriteVersion? = nil
     ) async -> Bool {
-        await queueValidatedMessage(
+        guard !isReadOnlyAppReviewDemoConversation(conversationId) else {
+            lastError = "This App Review preview is read-only."
+            return false
+        }
+        return await queueValidatedMessage(
             conversationId: conversationId,
             title: title,
             recipientId: recipientId,
@@ -7213,7 +7299,11 @@ final class AppModel: ObservableObject {
         body: String,
         clientMessageID: UUID? = nil
     ) async -> Bool {
-        await queueValidatedMessage(
+        guard !isReadOnlyAppReviewDemoConversation(conversationId) else {
+            lastError = "This App Review preview is read-only."
+            return false
+        }
+        return await queueValidatedMessage(
             conversationId: conversationId,
             title: title,
             recipientId: recipientId,
@@ -7316,6 +7406,11 @@ final class AppModel: ObservableObject {
         title: String,
         conversationId: String? = nil
     ) async -> Bool {
+        if let conversationId,
+           isReadOnlyAppReviewDemoConversation(conversationId) {
+            lastError = "This App Review preview is read-only."
+            return false
+        }
         let leaseKey = request.id.lowercased()
         guard let lease = paymentRequestChatShareLeases[leaseKey],
               await outboxContextIsCurrent(
@@ -7374,6 +7469,11 @@ final class AppModel: ObservableObject {
         title: String,
         conversationId: String? = nil
     ) async -> Bool {
+        if let conversationId,
+           isReadOnlyAppReviewDemoConversation(conversationId) {
+            lastError = "This App Review preview is read-only."
+            return false
+        }
         let claim = transaction.claim
         let referenceID = claim?.id ?? transaction.id
         let currency = claim?.currency ?? transaction.currency
@@ -7435,6 +7535,10 @@ final class AppModel: ObservableObject {
         submittedDraftBody: String? = nil,
         draftClearVersion: ConversationDraftWriteVersion? = nil
     ) async -> Bool {
+        guard !isReadOnlyAppReviewDemoConversation(conversationId) else {
+            lastError = "This App Review preview is read-only."
+            return false
+        }
         guard (submittedDraftBody == nil) == (draftClearVersion == nil) else {
             lastError = CustomerFacingMessagingCopy.draftSaveFailure
             return false
@@ -7684,6 +7788,13 @@ final class AppModel: ObservableObject {
         clientMessageID: UUID?,
         trustedPaymentEvent: Bool
     ) async -> SecureMessagingQueueResult? {
+        let rawRecipientID = recipientId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !(appReviewDemoIsActive
+            && AppReviewDemoContent.isSyntheticPeerID(rawRecipientID))
+        else {
+            lastError = "This App Review preview is read-only."
+            return nil
+        }
         let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
         if trustedPaymentEvent {
@@ -7695,9 +7806,7 @@ final class AppModel: ObservableObject {
             lastError = "Messages can't start with Kit Pay's reserved payment prefix."
             return nil
         }
-        guard let recipientUUID = UUID(
-            uuidString: recipientId.trimmingCharacters(in: .whitespacesAndNewlines)
-        ),
+        guard let recipientUUID = UUID(uuidString: rawRecipientID),
               !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         else {
             lastError = "Choose a valid Kit Pay contact."
@@ -7780,6 +7889,10 @@ final class AppModel: ObservableObject {
     }
 
     func markConversationRead(_ conversationID: String) async {
+#if DEBUG && APP_STORE_SCREENSHOTS
+        guard !AppStoreScreenshotFixture.isActive else { return }
+#endif
+        guard !isReadOnlyAppReviewDemoConversation(conversationID) else { return }
         // Only a message still in `.received` needs a receipt. Re-submitting the latest message
         // after it was already marked made the coordinator's strict single-candidate guard throw
         // "conversation no longer available" every time an up-to-date chat was reopened.
@@ -7815,6 +7928,7 @@ final class AppModel: ObservableObject {
     // MARK: - Conversation management (pin, mute, select, delete)
 
     func togglePinnedConversation(_ conversationID: String) async {
+        guard !isReadOnlyAppReviewDemoConversation(conversationID) else { return }
         do {
             try await store.update { persisted in
                 persisted.pinnedConversationIds = ConversationListPolicy.togglingMembership(
@@ -7829,6 +7943,7 @@ final class AppModel: ObservableObject {
     }
 
     func toggleMutedConversation(_ conversationID: String) async {
+        guard !isReadOnlyAppReviewDemoConversation(conversationID) else { return }
         do {
             try await store.update { persisted in
                 persisted.mutedConversationIds = ConversationListPolicy.togglingMembership(
@@ -7844,11 +7959,14 @@ final class AppModel: ObservableObject {
 
     /// Marks chats read locally right away, then sends authenticated read receipts when online.
     func markConversationsRead(_ conversationIDs: Set<String>) async {
-        guard !conversationIDs.isEmpty else { return }
+        let writableConversationIDs = conversationIDs.filter {
+            !isReadOnlyAppReviewDemoConversation($0)
+        }
+        guard !writableConversationIDs.isEmpty else { return }
         do {
             try await store.update { persisted in
                 for index in persisted.conversations.indices
-                where conversationIDs.contains(persisted.conversations[index].id) {
+                where writableConversationIDs.contains(persisted.conversations[index].id) {
                     persisted.conversations[index].unreadCount = 0
                 }
             }
@@ -7858,7 +7976,7 @@ final class AppModel: ObservableObject {
             return
         }
         guard isOnline, secureMessagingAvailable else { return }
-        for conversationID in conversationIDs {
+        for conversationID in writableConversationIDs {
             await markConversationRead(conversationID)
         }
     }
@@ -7866,10 +7984,13 @@ final class AppModel: ObservableObject {
     /// Deletes chats from this device only. Server copies stay end-to-end encrypted for the
     /// other participant; queued unsent messages for these chats are dropped from the outbox.
     func deleteConversationsLocally(_ conversationIDs: Set<String>) async {
-        guard !conversationIDs.isEmpty else { return }
+        let writableConversationIDs = conversationIDs.filter {
+            !isReadOnlyAppReviewDemoConversation($0)
+        }
+        guard !writableConversationIDs.isEmpty else { return }
         let userID = profile?.id
         let storageKeys = state.messages
-            .filter { conversationIDs.contains($0.conversationId) }
+            .filter { writableConversationIDs.contains($0.conversationId) }
             .flatMap { message -> [String] in
                 var keys: [String] = []
                 if let key = KitMediaMessageDescriptor.parse(message.body)?.storageKey {
@@ -7882,16 +8003,18 @@ final class AppModel: ObservableObject {
             }
         do {
             try await store.update { persisted in
-                persisted.conversations.removeAll { conversationIDs.contains($0.id) }
-                persisted.messages.removeAll { conversationIDs.contains($0.conversationId) }
+                persisted.conversations.removeAll { writableConversationIDs.contains($0.id) }
+                persisted.messages.removeAll {
+                    writableConversationIDs.contains($0.conversationId)
+                }
                 persisted.outbox.removeAll { command in
                     command.kind == .secureMessage
-                        && command.conversationId.map(conversationIDs.contains) == true
+                        && command.conversationId.map(writableConversationIDs.contains) == true
                 }
                 persisted.pinnedConversationIds = persisted.pinnedConversationIds?
-                    .filter { !conversationIDs.contains($0) }
+                    .filter { !writableConversationIDs.contains($0) }
                 persisted.mutedConversationIds = persisted.mutedConversationIds?
-                    .filter { !conversationIDs.contains($0) }
+                    .filter { !writableConversationIDs.contains($0) }
             }
             await publishLatestState()
             if let userID {
@@ -7909,7 +8032,9 @@ final class AppModel: ObservableObject {
 
     /// Deletes individual messages from this device only ("delete for me").
     func deleteMessagesLocally(_ messageIDs: Set<UUID>, conversationId: String) async {
-        guard !messageIDs.isEmpty else { return }
+        guard !messageIDs.isEmpty,
+              !isReadOnlyAppReviewDemoConversation(conversationId)
+        else { return }
         let userID = profile?.id
         let storageKeys = state.messages
             .filter { messageIDs.contains($0.id) && $0.conversationId == conversationId }
@@ -7950,7 +8075,7 @@ final class AppModel: ObservableObject {
     // MARK: - End-to-end encrypted iCloud chat backups
 
     func setMessageBackupFrequency(_ frequency: MessageBackupFrequency) async {
-        guard !isDeletingMessageBackup else { return }
+        guard !isDeletingMessageBackup, !appReviewDemoIsActive else { return }
         do {
             try await store.update { persisted in
                 var preferences = persisted.messageBackupPreferences ?? .default
@@ -7964,7 +8089,7 @@ final class AppModel: ObservableObject {
     }
 
     func setMessageBackupIncludesMedia(_ includesMedia: Bool) async {
-        guard !isDeletingMessageBackup else { return }
+        guard !isDeletingMessageBackup, !appReviewDemoIsActive else { return }
         do {
             try await store.update { persisted in
                 var preferences = persisted.messageBackupPreferences ?? .default
@@ -7982,6 +8107,7 @@ final class AppModel: ObservableObject {
         guard !isBackingUpMessages,
               !isDeletingMessageBackup,
               !isRestoringMessages,
+              !appReviewDemoIsActive,
               isSignedIn,
               accountSetupStep == nil,
               let userID = profile?.id,
@@ -8024,6 +8150,7 @@ final class AppModel: ObservableObject {
     @discardableResult
     func runAutomaticMessageBackupIfDue() async -> MessageBackupAutomaticRunResult {
         guard isSignedIn,
+              !appReviewDemoIsActive,
               accountSetupStep == nil,
               isOnline,
               !state.messages.isEmpty,
@@ -8134,6 +8261,12 @@ final class AppModel: ObservableObject {
     ) async {
         let rawRecipientId = recipientId.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !(appReviewDemoIsActive
+            && AppReviewDemoContent.isSyntheticPeerID(rawRecipientId))
+        else {
+            lastError = "This App Review preview is read-only."
+            return
+        }
         guard let recipientUUID = UUID(uuidString: rawRecipientId),
               !cleanName.isEmpty
         else {
@@ -9768,6 +9901,9 @@ final class AppModel: ObservableObject {
     /// Requests Contacts once, as the first scene becomes active. iOS persists
     /// the choice; later launches only inspect the stored authorization state.
     func requestContactsPermissionAtLaunch() async {
+#if DEBUG && APP_STORE_SCREENSHOTS
+        guard !AppStoreScreenshotFixture.isActive else { return }
+#endif
         guard UIApplication.shared.applicationState == .active else { return }
         if let restoreTask { await restoreTask.value }
         guard !acceptedAccountDeletionCleanupBlocked,
@@ -11148,39 +11284,142 @@ final class AppModel: ObservableObject {
         }
         callContacts = CallLifecyclePolicy.contactOptions(
             remote: remoteContacts,
-            history: state.calls,
+            history: state.calls.filter { !isReadOnlyAppReviewDemoCall($0.id) },
             context: phoneIdentityContext,
             excludingUserId: profile?.id,
             remoteAlreadyOrdered: true
         ).filter { !$0.isKitUser || communicationPrivacyAllowsOutbound(to: $0.id) }
     }
 
-    func canRetryMessage(_ messageID: UUID) -> Bool {
-        guard OutboxPolicy.canRetryMessage(messageID, in: state.outbox),
-              let command = state.outbox.first(where: {
-                  $0.kind == .secureMessage && $0.messageId == messageID
-              }),
-              let recipientUserIDs = command.recipientUserIds,
-              recipientUserIDs.count == 1,
-              communicationPrivacyAllowsOutbound(to: recipientUserIDs[0])
-        else { return false }
-        return true
+    private func failedMessageRetryContext(
+        conversationID rawConversationID: String,
+        recipientUserID rawRecipientUserID: String?
+    ) -> (userID: String, conversationID: String, recipientUserID: String)? {
+        guard let rawUserID = profile?.id,
+              let userUUID = UUID(
+                  uuidString: rawUserID.trimmingCharacters(in: .whitespacesAndNewlines)
+              ),
+              let conversationID = OutboxPolicy.canonicalConversationID(rawConversationID),
+              !isReadOnlyAppReviewDemoConversation(conversationID),
+              let rawRecipientUserID,
+              let recipientUUID = UUID(
+                  uuidString: rawRecipientUserID.trimmingCharacters(in: .whitespacesAndNewlines)
+              )
+        else { return nil }
+        let userID = userUUID.uuidString.lowercased()
+        let recipientUserID = recipientUUID.uuidString.lowercased()
+        guard userID != recipientUserID,
+              communicationPrivacyAllowsOutbound(to: recipientUserID)
+        else { return nil }
+        return (userID, conversationID, recipientUserID)
     }
 
-    func retryFailedMessage(_ messageID: UUID) async {
-        guard canRetryMessage(messageID) else { return }
+    func canRetryMessage(
+        _ messageID: UUID,
+        conversationID: String,
+        recipientUserID: String?
+    ) -> Bool {
+        guard let context = failedMessageRetryContext(
+            conversationID: conversationID,
+            recipientUserID: recipientUserID
+        ) else { return false }
+
+        let commands = state.outbox.filter {
+            $0.kind == .secureMessage && $0.messageId == messageID
+        }
+        if OutboxPolicy.canRetryMessage(messageID, in: state.outbox) {
+            guard commands.count == 1,
+                  commands[0].conversationId == context.conversationID,
+                  commands[0].recipientUserIds == [context.recipientUserID]
+            else { return false }
+            return true
+        }
+
+        guard secureMessagingAvailable else { return false }
+        return SecureMessagingExchangeCoordinator.canRetryFailedTextMessage(
+            in: state,
+            messageID: messageID,
+            userID: context.userID,
+            conversationID: context.conversationID,
+            recipientUserID: context.recipientUserID
+        )
+    }
+
+    func retryFailedMessage(
+        _ messageID: UUID,
+        conversationID: String,
+        recipientUserID: String?
+    ) async {
+        guard let context = failedMessageRetryContext(
+            conversationID: conversationID,
+            recipientUserID: recipientUserID
+        ), canRetryMessage(
+            messageID,
+            conversationID: context.conversationID,
+            recipientUserID: context.recipientUserID
+        ) else { return }
+        let expectedAccountEpoch = accountEpoch
+        guard let expectedSessionID = await sessions.current()?.sessionId,
+              await outboxContextIsCurrent(
+                  accountEpoch: expectedAccountEpoch,
+                  userID: context.userID,
+                  sessionID: expectedSessionID
+              ),
+              let commitAdmission = ProtectedCommunicationAdmissionGate.shared.lease(
+                  forAccountID: context.userID
+              )
+        else { return }
+
+        let resumesRetainedCommand = OutboxPolicy.canRetryMessage(
+            messageID,
+            in: state.outbox
+        )
         do {
-            try await store.update { persisted in
-                _ = OutboxPolicy.resumeFailedMessage(
+            if resumesRetainedCommand {
+                try await store.update(admission: commitAdmission) { persisted in
+                    let commands = persisted.outbox.filter {
+                        $0.kind == .secureMessage && $0.messageId == messageID
+                    }
+                    guard persisted.profile?.id.caseInsensitiveCompare(context.userID)
+                            == .orderedSame,
+                          persisted.communicationOwnerUserID?.caseInsensitiveCompare(
+                              context.userID
+                          ) == .orderedSame,
+                          commands.count == 1,
+                          commands[0].conversationId == context.conversationID,
+                          commands[0].recipientUserIds == [context.recipientUserID],
+                          OutboxPolicy.resumeFailedMessage(
+                              messageID: messageID,
+                              in: &persisted,
+                              at: Date()
+                          )
+                    else { throw CancellationError() }
+                }
+            } else {
+                guard secureMessagingAvailable else { return }
+                _ = try await SecureMessagingExchangeCoordinator.shared.retryFailedTextMessage(
                     messageID: messageID,
-                    in: &persisted,
-                    at: Date()
+                    forUserID: context.userID,
+                    conversationID: context.conversationID,
+                    expectedRecipientUserID: context.recipientUserID,
+                    commitAdmission: commitAdmission
                 )
             }
-            await publishLatestState()
+            guard await reloadOutboxStateIfCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: context.userID,
+                sessionID: expectedSessionID
+            ) else { return }
             scheduleOutboxWake()
             if isOnline { await flushOutbox(reportFailures: true) }
+        } catch is CancellationError {
+            return
         } catch {
+            guard await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: context.userID,
+                sessionID: expectedSessionID
+            ) else { return }
             lastError = error.localizedDescription
         }
     }

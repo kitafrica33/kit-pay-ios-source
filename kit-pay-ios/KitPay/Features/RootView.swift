@@ -2,22 +2,9 @@ import SwiftUI
 
 struct RootView: View {
     @EnvironmentObject private var model: AppModel
-    /// The overlay-window presenter that owns the minimized call surfaces. Observed so the app
-    /// content reserves the audio call strip's height (pushing content below the strip) the
-    /// moment the strip appears, and releases it when the call ends or escalates to video.
-    @ObservedObject private var callOverlay = CallOverlayWindowController.shared.presenter
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isConversationPresented = false
     @State private var isProfileDetailPresented = false
     @State private var measuredTabBarHeight = RootTabBarLayoutPolicy.estimatedBarHeight
-
-    /// While the full-width audio call strip is on screen, app content shifts down by the strip's
-    /// content height and sits below it. The strip itself extends up behind the status area, so
-    /// adding its content height to the top safe area lines the content's top edge up with the
-    /// strip's bottom edge exactly.
-    private var reservesAudioCallStripSpace: Bool {
-        callOverlay.surfaceStyle == .audioStrip
-    }
 
     var body: some View {
         Group {
@@ -45,20 +32,9 @@ struct RootView: View {
                 OnboardingView()
             }
         }
-        // Reserved as a safe-area inset (not padding) so navigation bars and scroll views inside
-        // each tab treat the strip like system chrome and lay out below it. Sheets and covers
-        // still slide over the reserved space, and the strip window floats above them.
-        .safeAreaInset(edge: .top, spacing: 0) {
-            if reservesAudioCallStripSpace {
-                Color.clear
-                    .frame(height: CallBannerMetrics.contentHeight)
-                    .accessibilityHidden(true)
-            }
-        }
-        .animation(
-            reduceMotion ? nil : .snappy(duration: 0.3),
-            value: reservesAudioCallStripSpace
-        )
+        // The strip's push-down is applied by CallOverlayWindowController through the app
+        // window's `additionalSafeAreaInsets`: a SwiftUI safe-area inset here could not move
+        // UIKit navigation bars, which stayed pinned underneath the strip.
         .onChange(of: model.selectedTab) { previous, selected in
             // The id-driven task below is the sole automatic Home authorizer. This transition
             // only invalidates the visit that is no longer visible.

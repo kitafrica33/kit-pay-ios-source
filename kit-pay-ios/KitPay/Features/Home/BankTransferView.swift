@@ -102,6 +102,14 @@ final class BankTransferViewModel: ObservableObject {
 
     init(api: APIClient = .shared) {
         self.api = api
+#if DEBUG && APP_STORE_SCREENSHOTS
+        if AppStoreScreenshotFixture.isActive {
+            banks = AppStoreScreenshotFixture.banks
+            beneficiaries = AppStoreScreenshotFixture.bankBeneficiaries
+            operations = AppStoreScreenshotFixture.bankOperations
+            loadedBankCountry = "UG"
+        }
+#endif
     }
 
     deinit {
@@ -116,6 +124,19 @@ final class BankTransferViewModel: ObservableObject {
     }
 
     func load(country: String, permitted: Bool?, online: Bool) async {
+#if DEBUG && APP_STORE_SCREENSHOTS
+        if AppStoreScreenshotFixture.isActive {
+            banks = AppStoreScreenshotFixture.banks
+            beneficiaries = AppStoreScreenshotFixture.bankBeneficiaries
+            operations = AppStoreScreenshotFixture.bankOperations
+            loadedBankCountry = "UG"
+            bankCatalogErrorMessage = nil
+            beneficiaryLoadErrorMessage = nil
+            operationLoadErrorMessage = nil
+            errorMessage = nil
+            return
+        }
+#endif
         guard BankTransferLoadRequestPolicy.shouldStart(
             isCancelled: Task.isCancelled
         ) else { return }

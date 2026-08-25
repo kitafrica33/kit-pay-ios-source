@@ -18,6 +18,7 @@ from ios_profile_entitlements import (
 
 
 SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
+APP_STORE_SCREENSHOT_FIXTURE_MARKER = b"KITPAY_APP_STORE_SCREENSHOT_FIXTURE_V1"
 SOURCE_RELEASE_URL = (
     "https://github.com/kitafrica33/kit-pay-ios-source/releases/tag/"
     "v{version}-build{build_number}"
@@ -53,6 +54,20 @@ def digest(path: pathlib.Path) -> dict[str, object]:
     }
 
 
+def executable_contains(path: pathlib.Path, needle: bytes) -> bool:
+    if not path.is_file() or path.is_symlink():
+        fail(f"Expected a regular signed executable: {path}")
+    overlap = max(len(needle) - 1, 0)
+    tail = b""
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            candidate = tail + chunk
+            if needle in candidate:
+                return True
+            tail = candidate[-overlap:] if overlap else b""
+    return False
+
+
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--app", type=pathlib.Path, required=True)
@@ -86,6 +101,12 @@ def main() -> None:
         fail("The corresponding-source URL does not match the release identity")
 
     info = load_plist(args.app / "Info.plist", "Signed app Info.plist")
+    executable_name = info.get("CFBundleExecutable")
+    if not isinstance(executable_name, str) or not executable_name:
+        fail("Signed app Info.plist has no executable name")
+    executable = args.app / executable_name
+    if executable_contains(executable, APP_STORE_SCREENSHOT_FIXTURE_MARKER):
+        fail("Signed app contains the forbidden App Store screenshot fixture")
     privacy = load_plist(
         args.app / "PrivacyInfo.xcprivacy",
         "Signed app privacy manifest",

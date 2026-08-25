@@ -426,6 +426,7 @@ struct ForwardMessagesView: View {
             return lhs.id < rhs.id
         }
         for conversation in orderedConversations {
+            guard !model.isReadOnlyAppReviewDemoConversation(conversation.id) else { continue }
             let presentation = ConversationContactPresentationPolicy.presentation(
                 for: conversation,
                 currentUserID: currentUserID,

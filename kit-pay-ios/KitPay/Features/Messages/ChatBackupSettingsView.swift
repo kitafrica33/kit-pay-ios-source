@@ -15,6 +15,17 @@ struct ChatBackupSettingsView: View {
     var body: some View {
         ScrollView {
             VStack(spacing: 18) {
+                if model.appReviewDemoIsActive {
+                    Label(
+                        "Backups are disabled while read-only App Review previews are visible.",
+                        systemImage: "eye.fill"
+                    )
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(KitColor.secondaryText)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(14)
+                    .kitGlass(cornerRadius: 20, shadow: false)
+                }
                 explainerCard
                 backupNowCard
                 scheduleCard
@@ -101,12 +112,14 @@ struct ChatBackupSettingsView: View {
                 model.isBackingUpMessages
                     || model.isRestoringMessages
                     || model.isDeletingMessageBackup
+                    || model.appReviewDemoIsActive
                     || !model.isOnline
             )
             .opacity(
                 model.isBackingUpMessages
                     || model.isRestoringMessages
                     || model.isDeletingMessageBackup
+                    || model.appReviewDemoIsActive
                     || !model.isOnline ? 0.6 : 1
             )
 
@@ -135,7 +148,7 @@ struct ChatBackupSettingsView: View {
                 }
             }
             .pickerStyle(.segmented)
-            .disabled(model.isDeletingMessageBackup)
+            .disabled(model.isDeletingMessageBackup || model.appReviewDemoIsActive)
 
             Toggle(isOn: Binding(
                 get: { preferences.includesMedia },
@@ -151,7 +164,7 @@ struct ChatBackupSettingsView: View {
                 }
             }
             .tint(KitColor.green)
-            .disabled(model.isDeletingMessageBackup)
+            .disabled(model.isDeletingMessageBackup || model.appReviewDemoIsActive)
 
             if preferences.frequency != .off {
                 Label(

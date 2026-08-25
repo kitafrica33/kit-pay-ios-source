@@ -443,6 +443,7 @@ enum SecureMessagingExchangeError: LocalizedError, Equatable {
     case invalidAccount
     case invalidRecipient
     case invalidConversation
+    case messageNotRetryable
     case invalidServerResponse
     case unsupportedEvent(String)
     case staleOutboundFanout
@@ -453,6 +454,7 @@ enum SecureMessagingExchangeError: LocalizedError, Equatable {
         case .invalidAccount: "Your messaging account changed. Sign in again to continue."
         case .invalidRecipient: "Choose one valid Kit Pay recipient."
         case .invalidConversation: "This conversation is no longer available."
+        case .messageNotRetryable: "This message can no longer be retried."
         case .invalidServerResponse: "Kit could not load this conversation. Please try again."
         case .unsupportedEvent: "Kit could not process a message update. Please try again."
         case .staleOutboundFanout: "The recipient's devices changed. Retry the message."
@@ -938,6 +940,105 @@ actor SecureMessagingExchangeCoordinator {
             conversation: queuedConversation,
             clientMessageID: messageID
         )
+    }
+
+    /// Restores one commandless failed plaintext message to the encrypted outbox without network
+    /// access. This covers failures such as a stale device roster or sign-out cleanup, where the
+    /// original command was deliberately discarded but its client message UUID remains the
+    /// server idempotency key. Roster validation and fresh Signal fanout construction still occur
+    /// through `prepareDeferredMessage` when the outbox is next flushed.
+    func retryFailedTextMessage(
+        messageID: UUID,
+        forUserID userID: String,
+        conversationID: String,
+        expectedRecipientUserID: String,
+        commitAdmission: ProtectedCommunicationAdmissionLease? = nil
+    ) async throws -> SecureMessagingQueueResult {
+        let local = try canonicalUUID(userID, error: .invalidAccount)
+        let conversationID = try canonicalUUID(
+            conversationID,
+            error: .invalidConversation
+        )
+        let recipient = try canonicalUUID(
+            expectedRecipientUserID,
+            error: .invalidRecipient
+        )
+        guard local != recipient else { throw SecureMessagingExchangeError.invalidRecipient }
+
+        let snapshot = await store.snapshot()
+        let candidate = try Self.failedTextRetryCandidate(
+            in: snapshot,
+            messageID: messageID,
+            userID: local,
+            conversationID: conversationID,
+            recipientUserID: recipient
+        )
+        if candidate.alreadyQueued {
+            return SecureMessagingQueueResult(
+                conversation: candidate.conversation,
+                clientMessageID: messageID
+            )
+        }
+
+        var commandID = UUID()
+        while commandID == messageID { commandID = UUID() }
+        let command = OfflineCommand(
+            id: commandID,
+            kind: .secureMessage,
+            createdAt: candidate.message.createdAt,
+            nextAttemptAt: Date(),
+            attemptCount: 0,
+            conversationId: conversationID,
+            messageId: messageID,
+            recipientUserIds: [recipient],
+            recipientName: candidate.conversation.title,
+            video: nil,
+            expiresAt: nil,
+            secureMessageFanout: nil
+        )
+        let mutation: (inout PersistedState) throws -> Void = { state in
+            let current = try Self.failedTextRetryCandidate(
+                in: state,
+                messageID: messageID,
+                userID: local,
+                conversationID: conversationID,
+                recipientUserID: recipient
+            )
+            if current.alreadyQueued { return }
+            guard let messageIndex = state.messages.firstIndex(where: {
+                $0.id == messageID
+            }) else { throw SecureMessagingExchangeError.messageNotRetryable }
+            state.messages[messageIndex].state = .queued
+            state.messages[messageIndex].failureReason = nil
+            state.outbox.append(command)
+        }
+        if let commitAdmission {
+            try await store.update(admission: commitAdmission, mutation)
+        } else {
+            try await store.update(mutation)
+        }
+
+        return SecureMessagingQueueResult(
+            conversation: candidate.conversation,
+            clientMessageID: messageID
+        )
+    }
+
+    nonisolated static func canRetryFailedTextMessage(
+        in state: PersistedState,
+        messageID: UUID,
+        userID: String,
+        conversationID: String,
+        recipientUserID: String
+    ) -> Bool {
+        guard let candidate = try? failedTextRetryCandidate(
+            in: state,
+            messageID: messageID,
+            userID: userID,
+            conversationID: conversationID,
+            recipientUserID: recipientUserID
+        ) else { return false }
+        return candidate.message.state == .failed && !candidate.alreadyQueued
     }
 
     private static func existingDeferredTextResult(
@@ -3845,6 +3946,98 @@ actor SecureMessagingExchangeCoordinator {
         rawValue.flatMap(Self.serverDate) != nil
     }
 
+    private nonisolated static func failedTextRetryCandidate(
+        in state: PersistedState,
+        messageID: UUID,
+        userID: String,
+        conversationID: String,
+        recipientUserID: String
+    ) throws -> FailedTextRetryCandidate {
+        guard SecureMessagingValidation.isCanonicalUUID(userID),
+              SecureMessagingValidation.isCanonicalUUID(conversationID),
+              SecureMessagingValidation.isCanonicalUUID(recipientUserID),
+              state.profile?.id == userID,
+              state.communicationOwnerUserID == userID,
+              state.secureMessaging?.enrollment?.userID == userID,
+              userID != recipientUserID
+        else { throw SecureMessagingExchangeError.messageNotRetryable }
+
+        let conversations = state.conversations.filter { $0.id == conversationID }
+        guard conversations.count == 1,
+              let conversation = conversations.first,
+              conversation.participantUserIds.count == 2,
+              conversation.participantUserIds.allSatisfy(
+                  SecureMessagingValidation.isCanonicalUUID
+              ),
+              Set(conversation.participantUserIds) == Set([userID, recipientUserID])
+        else { throw SecureMessagingExchangeError.messageNotRetryable }
+
+        let messages = state.messages.filter { $0.id == messageID }
+        guard messages.count == 1,
+              let message = messages.first,
+              message.conversationId == conversationID,
+              message.senderId == userID,
+              message.isOutgoing,
+              message.serverMessageId == nil,
+              message.sentAt == nil,
+              message.attachmentData == nil,
+              message.pendingAttachment == nil,
+              message.secureMessagingHistory == nil
+        else { throw SecureMessagingExchangeError.messageNotRetryable }
+        let body = message.body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !body.isEmpty,
+              body == message.body,
+              body.unicodeScalars.count <= 8_000,
+              !body.unicodeScalars.contains(where: { $0.value == 0 }),
+              !body.hasPrefix(KitMediaMessageDescriptor.prefix),
+              KitMediaMessageDescriptor.parse(body) == nil,
+              SecureMessageReservedPrefixPolicy.allowsUserAuthoredText(body)
+        else { throw SecureMessagingExchangeError.messageNotRetryable }
+
+        let relatedCommands = state.outbox.filter {
+            $0.id == messageID || $0.messageId == messageID
+        }
+        if relatedCommands.isEmpty {
+            guard message.state == .failed else {
+                throw SecureMessagingExchangeError.messageNotRetryable
+            }
+            return FailedTextRetryCandidate(
+                conversation: conversation,
+                message: message,
+                alreadyQueued: false
+            )
+        }
+
+        guard relatedCommands.count == 1,
+              let command = relatedCommands.first,
+              state.outbox.filter({ $0.id == command.id }).count == 1,
+              message.state == .queued,
+              message.failureReason == nil,
+              command.kind == .secureMessage,
+              command.createdAt == message.createdAt,
+              command.attemptCount >= 0,
+              command.conversationId == conversationID,
+              command.messageId == messageID,
+              command.recipientUserIds == [recipientUserID],
+              command.video == nil,
+              command.expiresAt == nil,
+              command.callId == nil,
+              command.terminationKind == nil,
+              command.terminationReason == nil,
+              command.failureDisposition == nil,
+              command.lastFailureReason == nil,
+              command.secureMessageFanout.map({
+                  $0.clientMessageID == messageID.uuidString.lowercased()
+                      && $0.conversationID == conversationID
+              }) ?? true
+        else { throw SecureMessagingExchangeError.messageNotRetryable }
+        return FailedTextRetryCandidate(
+            conversation: conversation,
+            message: message,
+            alreadyQueued: true
+        )
+    }
+
     private static func serverDate(_ rawValue: String) -> Date? {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -3865,6 +4058,12 @@ actor SecureMessagingExchangeCoordinator {
             state.conversations.append(conversation)
         }
     }
+}
+
+private struct FailedTextRetryCandidate {
+    let conversation: Conversation
+    let message: LocalMessage
+    let alreadyQueued: Bool
 }
 
 private struct ValidatedDirectConversation {

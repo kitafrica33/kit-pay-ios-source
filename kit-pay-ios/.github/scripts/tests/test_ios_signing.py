@@ -25,6 +25,7 @@ CLOUDKIT_SCHEMA = ROOT / ".github/cloudkit/KitMessageBackup.ckdb"
 TEAM = "A1B2C3D4E5"
 CLOUDKIT_TEAM = "AU55CKVJ55"
 BUNDLE = "africa.kit.pay.ios"
+EXECUTABLE = "KitPay"
 PROFILE_UUID = "11111111-2222-3333-4444-555555555555"
 CERTIFICATE_DER = b"synthetic-distribution-certificate"
 SOURCE_URL = (
@@ -1444,10 +1445,12 @@ class VerifyIOSArchiveTests(unittest.TestCase):
             root = pathlib.Path(raw)
             app = root / "KitPay.app"
             app.mkdir()
+            (app / EXECUTABLE).write_bytes(b"synthetic-mach-o")
             write_plist(
                 app / "Info.plist",
                 {
                     "CFBundleIdentifier": BUNDLE,
+                    "CFBundleExecutable": EXECUTABLE,
                     "CFBundleShortVersionString": "1.2.3",
                     "CFBundleVersion": "42",
                     "KitCorrespondingSourceURL": SOURCE_URL,
@@ -1741,6 +1744,7 @@ class VerifyIOSArchiveTests(unittest.TestCase):
                 app / "Info.plist",
                 {
                     "CFBundleIdentifier": BUNDLE,
+                    "CFBundleExecutable": EXECUTABLE,
                     "CFBundleShortVersionString": "1.2.3",
                     "CFBundleVersion": "42",
                     "KitCorrespondingSourceURL": SOURCE_URL,
@@ -1760,6 +1764,7 @@ class VerifyIOSArchiveTests(unittest.TestCase):
                 app / "Info.plist",
                 {
                     "CFBundleIdentifier": BUNDLE,
+                    "CFBundleExecutable": EXECUTABLE,
                     "CFBundleShortVersionString": "1.2.3",
                     "CFBundleVersion": "42",
                     "KitCorrespondingSourceURL": SOURCE_URL,
@@ -1783,6 +1788,7 @@ class VerifyIOSArchiveTests(unittest.TestCase):
                 app / "Info.plist",
                 {
                     "CFBundleIdentifier": BUNDLE,
+                    "CFBundleExecutable": EXECUTABLE,
                     "CFBundleShortVersionString": "1.2.3",
                     "CFBundleVersion": "42",
                     "KitCorrespondingSourceURL": SOURCE_URL,
@@ -1806,6 +1812,7 @@ class VerifyIOSArchiveTests(unittest.TestCase):
 
             info = {
                 "CFBundleIdentifier": BUNDLE,
+                "CFBundleExecutable": EXECUTABLE,
                 "CFBundleShortVersionString": "1.2.3",
                 "CFBundleVersion": "42",
                 "KitCorrespondingSourceURL": SOURCE_URL + "/",
@@ -1826,6 +1833,22 @@ class VerifyIOSArchiveTests(unittest.TestCase):
 
             info["KitCorrespondingSourceURL"] = SOURCE_URL
             write_plist(app / "Info.plist", info)
+
+            (app / EXECUTABLE).write_bytes(
+                b"prefix-KITPAY_APP_STORE_SCREENSHOT_FIXTURE_V1-suffix"
+            )
+            fixture_in_release = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(fixture_in_release.returncode, 0)
+            self.assertIn(
+                "forbidden App Store screenshot fixture",
+                fixture_in_release.stderr,
+            )
+            (app / EXECUTABLE).write_bytes(b"synthetic-mach-o")
 
             write_plist(
                 signed,

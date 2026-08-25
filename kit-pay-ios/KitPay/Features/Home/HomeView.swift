@@ -313,7 +313,7 @@ struct HomeView: View {
     }
 
     private var greeting: String {
-        switch Calendar.current.component(.hour, from: Date()) {
+        switch AppPresentationClock.calendar.component(.hour, from: AppPresentationClock.now) {
         case 5..<12: "Good morning,"
         case 12..<17: "Good afternoon,"
         default: "Good evening,"

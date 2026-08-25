@@ -5,13 +5,14 @@ on:
   workflow_dispatch:
     inputs:
       marketing_version:
-        description: CFBundleShortVersionString (for example 0.2.7)
+        description: CFBundleShortVersionString (for example 1.0)
         required: true
-        default: 0.2.7
+        default: 1.0
         type: string
       build_number:
         description: Monotonically increasing integer CFBundleVersion
         required: true
+        default: "23"
         type: string
       confirmation:
         description: Type ARCHIVE_KIT_PAY_APP_STORE
@@ -20,7 +21,7 @@ on:
       corresponding_source_url:
         description: >-
           Exact public AGPL corresponding-source release URL for this build, for example
-          https://github.com/kitafrica33/kit-pay-ios-source/releases/tag/v0.2.5-build15 .
+          https://github.com/kitafrica33/kit-pay-ios-source/releases/tag/v1.0-build23 .
           The archive is rejected unless this tagged release is already publicly available.
         required: true
         type: string
@@ -91,6 +92,8 @@ jobs:
         run: pod install --repo-update
       - name: Test release validators
         run: python3 -m unittest discover -s .github/scripts/tests -p 'test_ios_signing.py'
+      - name: Test App Store screenshot evidence tools
+        run: python3 -m unittest discover -s .github/scripts/tests -p 'test_*screenshots.py'
       - name: Build and run unit tests without signing material
         run: |
           set -euo pipefail
