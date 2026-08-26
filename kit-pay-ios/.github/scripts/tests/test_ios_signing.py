@@ -34,6 +34,10 @@ SOURCE_URL = (
 )
 ICLOUD_CONTAINER = f"iCloud.{BUNDLE}"
 ICLOUD_ENVIRONMENT_KEY = "com.apple.developer.icloud-container-environment"
+APP_GROUP_KEY = "com.apple.security.application-groups"
+APP_GROUP = "group.africa.kit.pay.ios"
+SHARE_BUNDLE = "africa.kit.pay.ios.share"
+SHARE_PROFILE_UUID = "66666666-7777-8888-9999-aaaaaaaaaaaa"
 
 PROFILE_GENERATOR_SPEC = importlib.util.spec_from_file_location(
     "kitpay_create_ios_app_store_profile",
@@ -75,6 +79,24 @@ def profile(aps_environment: str = "production") -> dict:
             "com.apple.developer.icloud-container-identifiers": [ICLOUD_CONTAINER],
             "com.apple.developer.icloud-services": ["CloudKit"],
             ICLOUD_ENVIRONMENT_KEY: "Production",
+            APP_GROUP_KEY: [APP_GROUP],
+        },
+    }
+
+
+def share_profile() -> dict:
+    """A share-extension distribution profile: the app group, and nothing else."""
+    return {
+        "UUID": SHARE_PROFILE_UUID,
+        "Platform": ["iOS"],
+        "DeveloperCertificates": [CERTIFICATE_DER],
+        "TeamIdentifier": [TEAM],
+        "ExpirationDate": dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=30),
+        "Entitlements": {
+            "application-identifier": f"{TEAM}.{SHARE_BUNDLE}",
+            "com.apple.developer.team-identifier": TEAM,
+            "get-task-allow": False,
+            APP_GROUP_KEY: [APP_GROUP],
         },
     }
 
@@ -115,6 +137,16 @@ def capability_resource(
                 }
             ],
         },
+    }
+
+
+def app_groups_capability_resource(
+    *, resource_id: str = "app-groups-capability"
+) -> dict[str, object]:
+    return {
+        "type": "bundleIdCapabilities",
+        "id": resource_id,
+        "attributes": {"capabilityType": "APP_GROUPS"},
     }
 
 
@@ -219,6 +251,8 @@ class PrepareIOSSigningTests(unittest.TestCase):
                 [
                     "python3",
                     str(PREPARE),
+                    "--app-group",
+                    APP_GROUP,
                     "--profile-plist",
                     str(profile_path),
                     "--certificate-der",
@@ -245,6 +279,141 @@ class PrepareIOSSigningTests(unittest.TestCase):
             self.assertEqual(export["provisioningProfiles"], {BUNDLE: PROFILE_UUID})
             self.assertEqual(uuid_path.read_text(encoding="ascii").strip(), PROFILE_UUID)
 
+    def test_share_extension_profile_joins_the_app_export_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = pathlib.Path(raw)
+            export_path = root / "ExportOptions.plist"
+            certificate_path = root / "distribution.der"
+            certificate_path.write_bytes(CERTIFICATE_DER)
+            app_profile_path = root / "profile.plist"
+            share_profile_path = root / "share-profile.plist"
+            write_plist(app_profile_path, profile())
+            write_plist(share_profile_path, share_profile())
+
+            for role, bundle, profile_path, uuid_name in (
+                ("app", BUNDLE, app_profile_path, "uuid"),
+                ("extension", SHARE_BUNDLE, share_profile_path, "share-uuid"),
+            ):
+                subprocess.run(
+                    [
+                        "python3",
+                        str(PREPARE),
+                        "--app-group",
+                        APP_GROUP,
+                        "--profile-plist",
+                        str(profile_path),
+                        "--certificate-der",
+                        str(certificate_path),
+                        "--bundle-id",
+                        bundle,
+                        "--team-id",
+                        TEAM,
+                        "--role",
+                        role,
+                        "--export-options",
+                        str(export_path),
+                        "--profile-uuid-output",
+                        str(root / uuid_name),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+
+            with export_path.open("rb") as source:
+                export = plistlib.load(source)
+            # Manual signing needs one profile per signed bundle; losing either entry fails the
+            # export with a message that never mentions the extension.
+            self.assertEqual(
+                export["provisioningProfiles"],
+                {BUNDLE: PROFILE_UUID, SHARE_BUNDLE: SHARE_PROFILE_UUID},
+            )
+            self.assertEqual(export["signingStyle"], "manual")
+
+    def test_rejects_profiles_that_do_not_authorize_the_app_group(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = pathlib.Path(raw)
+            certificate_path = root / "distribution.der"
+            certificate_path.write_bytes(CERTIFICATE_DER)
+            cases = (
+                ("app", BUNDLE, profile()),
+                ("extension", SHARE_BUNDLE, share_profile()),
+            )
+
+            for role, bundle, candidate in cases:
+                with self.subTest(role=role):
+                    candidate["Entitlements"].pop(APP_GROUP_KEY)
+                    profile_path = root / f"{role}.plist"
+                    write_plist(profile_path, candidate)
+
+                    result = subprocess.run(
+                        [
+                            "python3",
+                            str(PREPARE),
+                            "--app-group",
+                            APP_GROUP,
+                            "--profile-plist",
+                            str(profile_path),
+                            "--certificate-der",
+                            str(certificate_path),
+                            "--bundle-id",
+                            bundle,
+                            "--team-id",
+                            TEAM,
+                            "--role",
+                            role,
+                            "--export-options",
+                            str(root / f"{role}-ExportOptions.plist"),
+                            "--profile-uuid-output",
+                            str(root / f"{role}-uuid"),
+                        ],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("App Groups", result.stderr)
+
+    def test_rejects_a_share_extension_profile_that_reaches_further(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = pathlib.Path(raw)
+            certificate_path = root / "distribution.der"
+            certificate_path.write_bytes(CERTIFICATE_DER)
+            overreaching = share_profile()
+            overreaching["Entitlements"]["aps-environment"] = "production"
+            profile_path = root / "share-profile.plist"
+            write_plist(profile_path, overreaching)
+
+            result = subprocess.run(
+                [
+                    "python3",
+                    str(PREPARE),
+                    "--app-group",
+                    APP_GROUP,
+                    "--profile-plist",
+                    str(profile_path),
+                    "--certificate-der",
+                    str(certificate_path),
+                    "--bundle-id",
+                    SHARE_BUNDLE,
+                    "--team-id",
+                    TEAM,
+                    "--role",
+                    "extension",
+                    "--export-options",
+                    str(root / "ExportOptions.plist"),
+                    "--profile-uuid-output",
+                    str(root / "uuid"),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("push notifications", result.stderr)
+
     def test_accepts_profile_icloud_authorization_supersets(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = pathlib.Path(raw)
@@ -254,6 +423,8 @@ class PrepareIOSSigningTests(unittest.TestCase):
             command = [
                 "python3",
                 str(PREPARE),
+                "--app-group",
+                APP_GROUP,
                 "--profile-plist",
                 str(profile_path),
                 "--certificate-der",
@@ -302,6 +473,8 @@ class PrepareIOSSigningTests(unittest.TestCase):
                 [
                     "python3",
                     str(PREPARE),
+                    "--app-group",
+                    APP_GROUP,
                     "--profile-plist",
                     str(profile_path),
                     "--certificate-der",
@@ -336,6 +509,8 @@ class PrepareIOSSigningTests(unittest.TestCase):
             command = [
                 "python3",
                 str(PREPARE),
+                "--app-group",
+                APP_GROUP,
                 "--profile-plist",
                 str(profile_path),
                 "--certificate-der",
@@ -443,6 +618,8 @@ class PrepareIOSSigningTests(unittest.TestCase):
             common = [
                 "python3",
                 str(PREPARE),
+                "--app-group",
+                APP_GROUP,
                 "--profile-plist",
                 str(profile_path),
                 "--certificate-der",
@@ -528,6 +705,63 @@ class AppStoreProfileGeneratorTests(unittest.TestCase):
             client.calls[0]["query"],
             {"fields[bundleIdCapabilities]": "capabilityType,settings"},
         )
+
+    def test_app_groups_capability_is_enabled_and_verified(self) -> None:
+        client = FakeAppStoreConnectClient(
+            [
+                api_collection([]),
+                {"data": app_groups_capability_resource()},
+                api_collection([app_groups_capability_resource()]),
+            ]
+        )
+
+        PROFILE_GENERATOR._ensure_app_groups_enabled(client, "bundle-resource", sleep=lambda _: None)
+
+        mutation = client.calls[1]
+        self.assertEqual(mutation["method"], "POST")
+        self.assertEqual(mutation["path"], "/v1/bundleIdCapabilities")
+        self.assertEqual(
+            mutation["body"],
+            {
+                "data": {
+                    "type": "bundleIdCapabilities",
+                    "attributes": {"capabilityType": "APP_GROUPS"},
+                    "relationships": {
+                        "bundleId": {
+                            "data": {"type": "bundleIds", "id": "bundle-resource"}
+                        }
+                    },
+                }
+            },
+        )
+
+    def test_missing_extension_bundle_id_is_registered_explicitly(self) -> None:
+        client = FakeAppStoreConnectClient(
+            [
+                api_collection([]),
+                {
+                    "data": {
+                        "type": "bundleIds",
+                        "id": "share-bundle-resource",
+                        "attributes": {
+                            "identifier": SHARE_BUNDLE,
+                            "name": "Kit Pay Share",
+                            "platform": "IOS",
+                        },
+                    }
+                },
+            ]
+        )
+
+        resource_id = PROFILE_GENERATOR._ensure_bundle_id(
+            client,
+            SHARE_BUNDLE,
+            "Kit Pay Share",
+        )
+
+        self.assertEqual(resource_id, "share-bundle-resource")
+        self.assertEqual(client.calls[1]["method"], "POST")
+        self.assertEqual(client.calls[1]["path"], "/v1/bundleIds")
 
     def test_missing_capability_uses_exact_creation_body(self) -> None:
         client = FakeAppStoreConnectClient(
@@ -848,6 +1082,66 @@ class AppStoreProfileGeneratorTests(unittest.TestCase):
                         CERTIFICATE_DER,
                     )
 
+    def test_share_extension_profile_never_touches_the_icloud_capability(self) -> None:
+        profile_bytes = b"\x30" + (b"p" * 255)
+        client = FakeAppStoreConnectClient(
+            [
+                api_collection(
+                    [
+                        {
+                            "type": "bundleIds",
+                            "id": "share-bundle-resource",
+                            "attributes": {
+                                "identifier": SHARE_BUNDLE,
+                                "platform": "IOS",
+                            },
+                        }
+                    ]
+                ),
+                api_collection([app_groups_capability_resource()]),
+                api_collection([certificate_resource(CERTIFICATE_DER)]),
+                {
+                    "data": {
+                        "type": "profiles",
+                        "id": "share-profile-resource",
+                        "attributes": {
+                            "name": "Kit Pay Share App Store 123-1",
+                            "platform": "IOS",
+                            "profileType": "IOS_APP_STORE",
+                            "profileState": "ACTIVE",
+                            "uuid": SHARE_PROFILE_UUID,
+                            "expirationDate": "2999-01-01T00:00:00Z",
+                            "profileContent": base64.b64encode(profile_bytes).decode(
+                                "ascii"
+                            ),
+                        },
+                    }
+                },
+            ]
+        )
+
+        result = PROFILE_GENERATOR.provision_profile(
+            client,
+            bundle_id=SHARE_BUNDLE,
+            certificate_der=CERTIFICATE_DER,
+            profile_name="Kit Pay Share App Store 123-1",
+            icloud=False,
+        )
+
+        self.assertEqual(result, profile_bytes)
+        # The extension has no iCloud capability to enable, and asking to enable one would grant
+        # it reach it must never have.
+        capability_mutations = [
+            call
+            for call in client.calls
+            if call["method"] != "GET"
+            and "bundleIdCapabilities" in str(call["path"])
+        ]
+        self.assertFalse(capability_mutations)
+        self.assertTrue(
+            [call for call in client.calls if "bundleIdCapabilities" in str(call["path"])]
+        )
+
     def test_profile_creation_uses_exact_app_store_request(self) -> None:
         profile_bytes = b"\x30" + (b"p" * 255)
         client = FakeAppStoreConnectClient(
@@ -1076,15 +1370,17 @@ class AppStoreProfileGeneratorTests(unittest.TestCase):
 
 
 class SigningConfigurationTests(unittest.TestCase):
-    def test_build_27_release_identity_is_consistent(self) -> None:
+    def test_build_28_release_identity_is_consistent(self) -> None:
         workflow = (ROOT / ".github/workflows/ios-app-store-archive.yml").read_text()
         project = (ROOT / "KitPay.xcodeproj/project.pbxproj").read_text()
 
         self.assertIn("default: 1.0.16", workflow)
-        self.assertIn('default: "27"', workflow)
-        self.assertIn("v1.0.16-build27", workflow)
-        self.assertEqual(project.count("MARKETING_VERSION = 1.0.16;"), 2)
-        self.assertEqual(project.count("CURRENT_PROJECT_VERSION = 27;"), 2)
+        self.assertIn('default: "28"', workflow)
+        self.assertIn("v1.0.16-build28", workflow)
+        # Four each: Debug and Release of the app and of the share extension. iOS refuses to
+        # install an app whose extension carries a different version, so they move together.
+        self.assertEqual(project.count("MARKETING_VERSION = 1.0.16;"), 4)
+        self.assertEqual(project.count("CURRENT_PROJECT_VERSION = 28;"), 4)
         self.assertNotIn("MARKETING_VERSION = 1.0.1;", project)
 
     def test_manual_profile_is_scoped_to_the_app_target(self) -> None:
@@ -1092,12 +1388,45 @@ class SigningConfigurationTests(unittest.TestCase):
         project = (ROOT / "KitPay.xcodeproj/project.pbxproj").read_text()
 
         self.assertIn('KITPAY_PROFILE_UUID="$profile_uuid"', workflow)
+        self.assertIn('KITPAY_SHARE_PROFILE_UUID="$share_profile_uuid"', workflow)
         self.assertNotIn('PROVISIONING_PROFILE_SPECIFIER="$profile_uuid"', workflow)
         self.assertIn(
             'PROVISIONING_PROFILE_SPECIFIER = "$(KITPAY_PROFILE_UUID)"',
             project,
         )
+        self.assertIn(
+            'PROVISIONING_PROFILE_SPECIFIER = "$(KITPAY_SHARE_PROFILE_UUID)"',
+            project,
+        )
         self.assertIn('DEVELOPMENT_TEAM = "$(KITPAY_APPLE_TEAM_ID)"', project)
+
+    def test_share_extension_is_embedded_and_scoped_to_the_app_group(self) -> None:
+        project = (ROOT / "KitPay.xcodeproj/project.pbxproj").read_text()
+        with (ROOT / "KitPay/KitPay.entitlements").open("rb") as source:
+            app_entitlements = plistlib.load(source)
+        with (ROOT / "KitPayShare/KitPayShare.entitlements").open("rb") as source:
+            share_entitlements = plistlib.load(source)
+        with (ROOT / "KitPayShare/Info.plist").open("rb") as source:
+            share_info = plistlib.load(source)
+
+        self.assertIn('productType = "com.apple.product-type.app-extension"', project)
+        self.assertIn(f"PRODUCT_BUNDLE_IDENTIFIER = {SHARE_BUNDLE};", project)
+        self.assertIn("dstSubfolderSpec = 13", project)
+        self.assertIn("Embed Foundation Extensions", project)
+        self.assertIn("CODE_SIGN_ENTITLEMENTS = KitPayShare/KitPayShare.entitlements;", project)
+        self.assertEqual(project.count("APPLICATION_EXTENSION_API_ONLY = YES;"), 2)
+        self.assertIn('--register-bundle-name "Kit Pay Share"', (
+            ROOT / ".github/workflows/ios-app-store-archive.yml"
+        ).read_text())
+
+        self.assertEqual(app_entitlements.get(APP_GROUP_KEY), [APP_GROUP])
+        # The extension's only reach is the app group. Nothing else: no keychain, no iCloud, no
+        # push — it stages files and hands off.
+        self.assertEqual(share_entitlements, {APP_GROUP_KEY: [APP_GROUP]})
+        self.assertEqual(
+            share_info["NSExtension"]["NSExtensionPointIdentifier"],
+            "com.apple.share-services",
+        )
 
     def test_call_ui_supports_landscape_on_phone_and_tablet(self) -> None:
         with (ROOT / "KitPay/Info.plist").open("rb") as source:
@@ -1480,6 +1809,31 @@ class VerifyIOSArchiveTests(unittest.TestCase):
                     ]
                 },
             )
+            extension_path = app / "PlugIns" / "KitPayShare.appex"
+            extension_path.mkdir(parents=True)
+            write_plist(
+                extension_path / "Info.plist",
+                {
+                    "CFBundleIdentifier": SHARE_BUNDLE,
+                    "CFBundleShortVersionString": "1.2.3",
+                    "CFBundleVersion": "42",
+                    "NSExtension": {
+                        "NSExtensionPointIdentifier": "com.apple.share-services",
+                    },
+                },
+            )
+            extension_embedded = root / "share-embedded.plist"
+            extension_signed = root / "share-signed.plist"
+            write_plist(extension_embedded, share_profile())
+            write_plist(
+                extension_signed,
+                {
+                    "application-identifier": f"{TEAM}.{SHARE_BUNDLE}",
+                    "com.apple.developer.team-identifier": TEAM,
+                    "get-task-allow": False,
+                    APP_GROUP_KEY: [APP_GROUP],
+                },
+            )
             embedded = root / "embedded.plist"
             signed = root / "signed.plist"
             write_plist(embedded, profile())
@@ -1495,6 +1849,7 @@ class VerifyIOSArchiveTests(unittest.TestCase):
                     ],
                     "com.apple.developer.icloud-services": ["CloudKit"],
                     ICLOUD_ENVIRONMENT_KEY: "Production",
+                    APP_GROUP_KEY: [APP_GROUP],
                 },
             )
             artifacts = []
@@ -1523,6 +1878,18 @@ class VerifyIOSArchiveTests(unittest.TestCase):
                 BUNDLE,
                 "--team-id",
                 TEAM,
+                "--extension",
+                str(extension_path),
+                "--extension-bundle-id",
+                SHARE_BUNDLE,
+                "--extension-profile-plist",
+                str(extension_embedded),
+                "--extension-entitlements-plist",
+                str(extension_signed),
+                "--expected-extension-profile-uuid",
+                SHARE_PROFILE_UUID,
+                "--app-group",
+                APP_GROUP,
                 "--version",
                 "1.2.3",
                 "--build-number",

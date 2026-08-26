@@ -213,7 +213,7 @@ struct HomeView: View {
             service("Pay bills", "doc.text.fill", providerEntry: .bills, available: canPayBills)
             service("Airtime", "iphone.gen3", providerEntry: .airtime, available: canBuyAirtime)
             service("Mobile", "iphone.gen3.radiowaves.left.and.right", feature: .mobileMoney, available: canUseMobileMoney)
-            service("Bank", "building.columns.fill", feature: .bankTransfer, available: canUseBankTransfers)
+            service("Bank", "building.columns.fill", feature: .bankTransfer, available: canUseBank)
             service("Scan", "qrcode.viewfinder", feature: .scanQR, available: canUseMerchantQR)
         }
     }
@@ -371,8 +371,9 @@ struct HomeView: View {
         model.capabilities?.enablesMobileMoney == true
     }
 
-    private var canUseBankTransfers: Bool {
+    private var canUseBank: Bool {
         model.capabilities?.enablesBankTransfers == true
+            || model.capabilities?.enablesBankDeposits == true
     }
 
     private var canUseMerchantQR: Bool {

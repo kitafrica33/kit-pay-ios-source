@@ -12,7 +12,7 @@ on:
       build_number:
         description: Monotonically increasing integer CFBundleVersion
         required: true
-        default: "27"
+        default: "28"
         type: string
       confirmation:
         description: Type ARCHIVE_KIT_PAY_APP_STORE
@@ -21,7 +21,7 @@ on:
       corresponding_source_url:
         description: >-
           Exact public AGPL corresponding-source release URL for this build, for example
-          https://github.com/kitafrica33/kit-pay-ios-source/releases/tag/v1.0.16-build27 .
+          https://github.com/kitafrica33/kit-pay-ios-source/releases/tag/v1.0.16-build28 .
           The archive is rejected unless this tagged release is already publicly available.
         required: true
         type: string
@@ -122,6 +122,8 @@ jobs:
     environment: production
     env:
       IOS_BUNDLE_ID: africa.kit.pay.ios
+      IOS_SHARE_BUNDLE_ID: africa.kit.pay.ios.share
+      IOS_APP_GROUP: group.africa.kit.pay.ios
       MARKETING_VERSION: ${{ inputs.marketing_version }}
       BUILD_NUMBER: ${{ inputs.build_number }}
       CORRESPONDING_SOURCE_URL: ${{ needs.quality.outputs.corresponding_source_url }}
@@ -250,6 +252,16 @@ jobs:
             --certificate-der "$RUNNER_TEMP/kitpay-distribution-certificate.der" \
             --profile-name "Kit Pay App Store ${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
             --profile-output "$RUNNER_TEMP/kitpay-app-store.mobileprovision"
+          # The share extension is a second signed bundle inside the same IPA, so it needs its own
+          # App Store profile. It has no iCloud capability to enable — only the shared app group,
+          # which both App IDs must already carry.
+          python3 .github/scripts/create_ios_app_store_profile.py \
+            --bundle-id "$IOS_SHARE_BUNDLE_ID" \
+            --certificate-der "$RUNNER_TEMP/kitpay-distribution-certificate.der" \
+            --profile-name "Kit Pay Share App Store ${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --profile-output "$RUNNER_TEMP/kitpay-share-app-store.mobileprovision" \
+            --register-bundle-name "Kit Pay Share" \
+            --skip-icloud-capability
 
       - name: Validate and install generated App Store profile
         env:
@@ -258,29 +270,50 @@ jobs:
           set -euo pipefail
           test -n "${APPLE_TEAM_ID:-}"
           test -s "$RUNNER_TEMP/kitpay-app-store.mobileprovision"
+          test -s "$RUNNER_TEMP/kitpay-share-app-store.mobileprovision"
           security cms -D \
             -i "$RUNNER_TEMP/kitpay-app-store.mobileprovision" \
             > "$RUNNER_TEMP/kitpay-profile.plist"
+          security cms -D \
+            -i "$RUNNER_TEMP/kitpay-share-app-store.mobileprovision" \
+            > "$RUNNER_TEMP/kitpay-share-profile.plist"
           python3 .github/scripts/prepare_ios_signing.py \
             --profile-plist "$RUNNER_TEMP/kitpay-profile.plist" \
             --certificate-der "$RUNNER_TEMP/kitpay-distribution-certificate.der" \
             --bundle-id "$IOS_BUNDLE_ID" \
             --team-id "$APPLE_TEAM_ID" \
+            --role app \
+            --app-group "$IOS_APP_GROUP" \
             --export-options "$RUNNER_TEMP/KitPayExportOptions.generated.plist" \
             --profile-uuid-output "$RUNNER_TEMP/kitpay-profile-uuid"
+          # Adds the extension to the same export options mapping the app just wrote.
+          python3 .github/scripts/prepare_ios_signing.py \
+            --profile-plist "$RUNNER_TEMP/kitpay-share-profile.plist" \
+            --certificate-der "$RUNNER_TEMP/kitpay-distribution-certificate.der" \
+            --bundle-id "$IOS_SHARE_BUNDLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --role extension \
+            --app-group "$IOS_APP_GROUP" \
+            --export-options "$RUNNER_TEMP/KitPayExportOptions.generated.plist" \
+            --profile-uuid-output "$RUNNER_TEMP/kitpay-share-profile-uuid"
 
-          profile_uuid="$(<"$RUNNER_TEMP/kitpay-profile-uuid")"
           profile_directory="$HOME/Library/MobileDevice/Provisioning Profiles"
           mkdir -p "$profile_directory"
+          profile_uuid="$(<"$RUNNER_TEMP/kitpay-profile-uuid")"
           install -m 600 \
             "$RUNNER_TEMP/kitpay-app-store.mobileprovision" \
             "$profile_directory/${profile_uuid}.mobileprovision"
+          share_profile_uuid="$(<"$RUNNER_TEMP/kitpay-share-profile-uuid")"
+          install -m 600 \
+            "$RUNNER_TEMP/kitpay-share-app-store.mobileprovision" \
+            "$profile_directory/${share_profile_uuid}.mobileprovision"
       - name: Archive and export signed IPA
         env:
           APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
           profile_uuid="$(<"$RUNNER_TEMP/kitpay-profile-uuid")"
+          share_profile_uuid="$(<"$RUNNER_TEMP/kitpay-share-profile-uuid")"
           archive_path="$RUNNER_TEMP/KitPay.xcarchive"
           export_path="$GITHUB_WORKSPACE/build/app-store"
           mkdir -p "$export_path"
@@ -293,6 +326,7 @@ jobs:
             -archivePath "$archive_path" \
             KITPAY_APPLE_TEAM_ID="$APPLE_TEAM_ID" \
             KITPAY_PROFILE_UUID="$profile_uuid" \
+            KITPAY_SHARE_PROFILE_UUID="$share_profile_uuid" \
             SWIFT_ENABLE_EXPLICIT_MODULES=NO \
             MARKETING_VERSION="$MARKETING_VERSION" \
             CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
@@ -341,9 +375,29 @@ jobs:
           codesign -d --entitlements :- "$app_path" \
             > "$RUNNER_TEMP/kitpay-signed-entitlements.plist" 2>/dev/null
 
+          # The share extension is the only other signed bundle in the IPA. Exactly one, at the
+          # only place iOS will load it from.
+          plugin_count="$(find "$app_path/PlugIns" -maxdepth 1 -type d -name '*.appex' | wc -l | tr -d ' ')"
+          test "$plugin_count" = '1'
+          extension_path="$app_path/PlugIns/KitPayShare.appex"
+          test -d "$extension_path"
+          test -s "$extension_path/embedded.mobileprovision"
+          security cms -D \
+            -i "$extension_path/embedded.mobileprovision" \
+            > "$RUNNER_TEMP/kitpay-share-embedded-profile.plist"
+          codesign -d --entitlements :- "$extension_path" \
+            > "$RUNNER_TEMP/kitpay-share-signed-entitlements.plist" 2>/dev/null
+
           profile_uuid="$(<"$RUNNER_TEMP/kitpay-profile-uuid")"
+          share_profile_uuid="$(<"$RUNNER_TEMP/kitpay-share-profile-uuid")"
           python3 .github/scripts/verify_ios_archive.py \
             --app "$app_path" \
+            --extension "$extension_path" \
+            --extension-bundle-id "$IOS_SHARE_BUNDLE_ID" \
+            --extension-profile-plist "$RUNNER_TEMP/kitpay-share-embedded-profile.plist" \
+            --extension-entitlements-plist "$RUNNER_TEMP/kitpay-share-signed-entitlements.plist" \
+            --expected-extension-profile-uuid "$share_profile_uuid" \
+            --app-group "$IOS_APP_GROUP" \
             --embedded-profile-plist "$RUNNER_TEMP/kitpay-embedded-profile.plist" \
             --signed-entitlements-plist "$RUNNER_TEMP/kitpay-signed-entitlements.plist" \
             --expected-profile-uuid "$profile_uuid" \
@@ -375,12 +429,16 @@ jobs:
         if: ${{ always() }}
         run: |
           set +e
-          if [[ -f "$RUNNER_TEMP/kitpay-profile-uuid" ]]; then
-            profile_uuid="$(<"$RUNNER_TEMP/kitpay-profile-uuid")"
-            if [[ "$profile_uuid" =~ ^[0-9A-Fa-f-]{36}$ ]]; then
-              rm -f "$HOME/Library/MobileDevice/Provisioning Profiles/${profile_uuid}.mobileprovision"
+          for uuid_file in \
+            "$RUNNER_TEMP/kitpay-profile-uuid" \
+            "$RUNNER_TEMP/kitpay-share-profile-uuid"; do
+            if [[ -f "$uuid_file" ]]; then
+              profile_uuid="$(<"$uuid_file")"
+              if [[ "$profile_uuid" =~ ^[0-9A-Fa-f-]{36}$ ]]; then
+                rm -f "$HOME/Library/MobileDevice/Provisioning Profiles/${profile_uuid}.mobileprovision"
+              fi
             fi
-          fi
+          done
           security delete-keychain "$RUNNER_TEMP/kitpay-signing.keychain-db" 2>/dev/null
           rm -rf \
             "$RUNNER_TEMP/KitPay.xcarchive" \
@@ -390,10 +448,15 @@ jobs:
             "$RUNNER_TEMP/kitpay-distribution-certificate.pem" \
             "$RUNNER_TEMP/kitpay-distribution-certificate.der" \
             "$RUNNER_TEMP/kitpay-app-store.mobileprovision" \
+            "$RUNNER_TEMP/kitpay-share-app-store.mobileprovision" \
             "$RUNNER_TEMP/kitpay-profile.plist" \
+            "$RUNNER_TEMP/kitpay-share-profile.plist" \
             "$RUNNER_TEMP/kitpay-embedded-profile.plist" \
+            "$RUNNER_TEMP/kitpay-share-embedded-profile.plist" \
             "$RUNNER_TEMP/kitpay-signed-entitlements.plist" \
+            "$RUNNER_TEMP/kitpay-share-signed-entitlements.plist" \
             "$RUNNER_TEMP/kitpay-profile-uuid" \
+            "$RUNNER_TEMP/kitpay-share-profile-uuid" \
             "$RUNNER_TEMP/kitpay-original-keychains.txt" \
             "$RUNNER_TEMP/kitpay-code-signing-identities.txt" \
             "$RUNNER_TEMP/KitPayExportOptions.generated.plist"

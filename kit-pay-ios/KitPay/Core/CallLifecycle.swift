@@ -1371,6 +1371,10 @@ struct ConversationTimelineDateSeparator: Equatable, Sendable {
 enum ConversationTimelineItem: Identifiable, Equatable {
     case message(LocalMessage)
     case payment(LocalMessage, KitPaymentMessage)
+    /// A group payment's announcement: the golden card each recipient claims their own share from.
+    case groupPayment(LocalMessage, KitGroupPaymentMessage)
+    /// Somebody answering a group payment, shown as a small centred line like a date heading.
+    case groupPaymentEvent(LocalMessage, KitGroupPaymentMessage)
     case call(CallRecord)
     case dateSeparator(ConversationTimelineDateSeparator)
 
@@ -1380,6 +1384,10 @@ enum ConversationTimelineItem: Identifiable, Equatable {
             "message:\(message.id.uuidString.lowercased())"
         case .payment(let message, _):
             "payment:\(message.id.uuidString.lowercased())"
+        case .groupPayment(let message, _):
+            "group-payment:\(message.id.uuidString.lowercased())"
+        case .groupPaymentEvent(let message, _):
+            "group-payment-event:\(message.id.uuidString.lowercased())"
         case .call(let call):
             "call:\(call.id.lowercased())"
         case .dateSeparator(let separator):
@@ -1394,6 +1402,8 @@ enum ConversationTimelineItem: Identifiable, Equatable {
         // time would file it under yesterday's date separator.
         case .message(let message): message.timelineDate
         case .payment(let message, _): message.timelineDate
+        case .groupPayment(let message, _): message.timelineDate
+        case .groupPaymentEvent(let message, _): message.timelineDate
         case .call(let call): call.startedAt
         case .dateSeparator(let separator): separator.day
         }
@@ -1466,8 +1476,37 @@ enum ConversationTimelinePolicy {
             return canonicalUUID($0.conversationId) == conversationID
         }
         candidates.reserveCapacity(matchingMessages.count + calls.count)
+        // Announcements first: an outcome is only believable in the company of the payment it
+        // answers, and the announcement is the only offline record of who sent that payment.
+        let groupPayments = canonicalUUID(conversation.id) != nil && conversation.isGroup
+            ? groupPaymentAnnouncements(in: matchingMessages)
+            : [:]
+        var claimedGroupPayments: Set<String> = []
+        var answeredGroupPayments: Set<String> = []
         for message in matchingMessages {
             let item: ConversationTimelineItem
+            if !groupPayments.isEmpty || KitGroupPaymentMessage.isGroupPaymentText(message.body) {
+                switch groupPaymentItem(
+                    for: message,
+                    announcements: groupPayments,
+                    claimedAnnouncements: &claimedGroupPayments,
+                    answeredShares: &answeredGroupPayments
+                ) {
+                case .project(let projected):
+                    candidates.append(
+                        Candidate(
+                            item: projected,
+                            kindOrder: 0,
+                            stableID: message.id.uuidString.lowercased()
+                        )
+                    )
+                    continue
+                case .drop:
+                    continue
+                case .notAGroupPayment:
+                    break
+                }
+            }
             if let paymentRecipient,
                paymentMessageSenderIsValid(
                    message,
@@ -1554,6 +1593,83 @@ enum ConversationTimelinePolicy {
             result.append(item)
         }
         return result
+    }
+
+    private enum GroupPaymentProjection {
+        case project(ConversationTimelineItem)
+        /// Group wire this thread must not render: a forgery, a duplicate, or an answer to a
+        /// payment that was never announced here. Dropped rather than shown as raw text.
+        case drop
+        case notAGroupPayment
+    }
+
+    private struct GroupPaymentAnnouncement {
+        /// Author of the announcement, which is the only offline evidence of who sent the money.
+        let senderUserID: String
+        /// Recipients named in the descriptor, when they fitted. Empty means "not stated here".
+        let recipientUserIDs: Set<String>
+    }
+
+    /// Indexes the `sent` announcements of a thread by payment, keeping the first of each.
+    ///
+    /// This is what later lets an outcome be believed or refused without a network call: a
+    /// "returned" event is only true from the member who sent the payment, and an "accepted" is
+    /// only true from someone the announcement listed as a recipient.
+    private static func groupPaymentAnnouncements(
+        in messages: [LocalMessage]
+    ) -> [String: GroupPaymentAnnouncement] {
+        var announcements: [String: GroupPaymentAnnouncement] = [:]
+        for message in messages {
+            guard KitGroupPaymentMessage.isGroupPaymentText(message.body),
+                  let descriptor = KitGroupPaymentMessage.parse(message.body),
+                  descriptor.action == .sent,
+                  let senderUserID = canonicalUUID(message.senderId),
+                  announcements[descriptor.groupPaymentId] == nil
+            else { continue }
+            announcements[descriptor.groupPaymentId] = GroupPaymentAnnouncement(
+                senderUserID: senderUserID,
+                recipientUserIDs: Set(descriptor.recipientUserIds.compactMap(canonicalUUID))
+            )
+        }
+        return announcements
+    }
+
+    private static func groupPaymentItem(
+        for message: LocalMessage,
+        announcements: [String: GroupPaymentAnnouncement],
+        claimedAnnouncements: inout Set<String>,
+        answeredShares: inout Set<String>
+    ) -> GroupPaymentProjection {
+        guard KitGroupPaymentMessage.isGroupPaymentText(message.body) else {
+            return .notAGroupPayment
+        }
+        guard let descriptor = KitGroupPaymentMessage.parse(message.body),
+              let author = canonicalUUID(message.senderId),
+              let announcement = announcements[descriptor.groupPaymentId]
+        else { return .drop }
+
+        switch descriptor.action {
+        case .sent:
+            // A second announcement of the same payment is a replay; the first one is the card.
+            guard author == announcement.senderUserID,
+                  claimedAnnouncements.insert(descriptor.groupPaymentId).inserted
+            else { return .drop }
+            return .project(.groupPayment(message, descriptor))
+        case .accepted, .rejected:
+            // Only a recipient can answer, only about themselves, and only once.
+            guard author != announcement.senderUserID,
+                  announcement.recipientUserIDs.isEmpty
+                  || announcement.recipientUserIDs.contains(author),
+                  answeredShares.insert("\(descriptor.groupPaymentId):\(author)").inserted
+            else { return .drop }
+            return .project(.groupPaymentEvent(message, descriptor))
+        case .returned:
+            // Pulling back what nobody claimed is the sender's move alone.
+            guard author == announcement.senderUserID,
+                  answeredShares.insert("\(descriptor.groupPaymentId):\(author)").inserted
+            else { return .drop }
+            return .project(.groupPaymentEvent(message, descriptor))
+        }
     }
 
     /// Payment actions are projected only in a canonical one-to-one server conversation. Sender

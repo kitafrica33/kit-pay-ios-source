@@ -329,6 +329,66 @@ actor APIClient {
         }
     }
 
+    /// Uploads an unencrypted image or PDF for a bank-deposit request. The caller attaches the
+    /// returned immutable asset id to the deposit only after this method has finalized the exact
+    /// bytes accepted by object storage.
+    func uploadBankDepositProof(
+        data: Data,
+        filename: String,
+        mimeType: String
+    ) async throws -> String {
+        guard BankDepositProofUploadPolicy.accepts(
+            data: data,
+            filename: filename,
+            mimeType: mimeType
+        ) else { throw BankDepositProofUploadError.invalidDocument }
+
+        let capturedSessionID: String
+        if let inheritedSessionID = APIClientSessionBinding.sessionID {
+            capturedSessionID = inheritedSessionID
+        } else if let currentSessionID = await sessionStore.current()?.sessionId {
+            capturedSessionID = currentSessionID
+        } else {
+            throw APIClientError.signedOut
+        }
+
+        return try await APIClientSessionBinding.$sessionID.withValue(capturedSessionID) {
+            let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+            let intent: MediaUploadIntentDTO = try await send(
+                path: "media/upload-intents",
+                method: "POST",
+                body: CreateBankDepositProofUploadIntentRequest(
+                    filename: filename,
+                    mimeType: mimeType,
+                    byteSize: data.count,
+                    sha256: digest
+                ),
+                headers: ["Idempotency-Key": UUID().uuidString.lowercased()]
+            )
+            guard intent.asset.id == intent.asset.id.trimmingCharacters(in: .whitespacesAndNewlines),
+                  let identifier = UUID(uuidString: intent.asset.id)
+            else { throw BankDepositProofUploadError.invalidServiceResponse }
+            let assetID = identifier.uuidString.lowercased()
+
+            try await uploadBankDepositProofBytes(
+                data,
+                using: intent.upload,
+                boundSessionID: capturedSessionID
+            )
+            try Task.checkCancellation()
+            let finalized: MediaAssetDTO = try await send(
+                path: "media/\(assetID)/finalize",
+                method: "POST",
+                body: EmptyBody()
+            )
+            guard finalized.id.caseInsensitiveCompare(assetID) == .orderedSame,
+                  !["failed", "rejected", "deleted"].contains(finalized.status.lowercased()),
+                  !["failed", "infected"].contains(finalized.scan.status.lowercased())
+            else { throw BankDepositProofUploadError.rejected }
+            return assetID
+        }
+    }
+
     /// Reserves, uploads, and finalizes exact JPEG bytes. The returned asset can be persisted
     /// before polling so process suspension never forces the client to upload the photo again.
     func prepareProfileAvatarUpload(jpegData: Data) async throws -> PreparedProfileAvatarUpload {
@@ -919,6 +979,51 @@ actor APIClient {
         }
     }
 
+    private func uploadBankDepositProofBytes(
+        _ data: Data,
+        using upload: MediaUploadInstructionsDTO,
+        boundSessionID: String?
+    ) async throws {
+        guard upload.method.caseInsensitiveCompare("PUT") == .orderedSame,
+              let url = URL(string: upload.url),
+              url.scheme?.caseInsensitiveCompare("https") == .orderedSame,
+              url.host?.isEmpty == false,
+              url.user == nil,
+              url.password == nil,
+              upload.headers.count <= 32,
+              upload.headers.allSatisfy({ isSafeUploadHeader(name: $0.key, value: $0.value) })
+        else { throw BankDepositProofUploadError.invalidServiceResponse }
+
+        try Task.checkCancellation()
+        try await requireCurrentProfileAvatarSession(boundSessionID)
+        try requireAppReviewDemoRequestPermission(
+            path: "bank-deposit-proof-upload-bytes",
+            method: "PUT",
+            sessionID: boundSessionID
+        )
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "PUT"
+        request.httpBody = data
+        request.timeoutInterval = 120
+        for (name, value) in upload.headers {
+            request.setValue(value, forHTTPHeaderField: name)
+        }
+
+        let (_, response) = try await session.data(for: request)
+        try Task.checkCancellation()
+        try await requireCurrentProfileAvatarSession(boundSessionID)
+        guard let http = response as? HTTPURLResponse else {
+            throw BankDepositProofUploadError.invalidServiceResponse
+        }
+        guard (200 ... 299).contains(http.statusCode) else {
+            throw APIClientError.httpResponse(
+                status: http.statusCode,
+                retryAfter: HTTPRetryAfterParser.delay(from: http)
+            )
+        }
+    }
+
     private func requireCurrentProfileAvatarSession(_ expectedSessionID: String?) async throws {
         guard let expectedSessionID else { return }
         guard let currentSessionID = await sessionStore.current()?.sessionId,
@@ -1500,6 +1605,31 @@ private struct CreateProfileAvatarUploadIntentRequest: Encodable {
     }
 }
 
+private struct CreateBankDepositProofUploadIntentRequest: Encodable {
+    let kind: String
+    let purpose = "bank_deposit_proof"
+    let filename: String
+    let mimeType: String
+    let byteSize: Int
+    let sha256: String
+    let clientEncrypted = false
+
+    init(filename: String, mimeType: String, byteSize: Int, sha256: String) {
+        self.kind = mimeType == "application/pdf" ? "document" : "image"
+        self.filename = filename
+        self.mimeType = mimeType
+        self.byteSize = byteSize
+        self.sha256 = sha256
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case kind, purpose, filename, sha256
+        case mimeType = "mime_type"
+        case byteSize = "byte_size"
+        case clientEncrypted = "client_encrypted"
+    }
+}
+
 private struct AttachProfileAvatarRequest: Encodable {
     let assetId: String
 
@@ -1732,6 +1862,45 @@ enum ProfileAvatarUploadPolicy {
 
     static func sha256(of data: Data) -> String {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+enum BankDepositProofUploadPolicy {
+    static let maximumBytes = 10 * 1_024 * 1_024
+    static let acceptedMIMETypes: Set<String> = [
+        "image/jpeg",
+        "image/png",
+        "image/webp",
+        "application/pdf",
+    ]
+
+    static func accepts(data: Data, filename: String, mimeType: String) -> Bool {
+        let cleanFilename = filename.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !data.isEmpty
+            && data.count <= maximumBytes
+            && !cleanFilename.isEmpty
+            && cleanFilename.count <= 255
+            && cleanFilename.unicodeScalars.allSatisfy {
+                !CharacterSet.controlCharacters.contains($0)
+            }
+            && acceptedMIMETypes.contains(mimeType.lowercased())
+    }
+}
+
+enum BankDepositProofUploadError: LocalizedError, Equatable {
+    case invalidDocument
+    case invalidServiceResponse
+    case rejected
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidDocument:
+            "Choose a JPEG, PNG, WebP, or PDF receipt no larger than 10 MB."
+        case .invalidServiceResponse:
+            "Kit Pay could not prepare the payment-proof upload. Please try again."
+        case .rejected:
+            "That payment proof could not be accepted. Choose another file and try again."
+        }
     }
 }
 

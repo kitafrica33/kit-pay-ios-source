@@ -1392,6 +1392,8 @@ struct ConversationView: View {
     @State private var editorSession: MediaEditorSession?
     @State private var reactionPickerTarget: LocalMessage?
     @State private var reactionDetailTarget: LocalMessage?
+    /// The share this conversation has already taken, so a redraw cannot stage it twice.
+    @State private var appliedSharedDeliveryID: UUID?
     @State private var isSearchingMessages = false
     @State private var messageSearchQuery = ""
     @State private var searchMatchIndex = 0
@@ -1403,9 +1405,13 @@ struct ConversationView: View {
     @StateObject private var sendMoneyFlow = WalletFlowModel()
     @StateObject private var chatPaymentRequests = PaymentRequestsViewModel()
     @StateObject private var chatTransfers = ChatTransfersViewModel()
+    @StateObject private var chatGroupPayments = ChatGroupPaymentsViewModel()
     @ObservedObject private var presence = KitPresenceCenter.shared
     @State private var transferReverseTarget: ChatTransferReverseTarget?
     @State private var transferRejectTarget: ChatTransferRejectTarget?
+    @State private var groupPaymentDeclineTarget: GroupPaymentDeclineTarget?
+    @State private var groupPaymentReturnTarget: GroupPaymentReturnTarget?
+    @State private var groupPaymentComposer: GroupPaymentComposerTarget?
     @StateObject private var voiceRecorder = VoiceNoteRecorder()
     @FocusState private var isComposerFocused: Bool
 
@@ -1633,6 +1639,49 @@ struct ConversationView: View {
         }
     }
 
+    private var groupPaymentsEnabled: Bool {
+        !isReadOnlyAppReviewPreview
+            && isGroupConversation
+            && GroupPaymentPolicy(features: model.capabilities?.features).groupPaymentsEnabled
+    }
+
+    /// Payments this thread announces, in the order they were announced.
+    private var conversationGroupPaymentIDs: [String] {
+        timelineItems.compactMap { item in
+            guard case .groupPayment(_, let descriptor) = item else { return nil }
+            return descriptor.groupPaymentId
+        }
+    }
+
+    /// Re-reads group payment authority whenever a payment is announced or answered — which is
+    /// exactly when a card's buttons and counts go stale — or when connectivity returns.
+    private var groupPaymentLoadID: String {
+        let eventIDs = timelineItems.compactMap { item -> String? in
+            switch item {
+            case .groupPayment(let message, _), .groupPaymentEvent(let message, _):
+                return message.id.uuidString.lowercased()
+            default:
+                return nil
+            }
+        }
+        return "\(model.isOnline):\(groupPaymentsEnabled):\(eventIDs.joined(separator: ","))"
+    }
+
+    /// Members of this group who could be paid: everyone but the account holder.
+    private var groupPaymentMembers: [GroupPaymentDraftPolicy.Member] {
+        let selfID = model.profile?.id.lowercased()
+        return conversation.participantUserIds
+            .map { $0.lowercased() }
+            .filter { $0 != selfID }
+            .map {
+                GroupPaymentDraftPolicy.Member(
+                    userId: $0,
+                    name: participantDisplayName(for: $0)
+                )
+            }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
     var body: some View {
         conversationLifecycle
             // A voice note keeps playing after this screen is gone, so the floating bar needs to
@@ -1833,6 +1882,20 @@ struct ConversationView: View {
             in: timelineSnapshot,
             currentUserID: model.profile?.id
         )
+        // A sender's name heads a run of their messages rather than labelling every one of them.
+        // Rows that render nothing are excluded, so a silent event by another member cannot make
+        // the same person be introduced twice in a row.
+        let namedSenderMessageIDs = ConversationSenderRunPolicy.namedMessageIDs(
+            in: timelineItems,
+            isGroup: isGroupConversation,
+            isRendered: { message in
+                rendersAsBubble(
+                    message,
+                    albumMembership: albumMembership,
+                    suppressedReactionIDs: suppressedReactionIDs
+                )
+            }
+        )
         return VStack(spacing: 0) {
             ScrollViewReader { scrollProxy in
                 ScrollView {
@@ -1878,12 +1941,25 @@ struct ConversationView: View {
                                     // malformed system wire stays invisible rather than raw.
                                     EmptyView()
                                 } else if case .leader(let album) = albumMembership[message.id] {
-                                    albumBubble(album)
+                                    albumBubble(
+                                        album,
+                                        senderName: namedSenderMessageIDs.contains(message.id)
+                                            ? participantDisplayName(for: message.senderId)
+                                            : nil
+                                    )
                                 } else if albumMembership[message.id] != .follower {
-                                    bubble(message, reactionTallies: hoistedTallies)
+                                    bubble(
+                                        message,
+                                        reactionTallies: hoistedTallies,
+                                        showsSenderName: namedSenderMessageIDs.contains(message.id)
+                                    )
                                 }
                             case .payment(let message, let descriptor):
                                 paymentBubble(message, descriptor: descriptor)
+                            case .groupPayment(let message, let descriptor):
+                                groupPaymentCard(message, descriptor: descriptor)
+                            case .groupPaymentEvent(let message, let descriptor):
+                                groupPaymentOutcome(message, descriptor: descriptor)
                             case .call(let call):
                                 callBubble(call)
                             case .dateSeparator(let separator):
@@ -2386,6 +2462,83 @@ struct ConversationView: View {
             .environmentObject(model)
             .presentationBackground(.ultraThinMaterial)
         }
+        .sheet(item: $groupPaymentDeclineTarget) { target in
+            GroupPaymentDeclineView(
+                shareAmount: target.shareAmount,
+                isSubmitting: chatGroupPayments.actionPaymentId != nil,
+                errorMessage: chatGroupPayments.errorMessage
+            ) { reason in
+                let declined = await chatGroupPayments.rejectShare(
+                    target.descriptor,
+                    conversationID: conversation.id,
+                    announcementSenderID: target.announcementSenderID,
+                    reason: reason,
+                    groupPaymentsEnabled: groupPaymentsEnabled,
+                    isOnline: model.isOnline
+                )
+                guard declined else { return false }
+                await queueGroupPaymentOutcome(target.descriptor, action: .rejected)
+                await model.refresh()
+                return true
+            }
+            .presentationBackground(.ultraThinMaterial)
+        }
+        .sheet(item: $groupPaymentReturnTarget) { target in
+            GroupPaymentReturnView(
+                pendingCount: target.pendingCount,
+                isSubmitting: chatGroupPayments.actionPaymentId != nil,
+                errorMessage: chatGroupPayments.errorMessage
+            ) { reason, pin in
+                let returned = await chatGroupPayments.reverseUnclaimed(
+                    target.descriptor,
+                    conversationID: conversation.id,
+                    announcementSenderID: target.announcementSenderID,
+                    reason: reason,
+                    groupPaymentsEnabled: groupPaymentsEnabled,
+                    pin: pin,
+                    isOnline: model.isOnline,
+                    authorize: model.authorizeFinancialStepUp
+                )
+                guard returned else { return false }
+                await queueGroupPaymentOutcome(target.descriptor, action: .returned)
+                await model.refresh()
+                return true
+            }
+            .environmentObject(model)
+            .presentationBackground(.ultraThinMaterial)
+        }
+        .sheet(item: $groupPaymentComposer) { composer in
+            if let wallet = model.selectedWallet {
+                GroupPaymentComposerView(
+                    conversationId: conversation.id,
+                    conversationTitle: conversation.title,
+                    members: groupPaymentMembers,
+                    wallet: wallet,
+                    isSubmitting: chatGroupPayments.actionPaymentId != nil,
+                    errorMessage: chatGroupPayments.errorMessage
+                ) { body, pin in
+                    let payment = await chatGroupPayments.send(
+                        conversationId: conversation.id,
+                        body: body,
+                        idempotencyKey: composer.id,
+                        groupPaymentsEnabled: groupPaymentsEnabled,
+                        pin: pin,
+                        isOnline: model.isOnline,
+                        authorize: model.authorizeFinancialStepUp
+                    )
+                    guard let payment else { return nil }
+                    guard await announceGroupPayment(payment) else {
+                        chatGroupPayments.errorMessage = model.lastError
+                            ?? "The payment was confirmed, but its chat card could not be queued. Try again to restore the card."
+                        return nil
+                    }
+                    await model.refresh()
+                    return payment
+                }
+                .environmentObject(model)
+                .presentationBackground(.ultraThinMaterial)
+            }
+        }
     }
 
     private func finishGroupProfilePresentation() {
@@ -2456,6 +2609,17 @@ struct ConversationView: View {
             )
             await documentObservedAutoReversals()
         }
+        .task(id: groupPaymentLoadID) {
+            guard !isReadOnlyAppReviewPreview,
+                  model.isOnline,
+                  groupPaymentsEnabled,
+                  !conversationGroupPaymentIDs.isEmpty
+            else { return }
+            await chatGroupPayments.load(
+                isOnline: true,
+                paymentIds: conversationGroupPaymentIDs
+            )
+        }
         .task(id: draftPersistenceTaskKey) {
             guard !isReadOnlyAppReviewPreview,
                   draftPersistenceTaskKey.didRestore,
@@ -2491,6 +2655,10 @@ struct ConversationView: View {
                     visible: scenePhase == .active
                 )
             }
+            applySharedInboxDeliveryIfNeeded()
+        }
+        .onChange(of: model.sharedInboxDelivery) { _, _ in
+            applySharedInboxDeliveryIfNeeded()
         }
         .onChange(of: messages) { previousMessages, updatedMessages in
             if isSelectingMessages {
@@ -2785,6 +2953,10 @@ struct ConversationView: View {
                     Button { openPaymentRequest() } label: {
                         Label("Payment request", systemImage: "banknote")
                     }
+                } else if canSendGroupPayment {
+                    Button { openGroupPayment() } label: {
+                        Label("Pay the group", systemImage: "banknote.fill")
+                    }
                 }
             } label: {
                 Image(systemName: "plus")
@@ -2793,7 +2965,11 @@ struct ConversationView: View {
                     .frame(width: 42, height: 42)
                     .background(.ultraThinMaterial, in: Circle())
             }
-            .accessibilityLabel(isGroupConversation ? "Attachments" : "Attachments and payments")
+            .accessibilityLabel(
+                isGroupConversation && !canSendGroupPayment
+                    ? "Attachments"
+                    : "Attachments and payments"
+            )
 
             HStack(alignment: .bottom, spacing: 4) {
                 TextField(
@@ -3228,10 +3404,35 @@ struct ConversationView: View {
 
     // MARK: Bubbles
 
+    /// Would this message occupy a row of its own in the thread?
+    ///
+    /// This mirrors, exactly, the branches of the timeline's own `case .message` arm. Sender-name
+    /// runs are computed from it, so a row that renders nothing — a reaction event, a forged
+    /// system notice, a photo folded into an album — cannot break a run and make the same person
+    /// be introduced twice in a row.
+    private func rendersAsBubble(
+        _ message: LocalMessage,
+        albumMembership: [UUID: ChatMediaAlbumMembership],
+        suppressedReactionIDs: Set<UUID>
+    ) -> Bool {
+        if KitSystemMessage.parse(message.body) != nil {
+            return false
+        }
+        if suppressedReactionIDs.contains(message.id)
+            || SecureMessageReservedPrefixPolicy.beginsWithReservedPrefix(
+                message.body,
+                prefix: KitSystemMessage.prefix
+            ) {
+            return false
+        }
+        return albumMembership[message.id] != .follower
+    }
+
     @ViewBuilder
     private func bubble(
         _ message: LocalMessage,
-        reactionTallies: [String: [MessageReactionTally]]
+        reactionTallies: [String: [MessageReactionTally]],
+        showsSenderName: Bool
     ) -> some View {
         let descriptor = KitMediaMessageDescriptor.parse(message.body)
         let mediaKind = descriptor.map { KitChatMediaKind(mediaType: $0.mediaType) }
@@ -3246,7 +3447,8 @@ struct ConversationView: View {
             }
             if message.isOutgoing { Spacer(minLength: 44) }
             VStack(alignment: message.isOutgoing ? .trailing : .leading, spacing: 3) {
-            if isGroupConversation, !message.isOutgoing {
+            // Only the first message of a run carries the name; the rest are plainly theirs.
+            if isGroupConversation, !message.isOutgoing, showsSenderName {
                 Text(participantDisplayName(for: message.senderId))
                     .font(.caption2.weight(.semibold))
                     .foregroundStyle(KitColor.green)
@@ -3362,12 +3564,20 @@ struct ConversationView: View {
 
     /// One grid bubble for a run of consecutive captionless photos/videos. Tapping any cell
     /// opens the shared gallery at that item.
-    private func albumBubble(_ album: ChatMediaAlbum) -> some View {
+    /// `senderName` is non-nil only when this album heads a run of that member's messages.
+    private func albumBubble(_ album: ChatMediaAlbum, senderName: String?) -> some View {
         let isOutgoing = album.items[0].isOutgoing
         let closingMessage = messages.first { $0.id == album.items[album.items.count - 1].messageID }
         return HStack(alignment: .center, spacing: 8) {
             if isOutgoing { Spacer(minLength: 44) }
             VStack(alignment: isOutgoing ? .trailing : .leading, spacing: 0) {
+                if let senderName, !isOutgoing {
+                    Text(senderName)
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(KitColor.green)
+                        .padding(.horizontal, 7)
+                        .padding(.top, 6)
+                }
                 ChatMediaAlbumGridView(
                     album: album,
                     isOutgoing: isOutgoing,
@@ -3572,6 +3782,192 @@ struct ConversationView: View {
             )
             if !message.isOutgoing { Spacer(minLength: 52) }
         }
+    }
+
+    // MARK: Group payments
+
+    /// The golden card, centred in the thread: every member sees the same announcement and only
+    /// their own share underneath it.
+    private func groupPaymentCard(
+        _ message: LocalMessage,
+        descriptor: KitGroupPaymentMessage
+    ) -> some View {
+        let payment = chatGroupPayments.authoritativePayment(
+            for: descriptor,
+            conversationID: conversation.id,
+            announcementSenderID: message.senderId
+        )
+        return HStack {
+            Spacer(minLength: 0)
+            VStack(spacing: 4) {
+                GroupPaymentCardView(
+                    descriptor: descriptor,
+                    payment: payment,
+                    contradictsServer: chatGroupPayments.contradictsAuthoritativeState(
+                        descriptor,
+                        conversationID: conversation.id,
+                        announcementSenderID: message.senderId
+                    ),
+                    isOutgoing: message.isOutgoing,
+                    senderName: participantDisplayName(for: message.senderId),
+                    displayName: { participantDisplayName(for: $0) },
+                    isBusy: chatGroupPayments.actionPaymentId != nil,
+                    accept: {
+                        acceptGroupPaymentShare(
+                            descriptor,
+                            announcementSenderID: message.senderId
+                        )
+                    },
+                    decline: {
+                        groupPaymentDeclineTarget = GroupPaymentDeclineTarget(
+                            descriptor: descriptor,
+                            announcementSenderID: message.senderId,
+                            shareAmount: shareAmountCopy(payment)
+                        )
+                    },
+                    returnUnclaimed: {
+                        groupPaymentReturnTarget = GroupPaymentReturnTarget(
+                            descriptor: descriptor,
+                            announcementSenderID: message.senderId,
+                            pendingCount: payment?.pendingCount ?? 0
+                        )
+                    }
+                )
+                groupPaymentMetadata(message)
+            }
+            Spacer(minLength: 0)
+        }
+    }
+
+    /// The card's own time row. `messageMetadata` colours itself for a navy bubble, which would be
+    /// unreadable on pale gold.
+    private func groupPaymentMetadata(_ message: LocalMessage) -> some View {
+        HStack(spacing: 4) {
+            Text(AppPresentationClock.shortTime(message.createdAt))
+            if message.isOutgoing,
+               message.state == .failed,
+               conversationMessagingAvailable,
+               model.canRetryMessage(
+                   message.id,
+                   conversationID: conversation.id,
+                   recipientUserID: recipientUserID
+               ) {
+                Button {
+                    retryFailedMessage(message)
+                } label: {
+                    Image(systemName: deliveryIcon(message.state))
+                }
+                .buttonStyle(.plain)
+                .disabled(retryingMessageIDs.contains(message.id))
+                .accessibilityLabel("Retry announcing this payment")
+            } else if message.isOutgoing {
+                Image(systemName: deliveryIcon(message.state))
+            }
+        }
+        .font(.caption2)
+        .foregroundStyle(KitColor.secondaryText)
+    }
+
+    /// "Ama took their share" — the small, centred line, sized like the date heading.
+    @ViewBuilder
+    private func groupPaymentOutcome(
+        _ message: LocalMessage,
+        descriptor: KitGroupPaymentMessage
+    ) -> some View {
+        if let text = GroupPaymentCopy.outcome(
+            descriptor.action,
+            actorName: participantDisplayName(for: message.senderId),
+            isViewerActor: message.isOutgoing
+        ) {
+            GroupPaymentOutcomeChip(text: text)
+        }
+    }
+
+    /// This member's own share, for the decline sheet's confirmation line.
+    private func shareAmountCopy(_ payment: GroupPaymentDTO?) -> String {
+        guard let payment, let share = payment.yourShare else { return "Your share" }
+        return KitMoney.formatted(share.amount, currency: payment.currency)
+    }
+
+    private func acceptGroupPaymentShare(
+        _ descriptor: KitGroupPaymentMessage,
+        announcementSenderID: String
+    ) {
+        Task { @MainActor in
+            let accepted = await chatGroupPayments.acceptShare(
+                descriptor,
+                conversationID: conversation.id,
+                announcementSenderID: announcementSenderID,
+                groupPaymentsEnabled: groupPaymentsEnabled,
+                isOnline: model.isOnline
+            )
+            guard accepted else { return }
+            await queueGroupPaymentOutcome(descriptor, action: .accepted)
+            await model.refresh()
+        }
+    }
+
+    /// Tells the group what just happened to one share, never how much it was.
+    ///
+    /// The chip's id is derived from the payment, the outcome and this member, so a retry after a
+    /// flaky send cannot post "Ama took their share" twice.
+    private func queueGroupPaymentOutcome(
+        _ descriptor: KitGroupPaymentMessage,
+        action: KitGroupPaymentMessageAction
+    ) async {
+        guard let outcome = KitGroupPaymentMessage(
+            outcome: action,
+            groupPaymentId: descriptor.groupPaymentId
+        ), let actorUserId = model.profile?.id else { return }
+        _ = await model.queueGroupPaymentEvent(
+            conversationId: conversation.id,
+            title: conversation.title,
+            body: outcome.encoded,
+            clientMessageID: KitGroupPaymentMessage.outcomeMessageID(
+                groupPaymentId: descriptor.groupPaymentId,
+                action: action,
+                actorUserId: actorUserId
+            )
+        )
+    }
+
+    /// Posts the announcement once the server has confirmed the payment.
+    ///
+    /// The roster comes from what was actually created, not from the draft, and it is only carried
+    /// when the server agrees on how many members are being paid — otherwise the card falls back to
+    /// counts, which every member can read without learning who else was picked.
+    private func announceGroupPayment(_ payment: GroupPaymentDTO) async -> Bool {
+        guard let actorUserId = model.profile?.id,
+              GroupPaymentAuthorityPolicy.matchesContext(
+                  payment,
+                  conversationID: conversation.id,
+                  announcementSenderID: actorUserId
+              )
+        else {
+            model.lastError = "The payment was confirmed, but Kit could not verify its group."
+            return false
+        }
+        let confirmedRoster = payment.recipients.compactMap(\.userId)
+        let roster = confirmedRoster.count == payment.recipientCount
+            ? confirmedRoster
+            : []
+        guard let descriptor = KitGroupPaymentMessage(
+            announcing: payment,
+            recipientUserIds: roster
+        ) else {
+            model.lastError = "The payment was confirmed, but Kit could not prepare its chat card."
+            return false
+        }
+        return await model.queueGroupPaymentEvent(
+            conversationId: conversation.id,
+            title: conversation.title,
+            body: descriptor.encoded,
+            clientMessageID: KitGroupPaymentMessage.outcomeMessageID(
+                groupPaymentId: payment.id,
+                action: .sent,
+                actorUserId: actorUserId
+            )
+        )
     }
 
     private func messageMetadata(_ message: LocalMessage) -> some View {
@@ -4503,6 +4899,31 @@ struct ConversationView: View {
         showSendMoney = true
     }
 
+    /// Whether "Pay the group" belongs in this thread's menu at all.
+    ///
+    /// Hidden rather than shown-and-refused: there is nothing a member can do about a group with
+    /// no one else in it, or an account without a wallet.
+    private var canSendGroupPayment: Bool {
+        groupPaymentsEnabled
+            && conversationMessagingAvailable
+            && !groupPaymentMembers.isEmpty
+            && model.selectedWallet != nil
+    }
+
+    private func openGroupPayment() {
+        guard canSendGroupPayment else {
+            model.lastError = "Group payments are not available in this chat."
+            return
+        }
+        guard model.isOnline else {
+            model.lastError = "Connect to the internet to pay the group."
+            return
+        }
+        isComposerFocused = false
+        chatGroupPayments.errorMessage = nil
+        groupPaymentComposer = GroupPaymentComposerTarget()
+    }
+
     // MARK: Attachment staging
 
     /// Every capture flows through the creative editor before staging.
@@ -4664,6 +5085,123 @@ struct ConversationView: View {
                     ?? "The video note could not be read."
             }
         }
+    }
+
+    // MARK: Shares from other apps
+
+    /// Places a share this chat was chosen for into the composer.
+    ///
+    /// The files are staged exactly as if they had been attached here, and any shared link or text
+    /// goes into the draft — so the last decision, including whether to send at all, still belongs
+    /// to the person who shared. Nothing is sent automatically.
+    private func applySharedInboxDeliveryIfNeeded() {
+        guard let delivery = model.sharedInboxDelivery,
+              delivery.conversationID.caseInsensitiveCompare(conversation.id) == .orderedSame,
+              appliedSharedDeliveryID != delivery.id,
+              !isReadOnlyAppReviewPreview
+        else { return }
+        appliedSharedDeliveryID = delivery.id
+        Task { @MainActor in
+            await stageSharedInbox(delivery)
+        }
+    }
+
+    @MainActor
+    private func stageSharedInbox(_ delivery: SharedInboxDelivery) async {
+        let batch = delivery.batch
+        attachmentLoadGeneration &+= 1
+        let generation = attachmentLoadGeneration
+        isLoadingAttachment = true
+        defer {
+            if generation == attachmentLoadGeneration { isLoadingAttachment = false }
+        }
+
+        let availableSlots = ConversationAttachmentStagingPolicy.maximumStagedAttachments
+            - stagedAttachments.count
+        guard batch.items.count <= availableSlots else {
+            model.lastError = availableSlots == 0
+                ? "Remove an attachment from this draft before adding the shared items."
+                : "This draft has room for only \(availableSlots) more shared items."
+            model.retrySharedInboxDelivery(delivery.id)
+            return
+        }
+
+        // Prepare the entire batch before changing the composer. This is transactional: either
+        // every file is present and valid, or no draft/attachment is changed and the protected
+        // originals remain available for another attempt.
+        var preparedAttachments: [ChatStagedAttachment] = []
+        preparedAttachments.reserveCapacity(batch.items.count)
+        for item in batch.items {
+            guard generation == attachmentLoadGeneration else {
+                model.retrySharedInboxDelivery(delivery.id)
+                return
+            }
+            let batchID = batch.id
+            let data = try? await Task.detached(priority: .userInitiated) {
+                try SharedInboxStore().data(for: item, in: batchID)
+            }.value
+            guard generation == attachmentLoadGeneration else {
+                model.retrySharedInboxDelivery(delivery.id)
+                return
+            }
+            guard let data, let attachment = preparedSharedItem(item, data: data) else {
+                model.lastError = "The shared items could not all be attached. Nothing was removed."
+                model.retrySharedInboxDelivery(delivery.id)
+                return
+            }
+            preparedAttachments.append(attachment)
+        }
+
+        guard generation == attachmentLoadGeneration else {
+            model.retrySharedInboxDelivery(delivery.id)
+            return
+        }
+        if let text = batch.text {
+            // Shared text joins the draft rather than replacing it: someone who was already part
+            // way through a message must not lose it to a link they shared in.
+            let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+            draft = trimmed.isEmpty ? text : "\(trimmed)\n\(text)"
+        }
+        stagedAttachments.append(contentsOf: preparedAttachments)
+        // Only now: the plaintext in the shared container is removed once it lives in the
+        // composer, where the customer can see and remove it.
+        model.consumeSharedInboxDelivery(delivery.id)
+    }
+
+    /// Builds an attachment without mutating the composer. The caller commits a whole batch only
+    /// after every item succeeds, preventing a partial share from deleting files that never
+    /// appeared in the chat.
+    private func preparedSharedItem(
+        _ item: SharedInboxItem,
+        data: Data
+    ) -> ChatStagedAttachment? {
+        guard !data.isEmpty, data.count == item.byteCount else { return nil }
+        if item.mediaType.hasPrefix("image/") {
+            // Every shared image is re-encoded, which is what lets a camera-native HEIC be shared
+            // into a chat at all, and strips the location and device metadata with it.
+            guard data.count <= 64 * 1_024 * 1_024,
+                  let prepared = AttachmentImageDecoder.secureJPEG(from: data)
+            else { return nil }
+            return ChatStagedAttachment(
+                kind: .image,
+                data: prepared.data,
+                mediaType: "image/jpeg",
+                displayName: item.displayName,
+                previewImage: prepared.preview
+            )
+        }
+        let mediaType = SecureMessagingWire.allowedAttachmentMediaTypes.contains(item.mediaType)
+            ? item.mediaType
+            : "application/octet-stream"
+        let kind = KitChatMediaKind(mediaType: mediaType)
+        guard KitChatMediaLimits.fits(data.count, kind: kind) else { return nil }
+        return ChatStagedAttachment(
+            kind: kind,
+            data: data,
+            mediaType: mediaType,
+            displayName: item.displayName,
+            previewImage: nil
+        )
     }
 
     private func stageDocument(_ url: URL) {
@@ -5089,6 +5627,30 @@ private struct ChatTransferReverseTarget: Identifiable {
 private struct ChatTransferRejectTarget: Identifiable {
     let descriptor: KitPaymentMessage
     var id: String { descriptor.paymentRequestId }
+}
+
+private struct GroupPaymentDeclineTarget: Identifiable {
+    let descriptor: KitGroupPaymentMessage
+    let announcementSenderID: String
+    let shareAmount: String
+    var id: String { descriptor.groupPaymentId }
+}
+
+private struct GroupPaymentReturnTarget: Identifiable {
+    let descriptor: KitGroupPaymentMessage
+    let announcementSenderID: String
+    let pendingCount: Int
+    var id: String { descriptor.groupPaymentId }
+}
+
+/// Holds the composer's idempotency key for as long as the sheet is open, so retrying after a
+/// timeout resumes the same send instead of starting a second one.
+private struct GroupPaymentComposerTarget: Identifiable {
+    let id: String
+
+    init(id: String = UUID().uuidString.lowercased()) {
+        self.id = id
+    }
 }
 
 enum AttachmentImageDecoder {

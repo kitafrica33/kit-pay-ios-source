@@ -1,5 +1,8 @@
 import Foundation
+import PhotosUI
 import SwiftUI
+import UIKit
+import UniformTypeIdentifiers
 
 struct BankTransferLoadResults {
     let country: String
@@ -664,19 +667,343 @@ final class BankTransferViewModel: ObservableObject {
 
 }
 
+private struct BankDepositLoadResults {
+    let accounts: Result<BankFundingAccountListDTO, Error>
+    let deposits: Result<BankDepositRequestListDTO, Error>
+}
+
+private enum BankDepositFlowError: LocalizedError {
+    case invalidServiceResponse
+    case proofBindingMismatch
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidServiceResponse:
+            "Kit Pay could not confirm the bank-deposit details. Nothing was submitted. Please try again."
+        case .proofBindingMismatch:
+            "Kit Pay could not confirm that the receipt was attached to this deposit. Refresh before retrying."
+        }
+    }
+}
+
+@MainActor
+final class BankDepositViewModel: ObservableObject {
+    @Published private(set) var accounts: [BankFundingAccountDTO] = []
+    @Published private(set) var deposits: [BankDepositRequestDTO] = []
+    @Published private(set) var isLoading = false
+    @Published private(set) var isSubmitting = false
+    @Published private(set) var accountLoadErrorMessage: String?
+    @Published private(set) var depositLoadErrorMessage: String?
+    @Published var errorMessage: String?
+
+    private let api: APIClient
+    private var loadTask: Task<BankDepositLoadResults, Never>?
+    private var pollTasks: [String: Task<Void, Never>] = [:]
+
+    init(api: APIClient = .shared) {
+        self.api = api
+    }
+
+    deinit {
+        loadTask?.cancel()
+        pollTasks.values.forEach { $0.cancel() }
+    }
+
+    func activeAccounts(for wallet: Wallet?) -> [BankFundingAccountDTO] {
+        guard let wallet else { return [] }
+        return accounts.filter {
+            $0.isActive
+                && $0.currency.caseInsensitiveCompare(wallet.currency.code) == .orderedSame
+        }
+    }
+
+    func load(wallet: Wallet?, permitted: Bool?, online: Bool) async {
+        guard !Task.isCancelled, let permitted else { return }
+        guard permitted else {
+            cancelLoad()
+            accounts = []
+            deposits = []
+            errorMessage = nil
+            return
+        }
+        guard let wallet, wallet.status.caseInsensitiveCompare("active") == .orderedSame else {
+            cancelLoad()
+            accounts = []
+            deposits = []
+            errorMessage = "Choose an active Kit Pay wallet to use bank deposits."
+            return
+        }
+        guard online else {
+            cancelLoad()
+            if accounts.isEmpty && deposits.isEmpty {
+                errorMessage = "Connect to the internet to load bank deposits."
+            }
+            return
+        }
+        guard loadTask == nil else {
+            _ = await loadTask?.value
+            return
+        }
+
+        isLoading = true
+        errorMessage = nil
+        let task = Task { [api] in
+            async let accountResult: Result<BankFundingAccountListDTO, Error> = Self.result {
+                try await api.bankFundingAccounts()
+            }
+            async let depositResult: Result<BankDepositRequestListDTO, Error> = Self.result {
+                try await api.bankDepositRequests()
+            }
+            return await BankDepositLoadResults(
+                accounts: accountResult,
+                deposits: depositResult
+            )
+        }
+        loadTask = task
+        let results = await task.value
+        guard loadTask != nil else { return }
+        loadTask = nil
+        isLoading = false
+
+        switch results.accounts {
+        case .success(let response):
+            accounts = (response.items ?? [])
+                .filter(\.isActive)
+                .sorted { $0.label.localizedCaseInsensitiveCompare($1.label) == .orderedAscending }
+            accountLoadErrorMessage = nil
+        case .failure:
+            accountLoadErrorMessage = "Receiving bank accounts could not be loaded. Pull to refresh and try again."
+        }
+
+        switch results.deposits {
+        case .success(let response):
+            deposits = (response.items ?? [])
+                .filter { $0.walletId == wallet.id }
+                .sorted { ($0.createdAt ?? "") > ($1.createdAt ?? "") }
+            deposits.filter { !$0.isTerminal }.forEach { poll($0.id) }
+            depositLoadErrorMessage = nil
+        case .failure:
+            depositLoadErrorMessage = "Recent bank deposits could not be loaded. Pull to refresh and try again."
+        }
+    }
+
+    func create(
+        wallet: Wallet?,
+        fundingAccount: BankFundingAccountDTO,
+        enteredAmount: String,
+        note: String,
+        idempotencyKey: String,
+        permitted: Bool,
+        online: Bool
+    ) async -> BankDepositRequestDTO? {
+        guard !isSubmitting else { return nil }
+        guard permitted, online else {
+            errorMessage = permitted
+                ? "Connect to the internet to create a bank deposit."
+                : "Bank deposits are not enabled for your Kit Pay account."
+            return nil
+        }
+        guard let wallet,
+              wallet.status.caseInsensitiveCompare("active") == .orderedSame,
+              fundingAccount.isActive,
+              fundingAccount.currency.caseInsensitiveCompare(wallet.currency.code) == .orderedSame,
+              accounts.contains(where: { $0.id == fundingAccount.id })
+        else {
+            errorMessage = "Choose an available receiving account for this wallet."
+            return nil
+        }
+        let scale = Int(wallet.currency.scale) ?? -1
+        guard let amount = BankDepositMoney.apiAmount(enteredAmount, scale: scale) else {
+            errorMessage = "Enter a valid amount greater than zero."
+            return nil
+        }
+        let cleanNote = note.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard cleanNote.count <= 280 else {
+            errorMessage = "Keep the optional note to 280 characters or fewer."
+            return nil
+        }
+
+        isSubmitting = true
+        errorMessage = nil
+        defer { isSubmitting = false }
+        do {
+            let created = try await api.createBankDepositRequest(
+                walletId: wallet.id,
+                fundingAccountId: fundingAccount.id,
+                amount: amount,
+                note: cleanNote.isEmpty ? nil : cleanNote,
+                idempotencyKey: idempotencyKey
+            )
+            guard created.hasSameBinding(
+                wallet: wallet,
+                fundingAccount: fundingAccount,
+                submittedAmount: amount
+            ), created.status.caseInsensitiveCompare("awaiting_proof") == .orderedSame
+            else { throw BankDepositFlowError.invalidServiceResponse }
+            upsert(created)
+            poll(created.id)
+            return created
+        } catch {
+            errorMessage = customerMessage(error)
+            return nil
+        }
+    }
+
+    func uploadProof(
+        for deposit: BankDepositRequestDTO,
+        data: Data,
+        filename: String,
+        mimeType: String,
+        permitted: Bool,
+        online: Bool
+    ) async -> BankDepositRequestDTO? {
+        guard !isSubmitting else { return nil }
+        guard permitted, online else {
+            errorMessage = permitted
+                ? "Connect to the internet to upload payment proof."
+                : "Bank deposits are not enabled for your Kit Pay account."
+            return nil
+        }
+        guard deposit.acceptsProof else {
+            errorMessage = "This bank deposit is no longer accepting payment proof."
+            return nil
+        }
+
+        isSubmitting = true
+        errorMessage = nil
+        defer { isSubmitting = false }
+        do {
+            let assetID = try await api.uploadBankDepositProof(
+                data: data,
+                filename: filename,
+                mimeType: mimeType
+            )
+            let updated = try await api.attachBankDepositProof(
+                depositId: deposit.id,
+                mediaAssetId: assetID
+            )
+            guard updated.id == deposit.id,
+                  updated.walletId == deposit.walletId,
+                  updated.reference == deposit.reference,
+                  updated.fundingAccount.id == deposit.fundingAccount.id,
+                  updated.currency == deposit.currency,
+                  BankTransferMoney.amountsMatch(updated.amount, deposit.amount),
+                  updated.proof?.assetId.caseInsensitiveCompare(assetID) == .orderedSame
+            else { throw BankDepositFlowError.proofBindingMismatch }
+            upsert(updated)
+            poll(updated.id)
+            return updated
+        } catch {
+            errorMessage = customerMessage(error)
+            return nil
+        }
+    }
+
+    func refresh(_ deposit: BankDepositRequestDTO) async -> BankDepositRequestDTO? {
+        guard !Task.isCancelled else { return nil }
+        do {
+            let updated = try await api.bankDepositRequest(id: deposit.id)
+            guard updated.id == deposit.id,
+                  updated.walletId == deposit.walletId,
+                  updated.reference == deposit.reference,
+                  updated.fundingAccount.id == deposit.fundingAccount.id,
+                  updated.currency == deposit.currency,
+                  BankTransferMoney.amountsMatch(updated.amount, deposit.amount)
+            else { throw BankDepositFlowError.invalidServiceResponse }
+            upsert(updated)
+            return updated
+        } catch is CancellationError {
+            return nil
+        } catch {
+            errorMessage = customerMessage(error)
+            return nil
+        }
+    }
+
+    func clearError() {
+        errorMessage = nil
+    }
+
+    private nonisolated static func result<Value>(
+        _ operation: @escaping @Sendable () async throws -> Value
+    ) async -> Result<Value, Error> {
+        do { return .success(try await operation()) }
+        catch { return .failure(error) }
+    }
+
+    private func poll(_ id: String) {
+        guard pollTasks[id] == nil else { return }
+        pollTasks[id] = Task { [weak self] in
+            defer { self?.pollTasks[id] = nil }
+            for _ in 0 ..< 120 {
+                do { try await Task.sleep(nanoseconds: 5_000_000_000) }
+                catch { return }
+                guard let self,
+                      let current = self.deposits.first(where: { $0.id == id }),
+                      !current.isTerminal
+                else { return }
+                _ = await self.refresh(current)
+            }
+        }
+    }
+
+    private func upsert(_ deposit: BankDepositRequestDTO) {
+        deposits.removeAll { $0.id == deposit.id }
+        deposits.append(deposit)
+        deposits.sort { ($0.createdAt ?? "") > ($1.createdAt ?? "") }
+    }
+
+    private func cancelLoad() {
+        loadTask?.cancel()
+        loadTask = nil
+        isLoading = false
+    }
+
+    private func customerMessage(_ error: Error) -> String {
+        if let flowError = error as? BankDepositFlowError {
+            return flowError.localizedDescription
+        }
+        if let clientError = error as? APIClientError,
+           case .invalidPayload = clientError {
+            return BankDepositFlowError.invalidServiceResponse.localizedDescription
+        }
+        let raw = (error as? APIErrorPayload)?.message ?? error.localizedDescription
+        return CustomerFacingPaymentCopy.neutralizedServiceMessage(raw)
+    }
+}
+
+private enum BankModal: Identifiable {
+    case addBeneficiary
+    case send(BankBeneficiaryDTO)
+    case transferReceipt(BankingOperationDTO)
+    case newDeposit
+    case depositReceipt(BankDepositRequestDTO)
+
+    var id: String {
+        switch self {
+        case .addBeneficiary: "add-beneficiary"
+        case .send(let beneficiary): "send-\(beneficiary.id)"
+        case .transferReceipt(let operation): "transfer-\(operation.id)"
+        case .newDeposit: "new-deposit"
+        case .depositReceipt(let deposit): "deposit-\(deposit.id)"
+        }
+    }
+}
+
 struct BankTransferView: View {
     @EnvironmentObject private var app: AppModel
     @Environment(\.dismiss) private var dismiss
     @StateObject private var model = BankTransferViewModel()
-    @State private var addingBeneficiary = false
-    @State private var selectedBeneficiary: BankBeneficiaryDTO?
-    @State private var selectedOperation: BankingOperationDTO?
+    @StateObject private var depositModel = BankDepositViewModel()
+    @State private var modal: BankModal?
     /// Built once per directory change: the rows below would otherwise rescan every synced contact
     /// on each redraw.
     @State private var contactIndex = BeneficiaryContactIndex()
 
-    private var permission: Bool? { app.capabilities?.enablesBankTransfers }
-    private var permitted: Bool { permission == true }
+    private var transferPermission: Bool? { app.capabilities?.enablesBankTransfers }
+    private var transfersPermitted: Bool { transferPermission == true }
+    private var depositPermission: Bool? { app.capabilities?.enablesBankDeposits }
+    private var depositsPermitted: Bool { depositPermission == true }
     private var country: String {
         let value = (app.profile?.countryCode ?? "UG")
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -684,8 +1011,9 @@ struct BankTransferView: View {
         return value.count == 2 ? value : "UG"
     }
     private var loadTrigger: String {
-        let capability = permission.map { $0 ? "enabled" : "disabled" } ?? "unknown"
-        return "\(country)-\(capability)-\(app.isOnline)"
+        let transfers = transferPermission.map { $0 ? "enabled" : "disabled" } ?? "unknown"
+        let deposits = depositPermission.map { $0 ? "enabled" : "disabled" } ?? "unknown"
+        return "\(country)-\(transfers)-\(deposits)-\(app.selectedWallet?.id ?? "none")-\(app.isOnline)"
     }
 
     var body: some View {
@@ -693,14 +1021,20 @@ struct BankTransferView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 18) {
                     intro
-                    beneficiariesSection
-                    transfersSection
+                    if depositsPermitted {
+                        depositSection
+                        depositsSection
+                    }
+                    if transfersPermitted {
+                        beneficiariesSection
+                        transfersSection
+                    }
                 }
                 .padding(20)
                 .padding(.bottom, 24)
             }
             .background(KitColor.canvas.ignoresSafeArea())
-            .navigationTitle("Bank transfer")
+            .navigationTitle("Bank")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
@@ -709,57 +1043,103 @@ struct BankTransferView: View {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
                         Task {
-                            await model.load(
+                            async let transfers: Void = model.load(
                                 country: country,
-                                permitted: permission,
+                                permitted: transferPermission,
                                 online: app.isOnline
                             )
+                            async let deposits: Void = depositModel.load(
+                                wallet: app.selectedWallet,
+                                permitted: depositPermission,
+                                online: app.isOnline
+                            )
+                            _ = await (transfers, deposits)
                         }
                     } label: {
                         Image(systemName: "arrow.clockwise")
                     }
-                    .disabled(model.isLoading || model.isSubmitting)
-                    .accessibilityLabel("Refresh bank transfers")
+                    .disabled(
+                        model.isLoading || model.isSubmitting
+                            || depositModel.isLoading || depositModel.isSubmitting
+                    )
+                    .accessibilityLabel("Refresh bank activity")
                 }
             }
             .task(id: loadTrigger) {
-                await model.load(country: country, permitted: permission, online: app.isOnline)
+                async let transfers: Void = model.load(
+                    country: country,
+                    permitted: transferPermission,
+                    online: app.isOnline
+                )
+                async let deposits: Void = depositModel.load(
+                    wallet: app.selectedWallet,
+                    permitted: depositPermission,
+                    online: app.isOnline
+                )
+                _ = await (transfers, deposits)
             }
             .onAppear { rebuildContactIndex(app.contactDirectory) }
             .onChange(of: app.contactDirectory) { _, contacts in
                 rebuildContactIndex(contacts)
             }
             .refreshable {
-                await model.load(country: country, permitted: permission, online: app.isOnline)
-            }
-            .sheet(isPresented: $addingBeneficiary) {
-                AddBankBeneficiaryView(
-                    model: model,
-                    permitted: permitted,
+                async let transfers: Void = model.load(
+                    country: country,
+                    permitted: transferPermission,
                     online: app.isOnline
                 )
-                .presentationBackground(.ultraThinMaterial)
-            }
-            .sheet(item: $selectedBeneficiary) { beneficiary in
-                BankTransferPaymentView(
-                    model: model,
-                    beneficiary: beneficiary,
-                    permitted: permitted,
+                async let deposits: Void = depositModel.load(
+                    wallet: app.selectedWallet,
+                    permitted: depositPermission,
                     online: app.isOnline
                 )
-                .environmentObject(app)
-                .presentationBackground(.ultraThinMaterial)
+                _ = await (transfers, deposits)
             }
-            .sheet(item: $selectedOperation) { operation in
-                BankTransferHistoryReceiptView(
-                    model: model,
-                    initialOperation: operation
-                )
+            .sheet(item: $modal) { presented in
+                Group {
+                    switch presented {
+                    case .addBeneficiary:
+                        AddBankBeneficiaryView(
+                            model: model,
+                            permitted: transfersPermitted,
+                            online: app.isOnline
+                        )
+                    case .send(let beneficiary):
+                        BankTransferPaymentView(
+                            model: model,
+                            beneficiary: beneficiary,
+                            permitted: transfersPermitted,
+                            online: app.isOnline
+                        )
+                        .environmentObject(app)
+                    case .transferReceipt(let operation):
+                        BankTransferHistoryReceiptView(
+                            model: model,
+                            initialOperation: operation
+                        )
+                    case .newDeposit:
+                        BankDepositFlowView(
+                            model: depositModel,
+                            initialDeposit: nil,
+                            permitted: depositsPermitted,
+                            online: app.isOnline
+                        )
+                        .environmentObject(app)
+                    case .depositReceipt(let deposit):
+                        BankDepositFlowView(
+                            model: depositModel,
+                            initialDeposit: deposit,
+                            permitted: depositsPermitted,
+                            online: app.isOnline
+                        )
+                        .environmentObject(app)
+                    }
+                }
                 .presentationBackground(.ultraThinMaterial)
             }
         }
         .presentationBackground(.ultraThinMaterial)
-        .interactiveDismissDisabled(model.isSubmitting)
+        .interactiveDismissDisabled(model.isSubmitting || depositModel.isSubmitting)
     }
 
     private var intro: some View {
@@ -769,10 +1149,10 @@ struct BankTransferView: View {
                 .foregroundStyle(.white)
                 .frame(width: 52, height: 52)
                 .background(KitColor.green.gradient, in: Circle())
-            Text("Send securely to a bank")
+            Text("Move money with your bank")
                 .font(.title2.bold())
                 .foregroundStyle(.primary)
-            Text("Every destination is verified by the bank before it can receive a transfer. Transfers are submitted online and remain visible until the bank confirms them.")
+            Text("Deposit into your Kit Pay wallet by bank transfer, or send from Kit Pay to a verified bank beneficiary. Every step stays visible until it is confirmed.")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
         }
@@ -781,22 +1161,116 @@ struct BankTransferView: View {
         .kitGlass(cornerRadius: 25)
     }
 
+    private var depositSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Deposit")
+                .font(.title3.bold())
+                .foregroundStyle(.primary)
+
+            Button { modal = .newDeposit } label: {
+                HStack(spacing: 14) {
+                    Image(systemName: "arrow.down.to.line.compact")
+                        .font(.title3.bold())
+                        .foregroundStyle(.white)
+                        .frame(width: 48, height: 48)
+                        .background(KitColor.green.gradient, in: Circle())
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Deposit by bank transfer")
+                            .font(.headline)
+                            .foregroundStyle(.primary)
+                        Text("Get a unique reference, transfer to Kit Pay, then upload your receipt.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.leading)
+                    }
+                    Spacer(minLength: 4)
+                    Image(systemName: "chevron.right")
+                        .font(.caption.bold())
+                        .foregroundStyle(.tertiary)
+                }
+                .padding(16)
+                .kitGlass(cornerRadius: 22, shadow: false)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(
+                !depositsPermitted || !app.isOnline
+                    || depositModel.isLoading || depositModel.isSubmitting
+                    || depositModel.activeAccounts(for: app.selectedWallet).isEmpty
+            )
+            .opacity(
+                depositModel.activeAccounts(for: app.selectedWallet).isEmpty ? 0.58 : 1
+            )
+
+            if depositModel.isLoading && depositModel.accounts.isEmpty {
+                ProgressView("Loading receiving accounts…")
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 8)
+            } else if let error = depositModel.accountLoadErrorMessage {
+                BankTransferInlineError(message: error)
+            } else if depositModel.activeAccounts(for: app.selectedWallet).isEmpty {
+                BankTransferInlineError(
+                    message: "No receiving bank account is available for this wallet's currency yet."
+                )
+            }
+
+            if let error = depositModel.errorMessage {
+                BankTransferInlineError(message: error)
+            }
+        }
+    }
+
+    private var depositsSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Recent deposits")
+                .font(.title3.bold())
+                .foregroundStyle(.primary)
+
+            if depositModel.isLoading && depositModel.deposits.isEmpty {
+                ProgressView("Loading bank deposits…")
+                    .frame(maxWidth: .infinity)
+                    .padding(24)
+            } else if let error = depositModel.depositLoadErrorMessage,
+                      depositModel.deposits.isEmpty {
+                BankTransferInlineError(message: error)
+            } else if depositModel.deposits.isEmpty {
+                Text("Deposits you create will appear here from reference generation through wallet credit.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(18)
+                    .kitGlass(cornerRadius: 20, shadow: false)
+            } else {
+                ForEach(depositModel.deposits.prefix(20)) { deposit in
+                    Button { modal = .depositReceipt(deposit) } label: {
+                        BankDepositRow(deposit: deposit)
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                if let error = depositModel.depositLoadErrorMessage {
+                    BankTransferInlineError(message: error)
+                }
+            }
+        }
+    }
+
     private var beneficiariesSection: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text("Saved beneficiaries")
+                Text("Send to bank")
                     .font(.title3.bold())
                     .foregroundStyle(.primary)
                 Spacer()
                 Button {
                     model.prepareAccountVerification()
-                    addingBeneficiary = true
+                    modal = .addBeneficiary
                 } label: {
                     Label("Add", systemImage: "plus")
                         .font(.subheadline.bold())
                 }
                 .disabled(
-                    !permitted
+                    !transfersPermitted
                         || !app.isOnline
                         || model.isLoading
                         || model.isSubmitting
@@ -819,18 +1293,18 @@ struct BankTransferView: View {
                 ContentUnavailableView(
                     "No bank beneficiaries",
                     systemImage: "person.crop.circle.badge.plus",
-                    description: Text("Add and verify a bank account before sending money.")
+                    description: Text("Add and verify a beneficiary before sending money to a bank.")
                 )
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 12)
                 .kitGlass(cornerRadius: 22)
             } else {
                 ForEach(model.transferableBeneficiaries) { beneficiary in
-                    Button { selectedBeneficiary = beneficiary } label: {
+                    Button { modal = .send(beneficiary) } label: {
                         beneficiaryRow(beneficiary)
                     }
                     .buttonStyle(.plain)
-                    .disabled(!permitted || !app.isOnline)
+                    .disabled(!transfersPermitted || !app.isOnline)
                 }
 
                 if let error = model.beneficiaryLoadErrorMessage {
@@ -923,7 +1397,7 @@ struct BankTransferView: View {
                     .kitGlass(cornerRadius: 20, shadow: false)
             } else {
                 ForEach(model.operations.prefix(20)) { operation in
-                    Button { selectedOperation = operation } label: {
+                    Button { modal = .transferReceipt(operation) } label: {
                         BankTransferOperationRow(
                             operation: operation,
                             bankName: model.banks.first(where: { $0.id == operation.bankId })?.name
@@ -936,6 +1410,691 @@ struct BankTransferView: View {
                     BankTransferInlineError(message: error)
                 }
             }
+        }
+    }
+}
+
+private struct BankDepositPreparedProof {
+    let data: Data
+    let filename: String
+    let mimeType: String
+}
+
+private enum BankDepositProofPreparation {
+    static func photo(from data: Data) throws -> BankDepositPreparedProof {
+        guard let image = UIImage(data: data) else {
+            throw BankDepositProofUploadError.invalidDocument
+        }
+        let normalized = resized(image, maximumDimension: 3_000)
+        for quality in [0.92, 0.82, 0.70, 0.58, 0.46] {
+            if let encoded = normalized.jpegData(compressionQuality: quality),
+               encoded.count <= BankDepositProofUploadPolicy.maximumBytes {
+                return BankDepositPreparedProof(
+                    data: encoded,
+                    filename: "bank-transfer-receipt.jpg",
+                    mimeType: "image/jpeg"
+                )
+            }
+        }
+        throw BankDepositProofUploadError.invalidDocument
+    }
+
+    static func importedFile(at url: URL) throws -> BankDepositPreparedProof {
+        let accessed = url.startAccessingSecurityScopedResource()
+        defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+        let values = try url.resourceValues(forKeys: [.fileSizeKey, .contentTypeKey])
+        if let fileSize = values.fileSize,
+           fileSize <= 0 || fileSize > BankDepositProofUploadPolicy.maximumBytes {
+            throw BankDepositProofUploadError.invalidDocument
+        }
+        let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+        let type = values.contentType ?? UTType(filenameExtension: url.pathExtension)
+        let mimeType: String
+        if type?.conforms(to: .pdf) == true {
+            guard data.starts(with: Data("%PDF-".utf8)) else {
+                throw BankDepositProofUploadError.invalidDocument
+            }
+            mimeType = "application/pdf"
+        } else if type?.conforms(to: .png) == true {
+            guard UIImage(data: data) != nil else {
+                throw BankDepositProofUploadError.invalidDocument
+            }
+            mimeType = "image/png"
+        } else if type?.conforms(to: .jpeg) == true {
+            guard UIImage(data: data) != nil else {
+                throw BankDepositProofUploadError.invalidDocument
+            }
+            mimeType = "image/jpeg"
+        } else {
+            throw BankDepositProofUploadError.invalidDocument
+        }
+        let filename = String(url.lastPathComponent.prefix(255))
+        guard BankDepositProofUploadPolicy.accepts(
+            data: data,
+            filename: filename,
+            mimeType: mimeType
+        ) else { throw BankDepositProofUploadError.invalidDocument }
+        return BankDepositPreparedProof(data: data, filename: filename, mimeType: mimeType)
+    }
+
+    private static func resized(_ image: UIImage, maximumDimension: CGFloat) -> UIImage {
+        let longest = max(image.size.width, image.size.height)
+        guard longest > maximumDimension else { return image }
+        let ratio = maximumDimension / longest
+        let size = CGSize(width: image.size.width * ratio, height: image.size.height * ratio)
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        format.opaque = true
+        return UIGraphicsImageRenderer(size: size, format: format).image { _ in
+            image.draw(in: CGRect(origin: .zero, size: size))
+        }
+    }
+}
+
+private struct BankDepositFlowView: View {
+    @EnvironmentObject private var app: AppModel
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject var model: BankDepositViewModel
+    let initialDeposit: BankDepositRequestDTO?
+    let permitted: Bool
+    let online: Bool
+
+    @State private var deposit: BankDepositRequestDTO?
+    @State private var accountID = ""
+    @State private var amount = ""
+    @State private var note = ""
+    @State private var idempotencyKey = BankTransferIdempotency.key(prefix: "ios-bank-deposit")
+    @State private var photoItem: PhotosPickerItem?
+    @State private var preparedProof: BankDepositPreparedProof?
+    @State private var importingDocument = false
+    @State private var isPreparingProof = false
+
+    private var wallet: Wallet? { app.selectedWallet }
+
+    private var availableAccounts: [BankFundingAccountDTO] {
+        model.activeAccounts(for: wallet)
+    }
+
+    private var selectedAccount: BankFundingAccountDTO? {
+        availableAccounts.first(where: { $0.id == accountID })
+    }
+
+    private var currentDeposit: BankDepositRequestDTO? {
+        guard let deposit else { return nil }
+        return model.deposits.first(where: { $0.id == deposit.id }) ?? deposit
+    }
+
+    private var amountMode: PaymentAmountInputMode {
+        let scale = max(0, min(9, Int(wallet?.currency.scale ?? "0") ?? 0))
+        return scale == 0 ? .whole : .decimal(maximumFractionDigits: scale)
+    }
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if let currentDeposit {
+                    depositDetails(currentDeposit)
+                } else {
+                    createForm
+                }
+            }
+            .background(KitColor.canvas.ignoresSafeArea())
+            .navigationTitle(currentDeposit == nil ? "Bank deposit" : "Deposit details")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button(currentDeposit == nil ? "Cancel" : "Done") { dismiss() }
+                        .disabled(model.isSubmitting || isPreparingProof)
+                }
+                if let currentDeposit {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button {
+                            Task { deposit = await model.refresh(currentDeposit) ?? currentDeposit }
+                        } label: {
+                            Image(systemName: "arrow.clockwise")
+                        }
+                        .disabled(model.isSubmitting || !online)
+                        .accessibilityLabel("Refresh deposit status")
+                    }
+                }
+            }
+        }
+        .interactiveDismissDisabled(model.isSubmitting || isPreparingProof)
+        .onAppear {
+            deposit = initialDeposit
+            if accountID.isEmpty { accountID = availableAccounts.first?.id ?? "" }
+            model.clearError()
+        }
+        .onChange(of: availableAccounts.map(\.id)) { _, ids in
+            if !ids.contains(accountID) { accountID = ids.first ?? "" }
+        }
+        .onChange(of: photoItem) { _, item in
+            guard let item else { return }
+            Task { await preparePhoto(item) }
+        }
+        .fileImporter(
+            isPresented: $importingDocument,
+            allowedContentTypes: [.jpeg, .png, .pdf],
+            allowsMultipleSelection: false
+        ) { result in
+            Task { await prepareImportedFile(result) }
+        }
+    }
+
+    private var createForm: some View {
+        ScrollView {
+            VStack(spacing: 18) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Label("Deposit into Kit Pay", systemImage: "building.columns.fill")
+                        .font(.title2.bold())
+                        .foregroundStyle(.primary)
+                    Text("Choose where to send your bank transfer. You do not need a beneficiary: the unique reference links the payment directly to your Kit Pay wallet.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(20)
+                .kitGlass(cornerRadius: 24)
+
+                if let wallet {
+                    HStack(spacing: 13) {
+                        Image(systemName: "wallet.bifold.fill")
+                            .foregroundStyle(KitColor.green)
+                            .frame(width: 44, height: 44)
+                            .background(KitColor.paleGreen, in: Circle())
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(wallet.name).font(.headline)
+                            Text("Funds will be credited to this wallet")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Text(wallet.currency.code)
+                            .font(.caption.bold())
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(16)
+                    .kitGlass(cornerRadius: 20, shadow: false)
+                }
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Receiving account")
+                        .font(.caption.bold())
+                        .foregroundStyle(.secondary)
+                    if availableAccounts.isEmpty {
+                        BankTransferInlineError(
+                            message: "No receiving bank account is available for this wallet's currency."
+                        )
+                    } else {
+                        Picker("Receiving account", selection: $accountID) {
+                            ForEach(availableAccounts) { account in
+                                Text("\(account.bank.name) · \(account.accountNumberMasked)")
+                                    .tag(account.id)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                        if let selectedAccount {
+                            Text(selectedAccount.accountName)
+                                .font(.subheadline.weight(.semibold))
+                            Text(selectedAccount.accountNumberMasked)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(18)
+                .kitGlass(cornerRadius: 20)
+
+                VStack(alignment: .leading, spacing: 9) {
+                    Text("Deposit amount")
+                        .font(.caption.bold())
+                        .foregroundStyle(.secondary)
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text(wallet?.currency.code ?? "UGX")
+                            .font(.headline.bold())
+                            .foregroundStyle(KitColor.green)
+                        KitAmountTextField(
+                            "0",
+                            value: $amount,
+                            mode: amountMode,
+                            textStyle: .large,
+                            textAlignment: .right
+                        )
+                    }
+                    Text("Enter the exact amount you will transfer from your bank.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(18)
+                .kitGlass(cornerRadius: 20)
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Optional note")
+                        .font(.caption.bold())
+                        .foregroundStyle(.secondary)
+                    TextField("For your records", text: $note, axis: .vertical)
+                        .lineLimit(2 ... 4)
+                        .onChange(of: note) { _, value in
+                            if value.count > 280 { note = String(value.prefix(280)) }
+                        }
+                    Text("\(note.count)/280")
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                }
+                .padding(18)
+                .kitGlass(cornerRadius: 20)
+
+                if let error = model.errorMessage {
+                    BankTransferInlineError(message: error)
+                }
+
+                Button {
+                    guard let selectedAccount else { return }
+                    Task {
+                        if let created = await model.create(
+                            wallet: wallet,
+                            fundingAccount: selectedAccount,
+                            enteredAmount: amount,
+                            note: note,
+                            idempotencyKey: idempotencyKey,
+                            permitted: permitted,
+                            online: online
+                        ) {
+                            deposit = created
+                        }
+                    }
+                } label: {
+                    if model.isSubmitting {
+                        HStack { Spacer(); ProgressView(); Spacer() }
+                    } else {
+                        Label("Get deposit instructions", systemImage: "arrow.right.circle.fill")
+                            .frame(maxWidth: .infinity)
+                    }
+                }
+                .buttonStyle(KitPrimaryButtonStyle())
+                .disabled(
+                    model.isSubmitting || !permitted || !online || selectedAccount == nil
+                        || BankDepositMoney.apiAmount(
+                            amount,
+                            scale: Int(wallet?.currency.scale ?? "") ?? -1
+                        ) == nil
+                )
+            }
+            .padding(22)
+        }
+    }
+
+    private func depositDetails(_ deposit: BankDepositRequestDTO) -> some View {
+        let presentation = BankDepositStatusPresentation(status: deposit.status)
+        return ScrollView {
+            VStack(spacing: 18) {
+                VStack(spacing: 12) {
+                    Image(systemName: presentation.icon)
+                        .font(.system(size: 34, weight: .bold))
+                        .foregroundStyle(.white)
+                        .frame(width: 78, height: 78)
+                        .background(presentation.color.gradient, in: Circle())
+                    Text(presentation.title)
+                        .font(.title.bold())
+                        .foregroundStyle(.primary)
+                    Text(BankTransferDisplay.amount(deposit.amount, currency: deposit.currency))
+                        .font(.system(size: 32, weight: .heavy, design: .rounded))
+                        .foregroundStyle(.primary)
+                    Text(presentation.message)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+
+                if !deposit.isTerminal {
+                    referenceCard(deposit)
+                    receivingAccountCard(deposit)
+                }
+
+                if deposit.acceptsProof {
+                    proofCard(deposit)
+                } else if let proof = deposit.proof {
+                    submittedProofCard(proof)
+                }
+
+                VStack(spacing: 13) {
+                    detailRow("Deposit reference", deposit.reference, monospaced: true)
+                    detailRow("Status", presentation.title)
+                    detailRow("Bank", deposit.fundingAccount.bank.name)
+                    detailRow("Kit Pay wallet", wallet?.name ?? "Selected wallet")
+                    if let bankReference = deposit.bankTransactionReference {
+                        detailRow("Bank transaction", bankReference, monospaced: true)
+                    }
+                    if let completed = deposit.completedAt {
+                        detailRow("Completed", formattedDate(completed))
+                    }
+                }
+                .padding(18)
+                .kitGlass(cornerRadius: 22)
+
+                if let rejection = deposit.rejection {
+                    BankTransferInlineError(
+                        message: rejection.reason ?? "The payment proof could not be matched to this deposit."
+                    )
+                }
+                if let error = model.errorMessage {
+                    BankTransferInlineError(message: error)
+                }
+
+                if deposit.isTerminal {
+                    Button("Start another deposit") {
+                        self.deposit = nil
+                        amount = ""
+                        note = ""
+                        preparedProof = nil
+                        photoItem = nil
+                        idempotencyKey = BankTransferIdempotency.key(prefix: "ios-bank-deposit")
+                        model.clearError()
+                    }
+                    .buttonStyle(KitPrimaryButtonStyle())
+                    .disabled(!permitted || !online)
+                }
+            }
+            .padding(22)
+        }
+    }
+
+    private func referenceCard(_ deposit: BankDepositRequestDTO) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Your payment reference")
+                .font(.caption.bold())
+                .foregroundStyle(.secondary)
+            HStack(spacing: 10) {
+                Text(deposit.reference)
+                    .font(.system(.title3, design: .monospaced).bold())
+                    .foregroundStyle(.primary)
+                    .textSelection(.enabled)
+                    .minimumScaleFactor(0.72)
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                Button {
+                    UIPasteboard.general.string = deposit.reference
+                } label: {
+                    Label("Copy", systemImage: "doc.on.doc")
+                        .font(.caption.bold())
+                }
+                .buttonStyle(.bordered)
+            }
+            Text("Use this exact reference in your bank transfer. It is how Kit Pay matches the payment to your wallet.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(18)
+        .background(KitColor.paleGreen.opacity(0.8), in: RoundedRectangle(cornerRadius: 22))
+        .overlay {
+            RoundedRectangle(cornerRadius: 22)
+                .stroke(KitColor.green.opacity(0.28), lineWidth: 1)
+        }
+    }
+
+    private func receivingAccountCard(_ deposit: BankDepositRequestDTO) -> some View {
+        let account = deposit.fundingAccount
+        return VStack(alignment: .leading, spacing: 13) {
+            Text("Transfer to")
+                .font(.headline)
+                .foregroundStyle(.primary)
+            detailRow("Bank", account.bank.name)
+            detailRow("Account name", account.accountName)
+            detailRow("Account number", account.accountNumber, monospaced: true)
+            if let branch = account.branchName { detailRow("Branch", branch) }
+            if let swift = account.swiftCode { detailRow("SWIFT", swift, monospaced: true) }
+            if let instructions = account.instructions, !instructions.isEmpty {
+                Divider()
+                Text(instructions)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Label(
+                "Do not send a different amount or omit the reference.",
+                systemImage: "exclamationmark.shield.fill"
+            )
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.orange)
+        }
+        .padding(18)
+        .kitGlass(cornerRadius: 22)
+    }
+
+    private func proofCard(_ deposit: BankDepositRequestDTO) -> some View {
+        VStack(alignment: .leading, spacing: 13) {
+            Text(deposit.proof == nil ? "Upload payment proof" : "Replace payment proof")
+                .font(.headline)
+                .foregroundStyle(.primary)
+            Text("After completing the bank transfer, add a clear receipt image or PDF. Kit Pay staff will verify it before your wallet is credited.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            HStack(spacing: 10) {
+                PhotosPicker(selection: $photoItem, matching: .images) {
+                    Label("Photo", systemImage: "photo.on.rectangle")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+
+                Button { importingDocument = true } label: {
+                    Label("File", systemImage: "doc")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+            }
+            .disabled(model.isSubmitting || isPreparingProof || !online)
+
+            if isPreparingProof {
+                ProgressView("Preparing receipt…")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            if let preparedProof {
+                HStack(spacing: 10) {
+                    Image(systemName: preparedProof.mimeType == "application/pdf"
+                        ? "doc.fill" : "photo.fill")
+                        .foregroundStyle(KitColor.green)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(preparedProof.filename)
+                            .font(.subheadline.weight(.semibold))
+                            .lineLimit(1)
+                        Text(ByteCountFormatter.string(
+                            fromByteCount: Int64(preparedProof.data.count),
+                            countStyle: .file
+                        ))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(KitColor.green)
+                }
+                .padding(13)
+                .background(KitColor.paleGreen.opacity(0.55), in: RoundedRectangle(cornerRadius: 16))
+
+                Button {
+                    Task {
+                        if let updated = await model.uploadProof(
+                            for: deposit,
+                            data: preparedProof.data,
+                            filename: preparedProof.filename,
+                            mimeType: preparedProof.mimeType,
+                            permitted: permitted,
+                            online: online
+                        ) {
+                            self.deposit = updated
+                            self.preparedProof = nil
+                            self.photoItem = nil
+                        }
+                    }
+                } label: {
+                    if model.isSubmitting {
+                        HStack { Spacer(); ProgressView("Uploading…"); Spacer() }
+                    } else {
+                        Label("Submit receipt for review", systemImage: "arrow.up.doc.fill")
+                            .frame(maxWidth: .infinity)
+                    }
+                }
+                .buttonStyle(KitPrimaryButtonStyle())
+                .disabled(model.isSubmitting || !permitted || !online)
+            }
+        }
+        .padding(18)
+        .kitGlass(cornerRadius: 22)
+    }
+
+    private func submittedProofCard(_ proof: BankDepositProofDTO) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: proof.mimeType == "application/pdf" ? "doc.fill" : "photo.fill")
+                .foregroundStyle(KitColor.green)
+                .frame(width: 42, height: 42)
+                .background(KitColor.paleGreen, in: Circle())
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Payment proof submitted")
+                    .font(.headline)
+                Text(proof.filename)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer()
+            Image(systemName: "checkmark.seal.fill")
+                .foregroundStyle(KitColor.green)
+        }
+        .padding(17)
+        .kitGlass(cornerRadius: 20, shadow: false)
+    }
+
+    private func detailRow(_ title: String, _ value: String, monospaced: Bool = false) -> some View {
+        HStack(alignment: .top) {
+            Text(title).foregroundStyle(.secondary)
+            Spacer(minLength: 18)
+            Text(value)
+                .font(monospaced ? .subheadline.monospaced() : .subheadline)
+                .fontWeight(.semibold)
+                .foregroundStyle(.primary)
+                .multilineTextAlignment(.trailing)
+                .textSelection(.enabled)
+        }
+    }
+
+    private func formattedDate(_ value: String) -> String {
+        guard let date = ISO8601DateFormatter().date(from: value) else { return value }
+        return date.formatted(date: .abbreviated, time: .shortened)
+    }
+
+    @MainActor
+    private func preparePhoto(_ item: PhotosPickerItem) async {
+        isPreparingProof = true
+        model.clearError()
+        defer { isPreparingProof = false }
+        do {
+            guard let data = try await item.loadTransferable(type: Data.self) else {
+                throw BankDepositProofUploadError.invalidDocument
+            }
+            preparedProof = try BankDepositProofPreparation.photo(from: data)
+        } catch {
+            preparedProof = nil
+            model.errorMessage = error.localizedDescription
+        }
+    }
+
+    @MainActor
+    private func prepareImportedFile(_ result: Result<[URL], Error>) async {
+        isPreparingProof = true
+        model.clearError()
+        defer { isPreparingProof = false }
+        do {
+            guard let url = try result.get().first else {
+                throw BankDepositProofUploadError.invalidDocument
+            }
+            preparedProof = try BankDepositProofPreparation.importedFile(at: url)
+            photoItem = nil
+        } catch {
+            preparedProof = nil
+            model.errorMessage = error.localizedDescription
+        }
+    }
+}
+
+private struct BankDepositRow: View {
+    let deposit: BankDepositRequestDTO
+
+    var body: some View {
+        let presentation = BankDepositStatusPresentation(status: deposit.status)
+        HStack(spacing: 13) {
+            Image(systemName: presentation.icon)
+                .font(.headline)
+                .foregroundStyle(presentation.color)
+                .frame(width: 44, height: 44)
+                .background(presentation.color.opacity(0.12), in: Circle())
+            VStack(alignment: .leading, spacing: 3) {
+                Text(deposit.fundingAccount.bank.name)
+                    .font(.body.bold())
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                Text(deposit.reference)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                Text(presentation.title)
+                    .font(.caption2.bold())
+                    .foregroundStyle(presentation.color)
+            }
+            Spacer()
+            Text(BankTransferDisplay.amount(deposit.amount, currency: deposit.currency))
+                .font(.subheadline.bold())
+                .foregroundStyle(.primary)
+        }
+        .padding(14)
+        .kitGlass(cornerRadius: 20, shadow: false)
+    }
+}
+
+private struct BankDepositStatusPresentation {
+    let title: String
+    let message: String
+    let icon: String
+    let color: Color
+
+    init(status: String) {
+        switch status.lowercased() {
+        case "awaiting_proof":
+            title = "Awaiting receipt"
+            message = "Complete the bank transfer using the exact reference, then upload your receipt."
+            icon = "doc.badge.arrow.up.fill"
+            color = .orange
+        case "proof_submitted":
+            title = "Receipt submitted"
+            message = "Your receipt is securely uploaded and will be checked before approval."
+            icon = "checkmark.shield.fill"
+            color = .blue
+        case "awaiting_approval":
+            title = "Under review"
+            message = "The transfer evidence was verified and is awaiting independent approval."
+            icon = "person.badge.clock.fill"
+            color = .blue
+        case "approved", "completed":
+            title = "Wallet credited"
+            message = "The bank transfer was approved and the money is now in your Kit Pay wallet."
+            icon = "checkmark.circle.fill"
+            color = KitColor.green
+        case "rejected":
+            title = "Deposit not approved"
+            message = "Review the reason below before creating another deposit."
+            icon = "exclamationmark.triangle.fill"
+            color = .red
+        case "expired":
+            title = "Deposit expired"
+            message = "This reference expired before the deposit could be approved. Create a new deposit to continue."
+            icon = "clock.badge.exclamationmark.fill"
+            color = .orange
+        default:
+            title = status.replacingOccurrences(of: "_", with: " ").capitalized
+            message = "Kit Pay is checking the latest status of this bank deposit."
+            icon = "clock.arrow.circlepath"
+            color = .blue
         }
     }
 }

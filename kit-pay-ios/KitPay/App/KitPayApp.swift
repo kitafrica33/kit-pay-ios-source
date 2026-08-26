@@ -73,8 +73,20 @@ struct KitPayApp: App {
                     if concealed { isCallPresented = false }
                     syncMinimizedCallSurface()
                 }
-                .onOpenURL { model.handleDeepLink($0) }
+                .onOpenURL { url in
+                    // The share extension's hand-off carries no payload — it only says that
+                    // something is waiting in Kit Pay's own container.
+                    if KitShareHandoffLink.matches(url) {
+                        model.refreshSharedInbox()
+                    } else {
+                        model.handleDeepLink(url)
+                    }
+                }
                 .task { await model.requestContactsPermissionAtLaunch() }
+                // A cold launch reaches `.active` before the session has been restored, so the
+                // first look for a staged share finds a signed-out app. This is the moment it
+                // becomes answerable.
+                .onChange(of: sharedInboxReadiness) { _, _ in model.refreshSharedInbox() }
                 .onChange(of: scenePhase) { _, phase in
                     if phase == .active {
                         Task { await model.requestContactsPermissionAtLaunch() }
@@ -88,6 +100,11 @@ struct KitPayApp: App {
                         // playback belongs back inside it rather than in a floating window over
                         // the app the user has just returned to.
                         ChatVideoPictureInPicture.shared.stopForForegroundIfNeeded()
+                        // A share may have been staged while Kit Pay was in the background, and
+                        // the extension's request to open the app is not guaranteed to arrive.
+                        // Looking every time the app comes forward is what makes the hand-off
+                        // reliable rather than hopeful.
+                        model.refreshSharedInbox()
                         syncMinimizedCallSurface()
                     } else if phase == .inactive {
                         // Close authenticated signalling as soon as the app is no longer active.
@@ -107,6 +124,15 @@ struct KitPayApp: App {
                     }
                 }
         }
+    }
+
+    /// Everything that decides whether a staged share can be offered a chat yet.
+    private var sharedInboxReadiness: String {
+        [
+            String(model.isSignedIn),
+            String(model.requiresBiometricSignIn),
+            String(model.accountSetupStep == nil),
+        ].joined(separator: ":")
     }
 
     @MainActor

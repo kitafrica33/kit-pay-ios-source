@@ -48,6 +48,140 @@ struct BankingOperationListDTO: Decodable {
     let items: [BankingOperationDTO]?
 }
 
+struct BankFundingAccountListDTO: Decodable {
+    let items: [BankFundingAccountDTO]?
+}
+
+struct BankFundingAccountBankDTO: Decodable, Hashable, Identifiable {
+    let id: String
+    let name: String
+    let code: String
+    let countryCode: String
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, code
+        case countryCode = "country_code"
+    }
+}
+
+/// A Kit Pay receiving account, not one of the customer's saved beneficiaries.
+///
+/// Keeping this model separate is deliberate: deposits credit the selected Kit Pay wallet and
+/// therefore never ask for, infer, or persist a beneficiary.
+struct BankFundingAccountDTO: Decodable, Hashable, Identifiable {
+    let id: String
+    let label: String
+    let bank: BankFundingAccountBankDTO
+    let accountName: String
+    let accountNumber: String
+    let accountNumberMasked: String
+    let branchName: String?
+    let branchCode: String?
+    let swiftCode: String?
+    let instructions: String?
+    let currency: String
+    let status: String
+
+    enum CodingKeys: String, CodingKey {
+        case id, label, bank, currency, status, instructions
+        case accountName = "account_name"
+        case accountNumber = "account_number"
+        case accountNumberMasked = "account_number_masked"
+        case branchName = "branch_name"
+        case branchCode = "branch_code"
+        case swiftCode = "swift_code"
+    }
+
+    var isActive: Bool {
+        status.caseInsensitiveCompare("active") == .orderedSame
+            && !accountNumber.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+}
+
+struct BankDepositRequestListDTO: Decodable {
+    let items: [BankDepositRequestDTO]?
+}
+
+struct BankDepositProofDTO: Decodable, Hashable {
+    let assetId: String
+    let filename: String
+    let status: String
+    let scanStatus: String
+    let mimeType: String?
+    let byteSize: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case filename, status
+        case assetId = "asset_id"
+        case scanStatus = "scan_status"
+        case mimeType = "mime_type"
+        case byteSize = "byte_size"
+    }
+}
+
+struct BankDepositRejectionDTO: Decodable, Hashable {
+    let code: String
+    let reason: String?
+}
+
+struct BankDepositRequestDTO: Decodable, Hashable, Identifiable {
+    let id: String
+    let reference: String
+    let walletId: String
+    let amount: String
+    let currency: CurrencyDTO
+    let status: String
+    let source: String
+    let fundingAccount: BankFundingAccountDTO
+    let proof: BankDepositProofDTO?
+    let bankTransactionReference: String?
+    let customerNote: String?
+    let rejection: BankDepositRejectionDTO?
+    let expiresAt: String
+    let createdAt: String?
+    let proofSubmittedAt: String?
+    let completedAt: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id, reference, amount, currency, status, source, proof, rejection
+        case walletId = "wallet_id"
+        case fundingAccount = "funding_account"
+        case bankTransactionReference = "bank_transaction_reference"
+        case customerNote = "customer_note"
+        case expiresAt = "expires_at"
+        case createdAt = "created_at"
+        case proofSubmittedAt = "proof_submitted_at"
+        case completedAt = "completed_at"
+    }
+
+    var acceptsProof: Bool {
+        ["awaiting_proof", "proof_submitted"].contains(status.lowercased())
+            && ISO8601DateFormatter().date(from: expiresAt).map { $0 > Date() } == true
+    }
+
+    var isTerminal: Bool {
+        ["approved", "completed", "rejected", "expired", "cancelled", "canceled"]
+            .contains(status.lowercased())
+    }
+
+    var isSuccessful: Bool {
+        ["approved", "completed"].contains(status.lowercased())
+    }
+
+    func hasSameBinding(
+        wallet: Wallet,
+        fundingAccount: BankFundingAccountDTO,
+        submittedAmount: String
+    ) -> Bool {
+        walletId == wallet.id
+            && fundingAccount.id == self.fundingAccount.id
+            && currency.code.caseInsensitiveCompare(wallet.currency.code) == .orderedSame
+            && currency.scale == wallet.currency.scale
+            && BankTransferMoney.amountsMatch(amount, submittedAmount)
+            && BankDepositReferencePolicy.isValid(reference)
+    }
+}
+
 enum BankTransferFeeMode: String, Codable, CaseIterable, Identifiable {
     case senderAbsorbs = "sender_absorbs"
     case beneficiaryAbsorbs = "recipient_absorbs"
@@ -452,6 +586,27 @@ struct CreateQuotedBankTransferRequest: Encodable {
     }
 }
 
+struct CreateBankDepositRequest: Encodable {
+    let walletId: String
+    let fundingAccountId: String
+    let amount: String
+    let note: String?
+
+    enum CodingKeys: String, CodingKey {
+        case amount, note
+        case walletId = "wallet_id"
+        case fundingAccountId = "funding_account_id"
+    }
+}
+
+struct AttachBankDepositProofRequest: Encodable {
+    let mediaAssetId: String
+
+    enum CodingKeys: String, CodingKey {
+        case mediaAssetId = "media_asset_id"
+    }
+}
+
 enum BankTransferContract {
     static let purpose = "bank_transfer"
     static let operationType = "bank_transfer"
@@ -571,6 +726,50 @@ enum BankTransferMoney {
     }
 }
 
+enum BankDepositMoney {
+    static func apiAmount(_ raw: String, scale: Int) -> String? {
+        guard (0 ... 9).contains(scale) else { return nil }
+        let compact = raw.filter { !$0.isWhitespace && $0 != "," }
+        let pieces = compact.split(separator: ".", omittingEmptySubsequences: false)
+        guard !compact.isEmpty,
+              pieces.count <= 2,
+              pieces.allSatisfy({ part in
+                  part.allSatisfy { $0.isASCII && $0.isNumber }
+              }),
+              let integerPart = pieces.first,
+              !integerPart.isEmpty
+        else { return nil }
+
+        let fraction = pieces.count == 2 ? String(pieces[1]) : ""
+        guard fraction.count <= scale else { return nil }
+        let integer = String(integerPart.drop(while: { $0 == "0" }))
+        let canonicalInteger = integer.isEmpty ? "0" : integer
+        let canonicalFraction = String(fraction.reversed().drop(while: { $0 == "0" }).reversed())
+        let canonical = canonicalFraction.isEmpty
+            ? canonicalInteger
+            : "\(canonicalInteger).\(canonicalFraction)"
+        guard Decimal(string: canonical, locale: Locale(identifier: "en_US_POSIX")).map({ $0 > 0 }) == true
+        else { return nil }
+        return canonical
+    }
+}
+
+enum BankDepositReferencePolicy {
+    static func isValid(_ value: String) -> Bool {
+        let groups = value.split(separator: "-", omittingEmptySubsequences: false)
+        guard value == value.uppercased(),
+              groups.count == 4,
+              groups.allSatisfy({ $0.count == 4 }),
+              groups.joined().allSatisfy({ character in
+                  character.isASCII && (character.isLetter || character.isNumber)
+              })
+        else { return false }
+        let characters = groups.joined()
+        return characters.contains(where: \.isLetter)
+            && characters.contains(where: \.isNumber)
+    }
+}
+
 enum BankTransferIdempotency {
     static func key(prefix: String, id: UUID = UUID()) -> String {
         "\(prefix)-\(id.uuidString.lowercased())"
@@ -581,6 +780,11 @@ extension CapabilitiesDTO {
     var enablesBankTransfers: Bool {
         let enabled = features?.compactMapValues { $0 }
         return enabled?["wallets"] == true && enabled?["bank_transfers"] == true
+    }
+
+    var enablesBankDeposits: Bool {
+        let enabled = features?.compactMapValues { $0 }
+        return enabled?["wallets"] == true && enabled?["bank_deposits"] == true
     }
 }
 

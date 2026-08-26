@@ -120,6 +120,9 @@ private enum CommunicationPreferenceSaveResult {
 private enum SecureMessageSubmissionKind {
     case userText
     case paymentEvent
+    /// The mirror image of `paymentEvent`: a group payment's announcement or an answer to one,
+    /// allowed only in a group thread and never in a one-to-one chat.
+    case groupPaymentEvent
     case reactionEvent
 }
 
@@ -682,6 +685,11 @@ final class AppModel: ObservableObject {
     @Published private(set) var unresolvedAccountDeletionAttemptBlocked = false
     @Published private(set) var messageConversationNavigationRequest:
         MessageConversationNavigationRequest?
+    /// Files (or a link) another app shared into Kit Pay, waiting for the customer to say which
+    /// chat they are for. Drives the destination picker over the chats list.
+    @Published private(set) var pendingSharedInboxBatch: SharedInboxBatch?
+    /// A share that now has a destination, on its way to that conversation's composer.
+    @Published private(set) var sharedInboxDelivery: SharedInboxDelivery?
     @Published private(set) var isBackingUpMessages = false
     @Published private(set) var isRestoringMessages = false
     @Published private(set) var isDeletingMessageBackup = false
@@ -3250,6 +3258,101 @@ final class AppModel: ObservableObject {
         pendingDeepLink = nil
     }
 
+    // MARK: Sharing into Kit Pay
+
+    /// Whether a share from another app can be offered a destination right now.
+    ///
+    /// Everything the share extension stages belongs to whoever was signed in when they shared it.
+    /// A locked, half-set-up, or signing-out app has no chat to put it in and no business showing a
+    /// list of chats, so the batch simply waits — or, on sign-out, is destroyed.
+    private var canDeliverSharedContent: Bool {
+        isSignedIn
+            && accountSetupStep == nil
+            && !requiresBiometricSignIn
+            && !isSigningOut
+            && !isSubmittingAccountDeletion
+            && !acceptedAccountDeletionCleanupBlocked
+            && !unresolvedAccountDeletionAttemptBlocked
+            && !protectedLocalStateRecoveryBlocked
+    }
+
+    /// Looks for anything the share sheet left in the app group container. Called on launch, on
+    /// every return to the foreground, and when the extension opens Kit Pay directly.
+    ///
+    /// Oldest batch first: someone who shared twice before switching apps gets both, in the order
+    /// they shared them, rather than one silently displacing the other.
+    func refreshSharedInbox() {
+        guard canDeliverSharedContent else { return }
+        guard appReviewDemoMutationsAllowed else {
+            // The read-only review account cannot send anything, so a staged share would sit in
+            // front of a picker that refuses every choice.
+            SharedInboxStore.shared.removeAll()
+            SharedInboxStore.shared.clearActiveAccount()
+            return
+        }
+        guard let accountID = profile?.id,
+              SharedInboxStore.shared.setActiveAccountID(accountID)
+        else { return }
+        guard pendingSharedInboxBatch == nil, sharedInboxDelivery == nil else { return }
+        pendingSharedInboxBatch = SharedInboxStore.shared
+            .pendingBatches(forAccountID: accountID)
+            .first
+    }
+
+    /// The chat the customer chose for the share now in front of them.
+    func routeSharedInbox(to conversationID: String) {
+        guard let batch = pendingSharedInboxBatch,
+              canDeliverSharedContent,
+              let conversation = state.conversations.first(where: {
+                  $0.id.caseInsensitiveCompare(conversationID) == .orderedSame
+              })
+        else { return }
+        pendingSharedInboxBatch = nil
+        sharedInboxDelivery = SharedInboxDelivery(
+            conversationID: conversation.id,
+            batch: batch
+        )
+        selectedTab = MainTabIndex.messages
+        messageConversationNavigationRequest = MessageConversationNavigationRequest(
+            conversationID: conversation.id
+        )
+    }
+
+    /// Called by the conversation once the shared files are staged in its composer. The plaintext
+    /// in the container is removed at that moment: it now lives only where the user can see it.
+    func consumeSharedInboxDelivery(_ id: UUID) {
+        guard let delivery = sharedInboxDelivery, delivery.id == id else { return }
+        sharedInboxDelivery = nil
+        SharedInboxStore.shared.remove(batchID: delivery.batch.id)
+        // A second share that arrived while the first was being placed can be offered now.
+        refreshSharedInbox()
+    }
+
+    /// Returns an unreadable or currently-too-large delivery to the destination picker without
+    /// deleting it. The customer can choose another chat (for example, one whose composer is
+    /// empty) or explicitly cancel; an implementation failure never silently discards plaintext.
+    func retrySharedInboxDelivery(_ id: UUID) {
+        guard let delivery = sharedInboxDelivery, delivery.id == id else { return }
+        sharedInboxDelivery = nil
+        pendingSharedInboxBatch = delivery.batch
+    }
+
+    /// The customer closed the destination picker without choosing a chat.
+    func discardPendingSharedInbox() {
+        guard let batch = pendingSharedInboxBatch else { return }
+        pendingSharedInboxBatch = nil
+        SharedInboxStore.shared.remove(batchID: batch.id)
+        refreshSharedInbox()
+    }
+
+    /// Nothing shared into the previous account may survive into the next one.
+    private func purgeSharedInbox() {
+        pendingSharedInboxBatch = nil
+        sharedInboxDelivery = nil
+        SharedInboxStore.shared.removeAll()
+        SharedInboxStore.shared.clearActiveAccount()
+    }
+
     /// Drops every HTTP response the app cached for the account that is going away. Avatar images
     /// are the only account-bound bytes that live outside the encrypted store.
     private func purgeSharedResponseCache() {
@@ -3483,6 +3586,9 @@ final class AppModel: ObservableObject {
         // copies so a signed-out — or deleted — customer's photo, and their contacts' photos,
         // cannot be re-displayed to whoever signs in next.
         purgeSharedResponseCache()
+        // Anything the share sheet staged is plaintext chosen by the customer who is leaving, for
+        // a chat that is about to disappear. It never carries over to the next account.
+        purgeSharedInbox()
         await publishLatestState()
         isSignedIn = false
         accountSetupStep = nil
@@ -7911,6 +8017,31 @@ final class AppModel: ObservableObject {
         )
     }
 
+    /// Queues a group payment announcement or an answer to one, produced by a server-confirmed
+    /// group payment flow. The only bypass for the user-text `KITGRP1:` reservation, and it goes
+    /// to the whole group rather than to a pinned recipient.
+    @discardableResult
+    func queueGroupPaymentEvent(
+        conversationId: String,
+        title: String,
+        body: String,
+        clientMessageID: UUID? = nil
+    ) async -> Bool {
+        guard !isReadOnlyAppReviewDemoConversation(conversationId) else {
+            lastError = "This App Review preview is read-only."
+            return false
+        }
+        return await queueValidatedMessage(
+            conversationId: conversationId,
+            title: title,
+            recipientId: nil,
+            body: body,
+            clientMessageID: clientMessageID,
+            draftClearVersion: nil,
+            submissionKind: .groupPaymentEvent
+        )
+    }
+
     /// Queues a reaction only through the typed reaction boundary. Plain composers and
     /// notification replies reserve `KITRXN1:` so pasted text cannot impersonate a reaction.
     @discardableResult
@@ -7966,6 +8097,11 @@ final class AppModel: ObservableObject {
                 lastError = "Kit Pay could not validate this payment event."
                 return false
             }
+        case .groupPaymentEvent:
+            guard KitGroupPaymentMessage.parse(trimmed) != nil else {
+                lastError = "Kit Pay could not validate this payment event."
+                return false
+            }
         case .reactionEvent:
             guard KitMessageReaction.parse(trimmed) != nil else {
                 lastError = "Kit Pay could not validate this reaction."
@@ -8000,6 +8136,13 @@ final class AppModel: ObservableObject {
         }
         if isGroupTarget, submissionKind == .paymentEvent {
             lastError = "Payment events can only be sent in one-to-one chats."
+            return false
+        }
+        if !isGroupTarget, submissionKind == .groupPaymentEvent {
+            // The other half of the rule above: group payment wire belongs to the group it was
+            // sent into, where every member can see the same announcement and answer for
+            // themselves. A one-to-one thread has no group to claim from.
+            lastError = "Group payments can only be sent in a group chat."
             return false
         }
         let recipientUserID: String?

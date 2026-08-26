@@ -163,12 +163,24 @@
 		A2500000000000000000000C /* WalletTopUp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2500000000000000000000C /* WalletTopUp.swift */; };
 		A2500000000000000000000D /* WalletTopUpView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2500000000000000000000D /* WalletTopUpView.swift */; };
 		A2500000000000000000000E /* WalletTopUpTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2500000000000000000000E /* WalletTopUpTests.swift */; };
+		AGRPPAY0001 /* GroupPaymentModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = BGRPPAY0001 /* GroupPaymentModels.swift */; };
+		AGRPPAY0002 /* APIClient+GroupPayments.swift in Sources */ = {isa = PBXBuildFile; fileRef = BGRPPAY0002 /* APIClient+GroupPayments.swift */; };
+		AGRPPAY0003 /* GroupPaymentPresentation.swift in Sources */ = {isa = PBXBuildFile; fileRef = BGRPPAY0003 /* GroupPaymentPresentation.swift */; };
+		AGRPPAY0004 /* ChatGroupPaymentActions.swift in Sources */ = {isa = PBXBuildFile; fileRef = BGRPPAY0004 /* ChatGroupPaymentActions.swift */; };
+		AGRPPAY0005 /* GroupPaymentComposerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BGRPPAY0005 /* GroupPaymentComposerView.swift */; };
+		AGRPPAYT001 /* GroupPaymentTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BGRPPAYT001 /* GroupPaymentTests.swift */; };
 		AVNP0000001 /* VoiceNotePlaybackPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = BVNP0000001 /* VoiceNotePlaybackPolicy.swift */; };
 		AVNP0000002 /* VoiceNotePlayer.swift in Sources */ = {isa = PBXBuildFile; fileRef = BVNP0000002 /* VoiceNotePlayer.swift */; };
 		AVNP0000003 /* VoiceNoteMiniPlayer.swift in Sources */ = {isa = PBXBuildFile; fileRef = BVNP0000003 /* VoiceNoteMiniPlayer.swift */; };
 		AVNP0000004 /* AppWindowOverlays.swift in Sources */ = {isa = PBXBuildFile; fileRef = BVNP0000004 /* AppWindowOverlays.swift */; };
 		AVNPT000001 /* VoiceNotePlaybackTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BVNPT000001 /* VoiceNotePlaybackTests.swift */; };
 		AVNP0000005 /* ChatVideoPictureInPicture.swift in Sources */ = {isa = PBXBuildFile; fileRef = BVNP0000005 /* ChatVideoPictureInPicture.swift */; };
+		ASHIN0000001 /* SharedInbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = BSHIN0000001 /* SharedInbox.swift */; };
+		ASHIN0000002 /* SharedContentDestinationView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BSHIN0000002 /* SharedContentDestinationView.swift */; };
+		ASHINT000001 /* SharedInboxTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BSHINT000001 /* SharedInboxTests.swift */; };
+		ASHR0000001 /* ShareViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = BSHR0000001 /* ShareViewController.swift */; };
+		ASHR0000004 /* SharedInbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = BSHIN0000001 /* SharedInbox.swift */; };
+		ASHR0000003 /* KitPayShare.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = BSHR0000002 /* KitPayShare.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -185,6 +197,13 @@
 			proxyType = 1;
 			remoteGlobalIDString = E10000000000000000000001;
 			remoteInfo = KitPay;
+		};
+		CSHR0000004 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = E10000000000000000000002 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = ESHR0000001;
+			remoteInfo = KitPayShare;
 		};
 /* End PBXContainerItemProxy section */
 
@@ -350,18 +369,36 @@
 		B2500000000000000000000C /* WalletTopUp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/WalletTopUp.swift; sourceTree = SOURCE_ROOT; };
 		B2500000000000000000000D /* WalletTopUpView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Home/WalletTopUpView.swift; sourceTree = SOURCE_ROOT; };
 		B2500000000000000000000E /* WalletTopUpTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/WalletTopUpTests.swift; sourceTree = SOURCE_ROOT; };
+		BGRPPAY0001 /* GroupPaymentModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/GroupPaymentModels.swift; sourceTree = SOURCE_ROOT; };
+		BGRPPAY0002 /* APIClient+GroupPayments.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "KitPay/Core/APIClient+GroupPayments.swift"; sourceTree = SOURCE_ROOT; };
+		BGRPPAY0003 /* GroupPaymentPresentation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/GroupPaymentPresentation.swift; sourceTree = SOURCE_ROOT; };
+		BGRPPAY0004 /* ChatGroupPaymentActions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Messages/ChatGroupPaymentActions.swift; sourceTree = SOURCE_ROOT; };
+		BGRPPAY0005 /* GroupPaymentComposerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Messages/GroupPaymentComposerView.swift; sourceTree = SOURCE_ROOT; };
+		BGRPPAYT001 /* GroupPaymentTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/GroupPaymentTests.swift; sourceTree = SOURCE_ROOT; };
 		BVNP0000001 /* VoiceNotePlaybackPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/VoiceNotePlaybackPolicy.swift; sourceTree = SOURCE_ROOT; };
 		BVNP0000002 /* VoiceNotePlayer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Messages/VoiceNotePlayer.swift; sourceTree = SOURCE_ROOT; };
 		BVNP0000003 /* VoiceNoteMiniPlayer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Messages/VoiceNoteMiniPlayer.swift; sourceTree = SOURCE_ROOT; };
 		BVNP0000004 /* AppWindowOverlays.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Overlays/AppWindowOverlays.swift; sourceTree = SOURCE_ROOT; };
 		BVNPT000001 /* VoiceNotePlaybackTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/VoiceNotePlaybackTests.swift; sourceTree = SOURCE_ROOT; };
 		BVNP0000005 /* ChatVideoPictureInPicture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Messages/ChatVideoPictureInPicture.swift; sourceTree = SOURCE_ROOT; };
+		BSHIN0000001 /* SharedInbox.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/SharedInbox.swift; sourceTree = SOURCE_ROOT; };
+		BSHIN0000002 /* SharedContentDestinationView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Messages/SharedContentDestinationView.swift; sourceTree = SOURCE_ROOT; };
+		BSHINT000001 /* SharedInboxTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/SharedInboxTests.swift; sourceTree = SOURCE_ROOT; };
+		BSHR0000001 /* ShareViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayShare/ShareViewController.swift; sourceTree = SOURCE_ROOT; };
+		BSHR0000003 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = KitPayShare/Info.plist; sourceTree = SOURCE_ROOT; };
+		BSHR0000004 /* KitPayShare.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = KitPayShare/KitPayShare.entitlements; sourceTree = SOURCE_ROOT; };
+		BSHR0000002 /* KitPayShare.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = KitPayShare.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		CSHR0000003 /* Embed Foundation Extensions */ = {isa = PBXCopyFilesBuildPhase; buildActionMask = 2147483647; dstPath = ""; dstSubfolderSpec = 13; files = (ASHR0000003 /* KitPayShare.appex in Embed Foundation Extensions */,); name = "Embed Foundation Extensions"; runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFrameworksBuildPhase section */
 		C10000000000000000000001 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (AA0000000000000000000003 /* LiveKit in Frameworks */,); runOnlyForDeploymentPostprocessing = 0; };
 		C30000000000000000000001 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 		CF1000000000000000000002 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		CSHR0000002 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -371,6 +408,7 @@
 				D10000000000000000000002 /* Sources */,
 				D30000000000000000000001 /* Tests */,
 				DF1000000000000000000001 /* KitPayUITests */,
+				DSHR0000001 /* KitPayShare */,
 				D10000000000000000000003 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -484,16 +522,23 @@
 				B2500000000000000000000A /* BeneficiaryContactMatch.swift */,
 				B2500000000000000000000C /* WalletTopUp.swift */,
 				B2500000000000000000000D /* WalletTopUpView.swift */,
+				BGRPPAY0001 /* GroupPaymentModels.swift */,
+				BGRPPAY0002 /* APIClient+GroupPayments.swift */,
+				BGRPPAY0003 /* GroupPaymentPresentation.swift */,
+				BGRPPAY0004 /* ChatGroupPaymentActions.swift */,
+				BGRPPAY0005 /* GroupPaymentComposerView.swift */,
 				BVNP0000001 /* VoiceNotePlaybackPolicy.swift */,
 				BVNP0000002 /* VoiceNotePlayer.swift */,
 				BVNP0000003 /* VoiceNoteMiniPlayer.swift */,
 				BVNP0000004 /* AppWindowOverlays.swift */,
 				BVNP0000005 /* ChatVideoPictureInPicture.swift */,
+				BSHIN0000001 /* SharedInbox.swift */,
+				BSHIN0000002 /* SharedContentDestinationView.swift */,
 			);
 			name = KitPay;
 			sourceTree = "<group>";
 		};
-		D10000000000000000000003 /* Products */ = {isa = PBXGroup; children = (B10000000000000000000014 /* KitPay.app */, B30000000000000000000003 /* KitPayTests.xctest */, BF1000000000000000000002 /* KitPayUITests.xctest */,); name = Products; sourceTree = "<group>"; };
+		D10000000000000000000003 /* Products */ = {isa = PBXGroup; children = (B10000000000000000000014 /* KitPay.app */, B30000000000000000000003 /* KitPayTests.xctest */, BF1000000000000000000002 /* KitPayUITests.xctest */, BSHR0000002 /* KitPayShare.appex */,); name = Products; sourceTree = "<group>"; };
 		D30000000000000000000001 /* Tests */ = {
 			isa = PBXGroup;
 			children = (
@@ -535,7 +580,9 @@
 				B2400000000000000000000C /* ScheduledSendTests.swift */,
 				B2500000000000000000000B /* BeneficiaryContactMatchTests.swift */,
 				B2500000000000000000000E /* WalletTopUpTests.swift */,
+				BGRPPAYT001 /* GroupPaymentTests.swift */,
 				BVNPT000001 /* VoiceNotePlaybackTests.swift */,
+				BSHINT000001 /* SharedInboxTests.swift */,
 			);
 			name = KitPayTests;
 			sourceTree = "<group>";
@@ -549,15 +596,16 @@
 			name = KitPayUITests;
 			sourceTree = "<group>";
 		};
+		DSHR0000001 /* KitPayShare */ = {isa = PBXGroup; children = (BSHR0000001 /* ShareViewController.swift */, BSHR0000003 /* Info.plist */, BSHR0000004 /* KitPayShare.entitlements */,); name = KitPayShare; sourceTree = "<group>"; };
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
 		E10000000000000000000001 /* KitPay */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = F10000000000000000000002 /* Build configuration list for PBXNativeTarget "KitPay" */;
-			buildPhases = (C10000000000000000000002 /* Sources */, C10000000000000000000001 /* Frameworks */, C10000000000000000000003 /* Resources */);
+			buildPhases = (C10000000000000000000002 /* Sources */, C10000000000000000000001 /* Frameworks */, C10000000000000000000003 /* Resources */, CSHR0000003 /* Embed Foundation Extensions */);
 			buildRules = ();
-			dependencies = ();
+			dependencies = (CSHR0000005 /* PBXTargetDependency */,);
 			name = KitPay;
 			packageProductDependencies = (D90000000000000000000001 /* LiveKit */,);
 			productName = KitPay;
@@ -586,12 +634,23 @@
 			productReference = BF1000000000000000000002 /* KitPayUITests.xctest */;
 			productType = "com.apple.product-type.bundle.ui-testing";
 		};
+		ESHR0000001 /* KitPayShare */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = FSHR0000003 /* Build configuration list for PBXNativeTarget "KitPayShare" */;
+			buildPhases = (CSHR0000001 /* Sources */, CSHR0000002 /* Frameworks */, CSHR0000006 /* Resources */);
+			buildRules = ();
+			dependencies = ();
+			name = KitPayShare;
+			productName = KitPayShare;
+			productReference = BSHR0000002 /* KitPayShare.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
 		E10000000000000000000002 /* Project object */ = {
 			isa = PBXProject;
-			attributes = {BuildIndependentTargetsInParallel = 1; LastSwiftUpdateCheck = 2600; LastUpgradeCheck = 2600; TargetAttributes = {E10000000000000000000001 = {CreatedOnToolsVersion = 26.0; }; E30000000000000000000001 = {CreatedOnToolsVersion = 26.0; TestTargetID = E10000000000000000000001; }; EF1000000000000000000001 = {CreatedOnToolsVersion = 26.0; TestTargetID = E10000000000000000000001; };};};
+			attributes = {BuildIndependentTargetsInParallel = 1; LastSwiftUpdateCheck = 2600; LastUpgradeCheck = 2600; TargetAttributes = {E10000000000000000000001 = {CreatedOnToolsVersion = 26.0; }; E30000000000000000000001 = {CreatedOnToolsVersion = 26.0; TestTargetID = E10000000000000000000001; }; EF1000000000000000000001 = {CreatedOnToolsVersion = 26.0; TestTargetID = E10000000000000000000001; }; ESHR0000001 = {CreatedOnToolsVersion = 26.0; };};};
 			buildConfigurationList = F10000000000000000000001 /* Build configuration list for PBXProject "KitPay" */;
 			compatibilityVersion = "Xcode 15.0";
 			developmentRegion = en;
@@ -602,13 +661,14 @@
 			productRefGroup = D10000000000000000000003 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
-			targets = (E10000000000000000000001 /* KitPay */, E30000000000000000000001 /* KitPayTests */, EF1000000000000000000001 /* KitPayUITests */,);
+			targets = (E10000000000000000000001 /* KitPay */, E30000000000000000000001 /* KitPayTests */, EF1000000000000000000001 /* KitPayUITests */, ESHR0000001 /* KitPayShare */,);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
 		C10000000000000000000003 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000011 /* Assets.xcassets in Resources */, A80000000000000000000001 /* PrivacyInfo.xcprivacy in Resources */, A12000000000000000000003 /* knock_brush.mp3 in Resources */, A12000000000000000000004 /* knock_brush.caf in Resources */, A16000000000000000000003 /* AGPL-3.0-only.txt in Resources */, A16000000000000000000004 /* THIRD_PARTY_NOTICES.txt in Resources */,); runOnlyForDeploymentPostprocessing = 0; };
 		C30000000000000000000003 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		CSHR0000006 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
@@ -716,11 +776,18 @@
 				A2500000000000000000000A /* BeneficiaryContactMatch.swift in Sources */,
 				A2500000000000000000000C /* WalletTopUp.swift in Sources */,
 				A2500000000000000000000D /* WalletTopUpView.swift in Sources */,
+				AGRPPAY0001 /* GroupPaymentModels.swift in Sources */,
+				AGRPPAY0002 /* APIClient+GroupPayments.swift in Sources */,
+				AGRPPAY0003 /* GroupPaymentPresentation.swift in Sources */,
+				AGRPPAY0004 /* ChatGroupPaymentActions.swift in Sources */,
+				AGRPPAY0005 /* GroupPaymentComposerView.swift in Sources */,
 				AVNP0000001 /* VoiceNotePlaybackPolicy.swift in Sources */,
 				AVNP0000002 /* VoiceNotePlayer.swift in Sources */,
 				AVNP0000003 /* VoiceNoteMiniPlayer.swift in Sources */,
 				AVNP0000004 /* AppWindowOverlays.swift in Sources */,
 				AVNP0000005 /* ChatVideoPictureInPicture.swift in Sources */,
+				ASHIN0000001 /* SharedInbox.swift in Sources */,
+				ASHIN0000002 /* SharedContentDestinationView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -766,7 +833,9 @@
 				A2400000000000000000000C /* ScheduledSendTests.swift in Sources */,
 				A2500000000000000000000B /* BeneficiaryContactMatchTests.swift in Sources */,
 				A2500000000000000000000E /* WalletTopUpTests.swift in Sources */,
+				AGRPPAYT001 /* GroupPaymentTests.swift in Sources */,
 				AVNPT000001 /* VoiceNotePlaybackTests.swift in Sources */,
+				ASHINT000001 /* SharedInboxTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -776,6 +845,15 @@
 			files = (
 				AF1000000000000000000001 /* AppLaunchUITests.swift in Sources */,
 				AF1000000000000000000002 /* AppStoreScreenshotUITests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		CSHR0000001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				ASHR0000001 /* ShareViewController.swift in Sources */,
+				ASHR0000004 /* SharedInbox.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -792,17 +870,24 @@
 			target = E10000000000000000000001 /* KitPay */;
 			targetProxy = CF1000000000000000000004 /* PBXContainerItemProxy */;
 		};
+		CSHR0000005 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = ESHR0000001 /* KitPayShare */;
+			targetProxy = CSHR0000004 /* PBXContainerItemProxy */;
+		};
 /* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		F20000000000000000000001 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {ALWAYS_SEARCH_USER_PATHS = NO; CLANG_ENABLE_MODULES = YES; CLANG_ENABLE_OBJC_ARC = YES; COPY_PHASE_STRIP = NO; DEBUG_INFORMATION_FORMAT = dwarf; ENABLE_TESTABILITY = YES; GCC_C_LANGUAGE_STANDARD = gnu17; GCC_OPTIMIZATION_LEVEL = 0; IPHONEOS_DEPLOYMENT_TARGET = 17.0; ONLY_ACTIVE_ARCH = YES; SDKROOT = iphoneos; SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)"; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; }; name = Debug; };
 		F20000000000000000000002 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {ALWAYS_SEARCH_USER_PATHS = NO; CLANG_ENABLE_MODULES = YES; CLANG_ENABLE_OBJC_ARC = YES; COPY_PHASE_STRIP = NO; DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym"; ENABLE_NS_ASSERTIONS = NO; GCC_C_LANGUAGE_STANDARD = gnu17; IPHONEOS_DEPLOYMENT_TARGET = 17.0; SDKROOT = iphoneos; SWIFT_COMPILATION_MODE = wholemodule; SWIFT_OPTIMIZATION_LEVEL = "-O"; VALIDATE_PRODUCT = YES; }; name = Release; };
-		F20000000000000000000003 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {APS_ENVIRONMENT = development; ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_ENTITLEMENTS = KitPay/KitPay.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 27; DEVELOPMENT_TEAM = AU55CKVJ55; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = KitPay/Info.plist; KIT_CORRESPONDING_SOURCE_URL = ""; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"; MARKETING_VERSION = 1.0.16; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Debug; };
-		F20000000000000000000004 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {APS_ENVIRONMENT = production; ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_ENTITLEMENTS = KitPay/KitPay.entitlements; CODE_SIGN_IDENTITY = "Apple Distribution"; CODE_SIGN_STYLE = Manual; CURRENT_PROJECT_VERSION = 27; DEVELOPMENT_TEAM = "$(KITPAY_APPLE_TEAM_ID)"; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = KitPay/Info.plist; KIT_CORRESPONDING_SOURCE_URL = ""; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"; MARKETING_VERSION = 1.0.16; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios; PRODUCT_NAME = "$(TARGET_NAME)"; PROVISIONING_PROFILE_SPECIFIER = "$(KITPAY_PROFILE_UUID)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Release; };
+		F20000000000000000000003 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {APS_ENVIRONMENT = development; ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_ENTITLEMENTS = KitPay/KitPay.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 28; DEVELOPMENT_TEAM = AU55CKVJ55; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = KitPay/Info.plist; KIT_CORRESPONDING_SOURCE_URL = ""; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"; MARKETING_VERSION = 1.0.16; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Debug; };
+		F20000000000000000000004 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {APS_ENVIRONMENT = production; ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_ENTITLEMENTS = KitPay/KitPay.entitlements; CODE_SIGN_IDENTITY = "Apple Distribution"; CODE_SIGN_STYLE = Manual; CURRENT_PROJECT_VERSION = 28; DEVELOPMENT_TEAM = "$(KITPAY_APPLE_TEAM_ID)"; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = KitPay/Info.plist; KIT_CORRESPONDING_SOURCE_URL = ""; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"; MARKETING_VERSION = 1.0.16; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios; PRODUCT_NAME = "$(TARGET_NAME)"; PROVISIONING_PROFILE_SPECIFIER = "$(KITPAY_PROFILE_UUID)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Release; };
 		F30000000000000000000001 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {BUNDLE_LOADER = "$(TEST_HOST)"; CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = AU55CKVJ55; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks @loader_path/Frameworks"; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios.tests; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_EMIT_LOC_STRINGS = NO; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/KitPay.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/KitPay"; }; name = Debug; };
 		F30000000000000000000002 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {BUNDLE_LOADER = "$(TEST_HOST)"; CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = AU55CKVJ55; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks @loader_path/Frameworks"; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios.tests; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_EMIT_LOC_STRINGS = NO; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/KitPay.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/KitPay"; }; name = Release; };
 		FF1000000000000000000001 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = AU55CKVJ55; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks @loader_path/Frameworks"; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios.uitests; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_EMIT_LOC_STRINGS = NO; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; TEST_TARGET_NAME = KitPay;}; name = Debug; };
 		FF1000000000000000000002 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = AU55CKVJ55; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks @loader_path/Frameworks"; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios.uitests; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_EMIT_LOC_STRINGS = NO; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; TEST_TARGET_NAME = KitPay;}; name = Release; };
+		FSHR0000001 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {APPLICATION_EXTENSION_API_ONLY = YES; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = KitPayShare/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks @executable_path/../../Frameworks"; MARKETING_VERSION = 1.0.16; CURRENT_PROJECT_VERSION = 28; CODE_SIGN_ENTITLEMENTS = KitPayShare/KitPayShare.entitlements; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios.share; PRODUCT_NAME = "$(TARGET_NAME)"; SKIP_INSTALL = YES; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = AU55CKVJ55; }; name = Debug; };
+		FSHR0000002 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {APPLICATION_EXTENSION_API_ONLY = YES; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = KitPayShare/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks @executable_path/../../Frameworks"; MARKETING_VERSION = 1.0.16; CURRENT_PROJECT_VERSION = 28; CODE_SIGN_ENTITLEMENTS = KitPayShare/KitPayShare.entitlements; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios.share; PRODUCT_NAME = "$(TARGET_NAME)"; SKIP_INSTALL = YES; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; CODE_SIGN_IDENTITY = "Apple Distribution"; CODE_SIGN_STYLE = Manual; DEVELOPMENT_TEAM = "$(KITPAY_APPLE_TEAM_ID)"; PROVISIONING_PROFILE_SPECIFIER = "$(KITPAY_SHARE_PROFILE_UUID)"; }; name = Release; };
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -810,6 +895,7 @@
 		F10000000000000000000002 /* Target */ = {isa = XCConfigurationList; buildConfigurations = (F20000000000000000000003, F20000000000000000000004,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
 		F30000000000000000000003 /* Build configuration list for PBXNativeTarget "KitPayTests" */ = {isa = XCConfigurationList; buildConfigurations = (F30000000000000000000001, F30000000000000000000002,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
 		FF1000000000000000000003 /* Build configuration list for PBXNativeTarget "KitPayUITests" */ = {isa = XCConfigurationList; buildConfigurations = (FF1000000000000000000001, FF1000000000000000000002,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		FSHR0000003 /* Build configuration list for PBXNativeTarget "KitPayShare" */ = {isa = XCConfigurationList; buildConfigurations = (FSHR0000001, FSHR0000002,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
 /* End XCConfigurationList section */
 
 /* Begin XCRemoteSwiftPackageReference section */

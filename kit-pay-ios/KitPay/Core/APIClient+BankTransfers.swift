@@ -34,6 +34,61 @@ extension APIClient {
         )
     }
 
+    func bankFundingAccounts() async throws -> BankFundingAccountListDTO {
+        try await send(
+            path: "banking/funding-accounts",
+            method: "GET",
+            body: BankTransferEmptyBody()
+        )
+    }
+
+    func bankDepositRequests() async throws -> BankDepositRequestListDTO {
+        try await send(
+            path: "banking/deposit-requests",
+            method: "GET",
+            body: BankTransferEmptyBody()
+        )
+    }
+
+    func bankDepositRequest(id: String) async throws -> BankDepositRequestDTO {
+        try await send(
+            path: "banking/deposit-requests/\(id)",
+            method: "GET",
+            body: BankTransferEmptyBody()
+        )
+    }
+
+    func createBankDepositRequest(
+        walletId: String,
+        fundingAccountId: String,
+        amount: String,
+        note: String?,
+        idempotencyKey: String
+    ) async throws -> BankDepositRequestDTO {
+        try await send(
+            path: "banking/deposit-requests",
+            method: "POST",
+            body: CreateBankDepositRequest(
+                walletId: walletId,
+                fundingAccountId: fundingAccountId,
+                amount: amount,
+                note: note
+            ),
+            headers: ["Idempotency-Key": idempotencyKey]
+        )
+    }
+
+    func attachBankDepositProof(
+        depositId: String,
+        mediaAssetId: String
+    ) async throws -> BankDepositRequestDTO {
+        try await send(
+            path: "banking/deposit-requests/\(depositId)/proof",
+            method: "POST",
+            body: AttachBankDepositProofRequest(mediaAssetId: mediaAssetId)
+        )
+    }
+
     func createBankAccountVerification(
         bankId: String,
         accountNumber: String,

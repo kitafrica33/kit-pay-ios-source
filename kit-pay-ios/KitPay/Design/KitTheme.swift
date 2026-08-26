@@ -19,6 +19,44 @@ enum KitColor {
     static let canvas = Color(uiColor: .systemGroupedBackground)
     static let primaryText = Color(uiColor: .label)
     static let secondaryText = Color(uiColor: .secondaryLabel)
+
+    /// Money shared out in a group wears gold, so it is never mistaken for an ordinary message or
+    /// for the green of a one-to-one payment at a glance.
+    ///
+    /// Both variants are darkened well past decorative "shiny gold": the light one has to carry
+    /// `primaryText` on it and the dark one has to sit on a near-black chat wallpaper.
+    static let gold = Color(uiColor: UIColor { traits in
+        traits.userInterfaceStyle == .dark
+            ? UIColor(red: 224 / 255, green: 176 / 255, blue: 68 / 255, alpha: 1)
+            : UIColor(red: 176 / 255, green: 126 / 255, blue: 18 / 255, alpha: 1)
+    })
+
+    /// Surface tint behind a group payment card and its glyphs, the gold counterpart of
+    /// `paleGreen`.
+    static let paleGold = Color(uiColor: UIColor { traits in
+        traits.userInterfaceStyle == .dark
+            ? UIColor(red: 74 / 255, green: 57 / 255, blue: 14 / 255, alpha: 1)
+            : UIColor(red: 252 / 255, green: 240 / 255, blue: 205 / 255, alpha: 1)
+    })
+
+    /// The two ends of the sheen along a group payment card's edge. Kept subtle enough that the
+    /// card still reads as a chat bubble rather than an advert.
+    static let goldSheen = LinearGradient(
+        colors: [
+            Color(uiColor: UIColor { traits in
+                traits.userInterfaceStyle == .dark
+                    ? UIColor(red: 246 / 255, green: 206 / 255, blue: 108 / 255, alpha: 1)
+                    : UIColor(red: 214 / 255, green: 166 / 255, blue: 54 / 255, alpha: 1)
+            }),
+            Color(uiColor: UIColor { traits in
+                traits.userInterfaceStyle == .dark
+                    ? UIColor(red: 150 / 255, green: 110 / 255, blue: 30 / 255, alpha: 1)
+                    : UIColor(red: 140 / 255, green: 96 / 255, blue: 10 / 255, alpha: 1)
+            }),
+        ],
+        startPoint: .topLeading,
+        endPoint: .bottomTrailing
+    )
 }
 
 /// Shared geometry for the circular Liquid Glass controls in the Messages, Chats, Calls, and

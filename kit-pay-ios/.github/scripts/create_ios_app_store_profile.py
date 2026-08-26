@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Create Kit Pay's App Store profile through the App Store Connect API.
 
-The script enables the explicit bundle ID's ICLOUD capability in XCODE_6 mode,
+The script enables the explicit bundle ID's required capabilities,
 matches the already-imported distribution certificate by its exact DER bytes,
 and creates one fresh IOS_APP_STORE profile. It never logs API response bodies,
 resource identifiers, tokens, private-key material, or provisioning-profile
@@ -287,7 +287,7 @@ def _single_response(value: object, expected_type: str, label: str) -> tuple[str
     return _resource(value.get("data"), expected_type, label)
 
 
-def _find_bundle_id(client: object, bundle_id: str) -> str:
+def _matching_bundle_ids(client: object, bundle_id: str) -> list[str]:
     response = client.request(
         "GET",
         "/v1/bundleIds",
@@ -307,9 +307,43 @@ def _find_bundle_id(client: object, bundle_id: str) -> str:
             and attributes.get("platform") in _IOS_BUNDLE_ID_PLATFORMS
         ):
             matches.append(resource_id)
+    return matches
+
+
+def _find_bundle_id(client: object, bundle_id: str) -> str:
+    matches = _matching_bundle_ids(client, bundle_id)
     if len(matches) != 1:
         _fail("The exact explicit iOS bundle ID was not found uniquely.")
     return matches[0]
+
+
+def _ensure_bundle_id(client: object, bundle_id: str, name: str | None) -> str:
+    """Find an explicit iOS App ID, registering only when the caller names the new bundle."""
+    matches = _matching_bundle_ids(client, bundle_id)
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1 or name is None:
+        _fail("The exact explicit iOS bundle ID was not found uniquely.")
+    response = client.request(
+        "POST",
+        "/v1/bundleIds",
+        body={
+            "data": {
+                "type": "bundleIds",
+                "attributes": {
+                    "identifier": bundle_id,
+                    "name": name,
+                    "platform": "IOS",
+                },
+            }
+        },
+        expected_status=201,
+        operation="bundle ID registration",
+    )
+    resource_id, attributes = _single_response(response, "bundleIds", "bundle ID")
+    if attributes.get("identifier") != bundle_id or attributes.get("platform") != "IOS":
+        _fail("App Store Connect registered an unexpected bundle ID.")
+    return resource_id
 
 
 def _icloud_xcode6_is_enabled(attributes: dict[str, object]) -> bool:
@@ -435,6 +469,61 @@ def _ensure_icloud_xcode6(
     if last_http_error is not None:
         raise last_http_error
     _fail("The bundle ID does not have the verified ICLOUD XCODE_6 capability.")
+
+
+def _load_app_groups_capability(client: object, bundle_resource_id: str) -> str | None:
+    response = client.request(
+        "GET",
+        f"/v1/bundleIds/{urllib.parse.quote(bundle_resource_id, safe='')}/bundleIdCapabilities",
+        query={"fields[bundleIdCapabilities]": "capabilityType"},
+        expected_status=200,
+        operation="App Groups capability lookup",
+    )
+    matches: list[str] = []
+    for candidate in _collection(response, "bundle capability"):
+        resource_id, attributes = _resource(
+            candidate,
+            "bundleIdCapabilities",
+            "bundle capability",
+        )
+        if attributes.get("capabilityType") == "APP_GROUPS":
+            matches.append(resource_id)
+    if len(matches) > 1:
+        _fail("The bundle ID has ambiguous App Groups capability records.")
+    return matches[0] if matches else None
+
+
+def _ensure_app_groups_enabled(
+    client: object,
+    bundle_resource_id: str,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    if _load_app_groups_capability(client, bundle_resource_id) is not None:
+        return
+    client.request(
+        "POST",
+        "/v1/bundleIdCapabilities",
+        body={
+            "data": {
+                "type": "bundleIdCapabilities",
+                "attributes": {"capabilityType": "APP_GROUPS"},
+                "relationships": {
+                    "bundleId": {
+                        "data": {"type": "bundleIds", "id": bundle_resource_id}
+                    }
+                },
+            }
+        },
+        expected_status=201,
+        operation="App Groups capability creation",
+    )
+    for attempt in range(len(_CAPABILITY_PROPAGATION_DELAYS_SECONDS) + 1):
+        if _load_app_groups_capability(client, bundle_resource_id) is not None:
+            return
+        if attempt < len(_CAPABILITY_PROPAGATION_DELAYS_SECONDS):
+            sleep(_CAPABILITY_PROPAGATION_DELAYS_SECONDS[attempt])
+    _fail("The bundle ID does not have the verified APP_GROUPS capability.")
 
 
 def _parse_api_date(value: object, label: str) -> dt.datetime:
@@ -596,9 +685,16 @@ def provision_profile(
     bundle_id: str,
     certificate_der: bytes,
     profile_name: str,
+    icloud: bool = True,
+    register_bundle_name: str | None = None,
 ) -> bytes:
-    bundle_resource_id = _find_bundle_id(client, bundle_id)
-    _ensure_icloud_xcode6(client, bundle_resource_id)
+    bundle_resource_id = _ensure_bundle_id(client, bundle_id, register_bundle_name)
+    # The share extension has no iCloud capability and must not be given one: it stages files in
+    # the app group and nothing else, and every capability it does not need is a capability it
+    # cannot misuse.
+    if icloud:
+        _ensure_icloud_xcode6(client, bundle_resource_id)
+    _ensure_app_groups_enabled(client, bundle_resource_id)
     certificate_resource_id = _find_distribution_certificate(client, certificate_der)
     return _create_profile(
         client,
@@ -647,6 +743,15 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--certificate-der", type=Path, required=True)
     parser.add_argument("--profile-name", required=True)
     parser.add_argument("--profile-output", type=Path, required=True)
+    parser.add_argument(
+        "--skip-icloud-capability",
+        action="store_true",
+        help="For the share extension App ID, which has no iCloud capability.",
+    )
+    parser.add_argument(
+        "--register-bundle-name",
+        help="Register the explicit iOS bundle ID with this name when it does not exist.",
+    )
     return parser.parse_args()
 
 
@@ -656,6 +761,10 @@ def _main() -> None:
         _fail("--bundle-id must be a valid explicit bundle identifier.")
     if _PROFILE_NAME_PATTERN.fullmatch(args.profile_name) is None:
         _fail("--profile-name has an invalid format.")
+    if args.register_bundle_name is not None and (
+        _PROFILE_NAME_PATTERN.fullmatch(args.register_bundle_name) is None
+    ):
+        _fail("--register-bundle-name has an invalid format.")
     certificate_der = _read_certificate(args.certificate_der)
     issuer_id, key_id, private_key = _configuration()
     client = AppStoreConnectClient(issuer_id, key_id, private_key)
@@ -664,6 +773,8 @@ def _main() -> None:
         bundle_id=args.bundle_id,
         certificate_der=certificate_der,
         profile_name=args.profile_name,
+        icloud=not args.skip_icloud_capability,
+        register_bundle_name=args.register_bundle_name,
     )
     _write_private_file(args.profile_output, profile)
 

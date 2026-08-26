@@ -110,6 +110,25 @@ struct RootView: View {
         } message: {
             Text(model.lastError ?? "")
         }
+        // Presented from the root rather than from the Chats tab: a share can arrive while the
+        // customer is looking at Home or a call, and the picker has to be reachable from wherever
+        // they actually are.
+        .sheet(
+            isPresented: Binding(
+                get: { model.pendingSharedInboxBatch != nil },
+                set: { if !$0 { model.discardPendingSharedInbox() } }
+            )
+        ) {
+            if let batch = model.pendingSharedInboxBatch {
+                SharedContentDestinationView(
+                    batch: batch,
+                    onChoose: { model.routeSharedInbox(to: $0.id) },
+                    onCancel: { model.discardPendingSharedInbox() }
+                )
+                .environmentObject(model)
+                .presentationBackground(.ultraThinMaterial)
+            }
+        }
     }
 
     private var homeAuthorizationTrigger: String {

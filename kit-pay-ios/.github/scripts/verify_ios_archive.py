@@ -40,6 +40,15 @@ def load_plist(path: pathlib.Path, label: str) -> dict:
     return value
 
 
+def authorizes_app_group(entitlements: dict, app_group: str, team_id: str) -> bool:
+    """True when exactly the one Kit Pay app group is authorized, and nothing else."""
+    groups = entitlements.get("com.apple.security.application-groups")
+    if not isinstance(groups, list) or not groups:
+        return False
+    accepted = {app_group, f"{team_id}.{app_group}"}
+    return all(isinstance(group, str) for group in groups) and set(groups) <= accepted
+
+
 def digest(path: pathlib.Path) -> dict[str, object]:
     if not path.is_file() or path.is_symlink():
         fail(f"Expected a regular artifact: {path}")
@@ -76,6 +85,15 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--expected-profile-uuid", required=True)
     parser.add_argument("--bundle-id", required=True)
     parser.add_argument("--team-id", required=True)
+    # The share extension ships inside the same IPA and is signed separately. It reaches the app
+    # through one app group and nothing else, so what it is allowed to do is verified here rather
+    # than assumed from the app's own entitlements.
+    parser.add_argument("--extension", type=pathlib.Path, required=True)
+    parser.add_argument("--extension-bundle-id", required=True)
+    parser.add_argument("--extension-profile-plist", type=pathlib.Path, required=True)
+    parser.add_argument("--extension-entitlements-plist", type=pathlib.Path, required=True)
+    parser.add_argument("--expected-extension-profile-uuid", required=True)
+    parser.add_argument("--app-group", required=True)
     parser.add_argument("--version", required=True)
     parser.add_argument("--build-number", required=True)
     parser.add_argument("--corresponding-source-url", required=True)
@@ -226,6 +244,108 @@ def main() -> None:
         ),
     )
     for passed, message in checks:
+        if not passed:
+            fail(message)
+
+    extension_info = load_plist(
+        args.extension / "Info.plist",
+        "Signed share extension Info.plist",
+    )
+    extension_profile = load_plist(
+        args.extension_profile_plist,
+        "Share extension provisioning profile",
+    )
+    extension_signed = load_plist(
+        args.extension_entitlements_plist,
+        "Share extension entitlements",
+    )
+    extension_profile_entitlements = extension_profile.get("Entitlements")
+    if not isinstance(extension_profile_entitlements, dict):
+        fail("The share extension provisioning profile has no entitlements")
+    extension_point = extension_info.get("NSExtension", {})
+    expected_extension_application_id = f"{args.team_id}.{args.extension_bundle_id}"
+    extension_checks = (
+        (
+            extension_info.get("CFBundleIdentifier") == args.extension_bundle_id,
+            "Unexpected signed share extension bundle identifier",
+        ),
+        (
+            extension_info.get("CFBundleShortVersionString") == args.version,
+            "The share extension marketing version must match the app",
+        ),
+        (
+            extension_info.get("CFBundleVersion") == args.build_number,
+            "The share extension build number must match the app",
+        ),
+        (
+            isinstance(extension_point, dict)
+            and extension_point.get("NSExtensionPointIdentifier")
+            == "com.apple.share-services",
+            "The share extension is not registered as a share extension",
+        ),
+        (
+            extension_profile.get("UUID") == args.expected_extension_profile_uuid,
+            "Unexpected share extension embedded profile UUID",
+        ),
+        (
+            extension_profile_entitlements.get("application-identifier")
+            == expected_extension_application_id,
+            "The share extension profile does not exactly match its bundle identifier",
+        ),
+        (
+            authorizes_app_group(
+                extension_profile_entitlements,
+                args.app_group,
+                args.team_id,
+            ),
+            "The share extension profile must authorize exactly the Kit Pay app group",
+        ),
+        (
+            extension_signed.get("application-identifier")
+            == expected_extension_application_id,
+            "Share extension identifier entitlement is incorrect",
+        ),
+        (
+            extension_signed.get("com.apple.developer.team-identifier") == args.team_id,
+            "Share extension team entitlement is incorrect",
+        ),
+        (
+            extension_signed.get("get-task-allow") is False,
+            "The share extension must explicitly prohibit debugging",
+        ),
+        (
+            authorizes_app_group(extension_signed, args.app_group, args.team_id),
+            "The share extension must be entitled to exactly the Kit Pay app group",
+        ),
+        (
+            authorizes_app_group(signed, args.app_group, args.team_id),
+            "The signed app must be entitled to exactly the Kit Pay app group",
+        ),
+        # Everything the extension is not allowed to reach. A share extension that could receive a
+        # push or read CloudKit would be a second, weaker copy of the app's own reach.
+        (
+            "aps-environment" not in extension_signed,
+            "The share extension must not be entitled to push notifications",
+        ),
+        (
+            "aps-environment" not in extension_profile_entitlements,
+            "The share extension profile must not authorize push notifications",
+        ),
+        (
+            "com.apple.developer.icloud-container-identifiers" not in extension_signed,
+            "The share extension must not be entitled to iCloud containers",
+        ),
+        (
+            "com.apple.developer.icloud-container-identifiers"
+            not in extension_profile_entitlements,
+            "The share extension profile must not authorize iCloud containers",
+        ),
+        (
+            "keychain-access-groups" not in extension_signed,
+            "The share extension must not be entitled to a shared keychain group",
+        ),
+    )
+    for passed, message in extension_checks:
         if not passed:
             fail(message)
 

@@ -15,6 +15,7 @@ enum SecureMessageReservedPrefixPolicy {
     /// notification-reply boundary.
     static func allowsUserAuthoredText(_ text: String) -> Bool {
         !beginsWithReservedPrefix(text, prefix: KitPaymentMessage.prefix)
+            && !beginsWithReservedPrefix(text, prefix: KitGroupPaymentMessage.prefix)
             && !beginsWithReservedPrefix(text, prefix: KitSystemMessage.prefix)
             && !beginsWithReservedPrefix(text, prefix: KitMessageReaction.prefix)
     }

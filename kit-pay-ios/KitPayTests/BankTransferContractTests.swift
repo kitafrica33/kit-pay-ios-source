@@ -119,6 +119,103 @@ final class BankTransferContractTests: XCTestCase {
         XCTAssertFalse(unknown.enablesBankTransfers)
     }
 
+    func testBankDepositCapabilityFailsClosedAndRemainsIndependentFromOutboundTransfers() throws {
+        let depositsOnly: CapabilitiesDTO = try decode(
+            """
+            {"currency":{"code":"UGX","scale":"0"},"features":{
+              "wallets":true,"bank_deposits":true,"bank_transfers":false
+            }}
+            """
+        )
+        let missingWallet: CapabilitiesDTO = try decode(
+            """
+            {"currency":{"code":"UGX","scale":"0"},"features":{"bank_deposits":true}}
+            """
+        )
+        let unknown: CapabilitiesDTO = try decode(
+            """
+            {"currency":{"code":"UGX","scale":"0"},"features":{
+              "wallets":true,"bank_deposits":null
+            }}
+            """
+        )
+
+        XCTAssertTrue(depositsOnly.enablesBankDeposits)
+        XCTAssertFalse(depositsOnly.enablesBankTransfers)
+        XCTAssertFalse(missingWallet.enablesBankDeposits)
+        XCTAssertFalse(unknown.enablesBankDeposits)
+    }
+
+    func testFundingAccountAndDepositResponseDecodeWithoutABeneficiary() throws {
+        let response: BankDepositRequestDTO = try decode(bankDepositJSON())
+
+        XCTAssertEqual(response.walletId, "33333333-3333-4333-8333-333333333333")
+        XCTAssertEqual(response.fundingAccount.accountName, "KIT POS UGANDA LIMITED")
+        XCTAssertEqual(response.fundingAccount.accountNumber, "0100012345678")
+        XCTAssertEqual(response.reference, "K7P2-9QMX-4R8C-T6WA")
+        XCTAssertTrue(response.acceptsProof)
+        XCTAssertFalse(response.isTerminal)
+        XCTAssertNil(response.proof)
+    }
+
+    func testDepositCreationContractNeverContainsABeneficiary() throws {
+        let request = CreateBankDepositRequest(
+            walletId: "33333333-3333-4333-8333-333333333333",
+            fundingAccountId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            amount: "1856.84",
+            note: "Bank transfer"
+        )
+        let body = try jsonObject(request)
+
+        XCTAssertEqual(body["wallet_id"] as? String, request.walletId)
+        XCTAssertEqual(body["funding_account_id"] as? String, request.fundingAccountId)
+        XCTAssertEqual(body["amount"] as? String, "1856.84")
+        XCTAssertEqual(Set(body.keys), ["wallet_id", "funding_account_id", "amount", "note"])
+        XCTAssertNil(body["beneficiary_id"])
+
+        let proof = try jsonObject(AttachBankDepositProofRequest(
+            mediaAssetId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        ))
+        XCTAssertEqual(Set(proof.keys), ["media_asset_id"])
+        XCTAssertNil(proof["beneficiary_id"])
+    }
+
+    func testDepositAmountsTrimTrailingZerosWithoutChangingValue() {
+        XCTAssertEqual(BankDepositMoney.apiAmount("1,856.840", scale: 3), "1856.84")
+        XCTAssertEqual(BankDepositMoney.apiAmount("1,768.80", scale: 2), "1768.8")
+        XCTAssertEqual(BankDepositMoney.apiAmount("1000.00", scale: 2), "1000")
+        XCTAssertEqual(BankDepositMoney.apiAmount("0001.20", scale: 2), "1.2")
+        XCTAssertNil(BankDepositMoney.apiAmount("0.00", scale: 2))
+        XCTAssertNil(BankDepositMoney.apiAmount("1.001", scale: 2))
+        XCTAssertNil(BankDepositMoney.apiAmount("UGX 500", scale: 0))
+    }
+
+    func testHumanReadableDepositReferenceRequiresFourUppercaseGroups() {
+        XCTAssertTrue(BankDepositReferencePolicy.isValid("K7P2-9QMX-4R8C-T6WA"))
+        XCTAssertFalse(BankDepositReferencePolicy.isValid("k7p2-9qmx-4r8c-t6wa"))
+        XCTAssertFalse(BankDepositReferencePolicy.isValid("K7P2-9QMX-4R8C"))
+        XCTAssertFalse(BankDepositReferencePolicy.isValid("7777-9999-4444-8888"))
+        XCTAssertFalse(BankDepositReferencePolicy.isValid("ABCD-EFGH-JKLM-NPQR"))
+    }
+
+    func testDepositProofPolicyAcceptsOnlySupportedBoundedFiles() {
+        XCTAssertTrue(BankDepositProofUploadPolicy.accepts(
+            data: Data([0xFF, 0xD8, 0xFF]),
+            filename: "receipt.jpg",
+            mimeType: "image/jpeg"
+        ))
+        XCTAssertFalse(BankDepositProofUploadPolicy.accepts(
+            data: Data(),
+            filename: "receipt.jpg",
+            mimeType: "image/jpeg"
+        ))
+        XCTAssertFalse(BankDepositProofUploadPolicy.accepts(
+            data: Data([0x01]),
+            filename: "receipt.heic",
+            mimeType: "image/heic"
+        ))
+    }
+
     func testAccountVerificationRequestUsesNormalizedBankContract() throws {
         let account = try XCTUnwrap(BankAccountNumber.apiValue(from: " 0012-34 ab 5678 "))
         let request = CreateBankAccountVerificationRequest(
@@ -685,6 +782,47 @@ final class BankTransferContractTests: XCTestCase {
             }
             """
         )
+    }
+
+    private func bankDepositJSON() -> String {
+        """
+        {
+          "id":"dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+          "reference":"K7P2-9QMX-4R8C-T6WA",
+          "wallet_id":"33333333-3333-4333-8333-333333333333",
+          "amount":"1856.84",
+          "currency":{"code":"UGX","scale":"2"},
+          "status":"awaiting_proof",
+          "source":"customer",
+          "funding_account":{
+            "id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "label":"Kit Pay collections",
+            "bank":{
+              "id":"11111111-1111-4111-8111-111111111111",
+              "name":"Stanbic Bank Uganda",
+              "code":"040147",
+              "country_code":"UG"
+            },
+            "account_name":"KIT POS UGANDA LIMITED",
+            "account_number":"0100012345678",
+            "account_number_masked":"••••5678",
+            "branch_name":"Garden City",
+            "branch_code":null,
+            "swift_code":"SBICUGKX",
+            "instructions":"Use the exact Kit Pay reference.",
+            "currency":"UGX",
+            "status":"active"
+          },
+          "proof":null,
+          "bank_transaction_reference":null,
+          "customer_note":null,
+          "rejection":null,
+          "expires_at":"2099-08-31T12:00:00Z",
+          "created_at":"2026-08-26T12:00:00Z",
+          "proof_submitted_at":null,
+          "completed_at":null
+        }
+        """
     }
 
     private func sampleQuote() throws -> BankTransferQuoteDTO {
