@@ -1385,6 +1385,9 @@ struct ConversationView: View {
     @State private var unseenIncomingCount = 0
     @State private var cameraPullProgress: CGFloat = 0
     @State private var cameraPull = ConversationCameraPullGesture()
+    /// Whether a finger is currently on the thread, as reported by the scroll view itself.
+    /// Only the scroll view knows this once it has taken the drag over, which it always does.
+    @State private var isConversationScrollInteracting = false
     @State private var conversationContentHeight: CGFloat = 0
     @State private var conversationViewportHeight: CGFloat = 0
     @State private var pendingScrollTargetMessageID: UUID?
@@ -2022,9 +2025,17 @@ struct ConversationView: View {
                 .onPreferenceChange(ConversationScrollMetricsKey.self) { metrics in
                     handleScrollMetrics(metrics)
                 }
-                // The only signal available on iOS 17 for "the finger came up". It runs alongside
-                // the scroll rather than competing with it, and the minimum distance keeps taps
-                // and the bubbles' own long-press menus out of it entirely.
+                // Where "the finger came up" comes from. On iOS 18 and later the scroll view says
+                // so itself; below that, the drag gesture is the only thing there is.
+                .modifier(
+                    ConversationScrollInteractionReporter(
+                        onInteractingChange: { isConversationScrollInteracting = $0 },
+                        onRelease: releaseCameraPull
+                    )
+                )
+                // Runs alongside the scroll rather than competing with it, and the minimum distance
+                // keeps taps and the bubbles' own long-press menus out of it entirely. Kept for
+                // iOS 17, where nothing else reports the release at all.
                 .simultaneousGesture(
                     DragGesture(minimumDistance: 12)
                         .onChanged { _ in updateCameraPullArming() }
@@ -5281,6 +5292,13 @@ struct ConversationView: View {
         if cameraPullProgress != overscroll {
             cameraPullProgress = overscroll
         }
+        // Taking an armed pull back before letting go, for the case where the scroll view has
+        // swallowed the drag gesture and its `onChanged` no longer arrives. Only ever read while
+        // the finger is still down: the release itself also collapses the overscroll as the thread
+        // bounces to rest, and disarming from that would swallow the camera just asked for.
+        if isConversationScrollInteracting {
+            cameraPull.dragged(progress: overscroll)
+        }
         guard !cameraPull.isArmed,
               overscroll >= ConversationCameraPullPolicy.triggerDistance
         else { return }
@@ -5401,6 +5419,39 @@ enum ConversationMessageSearchPolicy {
         else { return nil }
         return message.body.nilIfBlank
     }
+}
+
+/// Reports when a finger goes onto the thread and when it comes back off.
+///
+/// `DragGesture`'s `onEnded` is not delivered once a scroll view takes the drag over — and a pull
+/// past the last message is a scroll, every time. So the release the indicator kept promising
+/// ("Release for camera") never arrived and the camera never opened. iOS 18 publishes scroll
+/// phases, which is the signal this gesture wanted all along; iOS 17 is left with the drag gesture,
+/// which is all it has.
+private struct ConversationScrollInteractionReporter: ViewModifier {
+    let onInteractingChange: (Bool) -> Void
+    let onRelease: () -> Void
+
+    func body(content: Content) -> some View {
+        if #available(iOS 18.0, *) {
+            content.onScrollPhaseChange { oldPhase, newPhase in
+                let was = oldPhase.hasFingerDown
+                let now = newPhase.hasFingerDown
+                guard was != now else { return }
+                onInteractingChange(now)
+                if was { onRelease() }
+            }
+        } else {
+            content
+        }
+    }
+}
+
+@available(iOS 18.0, *)
+private extension ScrollPhase {
+    /// The phases that mean the customer is still touching the thread. Deceleration and the
+    /// rubber-band settle are both the aftermath of a release, not part of one.
+    var hasFingerDown: Bool { self == .tracking || self == .interacting }
 }
 
 /// How far past the last message the user must pull before the camera opens.

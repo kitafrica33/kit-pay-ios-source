@@ -770,6 +770,77 @@ enum BankDepositReferencePolicy {
     }
 }
 
+struct BankDepositInstructionField: Equatable, Identifiable {
+    let label: String
+    let value: String
+    let monospaced: Bool
+
+    var id: String { label }
+}
+
+/// One canonical representation of the bank coordinates shown on screen, copied to another app,
+/// and exported to PDF. Keeping these surfaces together prevents a stale or masked account number
+/// from reaching one of them while the others display the authoritative value.
+enum BankDepositInstructions {
+    static let exportActionTitle = "Export PDF"
+
+    static func accountFields(for deposit: BankDepositRequestDTO) -> [BankDepositInstructionField] {
+        let account = deposit.fundingAccount
+        var fields = [
+            BankDepositInstructionField(label: "Bank", value: account.bank.name, monospaced: false),
+            BankDepositInstructionField(label: "Account name", value: account.accountName, monospaced: false),
+            BankDepositInstructionField(label: "Account number", value: account.accountNumber, monospaced: true),
+        ]
+        append("Branch", account.branchName, monospaced: false, to: &fields)
+        append("Branch code", account.branchCode, monospaced: true, to: &fields)
+        append("SWIFT", account.swiftCode, monospaced: true, to: &fields)
+        return fields
+    }
+
+    static func receivingFields(for deposit: BankDepositRequestDTO) -> [BankDepositInstructionField] {
+        var fields = accountFields(for: deposit)
+        fields.append(
+            BankDepositInstructionField(
+                label: "Payment reference",
+                value: deposit.reference,
+                monospaced: true
+            )
+        )
+        fields.append(
+            BankDepositInstructionField(
+                label: "Exact amount",
+                value: KitMoney.formatted(
+                    deposit.amount,
+                    currency: deposit.currency,
+                    trimZeroFraction: true
+                ),
+                monospaced: false
+            )
+        )
+        return fields
+    }
+
+    static func clipboardText(for deposit: BankDepositRequestDTO) -> String {
+        receivingFields(for: deposit)
+            .map { "\($0.label): \($0.value)" }
+            .joined(separator: "\n")
+    }
+
+    private static func append(
+        _ label: String,
+        _ rawValue: String?,
+        monospaced: Bool,
+        to fields: inout [BankDepositInstructionField]
+    ) {
+        guard let value = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty
+        else { return }
+        fields.append(
+            BankDepositInstructionField(label: label, value: value, monospaced: monospaced)
+        )
+    }
+}
+
 enum BankTransferIdempotency {
     static func key(prefix: String, id: UUID = UUID()) -> String {
         "\(prefix)-\(id.uuidString.lowercased())"

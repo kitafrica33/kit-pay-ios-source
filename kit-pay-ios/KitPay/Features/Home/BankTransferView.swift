@@ -976,18 +976,19 @@ private enum BankModal: Identifiable {
     case addBeneficiary
     case send(BankBeneficiaryDTO)
     case transferReceipt(BankingOperationDTO)
-    case newDeposit
-    case depositReceipt(BankDepositRequestDTO)
 
     var id: String {
         switch self {
         case .addBeneficiary: "add-beneficiary"
         case .send(let beneficiary): "send-\(beneficiary.id)"
         case .transferReceipt(let operation): "transfer-\(operation.id)"
-        case .newDeposit: "new-deposit"
-        case .depositReceipt(let deposit): "deposit-\(deposit.id)"
         }
     }
+}
+
+private enum BankDepositDestination: Hashable {
+    case create
+    case receipt(BankDepositRequestDTO)
 }
 
 struct BankTransferView: View {
@@ -996,6 +997,7 @@ struct BankTransferView: View {
     @StateObject private var model = BankTransferViewModel()
     @StateObject private var depositModel = BankDepositViewModel()
     @State private var modal: BankModal?
+    @State private var depositDestination: BankDepositDestination?
     /// Built once per directory change: the rows below would otherwise rescan every synced contact
     /// on each redraw.
     @State private var contactIndex = BeneficiaryContactIndex()
@@ -1117,25 +1119,29 @@ struct BankTransferView: View {
                             model: model,
                             initialOperation: operation
                         )
-                    case .newDeposit:
-                        BankDepositFlowView(
-                            model: depositModel,
-                            initialDeposit: nil,
-                            permitted: depositsPermitted,
-                            online: app.isOnline
-                        )
-                        .environmentObject(app)
-                    case .depositReceipt(let deposit):
-                        BankDepositFlowView(
-                            model: depositModel,
-                            initialDeposit: deposit,
-                            permitted: depositsPermitted,
-                            online: app.isOnline
-                        )
-                        .environmentObject(app)
                     }
                 }
                 .presentationBackground(.ultraThinMaterial)
+            }
+            .navigationDestination(item: $depositDestination) { destination in
+                switch destination {
+                case .create:
+                    BankDepositFlowView(
+                        model: depositModel,
+                        initialDeposit: nil,
+                        permitted: depositsPermitted,
+                        online: app.isOnline
+                    )
+                    .environmentObject(app)
+                case .receipt(let deposit):
+                    BankDepositFlowView(
+                        model: depositModel,
+                        initialDeposit: deposit,
+                        permitted: depositsPermitted,
+                        online: app.isOnline
+                    )
+                    .environmentObject(app)
+                }
             }
         }
         .presentationBackground(.ultraThinMaterial)
@@ -1167,7 +1173,7 @@ struct BankTransferView: View {
                 .font(.title3.bold())
                 .foregroundStyle(.primary)
 
-            Button { modal = .newDeposit } label: {
+            Button { depositDestination = .create } label: {
                 HStack(spacing: 14) {
                     Image(systemName: "arrow.down.to.line.compact")
                         .font(.title3.bold())
@@ -1242,7 +1248,7 @@ struct BankTransferView: View {
                     .kitGlass(cornerRadius: 20, shadow: false)
             } else {
                 ForEach(depositModel.deposits.prefix(20)) { deposit in
-                    Button { modal = .depositReceipt(deposit) } label: {
+                    Button { depositDestination = .receipt(deposit) } label: {
                         BankDepositRow(deposit: deposit)
                     }
                     .buttonStyle(.plain)
@@ -1508,6 +1514,7 @@ private struct BankDepositFlowView: View {
     @State private var preparedProof: BankDepositPreparedProof?
     @State private var importingDocument = false
     @State private var isPreparingProof = false
+    @State private var copiedInstructionLabel: String?
 
     private var wallet: Wallet? { app.selectedWallet }
 
@@ -1530,32 +1537,31 @@ private struct BankDepositFlowView: View {
     }
 
     var body: some View {
-        NavigationStack {
-            Group {
-                if let currentDeposit {
-                    depositDetails(currentDeposit)
-                } else {
-                    createForm
-                }
+        Group {
+            if let currentDeposit {
+                depositDetails(currentDeposit)
+            } else {
+                createForm
             }
-            .background(KitColor.canvas.ignoresSafeArea())
-            .navigationTitle(currentDeposit == nil ? "Bank deposit" : "Deposit details")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button(currentDeposit == nil ? "Cancel" : "Done") { dismiss() }
-                        .disabled(model.isSubmitting || isPreparingProof)
-                }
-                if let currentDeposit {
-                    ToolbarItem(placement: .topBarTrailing) {
-                        Button {
-                            Task { deposit = await model.refresh(currentDeposit) ?? currentDeposit }
-                        } label: {
-                            Image(systemName: "arrow.clockwise")
-                        }
-                        .disabled(model.isSubmitting || !online)
-                        .accessibilityLabel("Refresh deposit status")
+        }
+        .background(KitColor.canvas.ignoresSafeArea())
+        .navigationTitle(currentDeposit == nil ? "Bank deposit" : "Deposit details")
+        .navigationBarTitleDisplayMode(.inline)
+        .navigationBarBackButtonHidden(true)
+        .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                Button(currentDeposit == nil ? "Cancel" : "Done") { dismiss() }
+                    .disabled(model.isSubmitting || isPreparingProof)
+            }
+            if let currentDeposit {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        Task { deposit = await model.refresh(currentDeposit) ?? currentDeposit }
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
                     }
+                    .disabled(model.isSubmitting || !online)
+                    .accessibilityLabel("Refresh deposit status")
                 }
             }
         }
@@ -1578,6 +1584,12 @@ private struct BankDepositFlowView: View {
             allowsMultipleSelection: false
         ) { result in
             Task { await prepareImportedFile(result) }
+        }
+        .task(id: copiedInstructionLabel) {
+            guard copiedInstructionLabel != nil else { return }
+            do { try await Task.sleep(nanoseconds: 1_600_000_000) }
+            catch { return }
+            copiedInstructionLabel = nil
         }
     }
 
@@ -1753,6 +1765,11 @@ private struct BankDepositFlowView: View {
                     receivingAccountCard(deposit)
                 }
 
+                ExportBankDepositPDFButton(
+                    deposit: deposit,
+                    walletName: wallet?.name
+                )
+
                 if deposit.acceptsProof {
                     proofCard(deposit)
                 } else if let proof = deposit.proof {
@@ -1815,12 +1832,17 @@ private struct BankDepositFlowView: View {
                     .lineLimit(1)
                 Spacer(minLength: 4)
                 Button {
-                    UIPasteboard.general.string = deposit.reference
+                    copy(deposit.reference, label: "Payment reference")
                 } label: {
-                    Label("Copy", systemImage: "doc.on.doc")
+                    Label(
+                        copiedInstructionLabel == "Payment reference" ? "Copied" : "Copy",
+                        systemImage: copiedInstructionLabel == "Payment reference"
+                            ? "checkmark" : "doc.on.doc"
+                    )
                         .font(.caption.bold())
                 }
                 .buttonStyle(.bordered)
+                .accessibilityLabel("Copy payment reference")
             }
             Text("Use this exact reference in your bank transfer. It is how Kit Pay matches the payment to your wallet.")
                 .font(.caption)
@@ -1837,14 +1859,30 @@ private struct BankDepositFlowView: View {
     private func receivingAccountCard(_ deposit: BankDepositRequestDTO) -> some View {
         let account = deposit.fundingAccount
         return VStack(alignment: .leading, spacing: 13) {
-            Text("Transfer to")
-                .font(.headline)
-                .foregroundStyle(.primary)
-            detailRow("Bank", account.bank.name)
-            detailRow("Account name", account.accountName)
-            detailRow("Account number", account.accountNumber, monospaced: true)
-            if let branch = account.branchName { detailRow("Branch", branch) }
-            if let swift = account.swiftCode { detailRow("SWIFT", swift, monospaced: true) }
+            HStack {
+                Text("Transfer to")
+                    .font(.headline)
+                    .foregroundStyle(.primary)
+                Spacer()
+                Button {
+                    copy(
+                        BankDepositInstructions.clipboardText(for: deposit),
+                        label: "All deposit details"
+                    )
+                } label: {
+                    Label(
+                        copiedInstructionLabel == "All deposit details" ? "Copied" : "Copy all",
+                        systemImage: copiedInstructionLabel == "All deposit details"
+                            ? "checkmark" : "doc.on.doc.fill"
+                    )
+                    .font(.caption.bold())
+                }
+                .buttonStyle(.bordered)
+                .accessibilityLabel("Copy all bank deposit details")
+            }
+            ForEach(BankDepositInstructions.accountFields(for: deposit)) { field in
+                copyableInstructionRow(field)
+            }
             if let instructions = account.instructions, !instructions.isEmpty {
                 Divider()
                 Text(instructions)
@@ -1860,6 +1898,40 @@ private struct BankDepositFlowView: View {
         }
         .padding(18)
         .kitGlass(cornerRadius: 22)
+    }
+
+    private func copyableInstructionRow(_ field: BankDepositInstructionField) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Text(field.label)
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 12)
+            Text(field.value)
+                .font(field.monospaced ? .subheadline.monospaced() : .subheadline)
+                .fontWeight(.semibold)
+                .foregroundStyle(.primary)
+                .multilineTextAlignment(.trailing)
+                .textSelection(.enabled)
+            Button {
+                copy(field.value, label: field.label)
+            } label: {
+                Image(systemName: copiedInstructionLabel == field.label ? "checkmark" : "doc.on.doc")
+                    .font(.caption.bold())
+                    .frame(width: 28, height: 28)
+            }
+            .buttonStyle(.borderless)
+            .accessibilityLabel("Copy \(field.label.lowercased())")
+        }
+    }
+
+    private func copy(_ value: String, label: String) {
+        UIPasteboard.general.setItems(
+            [[UTType.plainText.identifier: value]],
+            options: [
+                .localOnly: true,
+                .expirationDate: Date().addingTimeInterval(300),
+            ]
+        )
+        copiedInstructionLabel = label
     }
 
     private func proofCard(_ deposit: BankDepositRequestDTO) -> some View {

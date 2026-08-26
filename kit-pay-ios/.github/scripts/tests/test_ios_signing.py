@@ -57,6 +57,25 @@ if PROFILE_ENTITLEMENTS_SPEC is None or PROFILE_ENTITLEMENTS_SPEC.loader is None
     raise RuntimeError("Could not load ios_profile_entitlements.py")
 PROFILE_ENTITLEMENTS = importlib.util.module_from_spec(PROFILE_ENTITLEMENTS_SPEC)
 PROFILE_ENTITLEMENTS_SPEC.loader.exec_module(PROFILE_ENTITLEMENTS)
+sys.modules["ios_profile_entitlements"] = PROFILE_ENTITLEMENTS
+
+PREPARE_SPEC = importlib.util.spec_from_file_location(
+    "kitpay_prepare_ios_signing",
+    PREPARE,
+)
+if PREPARE_SPEC is None or PREPARE_SPEC.loader is None:
+    raise RuntimeError("Could not load prepare_ios_signing.py")
+PREPARE_MODULE = importlib.util.module_from_spec(PREPARE_SPEC)
+PREPARE_SPEC.loader.exec_module(PREPARE_MODULE)
+
+VERIFY_SPEC = importlib.util.spec_from_file_location(
+    "kitpay_verify_ios_archive",
+    VERIFY,
+)
+if VERIFY_SPEC is None or VERIFY_SPEC.loader is None:
+    raise RuntimeError("Could not load verify_ios_archive.py")
+VERIFY_MODULE = importlib.util.module_from_spec(VERIFY_SPEC)
+VERIFY_SPEC.loader.exec_module(VERIFY_MODULE)
 
 
 def write_plist(path: pathlib.Path, value: dict) -> None:
@@ -237,6 +256,56 @@ class IOSProfileEntitlementAuthorizationTests(unittest.TestCase):
 
 
 class PrepareIOSSigningTests(unittest.TestCase):
+    def test_app_group_authorization_requires_one_exact_group(self) -> None:
+        accepted = (
+            [APP_GROUP],
+            [f"{TEAM}.{APP_GROUP}"],
+        )
+        rejected = (
+            None,
+            [],
+            APP_GROUP,
+            [APP_GROUP, APP_GROUP],
+            [APP_GROUP, f"{TEAM}.{APP_GROUP}"],
+            [APP_GROUP, "group.example.unexpected"],
+            ["group.example.unexpected"],
+            [1],
+        )
+        for value in accepted:
+            with self.subTest(accepted=value):
+                entitlements = {APP_GROUP_KEY: value}
+                self.assertTrue(
+                    PREPARE_MODULE.authorizes_app_group(
+                        entitlements,
+                        APP_GROUP,
+                        TEAM,
+                    )
+                )
+                self.assertTrue(
+                    VERIFY_MODULE.authorizes_app_group(
+                        entitlements,
+                        APP_GROUP,
+                        TEAM,
+                    )
+                )
+        for value in rejected:
+            with self.subTest(rejected=value):
+                entitlements = {APP_GROUP_KEY: value}
+                self.assertFalse(
+                    PREPARE_MODULE.authorizes_app_group(
+                        entitlements,
+                        APP_GROUP,
+                        TEAM,
+                    )
+                )
+                self.assertFalse(
+                    VERIFY_MODULE.authorizes_app_group(
+                        entitlements,
+                        APP_GROUP,
+                        TEAM,
+                    )
+                )
+
     def test_generates_manual_export_options_for_exact_profile(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = pathlib.Path(raw)
@@ -736,32 +805,34 @@ class AppStoreProfileGeneratorTests(unittest.TestCase):
         )
 
     def test_missing_extension_bundle_id_is_registered_explicitly(self) -> None:
-        client = FakeAppStoreConnectClient(
-            [
-                api_collection([]),
-                {
-                    "data": {
-                        "type": "bundleIds",
-                        "id": "share-bundle-resource",
-                        "attributes": {
-                            "identifier": SHARE_BUNDLE,
-                            "name": "Kit Pay Share",
-                            "platform": "IOS",
+        for platform in ("IOS", "UNIVERSAL"):
+            with self.subTest(platform=platform):
+                client = FakeAppStoreConnectClient(
+                    [
+                        api_collection([]),
+                        {
+                            "data": {
+                                "type": "bundleIds",
+                                "id": "share-bundle-resource",
+                                "attributes": {
+                                    "identifier": SHARE_BUNDLE,
+                                    "name": "Kit Pay Share",
+                                    "platform": platform,
+                                },
+                            }
                         },
-                    }
-                },
-            ]
-        )
+                    ]
+                )
 
-        resource_id = PROFILE_GENERATOR._ensure_bundle_id(
-            client,
-            SHARE_BUNDLE,
-            "Kit Pay Share",
-        )
+                resource_id = PROFILE_GENERATOR._ensure_bundle_id(
+                    client,
+                    SHARE_BUNDLE,
+                    "Kit Pay Share",
+                )
 
-        self.assertEqual(resource_id, "share-bundle-resource")
-        self.assertEqual(client.calls[1]["method"], "POST")
-        self.assertEqual(client.calls[1]["path"], "/v1/bundleIds")
+                self.assertEqual(resource_id, "share-bundle-resource")
+                self.assertEqual(client.calls[1]["method"], "POST")
+                self.assertEqual(client.calls[1]["path"], "/v1/bundleIds")
 
     def test_missing_capability_uses_exact_creation_body(self) -> None:
         client = FakeAppStoreConnectClient(
@@ -1370,17 +1441,17 @@ class AppStoreProfileGeneratorTests(unittest.TestCase):
 
 
 class SigningConfigurationTests(unittest.TestCase):
-    def test_build_28_release_identity_is_consistent(self) -> None:
+    def test_build_29_release_identity_is_consistent(self) -> None:
         workflow = (ROOT / ".github/workflows/ios-app-store-archive.yml").read_text()
         project = (ROOT / "KitPay.xcodeproj/project.pbxproj").read_text()
 
         self.assertIn("default: 1.0.16", workflow)
-        self.assertIn('default: "28"', workflow)
-        self.assertIn("v1.0.16-build28", workflow)
+        self.assertIn('default: "29"', workflow)
+        self.assertIn("v1.0.16-build29", workflow)
         # Four each: Debug and Release of the app and of the share extension. iOS refuses to
         # install an app whose extension carries a different version, so they move together.
         self.assertEqual(project.count("MARKETING_VERSION = 1.0.16;"), 4)
-        self.assertEqual(project.count("CURRENT_PROJECT_VERSION = 28;"), 4)
+        self.assertEqual(project.count("CURRENT_PROJECT_VERSION = 29;"), 4)
         self.assertNotIn("MARKETING_VERSION = 1.0.1;", project)
 
     def test_manual_profile_is_scoped_to_the_app_target(self) -> None:
@@ -1498,6 +1569,9 @@ class SigningConfigurationTests(unittest.TestCase):
             '--profile-output "$RUNNER_TEMP/kitpay-app-store.mobileprovision"',
             generation_step,
         )
+        # The generated app profile, generated extension profile, and final signed archive are
+        # each checked against the same exact App Group identifier.
+        self.assertEqual(workflow.count('--app-group "$IOS_APP_GROUP"'), 3)
         self.assertIn(
             'security cms -D \\\n            -i "$RUNNER_TEMP/kitpay-app-store.mobileprovision"',
             workflow,
@@ -1927,6 +2001,22 @@ class VerifyIOSArchiveTests(unittest.TestCase):
                 result["artifacts"]["ipa"]["sha256"],
                 hashlib.sha256(b"ipa").hexdigest(),
             )
+
+            app_profile_without_group = profile()
+            app_profile_without_group["Entitlements"].pop(APP_GROUP_KEY)
+            write_plist(embedded, app_profile_without_group)
+            missing_app_profile_group = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(missing_app_profile_group.returncode, 0)
+            self.assertIn(
+                "Embedded profile must authorize exactly the Kit Pay app group",
+                missing_app_profile_group.stderr,
+            )
+            write_plist(embedded, profile())
 
             apple_generated_profile = profile()
             apple_generated_profile["Entitlements"][

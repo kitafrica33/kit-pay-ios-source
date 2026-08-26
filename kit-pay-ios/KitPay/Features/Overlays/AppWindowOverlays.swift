@@ -39,6 +39,14 @@ enum AppWindowTopStripReservation {
     static let callKey = "call"
     static let voiceNoteKey = "voice-note"
 
+    /// Breathing space between a strip and whatever the app draws under it.
+    ///
+    /// A strip claims only its own content height, and reserving exactly that put the screen's
+    /// first row — a navigation title, the top of a thread — hard against the strip's bottom edge,
+    /// reading as one squeezed block rather than two surfaces. The gap is added once, here, so the
+    /// call strip and the voice-note bar are spaced identically and neither has to remember to.
+    static let contentGap: CGFloat = 10
+
     private static var claims: [String: CGFloat] = [:]
 
     /// Registers (`height > 0`) or releases (`height <= 0`) one surface's claim.
@@ -53,7 +61,8 @@ enum AppWindowTopStripReservation {
     }
 
     private static func apply(in scene: UIWindowScene?) {
-        let reserved = claims.values.max() ?? 0
+        let tallest = claims.values.max() ?? 0
+        let reserved = tallest > 0 ? tallest + contentGap : 0
         guard let scene = scene ?? foregroundWindowScene() else { return }
         for window in scene.windows {
             guard !(window is OverlayPassthroughWindow),

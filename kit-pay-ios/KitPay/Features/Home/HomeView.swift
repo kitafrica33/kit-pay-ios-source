@@ -16,7 +16,6 @@ private enum HomeModal: Identifiable {
     case wallet(WalletDestination)
     case provider(ProviderFlowEntry)
     case mobileMoney
-    case bankTransfer
     case scanQR
 
     var id: String {
@@ -24,7 +23,6 @@ private enum HomeModal: Identifiable {
         case let .wallet(destination): "wallet-\(destination.id)"
         case let .provider(entry): "provider-\(entry.id)"
         case .mobileMoney: "mobile-money"
-        case .bankTransfer: "bank-transfer"
         case .scanQR: "scan-qr"
         }
     }
@@ -34,6 +32,7 @@ struct HomeView: View {
     @EnvironmentObject private var model: AppModel
     @State private var balancesVisible = true
     @State private var modal: HomeModal?
+    @State private var isBankTransferPresented = false
 
     var body: some View {
         Group {
@@ -95,13 +94,13 @@ struct HomeView: View {
             case .mobileMoney:
                 MobileMoneyView().environmentObject(model)
                     .presentationBackground(.ultraThinMaterial)
-            case .bankTransfer:
-                BankTransferView().environmentObject(model)
-                    .presentationBackground(.ultraThinMaterial)
             case .scanQR:
                 MerchantQRPaymentView().environmentObject(model)
                     .presentationBackground(.ultraThinMaterial)
             }
+        }
+        .fullScreenCover(isPresented: $isBankTransferPresented) {
+            BankTransferView().environmentObject(model)
         }
     }
 
@@ -444,7 +443,7 @@ struct HomeView: View {
         }
         switch feature {
         case .mobileMoney: modal = .mobileMoney
-        case .bankTransfer: modal = .bankTransfer
+        case .bankTransfer: isBankTransferPresented = true
         case .scanQR: modal = .scanQR
         }
     }

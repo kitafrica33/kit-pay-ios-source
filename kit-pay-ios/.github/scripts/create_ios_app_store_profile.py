@@ -341,7 +341,13 @@ def _ensure_bundle_id(client: object, bundle_id: str, name: str | None) -> str:
         operation="bundle ID registration",
     )
     resource_id, attributes = _single_response(response, "bundleIds", "bundle ID")
-    if attributes.get("identifier") != bundle_id or attributes.get("platform") != "IOS":
+    # Apple may normalize a newly registered iOS App ID to UNIVERSAL in the
+    # response even though the create request uses IOS. Both values represent
+    # an iOS-capable explicit identifier and are already accepted by lookup.
+    if (
+        attributes.get("identifier") != bundle_id
+        or attributes.get("platform") not in _IOS_BUNDLE_ID_PLATFORMS
+    ):
         _fail("App Store Connect registered an unexpected bundle ID.")
     return resource_id
 

@@ -53,10 +53,10 @@ def authorizes_app_group(entitlements: dict, app_group: str, team_id: str) -> bo
     container is a profile that was generated against the wrong App ID.
     """
     groups = entitlements.get(APP_GROUP_KEY)
-    if not isinstance(groups, list) or not groups:
+    if not isinstance(groups, list) or len(groups) != 1:
         return False
     accepted = {app_group, f"{team_id}.{app_group}"}
-    return all(isinstance(group, str) for group in groups) and set(groups) <= accepted
+    return isinstance(groups[0], str) and groups[0] in accepted
 
 
 def main() -> None:

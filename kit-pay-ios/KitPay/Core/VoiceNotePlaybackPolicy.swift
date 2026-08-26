@@ -93,8 +93,9 @@ enum VoiceNoteSeekPolicy {
 /// it: scrolled past in the thread, or left behind entirely. While the bubble that owns the note
 /// is visible the bubble *is* the control, so a second one on top of it would be noise.
 enum VoiceNoteMiniBarPolicy {
-    /// Height of the bar's content below the top safe-area inset — the same reservation the
-    /// minimized call strip takes, so the two surfaces push content down identically.
+    /// Height of the bar's content below the top safe-area inset — the same claim the minimized
+    /// call strip makes, so the two surfaces push content down identically.
+    /// `AppWindowTopStripReservation` adds the gap that separates either one from the app below.
     static let contentHeight: CGFloat = 60
 
     static func isVisible(hasPlayback: Bool, isSourceOnScreen: Bool) -> Bool {

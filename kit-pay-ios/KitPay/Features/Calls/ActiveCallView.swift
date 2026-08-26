@@ -304,8 +304,9 @@ private extension ClosedRange where Bound == CGFloat {
 }
 
 /// Shared geometry of the full-width audio call strip. `MinimizedCallView` draws the strip with
-/// this height below the top safe-area inset, and `RootView` reserves exactly the same amount as
-/// a top safe-area inset so app content is pushed below the strip instead of covered by it.
+/// this height below the top safe-area inset, and `AppWindowTopStripReservation` reserves it — plus
+/// its own `contentGap` — as a top safe-area inset, so app content is pushed clear of the strip
+/// instead of covered by it or crowded against it.
 enum CallBannerMetrics {
     /// Height of the strip's content below the top safe-area inset.
     static let contentHeight: CGFloat = 60

@@ -43,10 +43,10 @@ def load_plist(path: pathlib.Path, label: str) -> dict:
 def authorizes_app_group(entitlements: dict, app_group: str, team_id: str) -> bool:
     """True when exactly the one Kit Pay app group is authorized, and nothing else."""
     groups = entitlements.get("com.apple.security.application-groups")
-    if not isinstance(groups, list) or not groups:
+    if not isinstance(groups, list) or len(groups) != 1:
         return False
     accepted = {app_group, f"{team_id}.{app_group}"}
-    return all(isinstance(group, str) for group in groups) and set(groups) <= accepted
+    return isinstance(groups[0], str) and groups[0] in accepted
 
 
 def digest(path: pathlib.Path) -> dict[str, object]:
@@ -180,6 +180,14 @@ def main() -> None:
         (
             profile_entitlements.get("aps-environment") == "production",
             "Embedded profile does not authorize production APNs",
+        ),
+        (
+            authorizes_app_group(
+                profile_entitlements,
+                args.app_group,
+                args.team_id,
+            ),
+            "Embedded profile must authorize exactly the Kit Pay app group",
         ),
         (
             profile_entitlements.get(

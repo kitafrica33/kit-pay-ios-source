@@ -14,6 +14,9 @@ struct KitReceiptContent {
     }
 
     let disposition: Disposition
+    /// PDF metadata title and visible uppercase heading.
+    let documentTitle: String
+    let documentKicker: String
     /// "Payment Successful" / "Payment Pending" / "Payment Failed" / "Payment Reversed".
     let statusLabel: String
     /// "UGX 150,000" — grouped, unsigned.
@@ -26,6 +29,8 @@ struct KitReceiptContent {
     let shareMessage: String
     /// "Kit-Receipt-<reference>.pdf", sanitized for the filesystem.
     let fileName: String
+    /// Product-specific verification language shown in the footer.
+    let footerNote: String
 
     static func from(transaction: WalletTransaction, senderName: String?) -> KitReceiptContent {
         // Mirrors TransactionDetailView.statusColor exactly: anything not explicitly terminal
@@ -108,12 +113,80 @@ struct KitReceiptContent {
 
         return KitReceiptContent(
             disposition: disposition,
+            documentTitle: "Kit Pay receipt",
+            documentKicker: "PROOF OF PAYMENT",
             statusLabel: statusLabel,
             headlineAmount: headlineAmount,
             directionLine: directionLine,
             rows: rows,
             shareMessage: shareMessage,
-            fileName: fileName
+            fileName: fileName,
+            footerNote: "This receipt was generated from the sender's Kit Pay transaction record."
+        )
+    }
+
+    static func bankDepositInstructions(
+        from deposit: BankDepositRequestDTO,
+        walletName: String?
+    ) -> KitReceiptContent {
+        let disposition: Disposition
+        let statusLabel: String
+        switch deposit.status.lowercased() {
+        case "approved", "completed":
+            disposition = .successful
+            statusLabel = "Wallet Credited"
+        case "rejected", "cancelled", "canceled":
+            disposition = .failed
+            statusLabel = "Deposit Not Approved"
+        case "expired":
+            disposition = .reversed
+            statusLabel = "Deposit Expired"
+        case "proof_submitted":
+            disposition = .pending
+            statusLabel = "Receipt Submitted"
+        case "awaiting_approval":
+            disposition = .pending
+            statusLabel = "Under Review"
+        default:
+            disposition = .pending
+            statusLabel = "Awaiting Receipt"
+        }
+
+        var rows = BankDepositInstructions.receivingFields(for: deposit)
+            .map { (label: $0.label, value: $0.value) }
+        func appendRow(_ label: String, _ rawValue: String?) {
+            guard let value = trimmedNonEmpty(rawValue) else { return }
+            rows.append((label: label, value: value))
+        }
+        appendRow("Kit Pay wallet", walletName)
+        appendRow("Status", statusLabel)
+        appendRow("Created", displayDate(from: deposit.createdAt ?? ""))
+        appendRow("Expires", displayDate(from: deposit.expiresAt))
+        appendRow("Your note", deposit.customerNote)
+        appendRow("Bank instructions", deposit.fundingAccount.instructions)
+
+        let amount = KitMoney.formatted(
+            deposit.amount,
+            currency: deposit.currency,
+            trimZeroFraction: true
+        )
+        let reference = deposit.reference
+        let isInstruction = !deposit.isTerminal
+        return KitReceiptContent(
+            disposition: disposition,
+            documentTitle: isInstruction
+                ? "Kit Pay bank deposit instructions"
+                : "Kit Pay bank deposit record",
+            documentKicker: isInstruction ? "BANK DEPOSIT INSTRUCTIONS" : "BANK DEPOSIT RECORD",
+            statusLabel: statusLabel,
+            headlineAmount: amount,
+            directionLine: "Transfer to \(deposit.fundingAccount.bank.name)",
+            rows: rows,
+            shareMessage: isInstruction
+                ? "Bank deposit instructions for \(amount), reference \(reference). PDF attached."
+                : "Bank deposit record for \(amount), reference \(reference). PDF attached.",
+            fileName: "Kit-Bank-Deposit-\(sanitizedFileComponent(reference)).pdf",
+            footerNote: "Use the exact amount and reference. Wallet credit follows verification."
         )
     }
 
@@ -305,11 +378,13 @@ enum KitReceiptPDFRenderer {
         pages.append(currentRows)
         cardTops.append(cardTop)
 
-        let reference = content.rows.first(where: { $0.label == "Reference" })?.value ?? ""
+        let reference = content.rows.first(where: {
+            $0.label == "Reference" || $0.label == "Payment reference"
+        })?.value ?? ""
 
         let format = UIGraphicsPDFRendererFormat()
         format.documentInfo = [
-            kCGPDFContextTitle as String: "Kit Pay receipt",
+            kCGPDFContextTitle as String: content.documentTitle,
             kCGPDFContextCreator as String: "Kit Pay",
         ]
         let renderer = UIGraphicsPDFRenderer(
@@ -326,7 +401,7 @@ enum KitReceiptPDFRenderer {
                 cg.fill(CGRect(origin: .zero, size: Metrics.pageSize))
 
                 if pageIndex == 0 {
-                    drawPrimaryHeader(in: cg)
+                    drawPrimaryHeader(kicker: content.documentKicker, in: cg)
 
                     // Hero block, centered.
                     let pillRect = CGRect(
@@ -360,7 +435,11 @@ enum KitReceiptPDFRenderer {
                         height: directionHeight
                     ))
                 } else {
-                    drawContinuationHeader(reference: reference, in: cg)
+                    drawContinuationHeader(
+                        documentTitle: content.documentTitle,
+                        reference: reference,
+                        in: cg
+                    )
                 }
 
                 drawCard(
@@ -369,14 +448,19 @@ enum KitReceiptPDFRenderer {
                     valueWidth: valueWidth,
                     in: cg
                 )
-                drawFooter(page: pageIndex + 1, of: pages.count, in: cg)
+                drawFooter(
+                    note: content.footerNote,
+                    page: pageIndex + 1,
+                    of: pages.count,
+                    in: cg
+                )
             }
         }
     }
 
     // MARK: Header / footer
 
-    private static func drawPrimaryHeader(in cg: CGContext) {
+    private static func drawPrimaryHeader(kicker: String, in cg: CGContext) {
         let logoWidth: CGFloat = 120
         let logoHeight = logoWidth
             * (KitLogoGeometry.fullViewBox.height / KitLogoGeometry.fullViewBox.width)
@@ -388,7 +472,7 @@ enum KitReceiptPDFRenderer {
         let rightX = Metrics.margin + logoWidth + 24
         let rightWidth = Metrics.pageSize.width - Metrics.margin - rightX
         let proof = attributed(
-            "PROOF OF PAYMENT",
+            kicker,
             font: .systemFont(ofSize: 11, weight: .semibold),
             color: Palette.navy,
             kern: 2,
@@ -412,7 +496,11 @@ enum KitReceiptPDFRenderer {
         ))
     }
 
-    private static func drawContinuationHeader(reference: String, in cg: CGContext) {
+    private static func drawContinuationHeader(
+        documentTitle: String,
+        reference: String,
+        in cg: CGContext
+    ) {
         let logoWidth: CGFloat = 60
         let logoHeight = logoWidth
             * (KitLogoGeometry.fullViewBox.height / KitLogoGeometry.fullViewBox.width)
@@ -423,7 +511,9 @@ enum KitReceiptPDFRenderer {
         let rightX = Metrics.margin + logoWidth + 24
         let rightWidth = Metrics.pageSize.width - Metrics.margin - rightX
         let referenceText = attributed(
-            reference.isEmpty ? "Receipt (continued)" : "Receipt \(reference) (continued)",
+            reference.isEmpty
+                ? "\(documentTitle) (continued)"
+                : "\(documentTitle) · \(reference) (continued)",
             font: .systemFont(ofSize: 10, weight: .medium),
             color: Palette.labelGray,
             alignment: .right
@@ -434,7 +524,7 @@ enum KitReceiptPDFRenderer {
         cg.fill(CGRect(x: Metrics.margin, y: 80, width: Metrics.contentWidth, height: 1))
     }
 
-    private static func drawFooter(page: Int, of total: Int, in cg: CGContext) {
+    private static func drawFooter(note: String, page: Int, of total: Int, in cg: CGContext) {
         let markHeight: CGFloat = 18
         let markWidth = markHeight
             * (KitLogoGeometry.markViewBox.width / KitLogoGeometry.markViewBox.height)
@@ -450,7 +540,7 @@ enum KitReceiptPDFRenderer {
         )
         line1.draw(in: CGRect(x: textX, y: Metrics.footerY, width: 380, height: 12))
         let line2 = attributed(
-            "This receipt was generated from the sender's Kit Pay transaction record.",
+            note,
             font: .systemFont(ofSize: 8, weight: .regular),
             color: Palette.footerGray
         )
@@ -605,7 +695,7 @@ enum KitReceiptPDFRenderer {
 
 // MARK: - Share button
 
-/// The single "Share receipt" affordance: generates the branded PDF on tap, then presents the
+/// The single "Share receipt" affordance: exports the receipt PDF on tap, then presents the
 /// system share sheet with the status-aware message and the PDF attached together.
 struct ShareReceiptButton: View {
     let transaction: WalletTransaction
@@ -656,6 +746,70 @@ struct ShareReceiptButton: View {
                 generatedReceipt = GeneratedReceipt(url: url, message: content.shareMessage)
             } catch {
                 generationError = "Could not create the receipt PDF. Please try again."
+            }
+            isGenerating = false
+        }
+    }
+}
+
+/// Produces a print-ready instruction sheet from the same authoritative fields shown in the
+/// deposit flow. The wording intentionally stays plain: customers export a PDF; the visual brand
+/// treatment is not presented as a different document type.
+struct ExportBankDepositPDFButton: View {
+    let deposit: BankDepositRequestDTO
+    let walletName: String?
+
+    @State private var generatedDocument: GeneratedReceipt?
+    @State private var isGenerating = false
+    @State private var generationError: String?
+
+    var body: some View {
+        VStack(spacing: 8) {
+            Button {
+                generateAndShare()
+            } label: {
+                if isGenerating {
+                    ProgressView()
+                        .frame(maxWidth: .infinity)
+                } else {
+                    Label(
+                        BankDepositInstructions.exportActionTitle,
+                        systemImage: "square.and.arrow.up"
+                    )
+                    .frame(maxWidth: .infinity)
+                }
+            }
+            .buttonStyle(KitSecondaryButtonStyle())
+            .disabled(isGenerating)
+            .accessibilityIdentifier("bank-deposit-export-pdf")
+
+            if let generationError {
+                Text(generationError)
+                    .font(.footnote)
+                    .foregroundStyle(.red)
+                    .multilineTextAlignment(.center)
+            }
+        }
+        .sheet(item: $generatedDocument) { document in
+            ActivityShareSheet(items: [document.message, document.url])
+                .ignoresSafeArea()
+        }
+    }
+
+    private func generateAndShare() {
+        guard !isGenerating else { return }
+        isGenerating = true
+        generationError = nil
+        let content = KitReceiptContent.bankDepositInstructions(
+            from: deposit,
+            walletName: walletName
+        )
+        Task { @MainActor in
+            do {
+                let url = try KitReceiptPDFRenderer.render(content)
+                generatedDocument = GeneratedReceipt(url: url, message: content.shareMessage)
+            } catch {
+                generationError = "Could not create the bank deposit PDF. Please try again."
             }
             isGenerating = false
         }

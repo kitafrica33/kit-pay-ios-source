@@ -216,6 +216,75 @@ final class BankTransferContractTests: XCTestCase {
         ))
     }
 
+    func testDepositInstructionsExposeExactCopyableBankCoordinates() throws {
+        let deposit: BankDepositRequestDTO = try decode(bankDepositJSON())
+        let fields = BankDepositInstructions.receivingFields(for: deposit)
+
+        XCTAssertEqual(
+            fields.map(\.label),
+            [
+                "Bank",
+                "Account name",
+                "Account number",
+                "Branch",
+                "SWIFT",
+                "Payment reference",
+                "Exact amount",
+            ]
+        )
+        XCTAssertEqual(
+            fields.first(where: { $0.label == "Account number" })?.value,
+            "0100012345678"
+        )
+        XCTAssertEqual(
+            fields.first(where: { $0.label == "Exact amount" })?.value,
+            "UGX 1,856.84"
+        )
+        XCTAssertFalse(fields.contains(where: { $0.label == "Branch code" }))
+
+        let copied = BankDepositInstructions.clipboardText(for: deposit)
+        XCTAssertTrue(copied.contains("Payment reference: K7P2-9QMX-4R8C-T6WA"))
+        XCTAssertTrue(copied.contains("Account number: 0100012345678"))
+        XCTAssertFalse(copied.contains("••••5678"))
+    }
+
+    func testDepositPDFUsesPlainExportCopyAndAuthoritativeInstructions() throws {
+        let deposit: BankDepositRequestDTO = try decode(bankDepositJSON())
+        let content = KitReceiptContent.bankDepositInstructions(
+            from: deposit,
+            walletName: "Main wallet"
+        )
+
+        XCTAssertEqual(BankDepositInstructions.exportActionTitle, "Export PDF")
+        XCTAssertEqual(content.documentKicker, "BANK DEPOSIT INSTRUCTIONS")
+        XCTAssertEqual(content.headlineAmount, "UGX 1,856.84")
+        XCTAssertEqual(content.statusLabel, "Awaiting Receipt")
+        XCTAssertEqual(content.fileName, "Kit-Bank-Deposit-K7P2-9QMX-4R8C-T6WA.pdf")
+        XCTAssertEqual(
+            content.rows.first(where: { $0.label == "Account number" })?.value,
+            "0100012345678"
+        )
+        XCTAssertEqual(
+            content.rows.first(where: { $0.label == "Kit Pay wallet" })?.value,
+            "Main wallet"
+        )
+        XCTAssertTrue(content.shareMessage.contains("reference K7P2-9QMX-4R8C-T6WA"))
+    }
+
+    func testDepositPDFRendererProducesAPDFFile() throws {
+        let deposit: BankDepositRequestDTO = try decode(bankDepositJSON())
+        let content = KitReceiptContent.bankDepositInstructions(
+            from: deposit,
+            walletName: "Main wallet"
+        )
+        let url = try KitReceiptPDFRenderer.render(content)
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+
+        let data = try Data(contentsOf: url)
+        XCTAssertTrue(data.starts(with: Data("%PDF".utf8)))
+        XCTAssertGreaterThan(data.count, 1_000)
+    }
+
     func testAccountVerificationRequestUsesNormalizedBankContract() throws {
         let account = try XCTUnwrap(BankAccountNumber.apiValue(from: " 0012-34 ab 5678 "))
         let request = CreateBankAccountVerificationRequest(

@@ -31,6 +31,9 @@ final class VoiceNoteRecorder: NSObject, ObservableObject, AVAudioRecorderDelega
     private var recorder: AVAudioRecorder?
     private var meterTask: Task<Void, Never>?
     private var fileURL: URL?
+    /// Whether this recorder is the one that activated the shared audio session. The session is
+    /// shared with `VoiceNotePlayer`, and handing it back is only ours to do if we took it.
+    private var ownsAudioSession = false
 
     var isRecording: Bool { state == .recording }
 
@@ -58,6 +61,7 @@ final class VoiceNoteRecorder: NSObject, ObservableObject, AVAudioRecorderDelega
             let session = AVAudioSession.sharedInstance()
             try session.setCategory(.playAndRecord, mode: .spokenAudio, options: [.duckOthers])
             try session.setActive(true)
+            ownsAudioSession = true
             let recorder = try AVAudioRecorder(url: url, settings: settings)
             recorder.delegate = self
             recorder.isMeteringEnabled = true
@@ -156,9 +160,25 @@ final class VoiceNoteRecorder: NSObject, ObservableObject, AVAudioRecorderDelega
         recorder = nil
         fileURL = nil
         if let url { try? FileManager.default.removeItem(at: url) }
-        try? AVAudioSession.sharedInstance().setActive(
-            false,
-            options: [.notifyOthersOnDeactivation]
-        )
+        releaseAudioSession()
+    }
+
+    /// Gives the audio session back — but only as far as is actually ours to give.
+    ///
+    /// `cancel()` runs on every exit from a conversation, recording or not, so an unconditional
+    /// deactivation here silenced a voice note that was playing quite happily in the floating bar:
+    /// the note's own `AVAudioPlayer` survived, which is why pausing and playing it again brought
+    /// the sound back. Leave the session alone unless this recorder is the one that took it, and
+    /// even then hand it to the player rather than tearing it down if a note is still going.
+    private func releaseAudioSession() {
+        guard ownsAudioSession else { return }
+        ownsAudioSession = false
+        let session = AVAudioSession.sharedInstance()
+        if VoiceNotePlayer.shared.playing != nil {
+            try? session.setCategory(.playback, mode: .spokenAudio)
+            try? session.setActive(true)
+            return
+        }
+        try? session.setActive(false, options: [.notifyOthersOnDeactivation])
     }
 }

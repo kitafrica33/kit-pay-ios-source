@@ -78,7 +78,7 @@ struct KYCView: View {
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { Task { await model.refreshKYC() } }
         }
-        .sheet(item: $verificationDestination, onDismiss: {
+        .fullScreenCover(item: $verificationDestination, onDismiss: {
             returnedFromVerification = true
             Task { await model.refreshKYC() }
         }) { destination in
