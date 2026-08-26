@@ -1076,15 +1076,15 @@ class AppStoreProfileGeneratorTests(unittest.TestCase):
 
 
 class SigningConfigurationTests(unittest.TestCase):
-    def test_build_25_release_identity_is_consistent(self) -> None:
+    def test_build_26_release_identity_is_consistent(self) -> None:
         workflow = (ROOT / ".github/workflows/ios-app-store-archive.yml").read_text()
         project = (ROOT / "KitPay.xcodeproj/project.pbxproj").read_text()
 
         self.assertIn("default: 1.0.16", workflow)
-        self.assertIn('default: "25"', workflow)
-        self.assertIn("v1.0.16-build25", workflow)
+        self.assertIn('default: "26"', workflow)
+        self.assertIn("v1.0.16-build26", workflow)
         self.assertEqual(project.count("MARKETING_VERSION = 1.0.16;"), 2)
-        self.assertEqual(project.count("CURRENT_PROJECT_VERSION = 25;"), 2)
+        self.assertEqual(project.count("CURRENT_PROJECT_VERSION = 26;"), 2)
         self.assertNotIn("MARKETING_VERSION = 1.0.1;", project)
 
     def test_manual_profile_is_scoped_to_the_app_target(self) -> None:

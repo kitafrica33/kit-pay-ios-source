@@ -106,16 +106,19 @@ and Apple Liquid Glass.
   remain fenced to iOS 1.0.16 build 24 (`1.0.16-r24`) or later, and the server must emit
   `conversation.updated` and the member events ONLY to clients at or above this build (device
   version fencing), and must never send `conversation.created/updated` for threads the
-  recipient was removed from. Android must mirror KITRXN1 (canonical order `v,a,t,e`, one
-  reaction per user per message, aggregation sorted by `(sent_at, server_message_id)`) and
-  KITSYS1 before cross-platform rollout. Reverb-backed authenticated user and conversation
+  recipient was removed from. Android 0.2.25 and later mirrors KITRXN1 (canonical order
+  `v,a,t,e`, one reaction per user per message, aggregation sorted by
+  `(sent_at, server_message_id)`) and renders the same server-authenticated membership events
+  that iOS stores as local KITSYS1 notices, satisfying the client-side cross-platform rollout
+  boundary. Reverb-backed authenticated user and conversation
   channels deliver opaque sync nudges plus presence/typing events; durable message state still
   converges only through ordinary sync. Outbound typing is throttled (≥4s, auto-expiring), and
   the versioned `messaging_presence_visible` account preference symmetrically controls sending
   and rendering presence while leaving private sync nudges connected.
   Authenticated group rename, add/remove-member, and leave operations are implemented with
-  server-authoritative roster/role replacement. Group reporting remains blocked: the existing
-  abuse-report API is limited to a two-party conversation plus one reported account. Existing
+  server-authoritative roster/role replacement. Authenticated group-message reporting binds the
+  report to both the group membership and the decrypted message sender; it cannot infer a target
+  from unauthenticated display text. Existing
   group history becomes read-only whenever `features.messaging_groups` is absent or withdrawn;
   queued group ciphertext remains local until the gate returns, or is failed if membership ends.
 - iCloud chat backups require the `iCloud.africa.kit.pay.ios` CloudKit container to be

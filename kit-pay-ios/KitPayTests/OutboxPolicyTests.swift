@@ -426,7 +426,73 @@ final class OutboxPolicyTests: XCTestCase {
             OutboxPolicy.failureDecision(
                 for: SecureMessagingExchangeError.reactionCapabilityUnavailable
             ),
-            .retry(after: nil)
+            .permanent
+        )
+    }
+
+    func testUnsupportedReactionIsRetiredWithoutBlockingLaterText() throws {
+        let now = Date(timeIntervalSince1970: 1_777_777_777)
+        let reactionMessageID = UUID()
+        let laterMessageID = UUID()
+        let reaction = try XCTUnwrap(
+            KitMessageReaction(
+                operation: .add,
+                targetServerMessageID: UUID().uuidString.lowercased(),
+                emoji: "👍"
+            )
+        )
+        var reactionCommand = command(
+            id: reactionMessageID.uuidString,
+            kind: .secureMessage,
+            createdAt: now,
+            nextAttemptAt: now
+        )
+        reactionCommand.conversationId = "550e8400-e29b-41d4-a716-446655440000"
+        var laterCommand = command(
+            id: laterMessageID.uuidString,
+            kind: .secureMessage,
+            createdAt: now.addingTimeInterval(1),
+            nextAttemptAt: now.addingTimeInterval(1)
+        )
+        laterCommand.conversationId = reactionCommand.conversationId
+        var state = PersistedState.empty
+        state.messages = [
+            LocalMessage(
+                id: reactionMessageID,
+                conversationId: reactionCommand.conversationId!,
+                senderId: "current-user",
+                body: reaction.encoded,
+                createdAt: now,
+                sentAt: nil,
+                state: .queued,
+                failureReason: nil,
+                isOutgoing: true
+            ),
+            LocalMessage(
+                id: laterMessageID,
+                conversationId: laterCommand.conversationId!,
+                senderId: "current-user",
+                body: "still sends",
+                createdAt: now.addingTimeInterval(1),
+                sentAt: nil,
+                state: .queued,
+                failureReason: nil,
+                isOutgoing: true
+            ),
+        ]
+        state.outbox = [reactionCommand, laterCommand]
+
+        OutboxPolicy.markPermanentFailure(
+            for: reactionCommand,
+            reason: SecureMessagingExchangeError.reactionCapabilityUnavailable.localizedDescription,
+            in: &state
+        )
+
+        XCTAssertEqual(state.outbox.map(\.id), [laterCommand.id])
+        XCTAssertEqual(state.messages.map(\.id), [laterMessageID])
+        XCTAssertEqual(
+            OutboxPolicy.readyCommands(state.outbox, at: now.addingTimeInterval(2)).map(\.id),
+            [laterCommand.id]
         )
     }
 

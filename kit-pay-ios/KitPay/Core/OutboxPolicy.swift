@@ -190,6 +190,18 @@ enum OutboxPolicy {
         in state: inout PersistedState
     ) {
         guard let index = state.outbox.firstIndex(where: { $0.id == command.id }) else { return }
+        if command.kind == .secureMessage,
+           let messageID = command.messageId,
+           let messageIndex = state.messages.firstIndex(where: { $0.id == messageID }),
+           KitMessageReaction.parse(state.messages[messageIndex].body) != nil {
+            // Reactions are annotations and have no standalone retry UI. Keeping an unsupported
+            // reaction as a failed command would strand every later message in this conversation
+            // behind its FIFO head. Remove only that reaction intent; ordinary messages retain
+            // their explicit retry affordance and other conversations remain independent.
+            state.outbox.remove(at: index)
+            state.messages.remove(at: messageIndex)
+            return
+        }
         if command.kind == .secureMessage || command.kind == .scheduledPaymentRequest {
             state.outbox[index].failureDisposition = .requiresUserRetry
             state.outbox[index].lastFailureReason = reason
@@ -429,9 +441,10 @@ enum OutboxPolicy {
 
         if let exchangeError = error as? SecureMessagingExchangeError {
             switch exchangeError {
-            case .retryLimitExceeded, .groupCapabilityUnavailable,
-                    .reactionCapabilityUnavailable:
+            case .retryLimitExceeded, .groupCapabilityUnavailable:
                 return .retry(after: nil)
+            case .reactionCapabilityUnavailable:
+                return .permanent
             case .invalidAccount:
                 return .permanent
             case .invalidRecipient, .invalidConversation, .messageNotRetryable,
