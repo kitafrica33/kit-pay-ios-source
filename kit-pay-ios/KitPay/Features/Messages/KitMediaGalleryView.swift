@@ -33,6 +33,10 @@ struct KitMediaGalleryView: View {
     let loadData: (KitGalleryItem) async throws -> Data
     /// Optional 'Show in chat' action; gallery dismisses itself first, then calls this.
     let showInChat: ((KitGalleryItem) -> Void)?
+    /// Reopens the conversation gallery at the handed-off video when the system PiP window asks
+    /// to restore. This closure is bound to that video at attach time, not kept as mutable global
+    /// state that a later conversation could overwrite.
+    let restoreFromPictureInPicture: (UUID) -> Void
     let onDismiss: () -> Void
 
     @StateObject private var loader = GalleryPageLoader()
@@ -50,12 +54,14 @@ struct KitMediaGalleryView: View {
         initialItemID: UUID,
         loadData: @escaping (KitGalleryItem) async throws -> Data,
         showInChat: ((KitGalleryItem) -> Void)?,
+        restoreFromPictureInPicture: @escaping (UUID) -> Void,
         onDismiss: @escaping () -> Void
     ) {
         self.items = items
         self.initialItemID = initialItemID
         self.loadData = loadData
         self.showInChat = showInChat
+        self.restoreFromPictureInPicture = restoreFromPictureInPicture
         self.onDismiss = onDismiss
         _selection = State(
             initialValue: items.firstIndex(where: { $0.messageID == initialItemID }) ?? 0
@@ -142,7 +148,8 @@ struct KitMediaGalleryView: View {
                 data: data,
                 isActive: isActive,
                 chromeVisible: chromeVisible,
-                onToggleChrome: toggleChrome
+                onToggleChrome: toggleChrome,
+                restoreFromPictureInPicture: restoreFromPictureInPicture
             )
         default:
             GalleryImagePage(
@@ -208,7 +215,7 @@ struct KitMediaGalleryView: View {
     private var topBar: some View {
         HStack(alignment: .center, spacing: 12) {
             Button {
-                onDismiss()
+                dismissGallery()
             } label: {
                 Image(systemName: "xmark")
                     .font(.system(size: 17, weight: .semibold))
@@ -269,7 +276,7 @@ struct KitMediaGalleryView: View {
 
             if let showInChat, let currentItem {
                 Button {
-                    onDismiss()
+                    dismissGallery()
                     showInChat(currentItem)
                 } label: {
                     bottomBarLabel(systemName: "text.bubble", title: "Show in chat")
@@ -333,13 +340,21 @@ struct KitMediaGalleryView: View {
                 guard isDragDismissing else { return }
                 isDragDismissing = false
                 if dismissDrag > 120 || value.predictedEndTranslation.height > 320 {
-                    onDismiss()
+                    dismissGallery()
                 } else if reduceMotion {
                     dismissDrag = 0
                 } else {
                     withAnimation(.spring(duration: 0.3)) { dismissDrag = 0 }
                 }
             }
+    }
+
+    /// Leaving the gallery hands a still-playing video to the system's floating window instead of
+    /// cutting it off. This runs *before* the dismissal, because AVKit will not hand off a layer
+    /// that has already been torn out of its window.
+    private func dismissGallery() {
+        ChatVideoPictureInPicture.shared.startIfPlaying()
+        onDismiss()
     }
 
     private func toggleChrome() {
@@ -760,6 +775,7 @@ private struct GalleryVideoPage: View {
     let isActive: Bool
     let chromeVisible: Bool
     let onToggleChrome: () -> Void
+    let restoreFromPictureInPicture: (UUID) -> Void
 
     @StateObject private var controller = GalleryVideoController()
     @State private var poster: UIImage?
@@ -771,8 +787,11 @@ private struct GalleryVideoPage: View {
     var body: some View {
         ZStack {
             if let player = controller.player {
-                PlayerLayerView(player: player)
-                    .ignoresSafeArea()
+                PlayerLayerView(
+                    player: player,
+                    onLayerReady: { controller.attachLayer($0) }
+                )
+                .ignoresSafeArea()
             }
             if let poster, !controller.hasStartedPlayback {
                 Image(uiImage: poster)
@@ -794,7 +813,12 @@ private struct GalleryVideoPage: View {
                     mediaType: item.mediaType
                 )
             }
-            controller.prepare(data: data, mediaType: item.mediaType)
+            controller.prepare(
+                data: data,
+                mediaType: item.mediaType,
+                messageID: item.messageID,
+                restoreFromPictureInPicture: restoreFromPictureInPicture
+            )
         }
         .onChange(of: isActive) { _, nowActive in
             if !nowActive { controller.pause() }
@@ -888,8 +912,22 @@ private final class GalleryVideoController: ObservableObject {
     private var fileURL: URL?
     private var timeObserver: Any?
     private var endObserver: NSObjectProtocol?
+    /// The layer this page is drawing into, reported by `PlayerLayerView`. Picture in Picture
+    /// hands off a *layer*, so the window can only be armed once one exists.
+    private weak var playerLayer: AVPlayerLayer?
+    /// Identifies the handed-off video, so restoring from the floating window can reopen the
+    /// gallery on it rather than wherever the thread happens to be.
+    private var messageID: UUID?
+    private var restoreFromPictureInPicture: ((UUID) -> Void)?
 
-    func prepare(data: Data, mediaType: String) {
+    func prepare(
+        data: Data,
+        mediaType: String,
+        messageID: UUID,
+        restoreFromPictureInPicture: @escaping (UUID) -> Void
+    ) {
+        self.messageID = messageID
+        self.restoreFromPictureInPicture = restoreFromPictureInPicture
         guard player == nil else { return }
         guard let url = try? ChatMediaTempFiles.writeTemporaryFile(
             data: data,
@@ -929,18 +967,37 @@ private final class GalleryVideoController: ObservableObject {
         }
     }
 
+    /// Reported by the layer host as it comes up, and again on reuse.
+    func attachLayer(_ layer: AVPlayerLayer) {
+        playerLayer = layer
+        if isPlaying { armPictureInPicture() }
+    }
+
+    /// Leaves the page. A video that is still playing keeps going in the system's floating window,
+    /// and the plaintext it is playing from stays on disk until that window closes — hence the
+    /// deferral rather than an unconditional teardown.
     func teardown() {
+        guard !ChatVideoPictureInPicture.shared.retainTeardown(owner: self, { [self] in
+            releaseResources()
+        }) else { return }
+        ChatVideoPictureInPicture.shared.detach(owner: self)
+        releaseResources()
+    }
+
+    private func releaseResources() {
         if let timeObserver { player?.removeTimeObserver(timeObserver) }
         timeObserver = nil
         if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
         endObserver = nil
         player?.pause()
         player = nil
+        playerLayer = nil
         isPlaying = false
         hasStartedPlayback = false
         currentTime = 0
         ChatMediaTempFiles.removeTemporaryFile(fileURL)
         fileURL = nil
+        restoreFromPictureInPicture = nil
     }
 
     func togglePlayback() {
@@ -952,12 +1009,25 @@ private final class GalleryVideoController: ObservableObject {
             player.play()
             isPlaying = true
             hasStartedPlayback = true
+            armPictureInPicture()
         }
     }
 
     func pause() {
         player?.pause()
         isPlaying = false
+    }
+
+    /// Points the floating window at this page's video. Armed on every play, so the hand-off
+    /// always follows the video the user is actually watching.
+    private func armPictureInPicture() {
+        guard let playerLayer, let messageID, let restoreFromPictureInPicture else { return }
+        ChatVideoPictureInPicture.shared.attach(
+            playerLayer: playerLayer,
+            owner: self,
+            messageID: messageID,
+            restore: restoreFromPictureInPicture
+        )
     }
 
     func toggleMute() {
@@ -991,17 +1061,24 @@ private final class GalleryVideoController: ObservableObject {
         isPlaying = false
         currentTime = 0
         player?.seek(to: .zero)
+        // Nothing left to watch: the floating window closes itself rather than sitting on the
+        // user's screen showing a frozen last frame.
+        ChatVideoPictureInPicture.shared.stopForPlaybackEnd(owner: self)
     }
 }
 
 /// Bare AVPlayerLayer host so the gallery can draw its own minimal controls.
 private struct PlayerLayerView: UIViewRepresentable {
     let player: AVPlayer
+    /// Reports the backing layer up to the page's controller: Picture in Picture hands off a
+    /// layer, not a player, so the hand-off cannot be armed until this exists.
+    var onLayerReady: ((AVPlayerLayer) -> Void)? = nil
 
     func makeUIView(context _: Context) -> PlayerContainerView {
         let view = PlayerContainerView()
         view.playerLayer.player = player
         view.playerLayer.videoGravity = .resizeAspect
+        onLayerReady?(view.playerLayer)
         return view
     }
 
@@ -1009,6 +1086,7 @@ private struct PlayerLayerView: UIViewRepresentable {
         if uiView.playerLayer.player !== player {
             uiView.playerLayer.player = player
         }
+        onLayerReady?(uiView.playerLayer)
     }
 
     final class PlayerContainerView: UIView {

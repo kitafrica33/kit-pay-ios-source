@@ -1635,6 +1635,17 @@ struct ConversationView: View {
 
     var body: some View {
         conversationLifecycle
+            // A voice note keeps playing after this screen is gone, so the floating bar needs to
+            // be able to name it. Only this screen can turn a sender id into "You", a contact, or
+            // a neutral fallback, so the resolver travels with the thread.
+            .environment(
+                \.voiceNoteChatContext,
+                VoiceNoteChatContext(
+                    conversationID: conversation.id,
+                    conversationTitle: currentConversation.title,
+                    displayName: { participantDisplayName(for: $0) }
+                )
+            )
     }
 
     // MARK: Presence & typing
@@ -2216,6 +2227,14 @@ struct ConversationView: View {
                     }
                 )
                 .environmentObject(model)
+                .environment(
+                    \.voiceNoteChatContext,
+                    VoiceNoteChatContext(
+                        conversationID: conversation.id,
+                        conversationTitle: currentConversation.title,
+                        displayName: { participantDisplayName(for: $0) }
+                    )
+                )
                 .toolbar {
                     ToolbarItem(placement: .confirmationAction) {
                         Button("Done") { showGroupMediaLibrary = false }
@@ -2248,6 +2267,9 @@ struct ConversationView: View {
                 },
                 showInChat: { item in
                     pendingScrollTargetMessageID = item.messageID
+                },
+                restoreFromPictureInPicture: { messageID in
+                    galleryTarget = ConversationGalleryTarget(id: messageID)
                 },
                 onDismiss: { galleryTarget = nil }
             )
@@ -5210,6 +5232,18 @@ private struct ConversationContactProfileView: View {
                             }
                         )
                         .environmentObject(model)
+                        .environment(
+                            \.voiceNoteChatContext,
+                            VoiceNoteChatContext(
+                                conversationID: conversation.id,
+                                conversationTitle: displayName,
+                                displayName: { senderUserID in
+                                    senderUserID.lowercased() == model.profile?.id.lowercased()
+                                        ? "You"
+                                        : displayName
+                                }
+                            )
+                        )
                     } label: {
                         HStack(spacing: 12) {
                             Image(systemName: "photo.on.rectangle.angled")

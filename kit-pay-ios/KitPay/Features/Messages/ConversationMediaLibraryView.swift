@@ -530,6 +530,7 @@ private struct MediaLibraryGridCell: View {
 
 private struct MediaLibraryAudioRow: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.voiceNoteChatContext) private var chatContext
     @ObservedObject private var player = VoiceNotePlayer.shared
 
     let item: ConversationMediaItem
@@ -570,6 +571,10 @@ private struct MediaLibraryAudioRow: View {
         .kitGlass(cornerRadius: 18, shadow: false)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(title), \(item.byteLabel), \(item.dateLabel)")
+        // While this row is on screen it is the control for its own note; the floating bar only
+        // takes over once the note is playing somewhere the user can no longer reach it.
+        .onAppear { player.noteSourceVisibility(true, for: item.message.id) }
+        .onDisappear { player.noteSourceVisibility(false, for: item.message.id) }
     }
 
     private var actionButton: some View {
@@ -614,7 +619,11 @@ private struct MediaLibraryAudioRow: View {
 
     private func handleTap() {
         if let localData {
-            player.toggle(data: localData, id: item.message.id)
+            player.toggle(
+                data: localData,
+                id: item.message.id,
+                context: chatContext.playbackContext(senderUserID: item.message.senderId)
+            )
             return
         }
         Task { await download() }

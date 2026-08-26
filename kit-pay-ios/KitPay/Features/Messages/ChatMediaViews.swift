@@ -91,85 +91,6 @@ enum ChatMediaTempFiles {
     }
 }
 
-// MARK: - Voice note playback
-
-/// One-at-a-time voice-note playback with published progress.
-@MainActor
-final class VoiceNotePlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
-    static let shared = VoiceNotePlayer()
-
-    @Published private(set) var playingID: UUID?
-    @Published private(set) var isPaused = false
-    @Published private(set) var progress: Double = 0
-    @Published private(set) var duration: TimeInterval = 0
-
-    private var player: AVAudioPlayer?
-    private var progressTask: Task<Void, Never>?
-
-    func toggle(data: Data, id: UUID) {
-        if playingID == id, let player {
-            if player.isPlaying {
-                player.pause()
-                isPaused = true
-            } else {
-                player.play()
-                isPaused = false
-            }
-            return
-        }
-        stop()
-        guard CallMediaCoordinator.shared.activeCall == nil else { return }
-        do {
-            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .spokenAudio)
-            try AVAudioSession.sharedInstance().setActive(true)
-            let player = try AVAudioPlayer(data: data)
-            player.delegate = self
-            player.prepareToPlay()
-            player.play()
-            self.player = player
-            playingID = id
-            isPaused = false
-            duration = player.duration
-            progress = 0
-            startProgressUpdates()
-        } catch {
-            stop()
-        }
-    }
-
-    func stop() {
-        progressTask?.cancel()
-        progressTask = nil
-        player?.stop()
-        player = nil
-        playingID = nil
-        isPaused = false
-        progress = 0
-        duration = 0
-        try? AVAudioSession.sharedInstance().setActive(
-            false,
-            options: [.notifyOthersOnDeactivation]
-        )
-    }
-
-    nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
-        Task { @MainActor in self.stop() }
-    }
-
-    private func startProgressUpdates() {
-        progressTask?.cancel()
-        progressTask = Task { [weak self] in
-            while !Task.isCancelled {
-                guard let self, let player = self.player else { return }
-                if player.duration > 0 {
-                    self.progress = player.currentTime / player.duration
-                }
-                try? await Task.sleep(for: .milliseconds(120))
-            }
-        }
-    }
-}
-
 // MARK: - Shared media loading state
 
 /// Downloads/decrypts (or serves from cache) the plaintext for one media message.
@@ -427,22 +348,30 @@ struct MediaImageViewer: View {
 
 struct VoiceNoteBubbleView: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.voiceNoteChatContext) private var chatContext
     @ObservedObject private var player = VoiceNotePlayer.shared
     let message: LocalMessage
     let descriptor: KitMediaMessageDescriptor
     @StateObject private var loader = SecureMediaLoader()
     @State private var retryGeneration = 0
+    /// Fraction playback was at when the current slide began, so a slide moves the note relative
+    /// to where the finger went down instead of jumping to it.
+    @State private var scrubOrigin: Double?
 
     private var data: Data? { loader.data ?? message.attachmentData }
     private var isCurrent: Bool { player.playingID == message.id }
     private var isPlaying: Bool { isCurrent && !player.isPaused }
     private var accent: Color { message.isOutgoing ? .white : KitColor.green }
 
+    private var playbackContext: VoiceNotePlaybackContext {
+        chatContext.playbackContext(senderUserID: message.senderId)
+    }
+
     var body: some View {
         HStack(spacing: 11) {
             Button {
                 if let data {
-                    player.toggle(data: data, id: message.id)
+                    player.toggle(data: data, id: message.id, context: playbackContext)
                 } else {
                     retryGeneration &+= 1
                 }
@@ -468,7 +397,24 @@ struct VoiceNoteBubbleView: View {
                     accent: accent,
                     seed: message.id
                 )
-                .frame(width: 138, height: 22)
+                .frame(width: VoiceNoteSeekPolicy.waveformWidth, height: 22)
+                .contentShape(Rectangle())
+                // Runs *alongside* the thread's scroll rather than replacing it: a mostly-vertical
+                // drag that starts on the waveform is someone scrolling past, and is left alone.
+                .simultaneousGesture(seekGesture)
+                .accessibilityElement()
+                .accessibilityLabel("Voice note position")
+                .accessibilityValue(
+                    isCurrent ? "\(Int((player.progress * 100).rounded())) percent" : "Not playing"
+                )
+                .accessibilityAdjustableAction { direction in
+                    guard isCurrent else { return }
+                    switch direction {
+                    case .increment: player.seek(by: 5)
+                    case .decrement: player.seek(by: -5)
+                    @unknown default: break
+                    }
+                }
                 Text(subtitle)
                     .font(.caption2.monospacedDigit())
                     .foregroundStyle(
@@ -477,7 +423,7 @@ struct VoiceNoteBubbleView: View {
             }
         }
         .padding(.vertical, 3)
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .contain)
         .accessibilityLabel("End-to-end encrypted voice note")
         .task(id: "\(descriptor.storageKey):\(model.isOnline):\(retryGeneration)") {
             guard data == nil else { return }
@@ -487,6 +433,53 @@ struct VoiceNoteBubbleView: View {
                 descriptorText: message.body
             )
         }
+        // While this bubble is on screen it *is* the control for its own note, so the floating bar
+        // stays out of the way; the moment the thread scrolls past it, the bar takes over.
+        .onAppear { player.noteSourceVisibility(true, for: message.id) }
+        .onDisappear { player.noteSourceVisibility(false, for: message.id) }
+    }
+
+    /// A tap positions the note at the point touched — starting it there if it was not playing —
+    /// and a horizontal slide scrubs from wherever the finger went down.
+    private var seekGesture: some Gesture {
+        DragGesture(minimumDistance: 0)
+            .onChanged { value in
+                guard isCurrent else { return }
+                if scrubOrigin == nil { scrubOrigin = player.progress }
+                guard let origin = scrubOrigin,
+                      VoiceNoteSeekPolicy.isScrub(translation: value.translation)
+                else { return }
+                player.seek(
+                    toFraction: VoiceNoteSeekPolicy.scrubbedFraction(
+                        from: origin,
+                        translationWidth: value.translation.width,
+                        width: VoiceNoteSeekPolicy.waveformWidth
+                    )
+                )
+            }
+            .onEnded { value in
+                let origin = scrubOrigin ?? player.progress
+                scrubOrigin = nil
+                if VoiceNoteSeekPolicy.isTap(translation: value.translation) {
+                    let fraction = VoiceNoteSeekPolicy.fraction(
+                        atX: value.location.x,
+                        width: VoiceNoteSeekPolicy.waveformWidth
+                    )
+                    if !isCurrent {
+                        guard let data else { return }
+                        player.toggle(data: data, id: message.id, context: playbackContext)
+                    }
+                    player.seek(toFraction: fraction)
+                } else if isCurrent, VoiceNoteSeekPolicy.isScrub(translation: value.translation) {
+                    player.seek(
+                        toFraction: VoiceNoteSeekPolicy.scrubbedFraction(
+                            from: origin,
+                            translationWidth: value.translation.width,
+                            width: VoiceNoteSeekPolicy.waveformWidth
+                        )
+                    )
+                }
+            }
     }
 
     private var subtitle: String {

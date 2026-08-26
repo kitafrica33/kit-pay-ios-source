@@ -84,6 +84,10 @@ struct KitPayApp: App {
                         // hand the video back to the in-app surfaces.
                         CallOverlayWindowController.shared
                             .stopPictureInPictureForForegroundIfNeeded()
+                        // Same for a chat video: if the viewer it came from is still on screen,
+                        // playback belongs back inside it rather than in a floating window over
+                        // the app the user has just returned to.
+                        ChatVideoPictureInPicture.shared.stopForForegroundIfNeeded()
                         syncMinimizedCallSurface()
                     } else if phase == .inactive {
                         // Close authenticated signalling as soon as the app is no longer active.

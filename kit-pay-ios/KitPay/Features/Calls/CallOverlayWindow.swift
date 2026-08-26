@@ -82,25 +82,13 @@ final class CallOverlayHitRegion {
     var frame: CGRect = .zero
 }
 
-/// Only forwards touches that land on the call bubble itself. Every other point falls through to
-/// the app's own window, so the overlay never blocks the interface it floats above.
-final class CallOverlayPassthroughWindow: UIWindow {
-    /// Set from the main actor; read on the main thread during hit testing.
-    var interactiveFrameProvider: (() -> CGRect)?
-
-    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
-        guard let frame = interactiveFrameProvider?(), frame.contains(point) else { return nil }
-        return super.hitTest(point, with: event)
-    }
-}
-
 @MainActor
 final class CallOverlayWindowController {
     static let shared = CallOverlayWindowController()
 
     let presenter = CallOverlayPresenter()
 
-    private var window: CallOverlayPassthroughWindow?
+    private var window: OverlayPassthroughWindow?
     private let pictureInPicture = CallPictureInPictureCoordinator()
     private var remoteVideoTrackObservation: AnyCancellable?
     private var localCameraObservation: AnyCancellable?
@@ -254,31 +242,16 @@ final class CallOverlayWindowController {
         applyAppWindowStripReservation(for: style)
     }
 
-    /// The audio strip must PUSH the app below it — including UIKit navigation bars, which a
-    /// SwiftUI `safeAreaInset` cannot move (the bar pins to the hosting controller's safe area,
-    /// so it stayed hidden underneath the strip). Extending the app window's own safe area is
-    /// the one mechanism every bar, scroll view, and tab respects. Applied only while the strip
-    /// is actually drawn, so no phantom gap remains when the full call UI (or no call) is up.
+    /// Claims the strip's height at the top of the app window, so content — including UIKit
+    /// navigation bars — is pushed below the strip instead of covered by it. Claimed only while
+    /// the strip is actually drawn, so no phantom gap remains when the full call UI (or no call)
+    /// is up. `AppWindowTopStripReservation` arbitrates against the voice-note bar's claim.
     private func applyAppWindowStripReservation(for style: CallOverlaySurfaceStyle?) {
-        let reserved: CGFloat = style == .audioStrip ? CallBannerMetrics.contentHeight : 0
-        guard let scene = window?.windowScene ?? foregroundWindowScene() else { return }
-        for appWindow in scene.windows {
-            guard !(appWindow is CallOverlayPassthroughWindow),
-                  appWindow.windowLevel == .normal,
-                  let root = appWindow.rootViewController,
-                  root.additionalSafeAreaInsets.top != reserved
-            else { continue }
-
-            let updateLayout = {
-                root.additionalSafeAreaInsets.top = reserved
-                appWindow.layoutIfNeeded()
-            }
-            if UIAccessibility.isReduceMotionEnabled {
-                updateLayout()
-            } else {
-                UIView.animate(withDuration: 0.25, animations: updateLayout)
-            }
-        }
+        AppWindowTopStripReservation.set(
+            style == .audioStrip ? CallBannerMetrics.contentHeight : 0,
+            for: AppWindowTopStripReservation.callKey,
+            in: window?.windowScene
+        )
     }
 
     /// Tears the surface and any Picture in Picture session down. Called when the call ends and
@@ -300,11 +273,11 @@ final class CallOverlayWindowController {
         UIDevice.current.isProximityMonitoringEnabled = false
     }
 
-    private func ensureWindow() -> CallOverlayPassthroughWindow? {
+    private func ensureWindow() -> OverlayPassthroughWindow? {
         if let window, window.windowScene != nil { return window }
         guard let scene = foregroundWindowScene() else { return nil }
 
-        let created = window ?? CallOverlayPassthroughWindow(windowScene: scene)
+        let created = window ?? OverlayPassthroughWindow(windowScene: scene)
         created.windowScene = scene
         // Above the app's own window so sheets and full-screen covers cannot bury the call, and
         // below the system alert level so permission prompts still come out on top.
