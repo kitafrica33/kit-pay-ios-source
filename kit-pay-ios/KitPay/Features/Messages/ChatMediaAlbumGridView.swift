@@ -13,6 +13,11 @@ struct ChatMediaAlbumGridView: View {
     let cachedData: (ChatMediaAlbumItem) -> Data?
     /// Tap on any cell (an item from `album.items`).
     let onTap: (ChatMediaAlbumItem) -> Void
+    /// Long-press menu for one cell. Album members are ordinary messages: each can be answered,
+    /// reacted to, forwarded, and deleted on its own, exactly as it could outside an album.
+    var cellMenu: ((ChatMediaAlbumItem) -> AnyView)? = nil
+    /// Anything that belongs on top of one cell — today, that cell's own reaction chips.
+    var cellBadge: ((ChatMediaAlbumItem) -> AnyView)? = nil
 
     private enum Metrics {
         static let gap: CGFloat = 2
@@ -146,7 +151,7 @@ struct ChatMediaAlbumGridView: View {
         size: CGSize,
         overflowCount: Int = 0
     ) -> some View {
-        ChatMediaAlbumGridCell(
+        let content = ChatMediaAlbumGridCell(
             item: item,
             index: index,
             total: album.items.count,
@@ -155,8 +160,18 @@ struct ChatMediaAlbumGridView: View {
             overflowCount: overflowCount,
             data: cachedData(item),
             cornerRadius: Metrics.cellCornerRadius,
-            onTap: { onTap(item) }
+            onTap: { onTap(item) },
+            badge: cellBadge?(item)
         )
+        // Attached only when there is a menu to show, so a thread that offers none keeps the
+        // plain, undelayed tap.
+        return Group {
+            if let cellMenu {
+                content.contextMenu { cellMenu(item) }
+            } else {
+                content
+            }
+        }
     }
 
     private func storageKey(for item: ChatMediaAlbumItem) -> String? {
@@ -177,6 +192,8 @@ private struct ChatMediaAlbumGridCell: View {
     let data: Data?
     let cornerRadius: CGFloat
     let onTap: () -> Void
+    /// Drawn over this cell's bottom-trailing corner; nil when there is nothing to show.
+    var badge: AnyView? = nil
 
     @State private var videoPoster: UIImage?
 
@@ -226,6 +243,11 @@ private struct ChatMediaAlbumGridCell: View {
             .frame(width: size.width, height: size.height)
             .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
             .overlay { overlays }
+            .overlay(alignment: .bottomTrailing) {
+                if let badge {
+                    badge.padding(4)
+                }
+            }
             .contentShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
         }
         .buttonStyle(.plain)

@@ -1441,18 +1441,39 @@ class AppStoreProfileGeneratorTests(unittest.TestCase):
 
 
 class SigningConfigurationTests(unittest.TestCase):
-    def test_build_29_release_identity_is_consistent(self) -> None:
+    def test_build_30_release_identity_is_consistent(self) -> None:
         workflow = (ROOT / ".github/workflows/ios-app-store-archive.yml").read_text()
         project = (ROOT / "KitPay.xcodeproj/project.pbxproj").read_text()
 
         self.assertIn("default: 1.0.16", workflow)
-        self.assertIn('default: "29"', workflow)
-        self.assertIn("v1.0.16-build29", workflow)
+        self.assertIn('default: "30"', workflow)
+        self.assertIn("v1.0.16-build30", workflow)
         # Four each: Debug and Release of the app and of the share extension. iOS refuses to
         # install an app whose extension carries a different version, so they move together.
         self.assertEqual(project.count("MARKETING_VERSION = 1.0.16;"), 4)
-        self.assertEqual(project.count("CURRENT_PROJECT_VERSION = 29;"), 4)
+        self.assertEqual(project.count("CURRENT_PROJECT_VERSION = 30;"), 4)
         self.assertNotIn("MARKETING_VERSION = 1.0.1;", project)
+
+    def test_message_edit_floor_matches_the_build_that_ships(self) -> None:
+        """The edit capability floor names a release; that release has to be this one.
+
+        `MessagingMessageEditCapabilityPolicy` refuses to send a correction to any iOS peer below
+        its declared floor. If the floor were left pointing at a build we never cut, every peer
+        would fail the test and the feature would be dark; if it pointed below the build that
+        first implements `KITEDIT1`, an older client would be handed a descriptor it renders as a
+        chat bubble. Pinning it to the project's own version keeps the backend gate honest too,
+        since the server maps builds at or above this floor onto the capability.
+        """
+        project = (ROOT / "KitPay.xcodeproj/project.pbxproj").read_text()
+        policy = (ROOT / "KitPay/Core/MessageEditModels.swift").read_text()
+
+        marketing = re.search(r"MARKETING_VERSION = ([\d.]+);", project).group(1)
+        build = re.search(r"CURRENT_PROJECT_VERSION = (\d+);", project).group(1)
+
+        self.assertIn(f'static let minimumIOSRelease = "{marketing}-r{build}"', policy)
+        self.assertIn(f"static let minimumIOSBuild = {build}", policy)
+        expected_version = ", ".join(marketing.split("."))
+        self.assertIn(f"static let minimumIOSVersion = [{expected_version}]", policy)
 
     def test_manual_profile_is_scoped_to_the_app_target(self) -> None:
         workflow = (ROOT / ".github/workflows/ios-app-store-archive.yml").read_text()

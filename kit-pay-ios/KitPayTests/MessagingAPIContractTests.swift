@@ -21,6 +21,118 @@ final class MessagingAPIContractTests: XCTestCase {
         let signedPreKeySignature: Data
     }
 
+    func testGroupDescriptionPolicyCanonicalizesAndBoundsLikeTheServer() {
+        // Edge whitespace goes; the interior newline — the one control character a paragraph
+        // keeps — stays; bidirectional overrides are stripped wherever they appear.
+        XCTAssertEqual(
+            MessagingGroupDescriptionPolicy.normalized("\u{3000}What we ship\nand when\u{00A0}"),
+            "What we ship\nand when"
+        )
+        XCTAssertEqual(
+            MessagingGroupDescriptionPolicy.normalized("safe\u{202E}txt.exe"),
+            "safetxt.exe"
+        )
+        XCTAssertEqual(
+            MessagingGroupDescriptionPolicy.normalized("a\u{0007}b\u{0000}c"),
+            "abc"
+        )
+
+        XCTAssertTrue(
+            MessagingGroupDescriptionPolicy.isValid(String(repeating: "a", count: 512))
+        )
+        XCTAssertFalse(
+            MessagingGroupDescriptionPolicy.isValid(String(repeating: "a", count: 513))
+        )
+        // 400 three-byte scalars pass the scalar cap and break the 1024-byte cap.
+        XCTAssertFalse(
+            MessagingGroupDescriptionPolicy.isValid(String(repeating: "€", count: 400))
+        )
+        XCTAssertFalse(MessagingGroupDescriptionPolicy.isValid("\u{00A0}\u{3000}"))
+    }
+
+    func testGroupDescriptionRequestAlwaysCarriesTheKeyAndClearsWithExplicitNull() throws {
+        let encoder = JSONEncoder()
+        let cleared = try encoder.encode(
+            UpdateMessagingGroupDescriptionRequest(description: nil)
+        )
+        XCTAssertEqual(String(data: cleared, encoding: .utf8), #"{"description":null}"#)
+
+        let set = try encoder.encode(
+            UpdateMessagingGroupDescriptionRequest(description: "Ships weekly")
+        )
+        XCTAssertEqual(
+            String(data: set, encoding: .utf8),
+            #"{"description":"Ships weekly"}"#
+        )
+
+        // Non-canonical input never reaches the wire.
+        XCTAssertThrowsError(
+            try UpdateMessagingGroupDescriptionRequest(description: " padded ")
+        )
+        XCTAssertThrowsError(
+            try UpdateMessagingGroupDescriptionRequest(
+                description: String(repeating: "a", count: 513)
+            )
+        )
+    }
+
+    func testGroupPhotoRequestAndURLPolicyFailClosed() throws {
+        XCTAssertNoThrow(
+            try AttachMessagingGroupPhotoRequest(
+                assetId: "3b47a1f0-90c7-4b7e-8f3c-2f4a5b6c7d8e"
+            )
+        )
+        XCTAssertThrowsError(try AttachMessagingGroupPhotoRequest(assetId: "not-an-asset"))
+        XCTAssertThrowsError(
+            try AttachMessagingGroupPhotoRequest(
+                assetId: "3B47A1F0-90C7-4B7E-8F3C-2F4A5B6C7D8E"
+            )
+        )
+
+        XCTAssertTrue(
+            MessagingGroupPhotoURLPolicy.isValid(
+                "https://pay.kit.africa/conversations/\(conversationId)/photo/\(messageId)"
+            )
+        )
+        XCTAssertFalse(MessagingGroupPhotoURLPolicy.isValid("http://pay.kit.africa/photo"))
+        XCTAssertFalse(MessagingGroupPhotoURLPolicy.isValid("https://"))
+        XCTAssertFalse(MessagingGroupPhotoURLPolicy.isValid("https://pay.kit.africa/a photo"))
+        XCTAssertFalse(MessagingGroupPhotoURLPolicy.isValid("javascript:alert(1)"))
+        XCTAssertFalse(
+            MessagingGroupPhotoURLPolicy.isValid(
+                "https://pay.kit.africa/" + String(repeating: "a", count: 2_048)
+            )
+        )
+    }
+
+    func testConversationDTODecodesGroupIdentityAndOldPayloadsWithoutIt() throws {
+        let decoder = JSONDecoder()
+        let modern = try decoder.decode(
+            MessagingConversationDTO.self,
+            from: Data(#"{"id":"c","type":"group","description":"d","photo_url":"u"}"#.utf8)
+        )
+        XCTAssertEqual(modern.description, "d")
+        XCTAssertEqual(modern.photoUrl, "u")
+
+        // An old server omits both keys entirely; the DTO must not invent them.
+        let legacy = try decoder.decode(
+            MessagingConversationDTO.self,
+            from: Data(#"{"id":"c","type":"group","title":"t"}"#.utf8)
+        )
+        XCTAssertNil(legacy.description)
+        XCTAssertNil(legacy.photoUrl)
+    }
+
+    func testConversationModelDecodesStateWrittenBeforeGroupIdentity() throws {
+        // The PersistedState rule: every added field is Optional with a default, so encrypted
+        // state written by earlier builds keeps decoding. This is that rule, held by a test.
+        let legacy = #"{"id":"c1","title":"Team","participantUserIds":["a","b"],"# +
+            #""unreadCount":0,"updatedAt":700000000}"#
+        let decoded = try JSONDecoder().decode(Conversation.self, from: Data(legacy.utf8))
+        XCTAssertNil(decoded.groupDescription)
+        XCTAssertNil(decoded.groupPhotoURL)
+    }
+
     func testConversationFiltersMatchAllAndUnreadSemantics() {
         let now = Date(timeIntervalSince1970: 1_700_000_000)
         let readDirect = Conversation(

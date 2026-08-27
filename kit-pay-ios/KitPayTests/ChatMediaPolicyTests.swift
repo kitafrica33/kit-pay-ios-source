@@ -19,6 +19,27 @@ final class ChatMediaPolicyTests: XCTestCase {
         )
     }
 
+    func testEditableVideoSourceBoundIsADiskGuardAboveTheWireCap() {
+        XCTAssertTrue(ConversationAttachmentStagingPolicy.editableVideoSource(byteCount: 1))
+        XCTAssertTrue(
+            ConversationAttachmentStagingPolicy.editableVideoSource(
+                byteCount: ConversationAttachmentStagingPolicy.maximumEditableVideoSourceBytes
+            )
+        )
+        XCTAssertFalse(
+            ConversationAttachmentStagingPolicy.editableVideoSource(
+                byteCount: ConversationAttachmentStagingPolicy.maximumEditableVideoSourceBytes + 1
+            )
+        )
+        XCTAssertFalse(ConversationAttachmentStagingPolicy.editableVideoSource(byteCount: 0))
+        // The trim editor may accept a source the wire would refuse whole — trimming is the
+        // remedy — so the source bound must sit strictly above the transfer cap.
+        XCTAssertGreaterThan(
+            ConversationAttachmentStagingPolicy.maximumEditableVideoSourceBytes,
+            Int64(SecureMediaAttachmentCipher.maximumPlaintextBytes)
+        )
+    }
+
     func testMediaKindClassificationFollowsMIMEPrefix() {
         XCTAssertEqual(KitChatMediaKind(mediaType: "image/jpeg"), .image)
         XCTAssertEqual(KitChatMediaKind(mediaType: "IMAGE/PNG"), .image)

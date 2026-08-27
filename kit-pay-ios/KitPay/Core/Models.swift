@@ -523,10 +523,11 @@ struct RealtimeProtocolCapabilityDTO: Decodable {
     let channels: RealtimeChannelTemplatesDTO?
     let presence: Bool?
     let typing: Bool?
+    let calls: Bool?
 
     private enum CodingKeys: String, CodingKey {
         case version = "v"
-        case scheme, host, port, path, key, channels, presence, typing
+        case scheme, host, port, path, key, channels, presence, typing, calls
         case protocolVersion = "protocol"
         case authPath = "auth_path"
         case activityTimeout = "activity_timeout"
@@ -563,6 +564,10 @@ struct KitRealtimeConfiguration: Equatable, Hashable, Sendable {
     let conversationChannelTemplate: String
     let presenceEnabled: Bool
     let typingEnabled: Bool
+    /// Whether `kit.call.answered` will arrive on the user channel. Absent from an older
+    /// advertisement means false: the frame is ignored and the `call.answered` push keeps
+    /// carrying the answer, rather than the whole socket failing over a missing member.
+    let callAnswerEnabled: Bool
 
     init?(capability: RealtimeProtocolCapabilityDTO) {
         guard capability.version == 1,
@@ -603,6 +608,7 @@ struct KitRealtimeConfiguration: Equatable, Hashable, Sendable {
         conversationChannelTemplate = Self.expectedConversationChannelTemplate
         self.presenceEnabled = presenceEnabled
         self.typingEnabled = typingEnabled
+        callAnswerEnabled = capability.calls == true
     }
 
     var socketURL: URL? {
@@ -640,6 +646,7 @@ struct KitRealtimeConfiguration: Equatable, Hashable, Sendable {
         [
             host, String(port), path, key, String(Int(activityTimeout)),
             String(Int(maximumConnectionSeconds)), String(presenceEnabled), String(typingEnabled),
+            String(callAnswerEnabled),
         ].joined(separator: "|")
     }
 }
@@ -2579,6 +2586,12 @@ struct LocalMessage: Codable, Hashable, Identifiable {
     /// protocol. A missing value is fail-closed: the message remains visible locally but is never
     /// offered as a trusted history source to another enrollment.
     var secureMessagingHistory: SecureMessagingRetainedMessageMetadata? = nil
+    /// Server message this one answers, when the sender swiped to reply. It is the same value
+    /// the wire carries in `replyToMessageID`, kept here so a queued answer can already draw its
+    /// quote before the send round-trip mints a metadata record. Reactions never populate it:
+    /// they point at a target too, but they are timeline metadata rather than an answer.
+    /// Optional keeps state written by earlier builds decodable.
+    var replyToServerMessageID: String? = nil
     /// When the sender asked for this message to leave the device. `nil` is an ordinary send.
     /// It survives delivery on purpose: a message that went out at its scheduled minute belongs
     /// at that minute in the timeline, not at the minute it was composed. Optional keeps state
@@ -2614,6 +2627,11 @@ struct Conversation: Codable, Hashable, Identifiable {
     /// Authenticated server roles for the active group roster. Optional keeps protected state
     /// written before group management backward-decodable; missing roles expose only self-leave.
     var groupMemberRoles: [String: MessagingGroupRole]? = nil
+    /// Server-visible group description. Optional with a default for the same reason as
+    /// `conversationType`: encrypted state written by earlier builds must stay decodable.
+    var groupDescription: String? = nil
+    /// The group photo's public content address; nil shows the generated group avatar.
+    var groupPhotoURL: String? = nil
 
     var isGroup: Bool { conversationType == SecureMessagingWire.groupConversationType }
 

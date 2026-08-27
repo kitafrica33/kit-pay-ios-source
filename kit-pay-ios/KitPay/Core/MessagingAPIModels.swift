@@ -18,6 +18,7 @@ enum SecureMessageReservedPrefixPolicy {
             && !beginsWithReservedPrefix(text, prefix: KitGroupPaymentMessage.prefix)
             && !beginsWithReservedPrefix(text, prefix: KitSystemMessage.prefix)
             && !beginsWithReservedPrefix(text, prefix: KitMessageReaction.prefix)
+            && !beginsWithReservedPrefix(text, prefix: KitMessageEdit.prefix)
     }
 }
 
@@ -564,6 +565,19 @@ enum SecureMessagingMessageKind: String, Codable, Sendable {
     case encrypted
     case encryptedAttachment = "encrypted_attachment"
     case encryptedReaction = "encrypted_reaction"
+    case encryptedEdit = "encrypted_edit"
+
+    /// True for the kinds that annotate the timeline rather than add to it. A reaction and a
+    /// correction are both about something already said, so neither draws a bubble, raises an
+    /// unread badge, nor resorts the chat list. Every path that has to make that distinction
+    /// asks here, so a kind added later cannot be treated as an event by one path and as a
+    /// message by another.
+    var isTimelineMetadata: Bool {
+        switch self {
+        case .encrypted, .encryptedAttachment: false
+        case .encryptedReaction, .encryptedEdit: true
+        }
+    }
 }
 
 /// Binds the authenticated plaintext namespace to the server-visible routing metadata. This is
@@ -585,6 +599,18 @@ enum SecureMessagingContentBindingPolicy {
                   attachments.isEmpty
             else { return nil }
             return .encryptedReaction
+        }
+
+        if SecureMessageReservedPrefixPolicy.beginsWithReservedPrefix(
+            plaintext,
+            prefix: KitMessageEdit.prefix
+        ) {
+            guard KitMessageEdit.isEditText(plaintext),
+                  let edit = KitMessageEdit.parse(plaintext),
+                  replyToMessageID == edit.targetServerMessageID,
+                  attachments.isEmpty
+            else { return nil }
+            return .encryptedEdit
         }
 
         let mediaAttachments = KitMediaMessageDescriptor.attachments(for: plaintext)
@@ -612,7 +638,7 @@ enum SecureMessagingContentBindingPolicy {
             return attachmentCount == 0
         case .encryptedAttachment:
             return attachmentCount > 0
-        case .encryptedReaction:
+        case .encryptedReaction, .encryptedEdit:
             return attachmentCount == 0 && replyToMessageID != nil
         }
     }
@@ -933,6 +959,8 @@ struct MessagingConversationDTO: Decodable, Equatable, Sendable {
     let id: String?
     let type: String?
     let title: String?
+    let description: String?
+    let photoUrl: String?
     let parentId: String?
     let createdBy: String?
     let role: String?
@@ -941,11 +969,38 @@ struct MessagingConversationDTO: Decodable, Equatable, Sendable {
     let updatedAt: String?
 
     enum CodingKeys: String, CodingKey {
-        case id, type, title, role, members
+        case id, type, title, description, role, members
+        case photoUrl = "photo_url"
         case parentId = "parent_id"
         case createdBy = "created_by"
         case createdAt = "created_at"
         case updatedAt = "updated_at"
+    }
+
+    init(
+        id: String? = nil,
+        type: String? = nil,
+        title: String? = nil,
+        description: String? = nil,
+        photoUrl: String? = nil,
+        parentId: String? = nil,
+        createdBy: String? = nil,
+        role: String? = nil,
+        members: [MessagingConversationMemberDTO?]? = nil,
+        createdAt: String? = nil,
+        updatedAt: String? = nil
+    ) {
+        self.id = id
+        self.type = type
+        self.title = title
+        self.description = description
+        self.photoUrl = photoUrl
+        self.parentId = parentId
+        self.createdBy = createdBy
+        self.role = role
+        self.members = members
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
     }
 }
 
@@ -998,6 +1053,104 @@ struct RenameMessagingGroupRequest: Encodable, Equatable, Sendable {
             throw SecureMessagingContractError.invalid("group-conversation title")
         }
         self.title = clean
+    }
+}
+
+/// Mirrors the backend's ConversationDescription: a paragraph, not a label. Control characters
+/// and bidirectional overrides are stripped wherever they appear — U+000A alone survives inside
+/// the value — and the edges are trimmed, so client and server agree about what "empty" is.
+enum MessagingGroupDescriptionPolicy {
+    static let maximumUnicodeScalars = 512
+    static let maximumUTF8Bytes = 1024
+
+    static func normalized(_ value: String) -> String {
+        let kept = String(String.UnicodeScalarView(value.unicodeScalars.filter { scalar in
+            !isDisallowed(scalar)
+        }))
+        return kept.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    static func isValid(_ value: String) -> Bool {
+        let clean = normalized(value)
+        return !clean.isEmpty
+            && clean.unicodeScalars.count <= maximumUnicodeScalars
+            && clean.utf8.count <= maximumUTF8Bytes
+    }
+
+    private static func isDisallowed(_ scalar: Unicode.Scalar) -> Bool {
+        switch scalar.value {
+        case 0x0000 ... 0x0009, 0x000B ... 0x001F, 0x007F,
+             0x200E, 0x200F, 0x202A ... 0x202E, 0x2066 ... 0x2069:
+            return true
+        default:
+            return false
+        }
+    }
+}
+
+/// Structural sanity for a group photo address: HTTPS with a host, credential-free, bounded,
+/// and free of whitespace and control scalars. Host trust stays with the image cache's own
+/// validation at fetch time, where an untrusted address degrades to the generated avatar.
+enum MessagingGroupPhotoURLPolicy {
+    static let maximumLength = 2048
+
+    static func isValid(_ value: String) -> Bool {
+        guard value.count <= maximumLength,
+              !value.unicodeScalars.contains(where: { scalar in
+                  scalar.properties.isWhitespace || scalar.value < 0x20 || scalar.value == 0x7F
+              }),
+              let url = URL(string: value),
+              url.scheme?.caseInsensitiveCompare("https") == .orderedSame,
+              url.host?.isEmpty == false,
+              url.user == nil,
+              url.password == nil
+        else { return false }
+        return true
+    }
+}
+
+/// Sets or clears the group description. The `description` key is always present on the wire:
+/// the server reads an absent key as "leave it alone" and an explicit null as "remove it",
+/// and Swift's synthesized encoding can only say the first.
+struct UpdateMessagingGroupDescriptionRequest: Encodable, Equatable, Sendable {
+    let description: String?
+
+    init(description: String?) throws {
+        if let description {
+            let clean = MessagingGroupDescriptionPolicy.normalized(description)
+            guard clean == description, MessagingGroupDescriptionPolicy.isValid(clean) else {
+                throw SecureMessagingContractError.invalid("group-conversation description")
+            }
+        }
+        self.description = description
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        if let description {
+            try container.encode(description, forKey: .description)
+        } else {
+            try container.encodeNil(forKey: .description)
+        }
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case description
+    }
+}
+
+struct AttachMessagingGroupPhotoRequest: Encodable, Equatable, Sendable {
+    let assetId: String
+
+    init(assetId: String) throws {
+        guard SecureMessagingWirePolicy.isCanonicalUUID(assetId) else {
+            throw SecureMessagingContractError.invalid("group photo asset ID")
+        }
+        self.assetId = assetId
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case assetId = "asset_id"
     }
 }
 
@@ -1056,6 +1209,35 @@ struct CreateDirectMessagingConversationRequest: Encodable, Equatable, Sendable 
         case memberIds = "member_ids"
         case type
         case title
+    }
+}
+
+struct MessagingMessageInfoRecipientDTO: Decodable, Equatable, Sendable {
+    let userId: String?
+    let name: String?
+    let deliveredAt: String?
+    let readAt: String?
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case userId = "user_id"
+        case deliveredAt = "delivered_at"
+        case readAt = "read_at"
+    }
+}
+
+/// Sent, delivered and read moments for one message, answered only to the person who sent it.
+struct MessagingMessageInfoDTO: Decodable, Equatable, Sendable {
+    let messageId: String?
+    let conversationId: String?
+    let sentAt: String?
+    let recipients: [MessagingMessageInfoRecipientDTO?]?
+
+    enum CodingKeys: String, CodingKey {
+        case recipients
+        case messageId = "message_id"
+        case conversationId = "conversation_id"
+        case sentAt = "sent_at"
     }
 }
 

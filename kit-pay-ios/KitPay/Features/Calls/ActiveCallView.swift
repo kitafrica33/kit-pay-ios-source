@@ -1221,15 +1221,22 @@ struct ActiveCallView: View {
         case .idle:
             "Call ended"
         case .preparing:
-            coordinator.activeCall?.direction == "outgoing" ? "Ringing…" : "Preparing…"
+            coordinator.activeCall?.direction == "outgoing" && !coordinator.presentedCallWasAnswered
+                ? "Ringing…"
+                : "Preparing…"
         case .connecting:
             "Connecting…"
         case .reconnecting:
             "Reconnecting…"
         case .connected:
             if media.hasRemoteParticipant {
+                // Derived from the answer anchor when one exists, so both sides count from
+                // the same server instant instead of from whenever each side's media landed.
                 CallDurationFormatter.string(
-                    from: media.remoteParticipantConnectedAt ?? date,
+                    from: coordinator.presentedCallDurationSeconds()
+                        .map { date.addingTimeInterval(TimeInterval(-$0)) }
+                        ?? media.remoteParticipantConnectedAt
+                        ?? date,
                     to: date
                 )
             } else if media.remoteParticipantConnectedAt != nil {
@@ -1237,7 +1244,10 @@ struct ActiveCallView: View {
                 // remote-absence grace period waits for them to come back.
                 "Waiting for them to reconnect…"
             } else {
-                coordinator.activeCall?.direction == "outgoing" ? "Ringing…" : "Connecting…"
+                CallAwaitingRemoteStatusPolicy.label(
+                    isOutgoing: coordinator.activeCall?.direction == "outgoing",
+                    answered: coordinator.presentedCallWasAnswered
+                )
             }
         case .ending:
             "Ending…"
@@ -2423,13 +2433,20 @@ struct MinimizedCallView: View {
         at date: Date = Date()
     ) -> String {
         if media.hasRemoteParticipant {
+            // The same anchor the full-screen header uses, so minimizing the call never
+            // changes what the timer says.
             return CallDurationFormatter.string(
-                from: media.remoteParticipantConnectedAt ?? date,
+                from: coordinator.presentedCallDurationSeconds()
+                    .map { date.addingTimeInterval(TimeInterval(-$0)) }
+                    ?? media.remoteParticipantConnectedAt
+                    ?? date,
                 to: date
             )
         }
         if media.remoteParticipantConnectedAt != nil { return "Waiting to reconnect" }
-        return call.direction == "outgoing" ? "Ringing" : "Connecting"
+        return call.direction == "outgoing" && !coordinator.presentedCallWasAnswered
+            ? "Ringing"
+            : "Connecting"
     }
 }
 

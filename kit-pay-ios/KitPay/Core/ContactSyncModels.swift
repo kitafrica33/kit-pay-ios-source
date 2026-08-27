@@ -646,7 +646,18 @@ enum ConversationContactPresentationPolicy {
               participantIDs.count == 2,
               participantIDs.remove(currentUserID) != nil,
               let recipientUserID = participantIDs.first
-        else { return fallback(name: fallbackName) }
+        else {
+            // A group presents its own identity: the authenticated title and, when one is
+            // set, the group's own photo — never a member's face borrowed onto a shared room.
+            return ConversationContactPresentation(
+                recipientUserID: nil,
+                displayName: fallbackName,
+                avatarURL: conversation.isGroup
+                    ? cleanHTTPSURL(conversation.groupPhotoURL)
+                    : nil,
+                contact: nil
+            )
+        }
 
         let matches = contacts.filter {
             ContactRecipientDirectory.recipientUserId(for: $0) == recipientUserID

@@ -13,6 +13,10 @@ enum KitRealtimeEvent: Equatable, Sendable {
     case connectionLive(Bool)
     case availabilityLost
     case conversationUnavailable(conversationID: String)
+    /// A call this account is on was answered, already validated by the transport. Carried on
+    /// the same authenticated user channel as sync nudges; the `call.answered` push remains
+    /// the fallback for a device whose socket is down.
+    case callAnswered(CallAnswerSignal)
 }
 
 // MARK: - Transport
@@ -166,6 +170,10 @@ final class KitPresenceCenter: ObservableObject {
     /// Presence privacy does not gate this callback: message delivery still relies on the
     /// authenticated user channel when a user chooses not to publish or render presence.
     var connectionStateHandler: ((Bool) -> Void)?
+    /// Delivers a validated `kit.call.answered` to the call lifecycle owner. Like sync nudges
+    /// — and unlike presence and typing — this is call signalling on the authenticated user
+    /// channel, so the presence privacy toggle does not gate it.
+    var callAnswerHandler: ((CallAnswerSignal) -> Void)?
     /// The communication privacy toggle sets this; while `false` this client sends no
     /// heartbeats and no new typing signals.
     /// The privacy toggle is symmetric, like read receipts: turning your own status off also
@@ -357,6 +365,7 @@ final class KitPresenceCenter: ObservableObject {
         activeConversationID = nil
         syncRequestHandler = nil
         connectionStateHandler = nil
+        callAnswerHandler = nil
     }
 
     func setForeground(_ foreground: Bool) {
@@ -457,6 +466,8 @@ final class KitPresenceCenter: ObservableObject {
             typing = [:]
         case .conversationUnavailable(let conversationID):
             typing[conversationID.lowercased()] = nil
+        case .callAnswered(let signal):
+            callAnswerHandler?(signal)
         }
     }
 

@@ -443,7 +443,7 @@ enum OutboxPolicy {
             switch exchangeError {
             case .retryLimitExceeded, .groupCapabilityUnavailable:
                 return .retry(after: nil)
-            case .reactionCapabilityUnavailable:
+            case .reactionCapabilityUnavailable, .editCapabilityUnavailable:
                 return .permanent
             case .invalidAccount:
                 return .permanent

@@ -6,12 +6,15 @@ import Foundation
 /// clip in another app can be sent to a chat without going back to Kit Pay and finding the file
 /// again. The share extension cannot send anything itself — it has no access to the account's
 /// keys and it must not — so it does the one thing it is allowed to do: it copies what the user
-/// picked into the app group container and steps aside. The app picks it up, asks who it is for,
-/// and stages it in that chat's composer exactly as if the user had attached it there.
+/// picked into the app group container and steps aside. A protected, account-bound snapshot lets
+/// the extension ask who it is for without opening the app or reading its keys. The app later
+/// revalidates that requested route and stages it in the chat's composer exactly as if the user had
+/// attached it there.
 ///
 /// Everything staged here is plaintext the user has just chosen to send, so it is written with
-/// complete file protection and deleted the moment it has been staged. A batch nobody ever
-/// delivered is not kept: ``SharedInboxPolicy/retention`` retires it on the next launch.
+/// complete file protection and deleted only after every chosen item has reached the durable
+/// local outbox (or the customer explicitly discards it). A batch nobody ever delivered is not
+/// kept: ``SharedInboxPolicy/retention`` retires it on the next launch.
 enum KitAppGroup {
     /// Must match the `com.apple.security.application-groups` entitlement on BOTH the app and the
     /// share extension. Without it the extension's container is private and the hand-off silently
@@ -24,7 +27,7 @@ enum KitAppGroup {
 }
 
 /// One file the user shared into Kit Pay.
-struct SharedInboxItem: Codable, Identifiable, Equatable {
+struct SharedInboxItem: Codable, Identifiable, Equatable, Sendable {
     let id: UUID
     /// Name of the file inside the batch directory. Never a path.
     let fileName: String
@@ -36,7 +39,7 @@ struct SharedInboxItem: Codable, Identifiable, Equatable {
 }
 
 /// Everything one trip through the share sheet produced.
-struct SharedInboxBatch: Codable, Identifiable, Equatable {
+struct SharedInboxBatch: Codable, Identifiable, Equatable, Sendable {
     let id: UUID
     /// The account that owned the app when the share was created. Without this binding, plaintext
     /// staged before sign-out could be offered to the next person who signs in on the device.
@@ -47,37 +50,104 @@ struct SharedInboxBatch: Codable, Identifiable, Equatable {
     /// a link saved as a `.txt` attachment would be useless to the person receiving it — so text
     /// lands in the composer, as the message, where the user can add to it before sending.
     let text: String?
+    /// A destination chosen inside the extension. It is only a requested route: the containing
+    /// app revalidates it against protected current conversation/contact state before staging.
+    let destination: SharedInboxDestinationRequest?
 
     init(
         id: UUID,
         ownerAccountID: String,
         receivedAt: Date,
         items: [SharedInboxItem],
-        text: String? = nil
+        text: String? = nil,
+        destination: SharedInboxDestinationRequest? = nil
     ) {
         self.id = id
         self.ownerAccountID = ownerAccountID
         self.receivedAt = receivedAt
         self.items = items
         self.text = text
+        self.destination = destination
     }
 
     /// True when there is something for a chat to receive.
     var isDeliverable: Bool { !items.isEmpty || !(text ?? "").isEmpty }
 }
 
+/// The requested route persisted with a staged share.
+struct SharedInboxDestinationRequest: Codable, Equatable, Sendable {
+    let kind: SharedInboxDestination.Kind
+    let conversationID: String?
+    let recipientUserID: String?
+    let displayName: String
+}
+
+/// One safe-to-display row published by the containing app for the extension's picker.
+///
+/// The snapshot intentionally contains only presentation text and opaque routing UUIDs. It never
+/// contains phone numbers, a group roster, authentication material, encryption keys, message
+/// history, or avatar bytes/URLs.
+struct SharedInboxDestination: Codable, Identifiable, Equatable, Sendable {
+    enum Kind: String, Codable, Sendable {
+        case direct
+        case group
+        case contact
+    }
+
+    let conversationID: String?
+    let recipientUserID: String?
+    let displayName: String
+    let kind: Kind
+    let memberCount: Int?
+
+    var id: String {
+        if let conversationID { return "conversation:\(conversationID)" }
+        return "contact:\(recipientUserID ?? "invalid")"
+    }
+
+    var request: SharedInboxDestinationRequest {
+        SharedInboxDestinationRequest(
+            kind: kind,
+            conversationID: conversationID,
+            recipientUserID: recipientUserID,
+            displayName: displayName
+        )
+    }
+}
+
+/// Account-bound recipient directory consumed by the share extension while the app is suspended.
+struct SharedInboxDestinationSnapshot: Codable, Equatable, Sendable {
+    static let schemaVersion = 1
+
+    let version: Int
+    let ownerAccountID: String
+    let generatedAt: Date
+    let destinations: [SharedInboxDestination]
+
+    init(
+        ownerAccountID: String,
+        generatedAt: Date,
+        destinations: [SharedInboxDestination]
+    ) {
+        version = Self.schemaVersion
+        self.ownerAccountID = ownerAccountID
+        self.generatedAt = generatedAt
+        self.destinations = destinations
+    }
+}
+
 /// A share that has been given a destination and is on its way to that chat's composer.
-struct SharedInboxDelivery: Identifiable, Equatable {
+struct SharedInboxDelivery: Identifiable, Equatable, Sendable {
     let id = UUID()
     let conversationID: String
     let batch: SharedInboxBatch
 }
 
-/// The link the share extension opens to bring Kit Pay forward once a share is staged.
+/// A legacy no-payload link accepted from pre-picker development builds.
 ///
 /// Deliberately not a ``KitDeepLink``: that type only ever selects a pre-authentication screen and
-/// refuses anything else, and a share must not widen it. This URL carries no payload at all — it
-/// only says "look in the inbox", and the inbox is in our own container.
+/// refuses anything else, and a share must not widen it. The shipping extension does not attempt
+/// to open this URL: share extensions cannot launch their containing application.
 enum KitShareHandoffLink {
     static let url = URL(string: "kitwallet://share")
 
@@ -94,9 +164,38 @@ enum SharedInboxPolicy {
     /// the messaging wire is not compiled into the extension.
     static let maximumBytes = 200 * 1_024 * 1_024
 
+    /// The composer currently materializes a batch while preparing previews and encrypted local
+    /// queue records. Keep the whole handoff within the same bound as one supported attachment;
+    /// otherwise eight individually valid 200 MiB files could transiently require well over a
+    /// gigabyte and be terminated by iOS before any bubble appears.
+    static let maximumBatchBytes = maximumBytes
+
+    /// Keep abandoned plaintext shares bounded even when the containing app is not opened for a
+    /// while. Existing confirmed shares win over a newer share: silently evicting something the
+    /// extension already told the customer was queued would be data loss.
+    static let maximumPendingBatches = 4
+    static let maximumRetainedBytes = 400 * 1_024 * 1_024
+
     /// Matches `ConversationAttachmentStagingPolicy.maximumStagedAttachments`, so a share that the
     /// extension accepted is always a share the composer can hold.
     static let maximumItems = 8
+
+    /// A bounded snapshot keeps extension decoding predictable even if local shared storage is
+    /// corrupt. Most people have far fewer chats; the most recently active rows are retained.
+    static let maximumDestinations = 500
+    static let maximumRecentDestinations = 5
+
+    /// Destination names remain useful while offline, but an old roster should not live forever.
+    /// The containing app still validates a selected ID against protected current state, so a
+    /// stale row can never authorize delivery to a conversation the account no longer has.
+    static let destinationSnapshotRetention: TimeInterval = 30 * 24 * 60 * 60
+
+    static let maximumDestinationNameCharacters = 120
+
+    /// ImageIO normally downsamples without decoding a full-size bitmap, but an extension-provided
+    /// source can still make CoreGraphics allocate aggressively while parsing. Larger images stay
+    /// fully shareable as documents instead of risking a jetsam termination in the containing app.
+    static let maximumImageDecodeBytes = 64 * 1_024 * 1_024
 
     /// An undelivered share is a file the user has forgotten about. It goes.
     static let retention: TimeInterval = 24 * 60 * 60
@@ -108,6 +207,146 @@ enum SharedInboxPolicy {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let value = UUID(uuidString: trimmed) else { return nil }
         return value.uuidString.lowercased()
+    }
+
+    static func canonicalConversationID(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let value = UUID(uuidString: trimmed) else { return nil }
+        return value.uuidString.lowercased()
+    }
+
+    static func destinationDisplayName(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let withoutControls = raw.unicodeScalars.filter {
+            !CharacterSet.controlCharacters.contains($0)
+        }
+        let collapsed = String(String.UnicodeScalarView(withoutControls))
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
+        guard !collapsed.isEmpty else { return nil }
+        return String(collapsed.prefix(maximumDestinationNameCharacters))
+    }
+
+    static func isValidDestination(_ destination: SharedInboxDestination) -> Bool {
+        let conversationID = destination.conversationID.flatMap {
+            canonicalConversationID($0)
+        }
+        let recipientUserID = destination.recipientUserID.flatMap { canonicalAccountID($0) }
+        guard conversationID == destination.conversationID,
+              recipientUserID == destination.recipientUserID,
+              destinationDisplayName(destination.displayName) == destination.displayName
+        else { return false }
+        switch destination.kind {
+        case .direct:
+            return conversationID != nil && recipientUserID != nil && destination.memberCount == nil
+        case .group:
+            guard conversationID != nil,
+                  recipientUserID == nil,
+                  let memberCount = destination.memberCount
+            else { return false }
+            return (2 ... 1_024).contains(memberCount)
+        case .contact:
+            return conversationID == nil
+                && recipientUserID != nil
+                && destination.memberCount == nil
+        }
+    }
+
+    static func isValidDestinationRequest(_ request: SharedInboxDestinationRequest) -> Bool {
+        isValidDestination(SharedInboxDestination(
+            conversationID: request.conversationID,
+            recipientUserID: request.recipientUserID,
+            displayName: request.displayName,
+            kind: request.kind,
+            memberCount: request.kind == .group ? 2 : nil
+        ))
+    }
+
+    /// Revalidates an extension route against the app's protected current conversation. A forged
+    /// identifier cannot turn a direct recipient into a group (or vice versa), and a stale group
+    /// from which the account was removed no longer qualifies.
+    static func destinationRequest(
+        _ request: SharedInboxDestinationRequest,
+        matchesConversationID rawConversationID: String,
+        isGroup: Bool,
+        participantUserIDs: [String],
+        currentAccountID rawCurrentAccountID: String
+    ) -> Bool {
+        guard isValidDestinationRequest(request),
+              let conversationID = canonicalConversationID(rawConversationID),
+              request.conversationID == conversationID,
+              let currentAccountID = canonicalAccountID(rawCurrentAccountID)
+        else { return false }
+        let canonicalParticipants = participantUserIDs.compactMap { canonicalAccountID($0) }
+        let participants = Set(canonicalParticipants)
+        guard canonicalParticipants.count == participantUserIDs.count,
+              participants.count == participantUserIDs.count,
+              participants.contains(currentAccountID)
+        else { return false }
+        switch request.kind {
+        case .group:
+            return isGroup && participants.count >= 2
+        case .direct:
+            guard !isGroup, let recipientUserID = request.recipientUserID else { return false }
+            return participants == Set([currentAccountID, recipientUserID])
+        case .contact:
+            return false
+        }
+    }
+
+    /// Five chats by activity, then every other eligible Kit Pay contact and group alphabetically.
+    /// A direct chat in the recent section suppresses its duplicate contact row. A recent group is
+    /// likewise not repeated in the final group section.
+    static func orderedDestinations(
+        recentCandidates: [(destination: SharedInboxDestination, updatedAt: Date)],
+        contacts: [SharedInboxDestination]
+    ) -> [SharedInboxDestination] {
+        let orderedConversations = recentCandidates
+            .filter { $0.destination.kind != .contact && isValidDestination($0.destination) }
+            .sorted {
+                if $0.updatedAt != $1.updatedAt { return $0.updatedAt > $1.updatedAt }
+                return $0.destination.id < $1.destination.id
+            }
+        let recent = orderedConversations
+            .prefix(maximumRecentDestinations)
+            .map { $0.destination }
+        var seenRecipientIDs = Set(recent.compactMap(\.recipientUserID))
+        let recentConversationIDs = Set(recent.compactMap(\.conversationID))
+        let sortedContacts = contacts
+            .filter {
+                $0.kind == .contact
+                    && isValidDestination($0)
+            }
+            .sorted {
+                let comparison = $0.displayName.localizedCaseInsensitiveCompare($1.displayName)
+                if comparison != .orderedSame { return comparison == .orderedAscending }
+                return $0.id < $1.id
+            }
+        var otherContacts: [SharedInboxDestination] = []
+        for contact in sortedContacts {
+            guard let recipientUserID = contact.recipientUserID,
+                  seenRecipientIDs.insert(recipientUserID).inserted
+            else { continue }
+            otherContacts.append(contact)
+        }
+        let otherGroups = orderedConversations
+            .map(\.destination)
+            .filter {
+                $0.kind == .group
+                    && $0.conversationID.map { !recentConversationIDs.contains($0) } == true
+            }
+            .sorted {
+                let comparison = $0.displayName.localizedCaseInsensitiveCompare($1.displayName)
+                if comparison != .orderedSame { return comparison == .orderedAscending }
+                return $0.id < $1.id
+            }
+        return Array((recent + otherContacts + otherGroups).prefix(maximumDestinations))
+    }
+
+    static func destinationSnapshotIsExpired(generatedAt: Date, now: Date) -> Bool {
+        now.timeIntervalSince(generatedAt) >= destinationSnapshotRetention
+            || generatedAt.timeIntervalSince(now) > destinationSnapshotRetention
     }
 
     /// The media types the encrypted wire accepts. Duplicated from
@@ -159,6 +398,45 @@ enum SharedInboxPolicy {
         byteCount > 0 && byteCount <= maximumBytes
     }
 
+    static func batchFits(_ items: [SharedInboxItem]) -> Bool {
+        var total = 0
+        for item in items {
+            let (next, overflow) = total.addingReportingOverflow(item.byteCount)
+            guard !overflow, next <= maximumBatchBytes else { return false }
+            total = next
+        }
+        return true
+    }
+
+    static func payloadByteCount(_ batch: SharedInboxBatch) -> Int {
+        batch.items.reduce(0) { $0 + $1.byteCount }
+    }
+
+    /// The oldest confirmed prefix that fits the retained-inbox limits. Once one batch no longer
+    /// fits, every newer batch is discarded too; this is deliberately newest-first pruning rather
+    /// than cherry-picking small recent shares ahead of an older share already promised to the
+    /// customer.
+    static func retainedPrefix(_ batches: [SharedInboxBatch]) -> [SharedInboxBatch] {
+        let ordered = batches.sorted {
+            if $0.receivedAt != $1.receivedAt { return $0.receivedAt < $1.receivedAt }
+            return $0.id.uuidString < $1.id.uuidString
+        }
+        var retained: [SharedInboxBatch] = []
+        var retainedBytes = 0
+        for batch in ordered {
+            guard retained.count < maximumPendingBatches else { break }
+            let batchBytes = payloadByteCount(batch)
+            guard batchBytes <= maximumRetainedBytes - retainedBytes else { break }
+            retained.append(batch)
+            retainedBytes += batchBytes
+        }
+        return retained
+    }
+
+    static func shouldDecodeSharedImage(byteCount: Int) -> Bool {
+        byteCount > 0 && byteCount <= maximumImageDecodeBytes
+    }
+
     static func isExpired(receivedAt: Date, now: Date) -> Bool {
         now.timeIntervalSince(receivedAt) >= retention
             // A batch stamped in the future is a clock change, not a fresh share.
@@ -191,11 +469,18 @@ enum SharedInboxPolicy {
 
     /// What the composer chip and the destination picker call the file.
     static func displayName(suggestedName: String?, mediaType: String) -> String {
-        let trimmed = (suggestedName ?? "")
-            .components(separatedBy: CharacterSet(charactersIn: "/\\:\0"))
-            .joined(separator: "-")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmed.isEmpty { return String(trimmed.prefix(120)) }
+        let withoutUnsafeScalars = (suggestedName ?? "").unicodeScalars.map { scalar in
+            CharacterSet.controlCharacters.contains(scalar)
+                || CharacterSet(charactersIn: "/\\:").contains(scalar)
+                ? "-"
+                : String(scalar)
+        }.joined()
+        let trimmed = withoutUnsafeScalars
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
+        if !trimmed.isEmpty {
+            return String(trimmed.prefix(maximumDestinationNameCharacters))
+        }
         if mediaType.hasPrefix("image/") { return "Photo" }
         if mediaType.hasPrefix("video/") { return "Video" }
         if mediaType.hasPrefix("audio/") { return "Audio" }
@@ -212,6 +497,49 @@ enum SharedInboxPolicy {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
         return String(trimmed.prefix(maximumTextCharacters))
+    }
+
+    /// Mirrors how the conversation composer appends shared text, and gives the explicit
+    /// re-route action a conservative inverse. If the customer edited inside the inserted span we
+    /// return nil rather than guessing at, and possibly deleting, their words.
+    static func composerDraft(existingDraft: String, sharedText: String) -> String {
+        if draft(existingDraft, containsSharedTextBlock: sharedText) {
+            return existingDraft
+        }
+        let existing = existingDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        return existing.isEmpty ? sharedText : "\(existing)\n\(sharedText)"
+    }
+
+    private static func draft(_ draft: String, containsSharedTextBlock sharedText: String) -> Bool {
+        draft == sharedText
+            || draft.hasPrefix("\(sharedText)\n")
+            || draft.contains("\n\(sharedText)\n")
+            || draft.hasSuffix("\n\(sharedText)")
+    }
+
+    static func draftAfterRemovingShare(
+        currentDraft: String,
+        originalDraft: String,
+        sharedText: String
+    ) -> String? {
+        if currentDraft == originalDraft { return currentDraft }
+        let applied = composerDraft(existingDraft: originalDraft, sharedText: sharedText)
+        if currentDraft == applied { return originalDraft }
+        guard currentDraft.hasPrefix(applied) else { return nil }
+        let suffix = currentDraft.dropFirst(applied.count)
+        guard suffix.first?.isWhitespace == true else { return nil }
+        return originalDraft + suffix
+    }
+
+    static func isValidItemMetadata(_ item: SharedInboxItem) -> Bool {
+        guard isSafeFileName(item.fileName),
+              fits(item.byteCount),
+              normalizedMediaType(item.mediaType) == item.mediaType,
+              displayName(suggestedName: item.displayName, mediaType: item.mediaType)
+                == item.displayName
+        else { return false }
+        let ownName = item.id.uuidString
+        return item.fileName == ownName || item.fileName.hasPrefix("\(ownName).")
     }
 
     /// The one line the destination picker shows above the chat list.
@@ -242,6 +570,7 @@ struct SharedInboxStore {
     private static let directoryName = "SharedInbox"
     private static let manifestName = "manifest.json"
     private static let accountBindingName = "SharedInbox.account.json"
+    private static let destinationSnapshotName = "SharedInbox.destinations.json"
 
     private struct AccountBinding: Codable {
         let accountID: String
@@ -253,6 +582,10 @@ struct SharedInboxStore {
 
     private var accountBindingURL: URL? {
         containerURL?.appendingPathComponent(Self.accountBindingName, isDirectory: false)
+    }
+
+    private var destinationSnapshotURL: URL? {
+        containerURL?.appendingPathComponent(Self.destinationSnapshotName, isDirectory: false)
     }
 
     /// Publishes the signed-in account to the extension without exposing credentials or keys.
@@ -291,8 +624,84 @@ struct SharedInboxStore {
     }
 
     func clearActiveAccount() {
-        guard let accountBindingURL else { return }
-        try? fileManager.removeItem(at: accountBindingURL)
+        if let accountBindingURL { try? fileManager.removeItem(at: accountBindingURL) }
+        clearDestinations()
+    }
+
+    /// Publishes the app's latest ordered destination rows without publishing protected chat state.
+    @discardableResult
+    func setDestinations(
+        _ destinations: [SharedInboxDestination],
+        forAccountID rawAccountID: String,
+        generatedAt: Date = Date()
+    ) -> Bool {
+        guard let ownerAccountID = SharedInboxPolicy.canonicalAccountID(rawAccountID),
+              destinations.count <= SharedInboxPolicy.maximumDestinations,
+              Set(destinations.map(\.id)).count == destinations.count,
+              destinations.allSatisfy(SharedInboxPolicy.isValidDestination),
+              let destinationSnapshotURL
+        else { return false }
+        let snapshot = SharedInboxDestinationSnapshot(
+            ownerAccountID: ownerAccountID,
+            generatedAt: generatedAt,
+            destinations: destinations
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        guard let data = try? encoder.encode(snapshot) else { return false }
+        do {
+            try data.write(
+                to: destinationSnapshotURL,
+                options: [.atomic, .completeFileProtection]
+            )
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// Reads an account-bound, bounded and fresh picker snapshot. Any malformed or cross-account
+    /// file is destroyed instead of allowing one person's chat names to appear for another.
+    func destinations(
+        forAccountID rawAccountID: String,
+        now: Date = Date()
+    ) -> [SharedInboxDestination] {
+        guard let accountID = SharedInboxPolicy.canonicalAccountID(rawAccountID),
+              let destinationSnapshotURL,
+              let values = try? destinationSnapshotURL.resourceValues(
+                  forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]
+              ),
+              values.isRegularFile == true,
+              values.isSymbolicLink != true,
+              let size = values.fileSize,
+              (1 ... 512 * 1_024).contains(size),
+              let data = try? Data(contentsOf: destinationSnapshotURL)
+        else { return [] }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let snapshot = try? decoder.decode(
+                  SharedInboxDestinationSnapshot.self,
+                  from: data
+              ),
+              snapshot.version == SharedInboxDestinationSnapshot.schemaVersion,
+              snapshot.ownerAccountID == accountID,
+              !SharedInboxPolicy.destinationSnapshotIsExpired(
+                  generatedAt: snapshot.generatedAt,
+                  now: now
+              ),
+              snapshot.destinations.count <= SharedInboxPolicy.maximumDestinations,
+              Set(snapshot.destinations.map(\.id)).count == snapshot.destinations.count,
+              snapshot.destinations.allSatisfy(SharedInboxPolicy.isValidDestination)
+        else {
+            clearDestinations()
+            return []
+        }
+        return snapshot.destinations
+    }
+
+    func clearDestinations() {
+        guard let destinationSnapshotURL else { return }
+        try? fileManager.removeItem(at: destinationSnapshotURL)
     }
 
     // MARK: Writing (share extension)
@@ -340,7 +749,8 @@ struct SharedInboxStore {
         fileAt sourceURL: URL,
         suggestedName: String?,
         mediaType rawMediaType: String?,
-        batchID: UUID
+        batchID: UUID,
+        maximumAcceptedBytes: Int = SharedInboxPolicy.maximumBatchBytes
     ) throws -> SharedInboxItem {
         guard let rootURL else { throw SharedInboxError.unavailable }
         let sourceValues = try sourceURL.resourceValues(
@@ -352,6 +762,9 @@ struct SharedInboxStore {
         let byteCount = sourceValues.fileSize ?? 0
         guard SharedInboxPolicy.fits(byteCount) else {
             throw byteCount > 0 ? SharedInboxError.tooLarge : SharedInboxError.unreadable
+        }
+        guard maximumAcceptedBytes > 0, byteCount <= maximumAcceptedBytes else {
+            throw SharedInboxError.batchTooLarge
         }
         let mediaType = SharedInboxPolicy.normalizedMediaType(rawMediaType)
         let id = UUID()
@@ -398,12 +811,17 @@ struct SharedInboxStore {
         items: [SharedInboxItem],
         text: String?,
         ownerAccountID rawOwnerAccountID: String,
-        receivedAt: Date
+        receivedAt: Date,
+        destination: SharedInboxDestinationRequest? = nil
     ) throws {
         guard let rootURL else { throw SharedInboxError.unavailable }
         guard let ownerAccountID = SharedInboxPolicy.canonicalAccountID(rawOwnerAccountID)
         else { throw SharedInboxError.signedOut }
         let normalizedText = SharedInboxPolicy.normalizedText(text)
+        guard destination.map(SharedInboxPolicy.isValidDestinationRequest) ?? true else {
+            remove(batchID: id)
+            throw SharedInboxError.unreadable
+        }
         guard !items.isEmpty || normalizedText != nil else {
             remove(batchID: id)
             throw SharedInboxError.empty
@@ -411,10 +829,8 @@ struct SharedInboxStore {
         guard items.count <= SharedInboxPolicy.maximumItems,
               Set(items.map(\.id)).count == items.count,
               Set(items.map(\.fileName)).count == items.count,
-              items.allSatisfy({
-                  SharedInboxPolicy.isSafeFileName($0.fileName)
-                      && SharedInboxPolicy.fits($0.byteCount)
-              })
+              SharedInboxPolicy.batchFits(items),
+              items.allSatisfy(SharedInboxPolicy.isValidItemMetadata)
         else {
             remove(batchID: id)
             throw SharedInboxError.unreadable
@@ -424,11 +840,27 @@ struct SharedInboxStore {
             ownerAccountID: ownerAccountID,
             receivedAt: receivedAt,
             items: items,
-            text: normalizedText
+            text: normalizedText,
+            destination: destination
         )
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         let data = try encoder.encode(batch)
+        let confirmed = confirmedBatches(
+            at: rootURL,
+            ownerAccountID: ownerAccountID,
+            excluding: id
+        )
+        let retainedBytes = confirmed.reduce(0) {
+            $0 + SharedInboxPolicy.payloadByteCount($1)
+        }
+        let batchBytes = SharedInboxPolicy.payloadByteCount(batch)
+        guard confirmed.count < SharedInboxPolicy.maximumPendingBatches,
+              batchBytes <= SharedInboxPolicy.maximumRetainedBytes - retainedBytes
+        else {
+            remove(batchID: id)
+            throw SharedInboxError.inboxFull
+        }
         // A text-only share never created the directory, because nothing was copied into it.
         let batchURL = try secureBatchURL(rootURL: rootURL, batchID: id)
         for item in items {
@@ -438,6 +870,43 @@ struct SharedInboxStore {
             to: batchURL.appendingPathComponent(Self.manifestName, isDirectory: false),
             options: [.atomic, .completeFileProtection]
         )
+    }
+
+    /// Atomically records the containing app's validated conversation before the composer can
+    /// queue the first item. The caller supplies the exact batch it read; a stale process or view
+    /// cannot overwrite a newer route. This makes a partially queued multi-item share recover to
+    /// the same conversation after process death instead of returning to a free destination
+    /// picker.
+    func pinDestination(
+        for batch: SharedInboxBatch,
+        to destination: SharedInboxDestinationRequest
+    ) throws -> SharedInboxBatch {
+        guard destination.kind != .contact,
+              SharedInboxPolicy.isValidDestinationRequest(destination),
+              let rootURL
+        else { throw SharedInboxError.unreadable }
+        let batchURL = rootURL.appendingPathComponent(batch.id.uuidString, isDirectory: true)
+        guard let current = decodeBatch(at: batchURL), current == batch else {
+            throw SharedInboxError.unreadable
+        }
+        if current.destination == destination { return current }
+
+        let pinned = SharedInboxBatch(
+            id: current.id,
+            ownerAccountID: current.ownerAccountID,
+            receivedAt: current.receivedAt,
+            items: current.items,
+            text: current.text,
+            destination: destination
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(pinned)
+        try data.write(
+            to: batchURL.appendingPathComponent(Self.manifestName, isDirectory: false),
+            options: [.atomic, .completeFileProtection]
+        )
+        return pinned
     }
 
     // MARK: Reading (app)
@@ -464,7 +933,14 @@ struct SharedInboxStore {
             }
             batches.append(batch)
         }
-        return batches.sorted { $0.receivedAt < $1.receivedAt }
+        let retained = SharedInboxPolicy.retainedPrefix(batches)
+        let retainedIDs = Set(retained.map(\.id))
+        for batch in batches where !retainedIDs.contains(batch.id) {
+            try? fileManager.removeItem(
+                at: rootURL.appendingPathComponent(batch.id.uuidString, isDirectory: true)
+            )
+        }
+        return retained
     }
 
     func data(for item: SharedInboxItem, in batchID: UUID) throws -> Data {
@@ -514,14 +990,33 @@ struct SharedInboxStore {
         guard let batch = try? decoder.decode(SharedInboxBatch.self, from: data),
               batch.id == id,
               SharedInboxPolicy.canonicalAccountID(batch.ownerAccountID) == batch.ownerAccountID,
+              batch.destination.map(SharedInboxPolicy.isValidDestinationRequest) ?? true,
               batch.isDeliverable,
               batch.items.count <= SharedInboxPolicy.maximumItems,
-              batch.items.allSatisfy({
-                  SharedInboxPolicy.isSafeFileName($0.fileName)
-                      && SharedInboxPolicy.fits($0.byteCount)
-              })
+              Set(batch.items.map(\.id)).count == batch.items.count,
+              Set(batch.items.map(\.fileName)).count == batch.items.count,
+              SharedInboxPolicy.batchFits(batch.items),
+              batch.items.allSatisfy(SharedInboxPolicy.isValidItemMetadata)
         else { return nil }
         return batch
+    }
+
+    private func confirmedBatches(
+        at rootURL: URL,
+        ownerAccountID: String,
+        excluding excludedID: UUID
+    ) -> [SharedInboxBatch] {
+        guard let entries = try? fileManager.contentsOfDirectory(
+            at: rootURL,
+            includingPropertiesForKeys: nil
+        ) else { return [] }
+        return entries.compactMap { entry in
+            guard entry.lastPathComponent != excludedID.uuidString,
+                  let batch = decodeBatch(at: entry),
+                  batch.ownerAccountID == ownerAccountID
+            else { return nil }
+            return batch
+        }
     }
 
     private func secureBatchURL(rootURL: URL, batchID: UUID) throws -> URL {
@@ -557,6 +1052,8 @@ enum SharedInboxError: LocalizedError, Equatable {
     case unavailable
     case signedOut
     case tooLarge
+    case batchTooLarge
+    case inboxFull
     case empty
     case unreadable
 
@@ -568,6 +1065,10 @@ enum SharedInboxError: LocalizedError, Equatable {
             "Open Kit Pay and sign in before sharing to a chat."
         case .tooLarge:
             "Files up to \(SharedInboxPolicy.maximumBytes / (1_024 * 1_024)) MB can be shared to Kit Pay."
+        case .batchTooLarge:
+            "A single share can include up to \(SharedInboxPolicy.maximumBatchBytes / (1_024 * 1_024)) MB in total."
+        case .inboxFull:
+            "Open Kit Pay to send or discard your earlier shared items, then try again."
         case .empty:
             "Nothing in that share could be sent through Kit Pay."
         case .unreadable:

@@ -1,3 +1,4 @@
+import PhotosUI
 import SwiftUI
 
 // MARK: - Member presentation
@@ -22,9 +23,17 @@ struct GroupMemberPresentation: Identifiable, Equatable {
 struct GroupProfileView: View {
     let conversationID: String
     let title: String
+    /// The group's server-visible identity beyond its name. Display for every member.
+    var groupDescription: String? = nil
+    var photoURL: String? = nil
     let members: [GroupMemberPresentation]
     /// Non-nil only when the current user may perform the action (role-gated by the caller).
     let renameGroup: ((String) async -> Bool)?
+    /// Saves (or clears, on nil) the description; non-nil only for owners and admins.
+    var updateDescription: ((String?) async -> Bool)? = nil
+    /// Runs the moderated upload on prepared JPEG bytes and attaches the clean asset.
+    var updatePhoto: ((Data) async -> Bool)? = nil
+    var removePhoto: (() async -> Bool)? = nil
     let addMembers: (() -> Void)?
     let canRemoveMember: ((String) -> Bool)?
     let removeMember: ((String) async -> Bool)?   // userID
@@ -45,12 +54,18 @@ struct GroupProfileView: View {
     @State private var showLeaveConfirmation = false
     @State private var isLeaving = false
     @State private var leaveFailed = false
+    @State private var selectedPhotoItem: PhotosPickerItem?
+    @State private var isUpdatingPhoto = false
+    @State private var photoUpdateFailed = false
+    @State private var showRemovePhotoConfirmation = false
+    @State private var showDescriptionEditor = false
 
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 22) {
                     header
+                    descriptionSection
                     membersSection
                     if addMembers != nil || openMediaLibrary != nil {
                         actionRows
@@ -69,6 +84,13 @@ struct GroupProfileView: View {
                     Button("Done") { dismiss() }
                 }
             }
+            .navigationDestination(isPresented: $showDescriptionEditor) {
+                GroupDescriptionEditorView(
+                    groupTitle: displayedTitle,
+                    initialDescription: groupDescription,
+                    save: updateDescription ?? { _ in false }
+                )
+            }
             .alert("Rename group", isPresented: $showRenamePrompt) {
                 TextField("Group name", text: $renameDraft)
                 Button("Save") { submitRename() }
@@ -79,16 +101,86 @@ struct GroupProfileView: View {
             }
         }
         .tint(KitColor.green)
-        .interactiveDismissDisabled(isRenaming || isLeaving || removingMemberID != nil)
+        .interactiveDismissDisabled(
+            isRenaming || isLeaving || removingMemberID != nil || isUpdatingPhoto
+        )
+        .onChange(of: selectedPhotoItem) { _, item in
+            guard let item else { return }
+            submitPhoto(item)
+        }
+        .confirmationDialog(
+            "Remove the group photo?",
+            isPresented: $showRemovePhotoConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Remove photo", role: .destructive) { submitPhotoRemoval() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Everyone will see the generated group avatar instead.")
+        }
     }
 
     // MARK: Header
 
     private var header: some View {
         VStack(spacing: 12) {
-            AvatarView(name: displayedTitle, size: 96)
-                .kitCircularGlass(diameter: 116, interactive: false)
-                .accessibilityLabel("Group avatar for \(displayedTitle)")
+            GroupAvatarView(
+                title: displayedTitle,
+                photoURL: photoURL,
+                size: 96,
+                showsBadge: photoURL != nil
+            )
+            .kitCircularGlass(diameter: 116, interactive: false)
+            .accessibilityLabel("Group avatar for \(displayedTitle)")
+
+            if updatePhoto != nil {
+                HStack(spacing: 14) {
+                    PhotosPicker(
+                        selection: $selectedPhotoItem,
+                        matching: .images,
+                        photoLibrary: .shared()
+                    ) {
+                        HStack(spacing: 6) {
+                            if isUpdatingPhoto {
+                                ProgressView()
+                                    .controlSize(.small)
+                            } else {
+                                Image(systemName: "camera.fill")
+                                    .font(.footnote.weight(.semibold))
+                            }
+                            Text(photoURL == nil ? "Add photo" : "Change photo")
+                                .font(.footnote.weight(.semibold))
+                        }
+                        .foregroundStyle(KitColor.green)
+                        .frame(minHeight: 32)
+                        .contentShape(Rectangle())
+                    }
+                    .disabled(isUpdatingPhoto)
+                    .accessibilityLabel(photoURL == nil ? "Add a group photo" : "Change the group photo")
+
+                    if photoURL != nil, removePhoto != nil {
+                        Button {
+                            showRemovePhotoConfirmation = true
+                        } label: {
+                            Text("Remove")
+                                .font(.footnote.weight(.semibold))
+                                .foregroundStyle(.red)
+                                .frame(minHeight: 32)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(isUpdatingPhoto)
+                        .accessibilityLabel("Remove the group photo")
+                    }
+                }
+            }
+
+            if photoUpdateFailed {
+                Text("The group photo could not be changed. Try again.")
+                    .font(.footnote)
+                    .foregroundStyle(.orange)
+                    .multilineTextAlignment(.center)
+            }
 
             if renameGroup != nil {
                 Button {
@@ -135,6 +227,54 @@ struct GroupProfileView: View {
             Text("\(members.count) \(members.count == 1 ? "member" : "members")")
                 .font(.subheadline)
                 .foregroundStyle(KitColor.secondaryText)
+        }
+    }
+
+    // MARK: Description
+
+    /// What this group is for, readable by every member. Managers may edit it on its own
+    /// full screen; a group with none shows the affordance only to people who could write it.
+    @ViewBuilder
+    private var descriptionSection: some View {
+        if groupDescription != nil || updateDescription != nil {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Description")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(KitColor.secondaryText)
+                    .padding(.horizontal, 6)
+
+                if let groupDescription {
+                    Button {
+                        guard updateDescription != nil else { return }
+                        showDescriptionEditor = true
+                    } label: {
+                        HStack(alignment: .top, spacing: 12) {
+                            Text(groupDescription)
+                                .font(.body)
+                                .foregroundStyle(KitColor.primaryText)
+                                .multilineTextAlignment(.leading)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            if updateDescription != nil {
+                                Image(systemName: "pencil")
+                                    .font(.footnote.weight(.semibold))
+                                    .foregroundStyle(KitColor.green)
+                                    .accessibilityHidden(true)
+                            }
+                        }
+                        .padding(18)
+                        .kitGlass(cornerRadius: 24, shadow: false)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(updateDescription == nil)
+                    .accessibilityLabel("Group description: \(groupDescription)")
+                    .accessibilityHint(updateDescription != nil ? "Edits the description" : "")
+                } else if updateDescription != nil {
+                    actionRow(title: "Add group description", systemName: "text.alignleft") {
+                        showDescriptionEditor = true
+                    }
+                }
+            }
         }
     }
 
@@ -425,6 +565,42 @@ struct GroupProfileView: View {
     // MARK: Mutations (closure-driven)
 
     @MainActor
+    private func submitPhoto(_ item: PhotosPickerItem) {
+        guard let updatePhoto, !isUpdatingPhoto else { return }
+        isUpdatingPhoto = true
+        photoUpdateFailed = false
+        Task { @MainActor in
+            defer {
+                isUpdatingPhoto = false
+                selectedPhotoItem = nil
+            }
+            guard let sourceData = try? await item.loadTransferable(type: Data.self),
+                  sourceData.count <= ProfileAvatarImagePreparer.maximumInputBytes,
+                  let jpeg = await Task.detached(priority: .userInitiated, operation: {
+                      ProfileAvatarImagePreparer.prepareJPEG(from: sourceData)
+                  }).value
+            else {
+                photoUpdateFailed = true
+                return
+            }
+            let updated = await updatePhoto(jpeg)
+            if !updated { photoUpdateFailed = true }
+        }
+    }
+
+    @MainActor
+    private func submitPhotoRemoval() {
+        guard let removePhoto, !isUpdatingPhoto else { return }
+        isUpdatingPhoto = true
+        photoUpdateFailed = false
+        Task { @MainActor in
+            let removed = await removePhoto()
+            isUpdatingPhoto = false
+            if !removed { photoUpdateFailed = true }
+        }
+    }
+
+    @MainActor
     private func submitRename() {
         guard let renameGroup, !isRenaming else { return }
         let name = MessagingGroupTitlePolicy.normalized(renameDraft)
@@ -468,6 +644,114 @@ struct GroupProfileView: View {
                 dismiss()
             } else {
                 leaveFailed = true
+            }
+        }
+    }
+}
+
+/// The group description on its own breathable screen — a pushed destination, never a sheet,
+/// per the app-wide rule for substantive edits. Saving an emptied field clears the description;
+/// the screen pops only once the server has accepted, so what group info shows next is always
+/// the server's answer.
+struct GroupDescriptionEditorView: View {
+    let groupTitle: String
+    let initialDescription: String?
+    let save: (String?) async -> Bool
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var draft: String
+    @State private var isSaving = false
+    @State private var saveFailed = false
+
+    init(groupTitle: String, initialDescription: String?, save: @escaping (String?) async -> Bool) {
+        self.groupTitle = groupTitle
+        self.initialDescription = initialDescription
+        self.save = save
+        _draft = State(initialValue: initialDescription ?? "")
+    }
+
+    private var canonicalDraft: String {
+        MessagingGroupDescriptionPolicy.normalized(draft)
+    }
+
+    private var hasChanges: Bool {
+        canonicalDraft != (initialDescription ?? "")
+    }
+
+    private var isWithinBounds: Bool {
+        canonicalDraft.isEmpty || MessagingGroupDescriptionPolicy.isValid(canonicalDraft)
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                Text("Say what \(groupTitle) is for. Every member can read it; only owners and admins can change it.")
+                    .font(.subheadline)
+                    .foregroundStyle(KitColor.secondaryText)
+
+                TextField("Add a description", text: $draft, axis: .vertical)
+                    .font(.body)
+                    .foregroundStyle(KitColor.primaryText)
+                    .lineLimit(4 ... 12)
+                    .padding(16)
+                    .kitGlass(cornerRadius: 20, shadow: false)
+                    .disabled(isSaving)
+                    .accessibilityLabel("Group description")
+
+                HStack {
+                    if !isWithinBounds {
+                        Text("Descriptions are at most \(MessagingGroupDescriptionPolicy.maximumUnicodeScalars) characters and \(MessagingGroupDescriptionPolicy.maximumUTF8Bytes) UTF-8 bytes.")
+                            .font(.footnote)
+                            .foregroundStyle(.orange)
+                    }
+                    Spacer()
+                    Text("\(canonicalDraft.unicodeScalars.count)/\(MessagingGroupDescriptionPolicy.maximumUnicodeScalars)")
+                        .font(.footnote.monospacedDigit())
+                        .foregroundStyle(KitColor.secondaryText)
+                }
+
+                if saveFailed {
+                    Text("The description could not be changed. Try again.")
+                        .font(.footnote)
+                        .foregroundStyle(.orange)
+                }
+
+                Spacer(minLength: 24)
+            }
+            .padding(22)
+        }
+        .background(KitColor.canvas.ignoresSafeArea())
+        .navigationTitle("Group description")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .confirmationAction) {
+                Button(canonicalDraft.isEmpty && initialDescription != nil ? "Remove" : "Save") {
+                    submit()
+                }
+                .disabled(!hasChanges || !isWithinBounds || isSaving)
+            }
+            if isSaving {
+                ToolbarItem(placement: .cancellationAction) {
+                    ProgressView().controlSize(.small)
+                }
+            }
+        }
+        .interactiveDismissDisabled(isSaving)
+    }
+
+    @MainActor
+    private func submit() {
+        guard hasChanges, isWithinBounds, !isSaving else { return }
+        isSaving = true
+        saveFailed = false
+        let value = canonicalDraft.isEmpty ? nil : canonicalDraft
+        Task { @MainActor in
+            let saved = await save(value)
+            isSaving = false
+            if saved {
+                dismiss()
+            } else {
+                saveFailed = true
             }
         }
     }

@@ -631,6 +631,98 @@ struct AvatarView: View {
     }
 }
 
+/// A group's avatar: the group photo when one is set, otherwise a generated group-styled
+/// disc — a people glyph in the title's stable hue, never one member's face or initials —
+/// plus a small persistent badge that says "group" even while a photo covers the disc.
+/// Photos ride `ProfileAvatarCache`, so a group face seen once survives relaunch and offline.
+struct GroupAvatarView: View {
+    let title: String
+    let photoURL: String?
+    var size: CGFloat = 52
+    /// The unambiguous group marker. On by default; turned off only where the surface already
+    /// says "group" in words right next to the avatar.
+    var showsBadge = true
+
+    @State private var image: UIImage?
+    @Environment(\.colorScheme) private var colorScheme
+
+    init(title: String, photoURL: String?, size: CGFloat = 52, showsBadge: Bool = true) {
+        self.title = title
+        self.photoURL = photoURL
+        self.size = size
+        self.showsBadge = showsBadge
+        _image = State(initialValue: ProfileAvatarCache.cachedImage(for: photoURL))
+    }
+
+    /// Same FNV-1a the initials avatar uses, so a group keeps one stable colour everywhere.
+    private var hue: Double {
+        var hash: UInt64 = 0xcbf29ce484222325
+        for scalar in title.unicodeScalars {
+            hash ^= UInt64(scalar.value)
+            hash = hash &* 0x100000001b3
+        }
+        return Double(hash % 360) / 360
+    }
+
+    private var discColor: Color {
+        colorScheme == .dark
+            ? Color(hue: hue, saturation: 0.38, brightness: 0.30)
+            : Color(hue: hue, saturation: 0.18, brightness: 0.98)
+    }
+
+    private var glyphColor: Color {
+        colorScheme == .dark
+            ? Color(hue: hue, saturation: 0.46, brightness: 0.94)
+            : Color(hue: hue, saturation: 0.62, brightness: 0.57)
+    }
+
+    var body: some View {
+        ZStack {
+            Circle().fill(discColor)
+            Image(systemName: "person.2.fill")
+                .font(.system(size: size * 0.34, weight: .semibold))
+                .foregroundStyle(glyphColor)
+            if let image {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+                    .transition(.opacity)
+            }
+        }
+        .frame(width: size, height: size)
+        .clipShape(Circle())
+        .overlay(alignment: .bottomTrailing) {
+            if showsBadge {
+                Image(systemName: "person.2.fill")
+                    .font(.system(size: size * 0.17, weight: .bold))
+                    .foregroundStyle(.white)
+                    .frame(width: size * 0.36, height: size * 0.36)
+                    .background(KitColor.green, in: Circle())
+                    .overlay {
+                        Circle().stroke(.white, lineWidth: 1.5)
+                    }
+                    .offset(x: size * 0.04, y: size * 0.04)
+                    .accessibilityHidden(true)
+            }
+        }
+        .animation(.easeOut(duration: 0.18), value: image == nil)
+        .task(id: photoURL) { await load() }
+        .accessibilityLabel("Group photo for \(title)")
+    }
+
+    private func load() async {
+        if let cached = ProfileAvatarCache.cachedImage(for: photoURL) {
+            image = cached
+            return
+        }
+        image = nil
+        guard let photoURL else { return }
+        let loaded = await ProfileAvatarCache.shared.image(for: photoURL)
+        guard !Task.isCancelled else { return }
+        image = loaded
+    }
+}
+
 /// Displays initials immediately, then replaces them with the immutable remote profile photo.
 /// Keeping the placeholder in the same fixed circle prevents layout shifts while the image loads.
 ///

@@ -474,6 +474,49 @@ actor APIClient {
         throw ProfileAvatarUploadError.scanTimedOut
     }
 
+    /// Uploads, finalizes, and waits for the moderated scan exactly like a profile photo, but
+    /// stops before the attach: a group photo attaches to a conversation through the messaging
+    /// transport, never to the account. Returns the clean asset's canonical id.
+    func prepareGroupPhotoAsset(jpegData: Data) async throws -> String {
+        let prepared = try await prepareProfileAvatarUpload(jpegData: jpegData)
+        try await ProfileAvatarDeadline.run(
+            maximumWait: ProfileAvatarUploadPolicy.maximumScanWait
+        ) { [self] in
+            try await awaitReadyCleanMediaAsset(assetID: prepared.assetID)
+        }
+        return prepared.assetID
+    }
+
+    private func awaitReadyCleanMediaAsset(assetID: String) async throws {
+        var asset: MediaAssetDTO = try await send(
+            path: "media/\(assetID)",
+            method: "GET",
+            body: EmptyBody()
+        )
+        for attempt in 0 ..< ProfileAvatarUploadPolicy.maximumScanPolls {
+            try Task.checkCancellation()
+            guard asset.id.caseInsensitiveCompare(assetID) == .orderedSame else {
+                throw ProfileAvatarUploadError.invalidServiceResponse
+            }
+            if asset.status.caseInsensitiveCompare("ready") == .orderedSame,
+               asset.scan.status.caseInsensitiveCompare("clean") == .orderedSame {
+                return
+            }
+            if ["failed", "rejected", "deleted"].contains(asset.status.lowercased())
+                || ["failed", "infected"].contains(asset.scan.status.lowercased()) {
+                throw ProfileAvatarUploadError.rejected
+            }
+            guard attempt + 1 < ProfileAvatarUploadPolicy.maximumScanPolls else { break }
+            try await Task.sleep(nanoseconds: ProfileAvatarUploadPolicy.scanPollNanoseconds)
+            asset = try await send(
+                path: "media/\(assetID)",
+                method: "GET",
+                body: EmptyBody()
+            )
+        }
+        throw ProfileAvatarUploadError.scanTimedOut
+    }
+
     private func canonicalProfileAvatarAssetID(_ value: String) throws -> String {
         guard value == value.trimmingCharacters(in: .whitespacesAndNewlines),
               let identifier = UUID(uuidString: value)
@@ -1821,6 +1864,15 @@ struct RTCIceServer: Decodable {
 struct CallSessionDTO: Decodable {
     let call: CallDTO
     let rtc: RTCDetails
+    /// The server instant this response was built. Present on accept: paired with the call's
+    /// `answered_at` it gives the call's true age at delivery, so the answering device can
+    /// anchor its timer without trusting its own wall clock.
+    let serverTime: String?
+
+    enum CodingKeys: String, CodingKey {
+        case call, rtc
+        case serverTime = "server_time"
+    }
 }
 
 struct PushTokenStatus: Decodable {

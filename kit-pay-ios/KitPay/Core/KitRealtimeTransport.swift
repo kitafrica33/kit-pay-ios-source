@@ -85,6 +85,7 @@ enum KitPusherInboundFrame: Equatable, Sendable {
     case memberRemoved(channel: String, userID: String)
     case syncNudge(channel: String)
     case typing(channel: String, userID: String, isTyping: Bool)
+    case callAnswered(channel: String, signal: CallAnswerSignal)
     case ignored
     case rejectedClientEvent
 
@@ -188,6 +189,27 @@ enum KitPusherCodec {
                 userID: userID,
                 isTyping: event == "kit.typing"
             )
+        case "kit.call.answered":
+            // Fully validated before anything downstream may act, because acting on this
+            // silences a ringing device, starts both call timers, and moves CallKit state.
+            // The shape is exact, and the pair of instants must describe an age the server's
+            // own four-hour cap allows — judged clock-to-clock, never against this device's.
+            guard let channel = channel(in: object),
+                  let payload = applicationObject(object["data"]),
+                  Set(payload.keys) == [
+                      "v", "call_id", "state", "answered_at", "answered_by", "server_time",
+                  ],
+                  exactInteger(payload["v"]) == 1,
+                  payload["state"] as? String == CallAnswerSignalPolicy.activeState,
+                  let rawAnsweredBy = payload["answered_by"] as? String,
+                  KitRealtimeIdentifierPolicy.canonicalUserID(rawAnsweredBy) != nil,
+                  let signal = CallAnswerSignalPolicy.signal(
+                      callId: payload["call_id"] as? String,
+                      answeredAt: payload["answered_at"] as? String,
+                      serverTime: payload["server_time"] as? String
+                  )
+            else { return nil }
+            return .callAnswered(channel: channel, signal: signal)
         default:
             return .ignored
         }
@@ -843,6 +865,22 @@ actor KitReverbRealtimeTransport: KitRealtimeTransport {
                 userID: actorID,
                 isTyping: isTyping
             ))
+        case .callAnswered(let channel, let signal):
+            // Only the authenticated user channel may say a call was answered — a presence
+            // channel peer must never be able to silence this device's ring or start its
+            // timer. A frame outside that channel is treated as the hostile input it is.
+            guard connectionState == .live,
+                  channel == userChannel,
+                  subscribedChannels.contains(channel)
+            else {
+                try recordDroppedFrame()
+                return
+            }
+            // A stale advertisement is benign, not hostile: the server can enable the frame
+            // before this client refreshes capabilities. Dropping it silently keeps the push
+            // as the answer path without counting authentic frames toward the flood guard.
+            guard configuration?.callAnswerEnabled == true else { return }
+            emit(.callAnswered(signal))
         case .connectionEstablished:
             if connectionState != .handshaking { try recordDroppedFrame() }
         case .ignored, .rejectedClientEvent:

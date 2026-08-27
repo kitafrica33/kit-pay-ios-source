@@ -21,16 +21,28 @@ struct CallMediaHandoff: Sendable {
     let token: String
     let room: String
     let expiresAt: String
+    /// The server's answer instant and its own send clock, verbatim from the response that
+    /// carried this handoff. Present only on an accept — the answering device already holds
+    /// the authoritative anchor and must not wait for a frame or a push to learn it. A start
+    /// response carries neither: nobody has answered yet.
+    let answeredAt: String?
+    let serverTime: String?
 
     init(session: CallSessionDTO, participantAvatarURL: String? = nil) throws {
         try self.init(
             call: session.call,
             rtc: session.rtc,
-            participantAvatarURL: participantAvatarURL
+            participantAvatarURL: participantAvatarURL,
+            serverTime: session.serverTime
         )
     }
 
-    init(call: CallDTO, rtc: RTCDetails, participantAvatarURL: String? = nil) throws {
+    init(
+        call: CallDTO,
+        rtc: RTCDetails,
+        participantAvatarURL: String? = nil,
+        serverTime: String? = nil
+    ) throws {
         try self.init(
             callId: call.id,
             conversationId: call.conversationId,
@@ -38,7 +50,9 @@ struct CallMediaHandoff: Sendable {
             participantAvatarURL: participantAvatarURL,
             direction: call.direction,
             video: call.isVideoCall,
-            rtc: rtc
+            rtc: rtc,
+            answeredAt: call.answeredAt,
+            serverTime: serverTime
         )
     }
 
@@ -54,6 +68,8 @@ struct CallMediaHandoff: Sendable {
             direction: direction,
             video: video,
             rtc: rtc,
+            answeredAt: answeredAt,
+            serverTime: serverTime,
             expectedRoom: room
         )
     }
@@ -66,6 +82,8 @@ struct CallMediaHandoff: Sendable {
         direction: String,
         video: Bool,
         rtc: RTCDetails,
+        answeredAt: String? = nil,
+        serverTime: String? = nil,
         expectedRoom: String? = nil
     ) throws {
         guard UUID(uuidString: callId) != nil,
@@ -94,6 +112,8 @@ struct CallMediaHandoff: Sendable {
         token = rtc.token
         room = rtc.room
         expiresAt = rtc.expiresAt
+        self.answeredAt = answeredAt
+        self.serverTime = serverTime
     }
 }
 

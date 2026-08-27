@@ -51,6 +51,17 @@ struct MessagingAPIEndpoint {
         )
     }
 
+    static func conversationPhoto(
+        _ conversationId: String,
+        method: String
+    ) throws -> MessagingAPIEndpoint {
+        try requireUUID(conversationId, field: "conversation ID")
+        return MessagingAPIEndpoint(
+            path: "messaging/conversations/\(conversationId)/photo",
+            method: method
+        )
+    }
+
     static func conversationMembers(_ conversationId: String) throws -> MessagingAPIEndpoint {
         try requireUUID(conversationId, field: "conversation ID")
         return MessagingAPIEndpoint(
@@ -144,6 +155,18 @@ struct MessagingAPIEndpoint {
         return MessagingAPIEndpoint(
             path: "messaging/conversations/\(conversationId)/messages/\(messageId)/history-envelopes",
             method: "POST"
+        )
+    }
+
+    static func messageInfo(
+        conversationId: String,
+        messageId: String
+    ) throws -> MessagingAPIEndpoint {
+        try requireUUID(conversationId, field: "conversation ID")
+        try requireUUID(messageId, field: "message ID")
+        return MessagingAPIEndpoint(
+            path: "messaging/conversations/\(conversationId)/messages/\(messageId)/info",
+            method: "GET"
         )
     }
 
@@ -244,6 +267,43 @@ extension APIClient {
             path: endpoint.path,
             method: endpoint.method,
             body: try RenameMessagingGroupRequest(title: title)
+        )
+    }
+
+    func updateGroupMessagingConversationDescription(
+        conversationId: String,
+        description: String?
+    ) async throws -> MessagingConversationDTO {
+        let endpoint = try MessagingAPIEndpoint.updateConversation(conversationId)
+        return try await send(
+            path: endpoint.path,
+            method: endpoint.method,
+            body: try UpdateMessagingGroupDescriptionRequest(description: description)
+        )
+    }
+
+    func attachGroupMessagingConversationPhoto(
+        conversationId: String,
+        assetId: String
+    ) async throws -> MessagingConversationDTO {
+        let endpoint = try MessagingAPIEndpoint.conversationPhoto(conversationId, method: "PUT")
+        return try await send(
+            path: endpoint.path,
+            method: endpoint.method,
+            body: try AttachMessagingGroupPhotoRequest(assetId: assetId)
+        )
+    }
+
+    /// APIClient's DELETE policy guarantees the request carries no JSON body, matching the
+    /// backend's strict bodyless contract for this endpoint.
+    func removeGroupMessagingConversationPhoto(
+        conversationId: String
+    ) async throws -> MessagingConversationDTO {
+        let endpoint = try MessagingAPIEndpoint.conversationPhoto(conversationId, method: "DELETE")
+        return try await send(
+            path: endpoint.path,
+            method: endpoint.method,
+            body: MessagingEmptyBody()
         )
     }
 
@@ -361,6 +421,19 @@ extension APIClient {
     ) async throws -> MessageDeliveryAcknowledgementDTO {
         let endpoint = MessagingAPIEndpoint.deliveryAcknowledgements
         return try await send(path: endpoint.path, method: endpoint.method, body: request)
+    }
+
+    /// Sent, delivered and read moments for one message. The server answers this only to the
+    /// person who sent it, so a 403 here is the contract working rather than a failure to explain.
+    func messagingMessageInfo(
+        conversationId: String,
+        messageId: String
+    ) async throws -> MessagingMessageInfoDTO {
+        let endpoint = try MessagingAPIEndpoint.messageInfo(
+            conversationId: conversationId,
+            messageId: messageId
+        )
+        return try await send(path: endpoint.path, method: endpoint.method, body: MessagingEmptyBody())
     }
 
     func markMessagingConversationRead(

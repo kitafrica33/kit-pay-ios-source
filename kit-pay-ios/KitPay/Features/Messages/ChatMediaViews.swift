@@ -16,6 +16,25 @@ struct ChatStagedAttachment: Identifiable {
     /// filename survives the v1 wire format.
     let displayName: String
     let previewImage: UIImage?
+    /// Shares retained in the app-group inbox reuse their source UUID across retries. Ordinary
+    /// camera/library attachments leave this nil and receive the queue's usual fresh identifier.
+    let clientMessageID: UUID?
+
+    init(
+        kind: KitChatMediaKind,
+        data: Data,
+        mediaType: String,
+        displayName: String,
+        previewImage: UIImage?,
+        clientMessageID: UUID? = nil
+    ) {
+        self.kind = kind
+        self.data = data
+        self.mediaType = mediaType
+        self.displayName = displayName
+        self.previewImage = previewImage
+        self.clientMessageID = clientMessageID
+    }
 
     var byteLabel: String { ChatMediaBytes.label(data.count) }
 }

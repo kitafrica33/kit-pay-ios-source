@@ -74,8 +74,8 @@ struct KitPayApp: App {
                     syncMinimizedCallSurface()
                 }
                 .onOpenURL { url in
-                    // The share extension's hand-off carries no payload — it only says that
-                    // something is waiting in Kit Pay's own container.
+                    // Retain the no-payload share route for pre-picker development builds. The
+                    // shipping share extension does not try to launch its containing app.
                     if KitShareHandoffLink.matches(url) {
                         model.refreshSharedInbox()
                     } else {
@@ -100,10 +100,9 @@ struct KitPayApp: App {
                         // playback belongs back inside it rather than in a floating window over
                         // the app the user has just returned to.
                         ChatVideoPictureInPicture.shared.stopForForegroundIfNeeded()
-                        // A share may have been staged while Kit Pay was in the background, and
-                        // the extension's request to open the app is not guaranteed to arrive.
-                        // Looking every time the app comes forward is what makes the hand-off
-                        // reliable rather than hopeful.
+                        // A share may have been staged while Kit Pay was in the background. Share
+                        // extensions cannot launch their containing app, so every foreground is
+                        // the reliable hand-off point.
                         model.refreshSharedInbox()
                         syncMinimizedCallSurface()
                     } else if phase == .inactive {
@@ -130,6 +129,7 @@ struct KitPayApp: App {
     private var sharedInboxReadiness: String {
         [
             String(model.isSignedIn),
+            String(model.isOnline),
             String(model.requiresBiometricSignIn),
             String(model.accountSetupStep == nil),
         ].joined(separator: ":")

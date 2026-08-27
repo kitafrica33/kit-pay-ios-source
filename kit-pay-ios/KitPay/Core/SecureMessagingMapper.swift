@@ -308,7 +308,7 @@ enum SecureMessagingHistoryBackfillCodec {
               (1...127).contains(identity.senderSignalDeviceID),
               SecureMessagingValidation.isRosterRevision(identity.rosterRevision),
               identity.replyToMessageID.map(SecureMessagingValidation.isCanonicalUUID) ?? true,
-              identity.kind != .encryptedReaction || identity.replyToMessageID != nil
+              !identity.kind.isTimelineMetadata || identity.replyToMessageID != nil
         else { throw SecureMessagingCryptoError.invalidContent }
     }
 

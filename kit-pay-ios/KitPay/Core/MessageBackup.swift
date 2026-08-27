@@ -342,7 +342,15 @@ enum MessageBackupValidationPolicy {
                   (message.failureReason?.utf8.count ?? 0) <= 4_096,
                   [.sent, .delivered, .read, .received].contains(message.state),
                   message.pendingAttachment == nil,
-                  message.serverMessageId.map(SecureMessagingWirePolicy.isCanonicalUUID) ?? true
+                  message.serverMessageId.map(SecureMessagingWirePolicy.isCanonicalUUID) ?? true,
+                  message.replyToServerMessageID
+                    .map(SecureMessagingWirePolicy.isCanonicalUUID) ?? true,
+                  // A message never answers itself, and a reaction is never an answer.
+                  message.replyToServerMessageID == nil
+                    || message.replyToServerMessageID
+                        != message.serverMessageId?.lowercased(),
+                  message.replyToServerMessageID == nil
+                    || !KitMessageReaction.isReactionText(message.body)
             else { throw MessageBackupError.invalidBackup }
             // Accumulated stepwise rather than as one expression: the summed optionals are cheap
             // at runtime but expensive to type-check as a single term.
@@ -360,6 +368,7 @@ enum MessageBackupValidationPolicy {
             messageBytes += message.senderId.utf8.count
             messageBytes += message.serverMessageId?.utf8.count ?? 0
             messageBytes += message.failureReason?.utf8.count ?? 0
+            messageBytes += message.replyToServerMessageID?.utf8.count ?? 0
             messageBytes += historyBytes
             guard addBounded(
                 messageBytes,
@@ -396,6 +405,11 @@ enum MessageBackupValidationPolicy {
                       SecureMessagingWirePolicy.isRosterRevision(history.rosterRevision),
                       history.replyToMessageID.map(SecureMessagingWirePolicy.isCanonicalUUID)
                         ?? true,
+                      // The visible pointer must be the authenticated one, not a second claim
+                      // about who this message answers.
+                      message.replyToServerMessageID == nil
+                        || message.replyToServerMessageID
+                            == history.replyToMessageID?.lowercased(),
                       SecureMessagingContentBindingPolicy.kind(
                           for: message.body,
                           replyToMessageID: history.replyToMessageID,
@@ -405,6 +419,13 @@ enum MessageBackupValidationPolicy {
                         || (message.serverMessageId != nil
                             && history.senderUserID == message.senderId
                             && MessageReactionAggregationPolicy.hasValidTarget(
+                                for: message,
+                                among: payload.messages
+                            )),
+                      history.kind != .encryptedEdit
+                        || (message.serverMessageId != nil
+                            && history.senderUserID == message.senderId
+                            && MessageEditAggregationPolicy.hasValidTarget(
                                 for: message,
                                 among: payload.messages
                             ))

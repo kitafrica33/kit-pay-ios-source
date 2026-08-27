@@ -124,6 +124,9 @@ private enum SecureMessageSubmissionKind {
     /// allowed only in a group thread and never in a one-to-one chat.
     case groupPaymentEvent
     case reactionEvent
+    /// A correction to the wording of one's own already-sent message, allowed only through the
+    /// typed edit boundary and only inside the fifteen minutes the server also enforces.
+    case editEvent
 }
 
 private struct CommunicationPreferenceConflictRefreshFailure: Error {}
@@ -714,6 +717,12 @@ final class AppModel: ObservableObject {
     /// that stale task from committing into the replacement account.
     private var flushingAccountEpoch: UUID?
     private var locallyTerminatedCallIds: Set<String> = []
+    /// Answers that arrived before this device could name the call they belong to. Placing a
+    /// call is a `POST /calls` whose response carries the call id and a socket that is already
+    /// live, so on a slow uplink the callee can pick up while that response is still in
+    /// flight. Held by exact call id, oldest first, and claimed the moment a response names
+    /// its call; anything else ages out of the bounded buffer without ever being applied.
+    private var pendingCallAnswers: [(callId: String, signal: CallAnswerSignal?)] = []
     private var accountEpoch = UUID()
     private var paymentRequestChatShareLeases: [String: PaymentRequestChatShareLease] = [:]
     private var capabilitiesRequestTracker = CapabilitiesRequestResolutionTracker()
@@ -727,6 +736,7 @@ final class AppModel: ObservableObject {
     private var contactSyncTask: Task<Bool, Never>?
     private var contactSyncGeneration: UInt64 = 0
     private var contactChangeDebounceTask: Task<Void, Never>?
+    private var resolvingSharedInboxBatchID: UUID?
     private var contactSyncNeedsAnotherPass = false
     private var didRequestContactsAtLaunch = false
     private var isApplyingAccountDiscoveryChoice = false
@@ -1035,6 +1045,21 @@ final class AppModel: ObservableObject {
                     Task { @MainActor in await self?.refresh() }
                     return
                 }
+                if let payload = notification.object as? [AnyHashable: Any],
+                   let answered = CallAnsweredPush(payload: payload) {
+                    // The push fallback of the answer signal. Applied directly — the refresh
+                    // that used to be this wake's only effect still runs, but off the path
+                    // between the callee picking up and this device reflecting it.
+                    Task { @MainActor in
+                        guard let self else { return }
+                        self.handleCallAnswerSignal(
+                            callId: answered.callId,
+                            signal: answered.signal
+                        )
+                        await self.refresh()
+                    }
+                    return
+                }
                 Task { @MainActor in
                     guard let self else { return }
                     if SecureMessagingRemoteWake(notification.object) != nil {
@@ -1243,6 +1268,10 @@ final class AppModel: ObservableObject {
     var messagingReactionsEnabled: Bool {
         secureMessagingAvailable
             && MessagingReactionCapabilityPolicy.isEnabled(features: capabilities?.features)
+    }
+    var messagingMessageEditsEnabled: Bool {
+        secureMessagingAvailable
+            && MessagingMessageEditCapabilityPolicy.isEnabled(features: capabilities?.features)
     }
     var messagingRealtimeConfiguration: KitRealtimeConfiguration? {
         guard appReviewDemoMutationsAllowed, secureMessagingAvailable else { return nil }
@@ -1710,6 +1739,7 @@ final class AppModel: ObservableObject {
         let displayedState = appReviewDemoProjectedState(from: projection.state)
         state = displayedState
         syncAvatarCacheAccount()
+        publishSharedDestinationsIfPossible()
         return displayedState
     }
 
@@ -2324,6 +2354,7 @@ final class AppModel: ObservableObject {
         biometricAccessState = .notRequired
         homeBiometricState = .notRequired
         locallyTerminatedCallIds.removeAll()
+        pendingCallAnswers.removeAll()
         await publishLatestState()
         rebuildCallContacts()
         _ = await reloadCapabilities()
@@ -3276,13 +3307,121 @@ final class AppModel: ObservableObject {
             && !protectedLocalStateRecoveryBlocked
     }
 
-    /// Looks for anything the share sheet left in the app group container. Called on launch, on
-    /// every return to the foreground, and when the extension opens Kit Pay directly.
+    /// Gives the extension a small, account-bound address book it can render while this process is
+    /// suspended. It contains five recent chats followed by other eligible Kit Pay contacts and
+    /// groups. The extension receives no phone numbers, group roster, messages, credentials, or
+    /// key material; every opaque route UUID is revalidated here when the app becomes active.
+    private func publishSharedDestinationsIfPossible() {
+        guard canDeliverSharedContent,
+              appReviewDemoMutationsAllowed,
+              secureMessagingAvailable,
+              hasUsableCommunicationPrivacyProjection,
+              let rawAccountID = profile?.id,
+              let accountID = SharedInboxPolicy.canonicalAccountID(rawAccountID),
+              SharedInboxStore.shared.setActiveAccountID(accountID)
+        else {
+            // Recipient names are convenience data, not an entitlement to bypass the app's lock.
+            // Keep the opaque account binding so a share can still wait safely, but expose no
+            // directory while biometric/setup/privacy gates are closed.
+            SharedInboxStore.shared.clearDestinations()
+            return
+        }
+
+        let currentUserID = profile?.id
+        let directory = contactDirectory
+        let recentCandidates = state.conversations.compactMap {
+            conversation -> (destination: SharedInboxDestination, updatedAt: Date)? in
+                guard !isReadOnlyAppReviewDemoConversation(conversation.id),
+                      let conversationID = SharedInboxPolicy.canonicalConversationID(
+                          conversation.id
+                      )
+                else { return nil }
+                let identity = ConversationContactPresentationPolicy.presentation(
+                    for: conversation,
+                    currentUserID: currentUserID,
+                    contacts: directory
+                )
+                guard let displayName = SharedInboxPolicy.destinationDisplayName(
+                    identity.displayName
+                ) else { return nil }
+
+                if conversation.isGroup {
+                    guard messagingGroupsEnabled else { return nil }
+                    let memberIDs = conversation.participantUserIds.compactMap {
+                        SharedInboxPolicy.canonicalAccountID($0)
+                    }
+                    guard memberIDs.count == conversation.participantUserIds.count,
+                          Set(memberIDs).count == memberIDs.count,
+                          memberIDs.count >= 2,
+                          memberIDs.contains(accountID)
+                    else { return nil }
+                    return (SharedInboxDestination(
+                        conversationID: conversationID,
+                        recipientUserID: nil,
+                        displayName: displayName,
+                        kind: .group,
+                        memberCount: memberIDs.count
+                    ), conversation.updatedAt)
+                }
+
+                guard let rawRecipientUserID = identity.recipientUserID,
+                      let recipientUserID = SharedInboxPolicy.canonicalAccountID(
+                          rawRecipientUserID
+                      ),
+                      communicationPrivacyAllowsOutbound(to: recipientUserID),
+                      !isCommunicationBlocked(userID: recipientUserID)
+                else { return nil }
+                return (SharedInboxDestination(
+                    conversationID: conversationID,
+                    recipientUserID: recipientUserID,
+                    displayName: displayName,
+                    kind: .direct,
+                    memberCount: nil
+                ), conversation.updatedAt)
+            }
+        let contactDestinations = ContactRecipientDirectory
+            .ordered(communicationContactDirectory, context: phoneIdentityContext)
+            .compactMap { contact -> SharedInboxDestination? in
+                guard let rawRecipientUserID = ContactRecipientDirectory.recipientUserId(for: contact),
+                      let recipientUserID = SharedInboxPolicy.canonicalAccountID(
+                          rawRecipientUserID
+                      ),
+                      recipientUserID.caseInsensitiveCompare(accountID) != .orderedSame,
+                      communicationPrivacyAllowsOutbound(to: recipientUserID),
+                      !isCommunicationBlocked(userID: recipientUserID),
+                      let displayName = SharedInboxPolicy.destinationDisplayName(contact.name)
+                else { return nil }
+                return SharedInboxDestination(
+                    conversationID: nil,
+                    recipientUserID: recipientUserID,
+                    displayName: displayName,
+                    kind: .contact,
+                    memberCount: nil
+                )
+            }
+        let destinations = SharedInboxPolicy.orderedDestinations(
+            recentCandidates: recentCandidates,
+            contacts: contactDestinations
+        )
+        guard SharedInboxStore.shared.setDestinations(
+            destinations,
+            forAccountID: accountID
+        ) else {
+            SharedInboxStore.shared.clearDestinations()
+            return
+        }
+    }
+
+    /// Looks for anything the share sheet left in the app group container. Called on launch and on
+    /// every return to the foreground; a share extension cannot open its containing app itself.
     ///
     /// Oldest batch first: someone who shared twice before switching apps gets both, in the order
     /// they shared them, rather than one silently displacing the other.
     func refreshSharedInbox() {
-        guard canDeliverSharedContent else { return }
+        guard canDeliverSharedContent else {
+            SharedInboxStore.shared.clearDestinations()
+            return
+        }
         guard appReviewDemoMutationsAllowed else {
             // The read-only review account cannot send anything, so a staged share would sit in
             // front of a picker that refuses every choice.
@@ -3293,10 +3432,190 @@ final class AppModel: ObservableObject {
         guard let accountID = profile?.id,
               SharedInboxStore.shared.setActiveAccountID(accountID)
         else { return }
-        guard pendingSharedInboxBatch == nil, sharedInboxDelivery == nil else { return }
-        pendingSharedInboxBatch = SharedInboxStore.shared
-            .pendingBatches(forAccountID: accountID)
-            .first
+        publishSharedDestinationsIfPossible()
+        let now = Date()
+        if let delivery = sharedInboxDelivery,
+           SharedInboxPolicy.isExpired(receivedAt: delivery.batch.receivedAt, now: now) {
+            sharedInboxDelivery = nil
+            SharedInboxStore.shared.remove(batchID: delivery.batch.id)
+        }
+        if let batch = pendingSharedInboxBatch,
+           SharedInboxPolicy.isExpired(receivedAt: batch.receivedAt, now: now) {
+            pendingSharedInboxBatch = nil
+            SharedInboxStore.shared.remove(batchID: batch.id)
+        }
+        guard sharedInboxDelivery == nil else { return }
+        if pendingSharedInboxBatch == nil {
+            pendingSharedInboxBatch = SharedInboxStore.shared
+                .pendingBatches(forAccountID: accountID)
+                .first
+        }
+        if let batch = pendingSharedInboxBatch {
+            let startedConversationIDs = durableSharedInboxConversationIDs(for: batch)
+            if startedConversationIDs.count == 1,
+               let conversationID = startedConversationIDs.first {
+                routeSharedInbox(to: conversationID)
+                return
+            }
+            if startedConversationIDs.count > 1 {
+                lastError = "This staged share has conflicting local delivery records. Remove it and share again."
+                return
+            }
+        }
+        routeRequestedSharedInboxDestinationIfPossible()
+    }
+
+    /// Stable share item UUIDs double as outbox/message UUIDs. The protected local projection is
+    /// therefore the durable truth after a process restart: if any item already exists, the batch
+    /// is pinned to that conversation and can never be re-routed into a duplicate/collision.
+    private func durableSharedInboxConversationIDs(for batch: SharedInboxBatch) -> Set<String> {
+        var messageIDs = Set(batch.items.map(\.id))
+        if batch.text != nil { messageIDs.insert(batch.id) }
+        return Set(state.messages.compactMap { message in
+            guard message.isOutgoing, messageIDs.contains(message.id) else { return nil }
+            return SharedInboxPolicy.canonicalConversationID(message.conversationId)
+        })
+    }
+
+    func sharedInboxHasDurablyQueuedContent(_ batch: SharedInboxBatch) -> Bool {
+        !durableSharedInboxConversationIDs(for: batch).isEmpty
+    }
+
+    /// A share-extension choice is a request, never authority. Existing chats are resolved only
+    /// from protected local state. A contact without a thread goes through the authenticated,
+    /// server-idempotent direct-conversation creation path when online; offline it remains visible
+    /// in the in-app picker and its bytes stay queued.
+    private func routeRequestedSharedInboxDestinationIfPossible() {
+        guard let batch = pendingSharedInboxBatch,
+              let destination = batch.destination,
+              canDeliverSharedContent
+        else { return }
+
+        let routePrivacyAllows = destination.kind == .group
+            || (communicationPrivacyAllowsOutbound(to: destination.recipientUserID)
+                && !isCommunicationBlocked(userID: destination.recipientUserID))
+        guard routePrivacyAllows else { return }
+        if let conversationID = destination.conversationID,
+           let conversation = state.conversations.first(where: {
+               $0.id.caseInsensitiveCompare(conversationID) == .orderedSame
+           }), let currentAccountID = profile?.id,
+           SharedInboxPolicy.destinationRequest(
+               destination,
+               matchesConversationID: conversation.id,
+               isGroup: conversation.isGroup,
+               participantUserIDs: conversation.participantUserIds,
+               currentAccountID: currentAccountID
+           ) {
+            routeSharedInbox(to: conversation.id)
+            return
+        }
+        guard destination.kind != .group,
+              let recipientUserID = destination.recipientUserID
+        else { return }
+        if let conversation = existingDirectConversationForSharedInbox(
+            recipientUserID: recipientUserID
+        ) {
+            routeSharedInbox(to: conversation.id)
+            return
+        }
+        guard isOnline,
+              secureMessagingAvailable,
+              communicationPrivacyAllowsOutbound(to: recipientUserID),
+              !isCommunicationBlocked(userID: recipientUserID),
+              resolvingSharedInboxBatchID != batch.id
+        else { return }
+        resolvingSharedInboxBatchID = batch.id
+        Task { [weak self] in
+            await self?.resolveSharedInboxContactDestination(
+                batchID: batch.id,
+                recipientUserID: recipientUserID,
+                title: destination.displayName
+            )
+            if self?.resolvingSharedInboxBatchID == batch.id {
+                self?.resolvingSharedInboxBatchID = nil
+            }
+        }
+    }
+
+    private func existingDirectConversationForSharedInbox(
+        recipientUserID: String
+    ) -> Conversation? {
+        guard let currentUserID = SharedInboxPolicy.canonicalAccountID(profile?.id),
+              let recipientUserID = SharedInboxPolicy.canonicalAccountID(recipientUserID)
+        else { return nil }
+        let participants = Set([currentUserID, recipientUserID])
+        return state.conversations
+            .filter {
+                !$0.isGroup
+                    && Set($0.participantUserIds.compactMap {
+                        SharedInboxPolicy.canonicalAccountID($0)
+                    }) == participants
+            }
+            .max { $0.updatedAt < $1.updatedAt }
+    }
+
+    private func resolveSharedInboxContactDestination(
+        batchID: UUID,
+        recipientUserID: String,
+        title: String
+    ) async {
+        guard pendingSharedInboxBatch?.id == batchID,
+              canDeliverSharedContent,
+              isOnline,
+              secureMessagingAvailable,
+              let currentUserID = profile?.id,
+              let expectedSessionID = await sessions.current()?.sessionId,
+              let commitAdmission = ProtectedCommunicationAdmissionGate.shared.lease(
+                  forAccountID: currentUserID
+              )
+        else { return }
+        let expectedAccountEpoch = accountEpoch
+        guard await outboxContextIsCurrent(
+            accountEpoch: expectedAccountEpoch,
+            userID: currentUserID,
+            sessionID: expectedSessionID
+        ) else { return }
+
+        do {
+            let created = try await APIClientSessionBinding.$sessionID.withValue(
+                expectedSessionID
+            ) {
+                try await SecureMessagingExchangeCoordinator.shared.ensureDirectConversation(
+                    forUserID: currentUserID,
+                    recipientUserID: recipientUserID,
+                    title: title,
+                    commitAdmission: commitAdmission
+                )
+            }
+            guard pendingSharedInboxBatch?.id == batchID,
+                  ProtectedCommunicationAdmissionGate.shared.permits(commitAdmission),
+                  await outboxContextIsCurrent(
+                      accountEpoch: expectedAccountEpoch,
+                      userID: currentUserID,
+                      sessionID: expectedSessionID
+                  )
+            else { return }
+            await publishLatestState()
+            guard pendingSharedInboxBatch?.id == batchID,
+                  let resolved = existingDirectConversationForSharedInbox(
+                      recipientUserID: recipientUserID
+                  ),
+                  resolved.id.caseInsensitiveCompare(created.id) == .orderedSame
+            else { return }
+            routeSharedInbox(to: resolved.id)
+        } catch is CancellationError {
+            return
+        } catch {
+            // Keep the batch intact and the ordinary destination picker usable. A transient
+            // network failure must never turn a staged share into a disappearance.
+            guard pendingSharedInboxBatch?.id == batchID,
+                  await outboxContextIsCurrent(
+                      accountEpoch: expectedAccountEpoch,
+                      userID: currentUserID,
+                      sessionID: expectedSessionID
+                  )
+            else { return }
+        }
     }
 
     /// The chat the customer chose for the share now in front of them.
@@ -3305,12 +3624,34 @@ final class AppModel: ObservableObject {
               canDeliverSharedContent,
               let conversation = state.conversations.first(where: {
                   $0.id.caseInsensitiveCompare(conversationID) == .orderedSame
-              })
+              }), sharedInboxConversationIsEligible(conversation)
         else { return }
+        let durableConversationIDs = durableSharedInboxConversationIDs(for: batch)
+        let canonicalConversationID = SharedInboxPolicy.canonicalConversationID(conversation.id)
+        guard durableConversationIDs.isEmpty
+                || (canonicalConversationID.map { durableConversationIDs == Set([$0]) } == true)
+        else {
+            lastError = "Part of this share is already queued in another conversation. Finish it there or discard what remains."
+            return
+        }
+        guard let destination = sharedInboxDestinationRequest(for: conversation) else { return }
+        let pinnedBatch: SharedInboxBatch
+        do {
+            // Persist the validated destination before the first queue attempt. If the process is
+            // killed after item one of eight, both the manifest and the stable local message IDs
+            // independently force the remaining seven back into this exact conversation.
+            pinnedBatch = try SharedInboxStore.shared.pinDestination(
+                for: batch,
+                to: destination
+            )
+        } catch {
+            lastError = "Kit Pay could not safely save this chat choice. Nothing was queued. Try again."
+            return
+        }
         pendingSharedInboxBatch = nil
         sharedInboxDelivery = SharedInboxDelivery(
             conversationID: conversation.id,
-            batch: batch
+            batch: pinnedBatch
         )
         selectedTab = MainTabIndex.messages
         messageConversationNavigationRequest = MessageConversationNavigationRequest(
@@ -3318,8 +3659,67 @@ final class AppModel: ObservableObject {
         )
     }
 
-    /// Called by the conversation once the shared files are staged in its composer. The plaintext
-    /// in the container is removed at that moment: it now lives only where the user can see it.
+    private func sharedInboxDestinationRequest(
+        for conversation: Conversation
+    ) -> SharedInboxDestinationRequest? {
+        guard let conversationID = SharedInboxPolicy.canonicalConversationID(conversation.id),
+              let currentAccountID = SharedInboxPolicy.canonicalAccountID(profile?.id),
+              let displayName = SharedInboxPolicy.destinationDisplayName(
+                  ConversationContactPresentationPolicy.presentation(
+                      for: conversation,
+                      currentUserID: currentAccountID,
+                      contacts: contactDirectory
+                  ).displayName
+              )
+        else { return nil }
+        let participants = Set(conversation.participantUserIds.compactMap {
+            SharedInboxPolicy.canonicalAccountID($0)
+        })
+        if conversation.isGroup {
+            return SharedInboxDestinationRequest(
+                kind: .group,
+                conversationID: conversationID,
+                recipientUserID: nil,
+                displayName: displayName
+            )
+        }
+        guard let recipientUserID = participants.first(where: { $0 != currentAccountID }) else {
+            return nil
+        }
+        return SharedInboxDestinationRequest(
+            kind: .direct,
+            conversationID: conversationID,
+            recipientUserID: recipientUserID,
+            displayName: displayName
+        )
+    }
+
+    func sharedInboxConversationIsEligible(_ conversation: Conversation) -> Bool {
+        guard secureMessagingAvailable,
+              let currentAccountID = SharedInboxPolicy.canonicalAccountID(profile?.id)
+        else {
+            return false
+        }
+        let canonicalParticipants = conversation.participantUserIds.compactMap {
+            SharedInboxPolicy.canonicalAccountID($0)
+        }
+        let participants = Set(canonicalParticipants)
+        guard canonicalParticipants.count == conversation.participantUserIds.count,
+              participants.count == conversation.participantUserIds.count,
+              participants.contains(currentAccountID)
+        else { return false }
+        if conversation.isGroup {
+            return messagingGroupsEnabled && participants.count >= 2
+        }
+        guard participants.count == 2,
+              let recipientUserID = participants.first(where: { $0 != currentAccountID })
+        else { return false }
+        return communicationPrivacyAllowsOutbound(to: recipientUserID)
+            && !isCommunicationBlocked(userID: recipientUserID)
+    }
+
+    /// Called only after every selected shared item is durably represented in the local outbox.
+    /// At that point its protected handoff copy is redundant and can be removed.
     func consumeSharedInboxDelivery(_ id: UUID) {
         guard let delivery = sharedInboxDelivery, delivery.id == id else { return }
         sharedInboxDelivery = nil
@@ -3337,6 +3737,15 @@ final class AppModel: ObservableObject {
         pendingSharedInboxBatch = delivery.batch
     }
 
+    /// The customer explicitly removed an applied share instead of sending it. This is the only
+    /// pre-outbox path that destroys the protected handoff after it has reached a composer.
+    func discardSharedInboxDelivery(_ id: UUID) {
+        guard let delivery = sharedInboxDelivery, delivery.id == id else { return }
+        sharedInboxDelivery = nil
+        SharedInboxStore.shared.remove(batchID: delivery.batch.id)
+        refreshSharedInbox()
+    }
+
     /// The customer closed the destination picker without choosing a chat.
     func discardPendingSharedInbox() {
         guard let batch = pendingSharedInboxBatch else { return }
@@ -3347,6 +3756,7 @@ final class AppModel: ObservableObject {
 
     /// Nothing shared into the previous account may survive into the next one.
     private func purgeSharedInbox() {
+        resolvingSharedInboxBatchID = nil
         pendingSharedInboxBatch = nil
         sharedInboxDelivery = nil
         SharedInboxStore.shared.removeAll()
@@ -3634,6 +4044,7 @@ final class AppModel: ObservableObject {
             await concealUnresolvedAcceptedAccountDeletionProjection()
         }
         locallyTerminatedCallIds.removeAll()
+        pendingCallAnswers.removeAll()
         didResumeAuthenticatedSession = false
         biometricUnlockEnabled = false
         biometricAccessState = .notRequired
@@ -7412,6 +7823,7 @@ final class AppModel: ObservableObject {
             communicationPreferences = result.0
             communicationBlocks = result.1
             hasLoadedCommunicationPrivacy = true
+            publishSharedDestinationsIfPossible()
             rebuildCallContacts()
             await persistCommunicationPrivacyCache(context: context)
             let refreshedBlockedUserIDs = Set(result.1.lazy.filter(\.blocked).map(\.userId))
@@ -7589,6 +8001,7 @@ final class AppModel: ObservableObject {
             communicationBlocks.removeAll { $0.userId == userID }
             if response.blocked { communicationBlocks.insert(response, at: 0) }
             hasLoadedCommunicationPrivacy = true
+            publishSharedDestinationsIfPossible()
             rebuildCallContacts()
             await persistCommunicationPrivacyCache(context: context)
             await refreshContactsAfterCommunicationBlockChange(context: context)
@@ -7774,6 +8187,7 @@ final class AppModel: ObservableObject {
         communicationPreferences = cache.preferences
         communicationBlocks = cache.blocks
         hasLoadedCommunicationPrivacy = true
+        publishSharedDestinationsIfPossible()
     }
 
     private func persistCommunicationPrivacyCache(
@@ -7974,7 +8388,8 @@ final class AppModel: ObservableObject {
         body: String,
         clientMessageID: UUID? = nil,
         draftClearVersion: ConversationDraftWriteVersion? = nil,
-        deliverAt: Date? = nil
+        deliverAt: Date? = nil,
+        replyToServerMessageID: String? = nil
     ) async -> Bool {
         guard !isReadOnlyAppReviewDemoConversation(conversationId) else {
             lastError = "This App Review preview is read-only."
@@ -7988,7 +8403,8 @@ final class AppModel: ObservableObject {
             clientMessageID: clientMessageID,
             draftClearVersion: draftClearVersion,
             submissionKind: .userText,
-            deliverAt: deliverAt
+            deliverAt: deliverAt,
+            replyToServerMessageID: replyToServerMessageID
         )
     }
 
@@ -8063,7 +8479,7 @@ final class AppModel: ObservableObject {
         guard state.messages.contains(where: { message in
             message.conversationId.lowercased() == canonicalConversationID
                 && message.serverMessageId?.lowercased() == reaction.targetServerMessageID
-                && message.secureMessagingHistory?.kind != .encryptedReaction
+                && message.secureMessagingHistory?.kind.isTimelineMetadata != true
         }) else {
             lastError = "This message is no longer available to react to."
             return false
@@ -8079,6 +8495,46 @@ final class AppModel: ObservableObject {
         )
     }
 
+    /// Queues a correction only through the typed edit boundary. Plain composers and notification
+    /// replies reserve `KITEDIT1:` so pasted text cannot impersonate somebody's second thought.
+    @discardableResult
+    func queueEditEvent(
+        conversationId: String,
+        title: String,
+        recipientId: String?,
+        edit: KitMessageEdit
+    ) async -> Bool {
+        guard messagingMessageEditsEnabled else {
+            lastError = messagingSendFailureMessage
+            return false
+        }
+        guard !isReadOnlyAppReviewDemoConversation(conversationId) else {
+            lastError = "This App Review preview is read-only."
+            return false
+        }
+        let canonicalConversationID = conversationId.lowercased()
+        // The same test the long-press menu applied, re-run at the moment of sending: the window
+        // may have closed while the correction was being typed, and only one's own settled
+        // message was ever eligible.
+        guard state.messages.contains(where: { message in
+            message.conversationId.lowercased() == canonicalConversationID
+                && message.serverMessageId?.lowercased() == edit.targetServerMessageID
+                && MessageEditAggregationPolicy.canEdit(message)
+        }) else {
+            lastError = "This message can no longer be edited."
+            return false
+        }
+        return await queueValidatedMessage(
+            conversationId: conversationId,
+            title: title,
+            recipientId: recipientId,
+            body: edit.encoded,
+            clientMessageID: nil,
+            draftClearVersion: nil,
+            submissionKind: .editEvent
+        )
+    }
+
     private func queueValidatedMessage(
         conversationId: String,
         title: String,
@@ -8087,10 +8543,20 @@ final class AppModel: ObservableObject {
         clientMessageID: UUID?,
         draftClearVersion: ConversationDraftWriteVersion?,
         submissionKind: SecureMessageSubmissionKind,
-        deliverAt: Date? = nil
+        deliverAt: Date? = nil,
+        replyToServerMessageID: String? = nil
     ) async -> Bool {
         let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
+        // Only something a person typed can be an answer. Payment cards and reaction descriptors
+        // are events the app authors; they point at nothing.
+        let replyTarget = submissionKind == .userText
+            ? replyToServerMessageID.flatMap { UUID(uuidString: $0)?.uuidString.lowercased() }
+            : nil
+        guard replyToServerMessageID == nil || replyTarget != nil else {
+            lastError = "That message is no longer available to reply to."
+            return false
+        }
         switch submissionKind {
         case .paymentEvent:
             guard KitPaymentMessage.parse(trimmed) != nil else {
@@ -8107,6 +8573,11 @@ final class AppModel: ObservableObject {
                 lastError = "Kit Pay could not validate this reaction."
                 return false
             }
+        case .editEvent:
+            guard KitMessageEdit.parse(trimmed) != nil else {
+                lastError = "Kit Pay could not validate this edit."
+                return false
+            }
         case .userText:
             guard SecureMessageReservedPrefixPolicy.allowsUserAuthoredText(trimmed) else {
                 lastError = "Messages can't start with a reserved Kit Pay event prefix."
@@ -8120,6 +8591,17 @@ final class AppModel: ObservableObject {
         guard secureMessagingAvailable else {
             lastError = messagingSendFailureMessage
             return false
+        }
+        if let replyTarget {
+            guard state.messages.contains(where: { message in
+                message.conversationId.caseInsensitiveCompare(cleanConversationId)
+                    == .orderedSame
+                    && message.serverMessageId?.lowercased() == replyTarget
+                    && message.secureMessagingHistory?.kind.isTimelineMetadata != true
+            }) else {
+                lastError = "That message is no longer available to reply to."
+                return false
+            }
         }
         // A GROUP thread has no single pinned recipient: the coordinator re-validates local
         // membership at queue time, and the per-member privacy/attestation gates run
@@ -8196,7 +8678,8 @@ final class AppModel: ObservableObject {
                 clientMessageID: clientMessageID,
                 submittedDraftBody: draftClearVersion == nil ? nil : body,
                 draftClearVersion: draftClearVersion,
-                deliverAt: deliverAt
+                deliverAt: deliverAt,
+                replyToServerMessageID: replyTarget
             )
             guard await reloadOutboxStateIfCurrent(
                 accountEpoch: expectedAccountEpoch,
@@ -8603,9 +9086,11 @@ final class AppModel: ObservableObject {
         mediaData: Data,
         mediaType: String,
         caption: String?,
+        clientMessageID: UUID? = nil,
         submittedDraftBody: String? = nil,
         draftClearVersion: ConversationDraftWriteVersion? = nil,
-        deliverAt: Date? = nil
+        deliverAt: Date? = nil,
+        replyToServerMessageID: String? = nil
     ) async -> Bool {
         guard !isReadOnlyAppReviewDemoConversation(conversationId) else {
             lastError = "This App Review preview is read-only."
@@ -8618,6 +9103,21 @@ final class AppModel: ObservableObject {
         guard let cleanConversationId = OutboxPolicy.canonicalConversationID(conversationId) else {
             lastError = "This conversation is no longer available. Nothing was sent."
             return false
+        }
+        let replyTarget = replyToServerMessageID
+            .flatMap { UUID(uuidString: $0)?.uuidString.lowercased() }
+        if replyToServerMessageID != nil {
+            guard let replyTarget,
+                  state.messages.contains(where: { message in
+                      message.conversationId.caseInsensitiveCompare(cleanConversationId)
+                          == .orderedSame
+                          && message.serverMessageId?.lowercased() == replyTarget
+                          && message.secureMessagingHistory?.kind.isTimelineMetadata != true
+                  })
+            else {
+                lastError = "That message is no longer available to reply to."
+                return false
+            }
         }
         let isGroupTarget = state.conversations.first(where: {
             $0.id.caseInsensitiveCompare(cleanConversationId) == .orderedSame
@@ -8718,7 +9218,7 @@ final class AppModel: ObservableObject {
             return false
         }
         do {
-            _ = try await SecureMessagingExchangeCoordinator.shared.queueDeferredImage(
+            let queued = try await SecureMessagingExchangeCoordinator.shared.queueDeferredImage(
                 forUserID: userID,
                 conversationID: cleanConversationId,
                 expectedRecipientUserID: recipientUserID,
@@ -8727,15 +9227,33 @@ final class AppModel: ObservableObject {
                 mediaType: mediaType,
                 caption: caption,
                 localStorageKey: parkedLocalKey,
+                clientMessageID: clientMessageID,
                 submittedDraftBody: submittedDraftBody,
                 draftClearVersion: draftClearVersion,
-                deliverAt: deliverAt
+                deliverAt: deliverAt,
+                replyToServerMessageID: replyTarget
             )
-            guard await reloadOutboxStateIfCurrent(
+            let reloaded = await reloadOutboxStateIfCurrent(
                 accountEpoch: expectedAccountEpoch,
                 userID: userID,
                 sessionID: expectedSessionID
-            ) else { return false }
+            )
+            if let parkedLocalKey {
+                // A large exact retry parks a fresh scratch copy before the coordinator discovers
+                // the stable message already exists. Retain the key only when this invocation's
+                // projection actually owns it; otherwise remove that redundant encrypted blob.
+                let persisted = await store.snapshot()
+                let ownsParkedCopy = persisted.messages.first(where: {
+                    $0.id == queued.clientMessageID
+                })?.pendingAttachment?.localStorageKey == parkedLocalKey
+                if !ownsParkedCopy {
+                    await SecureMediaFileCache.shared.remove(
+                        forStorageKey: parkedLocalKey,
+                        userID: userID
+                    )
+                }
+            }
+            guard reloaded else { return false }
             // Media bytes, pending attachment metadata and the outbox command are protected by
             // the same local commit. Upload/encryption replay continues independently from here;
             // kick it immediately so an online send starts uploading without waiting for a wake.
@@ -9146,6 +9664,78 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Description and photo share the rename admission: manager role behind the groups gate.
+    func canEditGroupConversationIdentity(_ conversationID: String) -> Bool {
+        canRenameGroupConversation(conversationID)
+    }
+
+    @discardableResult
+    func updateGroupConversationDescription(
+        _ conversationID: String,
+        description rawDescription: String?
+    ) async -> Bool {
+        let description = rawDescription
+            .map(MessagingGroupDescriptionPolicy.normalized)
+            .flatMap { $0.isEmpty ? nil : $0 }
+        guard canEditGroupConversationIdentity(conversationID),
+              description.map(MessagingGroupDescriptionPolicy.isValid) ?? true
+        else {
+            lastError = "You cannot change this group's description right now."
+            return false
+        }
+        return await performGroupMutation(conversationID: conversationID) {
+            try await SecureMessagingExchangeCoordinator.shared
+                .updateGroupConversationDescription(
+                    forUserID: $0,
+                    conversationID: conversationID,
+                    description: description
+                )
+        }
+    }
+
+    /// Runs the moderated avatar pipeline (upload, scan, sanitize) on the prepared JPEG and
+    /// then asks the server to make the clean asset this group's photo.
+    @discardableResult
+    func updateGroupConversationPhoto(
+        _ conversationID: String,
+        jpegData: Data
+    ) async -> Bool {
+        guard canEditGroupConversationIdentity(conversationID), !jpegData.isEmpty else {
+            lastError = "You cannot change this group's photo right now."
+            return false
+        }
+        let assetID: String
+        do {
+            assetID = try await api.prepareGroupPhotoAsset(jpegData: jpegData)
+        } catch is CancellationError {
+            return false
+        } catch {
+            lastError = error.localizedDescription
+            return false
+        }
+        return await performGroupMutation(conversationID: conversationID) {
+            try await SecureMessagingExchangeCoordinator.shared.attachGroupConversationPhoto(
+                forUserID: $0,
+                conversationID: conversationID,
+                assetID: assetID
+            )
+        }
+    }
+
+    @discardableResult
+    func removeGroupConversationPhoto(_ conversationID: String) async -> Bool {
+        guard canEditGroupConversationIdentity(conversationID) else {
+            lastError = "You cannot change this group's photo right now."
+            return false
+        }
+        return await performGroupMutation(conversationID: conversationID) {
+            try await SecureMessagingExchangeCoordinator.shared.removeGroupConversationPhoto(
+                forUserID: $0,
+                conversationID: conversationID
+            )
+        }
+    }
+
     @discardableResult
     func addGroupConversationMember(
         _ memberUserID: String,
@@ -9291,6 +9881,32 @@ final class AppModel: ObservableObject {
         } catch {
             // Read receipts are background bookkeeping: a failed or already-applied receipt is
             // retried on the next visit and must never interrupt the customer with an alert.
+        }
+    }
+
+    /// Sent, delivered and read moments for a message this account sent.
+    ///
+    /// Returns the reason it could not be answered rather than an empty sheet, because "nobody has
+    /// read this yet" and "we could not ask" look identical on screen and mean opposite things.
+    func messageDeliveryInfo(
+        conversationID: String,
+        serverMessageID: String
+    ) async -> Result<MessageDeliveryInfo, Error> {
+        guard let userID = profile?.id else {
+            return .failure(SecureMessagingExchangeError.invalidAccount)
+        }
+        guard secureMessagingAvailable, !isReadOnlyAppReviewDemoConversation(conversationID) else {
+            return .failure(SecureMessagingExchangeError.invalidConversation)
+        }
+        do {
+            let info = try await SecureMessagingExchangeCoordinator.shared.messageDeliveryInfo(
+                conversationID: conversationID,
+                serverMessageID: serverMessageID,
+                forUserID: userID
+            )
+            return .success(info)
+        } catch {
+            return .failure(error)
         }
     }
 
@@ -9715,6 +10331,9 @@ final class AppModel: ObservableObject {
             lastError = "Finish or cancel the current call attempt before starting another."
             return
         }
+        // Cleared before the request goes out, so only an answer to the call this attempt
+        // is about to place can ever be claimed by it.
+        pendingCallAnswers.removeAll()
         let presentation = ActiveCallPresentation(
             id: attempt.clientCallIDString,
             conversationId: nil,
@@ -10834,6 +11453,10 @@ final class AppModel: ObservableObject {
             await endLateAcceptedCall(result.call.id, lease: attempt.lease)
             return
         }
+        // The response has just named the call, so an answer that overtook it on the socket
+        // or the push can finally be matched and applied — before anything below spends time
+        // between the pickup and this screen reflecting it.
+        claimPendingCallAnswer(callId: result.call.id)
         if ephemeralOutgoingCallTaskID != taskID {
             // A response from the cancelled transport won the idempotent race. Fence the newer
             // request for this same client call ID; a duplicate response must not end this call.
@@ -11001,6 +11624,12 @@ final class AppModel: ObservableObject {
                     encounteredMissingMessagingCapability = true
                     continue
                 }
+                if isMessageEditCommand(activeCommand), !messagingMessageEditsEnabled {
+                    // A correction is held for the same reason: a peer whose client predates the
+                    // descriptor would render one as a bubble full of protocol text.
+                    encounteredMissingMessagingCapability = true
+                    continue
+                }
                 if isGroupMessagingCommand(activeCommand), !messagingGroupsEnabled {
                     // Capability withdrawal makes existing groups read-only. Preserve the
                     // encrypted command for a later authorized replay, but do not prepare or
@@ -11109,6 +11738,10 @@ final class AppModel: ObservableObject {
                         // Preparation awaited the live conversation/roster. Re-check the global
                         // gate before the separate send request so a withdrawn rollout cannot
                         // leak already-prepared reaction ciphertext.
+                        encounteredMissingMessagingCapability = true
+                        continue
+                    }
+                    if isMessageEditCommand(activeCommand), !messagingMessageEditsEnabled {
                         encounteredMissingMessagingCapability = true
                         continue
                     }
@@ -11381,6 +12014,14 @@ final class AppModel: ObservableObject {
               let message = state.messages.first(where: { $0.id == messageID })
         else { return false }
         return KitMessageReaction.parse(message.body) != nil
+    }
+
+    private func isMessageEditCommand(_ command: OfflineCommand) -> Bool {
+        guard command.kind == .secureMessage,
+              let messageID = command.messageId,
+              let message = state.messages.first(where: { $0.id == messageID })
+        else { return false }
+        return KitMessageEdit.parse(message.body) != nil
     }
 
     private func outboxContextIsCurrent(
@@ -12225,6 +12866,80 @@ final class AppModel: ObservableObject {
         _ = clearWaitingCallForLifecycle(callID: action.callId)
         NotificationCoordinator.shared.reportCallEnded(action.callUUID, reason: .failed)
         await terminateCall(id: action.callId, kind: .decline, reason: nil)
+    }
+
+    /// One validated "this call was answered", from any route — the socket frame, the
+    /// `call.answered` push, or a claim from the buffer once a start response named its call.
+    ///
+    /// Three kinds of device receive the same signal and each must do something different:
+    /// the caller advances and anchors its timers, this account's *other* ringing devices
+    /// stop offering the call, and the device that actually answered takes only the
+    /// timestamp. Every branch is fenced by exact call id, so a signal about any other call
+    /// moves nothing here.
+    func handleCallAnswerSignal(callId rawCallId: String, signal: CallAnswerSignal?) {
+        guard isSignedIn,
+              let callId = CallAnswerSignalPolicy.callId(rawCallId)
+        else { return }
+
+        let media = CallMediaCoordinator.shared
+        if media.activeCall?.id.caseInsensitiveCompare(callId) == .orderedSame {
+            media.applyCallAnswered(callId: callId, signal: signal)
+            if media.activeCall?.direction == "outgoing" {
+                // CallKit renders wall-clock dates, so the connect instant is derived from
+                // the two server timestamps and mapped onto local time at receipt. The
+                // device clock supplies only "now" — never the age — which keeps the system
+                // call timer on the same authoritative origin as the in-app one.
+                let age = signal.flatMap {
+                    CallAnswerSignalPolicy.age(
+                        answeredAt: $0.answeredAt,
+                        serverTime: $0.serverTime
+                    )
+                } ?? 0
+                NotificationCoordinator.shared.reportOutgoingCallConnected(
+                    callId: callId,
+                    connectedAt: Date().addingTimeInterval(-age)
+                )
+            }
+            return
+        }
+
+        // Not the call this device is on. If it is one this device is still offering —
+        // ringing full-screen or waiting behind the current call — another device on this
+        // account answered it, and the offer ends as answered-elsewhere rather than ringing
+        // on until the invite expires and recording a miss.
+        if callWaitingState.waitingCall?.callID.caseInsensitiveCompare(callId) == .orderedSame {
+            _ = clearWaitingCallForLifecycle(callID: callId)
+        }
+        NotificationCoordinator.shared.reportCallAnsweredElsewhere(callId: callId)
+
+        // And if a `POST /calls` is in flight, the answer may belong to the very call its
+        // response is about to name. Held for that exact claim instead of being dropped for
+        // not matching a call this device could not yet name.
+        if ephemeralOutgoingCallGate.attempt != nil {
+            rememberPendingCallAnswer(callId: callId, signal: signal)
+        }
+    }
+
+    private func rememberPendingCallAnswer(callId: String, signal: CallAnswerSignal?) {
+        // Re-inserted rather than merged, so a repeat of the same answer refreshes its
+        // position instead of ageing out behind newer, unrelated ones.
+        pendingCallAnswers.removeAll { $0.callId == callId }
+        pendingCallAnswers.append((callId: callId, signal: signal))
+        let capacity = 8
+        if pendingCallAnswers.count > capacity {
+            pendingCallAnswers.removeFirst(pendingCallAnswers.count - capacity)
+        }
+    }
+
+    /// Claims and applies the buffered answer for exactly [callId], once. A successful start
+    /// response calls this the moment it can name its call, which is what closes the gap
+    /// between "the callee picked up" and "this device knew which call that was about".
+    private func claimPendingCallAnswer(callId rawCallId: String) {
+        guard let callId = CallAnswerSignalPolicy.callId(rawCallId),
+              let index = pendingCallAnswers.firstIndex(where: { $0.callId == callId })
+        else { return }
+        let pending = pendingCallAnswers.remove(at: index)
+        handleCallAnswerSignal(callId: pending.callId, signal: pending.signal)
     }
 
     func handleCallSystemAction(_ action: CallSystemAction) async {

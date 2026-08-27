@@ -3,9 +3,9 @@ import SwiftUI
 /// The one question the share extension cannot answer: which chat.
 ///
 /// Everything else has already happened by the time this appears — the files are in Kit Pay's own
-/// container and the app is in front of the customer. Choosing here does not send anything; it
-/// opens that chat with the share already attached to the composer, so the last word on what goes
-/// out, and whether to say something with it, still belongs to the person sending it.
+/// container after the customer returns from the extension. Choosing here does not send anything;
+/// it opens that chat with the share already attached to the composer, so the last word on what
+/// goes out, and whether to say something with it, still belongs to the person sending it.
 struct SharedContentDestinationView: View {
     let batch: SharedInboxBatch
     let onChoose: (Conversation) -> Void
@@ -36,6 +36,11 @@ struct SharedContentDestinationView: View {
         List {
             Section {
                 sharePreview
+                if let requestedDestinationNote {
+                    Label(requestedDestinationNote, systemImage: "clock.arrow.circlepath")
+                        .font(.footnote)
+                        .foregroundStyle(KitColor.secondaryText)
+                }
             } header: {
                 Text("Shared with Kit Pay")
             } footer: {
@@ -120,6 +125,14 @@ struct SharedContentDestinationView: View {
         return nil
     }
 
+    private var requestedDestinationNote: String? {
+        guard let destination = batch.destination else { return nil }
+        if destination.kind == .contact {
+            return "Starting a chat with \(destination.displayName) when connected. You can choose another chat below."
+        }
+        return "That selected chat is no longer available. Choose another chat below."
+    }
+
     // MARK: Destinations
 
     private struct SharedContentDestination: Identifiable {
@@ -150,6 +163,7 @@ struct SharedContentDestinationView: View {
                     currentUserID: currentUserID,
                     contacts: directory
                 )
+                guard model.sharedInboxConversationIsEligible(conversation) else { return nil }
                 return SharedContentDestination(
                     id: conversation.id,
                     conversation: conversation,

@@ -1,5 +1,6 @@
 import Contacts
 import ContactsUI
+import CoreTransferable
 import ImageIO
 import PhotosUI
 import SwiftUI
@@ -600,11 +601,19 @@ struct MessagesView: View {
                     .accessibilityHidden(true)
             }
 
-            RemoteAvatarView(
-                name: context.displayName,
-                avatarURL: context.avatarURL,
-                size: 52
-            )
+            if conversation.isGroup {
+                GroupAvatarView(
+                    title: context.displayName,
+                    photoURL: context.avatarURL,
+                    size: 52
+                )
+            } else {
+                RemoteAvatarView(
+                    name: context.displayName,
+                    avatarURL: context.avatarURL,
+                    size: 52
+                )
+            }
 
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 5) {
@@ -1367,6 +1376,7 @@ struct ConversationView: View {
     @State private var showPaymentRequest = false
     @State private var showSendMoney = false
     @State private var showContactProfile = false
+    @State private var showGroupProfile = false
     @State private var showGroupMemberPicker = false
     @State private var showGroupMediaLibrary = false
     @State private var groupProfileFollowUp: GroupProfileFollowUp?
@@ -1395,8 +1405,28 @@ struct ConversationView: View {
     @State private var editorSession: MediaEditorSession?
     @State private var reactionPickerTarget: LocalMessage?
     @State private var reactionDetailTarget: LocalMessage?
+    /// The message whose delivery details are on screen. Held as its server identity rather than
+    /// the row itself, so the sheet keeps asking about the same message even if the thread reloads
+    /// underneath it.
+    @State private var messageInfoTarget: MessageInfoTarget?
+    /// The message the composer is currently answering. One choice for the whole composer, so a
+    /// typed line, a photo and a voice note all answer whatever the user swiped.
+    @State private var replyTarget: LocalMessage?
+    /// The message whose wording is being corrected, chosen from its long-press menu.
+    @State private var editTarget: LocalMessage?
+    /// A correction is written in its own field rather than in the composer's, so half a sentence
+    /// someone had already typed survives being interrupted — and so the draft store, which
+    /// mirrors the composer, is never handed wording that belongs to a message already sent.
+    @State private var editDraft = ""
+    @State private var isSubmittingEdit = false
+    /// Re-read on a timer so the edit affordance disappears when the fifteen minutes run out,
+    /// rather than lingering until some unrelated redraw.
+    @State private var editWindowNow = AppPresentationClock.now
     /// The share this conversation has already taken, so a redraw cannot stage it twice.
     @State private var appliedSharedDeliveryID: UUID?
+    /// The exact draft that existed before shared text was appended. Re-routing removes the
+    /// inserted span only when doing so cannot destroy wording the customer edited afterwards.
+    @State private var appliedSharedOriginalDraft: String?
     @State private var isSearchingMessages = false
     @State private var messageSearchQuery = ""
     @State private var searchMatchIndex = 0
@@ -1415,7 +1445,7 @@ struct ConversationView: View {
     @State private var groupPaymentDeclineTarget: GroupPaymentDeclineTarget?
     @State private var groupPaymentReturnTarget: GroupPaymentReturnTarget?
     @State private var groupPaymentComposer: GroupPaymentComposerTarget?
-    @StateObject private var voiceRecorder = VoiceNoteRecorder()
+    @StateObject private var voiceRecorder: VoiceNoteRecorder
     @FocusState private var isComposerFocused: Bool
 
     init(conversation: Conversation) {
@@ -1423,15 +1453,48 @@ struct ConversationView: View {
         _incomingSoundPolicy = State(
             initialValue: VisibleConversationSoundPolicy(conversationID: conversation.id)
         )
+        // From the registry, not constructed here: the draft must survive this view being
+        // torn down and remade, so a paused note is still waiting when the user comes back.
+        _voiceRecorder = StateObject(
+            wrappedValue: VoiceNoteDraftRegistry.shared.recorder(for: conversation.id)
+        )
     }
 
-    private var messages: [LocalMessage] {
+    private var messages: [LocalMessage] { correctedProjection.messages }
+
+    /// The thread as it currently reads, with every correction already applied.
+    ///
+    /// Applying the fold here rather than at each bubble is what keeps the whole screen honest
+    /// about one thing at a time: quotes, search, selection, forwarding and the notification
+    /// preview all read from this, so none of them can go on showing wording its author has
+    /// already withdrawn. The correction rows themselves are dropped — they are instructions
+    /// about a message, never messages.
+    private var correctedProjection: (messages: [LocalMessage], editedAt: [UUID: Date]) {
         // A Send Later message is shown in its own section under the timeline, not inline: it has
         // not happened yet, and a bubble sitting among sent messages would read as if it had.
         let waiting = scheduledMessageIDs
-        return model.state.messages
-            .filter { $0.conversationId == conversation.id && !waiting.contains($0.id) }
-            .sorted { $0.timelineDate < $1.timelineDate }
+        let visible = model.state.messages.filter {
+            $0.conversationId == conversation.id && !waiting.contains($0.id)
+        }
+        let corrections = MessageEditAggregationPolicy.appliedEdits(in: visible)
+        let instructions = MessageEditAggregationPolicy.suppressedMessageIDs(in: visible)
+        var editedAt: [UUID: Date] = [:]
+        var projected: [LocalMessage] = []
+        projected.reserveCapacity(visible.count)
+        for message in visible where !instructions.contains(message.id) {
+            guard let serverMessageID = message.serverMessageId?.lowercased(),
+                  let correction = corrections[serverMessageID]
+            else {
+                projected.append(message)
+                continue
+            }
+            var corrected = message
+            corrected.body = correction.body
+            editedAt[message.id] = correction.editedAt
+            projected.append(corrected)
+        }
+        projected.sort { $0.timelineDate < $1.timelineDate }
+        return (projected, editedAt)
     }
 
     private var currentConversation: Conversation {
@@ -1772,6 +1835,406 @@ struct ConversationView: View {
         }
     }
 
+    /// The long-press menu for one message. Album members get the same menu their standalone
+    /// siblings get, so a photo inside a run of photos can still be answered or reacted to.
+    @ViewBuilder
+    private func messageContextMenu(_ message: LocalMessage) -> some View {
+        if !isSelectingMessages {
+            if canReply(to: message) {
+                Button {
+                    beginReply(to: message)
+                } label: {
+                    Label("Reply", systemImage: "arrowshape.turn.up.left")
+                }
+            }
+            if !isReadOnlyAppReviewPreview,
+               conversationMessagingAvailable,
+               message.serverMessageId != nil,
+               model.messagingReactionsEnabled {
+                ControlGroup {
+                    ForEach(
+                        MessageReactionAggregationPolicy.quickReactions,
+                        id: \.self
+                    ) { emoji in
+                        Button(emoji) {
+                            Task { await toggleReaction(emoji, on: message) }
+                        }
+                    }
+                    Button {
+                        reactionPickerTarget = message
+                    } label: {
+                        Label("More reactions", systemImage: "plus.circle")
+                    }
+                }
+                .controlGroupStyle(.palette)
+            }
+            if canEdit(message) {
+                Button {
+                    beginEdit(message)
+                } label: {
+                    Label("Edit", systemImage: "pencil")
+                }
+            }
+            if let copyText = copyableText(for: message) {
+                Button {
+                    UIPasteboard.general.string = copyText
+                } label: {
+                    Label("Copy", systemImage: "doc.on.doc")
+                }
+            }
+            if let infoTarget = deliveryInfoTarget(for: message) {
+                Button {
+                    messageInfoTarget = infoTarget
+                } label: {
+                    Label("Info", systemImage: "info.circle")
+                }
+            }
+            if !isReadOnlyAppReviewPreview,
+               !forwardPayloadItems(for: [message.id]).isEmpty {
+                Button {
+                    forwardItems = forwardPayloadItems(for: [message.id])
+                    showForwardSheet = true
+                } label: {
+                    Label("Forward", systemImage: "arrowshape.turn.up.right")
+                }
+            }
+            if !isReadOnlyAppReviewPreview {
+                Button {
+                    withAnimation(.snappy(duration: 0.22)) {
+                        isSelectingMessages = true
+                        selectedMessageIDs = [message.id]
+                        isComposerFocused = false
+                    }
+                } label: {
+                    Label("Select", systemImage: "checkmark.circle")
+                }
+                if AbuseReportContract.isAvailable(
+                    features: model.capabilities?.features
+                ),
+                   let context = abuseReportContext(
+                       reportedUserID: message.senderId
+                   ),
+                   let reportTarget = AbuseReportTarget.message(
+                       message,
+                       context: context
+                   ) {
+                    Divider()
+                    Button(role: .destructive) {
+                        abuseReportPresentation = ConversationAbuseReportPresentation(
+                            context: context,
+                            target: reportTarget,
+                            reportedName: isGroupConversation
+                                ? participantDisplayName(for: message.senderId)
+                                : recipientDisplayName
+                        )
+                    } label: {
+                        Label("Report message", systemImage: "exclamationmark.bubble")
+                    }
+                }
+                Divider()
+                Button(role: .destructive) {
+                    selectedMessageIDs = [message.id]
+                    showDeleteMessagesConfirmation = true
+                } label: {
+                    Label("Delete for me", systemImage: "trash")
+                }
+            }
+        }
+    }
+
+    // MARK: Delivery details
+
+    /// The delivery details this message can be asked about, or nothing.
+    ///
+    /// Only messages this account sent, and only once the server has given one an identity: the
+    /// server answers this question to the sender alone, so offering it on somebody else's message
+    /// would promise an answer that is always a refusal.
+    private func deliveryInfoTarget(for message: LocalMessage) -> MessageInfoTarget? {
+        guard !isReadOnlyAppReviewPreview,
+              conversationMessagingAvailable,
+              model.secureMessagingAvailable,
+              message.isOutgoing,
+              let serverMessageID = message.serverMessageId
+        else { return nil }
+        return MessageInfoTarget(
+            conversationID: conversation.id,
+            serverMessageID: serverMessageID
+        )
+    }
+
+    // MARK: Replies
+
+    /// Whether this message can be answered right now. Beyond the message itself being an
+    /// answerable one, the thread has to be in a state where anything can be sent at all.
+    private func canReply(to message: LocalMessage) -> Bool {
+        !isReadOnlyAppReviewPreview
+            && !isSelectingMessages
+            && conversationMessagingAvailable
+            && model.secureMessagingAvailable
+            && MessageReplyQuotePolicy.canReply(to: message)
+    }
+
+    private func beginReply(to message: LocalMessage) {
+        guard canReply(to: message) else { return }
+        withAnimation(.snappy(duration: 0.2)) {
+            editTarget = nil
+            replyTarget = message
+        }
+        editDraft = ""
+        isComposerFocused = true
+    }
+
+    private func cancelReply() {
+        withAnimation(.snappy(duration: 0.2)) { replyTarget = nil }
+    }
+
+    /// The quote drawn above `message`, resolved from history this device already holds.
+    private func quote(for message: LocalMessage) -> MessageReplyQuote? {
+        MessageReplyQuotePolicy.quote(
+            for: message,
+            in: messages,
+            currentUserID: model.profile?.id,
+            displayName: { participantDisplayName(for: $0) }
+        )
+    }
+
+    /// "You", the sender's name, or — when this device cannot name them — the thread's own name.
+    private func quoteAuthorLabel(_ quote: MessageReplyQuote) -> String {
+        if quote.authorIsSelf { return "You" }
+        return quote.authorName?.nilIfBlank
+            ?? (isGroupConversation ? "Message" : recipientDisplayName)
+    }
+
+    /// Scrolls to the message a quote points at, when it is still in the loaded thread.
+    private func jumpToQuoted(_ targetServerMessageID: String) {
+        guard let target = messages.first(where: {
+            $0.serverMessageId?.lowercased() == targetServerMessageID
+        }) else { return }
+        pendingScrollTargetMessageID = target.id
+    }
+
+    @ViewBuilder
+    private func quotedBlock(for message: LocalMessage) -> some View {
+        if let quote = quote(for: message) {
+            QuotedMessagePreview(
+                authorLabel: quoteAuthorLabel(quote),
+                preview: quote.preview,
+                accent: message.isOutgoing ? .white.opacity(0.9) : KitColor.green,
+                textColor: message.isOutgoing ? .white : KitColor.primaryText,
+                background: message.isOutgoing
+                    ? Color.white.opacity(0.16)
+                    : KitColor.green.opacity(0.10),
+                onTap: { jumpToQuoted(quote.targetServerMessageID) }
+            )
+        }
+    }
+
+    /// The bar above the composer while an answer is being written.
+    @ViewBuilder
+    private var replyComposerBar: some View {
+        if let target = replyTarget {
+            let name = target.isOutgoing ? "You" : participantDisplayName(for: target.senderId)
+            HStack(spacing: 8) {
+                QuotedMessagePreview(
+                    authorLabel: name,
+                    preview: MessageReplyQuotePolicy.previewText(for: target),
+                    accent: KitColor.green,
+                    textColor: KitColor.primaryText,
+                    background: .clear
+                )
+                Button {
+                    cancelReply()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(KitColor.secondaryText)
+                        .frame(width: 30, height: 30)
+                        .contentShape(Circle())
+                }
+                .accessibilityLabel("Cancel reply")
+            }
+            .padding(.leading, 4)
+            .padding(.trailing, 2)
+            .background(
+                KitColor.green.opacity(0.08),
+                in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+            )
+            .transition(.move(edge: .bottom).combined(with: .opacity))
+        }
+    }
+
+    // MARK: Edits
+
+    /// Ticks while a correction is being written. Fifteen minutes is short enough that a stale
+    /// composer is a real possibility, and long enough that a per-frame clock would be waste.
+    private static let editWindowTicker = Timer
+        .publish(every: 15, on: .main, in: .common)
+        .autoconnect()
+
+    /// Whether this message can still be reworded right now. Beyond the message itself being
+    /// one's own recent words, the thread has to be in a state where anything can be sent at all.
+    private func canEdit(
+        _ message: LocalMessage,
+        now: Date = AppPresentationClock.now
+    ) -> Bool {
+        !isReadOnlyAppReviewPreview
+            && !isSelectingMessages
+            && conversationMessagingAvailable
+            && recipientCommunicationAllowed
+            && model.messagingMessageEditsEnabled
+            && MessageEditAggregationPolicy.canEdit(message, now: now)
+    }
+
+    private func beginEdit(_ message: LocalMessage) {
+        guard canEdit(message) else { return }
+        withAnimation(.snappy(duration: 0.2)) {
+            // Answering and correcting are two different things to be doing with a message, and
+            // the composer can only be doing one of them.
+            replyTarget = nil
+            editDraft = message.body
+            editWindowNow = AppPresentationClock.now
+            editTarget = message
+        }
+        isComposerFocused = true
+    }
+
+    private func cancelEdit() {
+        withAnimation(.snappy(duration: 0.2)) { editTarget = nil }
+        editDraft = ""
+    }
+
+    private var trimmedEditDraft: String {
+        editDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var canSubmitEdit: Bool {
+        guard let editTarget else { return false }
+        return canEdit(editTarget, now: editWindowNow)
+            && !isSubmittingEdit
+            && !trimmedEditDraft.isEmpty
+    }
+
+    private func submitEdit() {
+        guard let target = editTarget, canSubmitEdit else { return }
+        guard let targetServerMessageID = target.serverMessageId?.lowercased() else { return }
+        let replacement = trimmedEditDraft
+        // Nothing to say: the wording is already what it was going to be.
+        guard replacement != target.body else {
+            cancelEdit()
+            return
+        }
+        guard SecureMessageReservedPrefixPolicy.allowsUserAuthoredText(replacement) else {
+            model.lastError = "Messages can't start with Kit Pay's reserved prefixes."
+            return
+        }
+        guard let edit = KitMessageEdit(
+            targetServerMessageID: targetServerMessageID,
+            body: replacement
+        ) else {
+            model.lastError = "That wording is too long to send."
+            return
+        }
+        isSubmittingEdit = true
+        isComposerFocused = false
+        Task {
+            let queued = await model.queueEditEvent(
+                conversationId: conversation.id,
+                title: recipientDisplayName,
+                recipientId: recipientUserID,
+                edit: edit
+            )
+            isSubmittingEdit = false
+            if queued { cancelEdit() }
+        }
+    }
+
+    /// The bar above the composer while a correction is being written.
+    @ViewBuilder
+    private var editComposerBar: some View {
+        if let target = editTarget {
+            HStack(spacing: 8) {
+                Image(systemName: "pencil")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(KitColor.green)
+                    .padding(.leading, 8)
+                QuotedMessagePreview(
+                    authorLabel: "Edit message",
+                    preview: MessageReplyQuotePolicy.previewText(for: target),
+                    accent: KitColor.green,
+                    textColor: KitColor.primaryText,
+                    background: .clear
+                )
+                Button {
+                    cancelEdit()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(KitColor.secondaryText)
+                        .frame(width: 30, height: 30)
+                        .contentShape(Circle())
+                }
+                .accessibilityLabel("Cancel edit")
+            }
+            .padding(.trailing, 2)
+            .background(
+                KitColor.green.opacity(0.08),
+                in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+            )
+            .transition(.move(edge: .bottom).combined(with: .opacity))
+            .onReceive(Self.editWindowTicker) { tick in
+                editWindowNow = tick
+                guard !MessageEditAggregationPolicy.canEdit(target, now: tick) else { return }
+                // The server holds the authoritative clock and would refuse this now. Closing the
+                // composer says so before the wording is typed out a second time.
+                model.lastError = "That message can no longer be edited."
+                cancelEdit()
+            }
+        }
+    }
+
+    /// A stripped-down composer row for corrections. Every "start something new" affordance —
+    /// attachments, voice notes, payments, Send Later — is withdrawn, so no gesture can leave the
+    /// mode by accident and end up sending the correction as a fresh message.
+    private var editComposerRow: some View {
+        HStack(alignment: .bottom, spacing: 8) {
+            TextField("Edit message", text: $editDraft, axis: .vertical)
+                .lineLimit(1...5)
+                .focused($isComposerFocused)
+                .disabled(isSubmittingEdit)
+                .padding(.leading, 14)
+                .padding(.trailing, 10)
+                .padding(.vertical, 10)
+                .background(
+                    .ultraThinMaterial,
+                    in: RoundedRectangle(cornerRadius: 22, style: .continuous)
+                )
+                .overlay {
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                        .stroke(.white.opacity(0.55), lineWidth: 0.7)
+                        .allowsHitTesting(false)
+                }
+
+            Button {
+                submitEdit()
+            } label: {
+                Group {
+                    if isSubmittingEdit {
+                        ProgressView().tint(.white)
+                    } else {
+                        Image(systemName: "checkmark")
+                            .font(.headline.bold())
+                    }
+                }
+                .foregroundStyle(.white)
+                .frame(width: 44, height: 44)
+                .background(KitColor.green, in: Circle())
+            }
+            .disabled(!canSubmitEdit)
+            .opacity(canSubmitEdit ? 1 : 0.55)
+            .accessibilityLabel("Save the change")
+        }
+    }
+
     // MARK: Reactions
 
     /// Aggregated tallies keyed by the target's lowercase server message id.
@@ -1782,34 +2245,42 @@ struct ConversationView: View {
         )
     }
 
+    /// How far the chip row rides up into the bubble it belongs to. The row reclaims the same
+    /// amount of layout below it, so the chips read as part of the message rather than as a
+    /// separate line under it.
+    private static let reactionChipOverlap: CGFloat = 11
+
     private func reactionChips(
         _ tallies: [MessageReactionTally],
         for message: LocalMessage
     ) -> some View {
         HStack(spacing: 4) {
             ForEach(tallies) { tally in
-                HStack(spacing: 3) {
+                HStack(spacing: 4) {
                     Text(tally.emoji)
-                        .font(.footnote)
+                        .font(.system(size: 15))
                     if tally.count > 1 {
                         Text("\(tally.count)")
-                            .font(.caption2.weight(.semibold).monospacedDigit())
+                            .font(.caption.weight(.semibold).monospacedDigit())
                             .foregroundStyle(KitColor.primaryText)
                     }
                 }
                 .padding(.horizontal, 8)
-                .frame(height: 26)
-                .background(.ultraThinMaterial, in: Capsule())
+                .frame(height: 28)
+                .background(.regularMaterial, in: Capsule())
                 .overlay {
                     Capsule()
                         .stroke(
                             tally.includesCurrentUser
                                 ? KitColor.green
                                 : Color.white.opacity(0.4),
-                            lineWidth: tally.includesCurrentUser ? 1.2 : 0.6
+                            lineWidth: tally.includesCurrentUser ? 1.4 : 0.6
                         )
                         .allowsHitTesting(false)
                 }
+                // A soft rim lifts the chip off the bubble it overlaps, so the two stay legible
+                // as one object with two parts rather than as a smudge.
+                .shadow(color: .black.opacity(0.14), radius: 2.5, y: 1)
                 .contentShape(Capsule())
                 // Tap toggles; long-press ONLY opens the detail sheet. (The previous Button +
                 // simultaneous long-press fired BOTH: the toggle mutated the user's reaction
@@ -1829,7 +2300,11 @@ struct ConversationView: View {
                 .accessibilityAddTraits(.isButton)
             }
         }
-        .padding(.horizontal, 2)
+        .padding(.horizontal, 10)
+        // Drawn high, laid out low: the row overlaps the bubble's bottom edge and gives the
+        // same distance back below, so nothing after it is pushed down.
+        .offset(y: -Self.reactionChipOverlap)
+        .padding(.bottom, -Self.reactionChipOverlap)
     }
 
     /// One reaction per person per message: tapping the emoji you already hold removes it;
@@ -1875,7 +2350,9 @@ struct ConversationView: View {
         // One pass per render for every whole-thread fold (albums, reaction suppression,
         // reaction tallies): computing these per bubble would be quadratic in long threads
         // and re-trigger on every keystroke.
-        let timelineSnapshot = messages
+        let projection = correctedProjection
+        let timelineSnapshot = projection.messages
+        let correctionDates = projection.editedAt
         let albumMembership: [UUID: ChatMediaAlbumMembership] =
             isSelectingMessages ? [:] : ChatMediaAlbumPolicy.membership(for: timelineSnapshot)
         let suppressedReactionIDs = MessageReactionAggregationPolicy.suppressedMessageIDs(
@@ -1954,7 +2431,8 @@ struct ConversationView: View {
                                     bubble(
                                         message,
                                         reactionTallies: hoistedTallies,
-                                        showsSenderName: namedSenderMessageIDs.contains(message.id)
+                                        showsSenderName: namedSenderMessageIDs.contains(message.id),
+                                        editedAt: correctionDates[message.id]
                                     )
                                 }
                             case .payment(let message, let descriptor):
@@ -2124,7 +2602,15 @@ struct ConversationView: View {
         .fullScreenCover(item: $editorSession) { session in
             KitMediaEditorView(input: session.input) { output in
                 editorSession = nil
-                handleEditorOutput(output, original: session.input)
+                if let replacingID = session.replacingAttachmentID {
+                    handleStagedVideoEditOutput(
+                        output,
+                        replacing: replacingID,
+                        original: session.input
+                    )
+                } else {
+                    handleEditorOutput(output, original: session.input)
+                }
             }
         }
         .fileImporter(
@@ -2209,53 +2695,69 @@ struct ConversationView: View {
             }
             .presentationBackground(.ultraThinMaterial)
         }
+        // Group info is a full screen, not a sheet: identity, membership, and the description
+        // editor are substantive flows and follow the app-wide full-screen rule.
+        .fullScreenCover(isPresented: $showGroupProfile, onDismiss: finishGroupProfilePresentation) {
+            let group = currentConversation
+            GroupProfileView(
+                conversationID: group.id,
+                title: group.title,
+                groupDescription: group.groupDescription,
+                photoURL: group.groupPhotoURL,
+                members: group.participantUserIds.map { userID in
+                    GroupMemberPresentation(
+                        userID: userID,
+                        displayName: participantDisplayName(for: userID),
+                        isCurrentUser: userID.lowercased()
+                            == model.profile?.id.lowercased(),
+                        role: group.groupRole(for: userID)?.rawValue,
+                        avatarURL: model.contactAvatarURL(forUserID: userID)
+                    )
+                },
+                renameGroup: model.canRenameGroupConversation(group.id) ? { title in
+                    await model.renameGroupConversation(group.id, title: title)
+                } : nil,
+                updateDescription: model.canEditGroupConversationIdentity(group.id) ? { text in
+                    await model.updateGroupConversationDescription(
+                        group.id,
+                        description: text
+                    )
+                } : nil,
+                updatePhoto: model.canEditGroupConversationIdentity(group.id) ? { jpeg in
+                    await model.updateGroupConversationPhoto(group.id, jpegData: jpeg)
+                } : nil,
+                removePhoto: model.canEditGroupConversationIdentity(group.id) ? {
+                    await model.removeGroupConversationPhoto(group.id)
+                } : nil,
+                addMembers: model.canAddGroupConversationMember(group.id) ? {
+                    groupProfileFollowUp = .addMember
+                    showGroupProfile = false
+                } : nil,
+                canRemoveMember: { memberUserID in
+                    model.canRemoveGroupConversationMember(
+                        memberUserID,
+                        from: group.id
+                    )
+                },
+                removeMember: { memberUserID in
+                    await model.removeGroupConversationMember(
+                        memberUserID,
+                        from: group.id
+                    )
+                },
+                leaveGroup: model.canLeaveGroupConversation(group.id) ? {
+                    let left = await model.leaveGroupConversation(group.id)
+                    if left { groupProfileFollowUp = .leaveCompleted }
+                    return left
+                } : nil,
+                openMediaLibrary: {
+                    groupProfileFollowUp = .mediaLibrary
+                    showGroupProfile = false
+                }
+            )
+            .environmentObject(model)
+        }
         .sheet(isPresented: $showContactProfile, onDismiss: finishGroupProfilePresentation) {
-            if isGroupConversation {
-                let group = currentConversation
-                GroupProfileView(
-                    conversationID: group.id,
-                    title: group.title,
-                    members: group.participantUserIds.map { userID in
-                        GroupMemberPresentation(
-                            userID: userID,
-                            displayName: participantDisplayName(for: userID),
-                            isCurrentUser: userID.lowercased()
-                                == model.profile?.id.lowercased(),
-                            role: group.groupRole(for: userID)?.rawValue,
-                            avatarURL: model.contactAvatarURL(forUserID: userID)
-                        )
-                    },
-                    renameGroup: model.canRenameGroupConversation(group.id) ? { title in
-                        await model.renameGroupConversation(group.id, title: title)
-                    } : nil,
-                    addMembers: model.canAddGroupConversationMember(group.id) ? {
-                        groupProfileFollowUp = .addMember
-                        showContactProfile = false
-                    } : nil,
-                    canRemoveMember: { memberUserID in
-                        model.canRemoveGroupConversationMember(
-                            memberUserID,
-                            from: group.id
-                        )
-                    },
-                    removeMember: { memberUserID in
-                        await model.removeGroupConversationMember(
-                            memberUserID,
-                            from: group.id
-                        )
-                    },
-                    leaveGroup: model.canLeaveGroupConversation(group.id) ? {
-                        let left = await model.leaveGroupConversation(group.id)
-                        if left { groupProfileFollowUp = .leaveCompleted }
-                        return left
-                    } : nil,
-                    openMediaLibrary: {
-                        groupProfileFollowUp = .mediaLibrary
-                        showContactProfile = false
-                    }
-                )
-                .presentationBackground(.ultraThinMaterial)
-            } else {
             ConversationContactProfileView(
                 name: recipientDisplayName,
                 contact: recipientContact,
@@ -2285,7 +2787,6 @@ struct ConversationView: View {
             )
             .environmentObject(model)
             .presentationBackground(.ultraThinMaterial)
-            }
         }
         .sheet(isPresented: $showGroupMemberPicker) {
             GroupMemberPickerView(
@@ -2377,6 +2878,18 @@ struct ConversationView: View {
             )
             .presentationDetents([.medium])
             .presentationBackground(.ultraThinMaterial)
+        }
+        // A screen of its own rather than a half-height sheet: in a group this is a list of
+        // everybody the message was addressed to, each opening into three moments, which is a page
+        // of reading that a detent would spend the whole time being dragged out of the way.
+        .fullScreenCover(item: $messageInfoTarget) { target in
+            MessageInfoView(
+                conversationID: target.conversationID,
+                serverMessageID: target.serverMessageID,
+                nameForUserID: { participantDisplayName(for: $0) },
+                avatarURLForUserID: { model.contactAvatarURL(forUserID: $0) }
+            )
+            .environmentObject(model)
         }
         .sheet(isPresented: $showForwardSheet) {
             ForwardMessagesView(items: forwardItems) { sentCount in
@@ -2549,6 +3062,14 @@ struct ConversationView: View {
                 .environmentObject(model)
                 .presentationBackground(.ultraThinMaterial)
             }
+        }
+    }
+
+    private func openConversationProfile() {
+        if isGroupConversation {
+            showGroupProfile = true
+        } else {
+            showContactProfile = true
         }
     }
 
@@ -2741,7 +3262,12 @@ struct ConversationView: View {
             attachmentLoadGeneration &+= 1
             isLoadingAttachment = false
             isComposerFocused = false
-            voiceRecorder.cancel()
+            // An ordinary interruption pauses the draft and keeps it; leaving the chat
+            // must not cost the user what they already said. Discard stays explicit.
+            voiceRecorder.suspend()
+            if !voiceRecorder.hasDraft {
+                VoiceNoteDraftRegistry.shared.release(conversation.id)
+            }
             presence.stopLocalTyping(conversationID: conversation.id)
             if !isReadOnlyAppReviewPreview, !isSending { persistDraftImmediately() }
         }
@@ -2775,14 +3301,15 @@ struct ConversationView: View {
             }
         } else {
             ToolbarItem(placement: .topBarLeading) {
-                Button { showContactProfile = true } label: {
+                Button { openConversationProfile() } label: {
                     // Nothing sits under the photo but the Liquid Glass: no material card, no
                     // colour wash, and no ring of our own. The lens is an exact square of
                     // `avatarControlDiameter`, so it renders as a true circle around the photo.
                     ConversationAvatarView(
                         name: recipientDisplayName,
                         avatarURL: recipientPresentation.avatarURL,
-                        size: ConversationHeaderLayoutPolicy.avatarImageDiameter
+                        size: ConversationHeaderLayoutPolicy.avatarImageDiameter,
+                        isGroup: isGroupConversation
                     )
                     .kitBarControlGlass(
                         diameter: ConversationHeaderLayoutPolicy.avatarControlDiameter
@@ -2808,7 +3335,7 @@ struct ConversationView: View {
             // slot is measured against the whole bar, so the name always appears and falls back to
             // an ellipsis when it is too long.
             ToolbarItem(placement: .principal) {
-                Button { showContactProfile = true } label: {
+                Button { openConversationProfile() } label: {
                     VStack(alignment: .leading, spacing: 1) {
                         Text(recipientDisplayName)
                             .font(.headline)
@@ -2890,7 +3417,7 @@ struct ConversationView: View {
 
     private func stopReadOnlyGroupInteractions() {
         isComposerFocused = false
-        voiceRecorder.cancel()
+        voiceRecorder.suspend()
         presence.stopLocalTyping(conversationID: conversation.id)
         showPhotoPicker = false
         showCameraCapture = false
@@ -2901,6 +3428,9 @@ struct ConversationView: View {
     @ViewBuilder
     private var composer: some View {
         VStack(spacing: 8) {
+            if let delivery = activeAppliedSharedDelivery {
+                sharedInboxComposerBanner(delivery)
+            }
             if stagedAttachments.count == 1 {
                 stagedAttachmentChip(stagedAttachments[0])
             } else if stagedAttachments.count > 1 {
@@ -2913,9 +3443,13 @@ struct ConversationView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            if voiceRecorder.isRecording {
+            if voiceRecorder.hasDraft {
                 recordingBar
+            } else if editTarget != nil {
+                editComposerBar
+                editComposerRow
             } else {
+                replyComposerBar
                 composerRow
             }
         }
@@ -2926,6 +3460,65 @@ struct ConversationView: View {
                 .opacity(0.35)
                 .allowsHitTesting(false)
         }
+    }
+
+    private var activeAppliedSharedDelivery: SharedInboxDelivery? {
+        guard let delivery = model.sharedInboxDelivery,
+              appliedSharedDeliveryID == delivery.id,
+              delivery.conversationID.caseInsensitiveCompare(conversation.id) == .orderedSame
+        else { return nil }
+        return delivery
+    }
+
+    private func sharedInboxComposerBanner(_ delivery: SharedInboxDelivery) -> some View {
+        let hasDurableContent = model.sharedInboxHasDurablyQueuedContent(delivery.batch)
+        return HStack(spacing: 10) {
+            Image(systemName: !hasDurableContent
+                ? "square.and.arrow.down.fill"
+                : "checkmark.circle.fill")
+                .foregroundStyle(KitColor.green)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(!hasDurableContent
+                    ? "Shared from another app"
+                    : "Part of this share is already queued")
+                    .font(.caption.weight(.semibold))
+                Text(!hasDurableContent
+                    ? "Review it here, or choose another chat."
+                    : "Send the remaining items here, or discard what remains.")
+                    .font(.caption2)
+                    .foregroundStyle(KitColor.secondaryText)
+            }
+            Spacer(minLength: 6)
+            Menu {
+                if !hasDurableContent {
+                    Button {
+                        returnAppliedShareToPicker(delivery)
+                    } label: {
+                        Label("Choose another chat", systemImage: "arrowshape.turn.up.left")
+                    }
+                }
+                Button(role: .destructive) {
+                    discardAppliedShare(delivery)
+                } label: {
+                    Label(
+                        !hasDurableContent
+                            ? "Remove shared items"
+                            : "Discard items not queued",
+                        systemImage: "trash"
+                    )
+                }
+            } label: {
+                Image(systemName: "ellipsis.circle")
+                    .font(.title3)
+                    .frame(width: 40, height: 40)
+                    .contentShape(Circle())
+            }
+            .accessibilityLabel("Shared item options")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .background(KitColor.paleGreen.opacity(0.32), in: RoundedRectangle(cornerRadius: 16))
+        .accessibilityElement(children: .contain)
     }
 
     private var composerRow: some View {
@@ -3069,7 +3662,9 @@ struct ConversationView: View {
     private var recordingBar: some View {
         HStack(spacing: 12) {
             Button {
+                // The one deliberate way a draft dies.
                 voiceRecorder.cancel()
+                VoiceNoteDraftRegistry.shared.release(conversation.id)
             } label: {
                 Image(systemName: "trash.fill")
                     .font(.headline)
@@ -3080,16 +3675,26 @@ struct ConversationView: View {
             .accessibilityLabel("Discard recording")
 
             HStack(spacing: 10) {
-                Circle()
-                    .fill(.red)
-                    .frame(width: 9, height: 9)
-                    .opacity(Int(voiceRecorder.elapsed * 2) % 2 == 0 ? 1 : 0.25)
+                if voiceRecorder.isRecording {
+                    Circle()
+                        .fill(.red)
+                        .frame(width: 9, height: 9)
+                        .opacity(Int(voiceRecorder.elapsed * 2) % 2 == 0 ? 1 : 0.25)
+                }
                 Text(recordingTimeLabel)
                     .font(.subheadline.weight(.semibold).monospacedDigit())
                     .foregroundStyle(KitColor.navy)
-                RecorderLevelWave(level: voiceRecorder.level)
-                    .frame(maxWidth: .infinity)
-                    .frame(height: 24)
+                if voiceRecorder.isRecording {
+                    RecorderLevelWave(level: voiceRecorder.level)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 24)
+                } else {
+                    Text(voiceRecorder.isPreviewing ? "Playing…" : "Paused")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                draftControl
             }
             .padding(.horizontal, 14)
             .frame(height: 44)
@@ -3117,7 +3722,81 @@ struct ConversationView: View {
             .accessibilityLabel("Send voice note")
         }
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("Recording voice note, \(recordingTimeLabel)")
+        .accessibilityLabel(
+            voiceRecorder.isRecording
+                ? "Recording voice note, \(recordingTimeLabel)"
+                : "Voice note draft, \(recordingTimeLabel)"
+        )
+    }
+
+    /// The pause / listen-back / resume control for the phase the draft is in.
+    @ViewBuilder
+    private var draftControl: some View {
+        switch voiceRecorder.phase {
+        case .recording:
+            Button {
+                voiceRecorder.pause()
+            } label: {
+                Image(systemName: "pause.fill")
+                    .font(.headline)
+                    .foregroundStyle(KitColor.green)
+                    .frame(width: 32, height: 32)
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Pause recording")
+        case .paused:
+            Button {
+                voiceRecorder.beginPreview()
+            } label: {
+                Image(systemName: "play.fill")
+                    .font(.headline)
+                    .foregroundStyle(KitColor.green)
+                    .frame(width: 32, height: 32)
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .disabled(!voiceRecorder.hasPlayableSegments)
+            .accessibilityLabel("Listen to the draft")
+            Button {
+                voiceRecorder.resume()
+            } label: {
+                Image(systemName: "mic.fill")
+                    .font(.headline)
+                    .foregroundStyle(KitColor.green)
+                    .frame(width: 32, height: 32)
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .disabled(VoiceNoteDraftPolicy.capacityReached(voiceRecorder.elapsed))
+            .accessibilityLabel("Resume recording")
+        case .previewing:
+            Button {
+                voiceRecorder.endPreview()
+            } label: {
+                Image(systemName: "stop.fill")
+                    .font(.headline)
+                    .foregroundStyle(KitColor.green)
+                    .frame(width: 32, height: 32)
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Stop listening")
+            Button {
+                voiceRecorder.resume()
+            } label: {
+                Image(systemName: "mic.fill")
+                    .font(.headline)
+                    .foregroundStyle(KitColor.green)
+                    .frame(width: 32, height: 32)
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .disabled(VoiceNoteDraftPolicy.capacityReached(voiceRecorder.elapsed))
+            .accessibilityLabel("Resume recording")
+        case .idle:
+            EmptyView()
+        }
     }
 
     private var recordingTimeLabel: String {
@@ -3151,6 +3830,18 @@ struct ConversationView: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
+            if attachment.kind == .video {
+                Button {
+                    beginTrimmingStagedVideo(attachment)
+                } label: {
+                    Image(systemName: "scissors")
+                        .font(.body.weight(.semibold))
+                        .foregroundStyle(KitColor.green)
+                        .frame(width: 40, height: 40)
+                        .contentShape(Circle())
+                }
+                .accessibilityLabel("Trim video")
+            }
             Button {
                 removeStagedAttachment(attachment.id)
             } label: {
@@ -3201,6 +3892,21 @@ struct ConversationView: View {
                         .padding(3)
                         .accessibilityLabel("Remove \(attachment.displayName)")
                     }
+                    .overlay(alignment: .bottomLeading) {
+                        if attachment.kind == .video {
+                            Button {
+                                beginTrimmingStagedVideo(attachment)
+                            } label: {
+                                Image(systemName: "scissors")
+                                    .font(.caption.weight(.bold))
+                                    .foregroundStyle(.white)
+                                    .frame(width: 24, height: 24)
+                                    .background(.black.opacity(0.55), in: Circle())
+                            }
+                            .padding(3)
+                            .accessibilityLabel("Trim \(attachment.displayName)")
+                        }
+                    }
                     .accessibilityElement(children: .contain)
                     .accessibilityLabel(attachment.displayName)
                 }
@@ -3216,6 +3922,57 @@ struct ConversationView: View {
             attachmentLoadGeneration &+= 1
             isLoadingAttachment = false
             selectedPhotoItems = []
+        }
+    }
+
+    /// Removes only the attachment instances introduced by this handoff. Shared text is removed
+    /// when it is still the exact appended span (plus any later suffix); if the customer edited
+    /// inside that span, their current draft wins and remains in this chat.
+    @discardableResult
+    private func detachAppliedShareFromComposer(_ delivery: SharedInboxDelivery) -> Bool {
+        attachmentLoadGeneration &+= 1
+        let sharedItemIDs = Set(delivery.batch.items.map(\.id))
+        stagedAttachments.removeAll { attachment in
+            attachment.clientMessageID.map(sharedItemIDs.contains) == true
+        }
+        if stagedAttachments.isEmpty {
+            isLoadingAttachment = false
+            selectedPhotoItems = []
+        }
+
+        var removedSharedText = true
+        if let sharedText = delivery.batch.text,
+           let originalDraft = appliedSharedOriginalDraft {
+            if let restored = SharedInboxPolicy.draftAfterRemovingShare(
+                currentDraft: draft,
+                originalDraft: originalDraft,
+                sharedText: sharedText
+            ) {
+                draft = restored
+            } else {
+                removedSharedText = false
+            }
+        }
+        appliedSharedDeliveryID = nil
+        appliedSharedOriginalDraft = nil
+        return removedSharedText
+    }
+
+    private func returnAppliedShareToPicker(_ delivery: SharedInboxDelivery) {
+        guard !model.sharedInboxHasDurablyQueuedContent(delivery.batch) else { return }
+        let removedSharedText = detachAppliedShareFromComposer(delivery)
+        model.retrySharedInboxDelivery(delivery.id)
+        if !removedSharedText {
+            model.lastError =
+                "Your edited text stays in this draft. Choose a chat for the original shared copy."
+        }
+    }
+
+    private func discardAppliedShare(_ delivery: SharedInboxDelivery) {
+        let removedSharedText = detachAppliedShareFromComposer(delivery)
+        model.discardSharedInboxDelivery(delivery.id)
+        if !removedSharedText {
+            model.lastError = "Your edited text stays in this draft. The staged shared copy was removed."
         }
     }
 
@@ -3443,12 +4200,17 @@ struct ConversationView: View {
     private func bubble(
         _ message: LocalMessage,
         reactionTallies: [String: [MessageReactionTally]],
-        showsSenderName: Bool
+        showsSenderName: Bool,
+        editedAt: Date? = nil
     ) -> some View {
         let descriptor = KitMediaMessageDescriptor.parse(message.body)
         let mediaKind = descriptor.map { KitChatMediaKind(mediaType: $0.mediaType) }
         let isSelected = selectedMessageIDs.contains(message.id)
 
+        SwipeToReplyContainer(
+            isEnabled: canReply(to: message),
+            onReply: { beginReply(to: message) }
+        ) {
         HStack(alignment: .center, spacing: 8) {
             if isSelectingMessages {
                 Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
@@ -3465,7 +4227,12 @@ struct ConversationView: View {
                     .foregroundStyle(KitColor.green)
                     .padding(.horizontal, 4)
             }
-            bubbleBody(message, descriptor: descriptor, mediaKind: mediaKind)
+            bubbleBody(
+                message,
+                descriptor: descriptor,
+                mediaKind: mediaKind,
+                editedAt: editedAt
+            )
                 .overlay {
                     if isSearchingMessages, currentSearchMatchID == message.id {
                         RoundedRectangle(cornerRadius: 20, style: .continuous)
@@ -3475,88 +4242,7 @@ struct ConversationView: View {
                 }
                 // While selecting, taps must toggle selection — not open viewers or players.
                 .allowsHitTesting(!isSelectingMessages)
-                .contextMenu {
-                    if !isSelectingMessages {
-                        if !isReadOnlyAppReviewPreview,
-                           conversationMessagingAvailable,
-                           message.serverMessageId != nil,
-                           model.messagingReactionsEnabled {
-                            ControlGroup {
-                                ForEach(
-                                    MessageReactionAggregationPolicy.quickReactions,
-                                    id: \.self
-                                ) { emoji in
-                                    Button(emoji) {
-                                        Task { await toggleReaction(emoji, on: message) }
-                                    }
-                                }
-                                Button {
-                                    reactionPickerTarget = message
-                                } label: {
-                                    Label("More reactions", systemImage: "plus.circle")
-                                }
-                            }
-                            .controlGroupStyle(.palette)
-                        }
-                        if let copyText = copyableText(for: message) {
-                            Button {
-                                UIPasteboard.general.string = copyText
-                            } label: {
-                                Label("Copy", systemImage: "doc.on.doc")
-                            }
-                        }
-                        if !isReadOnlyAppReviewPreview,
-                           !forwardPayloadItems(for: [message.id]).isEmpty {
-                            Button {
-                                forwardItems = forwardPayloadItems(for: [message.id])
-                                showForwardSheet = true
-                            } label: {
-                                Label("Forward", systemImage: "arrowshape.turn.up.right")
-                            }
-                        }
-                        if !isReadOnlyAppReviewPreview {
-                            Button {
-                                withAnimation(.snappy(duration: 0.22)) {
-                                    isSelectingMessages = true
-                                    selectedMessageIDs = [message.id]
-                                    isComposerFocused = false
-                                }
-                            } label: {
-                                Label("Select", systemImage: "checkmark.circle")
-                            }
-                            if AbuseReportContract.isAvailable(
-                                features: model.capabilities?.features
-                            ),
-                               let context = abuseReportContext(
-                                   reportedUserID: message.senderId
-                               ),
-                               let reportTarget = AbuseReportTarget.message(
-                                   message,
-                                   context: context
-                               ) {
-                                Divider()
-                                Button(role: .destructive) {
-                                    abuseReportPresentation = ConversationAbuseReportPresentation(
-                                        context: context,
-                                        target: reportTarget,
-                                        reportedName: isGroupConversation
-                                            ? participantDisplayName(for: message.senderId)
-                                            : recipientDisplayName
-                                    )
-                                } label: {
-                                    Label("Report message", systemImage: "exclamationmark.bubble")
-                                }
-                            }
-                            Divider()
-                            Button(role: .destructive) {
-                                selectedMessageIDs = [message.id]
-                                showDeleteMessagesConfirmation = true
-                            } label: {
-                                Label("Delete for me", systemImage: "trash")
-                            }
-                        }
-                    }
-                }
+                .contextMenu { messageContextMenu(message) }
             if let serverID = message.serverMessageId?.lowercased(),
                let tallies = reactionTallies[serverID],
                !tallies.isEmpty {
@@ -3571,6 +4257,7 @@ struct ConversationView: View {
             toggleMessageSelection(message.id)
         }
         .accessibilityAddTraits(isSelectingMessages && isSelected ? .isSelected : [])
+        }
     }
 
     /// One grid bubble for a run of consecutive captionless photos/videos. Tapping any cell
@@ -3579,7 +4266,14 @@ struct ConversationView: View {
     private func albumBubble(_ album: ChatMediaAlbum, senderName: String?) -> some View {
         let isOutgoing = album.items[0].isOutgoing
         let closingMessage = messages.first { $0.id == album.items[album.items.count - 1].messageID }
-        return HStack(alignment: .center, spacing: 8) {
+        // Swiping the whole run answers the photo it opens with; a single photo inside the run
+        // can still be answered on its own from its long-press menu.
+        let leadMessage = messages.first { $0.id == album.items[0].messageID }
+        return SwipeToReplyContainer(
+            isEnabled: leadMessage.map { canReply(to: $0) } ?? false,
+            onReply: { leadMessage.map { beginReply(to: $0) } }
+        ) {
+        HStack(alignment: .center, spacing: 8) {
             if isOutgoing { Spacer(minLength: 44) }
             VStack(alignment: isOutgoing ? .trailing : .leading, spacing: 0) {
                 if let senderName, !isOutgoing {
@@ -3595,7 +4289,20 @@ struct ConversationView: View {
                     cachedData: { item in
                         messages.first(where: { $0.id == item.messageID })?.attachmentData
                     },
-                    onTap: { item in openGallery(at: item.messageID) }
+                    onTap: { item in openGallery(at: item.messageID) },
+                    cellMenu: { item in
+                        guard let message = messages.first(where: { $0.id == item.messageID })
+                        else { return AnyView(EmptyView()) }
+                        return AnyView(messageContextMenu(message))
+                    },
+                    cellBadge: { item in
+                        guard let message = messages.first(where: { $0.id == item.messageID }),
+                              let serverID = message.serverMessageId?.lowercased(),
+                              let tallies = reactionTallies[serverID],
+                              !tallies.isEmpty
+                        else { return AnyView(EmptyView()) }
+                        return AnyView(albumReactionBadge(tallies, for: message))
+                    }
                 )
                 .padding(.top, 3)
                 .padding(.horizontal, 3)
@@ -3612,6 +4319,41 @@ struct ConversationView: View {
             )
             if !isOutgoing { Spacer(minLength: 44) }
         }
+        }
+    }
+
+    /// Reaction chips for one photo inside an album, sized to sit in the corner of its cell.
+    /// A crowded album shows the two leading emoji and a count for the rest.
+    private func albumReactionBadge(
+        _ tallies: [MessageReactionTally],
+        for message: LocalMessage
+    ) -> some View {
+        let shown = tallies.prefix(2)
+        let hidden = tallies.count - shown.count
+        return HStack(spacing: 2) {
+            ForEach(Array(shown)) { tally in
+                Text(tally.emoji).font(.system(size: 12))
+            }
+            if hidden > 0 {
+                Text("+\(hidden)")
+                    .font(.system(size: 10, weight: .semibold).monospacedDigit())
+                    .foregroundStyle(.white)
+            }
+        }
+        .padding(.horizontal, 5)
+        .frame(height: 20)
+        .background(.black.opacity(0.55), in: Capsule())
+        .overlay {
+            if tallies.contains(where: \.includesCurrentUser) {
+                Capsule().stroke(KitColor.green, lineWidth: 1.2)
+            }
+        }
+        .contentShape(Capsule())
+        .onTapGesture { reactionDetailTarget = message }
+        .accessibilityLabel(
+            "\(tallies.reduce(0) { $0 + $1.count }) reactions"
+        )
+        .accessibilityAddTraits(.isButton)
     }
 
     /// Chronological photos/videos of this conversation for the shared gallery pager.
@@ -3647,12 +4389,16 @@ struct ConversationView: View {
     private func bubbleBody(
         _ message: LocalMessage,
         descriptor: KitMediaMessageDescriptor?,
-        mediaKind: KitChatMediaKind?
+        mediaKind: KitChatMediaKind?,
+        editedAt: Date? = nil
     ) -> some View {
         if let descriptor, let mediaKind, mediaKind == .image || mediaKind == .video {
             // Edge-to-edge media with a very slim frame at the top, left, and right;
             // the caption/time footer keeps regular padding below.
             VStack(alignment: message.isOutgoing ? .trailing : .leading, spacing: 0) {
+                quotedBlock(for: message)
+                    .padding(.horizontal, 5)
+                    .padding(.top, 5)
                 SecureMediaMessageView(
                     message: message,
                     descriptor: descriptor,
@@ -3677,6 +4423,7 @@ struct ConversationView: View {
             )
         } else {
             VStack(alignment: message.isOutgoing ? .trailing : .leading, spacing: 5) {
+                quotedBlock(for: message)
                 if let pending = message.pendingAttachment {
                     PendingSecureMediaMessageView(message: message, attachment: pending)
                     if KitChatMediaKind(mediaType: pending.mediaType) != .document,
@@ -3695,7 +4442,7 @@ struct ConversationView: View {
                     Text(ChatMessagePresentationPolicy.previewText(for: message))
                         .foregroundStyle(message.isOutgoing ? .white : KitColor.primaryText)
                 }
-                messageMetadata(message)
+                messageMetadata(message, editedAt: editedAt)
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
@@ -3981,8 +4728,16 @@ struct ConversationView: View {
         )
     }
 
-    private func messageMetadata(_ message: LocalMessage) -> some View {
+    private func messageMetadata(
+        _ message: LocalMessage,
+        editedAt: Date? = nil
+    ) -> some View {
         HStack(spacing: 4) {
+            // Beside the original time, never instead of it: the message still belongs to the
+            // moment it was said, and the marker only admits it was reworded afterwards.
+            if editedAt != nil {
+                Text("Edited")
+            }
             Text(AppPresentationClock.shortTime(message.createdAt))
             if message.isOutgoing,
                message.state == .failed,
@@ -4691,6 +5446,20 @@ struct ConversationView: View {
             return
         }
         let submittedAttachments = stagedAttachments
+        // The answer is fixed at the moment Send is pressed. Anything the user swipes to
+        // afterwards belongs to the next message, not to this one.
+        let answering = replyTarget.flatMap { canReply(to: $0) ? $0 : nil }?
+            .serverMessageId?
+            .lowercased()
+        let submittedSharedDelivery: SharedInboxDelivery? = model.sharedInboxDelivery.flatMap { delivery -> SharedInboxDelivery? in
+            guard appliedSharedDeliveryID == delivery.id,
+                  delivery.conversationID.caseInsensitiveCompare(conversation.id) == .orderedSame
+            else { return nil }
+            return delivery
+        }
+        let sharedTextClientMessageID = submittedSharedDelivery?.batch.text == nil
+            ? nil
+            : submittedSharedDelivery?.batch.id
         let persistenceVersion = model.nextConversationDraftWriteVersion()
         immediateDraftPersistenceTask?.cancel()
         immediateDraftPersistenceTask = nil
@@ -4715,8 +5484,10 @@ struct ConversationView: View {
                     title: recipientDisplayName,
                     recipientId: recipientUserID,
                     body: submittedDraft,
+                    clientMessageID: sharedTextClientMessageID,
                     draftClearVersion: clearVersion,
-                    deliverAt: deliverAt
+                    deliverAt: deliverAt,
+                    replyToServerMessageID: answering
                 )
             } else {
                 allQueued = await sendStagedAttachments(
@@ -4724,12 +5495,20 @@ struct ConversationView: View {
                     text: submittedText,
                     submittedDraft: submittedDraft,
                     clearVersion: clearVersion,
-                    deliverAt: deliverAt
+                    sharedTextClientMessageID: sharedTextClientMessageID,
+                    deliverAt: deliverAt,
+                    replyToServerMessageID: answering
                 )
             }
             if allQueued {
                 draftWriteVersion = clearVersion
                 if draft == submittedDraft { draft = "" }
+                cancelReply()
+                if let submittedSharedDelivery {
+                    model.consumeSharedInboxDelivery(submittedSharedDelivery.id)
+                    appliedSharedDeliveryID = nil
+                    appliedSharedOriginalDraft = nil
+                }
             }
             isSending = false
         }
@@ -4742,7 +5521,9 @@ struct ConversationView: View {
         text: String,
         submittedDraft: String,
         clearVersion: ConversationDraftWriteVersion,
-        deliverAt: Date? = nil
+        sharedTextClientMessageID: UUID?,
+        deliverAt: Date? = nil,
+        replyToServerMessageID: String? = nil
     ) async -> Bool {
         // A single non-document attachment carries the typed text as its caption. Documents
         // keep the filename in the caption (the wire descriptor has no filename field), and
@@ -4750,6 +5531,9 @@ struct ConversationView: View {
         // both send the typed text as a separate follow-up message.
         let textRidesOnMedia = attachments.count == 1 && attachments[0].kind != .document
         var queuedAllMedia = true
+        // Only the first attachment answers. A run of photos is one act of answering, not one
+        // answer per photo, and the follow-up text belongs to that same run.
+        var pendingReplyTarget = replyToServerMessageID
         for attachment in attachments {
             let caption: String? = if attachment.kind == .document {
                 attachment.displayName
@@ -4765,14 +5549,17 @@ struct ConversationView: View {
                 mediaData: attachment.data,
                 mediaType: attachment.mediaType,
                 caption: caption,
+                clientMessageID: attachment.clientMessageID,
                 submittedDraftBody: textRidesOnMedia ? submittedDraft : nil,
                 draftClearVersion: textRidesOnMedia ? clearVersion : nil,
-                deliverAt: deliverAt
+                deliverAt: deliverAt,
+                replyToServerMessageID: pendingReplyTarget
             )
             if queued {
                 // Durably queued: unstage it even if a later attachment fails, so a retry
                 // can never duplicate this one.
                 stagedAttachments.removeAll { $0.id == attachment.id }
+                pendingReplyTarget = nil
             } else {
                 queuedAllMedia = false
             }
@@ -4786,8 +5573,10 @@ struct ConversationView: View {
             title: recipientDisplayName,
             recipientId: recipientUserID,
             body: followUp,
+            clientMessageID: sharedTextClientMessageID,
             draftClearVersion: clearVersion,
-            deliverAt: deliverAt
+            deliverAt: deliverAt,
+            replyToServerMessageID: pendingReplyTarget
         )
         if !textQueued {
             model.lastError =
@@ -4813,17 +5602,29 @@ struct ConversationView: View {
 
     private func sendVoiceNote() {
         guard !isReadOnlyAppReviewPreview else { return }
-        guard let recording = voiceRecorder.finish() else { return }
+        let answering = replyTarget.flatMap { canReply(to: $0) ? $0 : nil }?
+            .serverMessageId?
+            .lowercased()
         isSending = true
         Task {
+            // The only place the draft leaves the device: the segments are stitched, read
+            // back, and handed to the encrypted send path.
+            guard let recording = await voiceRecorder.finish() else {
+                VoiceNoteDraftRegistry.shared.release(conversation.id)
+                isSending = false
+                return
+            }
+            VoiceNoteDraftRegistry.shared.release(conversation.id)
             let queued = await model.queueMediaMessage(
                 conversationId: conversation.id,
                 title: conversation.title,
                 recipientId: recipientUserID,
                 mediaData: recording.data,
                 mediaType: VoiceNoteRecorder.Recording.mediaType,
-                caption: nil
+                caption: nil,
+                replyToServerMessageID: answering
             )
+            if queued { cancelReply() }
             if !queued {
                 // Never drop a recorded note on a failed send — stage it so the user can retry.
                 stageAttachment(ChatStagedAttachment(
@@ -4992,6 +5793,15 @@ struct ConversationView: View {
     private func loadPickedLibraryItems(_ items: [PhotosPickerItem], generation: Int) async {
         guard generation == attachmentLoadGeneration else { return }
         isLoadingAttachment = true
+        // A single picked video goes through the same trim editor a camera capture does —
+        // including one still too large to send whole, which trimming is exactly the remedy
+        // for. A mixed or multi selection stages as before; each staged video then carries
+        // its own Trim affordance.
+        if items.count == 1, let only = items.first,
+           only.supportedContentTypes.contains(where: { $0.conforms(to: .movie) }) {
+            await openLibraryVideoInEditor(only, generation: generation)
+            return
+        }
         var failedCount = 0
         for item in items {
             guard generation == attachmentLoadGeneration else { return }
@@ -5098,6 +5908,116 @@ struct ConversationView: View {
         }
     }
 
+    /// Copies the picked video to an editor-owned protected temp file and opens the trim
+    /// editor. File-backed on purpose: pulling a library video through Data would hold up to
+    /// the whole file in memory before a single frame is shown.
+    @MainActor
+    private func openLibraryVideoInEditor(_ item: PhotosPickerItem, generation: Int) async {
+        defer {
+            if generation == attachmentLoadGeneration {
+                selectedPhotoItems = []
+                isLoadingAttachment = false
+            }
+        }
+        do {
+            guard let picked = try await item.loadTransferable(type: PickedLibraryVideo.self)
+            else { throw AttachmentSelectionError.invalidImage }
+            guard generation == attachmentLoadGeneration else {
+                try? FileManager.default.removeItem(at: picked.url)
+                return
+            }
+            let byteCount = (try? FileManager.default
+                .attributesOfItem(atPath: picked.url.path)[.size] as? Int64) ?? 0
+            guard ConversationAttachmentStagingPolicy.editableVideoSource(byteCount: byteCount)
+            else {
+                try? FileManager.default.removeItem(at: picked.url)
+                throw AttachmentSelectionError.videoSourceTooLarge
+            }
+            let mediaType = libraryVideoMediaType(for: item)
+            // Give the picker sheet a beat to dismiss before presenting the editor cover,
+            // exactly as handleCameraOutput does between covers.
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            guard generation == attachmentLoadGeneration else {
+                try? FileManager.default.removeItem(at: picked.url)
+                return
+            }
+            editorSession = MediaEditorSession(input: .video(picked.url, mediaType: mediaType))
+        } catch {
+            guard generation == attachmentLoadGeneration else { return }
+            model.lastError = (error as? LocalizedError)?.errorDescription
+                ?? "The selected video could not be read."
+        }
+    }
+
+    /// Writes a staged video back to a scratch file and opens the trim editor over it; the
+    /// editor's output replaces the staged attachment in place. This is how a video from a
+    /// multi-selection or the share extension gets its trim, without disturbing the
+    /// transactional share-inbox staging.
+    private func beginTrimmingStagedVideo(_ attachment: ChatStagedAttachment) {
+        guard attachment.kind == .video, editorSession == nil else { return }
+        do {
+            let fileExtension = attachment.mediaType == "video/quicktime" ? "mov" : "mp4"
+            let url = try KitCaptureTemporaryFileStore.makeFileURL(
+                directoryPrefix: KitCaptureTemporaryFileStore.editorDirectoryPrefix,
+                fileName: "staged.\(fileExtension)"
+            )
+            try attachment.data.write(to: url, options: [.atomic])
+            try KitCaptureTemporaryFileStore.protectFile(at: url)
+            editorSession = MediaEditorSession(
+                input: .video(url, mediaType: attachment.mediaType),
+                replacingAttachmentID: attachment.id
+            )
+        } catch {
+            model.lastError = "That video could not be opened for trimming."
+        }
+    }
+
+    /// Applies a staged-video trim: the edited file replaces the attachment's bytes, keeping
+    /// its position, name, and identity in the staged set. Cancelling keeps the original.
+    private func handleStagedVideoEditOutput(
+        _ output: KitMediaEditorOutput?,
+        replacing attachmentID: UUID,
+        original: KitMediaEditorInput
+    ) {
+        let originalURL: URL? = if case .video(let url, _) = original { url } else { nil }
+        guard case .video(let url, let mediaType) = output else {
+            if let originalURL { try? FileManager.default.removeItem(at: originalURL) }
+            return
+        }
+        if let originalURL, url == originalURL {
+            // Untouched: the staged bytes are already exactly this file.
+            try? FileManager.default.removeItem(at: originalURL)
+            return
+        }
+        Task { @MainActor in
+            defer {
+                try? FileManager.default.removeItem(at: url)
+                if let originalURL { try? FileManager.default.removeItem(at: originalURL) }
+            }
+            do {
+                let data = try await Task.detached(priority: .userInitiated) {
+                    try Data(contentsOf: url)
+                }.value
+                guard KitChatMediaLimits.fits(data.count, kind: .video) else {
+                    throw AttachmentSelectionError.fileTooLarge
+                }
+                guard let index = stagedAttachments.firstIndex(where: { $0.id == attachmentID })
+                else { return }
+                let existing = stagedAttachments[index]
+                stagedAttachments[index] = ChatStagedAttachment(
+                    kind: .video,
+                    data: data,
+                    mediaType: mediaType,
+                    displayName: existing.displayName,
+                    previewImage: existing.previewImage
+                )
+            } catch {
+                model.lastError = (error as? LocalizedError)?.errorDescription
+                    ?? "The trimmed video could not be read."
+            }
+        }
+    }
+
     // MARK: Shares from other apps
 
     /// Places a share this chat was chosen for into the composer.
@@ -5112,6 +6032,7 @@ struct ConversationView: View {
               !isReadOnlyAppReviewPreview
         else { return }
         appliedSharedDeliveryID = delivery.id
+        appliedSharedOriginalDraft = nil
         Task { @MainActor in
             await stageSharedInbox(delivery)
         }
@@ -5133,7 +6054,7 @@ struct ConversationView: View {
             model.lastError = availableSlots == 0
                 ? "Remove an attachment from this draft before adding the shared items."
                 : "This draft has room for only \(availableSlots) more shared items."
-            model.retrySharedInboxDelivery(delivery.id)
+            retryUnappliedSharedInboxDelivery(delivery)
             return
         }
 
@@ -5144,7 +6065,7 @@ struct ConversationView: View {
         preparedAttachments.reserveCapacity(batch.items.count)
         for item in batch.items {
             guard generation == attachmentLoadGeneration else {
-                model.retrySharedInboxDelivery(delivery.id)
+                retryUnappliedSharedInboxDelivery(delivery)
                 return
             }
             let batchID = batch.id
@@ -5152,31 +6073,31 @@ struct ConversationView: View {
                 try SharedInboxStore().data(for: item, in: batchID)
             }.value
             guard generation == attachmentLoadGeneration else {
-                model.retrySharedInboxDelivery(delivery.id)
+                retryUnappliedSharedInboxDelivery(delivery)
                 return
             }
             guard let data, let attachment = preparedSharedItem(item, data: data) else {
                 model.lastError = "The shared items could not all be attached. Nothing was removed."
-                model.retrySharedInboxDelivery(delivery.id)
+                retryUnappliedSharedInboxDelivery(delivery)
                 return
             }
             preparedAttachments.append(attachment)
         }
 
         guard generation == attachmentLoadGeneration else {
-            model.retrySharedInboxDelivery(delivery.id)
+            retryUnappliedSharedInboxDelivery(delivery)
             return
         }
+        let originalDraft = draft
         if let text = batch.text {
             // Shared text joins the draft rather than replacing it: someone who was already part
             // way through a message must not lose it to a link they shared in.
-            let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-            draft = trimmed.isEmpty ? text : "\(trimmed)\n\(text)"
+            draft = SharedInboxPolicy.composerDraft(existingDraft: draft, sharedText: text)
         }
+        appliedSharedOriginalDraft = draft == originalDraft ? nil : originalDraft
         stagedAttachments.append(contentsOf: preparedAttachments)
-        // Only now: the plaintext in the shared container is removed once it lives in the
-        // composer, where the customer can see and remove it.
-        model.consumeSharedInboxDelivery(delivery.id)
+        // Keep the protected handoff until the exact text/attachments are durably in the outbox.
+        // A view dismissal or process crash before Send can therefore re-stage this same batch.
     }
 
     /// Builds an attachment without mutating the composer. The caller commits a whole batch only
@@ -5187,23 +6108,27 @@ struct ConversationView: View {
         data: Data
     ) -> ChatStagedAttachment? {
         guard !data.isEmpty, data.count == item.byteCount else { return nil }
-        if item.mediaType.hasPrefix("image/") {
+        if item.mediaType.hasPrefix("image/"),
+           SharedInboxPolicy.shouldDecodeSharedImage(byteCount: data.count),
+           let prepared = AttachmentImageDecoder.secureJPEG(from: data) {
             // Every shared image is re-encoded, which is what lets a camera-native HEIC be shared
-            // into a chat at all, and strips the location and device metadata with it.
-            guard data.count <= 64 * 1_024 * 1_024,
-                  let prepared = AttachmentImageDecoder.secureJPEG(from: data)
-            else { return nil }
+            // into a chat at all, and strips the location and device metadata with it. An image
+            // too large to decode safely (or one ImageIO cannot parse) remains shareable below as
+            // an opaque document instead of making an already-accepted handoff impossible.
             return ChatStagedAttachment(
                 kind: .image,
                 data: prepared.data,
                 mediaType: "image/jpeg",
                 displayName: item.displayName,
-                previewImage: prepared.preview
+                previewImage: prepared.preview,
+                clientMessageID: item.id
             )
         }
-        let mediaType = SecureMessagingWire.allowedAttachmentMediaTypes.contains(item.mediaType)
-            ? item.mediaType
-            : "application/octet-stream"
+        let mediaType = item.mediaType.hasPrefix("image/")
+            ? SharedInboxPolicy.fallbackMediaType
+            : SecureMessagingWire.allowedAttachmentMediaTypes.contains(item.mediaType)
+                ? item.mediaType
+                : SharedInboxPolicy.fallbackMediaType
         let kind = KitChatMediaKind(mediaType: mediaType)
         guard KitChatMediaLimits.fits(data.count, kind: kind) else { return nil }
         return ChatStagedAttachment(
@@ -5211,8 +6136,15 @@ struct ConversationView: View {
             data: data,
             mediaType: mediaType,
             displayName: item.displayName,
-            previewImage: nil
+            previewImage: nil,
+            clientMessageID: item.id
         )
+    }
+
+    private func retryUnappliedSharedInboxDelivery(_ delivery: SharedInboxDelivery) {
+        appliedSharedDeliveryID = nil
+        appliedSharedOriginalDraft = nil
+        model.retrySharedInboxDelivery(delivery.id)
     }
 
     private func stageDocument(_ url: URL) {
@@ -5384,6 +6316,15 @@ struct ConversationView: View {
 enum ConversationAttachmentStagingPolicy {
     /// A send can carry several photos/videos; the album grid groups them on arrival.
     static let maximumStagedAttachments = 8
+
+    /// The largest library video the trim editor will accept as a SOURCE. A disk/scratch guard,
+    /// not a wire cap: the send cap still applies to the trimmed clip, and cutting a short
+    /// window out of a long, heavy video is exactly what the editor is for.
+    static let maximumEditableVideoSourceBytes: Int64 = 1_073_741_824
+
+    static func editableVideoSource(byteCount: Int64) -> Bool {
+        byteCount > 0 && byteCount <= maximumEditableVideoSourceBytes
+    }
 }
 
 /// Case- and diacritic-insensitive search across everything readable in one conversation:
@@ -5581,9 +6522,42 @@ private struct ConversationGalleryTarget: Identifiable {
     let id: UUID
 }
 
+/// The message the delivery-details sheet is asking about.
+private struct MessageInfoTarget: Identifiable {
+    let conversationID: String
+    let serverMessageID: String
+
+    var id: String { serverMessageID }
+}
+
+/// A library video received as a FILE, not as Data: the picker's copy lands directly in an
+/// editor-owned protected scratch directory, so a heavy video never has to fit in memory just
+/// to reach the trim editor. The receiver (the editor flow) owns and deletes the file.
+private struct PickedLibraryVideo: Transferable {
+    let url: URL
+
+    static var transferRepresentation: some TransferRepresentation {
+        FileRepresentation(importedContentType: .movie) { received in
+            let fileExtension = received.file.pathExtension.isEmpty
+                ? "mov"
+                : received.file.pathExtension.lowercased()
+            let destination = try KitCaptureTemporaryFileStore.makeFileURL(
+                directoryPrefix: KitCaptureTemporaryFileStore.editorDirectoryPrefix,
+                fileName: "library.\(fileExtension)"
+            )
+            try FileManager.default.copyItem(at: received.file, to: destination)
+            try KitCaptureTemporaryFileStore.protectFile(at: destination)
+            return PickedLibraryVideo(url: destination)
+        }
+    }
+}
+
 private struct MediaEditorSession: Identifiable {
     let id = UUID()
     let input: KitMediaEditorInput
+    /// When set, the editor's output replaces this staged attachment instead of staging a new
+    /// one — the path a "Trim" tap on an already-staged video takes.
+    var replacingAttachmentID: UUID? = nil
 }
 
 /// Full emoji picker for reactions, grouped by the curated catalog sections.
@@ -6149,9 +7123,14 @@ private struct ConversationAvatarView: View {
     let name: String
     let avatarURL: String?
     let size: CGFloat
+    var isGroup = false
 
     var body: some View {
-        RemoteAvatarView(name: name, avatarURL: avatarURL, size: size, ringOpacity: nil)
+        if isGroup {
+            GroupAvatarView(title: name, photoURL: avatarURL, size: size)
+        } else {
+            RemoteAvatarView(name: name, avatarURL: avatarURL, size: size, ringOpacity: nil)
+        }
     }
 }
 
@@ -6159,6 +7138,7 @@ private enum AttachmentSelectionError: LocalizedError {
     case invalidImage
     case invalidDocument
     case fileTooLarge
+    case videoSourceTooLarge
 
     var errorDescription: String? {
         switch self {
@@ -6168,6 +7148,8 @@ private enum AttachmentSelectionError: LocalizedError {
             "This document could not be read."
         case .fileTooLarge:
             "Files can be up to \(KitChatMediaLimits.maximumTransferLabel)."
+        case .videoSourceTooLarge:
+            "That video is too large to edit here. Choose a shorter video."
         }
     }
 }

@@ -70,6 +70,11 @@ struct RootView: View {
             center.connectionStateHandler = { [weak appModel] isLive in
                 appModel?.realtimeMessagingConnectionDidChange(isLive: isLive)
             }
+            // The primary answer path: the validated `kit.call.answered` frame, with the
+            // `call.answered` push remaining the fallback for a device whose socket is down.
+            center.callAnswerHandler = { [weak appModel] signal in
+                appModel?.handleCallAnswerSignal(callId: signal.callId, signal: signal)
+            }
             center.setForeground(
                 UIApplication.shared.applicationState == .active
                     && !model.requiresBiometricSignIn
@@ -113,7 +118,7 @@ struct RootView: View {
         // Presented from the root rather than from the Chats tab: a share can arrive while the
         // customer is looking at Home or a call, and the picker has to be reachable from wherever
         // they actually are.
-        .sheet(
+        .fullScreenCover(
             isPresented: Binding(
                 get: { model.pendingSharedInboxBatch != nil },
                 set: { if !$0 { model.discardPendingSharedInbox() } }
@@ -126,7 +131,6 @@ struct RootView: View {
                     onCancel: { model.discardPendingSharedInbox() }
                 )
                 .environmentObject(model)
-                .presentationBackground(.ultraThinMaterial)
             }
         }
     }

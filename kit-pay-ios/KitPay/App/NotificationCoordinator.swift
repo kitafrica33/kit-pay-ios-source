@@ -2146,6 +2146,23 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
         callProvider.reportOutgoingCall(with: callUUID, connectedAt: connectedAt)
     }
 
+    /// Another device on this account took the call, so this device stops offering it: the
+    /// CallKit call — revealed or still quarantined — ends as answered-elsewhere rather than
+    /// ringing on until the invite expires and recording a miss. The device that actually
+    /// answered and a caller's outgoing leg are fenced out and left untouched.
+    @MainActor
+    func reportCallAnsweredElsewhere(callId: String) {
+        guard let callUUID = UUID(uuidString: callId) else { return }
+        let offersQuarantinedRing = quarantinedIncomingCalls[callUUID] != nil
+        let offersRevealedRing =
+            backendCallIds[callUUID]?.caseInsensitiveCompare(callId) == .orderedSame
+                && !answeredCalls.contains(callUUID)
+                && !outgoingCalls.contains(callUUID)
+        guard offersQuarantinedRing || offersRevealedRing else { return }
+        clearCall(callUUID)
+        callProvider.reportCall(with: callUUID, endedAt: Date(), reason: .answeredElsewhere)
+    }
+
     @MainActor
     private func clearCall(_ callUUID: UUID) {
         let callID = backendCallIds[callUUID] ?? callUUID.uuidString.lowercased()

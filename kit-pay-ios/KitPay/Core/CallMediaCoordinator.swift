@@ -1422,6 +1422,14 @@ final class CallMediaCoordinator: ObservableObject {
     @Published private(set) var activeCall: ActiveCallPresentation?
     @Published private(set) var state: State = .idle
     @Published private(set) var controlError: String?
+    /// The presented call this device has seen a validated answer for, whichever route
+    /// carried it — the accept response, the socket frame, or the push. Exact-id fenced,
+    /// so a signal about any other call never silences or advances this one.
+    @Published private(set) var answeredCallId: String?
+    /// Where the presented call's displayed duration counts from. Server-authoritative when
+    /// any answer signal carried a usable instant pair; a locally observed media connection
+    /// otherwise, which a later server signal may still correct backward — never forward.
+    @Published private(set) var durationAnchor: CallDurationAnchor?
 
     let media: LiveKitCallMediaTransport
 
@@ -1493,6 +1501,70 @@ final class CallMediaCoordinator: ObservableObject {
         accountLeaseGate.activate(lease)
     }
 
+    /// Takes a validated answer for the call this coordinator is presenting. The exact-id
+    /// match is the fence at this layer: an answer buffered from another call, another
+    /// attempt, or another account's session can never satisfy it. Without an instant pair
+    /// the answer still counts — the caller stops hearing "Ringing…" — it just anchors no
+    /// timer, which the media connection then does.
+    func applyCallAnswered(callId: String, signal: CallAnswerSignal?) {
+        guard state != .idle,
+              state != .ending,
+              let presentedCallId = activeCall?.id,
+              presentedCallId.caseInsensitiveCompare(callId) == .orderedSame
+        else { return }
+        answeredCallId = presentedCallId
+        guard let signal else { return }
+        durationAnchor = CallDurationAnchorPolicy.anchor(
+            signal: signal,
+            monotonicNow: CallMonotonicClock.now(),
+            previous: durationAnchor
+        )
+    }
+
+    /// Whether the presented call has been answered, by any validated route.
+    var presentedCallWasAnswered: Bool {
+        guard let presented = activeCall?.id, let answeredCallId else { return false }
+        return answeredCallId.caseInsensitiveCompare(presented) == .orderedSame
+    }
+
+    /// Seconds the presented call has been running, from the anchor when one names it.
+    /// `nil` while no anchor does — the view keeps its local wall-clock fallback rather
+    /// than showing a timer this coordinator cannot vouch for.
+    func presentedCallDurationSeconds(
+        monotonicNow: TimeInterval = CallMonotonicClock.now()
+    ) -> Int? {
+        guard let anchor = durationAnchor,
+              let presented = activeCall?.id,
+              anchor.callId.caseInsensitiveCompare(presented) == .orderedSame
+        else { return nil }
+        return CallDurationAnchorPolicy.seconds(anchor, monotonicNow: monotonicNow)
+    }
+
+    /// A presentation that stops or changes calls drops any answer recorded for the old
+    /// one, while a rejoin or reconnect of the same call keeps its running timer.
+    private func alignAnswerState(toCallId callId: String?) {
+        if let answeredCallId,
+           answeredCallId.caseInsensitiveCompare(callId ?? "") != .orderedSame {
+            self.answeredCallId = nil
+        }
+        if let anchor = durationAnchor,
+           anchor.callId.caseInsensitiveCompare(callId ?? "") != .orderedSame {
+            durationAnchor = nil
+        }
+    }
+
+    /// The accept response already carries the authoritative answer, so the answering device
+    /// never waits for a frame or a push to know where its timer starts. A start response
+    /// carries no answer: the caller's arrives by signal, or by the media connection itself.
+    private func applyHandoffAnswer(_ handoff: CallMediaHandoff) {
+        guard let signal = CallAnswerSignalPolicy.signal(
+            callId: handoff.callId,
+            answeredAt: handoff.answeredAt,
+            serverTime: handoff.serverTime
+        ) else { return }
+        applyCallAnswered(callId: handoff.callId, signal: signal)
+    }
+
     /// Synchronously revokes matching admission before the first suspension, then tears down
     /// capture/playback. A suspended connect becomes stale through the session generation, while
     /// a delayed sign-out from another lease cannot reset replacement-account media.
@@ -1508,6 +1580,7 @@ final class CallMediaCoordinator: ObservableObject {
         activeHandoff = nil
         pendingOutgoingClientCallID = nil
         activeCall = nil
+        alignAnswerState(toCallId: nil)
         invalidateReconnect()
         controlError = nil
         state = .idle
@@ -1533,6 +1606,8 @@ final class CallMediaCoordinator: ObservableObject {
         activeHandoff = request.handoff
         activeCall = ActiveCallPresentation(request.handoff)
         state = .preparing
+        alignAnswerState(toCallId: request.handoff.callId)
+        applyHandoffAnswer(request.handoff)
         switch request.handoff.direction {
         case "outgoing":
             NotificationCoordinator.shared.requestStartOutgoingCall(request)
@@ -1561,6 +1636,10 @@ final class CallMediaCoordinator: ObservableObject {
         activeCall = ActiveCallPresentation(handoff)
         state = .connecting
         controlError = nil
+        // Keyed by call id, so a reconnect of the same call keeps its running timer while a
+        // replacement call starts from nothing it did not earn.
+        alignAnswerState(toCallId: handoff.callId)
+        applyHandoffAnswer(handoff)
         do {
             try await session.connect(handoff)
             guard accountLeaseGate.accepts(request.lease),
@@ -1656,6 +1735,7 @@ final class CallMediaCoordinator: ObservableObject {
         activeCall = presentation
         state = .connecting
         controlError = nil
+        alignAnswerState(toCallId: presentation.id)
         // The dial is still in flight. Resolving the media host now overlaps with it instead of
         // being paid for after the server answers.
         CallMediaPrewarmer.shared.prewarm()

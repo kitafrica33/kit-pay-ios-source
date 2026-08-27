@@ -1932,6 +1932,7 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
             pqLastResortPreKeySHA256: String(repeating: "c", count: 64)
         )
         try await store.update { state in
+            state.communicationOwnerUserID = localUserID
             state.secureMessaging = crypto
             state.conversations = [Conversation(
                 id: conversationID,
@@ -1949,6 +1950,12 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
             provisioningPreKeyCount: 1
         )
         let jpeg = Data([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0xff, 0xd9])
+        let retainedShareItemID = UUID()
+        let draftWriterID = UUID()
+        let draftClearVersion = ConversationDraftWriteVersion(
+            writerID: draftWriterID,
+            sequence: 2
+        )
 
         let result = try await coordinator.queueDeferredImage(
             forUserID: localUserID,
@@ -1957,12 +1964,63 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
             title: "ExampleContact",
             mediaData: jpeg,
             mediaType: "image/jpeg",
-            caption: "  Offline receipt  "
+            caption: "  Offline receipt  ",
+            clientMessageID: retainedShareItemID
         )
+        try await store.update { state in
+            state.conversationDrafts = [
+                conversationID: ConversationDraft(
+                    body: "Offline receipt",
+                    updatedAt: Date(),
+                    writeVersion: ConversationDraftWriteVersion(
+                        writerID: draftWriterID,
+                        sequence: 1
+                    )
+                ),
+            ]
+        }
+        let retry = try await coordinator.queueDeferredImage(
+            forUserID: localUserID,
+            conversationID: conversationID,
+            expectedRecipientUserID: recipientUserID,
+            title: "ExampleContact",
+            mediaData: jpeg,
+            mediaType: "image/jpeg",
+            caption: "Offline receipt",
+            clientMessageID: retainedShareItemID,
+            submittedDraftBody: "Offline receipt",
+            draftClearVersion: draftClearVersion
+        )
+        do {
+            _ = try await coordinator.queueDeferredImage(
+                forUserID: localUserID,
+                conversationID: conversationID,
+                expectedRecipientUserID: recipientUserID,
+                title: "ExampleContact",
+                mediaData: jpeg,
+                mediaType: "image/jpeg",
+                caption: "Different attachment",
+                clientMessageID: retainedShareItemID
+            )
+            XCTFail("a same-ID attachment collision must not be acknowledged as a retry")
+        } catch {
+            XCTAssertEqual(
+                error as? SecureMessagingExchangeError,
+                .invalidConversation
+            )
+        }
 
         let networkCallCount = await transport.networkCallCount()
         XCTAssertEqual(networkCallCount, 0)
         let snapshot = await store.snapshot()
+        XCTAssertEqual(retry.clientMessageID, result.clientMessageID)
+        XCTAssertEqual(snapshot.messages.count, 1)
+        XCTAssertEqual(snapshot.outbox.count, 1)
+        XCTAssertEqual(snapshot.conversationDrafts?[conversationID]?.body, "")
+        XCTAssertEqual(
+            snapshot.conversationDrafts?[conversationID]?.writeVersion,
+            draftClearVersion
+        )
         let message = try XCTUnwrap(snapshot.messages.first)
         let command = try XCTUnwrap(snapshot.outbox.first)
         XCTAssertEqual(result.clientMessageID, message.id)
