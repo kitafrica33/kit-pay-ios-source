@@ -1,0 +1,24 @@
+.DS_Store
+DerivedData/
+build/
+*.xcuserstate
+xcuserdata/
+KitPay/Configuration/Local.xcconfig
+Pods/
+KitPay.xcworkspace/
+
+# Apple signing material and locally exported release artifacts.
+*.cer
+*.p12
+*.p8
+*.pem
+*.mobileprovision
+*.provisionprofile
+*.keychain-db
+ExportOptions.plist
+*ExportOptions.generated.plist
+*.xcarchive
+*.ipa
+*.dSYM.zip
+__pycache__/
+*.py[cod]

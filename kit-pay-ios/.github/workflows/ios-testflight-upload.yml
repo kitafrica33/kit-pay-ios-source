@@ -1,0 +1,277 @@
+name: Upload verified iOS archive to TestFlight
+run-name: TestFlight Kit Pay ${{ inputs.marketing_version }} (${{ inputs.build_number }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      archive_run_id:
+        description: Successful Signed iOS App Store archive workflow run ID
+        required: true
+        type: string
+      marketing_version:
+        description: Exact archived CFBundleShortVersionString
+        required: true
+        type: string
+      build_number:
+        description: Exact archived CFBundleVersion
+        required: true
+        type: string
+      confirmation:
+        description: Type UPLOAD_KIT_PAY_TESTFLIGHT
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: kit-pay-ios-testflight-upload
+  cancel-in-progress: false
+
+jobs:
+  upload:
+    name: Verify archived IPA and upload to TestFlight
+    runs-on: macos-latest
+    timeout-minutes: 90
+    environment: production
+    env:
+      IOS_BUNDLE_ID: africa.kit.pay.ios
+      MARKETING_VERSION: ${{ inputs.marketing_version }}
+      BUILD_NUMBER: ${{ inputs.build_number }}
+    steps:
+      - name: Check out current protected source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate upload intent and current protected main
+        env:
+          ARCHIVE_RUN_ID: ${{ inputs.archive_run_id }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = 'refs/heads/main'
+          test "$CONFIRMATION" = 'UPLOAD_KIT_PAY_TESTFLIGHT'
+          [[ "$ARCHIVE_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]]
+          [[ "$MARKETING_VERSION" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]]
+          [[ "$BUILD_NUMBER" =~ ^[1-9][0-9]*$ ]]
+          (( ${#MARKETING_VERSION} <= 64 ))
+          (( ${#BUILD_NUMBER} <= 18 ))
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$GITHUB_SHA" = "$(git rev-parse refs/remotes/origin/main)"
+
+      - name: Verify exact successful archive workflow run
+        id: archive
+        env:
+          ARCHIVE_RUN_ID: ${{ inputs.archive_run_id }}
+          EXPECTED_SOURCE_SHA: ${{ github.sha }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          repository = os.environ.get('GITHUB_REPOSITORY', '')
+          run_id = os.environ.get('ARCHIVE_RUN_ID', '')
+          source_sha = os.environ.get('EXPECTED_SOURCE_SHA', '')
+          token = os.environ.get('GITHUB_TOKEN', '')
+          if not re.fullmatch(r'[^/\s]+/[^/\s]+', repository):
+              raise SystemExit('GITHUB_REPOSITORY is malformed')
+          if not re.fullmatch(r'[1-9][0-9]{0,19}', run_id):
+              raise SystemExit('The archive workflow run ID is malformed')
+          if not re.fullmatch(r'[0-9a-f]{40}', source_sha):
+              raise SystemExit('The expected source SHA is malformed')
+          if not token:
+              raise SystemExit('GITHUB_TOKEN is required to verify the archive run')
+
+          url = (
+              'https://api.github.com/repos/'
+              f'{urllib.parse.quote(repository, safe="/")}/actions/runs/{run_id}'
+          )
+          request = urllib.request.Request(
+              url,
+              headers={
+                  'Accept': 'application/vnd.github+json',
+                  'Authorization': f'Bearer {token}',
+                  'X-GitHub-Api-Version': '2022-11-28',
+              },
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  run = json.load(response)
+          except (urllib.error.URLError, json.JSONDecodeError) as error:
+              raise SystemExit(f'The archive workflow run could not be verified: {error}')
+
+          expected = {
+              'id': int(run_id),
+              'event': 'workflow_dispatch',
+              'head_branch': 'main',
+              'head_sha': source_sha,
+              'status': 'completed',
+              'conclusion': 'success',
+              'path': '.github/workflows/ios-app-store-archive.yml',
+          }
+          for field, value in expected.items():
+              if run.get(field) != value:
+                  raise SystemExit(f'The archive workflow run has an unexpected {field}')
+          run_repository = run.get('repository')
+          if not isinstance(run_repository, dict) or run_repository.get('full_name') != repository:
+              raise SystemExit('The archive workflow run belongs to a different repository')
+          run_attempt = run.get('run_attempt')
+          if type(run_attempt) is not int or run_attempt < 1:
+              raise SystemExit('The archive workflow run attempt is invalid')
+
+          artifact_name = f'kit-pay-ios-app-store-{source_sha}-{run_id}-{run_attempt}'
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              output.write(f'run_attempt={run_attempt}\n')
+              output.write(f'artifact_name={artifact_name}\n')
+          PY
+
+      - name: Test TestFlight artifact validator
+        run: >-
+          python3 -m unittest discover
+          -s .github/scripts/tests
+          -p 'test_ios_testflight_artifact.py'
+
+      - name: Test credential-safe TestFlight processing poller
+        run: >-
+          python3 -m unittest discover
+          -s .github/scripts/tests
+          -p 'test_wait_for_testflight_build.py'
+
+      - name: Download exact verified archive artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ steps.archive.outputs.artifact_name }}
+          path: ${{ runner.temp }}/kitpay-testflight-input
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.archive_run_id }}
+
+      - name: Verify evidence, source, target, and immutable artifact bytes
+        env:
+          ARCHIVE_RUN_ID: ${{ inputs.archive_run_id }}
+          ARCHIVE_RUN_ATTEMPT: ${{ steps.archive.outputs.run_attempt }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/verify_ios_testflight_artifact.py \
+            --artifact-directory "$RUNNER_TEMP/kitpay-testflight-input" \
+            --archive-run-id "$ARCHIVE_RUN_ID" \
+            --archive-run-attempt "$ARCHIVE_RUN_ATTEMPT" \
+            --source-commit "$GITHUB_SHA" \
+            --bundle-id "$IOS_BUNDLE_ID" \
+            --version "$MARKETING_VERSION" \
+            --build-number "$BUILD_NUMBER" \
+            --ipa-sha-output "$RUNNER_TEMP/kitpay-testflight-ipa-sha256"
+
+          verification_root="$RUNNER_TEMP/kitpay-testflight-verification"
+          mkdir -p "$verification_root"
+          ditto -x -k \
+            "$RUNNER_TEMP/kitpay-testflight-input/KitPay.ipa" \
+            "$verification_root"
+          app_count="$(find "$verification_root/Payload" -maxdepth 1 -type d -name '*.app' | wc -l | tr -d ' ')"
+          test "$app_count" = '1'
+          app_path="$(find "$verification_root/Payload" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          codesign --verify --deep --strict "$app_path"
+
+      - name: Install App Store Connect API key
+        env:
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          issuer_id = os.environ.get('APP_STORE_CONNECT_ISSUER_ID', '').strip()
+          key_id = os.environ.get('APP_STORE_CONNECT_KEY_ID', '').strip()
+          private_key = os.environ.get('APP_STORE_CONNECT_PRIVATE_KEY', '').strip()
+          if not re.fullmatch(r'[0-9a-fA-F-]{36}', issuer_id):
+              raise SystemExit('APP_STORE_CONNECT_ISSUER_ID must be a UUID')
+          if not re.fullmatch(r'[A-Z0-9]{10}', key_id):
+              raise SystemExit('APP_STORE_CONNECT_KEY_ID must be a 10-character key identifier')
+          if '\\n' in private_key and '\n' not in private_key:
+              private_key = private_key.replace('\\n', '\n')
+          if (
+              not private_key.startswith('-----BEGIN PRIVATE KEY-----\n')
+              or not private_key.endswith('\n-----END PRIVATE KEY-----')
+          ):
+              raise SystemExit('APP_STORE_CONNECT_PRIVATE_KEY must be a PKCS#8 PEM key')
+          key_id_marker = Path(os.environ['RUNNER_TEMP']) / 'kitpay-app-store-connect-key-id'
+          if key_id_marker.exists() or key_id_marker.is_symlink():
+              raise SystemExit('Refusing to overwrite the App Store Connect key ID marker')
+          key_id_marker.write_text(key_id + '\n', encoding='ascii')
+          key_id_marker.chmod(0o600)
+          key_directory = Path.home() / '.appstoreconnect' / 'private_keys'
+          key_directory.mkdir(parents=True, exist_ok=True)
+          key_path = key_directory / f'AuthKey_{key_id}.p8'
+          key_path.write_text(private_key + '\n', encoding='ascii')
+          key_path.chmod(0o600)
+          PY
+          openssl pkey \
+            -in "$HOME/.appstoreconnect/private_keys/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8" \
+            -check \
+            -noout
+
+      - name: Validate and upload exact IPA to TestFlight
+        env:
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+        run: |
+          set -euo pipefail
+          ipa_path="$RUNNER_TEMP/kitpay-testflight-input/KitPay.ipa"
+          expected_ipa_sha="$(<"$RUNNER_TEMP/kitpay-testflight-ipa-sha256")"
+          [[ "$expected_ipa_sha" =~ ^[0-9a-f]{64}$ ]]
+          test "$(shasum -a 256 "$ipa_path" | awk '{print $1}')" = "$expected_ipa_sha"
+          xcrun altool --validate-app \
+            --file "$ipa_path" \
+            --type ios \
+            --apiKey "$APP_STORE_CONNECT_KEY_ID" \
+            --apiIssuer "$APP_STORE_CONNECT_ISSUER_ID"
+          test "$(shasum -a 256 "$ipa_path" | awk '{print $1}')" = "$expected_ipa_sha"
+          xcrun altool --upload-app \
+            --file "$ipa_path" \
+            --type ios \
+            --apiKey "$APP_STORE_CONNECT_KEY_ID" \
+            --apiIssuer "$APP_STORE_CONNECT_ISSUER_ID"
+          test "$(shasum -a 256 "$ipa_path" | awk '{print $1}')" = "$expected_ipa_sha"
+
+      - name: Wait for exact uploaded build to finish TestFlight processing
+        env:
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+          IOS_VERSION: ${{ inputs.marketing_version }}
+          IOS_BUILD_NUMBER: ${{ inputs.build_number }}
+          TESTFLIGHT_POLL_TIMEOUT_SECONDS: '3600'
+        run: python3 .github/scripts/wait_for_testflight_build.py
+
+      - name: Remove App Store Connect key and downloaded archive
+        if: ${{ always() }}
+        run: |
+          set +e
+          if [[ -n "${RUNNER_TEMP:-}" ]]; then
+            key_id_marker="$RUNNER_TEMP/kitpay-app-store-connect-key-id"
+            if [[ -f "$key_id_marker" && ! -L "$key_id_marker" ]]; then
+              installed_key_id="$(<"$key_id_marker")"
+              if [[ "$installed_key_id" =~ ^[A-Z0-9]{10}$ ]]; then
+                rm -f "$HOME/.appstoreconnect/private_keys/AuthKey_${installed_key_id}.p8"
+              fi
+            fi
+            rm -rf \
+              "$RUNNER_TEMP/kitpay-testflight-input" \
+              "$RUNNER_TEMP/kitpay-testflight-verification"
+            rm -f \
+              "$RUNNER_TEMP/kitpay-app-store-connect-key-id" \
+              "$RUNNER_TEMP/kitpay-testflight-ipa-sha256"
+          fi

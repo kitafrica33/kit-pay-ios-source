@@ -1,0 +1,15 @@
+DEFINE SCHEMA
+  RECORD TYPE KitMessageBackup (
+    payload ASSET,
+    createdAt TIMESTAMP,
+    newestMessageAt TIMESTAMP,
+    byteSize INT64,
+    messageCount INT64,
+    schemaVersion INT64,
+    generation INT64,
+    deviceName STRING,
+    contentDigest STRING,
+    GRANT WRITE TO "_creator",
+    GRANT CREATE TO "_icloud",
+    GRANT READ TO "_creator"
+  );
