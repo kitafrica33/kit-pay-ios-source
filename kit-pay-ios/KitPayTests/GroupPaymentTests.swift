@@ -763,7 +763,7 @@ final class GroupPaymentTests: XCTestCase {
 
     // MARK: - Step-up binding
 
-    func testTheApprovedIntentPinsTheSplitTheMembersAndTheirAmounts() {
+    func testTheApprovedIntentPinsTheSplitTheMembersAndTheirAmounts() throws {
         let body = CreateGroupPaymentBody(
             sourceWalletId: "wallet-1",
             splitMode: "custom",
@@ -801,8 +801,18 @@ final class GroupPaymentTests: XCTestCase {
             for: evenBody,
             conversationId: conversationID
         )
-        XCTAssertEqual(field(evenIntent, "recipients"), "")
+        XCTAssertTrue(evenIntent.keys.contains("recipients"))
+        XCTAssertNil(field(evenIntent, "recipients"))
         XCTAssertEqual(field(evenIntent, "total_amount"), "30000")
+
+        XCTAssertEqual(
+            try KitFinancialStepUpBinding.intentHash(
+                purpose: GroupPaymentStepUpPolicy.sendPurpose,
+                intent: evenIntent
+            ),
+            "13f62a8ec6aa2775af1f879f3b733ee36e07ef82fba66ac54d7b308bc6b92248",
+            "the iPhone must hash the same null-normalized intent as Laravel"
+        )
 
         let reverse = GroupPaymentStepUpPolicy.reverseIntent(groupPaymentId: paymentID, reason: nil)
         XCTAssertEqual(field(reverse, "group_payment_id"), paymentID)

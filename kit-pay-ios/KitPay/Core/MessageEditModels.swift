@@ -16,8 +16,8 @@ enum MessagingMessageEditCapabilityPolicy {
     /// a misconfigured capability map cannot deliver a correction to a client that would render
     /// its descriptor as a chat bubble.
     static let minimumIOSVersion = [1, 0, 16]
-    static let minimumIOSBuild = 30
-    static let minimumIOSRelease = "1.0.16-r30"
+    static let minimumIOSBuild = 31
+    static let minimumIOSRelease = "1.0.16-r31"
 
     static func supports(
         roster: MessagingDeviceRosterDTO,

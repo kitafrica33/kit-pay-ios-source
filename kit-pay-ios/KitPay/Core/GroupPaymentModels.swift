@@ -749,16 +749,20 @@ enum GroupPaymentStepUpPolicy {
         for body: CreateGroupPaymentBody,
         conversationId: String
     ) -> [String: String?] {
-        [
+        let recipientIntent = (body.recipients ?? [])
+            .map { "\($0.userId):\($0.amount ?? "")" }
+            .joined(separator: ",")
+        return [
             "conversation_id": conversationId,
             "source_wallet_id": body.sourceWalletId,
             "split_mode": body.splitMode,
             "audience": body.audience,
             "total_amount": body.totalAmount,
             "note": body.note,
-            "recipients": (body.recipients ?? [])
-                .map { "\($0.userId):\($0.amount ?? "")" }
-                .joined(separator: ","),
+            // Laravel's request middleware normalizes an empty string to null before the
+            // challenge is hashed. Emit null here too, otherwise an even split to everyone
+            // rejects the genuine challenge as if its approval intent had been changed.
+            "recipients": recipientIntent.isEmpty ? nil : recipientIntent,
         ]
     }
 
