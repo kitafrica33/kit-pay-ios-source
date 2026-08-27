@@ -124,14 +124,35 @@ struct GroupProfileView: View {
 
     private var header: some View {
         VStack(spacing: 12) {
-            GroupAvatarView(
-                title: displayedTitle,
-                photoURL: photoURL,
-                size: 96,
-                showsBadge: photoURL != nil
-            )
-            .kitCircularGlass(diameter: 116, interactive: false)
-            .accessibilityLabel("Group avatar for \(displayedTitle)")
+            if updatePhoto != nil {
+                PhotosPicker(
+                    selection: $selectedPhotoItem,
+                    matching: .images,
+                    photoLibrary: .shared()
+                ) {
+                    groupAvatar
+                        .overlay(alignment: .bottomTrailing) {
+                            Image(systemName: "camera.fill")
+                                .font(.system(size: 15, weight: .bold))
+                                .foregroundStyle(.white)
+                                .frame(width: 36, height: 36)
+                                .background(KitColor.green, in: Circle())
+                                .overlay { Circle().stroke(.white, lineWidth: 2) }
+                                .offset(x: 3, y: 3)
+                                .accessibilityHidden(true)
+                        }
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .disabled(isUpdatingPhoto)
+                .accessibilityIdentifier("group-profile-photo-picker")
+                .accessibilityLabel(
+                    photoURL == nil ? "Add a group photo" : "Change the group photo"
+                )
+                .accessibilityHint("Opens your photo library")
+            } else {
+                groupAvatar
+            }
 
             if updatePhoto != nil {
                 HStack(spacing: 14) {
@@ -228,6 +249,17 @@ struct GroupProfileView: View {
                 .font(.subheadline)
                 .foregroundStyle(KitColor.secondaryText)
         }
+    }
+
+    private var groupAvatar: some View {
+        GroupAvatarView(
+            title: displayedTitle,
+            photoURL: photoURL,
+            size: 96,
+            showsBadge: photoURL != nil
+        )
+        .kitCircularGlass(diameter: 116, interactive: false)
+        .accessibilityLabel("Group avatar for \(displayedTitle)")
     }
 
     // MARK: Description

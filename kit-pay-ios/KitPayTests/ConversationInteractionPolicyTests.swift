@@ -87,6 +87,84 @@ final class ConversationInteractionPolicyTests: XCTestCase {
         )
     }
 
+    func testEveryOpenedConversationClaimsOneInitialJumpToItsNewestMessage() {
+        var policy = ConversationLatestPositionPolicy()
+
+        XCTAssertFalse(policy.claimOpening(
+            conversationID: "direct-chat",
+            hasTimelineContent: false
+        ))
+        XCTAssertNil(
+            policy.positionedConversationID,
+            "An empty shell must leave the opening jump available for restored inbound history"
+        )
+        XCTAssertTrue(policy.claimOpening(
+            conversationID: "direct-chat",
+            hasTimelineContent: true
+        ))
+        XCTAssertTrue(policy.hasPositioned(conversationID: "DIRECT-CHAT"))
+        XCTAssertFalse(
+            policy.claimOpening(
+                conversationID: "DIRECT-CHAT",
+                hasTimelineContent: true
+            ),
+            "A redraw of the same one-to-one chat must not keep stealing the reading position"
+        )
+        XCTAssertTrue(
+            policy.claimOpening(
+                conversationID: "group-chat",
+                hasTimelineContent: true
+            ),
+            "Opening a group must independently position its newest sent or received message"
+        )
+    }
+
+    func testTimelineFollowsOwnSendsAndNearbyIncomingMessagesOnly() {
+        XCTAssertFalse(ConversationLatestPositionPolicy.shouldFollowTimelineChange(
+            hasPositionedCurrentConversation: false,
+            latestMessageIsOutgoing: false,
+            isNearLatest: true
+        ), "The opening task exclusively owns the empty-to-hydrated jump")
+        XCTAssertTrue(ConversationLatestPositionPolicy.shouldFollowTimelineChange(
+            hasPositionedCurrentConversation: true,
+            latestMessageIsOutgoing: true,
+            isNearLatest: false
+        ))
+        XCTAssertTrue(ConversationLatestPositionPolicy.shouldFollowTimelineChange(
+            hasPositionedCurrentConversation: true,
+            latestMessageIsOutgoing: false,
+            isNearLatest: true
+        ))
+        XCTAssertFalse(ConversationLatestPositionPolicy.shouldFollowTimelineChange(
+            hasPositionedCurrentConversation: true,
+            latestMessageIsOutgoing: false,
+            isNearLatest: false
+        ))
+    }
+
+    func testHydratedGroupPaymentKeepsBottomPinnedWithoutFightingAnActiveScroll() {
+        XCTAssertFalse(ConversationLatestPositionPolicy.shouldFollowPaymentHydration(
+            hasPositionedCurrentConversation: false,
+            isNearLatest: true,
+            isInteracting: false
+        ), "The opening task exclusively owns an initially hydrated group-payment card")
+        XCTAssertTrue(ConversationLatestPositionPolicy.shouldFollowPaymentHydration(
+            hasPositionedCurrentConversation: true,
+            isNearLatest: true,
+            isInteracting: false
+        ))
+        XCTAssertFalse(ConversationLatestPositionPolicy.shouldFollowPaymentHydration(
+            hasPositionedCurrentConversation: true,
+            isNearLatest: false,
+            isInteracting: false
+        ))
+        XCTAssertFalse(ConversationLatestPositionPolicy.shouldFollowPaymentHydration(
+            hasPositionedCurrentConversation: true,
+            isNearLatest: true,
+            isInteracting: true
+        ))
+    }
+
     func testCameraPullEligibilityRequiresScrollableIdleTimeline() {
         XCTAssertTrue(ConversationCameraPullPolicy.isEligible(
             contentHeight: 700,

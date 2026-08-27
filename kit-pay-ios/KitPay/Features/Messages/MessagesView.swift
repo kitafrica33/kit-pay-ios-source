@@ -1393,6 +1393,11 @@ struct ConversationView: View {
     @State private var showForwardSheet = false
     @State private var isNearLatestMessage = true
     @State private var unseenIncomingCount = 0
+    /// Claims the one non-animated jump each conversation needs after its lazy timeline has
+    /// appeared. `defaultScrollAnchor` alone runs before restored messages and hydrated payment
+    /// cards have necessarily reached their final size.
+    @State private var latestPositionPolicy = ConversationLatestPositionPolicy()
+    @State private var deferredLatestPositionRequest = 0
     @State private var cameraPullProgress: CGFloat = 0
     @State private var cameraPull = ConversationCameraPullGesture()
     /// Whether a finger is currently on the thread, as reported by the scroll view itself.
@@ -2519,12 +2524,62 @@ struct ConversationView: View {
                         .onChanged { _ in updateCameraPullArming() }
                         .onEnded { _ in releaseCameraPull() }
                 )
+                .task(
+                    id: "\(conversation.id.lowercased()):\(timelineItems.last?.id ?? "empty")"
+                ) {
+                    guard !timelineItems.isEmpty else { return }
+                    // Let the LazyVStack install its bottom anchor before addressing it. This is
+                    // needed when protected history is already present as the screen opens.
+                    await Task.yield()
+                    guard !Task.isCancelled,
+                          latestPositionPolicy.claimOpening(
+                              conversationID: conversation.id,
+                              hasTimelineContent: !timelineItems.isEmpty
+                          )
+                    else { return }
+                    scrollToBottom(using: scrollProxy, animated: false)
+                }
                 .onChange(of: timelineItems.last?.id) { _, _ in
                     // A message the user just sent always snaps to the latest position; an
                     // incoming message must never yank them away from what they are reading.
-                    if messages.last?.isOutgoing == true || isNearLatestMessage {
+                    if ConversationLatestPositionPolicy.shouldFollowTimelineChange(
+                        hasPositionedCurrentConversation: latestPositionPolicy.hasPositioned(
+                            conversationID: conversation.id
+                        ),
+                        latestMessageIsOutgoing: latestTimelineMessageIsOutgoing,
+                        isNearLatest: isNearLatestMessage
+                    ) {
                         scrollToBottom(using: scrollProxy)
                     }
+                }
+                .onChange(of: chatGroupPayments.payments) { previous, updated in
+                    guard previous != updated,
+                          ConversationLatestPositionPolicy.shouldFollowPaymentHydration(
+                              hasPositionedCurrentConversation: latestPositionPolicy.hasPositioned(
+                                  conversationID: conversation.id
+                              ),
+                              isNearLatest: isNearLatestMessage,
+                              isInteracting: isConversationScrollInteracting
+                          )
+                    else { return }
+                    // The authoritative share list expands an existing card without changing its
+                    // timeline id. Re-address the bottom after that layout pass so it does not
+                    // grow over the composer or leave the thread feeling stuck.
+                    deferredLatestPositionRequest &+= 1
+                }
+                .task(id: deferredLatestPositionRequest) {
+                    guard deferredLatestPositionRequest > 0 else { return }
+                    await Task.yield()
+                    guard !Task.isCancelled,
+                          ConversationLatestPositionPolicy.shouldFollowPaymentHydration(
+                              hasPositionedCurrentConversation: latestPositionPolicy.hasPositioned(
+                                  conversationID: conversation.id
+                              ),
+                              isNearLatest: isNearLatestMessage,
+                              isInteracting: isConversationScrollInteracting
+                          )
+                    else { return }
+                    scrollToBottom(using: scrollProxy, animated: false)
                 }
                 .onChange(of: pendingScrollTargetMessageID) { _, target in
                     guard let target else { return }
@@ -3051,12 +3106,26 @@ struct ConversationView: View {
                         authorize: model.authorizeFinancialStepUp
                     )
                     guard let payment else { return nil }
-                    guard await announceGroupPayment(payment) else {
-                        chatGroupPayments.errorMessage = model.lastError
-                            ?? "The payment was confirmed, but its chat card could not be queued. Try again to restore the card."
-                        return nil
+                    // The money movement is already confirmed. Hand success back immediately so
+                    // the composer closes once; posting its idempotent chat card and refreshing
+                    // the wallet continue without leaving a live Send button over the thread.
+                    Task { @MainActor in
+                        var announced = await announceGroupPayment(payment)
+                        // A refresh can repair a transient roster/session race. The deterministic
+                        // client message id makes this one retry safe if the first queue actually
+                        // committed before reporting failure.
+                        await model.refresh()
+                        if !announced {
+                            announced = await announceGroupPayment(payment)
+                        }
+                        if !announced {
+                            let message = "The payment was sent, but its chat card could not be "
+                                + "added after retrying. Do not send it again; check Wallet "
+                                + "activity and contact Kit Pay support with reference \(payment.id)."
+                            chatGroupPayments.errorMessage = message
+                            model.lastError = message
+                        }
                     }
-                    await model.refresh()
                     return payment
                 }
                 .environmentObject(model)
@@ -6192,10 +6261,28 @@ struct ConversationView: View {
         }
     }
 
-    private func scrollToBottom(using proxy: ScrollViewProxy) {
+    private var latestTimelineMessageIsOutgoing: Bool {
+        guard let item = timelineItems.last else { return false }
+        switch item {
+        case .message(let message),
+             .payment(let message, _),
+             .groupPayment(let message, _),
+             .groupPaymentEvent(let message, _):
+            return message.isOutgoing
+        case .call, .dateSeparator:
+            return false
+        }
+    }
+
+    private func scrollToBottom(using proxy: ScrollViewProxy, animated: Bool = true) {
         unseenIncomingCount = 0
-        withAnimation(.easeOut(duration: 0.2)) {
+        let position = {
             proxy.scrollTo(ConversationScrollAnchor.bottom, anchor: .bottom)
+        }
+        if animated {
+            withAnimation(.easeOut(duration: 0.2)) { position() }
+        } else {
+            position()
         }
     }
 
@@ -6503,6 +6590,47 @@ private struct RecorderLevelWave: View {
             history.append(newLevel)
         }
         .accessibilityHidden(true)
+    }
+}
+
+/// Keeps opening and layout-driven jumps deliberate. A conversation is positioned exactly once
+/// on entry; later changes follow only while the customer is already reading the latest content.
+/// This distinction is what lets a hydrated group-payment card grow without trapping the scroll,
+/// while an incoming message still cannot pull somebody away from older history.
+struct ConversationLatestPositionPolicy: Equatable {
+    private(set) var positionedConversationID: String?
+
+    mutating func claimOpening(
+        conversationID: String,
+        hasTimelineContent: Bool = true
+    ) -> Bool {
+        // An empty shell is not an opening position. Protected history commonly arrives on the
+        // next render, and that first real row must retain the unconditional opening jump.
+        guard hasTimelineContent else { return false }
+        let canonical = conversationID.lowercased()
+        guard positionedConversationID != canonical else { return false }
+        positionedConversationID = canonical
+        return true
+    }
+
+    func hasPositioned(conversationID: String) -> Bool {
+        positionedConversationID == conversationID.lowercased()
+    }
+
+    static func shouldFollowTimelineChange(
+        hasPositionedCurrentConversation: Bool,
+        latestMessageIsOutgoing: Bool,
+        isNearLatest: Bool
+    ) -> Bool {
+        hasPositionedCurrentConversation && (latestMessageIsOutgoing || isNearLatest)
+    }
+
+    static func shouldFollowPaymentHydration(
+        hasPositionedCurrentConversation: Bool,
+        isNearLatest: Bool,
+        isInteracting: Bool
+    ) -> Bool {
+        hasPositionedCurrentConversation && isNearLatest && !isInteracting
     }
 }
 

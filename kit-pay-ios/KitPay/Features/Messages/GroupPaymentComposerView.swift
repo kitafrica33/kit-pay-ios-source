@@ -27,6 +27,13 @@ struct GroupPaymentComposerView: View {
     @State private var note = ""
     @State private var pin = ""
     @State private var validationMessage: String?
+    /// Claimed synchronously before the async task is created, closing the small window in which
+    /// two fast taps could otherwise both enter `submit` before the observable view model redraws.
+    @State private var submissionGate = GroupPaymentSubmissionGate()
+
+    private var isSubmissionInFlight: Bool {
+        isSubmitting || submissionGate.isSubmitting
+    }
 
     var body: some View {
         NavigationStack {
@@ -56,6 +63,7 @@ struct GroupPaymentComposerView: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }
+                        .disabled(isSubmissionInFlight)
                 }
             }
             .onAppear {
@@ -76,6 +84,7 @@ struct GroupPaymentComposerView: View {
                 validationMessage = nil
             }
         }
+        .interactiveDismissDisabled(isSubmissionInFlight)
     }
 
     // MARK: Sections
@@ -285,7 +294,7 @@ struct GroupPaymentComposerView: View {
         Button {
             send()
         } label: {
-            if isSubmitting {
+            if isSubmissionInFlight {
                 ProgressView().tint(.white).frame(maxWidth: .infinity)
             } else {
                 Label(
@@ -299,7 +308,8 @@ struct GroupPaymentComposerView: View {
         }
         .buttonStyle(GroupPaymentGoldButtonStyle())
         .disabled(
-            isSubmitting || (!model.financialApprovalUsesBiometrics && pin.count != 4)
+            isSubmissionInFlight
+                || (!model.financialApprovalUsesBiometrics && pin.count != 4)
         )
     }
 
@@ -357,6 +367,7 @@ struct GroupPaymentComposerView: View {
     }
 
     private func send() {
+        guard !isSubmitting, submissionGate.begin() else { return }
         let outcome = GroupPaymentDraftPolicy.draft(
             sourceWalletId: wallet.id,
             splitMode: splitMode,
@@ -371,14 +382,48 @@ struct GroupPaymentComposerView: View {
         switch outcome {
         case .problem(let message):
             validationMessage = message
+            submissionGate.resolve(succeeded: false)
         case .ready(let body):
             validationMessage = nil
-            Task {
-                if await submit(body, pin) != nil {
+            Task { @MainActor in
+                let succeeded = await submit(body, pin) != nil
+                if submissionGate.resolve(succeeded: succeeded) {
                     pin = ""
                     dismiss()
                 }
             }
         }
+    }
+}
+
+/// One submission per presentation. The successful transition returns `true` exactly once, which
+/// is the composer's sole authority to dismiss itself; a failed attempt reopens the same draft for
+/// a deliberate retry with the same idempotency key.
+struct GroupPaymentSubmissionGate: Equatable {
+    private enum Phase: Equatable {
+        case idle
+        case submitting
+        case succeeded
+    }
+
+    private var phase: Phase = .idle
+
+    var isSubmitting: Bool { phase == .submitting }
+
+    mutating func begin() -> Bool {
+        guard phase == .idle else { return false }
+        phase = .submitting
+        return true
+    }
+
+    @discardableResult
+    mutating func resolve(succeeded: Bool) -> Bool {
+        guard phase == .submitting else { return false }
+        if succeeded {
+            phase = .succeeded
+            return true
+        }
+        phase = .idle
+        return false
     }
 }

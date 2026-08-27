@@ -4,6 +4,30 @@ import XCTest
 /// Everything a group payment promises that is decided on the device: what the wire is allowed to
 /// carry, which of those descriptors the thread is willing to believe, and how the result reads.
 final class GroupPaymentTests: XCTestCase {
+    func testComposerSubmissionGateAcceptsOneTapAndDismissesOnce() {
+        var gate = GroupPaymentSubmissionGate()
+
+        XCTAssertTrue(gate.begin())
+        XCTAssertTrue(gate.isSubmitting)
+        XCTAssertFalse(gate.begin(), "A fast second tap must not start another payment")
+        XCTAssertTrue(gate.resolve(succeeded: true), "The confirmed payment dismisses the sheet")
+        XCTAssertFalse(gate.isSubmitting)
+        XCTAssertFalse(
+            gate.resolve(succeeded: true),
+            "A duplicate completion cannot dismiss the presentation a second time"
+        )
+        XCTAssertFalse(gate.begin(), "A succeeded presentation cannot send again")
+    }
+
+    func testComposerSubmissionGateReopensOnlyAfterFailure() {
+        var gate = GroupPaymentSubmissionGate()
+
+        XCTAssertTrue(gate.begin())
+        XCTAssertFalse(gate.resolve(succeeded: false))
+        XCTAssertFalse(gate.isSubmitting)
+        XCTAssertTrue(gate.begin(), "A failed request may be retried deliberately")
+    }
+
     private let sender = "10000000-0000-4000-8000-000000000001"
     private let ama = "10000000-0000-4000-8000-000000000002"
     private let ben = "10000000-0000-4000-8000-000000000003"
