@@ -28,11 +28,21 @@ private enum HomeModal: Identifiable {
     }
 }
 
+/// Home's full-screen flows, addressed by one value for the same reason as `HomeModal`:
+/// SwiftUI guarantees one presentation per view, so a second `fullScreenCover` on the same
+/// hierarchy would compete with the first and silently drop.
+private enum HomeCover: String, Identifiable {
+    case bankTransfer
+    case identityVerification
+
+    var id: String { rawValue }
+}
+
 struct HomeView: View {
     @EnvironmentObject private var model: AppModel
     @State private var balancesVisible = true
     @State private var modal: HomeModal?
-    @State private var isBankTransferPresented = false
+    @State private var cover: HomeCover?
 
     var body: some View {
         Group {
@@ -70,6 +80,9 @@ struct HomeView: View {
                     }
                     balanceCard
                     quickServices
+                    if let checklist = starterChecklist {
+                        starterChecklistSection(checklist)
+                    }
                     recentActivity
                 }
                 .padding(.horizontal, 18)
@@ -99,8 +112,28 @@ struct HomeView: View {
                     .presentationBackground(.ultraThinMaterial)
             }
         }
-        .fullScreenCover(isPresented: $isBankTransferPresented) {
-            BankTransferView().environmentObject(model)
+        .fullScreenCover(item: $cover) { cover in
+            switch cover {
+            case .bankTransfer:
+                BankTransferView().environmentObject(model)
+            case .identityVerification:
+                // Identity verification is a substantive flow: a true full screen with its own
+                // close affordance, never a half-height sheet.
+                NavigationStack {
+                    KYCView()
+                        .toolbar {
+                            ToolbarItem(placement: .topBarLeading) {
+                                Button {
+                                    self.cover = nil
+                                } label: {
+                                    Label("Close", systemImage: "xmark")
+                                }
+                                .accessibilityLabel("Close identity verification")
+                            }
+                        }
+                }
+                .environmentObject(model)
+            }
         }
     }
 
@@ -254,6 +287,142 @@ struct HomeView: View {
         .buttonStyle(.plain)
         .disabled(!available || !model.appReviewDemoMutationsAllowed)
         .opacity(!available || !model.appReviewDemoMutationsAllowed ? 0.55 : 1)
+    }
+
+    /// Derived entirely from state already in memory: nothing here waits on the network, so
+    /// Home renders at full speed whether or not the checklist appears.
+    private var starterChecklist: HomeStarterChecklist? {
+        HomeStarterChecklistPolicy.checklist(
+            // The live KYC endpoint updates model.kycStatus without rewriting the cached
+            // profile, so the freshest verdict is read first and the profile is the fallback.
+            // account_status deliberately, never the blended `status`: that one is overridden
+            // by per-device verification and would un-verify a verified account on a new phone.
+            kycStatus: model.kycStatus?.accountStatus ?? model.profile?.kycStatus,
+            messages: model.state.messages,
+            transactions: model.state.transactions,
+            hasConfirmedFirstMessage: model.state.starterFirstMessageAt != nil,
+            hasConfirmedFirstTransaction: model.state.starterFirstTransactionAt != nil,
+            isDemoActive: model.appReviewDemoIsActive,
+            isDemoConversation: model.isReadOnlyAppReviewDemoConversation
+        )
+    }
+
+    private func starterChecklistSection(_ checklist: HomeStarterChecklist) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("Get started")
+                    .font(.title2.bold())
+                    .foregroundStyle(KitColor.primaryText)
+                Spacer()
+                Text("\(checklist.completedCount)/\(checklist.totalCount)")
+                    .font(.subheadline.bold())
+                    .monospacedDigit()
+                    .foregroundStyle(KitColor.green)
+                    .accessibilityLabel(
+                        "\(checklist.completedCount) of \(checklist.totalCount) steps complete"
+                    )
+            }
+            VStack(spacing: 0) {
+                ForEach(Array(checklist.entries.enumerated()), id: \.element.step) { index, entry in
+                    starterRow(entry)
+                    if index < checklist.entries.count - 1 {
+                        Divider().padding(.leading, 62)
+                    }
+                }
+            }
+            .kitGlass(cornerRadius: 24, shadow: false)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Get started checklist")
+    }
+
+    @ViewBuilder
+    private func starterRow(_ entry: HomeStarterChecklist.Entry) -> some View {
+        if entry.isComplete {
+            starterRowContent(entry)
+        } else {
+            Button {
+                openStarterStep(entry.step)
+            } label: {
+                starterRowContent(entry)
+            }
+            .buttonStyle(.plain)
+        }
+    }
+
+    private func starterRowContent(_ entry: HomeStarterChecklist.Entry) -> some View {
+        HStack(spacing: 13) {
+            Image(systemName: starterIcon(entry.step))
+                .font(.headline)
+                .foregroundStyle(entry.isComplete ? KitColor.green : KitColor.primaryText)
+                .frame(width: 40, height: 40)
+                .background(KitColor.paleGreen.opacity(entry.isComplete ? 0.4 : 1), in: Circle())
+            VStack(alignment: .leading, spacing: 2) {
+                Text(starterTitle(entry.step))
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(KitColor.primaryText)
+                Text(starterSubtitle(entry.step))
+                    .font(.caption)
+                    .foregroundStyle(KitColor.secondaryText)
+                    .lineLimit(2)
+            }
+            Spacer(minLength: 8)
+            if entry.isComplete {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.title3)
+                    .foregroundStyle(KitColor.green)
+                    .accessibilityLabel("Complete")
+            } else {
+                Image(systemName: "chevron.right")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(KitColor.secondaryText)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .combine)
+        .accessibilityValue(entry.isComplete ? "Complete" : "Not complete")
+    }
+
+    private func starterIcon(_ step: HomeStarterStep) -> String {
+        switch step {
+        case .verifyIdentity: "checkmark.seal"
+        case .sendFirstMessage: "bubble.left.and.text.bubble.right"
+        case .makeFirstTransaction: "arrow.up.right.circle"
+        }
+    }
+
+    private func starterTitle(_ step: HomeStarterStep) -> String {
+        switch step {
+        case .verifyIdentity: "Verify identity"
+        case .sendFirstMessage: "Send first message"
+        case .makeFirstTransaction: "Make first transaction"
+        }
+    }
+
+    private func starterSubtitle(_ step: HomeStarterStep) -> String {
+        switch step {
+        case .verifyIdentity: "Confirm who you are to unlock full limits."
+        case .sendFirstMessage: "Say hello — messages are end-to-end encrypted."
+        case .makeFirstTransaction: "Send money to someone on Kit Pay."
+        }
+    }
+
+    private func openStarterStep(_ step: HomeStarterStep) {
+        switch HomeStarterStepRoutePolicy.presentation(
+            for: step,
+            secureMessagingAvailable: model.secureMessagingAvailable
+        ) {
+        case .fullScreen:
+            cover = .identityVerification
+        case .tabSwitch:
+            model.requestNewMessageCompose()
+        case .walletSheet:
+            open(.send, title: "Send", available: canSend, needsInternet: true)
+        case let .unavailable(message):
+            model.lastError = message
+        }
     }
 
     private var recentActivity: some View {
@@ -443,7 +612,7 @@ struct HomeView: View {
         }
         switch feature {
         case .mobileMoney: modal = .mobileMoney
-        case .bankTransfer: isBankTransferPresented = true
+        case .bankTransfer: cover = .bankTransfer
         case .scanQR: modal = .scanQR
         }
     }

@@ -1441,39 +1441,41 @@ class AppStoreProfileGeneratorTests(unittest.TestCase):
 
 
 class SigningConfigurationTests(unittest.TestCase):
-    def test_build_33_release_identity_is_consistent(self) -> None:
+    def test_build_34_release_identity_is_consistent(self) -> None:
         workflow = (ROOT / ".github/workflows/ios-app-store-archive.yml").read_text()
         project = (ROOT / "KitPay.xcodeproj/project.pbxproj").read_text()
 
         self.assertIn("default: 1.0.16", workflow)
-        self.assertIn('default: "33"', workflow)
-        self.assertIn("v1.0.16-build33", workflow)
+        self.assertIn('default: "34"', workflow)
+        self.assertIn("v1.0.16-build34", workflow)
         # Four each: Debug and Release of the app and of the share extension. iOS refuses to
         # install an app whose extension carries a different version, so they move together.
         self.assertEqual(project.count("MARKETING_VERSION = 1.0.16;"), 4)
-        self.assertEqual(project.count("CURRENT_PROJECT_VERSION = 33;"), 4)
+        self.assertEqual(project.count("CURRENT_PROJECT_VERSION = 34;"), 4)
         self.assertNotIn("MARKETING_VERSION = 1.0.1;", project)
 
-    def test_message_edit_floor_matches_the_build_that_ships(self) -> None:
-        """The edit capability floor names a release; that release has to be this one.
+    def test_message_edit_floor_stays_pinned_to_the_first_kitedit1_release(self) -> None:
+        """The edit capability floor is compatibility data, not build identity.
 
         `MessagingMessageEditCapabilityPolicy` refuses to send a correction to any iOS peer below
-        its declared floor. If the floor were left pointing at a build we never cut, every peer
-        would fail the test and the feature would be dark; if it pointed below the build that
-        first implements `KITEDIT1`, an older client would be handed a descriptor it renders as a
-        chat bubble. Pinning it to the project's own version keeps the backend gate honest too,
-        since the server maps builds at or above this floor onto the capability.
+        its declared floor: the first release that understands `KITEDIT1`, 1.0.16 build 33. The
+        floor must not ride along with routine build bumps — raising it with the next build would
+        wrongly exclude build-33 peers that already render corrections, and lowering it would
+        hand an older client a descriptor it renders as a chat bubble. So it is pinned here as a
+        literal, independent of the project's version, which may only sit at or above it; the
+        floor moves only when the descriptor's compatibility actually changes.
         """
         project = (ROOT / "KitPay.xcodeproj/project.pbxproj").read_text()
         policy = (ROOT / "KitPay/Core/MessageEditModels.swift").read_text()
 
-        marketing = re.search(r"MARKETING_VERSION = ([\d.]+);", project).group(1)
-        build = re.search(r"CURRENT_PROJECT_VERSION = (\d+);", project).group(1)
+        self.assertIn('static let minimumIOSRelease = "1.0.16-r33"', policy)
+        self.assertIn("static let minimumIOSBuild = 33\n", policy)
+        self.assertIn("static let minimumIOSVersion = [1, 0, 16]", policy)
 
-        self.assertIn(f'static let minimumIOSRelease = "{marketing}-r{build}"', policy)
-        self.assertIn(f"static let minimumIOSBuild = {build}", policy)
-        expected_version = ", ".join(marketing.split("."))
-        self.assertIn(f"static let minimumIOSVersion = [{expected_version}]", policy)
+        build = int(re.search(r"CURRENT_PROJECT_VERSION = (\d+);", project).group(1))
+        self.assertGreaterEqual(
+            build, 33, "the floor must name a build that has actually been cut"
+        )
 
     def test_manual_profile_is_scoped_to_the_app_target(self) -> None:
         workflow = (ROOT / ".github/workflows/ios-app-store-archive.yml").read_text()

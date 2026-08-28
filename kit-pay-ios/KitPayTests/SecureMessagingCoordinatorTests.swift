@@ -2306,7 +2306,8 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
                 read: { key, userID in
                     key == localStorageKey && userID == localUserID ? media : nil
                 },
-                copy: { _, _, _ in throw InjectedBlobCopyFailure.failed },
+                duplicateIfAbsent: { _, _, _ in .conflict },
+                removeDuplicate: { _, _, _ in false },
                 remove: { key, _ in await removals.record(key) }
             )
         )
@@ -2316,8 +2317,8 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
                 commandID: commandID,
                 forUserID: localUserID
             )
-            XCTFail("A failed cache copy must stop the descriptor checkpoint")
-        } catch InjectedBlobCopyFailure.failed {
+            XCTFail("A conflicting cache duplicate must stop the descriptor checkpoint")
+        } catch SecureMediaAttachmentError.invalidMedia {
             // Expected.
         }
 
@@ -4636,6 +4637,610 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
             transparency: nil
         )
     }
+
+    // MARK: Media-message v2 outbound pipeline (contract v0.4, 449925d9…)
+
+    /// One share-sheet hand-off of 2+ items and a caption becomes exactly one durable
+    /// projection: one LocalMessage whose id is the wire client_message_id, one OfflineCommand,
+    /// zero network calls — and re-offering the same durable share-batch id replays that exact
+    /// projection instead of minting a second message.
+    func testDeferredMediaBatchQueuesOneMessageOneCommandAndReplaysTheShareBatchID() async throws {
+        let localUserID = "10000000-0000-4000-8000-000000000043"
+        let recipientUserID = "10000000-0000-4000-8000-000000000044"
+        let conversationID = "30000000-0000-4000-8000-000000000043"
+        let sharedBatchID = UUID(uuidString: "80000000-0000-4000-8000-000000000043")!
+        let caption = "Two receipts, one message"
+        let firstParkKey = "70000000-0000-4000-8000-000000000043"
+        let secondParkKey = "70000000-0000-4000-8000-000000000044"
+        let firstPlaintext = Data(repeating: 0xA1, count: 300)
+        let secondPlaintext = Data(repeating: 0xB2, count: 517)
+        let blobs = InMemoryMediaBlobStore(seed: [
+            firstParkKey: firstPlaintext,
+            secondParkKey: secondPlaintext,
+        ])
+        var keyByte: UInt8 = 0x40
+        let batch = try KitMediaMessageV2OutboundBatch.queued(
+            attachments: [
+                .init(
+                    mediaType: "image/jpeg",
+                    plaintextByteSize: firstPlaintext.count,
+                    localStorageKey: firstParkKey
+                ),
+                .init(
+                    mediaType: "video/mp4",
+                    plaintextByteSize: secondPlaintext.count,
+                    localStorageKey: secondParkKey
+                ),
+            ],
+            rawCaption: caption,
+            keyMaterialFactory: {
+                keyByte += 1
+                return Data(repeating: keyByte, count: 64)
+            }
+        )
+        let store = try await makeStore(userID: localUserID)
+        var crypto = SecureMessagingPersistentState.empty
+        crypto.enrollment = raceEnrollment(userID: localUserID)
+        try await store.update { state in
+            state.secureMessaging = crypto
+            state.conversations = [Conversation(
+                id: conversationID,
+                title: "ExampleContact",
+                participantUserIds: [localUserID, recipientUserID],
+                unreadCount: 0,
+                updatedAt: Date(timeIntervalSince1970: 1_755_604_800)
+            )]
+        }
+        let transport = OfflineExchangeTransport()
+        let coordinator = SecureMessagingExchangeCoordinator(
+            transport: transport,
+            store: store,
+            engine: SecureMessagingCryptoEngine(),
+            provisioningPreKeyCount: 1,
+            mediaBlobs: blobs.access(forUserID: localUserID)
+        )
+
+        let first = try await coordinator.queueDeferredMediaBatch(
+            forUserID: localUserID,
+            conversationID: conversationID,
+            expectedRecipientUserID: recipientUserID,
+            title: "ExampleContact",
+            batch: batch,
+            clientMessageID: sharedBatchID
+        )
+        // The share extension retries with the same durable batch id and identical content.
+        let replay = try await coordinator.queueDeferredMediaBatch(
+            forUserID: localUserID,
+            conversationID: conversationID,
+            expectedRecipientUserID: recipientUserID,
+            title: "ExampleContact",
+            batch: batch,
+            clientMessageID: sharedBatchID
+        )
+
+        XCTAssertEqual(first.clientMessageID, sharedBatchID)
+        XCTAssertEqual(replay.clientMessageID, sharedBatchID)
+        let snapshot = await store.snapshot()
+        XCTAssertEqual(snapshot.messages.count, 1)
+        XCTAssertEqual(snapshot.outbox.count, 1)
+        let message = try XCTUnwrap(snapshot.messages.first)
+        let command = try XCTUnwrap(snapshot.outbox.first)
+        XCTAssertEqual(message.id, sharedBatchID)
+        XCTAssertEqual(message.body, caption)
+        XCTAssertEqual(message.pendingMediaBatch, batch)
+        XCTAssertEqual(message.state, .queued)
+        XCTAssertTrue(message.isOutgoing)
+        XCTAssertEqual(command.kind, .secureMessage)
+        XCTAssertEqual(command.messageId, sharedBatchID)
+        XCTAssertEqual(command.conversationId, conversationID)
+        XCTAssertNil(command.secureMessageFanout)
+        let networkCalls = await transport.networkCallCount()
+        XCTAssertEqual(networkCalls, 0, "airplane-mode queueing must touch no endpoint")
+        // The replay recognized its own projection, so neither park was retired as scratch.
+        let survivingKeys = await blobs.storageKeys()
+        XCTAssertEqual(survivingKeys, [firstParkKey, secondParkKey])
+    }
+
+    /// Flush end-to-end up to the send boundary: the fresh capabilities+roster admission gate
+    /// passes, every item uploads exactly once in ascending attachment-id order, and one
+    /// KITMEDIA2 descriptor carrying the caption becomes the durable body — all before any
+    /// send POST. A relaunch-style second flush replays from the sealed body without
+    /// re-uploading a single byte.
+    func testDeferredMediaBatchFlushUploadsInAscendingIDOrderAndSealsOneDescriptorBeforeAnySend() async throws {
+        let fixture = try await makeMediaBatchFlushFixture(mediaMessageEnabled: true)
+        let queuedSnapshot = await fixture.store.snapshot()
+        let commandID = try XCTUnwrap(queuedSnapshot.outbox.first?.id)
+
+        do {
+            _ = try await fixture.coordinator.prepareDeferredMessage(
+                commandID: commandID,
+                forUserID: fixture.userID
+            )
+            XCTFail("The injected roster outage must stop the flush after the durable seal")
+        } catch let error as APIErrorPayload {
+            XCTAssertEqual(error.code, "MESSAGING_TEMPORARILY_UNAVAILABLE")
+        }
+
+        // §5: ciphertext left the device once per item, ordered by ascending attachment id —
+        // computed here independently of the production upload-order helper.
+        let uploads = await fixture.transport.uploadedItems()
+        let expectedUploadOrder = fixture.batch.items
+            .sorted { $0.attachmentID < $1.attachmentID }
+            .map(\.mediaType)
+        XCTAssertEqual(uploads.map(\.mediaType), expectedUploadOrder)
+        XCTAssertEqual(uploads.count, 2)
+
+        let sealedSnapshot = await fixture.store.snapshot()
+        XCTAssertEqual(sealedSnapshot.messages.count, 1)
+        XCTAssertEqual(sealedSnapshot.outbox.count, 1)
+        let message = try XCTUnwrap(sealedSnapshot.messages.first)
+        let command = try XCTUnwrap(sealedSnapshot.outbox.first)
+        XCTAssertEqual(message.id, fixture.queued.clientMessageID)
+        XCTAssertEqual(command.messageId, fixture.queued.clientMessageID)
+        XCTAssertNil(message.pendingMediaBatch)
+        XCTAssertNil(command.secureMessageFanout)
+        // Exactly one sealed descriptor: same caption, both items in display order, and the
+        // exact server-issued upload triples the transport returned.
+        let sealed = try XCTUnwrap(KitMediaMessageV2Descriptor.parse(message.body))
+        XCTAssertEqual(sealed.caption, fixture.caption)
+        XCTAssertEqual(sealed.items.map(\.mediaType), fixture.batch.items.map(\.mediaType))
+        XCTAssertEqual(
+            Set(sealed.items.map { "\($0.storageKey)|\($0.ciphertextByteSize)|\($0.ciphertextSHA256)" }),
+            Set(uploads.map { "\($0.storageKey)|\($0.byteSize)|\($0.ciphertextSha256)" })
+        )
+        XCTAssertEqual(
+            KitMediaMessageFamilyPolicy.attachmentRequests(for: message.body).count,
+            2,
+            "the sealed body alone must yield the canonical outer rows"
+        )
+        let sendsAfterSeal = await fixture.transport.sendCount()
+        XCTAssertEqual(sendsAfterSeal, 0)
+        // Checkpointing moved each plaintext from its park key to its server storage key.
+        let survivingKeys = await fixture.blobs.storageKeys()
+        XCTAssertEqual(survivingKeys, Set(uploads.map(\.storageKey)))
+
+        // Crash-resume: the sealed body is sufficient; nothing uploads twice.
+        do {
+            _ = try await fixture.coordinator.prepareDeferredMessage(
+                commandID: commandID,
+                forUserID: fixture.userID
+            )
+            XCTFail("The injected roster outage must remain active on the resume pass")
+        } catch let error as APIErrorPayload {
+            XCTAssertEqual(error.code, "MESSAGING_TEMPORARILY_UNAVAILABLE")
+        }
+        let uploadsAfterResume = await fixture.transport.uploadedItems()
+        XCTAssertEqual(uploadsAfterResume.count, 2)
+        let resumed = await fixture.store.snapshot()
+        XCTAssertEqual(resumed.messages.first?.body, message.body)
+        let sendsAfterResume = await fixture.transport.sendCount()
+        XCTAssertEqual(sendsAfterResume, 0)
+    }
+
+    /// §6/§7 fail-closed: a capabilities document without the v2 feature makes the flush-time
+    /// admission gate refuse the whole message before any upload — never splitting it, never
+    /// downgrading it — and the queued projection survives untouched for a later retry.
+    func testDeferredMediaBatchFlushFailsClosedBeforeAnyUploadWhenCapabilityIsWithdrawn() async throws {
+        let fixture = try await makeMediaBatchFlushFixture(mediaMessageEnabled: false)
+        let queuedSnapshot = await fixture.store.snapshot()
+        let commandID = try XCTUnwrap(queuedSnapshot.outbox.first?.id)
+        let queuedMessage = try XCTUnwrap(queuedSnapshot.messages.first)
+        let queuedCommand = try XCTUnwrap(queuedSnapshot.outbox.first)
+
+        do {
+            _ = try await fixture.coordinator.prepareDeferredMessage(
+                commandID: commandID,
+                forUserID: fixture.userID
+            )
+            XCTFail("A withdrawn v2 capability must fail the whole message closed")
+        } catch SecureMessagingExchangeError.mediaMessageCapabilityUnavailable {
+            // Expected: the atomic admission gate answered no before any side effect.
+        }
+
+        let uploadCount = await fixture.transport.uploadCount()
+        XCTAssertEqual(uploadCount, 0)
+        let sendCount = await fixture.transport.sendCount()
+        XCTAssertEqual(sendCount, 0)
+        let snapshot = await fixture.store.snapshot()
+        XCTAssertEqual(snapshot.messages, [queuedMessage])
+        XCTAssertEqual(snapshot.outbox, [queuedCommand])
+        XCTAssertEqual(queuedMessage.body, fixture.caption)
+        XCTAssertEqual(queuedMessage.pendingMediaBatch, fixture.batch)
+        let survivingKeys = await fixture.blobs.storageKeys()
+        XCTAssertEqual(
+            survivingKeys,
+            Set(fixture.batch.items.map(\.localStorageKey)),
+            "every parked plaintext must survive a refused flush"
+        )
+    }
+
+    /// §6's roster leg of the same atomic gate, distinct from the server-flag leg above: the
+    /// server advertises the feature and a coherent media_message block, but one recipient
+    /// device in the fresh roster does not attest the v2 device capability. Admission is
+    /// unanimous, so the flush must fail closed with the identical zero-side-effect guarantee —
+    /// exactly zero attachment uploads and zero send POSTs, the queued message and command
+    /// byte-identical, and every parked plaintext surviving — after actually consulting the
+    /// roster (one fetch), proving the refusal came from the incompatible roster and the
+    /// message was never split or downgraded for the capable devices.
+    func testDeferredMediaBatchFlushFailsClosedWithZeroUploadsAndZeroSendsWhenARosterDeviceLacksV2() async throws {
+        let fixture = try await makeMediaBatchFlushFixture(
+            mediaMessageEnabled: true,
+            recipientDeviceSupportsMediaMessageV2: false
+        )
+        let queuedSnapshot = await fixture.store.snapshot()
+        let commandID = try XCTUnwrap(queuedSnapshot.outbox.first?.id)
+        let queuedMessage = try XCTUnwrap(queuedSnapshot.messages.first)
+        let queuedCommand = try XCTUnwrap(queuedSnapshot.outbox.first)
+
+        do {
+            _ = try await fixture.coordinator.prepareDeferredMessage(
+                commandID: commandID,
+                forUserID: fixture.userID
+            )
+            XCTFail("A roster with a v2-incapable device must fail the whole message closed")
+        } catch SecureMessagingExchangeError.mediaMessageCapabilityUnavailable {
+            // Expected: the unanimous roster attestation answered no before any side effect.
+        }
+
+        let rosterCallCount = await fixture.transport.rosterCallCount()
+        XCTAssertEqual(rosterCallCount, 1, "the refusal must come from a consulted fresh roster")
+        let uploadCount = await fixture.transport.uploadCount()
+        XCTAssertEqual(uploadCount, 0)
+        let sendCount = await fixture.transport.sendCount()
+        XCTAssertEqual(sendCount, 0)
+        let snapshot = await fixture.store.snapshot()
+        XCTAssertEqual(snapshot.messages, [queuedMessage])
+        XCTAssertEqual(snapshot.outbox, [queuedCommand])
+        XCTAssertEqual(queuedMessage.body, fixture.caption)
+        XCTAssertEqual(queuedMessage.pendingMediaBatch, fixture.batch)
+        let survivingKeys = await fixture.blobs.storageKeys()
+        XCTAssertEqual(
+            survivingKeys,
+            Set(fixture.batch.items.map(\.localStorageKey)),
+            "every parked plaintext must survive a refused flush"
+        )
+    }
+
+    /// The send boundary: one committed fanout for a sealed KITMEDIA2 body becomes exactly one
+    /// send POST whose client_message_id is the LocalMessage id, whose attachment rows are the
+    /// §5 canonical outer rows (ascending id, not display order), and whose encoded bytes carry
+    /// neither the caption nor any attachment key material.
+    func testSealedMediaBatchSendPostsExactlyOnceWithCanonicalRowsAndNoCaptionOnTheWire() async throws {
+        let userID = "10000000-0000-4000-8000-000000000045"
+        let recipientUserID = "10000000-0000-4000-8000-000000000046"
+        let localDeviceID = "20000000-0000-4000-8000-000000000045"
+        let recipientDeviceID = "20000000-0000-4000-8000-000000000046"
+        let conversationID = "30000000-0000-4000-8000-000000000045"
+        let clientMessageID = "80000000-0000-4000-8000-000000000045"
+        let rosterRevision = "v1:sha256:\(String(repeating: "d", count: 64))"
+        let caption = "Caption stays inside the sealed descriptor"
+        let createdAt = Date(timeIntervalSince1970: 1_755_604_800)
+        // Display order deliberately reverses the canonical outer order.
+        let displayedFirst = KitMediaMessageV2Descriptor.Item(
+            attachmentID: "22222222-2222-4222-8222-222222222222",
+            storageKey: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            mediaType: "video/mp4",
+            ciphertextByteSize: Int64(2_097_152 + 64 - (2_097_152 % 16)),
+            ciphertextSHA256: "fedcba" + String(repeating: "2", count: 58),
+            keyMaterial: Data(repeating: 0x42, count: 64),
+            plaintextByteSize: 2_097_152
+        )
+        let displayedSecond = KitMediaMessageV2Descriptor.Item(
+            attachmentID: "11111111-1111-4111-8111-111111111111",
+            storageKey: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            mediaType: "image/jpeg",
+            ciphertextByteSize: Int64(1_048_576 + 64 - (1_048_576 % 16)),
+            ciphertextSHA256: "abcdef" + String(repeating: "1", count: 58),
+            keyMaterial: Data(repeating: 0x41, count: 64),
+            plaintextByteSize: 1_048_576
+        )
+        let descriptor = try XCTUnwrap(KitMediaMessageV2Descriptor(
+            items: [displayedFirst, displayedSecond],
+            caption: caption
+        ))
+        let expectedRows = try XCTUnwrap(descriptor.attachmentRequests)
+        let fanout = SecureMessagingCommittedFanout(
+            clientMessageID: clientMessageID,
+            conversationID: conversationID,
+            rosterRevision: rosterRevision,
+            replyToMessageID: nil,
+            rosterDevices: [],
+            envelopes: [SecureMessagingOutboundEnvelope(
+                recipientDeviceID: recipientDeviceID,
+                envelopeType: SecureMessagingEnvelopeType.message.rawValue,
+                ciphertext: Data([1, 2, 3])
+            )]
+        )
+        let message = LocalMessage(
+            id: UUID(uuidString: clientMessageID)!,
+            conversationId: conversationID,
+            senderId: userID,
+            body: descriptor.encoded,
+            createdAt: createdAt,
+            sentAt: nil,
+            state: .queued,
+            failureReason: nil,
+            isOutgoing: true
+        )
+        let command = OfflineCommand(
+            id: UUID(uuidString: "90000000-0000-4000-8000-000000000045")!,
+            kind: .secureMessage,
+            createdAt: createdAt,
+            nextAttemptAt: createdAt,
+            attemptCount: 0,
+            conversationId: conversationID,
+            messageId: message.id,
+            recipientUserIds: [recipientUserID],
+            recipientName: "Peer",
+            video: nil,
+            expiresAt: nil,
+            secureMessageFanout: fanout
+        )
+        let store = try await makeStore(userID: userID)
+        var crypto = SecureMessagingPersistentState.empty
+        crypto.enrollment = raceEnrollment(userID: userID, serverDeviceID: localDeviceID)
+        try await store.update { state in
+            state.communicationOwnerUserID = userID
+            state.secureMessaging = crypto
+            state.conversations = [Conversation(
+                id: conversationID,
+                title: "Peer",
+                participantUserIds: [userID, recipientUserID],
+                unreadCount: 0,
+                updatedAt: createdAt
+            )]
+            state.messages = [message]
+            state.outbox = [command]
+        }
+        let serverMessageID = "70000000-0000-4000-8000-000000000045"
+        let transport = RecordingMediaSendTransport { request in
+            EncryptedMessageDTO(
+                id: serverMessageID,
+                conversationId: conversationID,
+                clientMessageId: request.clientMessageId,
+                sender: EncryptedMessageSenderDTO(id: userID, name: "Secure User"),
+                senderDeviceId: localDeviceID,
+                senderEnrollmentEpoch: 1,
+                senderSignalDeviceId: 1,
+                senderRegistrationId: 42,
+                senderProtocolVersion: SecureMessagingWire.protocolVersion,
+                senderBundleVersion: 1,
+                senderIdentityKeySha256: String(repeating: "a", count: 64),
+                rosterRevision: request.rosterRevision,
+                kind: request.kind.rawValue,
+                replyToMessageId: request.replyToMessageId,
+                envelope: nil,
+                attachments: request.attachments.map {
+                    EncryptedAttachmentDTO(
+                        id: $0.id,
+                        storageKey: $0.storageKey,
+                        mediaType: $0.mediaType,
+                        byteSize: $0.byteSize,
+                        ciphertextSha256: $0.ciphertextSha256,
+                        encryptionMetadataCiphertext: nil
+                    )
+                },
+                reactions: [],
+                sentAt: "2026-08-19T12:00:15Z",
+                revokedAt: nil
+            )
+        }
+        let coordinator = SecureMessagingExchangeCoordinator(
+            transport: transport,
+            store: store,
+            engine: SecureMessagingCryptoEngine(),
+            provisioningPreKeyCount: 1
+        )
+
+        _ = try await coordinator.sendQueuedMessage(commandID: command.id, forUserID: userID)
+
+        let requests = await transport.sentRequests()
+        XCTAssertEqual(requests.count, 1, "one committed fanout is exactly one send POST")
+        let request = try XCTUnwrap(requests.first)
+        XCTAssertEqual(request.clientMessageId, clientMessageID)
+        XCTAssertEqual(request.kind, .encryptedAttachment)
+        XCTAssertEqual(request.rosterRevision, rosterRevision)
+        XCTAssertEqual(request.attachments, expectedRows)
+        XCTAssertEqual(
+            request.attachments.map(\.id),
+            [
+                "11111111-1111-4111-8111-111111111111",
+                "22222222-2222-4222-8222-222222222222",
+            ],
+            "outer rows ride in canonical ascending-id order, not display order"
+        )
+        XCTAssertEqual(request.envelopes.count, 1)
+        let conversationIDs = await transport.sentConversationIDs()
+        XCTAssertEqual(conversationIDs, [conversationID])
+        // Leak fence: the caption and every attachment key travel only inside the encrypted
+        // descriptor; the outer request must carry none of those bytes.
+        let wireBytes = try JSONEncoder().encode(request)
+        let wireText = try XCTUnwrap(String(data: wireBytes, encoding: .utf8))
+        XCTAssertFalse(wireText.contains(caption))
+        XCTAssertFalse(wireText.contains("KITMEDIA2"))
+        XCTAssertFalse(wireText.contains(Data(repeating: 0x41, count: 64).base64EncodedString()))
+        XCTAssertFalse(wireText.contains(Data(repeating: 0x42, count: 64).base64EncodedString()))
+
+        let snapshot = await store.snapshot()
+        XCTAssertTrue(snapshot.outbox.isEmpty)
+        let sent = try XCTUnwrap(snapshot.messages.first)
+        XCTAssertEqual(sent.state, .sent)
+        XCTAssertEqual(sent.serverMessageId, serverMessageID)
+        XCTAssertEqual(sent.body, descriptor.encoded, "the sealed body survives the send verbatim")
+    }
+
+    /// Shared setup for the flush-stage tests: a queued two-item batch with caption, a real
+    /// provisioned enrollment (activation must succeed), an in-memory blob store holding both
+    /// parked plaintexts, and a transport whose roster answers once — enough for the flush-time
+    /// admission gate — then fails 503 so the pipeline stops deterministically after the seal,
+    /// before Signal session work that would need real recipient key material.
+    private func makeMediaBatchFlushFixture(
+        mediaMessageEnabled: Bool,
+        recipientDeviceSupportsMediaMessageV2: Bool = true
+    ) async throws -> MediaBatchFlushFixture {
+        let localUserID = "10000000-0000-4000-8000-000000000041"
+        let recipientUserID = "10000000-0000-4000-8000-000000000042"
+        let localDeviceID = "20000000-0000-0000-0000-000000000001"
+        let recipientDeviceID = "20000000-0000-4000-8000-000000000042"
+        let conversationID = "30000000-0000-4000-8000-000000000041"
+        let caption = "Family dinner receipts"
+        let firstParkKey = "70000000-0000-4000-8000-000000000041"
+        let secondParkKey = "70000000-0000-4000-8000-000000000042"
+        let firstPlaintext = Data((0 ..< 300).map { UInt8($0 % 251) })
+        let secondPlaintext = Data((0 ..< 517).map { UInt8(($0 * 7) % 251) })
+        let blobs = InMemoryMediaBlobStore(seed: [
+            firstParkKey: firstPlaintext,
+            secondParkKey: secondPlaintext,
+        ])
+        var keyByte: UInt8 = 0x50
+        let batch = try KitMediaMessageV2OutboundBatch.queued(
+            attachments: [
+                .init(
+                    mediaType: "image/jpeg",
+                    plaintextByteSize: firstPlaintext.count,
+                    localStorageKey: firstParkKey
+                ),
+                .init(
+                    mediaType: "video/mp4",
+                    plaintextByteSize: secondPlaintext.count,
+                    localStorageKey: secondParkKey
+                ),
+            ],
+            rawCaption: caption,
+            keyMaterialFactory: {
+                keyByte += 1
+                return Data(repeating: keyByte, count: 64)
+            }
+        )
+        let store = try await makeStore(userID: localUserID)
+        let engine = SecureMessagingCryptoEngine()
+        let provisioned = try await engine.provision(from: .empty, preKeyCount: 1)
+        let status = enrolledStatus(bundle: provisioned.bundle)
+        let binding = try SecureMessagingMapper.enrollmentBinding(
+            from: status,
+            userID: localUserID
+        )
+        let enrolled = try await engine.bindEnrollment(binding, to: provisioned.state)
+        try await store.update { state in
+            state.secureMessaging = enrolled
+            state.conversations = [Conversation(
+                id: conversationID,
+                title: "ExampleContact",
+                participantUserIds: [localUserID, recipientUserID],
+                unreadCount: 0,
+                updatedAt: Date(timeIntervalSince1970: 1_755_604_800)
+            )]
+        }
+        let transport = MediaBatchFlushTransport(
+            status: status,
+            conversation: directConversationDTO(
+                id: conversationID,
+                userID: localUserID,
+                peerID: recipientUserID,
+                peerName: "ExampleContact"
+            ),
+            capabilitiesDocument: try mediaMessageCapabilitiesDocument(
+                enabled: mediaMessageEnabled
+            ),
+            roster: try mediaBatchRoster(conversationID: conversationID, rows: [
+                mediaBatchDeviceRow(deviceID: localDeviceID, userID: localUserID),
+                mediaBatchDeviceRow(
+                    deviceID: recipientDeviceID,
+                    userID: recipientUserID,
+                    supportsMediaMessageV2: recipientDeviceSupportsMediaMessageV2
+                ),
+            ])
+        )
+        let coordinator = SecureMessagingExchangeCoordinator(
+            transport: transport,
+            store: store,
+            engine: engine,
+            provisioningPreKeyCount: 1,
+            mediaBlobs: blobs.access(forUserID: localUserID)
+        )
+        let queued = try await coordinator.queueDeferredMediaBatch(
+            forUserID: localUserID,
+            conversationID: conversationID,
+            expectedRecipientUserID: recipientUserID,
+            title: "ExampleContact",
+            batch: batch
+        )
+        return MediaBatchFlushFixture(
+            userID: localUserID,
+            caption: caption,
+            batch: batch,
+            store: store,
+            coordinator: coordinator,
+            transport: transport,
+            blobs: blobs,
+            queued: queued
+        )
+    }
+
+    /// The §6 capabilities document, coherent and enabled — or with the feature withdrawn
+    /// entirely, which the gate must read as an unavailable capability, not an error.
+    private func mediaMessageCapabilitiesDocument(enabled: Bool) throws -> CapabilitiesDTO {
+        var messaging: [String: Any] = [
+            "ready": true,
+            "version": SecureMessagingWire.protocolVersion,
+            "suite": SecureMessagingWire.protocolSuite,
+            "post_quantum": true,
+        ]
+        var features: [String: Any] = [:]
+        if enabled {
+            features[MessagingMediaMessageV2CapabilityPolicy.featureKey] = true
+            let coherentBlock: [String: Any] = [
+                "profile": MessagingMediaMessageV2CapabilityPolicy.profile,
+                "ready": true,
+                "max_attachments": KitMediaMessageV2Descriptor.maximumAttachmentCount,
+                "max_descriptor_bytes": KitMediaMessageV2Descriptor.maximumDescriptorUTF8Bytes,
+                "max_caption_utf8_bytes": KitMediaMessageV2Descriptor.maximumCaptionUTF8Bytes,
+                "min_attachment_ciphertext_bytes":
+                    KitMediaMessageV2Descriptor.minimumAttachmentCiphertextBytes,
+                "max_attachment_ciphertext_bytes":
+                    KitMediaMessageV2Descriptor.maximumAttachmentCiphertextBytes,
+                "max_aggregate_ciphertext_bytes":
+                    KitMediaMessageV2Descriptor.maximumAggregateCiphertextBytes,
+            ]
+            messaging["media_message"] = coherentBlock
+        }
+        let data = try JSONSerialization.data(withJSONObject: [
+            "api_version": "v1",
+            "currency": ["code": "UGX", "scale": "2"],
+            "features": features,
+            "protocols": ["messaging": messaging],
+        ])
+        return try JSONDecoder().decode(CapabilitiesDTO.self, from: data)
+    }
+
+    private func mediaBatchDeviceRow(
+        deviceID: String,
+        userID: String,
+        supportsMediaMessageV2: Bool = true
+    ) -> [String: Any] {
+        let capabilities: [String: Bool] = [
+            MessagingMediaMessageV2CapabilityPolicy.deviceCapabilityKey: supportsMediaMessageV2,
+            MessagingRichMediaCapabilityPolicy.deviceCapabilityKey: true,
+            MessagingRichMediaCapabilityPolicy.extendedSizeDeviceCapabilityKey: true,
+        ]
+        let client: [String: Any] = [
+            "platform": "android",
+            "version": "0.2.31",
+            "capabilities": capabilities,
+        ]
+        return ["device_id": deviceID, "user_id": userID, "client": client]
+    }
+
+    private func mediaBatchRoster(
+        conversationID: String,
+        rows: [[String: Any]]
+    ) throws -> MessagingDeviceRosterDTO {
+        let data = try JSONSerialization.data(withJSONObject: [
+            "conversation_id": conversationID,
+            "devices": rows,
+        ])
+        return try JSONDecoder().decode(MessagingDeviceRosterDTO.self, from: data)
+    }
 }
 
 private struct GroupRenameFixture {
@@ -5445,4 +6050,303 @@ private actor ActivationTransportStub: SecureMessagingActivationTransport {
 
     func publishedRequests() -> [PublishMessagingKeyBundleRequest] { requests }
     func resetRequests() -> [ResetMessagingEnrollmentRequest] { recordedResetRequests }
+}
+
+private struct MediaBatchFlushFixture {
+    let userID: String
+    let caption: String
+    let batch: KitMediaMessageV2OutboundBatch
+    let store: SecureLocalStore
+    let coordinator: SecureMessagingExchangeCoordinator
+    let transport: MediaBatchFlushTransport
+    let blobs: InMemoryMediaBlobStore
+    let queued: SecureMessagingQueueResult
+}
+
+private struct MediaBatchRecordedUpload: Equatable, Sendable {
+    let mediaType: String
+    let storageKey: String
+    let byteSize: Int64
+    let ciphertextSha256: String
+}
+
+/// Dict-backed stand-in for `SecureMediaFileCache` behind `SecureMediaBlobStoreAccess`,
+/// preserving the cache's non-overwriting semantics: `duplicate` classifies an existing
+/// destination by byte comparison instead of replacing it, and `removeDuplicate` deletes only
+/// while an identical survivor remains readable — the outcomes the upload loop's checkpoint
+/// choreography depends on.
+private actor InMemoryMediaBlobStore {
+    private var blobs: [String: Data]
+
+    init(seed: [String: Data]) {
+        blobs = seed
+    }
+
+    func read(_ storageKey: String) -> Data? { blobs[storageKey] }
+
+    func duplicate(fromKey: String, toKey: String) -> SecureMediaDuplicateOutcome {
+        guard let source = blobs[fromKey] else { return .sourceMissing }
+        if let existing = blobs[toKey] {
+            return existing == source ? .alreadyIdentical : .conflict
+        }
+        blobs[toKey] = source
+        return .stored
+    }
+
+    func removeDuplicate(_ key: String, keeping survivorKey: String) -> Bool {
+        guard key != survivorKey,
+              let doomed = blobs[key],
+              let survivor = blobs[survivorKey],
+              doomed == survivor
+        else { return false }
+        blobs.removeValue(forKey: key)
+        return true
+    }
+
+    func remove(_ storageKey: String) {
+        blobs.removeValue(forKey: storageKey)
+    }
+
+    func storageKeys() -> Set<String> { Set(blobs.keys) }
+
+    /// The coordinator seam, pinned to one account: any other user id reads nothing and
+    /// mutates nothing.
+    nonisolated func access(forUserID expectedUserID: String) -> SecureMediaBlobStoreAccess {
+        SecureMediaBlobStoreAccess(
+            read: { key, userID in
+                guard userID == expectedUserID else { return nil }
+                return await self.read(key)
+            },
+            duplicateIfAbsent: { fromKey, toKey, userID in
+                guard userID == expectedUserID else { return .sourceMissing }
+                return await self.duplicate(fromKey: fromKey, toKey: toKey)
+            },
+            removeDuplicate: { key, survivor, userID in
+                guard userID == expectedUserID else { return false }
+                return await self.removeDuplicate(key, keeping: survivor)
+            },
+            remove: { key, userID in
+                guard userID == expectedUserID else { return }
+                await self.remove(key)
+            }
+        )
+    }
+}
+
+/// Serves exactly what the flush stage needs: key status, the direct conversation, one
+/// §7-fresh capabilities document, and a roster that answers once — enough for the flush-time
+/// admission gate — then fails 503, so the pipeline stops deterministically inside the text
+/// hand-off, after the durable seal and before Signal session work that would need real
+/// recipient key material. Uploads mint per-call storage keys and echo real ciphertext facts;
+/// a send is counted and refused, because reaching it would already falsify the test.
+private actor MediaBatchFlushTransport: SecureMessagingExchangeTransport {
+    enum Failure: Error { case unexpectedNetworkCall }
+
+    private let status: MessagingKeyStatusDTO
+    private let conversation: MessagingConversationDTO
+    private let capabilitiesDocument: CapabilitiesDTO
+    private let roster: MessagingDeviceRosterDTO
+    private var rosterCalls = 0
+    private var uploads: [MediaBatchRecordedUpload] = []
+    private var sends = 0
+
+    init(
+        status: MessagingKeyStatusDTO,
+        conversation: MessagingConversationDTO,
+        capabilitiesDocument: CapabilitiesDTO,
+        roster: MessagingDeviceRosterDTO
+    ) {
+        self.status = status
+        self.conversation = conversation
+        self.capabilitiesDocument = capabilitiesDocument
+        self.roster = roster
+    }
+
+    func uploadedItems() -> [MediaBatchRecordedUpload] { uploads }
+    func uploadCount() -> Int { uploads.count }
+    func sendCount() -> Int { sends }
+    func rosterCallCount() -> Int { rosterCalls }
+
+    func messagingKeyStatus() async throws -> MessagingKeyStatusDTO { status }
+
+    func capabilities() async throws -> CapabilitiesDTO { capabilitiesDocument }
+
+    func messagingConversation(id: String) async throws -> MessagingConversationDTO {
+        guard id == conversation.id else { throw Failure.unexpectedNetworkCall }
+        return conversation
+    }
+
+    func messagingDeviceRoster(
+        conversationId: String
+    ) async throws -> MessagingDeviceRosterDTO {
+        guard conversationId == conversation.id else { throw Failure.unexpectedNetworkCall }
+        rosterCalls += 1
+        guard rosterCalls == 1 else {
+            throw APIErrorPayload(
+                code: "MESSAGING_TEMPORARILY_UNAVAILABLE",
+                message: "Please retry.",
+                httpStatus: 503
+            )
+        }
+        return roster
+    }
+
+    func uploadMessagingAttachment(
+        mediaType: String,
+        ciphertext: Data
+    ) async throws -> MessagingAttachmentUploadDTO {
+        guard !ciphertext.isEmpty else { throw Failure.unexpectedNetworkCall }
+        let upload = MediaBatchRecordedUpload(
+            mediaType: mediaType,
+            storageKey: String(format: "9a000000-0000-4000-8000-%012d", uploads.count + 1),
+            byteSize: Int64(ciphertext.count),
+            ciphertextSha256: SecureMessagingValidation.sha256Hex(ciphertext)
+        )
+        uploads.append(upload)
+        return MessagingAttachmentUploadDTO(
+            storageKey: upload.storageKey,
+            byteSize: upload.byteSize,
+            ciphertextSha256: upload.ciphertextSha256
+        )
+    }
+
+    func sendEncryptedMessage(
+        conversationId: String,
+        request: SendEncryptedMessageRequest
+    ) async throws -> EncryptedMessageDTO {
+        sends += 1
+        throw Failure.unexpectedNetworkCall
+    }
+
+    private func reject<T>() throws -> T { throw Failure.unexpectedNetworkCall }
+
+    func publishMessagingKeyBundle(
+        _ request: PublishMessagingKeyBundleRequest
+    ) async throws -> MessagingKeyStatusDTO { try reject() }
+
+    func resetMessagingEnrollment(
+        _ request: ResetMessagingEnrollmentRequest
+    ) async throws -> ResetMessagingEnrollmentDTO { try reject() }
+
+    func messagingConversations() async throws -> MessagingConversationListDTO { try reject() }
+
+    func createDirectMessagingConversation(
+        _ request: CreateDirectMessagingConversationRequest
+    ) async throws -> MessagingConversationDTO { try reject() }
+
+    func historicalMessagingDeviceRoster(
+        conversationId: String,
+        rosterRevision: String
+    ) async throws -> MessagingDeviceRosterDTO { try reject() }
+
+    func consumeMessagingKeyBundles(
+        conversationId: String,
+        request: ConsumeMessagingKeyBundlesRequest
+    ) async throws -> ConsumedMessagingKeyBundlesDTO { try reject() }
+
+    func downloadMessagingAttachment(
+        storageKey: String,
+        expectedByteSize: Int64
+    ) async throws -> Data { try reject() }
+
+    func syncEncryptedMessages(
+        cursor: String?,
+        limit: Int
+    ) async throws -> MessagingSyncDTO { try reject() }
+
+    func acknowledgeMessageDelivery(
+        _ request: AcknowledgeMessageDeliveryRequest
+    ) async throws -> MessageDeliveryAcknowledgementDTO { try reject() }
+
+    func markMessagingConversationRead(
+        conversationId: String,
+        request: MarkMessagingConversationReadRequest
+    ) async throws -> MessagingReadReceiptDTO { try reject() }
+}
+
+/// Records every send POST and answers with a caller-supplied echo of the request, so the
+/// strict outbound response validator can pass without a network. Everything else rejects:
+/// a committed fanout must need nothing but the send endpoint.
+private actor RecordingMediaSendTransport: SecureMessagingExchangeTransport {
+    enum Failure: Error { case unexpectedNetworkCall }
+
+    private let respond: @Sendable (SendEncryptedMessageRequest) -> EncryptedMessageDTO
+    private var recordedConversationIDs: [String] = []
+    private var recordedRequests: [SendEncryptedMessageRequest] = []
+
+    init(respond: @escaping @Sendable (SendEncryptedMessageRequest) -> EncryptedMessageDTO) {
+        self.respond = respond
+    }
+
+    func sentRequests() -> [SendEncryptedMessageRequest] { recordedRequests }
+    func sentConversationIDs() -> [String] { recordedConversationIDs }
+
+    func sendEncryptedMessage(
+        conversationId: String,
+        request: SendEncryptedMessageRequest
+    ) async throws -> EncryptedMessageDTO {
+        recordedConversationIDs.append(conversationId)
+        recordedRequests.append(request)
+        return respond(request)
+    }
+
+    private func reject<T>() throws -> T { throw Failure.unexpectedNetworkCall }
+
+    func messagingKeyStatus() async throws -> MessagingKeyStatusDTO { try reject() }
+
+    func publishMessagingKeyBundle(
+        _ request: PublishMessagingKeyBundleRequest
+    ) async throws -> MessagingKeyStatusDTO { try reject() }
+
+    func resetMessagingEnrollment(
+        _ request: ResetMessagingEnrollmentRequest
+    ) async throws -> ResetMessagingEnrollmentDTO { try reject() }
+
+    func messagingConversations() async throws -> MessagingConversationListDTO { try reject() }
+
+    func messagingConversation(id: String) async throws -> MessagingConversationDTO {
+        try reject()
+    }
+
+    func createDirectMessagingConversation(
+        _ request: CreateDirectMessagingConversationRequest
+    ) async throws -> MessagingConversationDTO { try reject() }
+
+    func messagingDeviceRoster(
+        conversationId: String
+    ) async throws -> MessagingDeviceRosterDTO { try reject() }
+
+    func historicalMessagingDeviceRoster(
+        conversationId: String,
+        rosterRevision: String
+    ) async throws -> MessagingDeviceRosterDTO { try reject() }
+
+    func consumeMessagingKeyBundles(
+        conversationId: String,
+        request: ConsumeMessagingKeyBundlesRequest
+    ) async throws -> ConsumedMessagingKeyBundlesDTO { try reject() }
+
+    func uploadMessagingAttachment(
+        mediaType: String,
+        ciphertext: Data
+    ) async throws -> MessagingAttachmentUploadDTO { try reject() }
+
+    func downloadMessagingAttachment(
+        storageKey: String,
+        expectedByteSize: Int64
+    ) async throws -> Data { try reject() }
+
+    func syncEncryptedMessages(
+        cursor: String?,
+        limit: Int
+    ) async throws -> MessagingSyncDTO { try reject() }
+
+    func acknowledgeMessageDelivery(
+        _ request: AcknowledgeMessageDeliveryRequest
+    ) async throws -> MessageDeliveryAcknowledgementDTO { try reject() }
+
+    func markMessagingConversationRead(
+        conversationId: String,
+        request: MarkMessagingConversationReadRequest
+    ) async throws -> MessagingReadReceiptDTO { try reject() }
 }

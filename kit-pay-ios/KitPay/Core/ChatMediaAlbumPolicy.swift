@@ -1,11 +1,17 @@
 import Foundation
 
 /// One display item inside a conversation timeline media album.
+///
+/// Carries identity and display facts only, never descriptor text: a descriptor holds
+/// attachment key material, so cells re-resolve the persisted row by identity instead.
 struct ChatMediaAlbumItem: Equatable, Identifiable {
     let messageID: UUID
-    /// The raw message body; parseable via `KitMediaMessageDescriptor.parse(_:)`.
-    let descriptorText: String
+    let conversationID: String
+    /// Opaque thumbnail-store key (the attachment's storage key); carries no key material.
+    /// Changes whenever the row's sealed descriptor changes, so cells keyed on it re-resolve.
+    let thumbnailKey: String
     let mediaType: String
+    let plaintextByteSize: Int
     let isOutgoing: Bool
     let createdAt: Date
 
@@ -102,8 +108,10 @@ enum ChatMediaAlbumPolicy {
         guard kind == .image || kind == .video else { return nil }
         return ChatMediaAlbumItem(
             messageID: message.id,
-            descriptorText: message.body,
+            conversationID: message.conversationId,
+            thumbnailKey: descriptor.storageKey,
             mediaType: descriptor.mediaType,
+            plaintextByteSize: descriptor.plaintextByteSize,
             isOutgoing: message.isOutgoing,
             createdAt: message.createdAt
         )

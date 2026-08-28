@@ -905,10 +905,23 @@ final class PaymentRailContractTests: XCTestCase {
             mode: .decimal(maximumFractionDigits: 2),
             locale: germany
         ))
-        XCTAssertEqual(pasted.editingCanonicalValue, "1856.80")
+        XCTAssertEqual(pasted.editingCanonicalValue, "1856.8")
         XCTAssertEqual(pasted.committedCanonicalValue, "1856.8")
-        XCTAssertEqual(pasted.displayedValue, "1,856.80")
-        XCTAssertEqual(pasted.caretUTF16Offset, 8)
+        XCTAssertEqual(pasted.displayedValue, "1,856.8")
+        XCTAssertEqual(pasted.caretUTF16Offset, 7)
+
+        let pastedWhole = try XCTUnwrap(PaymentInputFormatting.applyingEdit(
+            to: "",
+            range: NSRange(location: 0, length: 0),
+            replacement: "1000.00",
+            currentSelection: NSRange(location: 0, length: 0),
+            mode: .decimal(maximumFractionDigits: 2),
+            locale: unitedStates
+        ))
+        XCTAssertEqual(pastedWhole.editingCanonicalValue, "1000")
+        XCTAssertEqual(pastedWhole.committedCanonicalValue, "1000")
+        XCTAssertEqual(pastedWhole.displayedValue, "1,000")
+        XCTAssertEqual(pastedWhole.caretUTF16Offset, 5)
 
         XCTAssertNil(PaymentInputFormatting.applyingEdit(
             to: "1,000",

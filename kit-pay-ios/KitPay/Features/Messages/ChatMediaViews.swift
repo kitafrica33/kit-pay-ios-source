@@ -12,12 +12,15 @@ struct ChatStagedAttachment: Identifiable {
     let kind: KitChatMediaKind
     let data: Data
     let mediaType: String
-    /// Shown in the staging chip; doubles as the caption for documents so the
-    /// filename survives the v1 wire format.
+    /// Shown in the staging chip; for a lone document it also becomes the caption when no
+    /// typed text rides along, so the filename survives the v1 wire format.
     let displayName: String
     let previewImage: UIImage?
-    /// Shares retained in the app-group inbox reuse their source UUID across retries. Ordinary
-    /// camera/library attachments leave this nil and receive the queue's usual fresh identifier.
+    /// Shared-in rows carry their source item UUID so the composer can recognize and detach
+    /// exactly the rows a handoff introduced. It is only a fallback send identity: while a
+    /// shared delivery is applied, the whole send queues under the delivery's batch UUID.
+    /// Ordinary camera/library attachments leave this nil and receive the queue's usual
+    /// fresh identifier.
     let clientMessageID: UUID?
 
     init(
@@ -115,26 +118,74 @@ enum ChatMediaTempFiles {
 /// Downloads/decrypts (or serves from cache) the plaintext for one media message.
 @MainActor
 private final class SecureMediaLoader: ObservableObject {
-    @Published var data: Data?
+    /// Bytes together with the MIME/caption facts of the same authoritative resolution.
+    /// Anything that displays or re-encodes what was loaded must take its facts from here,
+    /// never from a row snapshot the view captured earlier.
+    @Published var loaded: SecureMediaLoadPolicy.LoadedItem?
     @Published var isLoading = false
     @Published var errorMessage: String?
 
+    var data: Data? { loaded?.data }
+
+    /// Identity only: the model re-resolves the current persisted row and re-parses its
+    /// descriptor before any cache probe, so a bubble's captured snapshot can never feed the
+    /// verifying open paths. `itemIndex` nil is the single-attachment (v1) shape; non-nil
+    /// addresses one item of a multi-attachment batch. `allowsDownload` false probes only what
+    /// is already local (the row's inline slot or the encrypted cache) and fails silently —
+    /// poster/preview surfaces must never turn scrolling into network transfers or error text.
     func load(
         model: AppModel,
+        messageID: UUID,
         conversationId: String,
-        descriptorText: String
+        itemIndex: Int?,
+        allowsDownload: Bool = true
     ) async {
-        guard data == nil, !isLoading else { return }
+        guard loaded == nil, !isLoading else { return }
         isLoading = true
         errorMessage = nil
         defer { isLoading = false }
         do {
-            data = try await model.loadSecureMedia(
+            loaded = try await model.loadSecureMediaItem(
+                messageID: messageID,
                 conversationId: conversationId,
-                descriptorText: descriptorText
+                itemIndex: itemIndex,
+                allowsDownload: allowsDownload
             )
         } catch {
+            guard allowsDownload else { return }
             errorMessage = model.isOnline ? "Tap to retry" : "Available when online"
+        }
+    }
+
+    /// Fresh authoritative resolution for a user-triggered presentation. Unlike `load` — which
+    /// keeps whatever it loaded for passive rendering — this never lets previously loaded UI
+    /// state service a later action: it re-resolves the identity right now (account, current
+    /// persisted row, full projection) and replaces `loaded` with the outcome, clearing it when
+    /// the row no longer resolves so stale bytes cannot be presented again. Callers must present
+    /// exactly the returned item — its bytes and its MIME/caption/size facts together.
+    @discardableResult
+    func refreshForPresentation(
+        model: AppModel,
+        messageID: UUID,
+        conversationId: String,
+        itemIndex: Int?
+    ) async -> SecureMediaLoadPolicy.LoadedItem? {
+        guard !isLoading else { return nil }
+        isLoading = true
+        errorMessage = nil
+        defer { isLoading = false }
+        do {
+            let fresh = try await model.loadSecureMediaItem(
+                messageID: messageID,
+                conversationId: conversationId,
+                itemIndex: itemIndex
+            )
+            loaded = fresh
+            return fresh
+        } catch {
+            loaded = nil
+            errorMessage = model.isOnline ? "Tap to retry" : "Available when online"
+            return nil
         }
     }
 }
@@ -177,19 +228,17 @@ struct PendingSecureMediaMessageView: View {
     @EnvironmentObject private var model: AppModel
     let message: LocalMessage
     let attachment: LocalPendingAttachment
-    /// Plaintext for large media parked in the encrypted file cache instead of inline.
-    @State private var parkedData: Data?
+    /// Bytes plus the MIME facts of the same authoritative identity resolution. Loaded by
+    /// message identity — never from this view's captured row snapshot — so the preview and
+    /// the facts shown with it can only ever be the current persisted pending attachment's.
+    @State private var loaded: SecureMediaLoadPolicy.LoadedItem?
 
     private var kind: KitChatMediaKind {
         KitChatMediaKind(mediaType: attachment.mediaType)
     }
 
-    private var mediaData: Data? {
-        message.attachmentData ?? parkedData
-    }
-
     private var sizeLabel: String? {
-        if let byteCount = mediaData?.count ?? attachment.byteCount {
+        if let byteCount = loaded?.data.count ?? attachment.byteCount {
             return ChatMediaBytes.label(byteCount)
         }
         return nil
@@ -205,17 +254,19 @@ struct PendingSecureMediaMessageView: View {
     var body: some View {
         pendingContent
             .task(id: message.id) {
-                guard mediaData == nil, kind == .image,
-                      attachment.localStorageKey != nil else { return }
-                parkedData = await model.loadPendingMedia(for: message)
+                guard loaded == nil, kind == .image else { return }
+                loaded = await model.loadPendingMedia(
+                    messageID: message.id,
+                    conversationId: message.conversationId
+                )
             }
     }
 
     @ViewBuilder
     private var pendingContent: some View {
-        if kind == .image,
-           let data = mediaData,
-           let image = UIImage(data: data) {
+        if let loaded,
+           KitChatMediaKind(mediaType: loaded.mediaType) == .image,
+           let image = UIImage(data: loaded.data) {
             Image(uiImage: image)
                 .resizable()
                 .scaledToFill()
@@ -256,6 +307,342 @@ struct PendingSecureMediaMessageView: View {
     }
 }
 
+// MARK: - Multi-attachment (KITMEDIA2) message
+
+/// One bubble for one multi-attachment message, whichever phase it is in: still uploading
+/// (`pendingMediaBatch`), sealed outgoing, or received. Items render in display order inside
+/// this single bubble — the batch is one message and must never read as several — and each item
+/// downloads, decrypts, and opens on its own without touching its siblings. The caption and the
+/// status/retry row belong to the enclosing bubble, not to any item.
+struct SecureMediaBatchMessageView: View {
+    let message: LocalMessage
+
+    var body: some View {
+        if let batch = message.pendingMediaBatch, batch.isStructurallyValid {
+            itemStack(
+                items: batch.items.map { ($0.attachmentID, $0.mediaType, $0.plaintextByteSize) },
+                isPending: true
+            )
+        } else if let descriptor = KitMediaMessageV2Descriptor.parse(message.body) {
+            itemStack(
+                items: descriptor.items.map {
+                    ($0.attachmentID, $0.mediaType, $0.plaintextByteSize)
+                },
+                isPending: false
+            )
+        } else {
+            // A damaged batch row (structural gate refused it) still owns its bubble; it shows
+            // the family placeholder rather than nothing, and never any raw wire text.
+            HStack(spacing: 11) {
+                Image(systemName: "paperclip")
+                    .font(.system(size: 19, weight: .semibold))
+                Text(KitMediaMessageFamilyPresentation.genericAttachmentLabel)
+                    .font(.subheadline.weight(.semibold))
+            }
+            .foregroundStyle(message.isOutgoing ? .white : KitColor.navy)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Attachment unavailable")
+        }
+    }
+
+    private func itemStack(
+        items: [(attachmentID: String, mediaType: String, plaintextByteSize: Int)],
+        isPending: Bool
+    ) -> some View {
+        VStack(alignment: message.isOutgoing ? .trailing : .leading, spacing: 5) {
+            ForEach(Array(items.enumerated()), id: \.element.attachmentID) { index, item in
+                SecureMediaBatchItemView(
+                    message: message,
+                    itemIndex: index,
+                    itemCount: items.count,
+                    attachmentID: item.attachmentID,
+                    mediaType: item.mediaType,
+                    plaintextByteSize: item.plaintextByteSize,
+                    isPending: isPending
+                )
+            }
+        }
+    }
+}
+
+/// One attachment of a multi-attachment message. Photos show themselves; everything else is a
+/// row that names its kind and size and opens (or first fetches) on tap. Pending items read
+/// only the local cache — their plaintext was parked at queue time and nothing exists on the
+/// server to fetch until the seal.
+struct SecureMediaBatchItemView: View {
+    @EnvironmentObject private var model: AppModel
+    @Environment(\.voiceNoteChatContext) private var chatContext
+    @ObservedObject private var player = VoiceNotePlayer.shared
+    let message: LocalMessage
+    let itemIndex: Int
+    let itemCount: Int
+    /// Queue-minted canonical UUID; doubles as this item's stable playback identity.
+    let attachmentID: String
+    let mediaType: String
+    let plaintextByteSize: Int
+    let isPending: Bool
+
+    @StateObject private var loader = SecureMediaLoader()
+    @State private var retryGeneration = 0
+    @State private var showsImageViewer = false
+    @State private var playbackURL: URL?
+    @State private var documentURL: URL?
+
+    private var kind: KitChatMediaKind { KitChatMediaKind(mediaType: mediaType) }
+
+    private var voiceNoteID: UUID {
+        UUID(uuidString: attachmentID) ?? message.id
+    }
+
+    /// Photos fetch themselves the way v1 photos do; other kinds wait for a tap, because a
+    /// batch can carry up to eight items of up to 200 MB each. Pending items always load —
+    /// for them "loading" is a local cache read, never network.
+    private var loadsAutomatically: Bool {
+        isPending || kind == .image
+    }
+
+    private var accessibilityPosition: String {
+        "item \(itemIndex + 1) of \(itemCount)"
+    }
+
+    var body: some View {
+        itemContent
+            .task(
+                id: "\(message.id):\(itemIndex):\(model.isOnline):\(retryGeneration)"
+            ) {
+                guard loadsAutomatically, loader.data == nil else { return }
+                await loader.load(
+                    model: model,
+                    messageID: message.id,
+                    conversationId: message.conversationId,
+                    itemIndex: itemIndex
+                )
+            }
+    }
+
+    @ViewBuilder
+    private var itemContent: some View {
+        switch kind {
+        case .image:
+            imageCell
+        case .voice:
+            voiceRow
+        case .video, .document:
+            fileRow
+        }
+    }
+
+    @ViewBuilder
+    private var imageCell: some View {
+        if let image = loader.data.flatMap(UIImage.init(data:)) {
+            Image(uiImage: image)
+                .resizable()
+                .scaledToFill()
+                .frame(maxWidth: 224, maxHeight: 168)
+                .clipShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
+                .contentShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
+                .onTapGesture {
+                    // A tap presents full-screen: re-prove the row first, and show only the
+                    // freshly resolved bytes — the rendered thumbnail is not authority.
+                    Task {
+                        guard !loader.isLoading,
+                              let fresh = await loader.refreshForPresentation(
+                                  model: model,
+                                  messageID: message.id,
+                                  conversationId: message.conversationId,
+                                  itemIndex: itemIndex
+                              ), UIImage(data: fresh.data) != nil else { return }
+                        showsImageViewer = true
+                    }
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("End-to-end encrypted photo, \(accessibilityPosition)")
+                .accessibilityAddTraits(.isButton)
+                .fullScreenCover(isPresented: $showsImageViewer) {
+                    MediaImageViewer(image: image)
+                }
+        } else {
+            Button { retryGeneration &+= 1 } label: {
+                mediaPlaceholder(
+                    systemImage: model.isOnline ? "photo.badge.arrow.down" : "photo.fill",
+                    title: loader.errorMessage
+                        ?? (isPending
+                            ? "Photo queued"
+                            : model.isOnline
+                                ? "Loading encrypted photo…"
+                                : "Photo available when online"),
+                    isLoading: loader.isLoading,
+                    isOutgoing: message.isOutgoing
+                )
+            }
+            .buttonStyle(.plain)
+            .disabled(loader.isLoading)
+            .accessibilityLabel("End-to-end encrypted photo, \(accessibilityPosition)")
+        }
+    }
+
+    private var voiceRow: some View {
+        let isCurrent = player.playingID == voiceNoteID
+        let isPlaying = isCurrent && !player.isPaused
+        return Button {
+            Task { await refreshThenPlay() }
+        } label: {
+            row(
+                systemImage: isPlaying ? "pause.fill" : "play.fill",
+                title: "Voice note",
+                subtitle: subtitleLabel
+            )
+        }
+        .buttonStyle(.plain)
+        .disabled(loader.isLoading)
+        .accessibilityLabel(
+            "End-to-end encrypted voice note, \(accessibilityPosition)"
+        )
+    }
+
+    private var fileRow: some View {
+        Button {
+            Task { await refreshThenPresent() }
+        } label: {
+            row(
+                systemImage: kind.symbolName,
+                title: kind.previewLabel,
+                subtitle: subtitleLabel
+            )
+        }
+        .buttonStyle(.plain)
+        .disabled(loader.isLoading)
+        .accessibilityLabel(
+            "End-to-end encrypted \(kind.previewLabel.lowercased()), \(accessibilityPosition)"
+        )
+        .fullScreenCover(
+            isPresented: Binding(
+                get: { playbackURL != nil || documentURL != nil },
+                set: { if !$0 { closePresentation() } }
+            )
+        ) {
+            if let playbackURL {
+                MediaVideoPlayerView(fileURL: playbackURL) { closePresentation() }
+            } else if let documentURL, let loaded = loader.loaded {
+                // Viewer facts from the same fresh resolution that produced the temp file —
+                // never the item fields this bubble captured at render time.
+                KitDocumentViewerView(
+                    fileURL: documentURL,
+                    displayName: presentedDisplayName(mediaType: loaded.mediaType),
+                    mediaType: loaded.mediaType,
+                    byteCount: loaded.data.count,
+                    onClose: { closePresentation() }
+                )
+            }
+        }
+    }
+
+    private func presentedDisplayName(mediaType: String) -> String {
+        "\(KitChatMediaKind(mediaType: mediaType).previewLabel) \(itemIndex + 1)"
+    }
+
+    private func row(systemImage: String, title: String, subtitle: String) -> some View {
+        HStack(spacing: 11) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(
+                        message.isOutgoing
+                            ? Color.white.opacity(0.14)
+                            : KitColor.paleGreen.opacity(0.55)
+                    )
+                    .frame(width: 38, height: 38)
+                if loader.isLoading {
+                    ProgressView()
+                        .tint(message.isOutgoing ? .white : KitColor.green)
+                } else {
+                    Image(systemName: systemImage)
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(message.isOutgoing ? .white : KitColor.green)
+                }
+            }
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(message.isOutgoing ? .white : KitColor.navy)
+                    .lineLimit(1)
+                Text(subtitle)
+                    .font(.caption)
+                    .foregroundStyle(
+                        message.isOutgoing ? .white.opacity(0.72) : KitColor.secondaryText
+                    )
+            }
+        }
+        .padding(.vertical, 2)
+    }
+
+    private var subtitleLabel: String {
+        if let errorMessage = loader.errorMessage { return errorMessage }
+        if loader.isLoading { return "Decrypting…" }
+        // Once loaded, the size fact tracks the resolved bytes, not the captured item field.
+        let bytes = loader.loaded?.data.count ?? plaintextByteSize
+        if isPending { return "Queued · \(ChatMediaBytes.label(bytes))" }
+        return ChatMediaBytes.label(bytes)
+    }
+
+    /// Every play/pause tap re-proves the row — account, current persisted row, full
+    /// projection — with a fresh resolution before any plaintext reaches the player;
+    /// previously loaded UI state never services it. If the row no longer resolves, a note
+    /// still playing under this identity is stopped rather than left presenting stale audio.
+    private func refreshThenPlay() async {
+        guard !loader.isLoading else { return }
+        guard let fresh = await loader.refreshForPresentation(
+            model: model,
+            messageID: message.id,
+            conversationId: message.conversationId,
+            itemIndex: itemIndex
+        ) else {
+            if player.playingID == voiceNoteID { player.stop() }
+            return
+        }
+        player.toggle(
+            data: fresh.data,
+            id: voiceNoteID,
+            context: chatContext.playbackContext(senderUserID: message.senderId)
+        )
+    }
+
+    private func refreshThenPresent() async {
+        guard !loader.isLoading else { return }
+        guard let fresh = await loader.refreshForPresentation(
+            model: model,
+            messageID: message.id,
+            conversationId: message.conversationId,
+            itemIndex: itemIndex
+        ) else { return }
+        present(fresh)
+    }
+
+    // Temp-file bytes, declared type, viewer branch, and suggested name all come from the same
+    // fresh resolution — never from the item facts this bubble captured at render time.
+    private func present(_ item: SecureMediaLoadPolicy.LoadedItem) {
+        guard playbackURL == nil, documentURL == nil else { return }
+        let presentedKind = KitChatMediaKind(mediaType: item.mediaType)
+        let url = try? ChatMediaTempFiles.writeTemporaryFile(
+            data: item.data,
+            mediaType: item.mediaType,
+            suggestedName: presentedKind == .document
+                ? presentedDisplayName(mediaType: item.mediaType)
+                : nil
+        )
+        if presentedKind == .video {
+            playbackURL = url
+        } else {
+            documentURL = url
+        }
+    }
+
+    private func closePresentation() {
+        ChatMediaTempFiles.removeTemporaryFile(playbackURL ?? documentURL)
+        playbackURL = nil
+        documentURL = nil
+    }
+}
+
 // MARK: - Image
 
 struct SecureImageMessageView: View {
@@ -268,7 +655,9 @@ struct SecureImageMessageView: View {
     @State private var showsViewer = false
 
     private var image: UIImage? {
-        (loader.data ?? message.attachmentData).flatMap(UIImage.init(data:))
+        // Identity-resolved bytes only: the captured row's inline slot is a snapshot, and the
+        // loader serves the same inline bytes through the current-row resolution instead.
+        loader.data.flatMap(UIImage.init(data:))
     }
 
     var body: some View {
@@ -284,7 +673,19 @@ struct SecureImageMessageView: View {
                         if let openGallery {
                             openGallery(message.id)
                         } else {
-                            showsViewer = true
+                            // A tap presents full-screen: re-prove the row first, and show
+                            // only the freshly resolved bytes — the rendered thumbnail is
+                            // not authority.
+                            Task {
+                                guard !loader.isLoading,
+                                      let fresh = await loader.refreshForPresentation(
+                                          model: model,
+                                          messageID: message.id,
+                                          conversationId: message.conversationId,
+                                          itemIndex: nil
+                                      ), UIImage(data: fresh.data) != nil else { return }
+                                showsViewer = true
+                            }
                         }
                     }
             } else {
@@ -307,8 +708,9 @@ struct SecureImageMessageView: View {
             guard image == nil else { return }
             await loader.load(
                 model: model,
+                messageID: message.id,
                 conversationId: message.conversationId,
-                descriptorText: message.body
+                itemIndex: nil
             )
         }
         .fullScreenCover(isPresented: $showsViewer) {
@@ -372,12 +774,13 @@ struct VoiceNoteBubbleView: View {
     let message: LocalMessage
     let descriptor: KitMediaMessageDescriptor
     @StateObject private var loader = SecureMediaLoader()
-    @State private var retryGeneration = 0
     /// Fraction playback was at when the current slide began, so a slide moves the note relative
     /// to where the finger went down instead of jumping to it.
     @State private var scrubOrigin: Double?
 
-    private var data: Data? { loader.data ?? message.attachmentData }
+    // Identity-resolved bytes only — the loader serves even the row's inline slot through the
+    // current-row resolution, never the view's captured snapshot.
+    private var data: Data? { loader.data }
     private var isCurrent: Bool { player.playingID == message.id }
     private var isPlaying: Bool { isCurrent && !player.isPaused }
     private var accent: Color { message.isOutgoing ? .white : KitColor.green }
@@ -389,11 +792,7 @@ struct VoiceNoteBubbleView: View {
     var body: some View {
         HStack(spacing: 11) {
             Button {
-                if let data {
-                    player.toggle(data: data, id: message.id, context: playbackContext)
-                } else {
-                    retryGeneration &+= 1
-                }
+                Task { await refreshThenToggle() }
             } label: {
                 Group {
                     if loader.isLoading {
@@ -444,12 +843,13 @@ struct VoiceNoteBubbleView: View {
         .padding(.vertical, 3)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("End-to-end encrypted voice note")
-        .task(id: "\(descriptor.storageKey):\(model.isOnline):\(retryGeneration)") {
+        .task(id: "\(descriptor.storageKey):\(model.isOnline)") {
             guard data == nil else { return }
             await loader.load(
                 model: model,
+                messageID: message.id,
                 conversationId: message.conversationId,
-                descriptorText: message.body
+                itemIndex: nil
             )
         }
         // While this bubble is on screen it *is* the control for its own note, so the floating bar
@@ -484,11 +884,16 @@ struct VoiceNoteBubbleView: View {
                         atX: value.location.x,
                         width: VoiceNoteSeekPolicy.waveformWidth
                     )
-                    if !isCurrent {
-                        guard let data else { return }
-                        player.toggle(data: data, id: message.id, context: playbackContext)
+                    if isCurrent {
+                        player.seek(toFraction: fraction)
+                    } else {
+                        // Tap-to-position starts playback, which presents plaintext: the same
+                        // fresh re-proof as the play button, then position at the tapped spot.
+                        Task {
+                            await refreshThenToggle()
+                            if isCurrent { player.seek(toFraction: fraction) }
+                        }
                     }
-                    player.seek(toFraction: fraction)
                 } else if isCurrent, VoiceNoteSeekPolicy.isScrub(translation: value.translation) {
                     player.seek(
                         toFraction: VoiceNoteSeekPolicy.scrubbedFraction(
@@ -499,6 +904,24 @@ struct VoiceNoteBubbleView: View {
                     )
                 }
             }
+    }
+
+    /// Every play/pause tap re-proves the row — account, current persisted row, full
+    /// projection — with a fresh resolution before any plaintext reaches the player;
+    /// previously loaded UI state never services it. If the row no longer resolves, a note
+    /// still playing under this identity is stopped rather than left presenting stale audio.
+    private func refreshThenToggle() async {
+        guard !loader.isLoading else { return }
+        guard let fresh = await loader.refreshForPresentation(
+            model: model,
+            messageID: message.id,
+            conversationId: message.conversationId,
+            itemIndex: nil
+        ) else {
+            if isCurrent { player.stop() }
+            return
+        }
+        player.toggle(data: fresh.data, id: message.id, context: playbackContext)
     }
 
     private var subtitle: String {
@@ -565,10 +988,8 @@ struct VideoMessageBubbleView: View {
         Button {
             if let openGallery {
                 openGallery(message.id)
-            } else if let data = loader.data ?? message.attachmentData {
-                present(data: data)
             } else {
-                Task { await load() }
+                Task { await refreshThenPresent() }
             }
         } label: {
             ZStack {
@@ -616,8 +1037,18 @@ struct VideoMessageBubbleView: View {
         .accessibilityElement(children: .combine)
         .accessibilityLabel("End-to-end encrypted video")
         .task(id: descriptor.storageKey) {
-            if let data = message.attachmentData ?? loader.data {
-                await makePoster(from: data)
+            // Poster only from bytes that are already local, but still through identity
+            // resolution — never the captured row snapshot. `allowsDownload: false` keeps
+            // scrolling a conversation from silently downloading large videos.
+            await loader.load(
+                model: model,
+                messageID: message.id,
+                conversationId: message.conversationId,
+                itemIndex: nil,
+                allowsDownload: false
+            )
+            if let loaded = loader.loaded {
+                await makePoster(from: loaded)
             }
         }
         .fullScreenCover(
@@ -635,29 +1066,34 @@ struct VideoMessageBubbleView: View {
     private var subtitle: String {
         if let errorMessage = loader.errorMessage { return errorMessage }
         if loader.isLoading { return "Decrypting…" }
-        if loader.data == nil && message.attachmentData == nil {
+        if loader.data == nil {
             return ChatMediaBytes.label(descriptor.plaintextByteSize)
         }
         return "Play"
     }
 
-    private func load() async {
-        await loader.load(
+    /// A tap presents playback: re-prove the row — account, current persisted row, full
+    /// projection — with a fresh resolution and present exactly that result; previously loaded
+    /// UI state never services it.
+    private func refreshThenPresent() async {
+        guard !loader.isLoading else { return }
+        guard let fresh = await loader.refreshForPresentation(
             model: model,
+            messageID: message.id,
             conversationId: message.conversationId,
-            descriptorText: message.body
-        )
-        if let data = loader.data {
-            await makePoster(from: data)
-            present(data: data)
-        }
+            itemIndex: nil
+        ) else { return }
+        await makePoster(from: fresh)
+        present(fresh)
     }
 
-    private func present(data: Data) {
+    // The temp file's declared type must come from the same authoritative resolution as the
+    // bytes it holds, not from the descriptor the bubble captured at render time.
+    private func present(_ item: SecureMediaLoadPolicy.LoadedItem) {
         guard playbackURL == nil else { return }
         playbackURL = try? ChatMediaTempFiles.writeTemporaryFile(
-            data: data,
-            mediaType: descriptor.mediaType
+            data: item.data,
+            mediaType: item.mediaType
         )
     }
 
@@ -666,11 +1102,11 @@ struct VideoMessageBubbleView: View {
         playbackURL = nil
     }
 
-    private func makePoster(from data: Data) async {
+    private func makePoster(from item: SecureMediaLoadPolicy.LoadedItem) async {
         guard poster == nil,
               let url = try? ChatMediaTempFiles.writeTemporaryFile(
-                  data: data,
-                  mediaType: descriptor.mediaType
+                  data: item.data,
+                  mediaType: item.mediaType
               )
         else { return }
         defer { ChatMediaTempFiles.removeTemporaryFile(url) }
@@ -726,19 +1162,23 @@ struct DocumentMessageBubbleView: View {
     @StateObject private var loader = SecureMediaLoader()
     @State private var previewURL: URL?
 
+    /// Before bytes exist the row label comes from the parse-gated bubble descriptor; once a
+    /// fresh resolution has loaded, every fact tracks that result instead.
     private var fileName: String {
-        descriptor.caption?.isEmpty == false
-            ? descriptor.caption!
-            : "Document.\(ChatMediaTempFiles.fileExtension(forMediaType: descriptor.mediaType))"
+        if let loaded = loader.loaded {
+            return Self.fileName(caption: loaded.caption, mediaType: loaded.mediaType)
+        }
+        return Self.fileName(caption: descriptor.caption, mediaType: descriptor.mediaType)
+    }
+
+    private static func fileName(caption: String?, mediaType: String) -> String {
+        if let caption, !caption.isEmpty { return caption }
+        return "Document.\(ChatMediaTempFiles.fileExtension(forMediaType: mediaType))"
     }
 
     var body: some View {
         Button {
-            if let data = loader.data ?? message.attachmentData {
-                present(data: data)
-            } else {
-                Task { await load() }
-            }
+            Task { await refreshThenPresent() }
         } label: {
             HStack(spacing: 11) {
                 ZStack {
@@ -783,12 +1223,17 @@ struct DocumentMessageBubbleView: View {
                 set: { if !$0 { closePreview() } }
             )
         ) {
-            if let previewURL {
+            if let previewURL, let loaded = loader.loaded {
+                // Viewer facts from the same fresh resolution that produced the temp file —
+                // never the descriptor this bubble captured at render time.
                 KitDocumentViewerView(
                     fileURL: previewURL,
-                    displayName: fileName,
-                    mediaType: descriptor.mediaType,
-                    byteCount: descriptor.plaintextByteSize,
+                    displayName: Self.fileName(
+                        caption: loaded.caption,
+                        mediaType: loaded.mediaType
+                    ),
+                    mediaType: loaded.mediaType,
+                    byteCount: loaded.data.count,
                     onClose: { closePreview() }
                 )
             }
@@ -798,26 +1243,32 @@ struct DocumentMessageBubbleView: View {
     private var subtitle: String {
         if let errorMessage = loader.errorMessage { return errorMessage }
         if loader.isLoading { return "Decrypting…" }
-        return ChatMediaBytes.label(descriptor.plaintextByteSize)
+        // Once loaded, the size fact tracks the resolved bytes, not the captured descriptor.
+        return ChatMediaBytes.label(loader.loaded?.data.count ?? descriptor.plaintextByteSize)
     }
 
-    private func load() async {
-        await loader.load(
+    /// A tap presents the preview: re-prove the row — account, current persisted row, full
+    /// projection — with a fresh resolution and present exactly that result; previously loaded
+    /// UI state never services it.
+    private func refreshThenPresent() async {
+        guard !loader.isLoading else { return }
+        guard let fresh = await loader.refreshForPresentation(
             model: model,
+            messageID: message.id,
             conversationId: message.conversationId,
-            descriptorText: message.body
-        )
-        if let data = loader.data {
-            present(data: data)
-        }
+            itemIndex: nil
+        ) else { return }
+        present(fresh)
     }
 
-    private func present(data: Data) {
+    // Temp-file bytes, declared type, and file name all come from the same fresh resolution —
+    // never from the descriptor the bubble captured at render time.
+    private func present(_ item: SecureMediaLoadPolicy.LoadedItem) {
         guard previewURL == nil else { return }
         previewURL = try? ChatMediaTempFiles.writeTemporaryFile(
-            data: data,
-            mediaType: descriptor.mediaType,
-            suggestedName: fileName
+            data: item.data,
+            mediaType: item.mediaType,
+            suggestedName: Self.fileName(caption: item.caption, mediaType: item.mediaType)
         )
     }
 

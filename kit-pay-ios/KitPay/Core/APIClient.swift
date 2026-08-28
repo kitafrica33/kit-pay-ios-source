@@ -129,33 +129,6 @@ actor APIClient {
         )
     }
 
-    func registerWithEmail(
-        name: String,
-        tag: String,
-        email: String,
-        password: String,
-        passwordConfirmation: String,
-        countryCode: String,
-        locale: String,
-        timezone: String
-    ) async throws -> EmailRegistrationResult {
-        try await send(
-            path: "auth/email/register",
-            method: "POST",
-            body: EmailRegistrationRequest(
-                name: EmailAccountValidation.normalizeName(name),
-                tag: EmailAccountValidation.normalizeTag(tag),
-                email: EmailAccountValidation.normalizeEmail(email),
-                password: password,
-                passwordConfirmation: passwordConfirmation,
-                countryCode: countryCode,
-                locale: locale,
-                timezone: timezone
-            ),
-            authentication: .none
-        )
-    }
-
     func verifyEmail(token: String) async throws -> EmailVerificationResult {
         try await send(
             path: "auth/email/verify",
@@ -163,15 +136,6 @@ actor APIClient {
             body: EmailVerificationRequest(
                 token: EmailAccountValidation.normalizeOpaqueToken(token)
             ),
-            authentication: .none
-        )
-    }
-
-    func resendEmailVerification(email: String) async throws -> EmailMessageResult {
-        try await send(
-            path: "auth/email/resend",
-            method: "POST",
-            body: EmailAddressRequest(email: EmailAccountValidation.normalizeEmail(email)),
             authentication: .none
         )
     }
@@ -343,12 +307,17 @@ actor APIClient {
             mimeType: mimeType
         ) else { throw BankDepositProofUploadError.invalidDocument }
 
-        let capturedSessionID: String
-        if let inheritedSessionID = APIClientSessionBinding.sessionID {
-            capturedSessionID = inheritedSessionID
-        } else if let currentSessionID = await sessionStore.current()?.sessionId {
-            capturedSessionID = currentSessionID
+        let inheritedSessionID = APIClientSessionBinding.sessionID
+        let persistedSessionID: String?
+        if inheritedSessionID == nil {
+            persistedSessionID = await sessionStore.current()?.sessionId
         } else {
+            persistedSessionID = nil
+        }
+        guard let capturedSessionID = AuthenticatedMediaUploadSessionPolicy.sessionID(
+            inherited: inheritedSessionID,
+            persisted: persistedSessionID
+        ) else {
             throw APIClientError.signedOut
         }
 
@@ -478,13 +447,27 @@ actor APIClient {
     /// stops before the attach: a group photo attaches to a conversation through the messaging
     /// transport, never to the account. Returns the clean asset's canonical id.
     func prepareGroupPhotoAsset(jpegData: Data) async throws -> String {
-        let prepared = try await prepareProfileAvatarUpload(jpegData: jpegData)
-        try await ProfileAvatarDeadline.run(
-            maximumWait: ProfileAvatarUploadPolicy.maximumScanWait
-        ) { [self] in
-            try await awaitReadyCleanMediaAsset(assetID: prepared.assetID)
+        // Unlike profile editing, the group-info screen reaches this API directly rather than
+        // through an already-bound API operation. Bind the durable current session before asking
+        // `prepareProfileAvatarUpload` to reserve bytes; without this, every valid selection
+        // failed locally as signed out immediately after the photo picker dismissed.
+        let capturedSessionID: String
+        if let inheritedSessionID = APIClientSessionBinding.sessionID {
+            capturedSessionID = inheritedSessionID
+        } else if let currentSessionID = await sessionStore.current()?.sessionId {
+            capturedSessionID = currentSessionID
+        } else {
+            throw APIClientError.signedOut
         }
-        return prepared.assetID
+        return try await APIClientSessionBinding.$sessionID.withValue(capturedSessionID) {
+            let prepared = try await self.prepareProfileAvatarUpload(jpegData: jpegData)
+            try await ProfileAvatarDeadline.run(
+                maximumWait: ProfileAvatarUploadPolicy.maximumScanWait
+            ) { [self] in
+                try await awaitReadyCleanMediaAsset(assetID: prepared.assetID)
+            }
+            return prepared.assetID
+        }
     }
 
     private func awaitReadyCleanMediaAsset(assetID: String) async throws {
@@ -526,6 +509,12 @@ actor APIClient {
 
     func transactions(walletId: String) async throws -> TransactionPage {
         try await send(path: "wallets/\(walletId)/transactions?limit=50", method: "GET", body: EmptyBody())
+    }
+
+    /// Server-owned account-wide starter milestones. Called only when the server advertises
+    /// `starter_checklist`; servers without the contract are never asked.
+    func starterMilestones() async throws -> StarterMilestonesDTO {
+        try await send(path: "onboarding/starter-checklist", method: "GET", body: EmptyBody())
     }
 
     func contacts() async throws -> ContactListDTO {
@@ -1585,23 +1574,6 @@ struct EmailLoginRequest: Encodable {
     let device: DeviceRegistration
 }
 
-struct EmailRegistrationRequest: Encodable {
-    let name: String
-    let tag: String
-    let email: String
-    let password: String
-    let passwordConfirmation: String
-    let countryCode: String
-    let locale: String
-    let timezone: String
-
-    enum CodingKeys: String, CodingKey {
-        case name, tag, email, password, locale, timezone
-        case passwordConfirmation = "password_confirmation"
-        case countryCode = "country_code"
-    }
-}
-
 struct EmailVerificationRequest: Encodable {
     let token: String
 }
@@ -1914,6 +1886,17 @@ enum ProfileAvatarUploadPolicy {
 
     static func sha256(of data: Data) -> String {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+/// Upload helpers are called both from already-bound API operations and directly from screens.
+/// The task-local binding wins when present; a direct caller must fall back to the durable session
+/// rather than reporting a false sign-out before its first request.
+enum AuthenticatedMediaUploadSessionPolicy {
+    static func sessionID(inherited: String?, persisted: String?) -> String? {
+        if let inherited, !inherited.isEmpty { return inherited }
+        if let persisted, !persisted.isEmpty { return persisted }
+        return nil
     }
 }
 

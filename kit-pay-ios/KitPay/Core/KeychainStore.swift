@@ -152,30 +152,26 @@ enum KeychainStore {
         let status = SecItemCopyMatching(query as CFDictionary, &item)
         if status == errSecItemNotFound { return nil }
         guard status == errSecSuccess else { throw KeychainError(status: status) }
-        return item as? Data
+        guard let data = item as? Data else { throw KeychainError(status: errSecDecode) }
+        return data
     }
 
-    static func setSynchronizable(_ data: Data, for account: String) throws {
-        let query: [String: Any] = [
+    /// Inserts an immutable synchronizable secret. Returns false when another writer already
+    /// created this account; callers must read and adopt that value instead of overwriting it.
+    static func addSynchronizableIfAbsent(_ data: Data, for account: String) throws -> Bool {
+        let item: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
-            kSecAttrSynchronizable as String: true
-        ]
-        // Synchronizable items cannot use a ThisDeviceOnly accessibility class.
-        let attributes: [String: Any] = [
+            kSecAttrSynchronizable as String: true,
             kSecValueData as String: data,
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock
         ]
-        let update = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
-        if update == errSecItemNotFound {
-            var inserted = query
-            attributes.forEach { inserted[$0.key] = $0.value }
-            let status = SecItemAdd(inserted as CFDictionary, nil)
-            guard status == errSecSuccess else { throw KeychainError(status: status) }
-        } else if update != errSecSuccess {
-            throw KeychainError(status: update)
-        }
+        // Synchronizable items cannot use a ThisDeviceOnly accessibility class.
+        let status = SecItemAdd(item as CFDictionary, nil)
+        if status == errSecDuplicateItem { return false }
+        guard status == errSecSuccess else { throw KeychainError(status: status) }
+        return true
     }
 
     static func removeSynchronizable(_ account: String) throws {

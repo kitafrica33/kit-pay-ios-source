@@ -25,6 +25,7 @@ actor MessageBackupManager {
     }
 
     private static let maximumConflictAttempts = 5
+    private static let maximumAssetReadAttempts = 3
 
     private let makeContainer: @Sendable () -> CKContainer
 
@@ -65,6 +66,7 @@ actor MessageBackupManager {
         // iCloud Keychain has delivered its key. Minting another synchronizable key in that window
         // can strand the existing backup and propagate the wrong key to the user's other devices.
         var existing = try await recordIfPresent(forUserID: payload.userID)
+        var hasObservedExistingBackup = existing != nil
         let existingKey = try MessageBackupKeyStore.existingKey(forUserID: payload.userID)
         let key = try MessageBackupUploadKeyPolicy.resolve(
             existingBackup: existing != nil,
@@ -74,15 +76,31 @@ actor MessageBackupManager {
 
         for attempt in 0..<Self.maximumConflictAttempts {
             if attempt > 0 {
-                existing = try await recordIfPresent(forUserID: payload.userID)
+                let refreshed = try await recordIfPresent(forUserID: payload.userID)
+                // Once this upload has observed ciphertext, a later missing read is not permission
+                // to recreate the record. It may be transient consistency or a concurrent explicit
+                // deletion; either way, fail without writing.
+                if hasObservedExistingBackup, refreshed == nil {
+                    throw MessageBackupError.assetUnavailable
+                }
+                existing = refreshed
+                hasObservedExistingBackup = hasObservedExistingBackup || refreshed != nil
             }
             let archive: MessageBackupPayload
             if let existing {
-                let remote = try self.payload(
-                    from: existing,
-                    key: key,
-                    expectedUserID: payload.userID
-                )
+                let remote: MessageBackupPayload
+                do {
+                    remote = try self.payload(
+                        from: existing,
+                        key: key,
+                        expectedUserID: payload.userID
+                    )
+                } catch MessageBackupError.assetUnavailable
+                    where attempt + 1 < Self.maximumConflictAttempts {
+                    // A fetched CKAsset URL can briefly refer to bytes that are not materialized
+                    // yet. Refetch the record, but never save over ciphertext we could not read.
+                    continue
+                }
                 archive = try MessageBackupConflictPolicy.merge(remote, payload)
                 let remoteMetadata = try MessageBackupContentMetadata.make(for: remote)
                 let archiveMetadata = try MessageBackupContentMetadata.make(for: archive)
@@ -133,10 +151,17 @@ actor MessageBackupManager {
 
             do {
                 let saved = try await database.save(record)
-                guard let summary = summary(from: saved) else {
-                    throw MessageBackupError.invalidBackup
-                }
-                return summary
+                // CloudKit may return a saved-record projection without every value we just
+                // supplied. The save is already committed at this point, so reporting the archive
+                // as damaged would be both false and liable to trigger a duplicate retry.
+                return summary(from: saved) ?? MessageBackupSummary(
+                    createdAt: archive.createdAt,
+                    byteSize: encrypted.count,
+                    messageCount: archive.messages.count,
+                    deviceName: archive.deviceName,
+                    generation: nextGeneration,
+                    contentDigest: metadata.digest
+                )
             } catch {
                 if Self.isServerRecordConflict(error) { continue }
                 if let cloudError = error as? CKError,
@@ -150,18 +175,31 @@ actor MessageBackupManager {
     }
 
     func downloadPayload(forUserID userID: String) async throws -> MessageBackupPayload {
-        let record: CKRecord
-        do {
-            record = try await database.record(for: Self.recordID(forUserID: userID))
-        } catch let error as CKError where error.code == .unknownItem {
-            throw MessageBackupError.backupNotFound
-        } catch let error as CKError where error.code == .notAuthenticated {
-            throw MessageBackupError.iCloudUnavailable
+        for attempt in 0..<Self.maximumAssetReadAttempts {
+            let record: CKRecord
+            do {
+                record = try await database.record(for: Self.recordID(forUserID: userID))
+            } catch let error as CKError where error.code == .unknownItem {
+                throw MessageBackupError.backupNotFound
+            } catch let error as CKError where error.code == .notAuthenticated {
+                throw MessageBackupError.iCloudUnavailable
+            }
+            // Fetching the record first gives iCloud Keychain the entire network round-trip to
+            // deliver its independently synchronized key. Re-read on every asset retry; never
+            // cache, replace, or remove key material as part of recovery.
+            guard let key = try MessageBackupKeyStore.existingKey(forUserID: userID) else {
+                throw MessageBackupError.keyUnavailable
+            }
+            do {
+                return try payload(from: record, key: key, expectedUserID: userID)
+            } catch MessageBackupError.assetUnavailable
+                where attempt + 1 < Self.maximumAssetReadAttempts {
+                // Each fetch gets a fresh CloudKit-managed asset URL. No record or key mutation
+                // occurs while iCloud finishes materializing the encrypted bytes.
+                continue
+            }
         }
-        guard let key = try MessageBackupKeyStore.existingKey(forUserID: userID) else {
-            throw MessageBackupError.keyUnavailable
-        }
-        return try payload(from: record, key: key, expectedUserID: userID)
+        throw MessageBackupError.assetUnavailable
     }
 
     func deleteBackup(forUserID userID: String) async throws {
@@ -213,18 +251,13 @@ actor MessageBackupManager {
         key: Data,
         expectedUserID: String
     ) throws -> MessageBackupPayload {
-        guard let asset = record[Field.payload] as? CKAsset,
-              let fileURL = asset.fileURL,
-              let size = try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize,
-              size > MessageBackupCrypto.envelopePrefix.count,
-              size <= MessageBackupValidationPolicy.maximumEncryptedBytes
-        else { throw MessageBackupError.invalidBackup }
-        let encrypted: Data
-        do {
-            encrypted = try Data(contentsOf: fileURL, options: [.mappedIfSafe])
-        } catch {
+        guard let asset = record[Field.payload] as? CKAsset else {
             throw MessageBackupError.invalidBackup
         }
+        let encrypted = try MessageBackupAssetReader.read(
+            from: asset.fileURL,
+            advertisedByteSize: encryptedByteSize(in: record)
+        )
         let payload = try MessageBackupCrypto.decrypt(encrypted, key: key)
         try MessageBackupValidationPolicy.validate(payload, expectedUserID: expectedUserID)
         return payload
@@ -250,6 +283,67 @@ actor MessageBackupManager {
               let failures = cloudError.partialErrorsByItemID
         else { return false }
         return failures.values.contains { ($0 as? CKError)?.code == .serverRecordChanged }
+    }
+}
+
+/// Reads CloudKit's provider-owned temporary asset without depending on URL resource metadata.
+/// `URLResourceValues.fileSize` may be unavailable while the asset itself is readable; that was
+/// previously reported as a permanently damaged backup before Kit attempted a single byte read.
+enum MessageBackupAssetReader {
+    private static let chunkBytes = 512 * 1_024
+
+    static func read(
+        from fileURL: URL?,
+        advertisedByteSize: Int?
+    ) throws -> Data {
+        try read(
+            from: fileURL,
+            advertisedByteSize: advertisedByteSize,
+            readBytes: boundedRead
+        )
+    }
+
+    static func read(
+        from fileURL: URL?,
+        advertisedByteSize: Int?,
+        readBytes: (URL, Int) throws -> Data
+    ) throws -> Data {
+        guard let fileURL else { throw MessageBackupError.assetUnavailable }
+        let maximum = MessageBackupValidationPolicy.maximumEncryptedBytes
+        let encrypted: Data
+        do {
+            encrypted = try readBytes(fileURL, maximum)
+        } catch {
+            throw MessageBackupError.assetUnavailable
+        }
+
+        // `byteSize` and the CKAsset are written atomically in one record. A mismatch therefore
+        // means this fetched local asset is incomplete/stale, not that the encrypted archive on
+        // the server is damaged. A fresh record fetch is the only safe recovery action.
+        guard encrypted.count <= maximum else { throw MessageBackupError.invalidBackup }
+        if let advertisedByteSize,
+           advertisedByteSize > MessageBackupCrypto.envelopePrefix.count,
+           advertisedByteSize <= maximum,
+           advertisedByteSize != encrypted.count {
+            throw MessageBackupError.assetUnavailable
+        }
+        return encrypted
+    }
+
+    private static func boundedRead(from fileURL: URL, maximumBytes: Int) throws -> Data {
+        let handle = try FileHandle(forReadingFrom: fileURL)
+        defer { try? handle.close() }
+        var data = Data()
+        data.reserveCapacity(min(maximumBytes, chunkBytes))
+        while data.count <= maximumBytes {
+            let remaining = maximumBytes + 1 - data.count
+            guard remaining > 0,
+                  let chunk = try handle.read(upToCount: min(chunkBytes, remaining)),
+                  !chunk.isEmpty
+            else { break }
+            data.append(chunk)
+        }
+        return data
     }
 }
 

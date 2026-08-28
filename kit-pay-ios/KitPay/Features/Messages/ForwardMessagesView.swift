@@ -2,15 +2,18 @@ import SwiftUI
 
 // MARK: - Public forwarding payload
 
-/// What is being forwarded, captured at menu time from the source conversation.
+/// What is being forwarded, captured at menu time from the source conversation. Media rides
+/// as pure identity: the bytes AND the MIME/caption facts they travel with are resolved
+/// together by the authoritative loader at send time, never captured here — captured wire
+/// text or facts could outlive the row that vouched for them.
 enum ForwardPayloadItem: Identifiable, Equatable {
     case text(id: UUID, body: String)
-    case media(id: UUID, sourceConversationID: String, descriptorText: String)
+    case media(id: UUID, sourceConversationID: String)
 
     var id: UUID {
         switch self {
         case let .text(id, _): id
-        case let .media(id, _, _): id
+        case let .media(id, _): id
         }
     }
 }
@@ -382,9 +385,13 @@ struct ForwardMessagesView: View {
             case .text:
                 messageCount += 1
                 if !icons.contains("text.bubble.fill") { icons.append("text.bubble.fill") }
-            case let .media(_, _, descriptorText):
-                let kind = KitMediaMessageDescriptor.parse(descriptorText)
-                    .map { KitChatMediaKind(mediaType: $0.mediaType) } ?? .document
+            case let .media(itemID, sourceConversationID):
+                // Label from the identity-resolved current row; an entry whose source row is
+                // gone (or no longer a forwardable v1 attachment) labels as a generic document.
+                let kind = model.secureMediaForwardKind(
+                    messageID: itemID,
+                    conversationId: sourceConversationID
+                ) ?? .document
                 mediaCounts[kind, default: 0] += 1
                 if kind != .image { includesRichMedia = true }
                 if !icons.contains(kind.symbolName) { icons.append(kind.symbolName) }
@@ -545,7 +552,6 @@ struct ForwardMessagesView: View {
         var totalSent = 0
         var successfulTargets = 0
         var failures: [ForwardTargetFailure] = []
-        var mediaCache: [UUID: Data] = [:]
 
         targetLoop: for (index, target) in targets.enumerated() {
             func publishProgress() {
@@ -643,46 +649,46 @@ struct ForwardMessagesView: View {
                         itemFailureReasons.append(model.lastError ?? "Couldn't forward this message.")
                     }
 
-                case let .media(itemID, sourceConversationID, descriptorText):
-                    if let descriptor = KitMediaMessageDescriptor.parse(descriptorText) {
-                        do {
-                            let mediaData: Data
-                            if let cached = mediaCache[itemID] {
-                                mediaData = cached
-                            } else {
-                                mediaData = try await model.loadSecureMedia(
-                                    conversationId: sourceConversationID,
-                                    descriptorText: descriptorText
-                                )
-                                mediaCache[itemID] = mediaData
-                            }
-                            let queued = await model.queueMediaMessage(
-                                conversationId: conversationID,
-                                title: title,
-                                recipientId: recipientUserID,
-                                mediaData: mediaData,
-                                mediaType: descriptor.mediaType,
-                                caption: descriptor.caption,
-                                submittedDraftBody: nil,
-                                draftClearVersion: nil
+                case let .media(itemID, sourceConversationID):
+                    do {
+                        // Re-resolved for EVERY destination: each load revalidates account
+                        // ownership and the full current source row and returns the bytes
+                        // together with the MIME type and caption they belong to (the loader's
+                        // own caches make repeats cheap). One earlier load is never authority
+                        // for the rest of the fan-out — a source deleted or replaced mid-loop
+                        // stops forwarding at the next target instead of replaying stale
+                        // plaintext from a memo.
+                        let loadedMedia = try await model.loadSecureMediaItem(
+                            messageID: itemID,
+                            conversationId: sourceConversationID,
+                            itemIndex: nil
+                        )
+                        let queued = await model.queueMediaMessage(
+                            conversationId: conversationID,
+                            title: title,
+                            recipientId: recipientUserID,
+                            mediaData: loadedMedia.data,
+                            mediaType: loadedMedia.mediaType,
+                            caption: loadedMedia.caption,
+                            submittedDraftBody: nil,
+                            draftClearVersion: nil
+                        )
+                        if queued {
+                            sentForTarget += 1
+                            totalSent += 1
+                        } else {
+                            let kind = KitChatMediaKind(mediaType: loadedMedia.mediaType)
+                            itemFailureReasons.append(
+                                model.lastError
+                                    ?? "Couldn't forward this \(kind.previewLabel.lowercased())."
                             )
-                            if queued {
-                                sentForTarget += 1
-                                totalSent += 1
-                            } else {
-                                let kind = KitChatMediaKind(mediaType: descriptor.mediaType)
-                                itemFailureReasons.append(
-                                    model.lastError
-                                        ?? "Couldn't forward this \(kind.previewLabel.lowercased())."
-                                )
-                            }
-                        } catch let urlError as URLError where urlError.code == .notConnectedToInternet {
-                            itemFailureReasons.append("Available when online.")
-                        } catch {
-                            itemFailureReasons.append(error.localizedDescription)
                         }
-                    } else {
+                    } catch let urlError as URLError where urlError.code == .notConnectedToInternet {
+                        itemFailureReasons.append("Available when online.")
+                    } catch is SecureMediaAttachmentError {
                         itemFailureReasons.append("This attachment can't be forwarded.")
+                    } catch {
+                        itemFailureReasons.append(error.localizedDescription)
                     }
                 }
                 completedUnits += 1

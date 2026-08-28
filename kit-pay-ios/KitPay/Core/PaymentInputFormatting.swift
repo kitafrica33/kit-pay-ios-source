@@ -185,6 +185,11 @@ enum PaymentInputFormatting {
             currentSelection: currentSelection,
             separators: displaySeparators
         )
+        // Multi-character replacements are paste/IME commits, not an in-progress keystroke.
+        // Normalize those immediately so a pasted `1,768.80` never sits in the field with a
+        // redundant zero. A single typed zero remains transient (`1.0`) so the next keystroke
+        // can still form `1.05`.
+        let commitsReplacement = replacement.utf16.count > 1
         guard let replacement = editingReplacement(
             replacement,
             mode: mode,
@@ -211,13 +216,18 @@ enum PaymentInputFormatting {
             locale: fixedDisplayLocale
         ) else { return nil }
 
-        let displayed = editingDisplayedInput(canonical, mode: mode)
+        let committed = committedCanonicalInput(canonical, mode: mode)
+        let editingCanonical = commitsReplacement ? committed : canonical
+        let displayed = editingDisplayedInput(editingCanonical, mode: mode)
+        let caretCanonicalPrefix = commitsReplacement
+            ? committedCanonicalInput(canonicalPrefix, mode: mode)
+            : canonicalPrefix
         return PaymentAmountEdit(
-            editingCanonicalValue: canonical,
-            committedCanonicalValue: committedCanonicalInput(canonical, mode: mode),
+            editingCanonicalValue: editingCanonical,
+            committedCanonicalValue: committed,
             displayedValue: displayed,
             caretUTF16Offset: displayedCaretOffset(
-                semanticOffset: canonicalPrefix.utf16.count,
+                semanticOffset: caretCanonicalPrefix.utf16.count,
                 in: displayed,
                 mode: mode,
                 separators: displaySeparators

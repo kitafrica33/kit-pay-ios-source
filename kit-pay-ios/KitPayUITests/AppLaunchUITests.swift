@@ -241,25 +241,47 @@ final class AppLaunchUITests: XCTestCase {
         attachScreenshot(of: app, named: "phone-sign-in")
     }
 
-    /// Registration and recovery are reachable and come back. These were the routes a
-    /// verification or recovery link had to reach by hand before deep links worked.
-    func testAccountRoutesOpenAndReturn() throws {
+    /// Phone is the sole registration route: no registration affordance may exist anywhere on
+    /// the signed-out surface, and email recovery lives only inside the email path.
+    func testNoRegistrationAffordanceAndRecoveryLivesInEmailPath() throws {
         let app = launchApp()
         try requireSignIn(app)
 
-        let createAccount = app.buttons["New to Kit Pay? Create an account"]
-        if createAccount.waitForExistence(timeout: 10) {
-            createAccount.tap()
-            XCTAssertTrue(
-                app.staticTexts["Create your account"].waitForExistence(timeout: 15),
-                "Create account did not open the registration form."
-            )
-            app.buttons["Back to sign in"].tap()
-            XCTAssertTrue(
-                app.staticTexts["Welcome to Kit Pay"].waitForExistence(timeout: 15),
-                "Back to sign in did not return."
-            )
+        XCTAssertFalse(
+            app.buttons["New to Kit Pay? Create an account"].exists,
+            "The retired registration button is back on the sign-in screen."
+        )
+        XCTAssertFalse(
+            app.staticTexts["Create your account"].exists,
+            "The retired registration form is reachable."
+        )
+        XCTAssertFalse(
+            app.staticTexts["Offline ready"].exists,
+            "The retired 'Offline ready' badge is back on the auth screen."
+        )
+        // Recovery must not be offered before the customer is on the email path.
+        XCTAssertFalse(
+            app.buttons["Forgot password?"].exists,
+            "Recovery leaked onto the phone-first screen."
+        )
+
+        let emailRoute = app.buttons["Sign in with email instead"]
+        guard emailRoute.waitForExistence(timeout: 10) else {
+            throw XCTSkip("Email sign-in is not offered by current capabilities.")
         }
+        emailRoute.tap()
+        XCTAssertTrue(
+            app.secureTextFields.firstMatch.waitForExistence(timeout: 15),
+            "Email sign-in did not show a password field."
+        )
+        XCTAssertFalse(
+            app.buttons["New to Kit Pay? Create an account"].exists,
+            "The retired registration button is back on the email path."
+        )
+        XCTAssertTrue(
+            app.buttons["Use reset token"].waitForExistence(timeout: 10),
+            "Reset-token completion is missing from the email path."
+        )
 
         let forgot = app.buttons["Forgot password?"]
         if forgot.waitForExistence(timeout: 10) {
@@ -276,25 +298,50 @@ final class AppLaunchUITests: XCTestCase {
         }
     }
 
-    /// Switching sign-in method must not carry a typed password across.
-    func testSignInMethodPickerSwitchesForms() throws {
+    /// Switching between the phone-first screen and the email path must not carry a typed
+    /// password across.
+    func testEmailPathOpensAndReturnsWithoutCarryingSecrets() throws {
         let app = launchApp()
         try requireSignIn(app)
 
-        let email = app.buttons["Email"]
-        guard email.waitForExistence(timeout: 10) else {
-            throw XCTSkip("Only one sign-in method is enabled, so there is no picker.")
+        let emailRoute = app.buttons["Sign in with email instead"]
+        guard emailRoute.waitForExistence(timeout: 10) else {
+            throw XCTSkip("Only one sign-in method is enabled, so there is no email route.")
         }
-        email.tap()
+        emailRoute.tap()
+        let passwordField = app.secureTextFields.firstMatch
         XCTAssertTrue(
-            app.secureTextFields.firstMatch.waitForExistence(timeout: 15),
+            passwordField.waitForExistence(timeout: 15),
             "Email sign-in did not show a password field."
         )
 
-        app.buttons["Phone"].tap()
+        // Type a sentinel so there is something concrete to prove gone. A secure field
+        // reports masked bullets while filled and its placeholder when empty, so "cleared"
+        // is asserted as "no longer the masked sentinel length", never as == "".
+        passwordField.tap()
+        let sentinel = "Sentinel123456"
+        passwordField.typeText(sentinel)
+        let filledValue = passwordField.value as? String ?? ""
+        XCTAssertEqual(
+            filledValue.count, sentinel.count,
+            "The sentinel password did not register in the secure field."
+        )
+
+        app.buttons["Use phone number instead"].tap()
         XCTAssertTrue(
             app.textFields["7XX XXX XXX"].waitForExistence(timeout: 15),
             "Switching back did not restore phone sign-in."
+        )
+
+        emailRoute.tap()
+        XCTAssertTrue(
+            passwordField.waitForExistence(timeout: 15),
+            "Returning to the email path did not show the password field."
+        )
+        let returnedValue = passwordField.value as? String ?? ""
+        XCTAssertNotEqual(
+            returnedValue.count, sentinel.count,
+            "A typed password survived leaving the email path."
         )
     }
 

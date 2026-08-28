@@ -92,7 +92,20 @@ enum MessageBackupAutomaticRunResult: Equatable, Sendable {
 /// Everything a restored device needs to rebuild chat history. Attachment plaintext is included
 /// only for small inline blobs; large media stays re-downloadable via each message's descriptor.
 struct MessageBackupPayload: Codable, Equatable, Sendable {
+    /// Schema 1 is the shape every shipped build reads. Schema 2 marks the presence of
+    /// KITMEDIA2 descriptor bodies: below-floor builds require an exact schema match, so a
+    /// v2-bearing archive is rejected whole instead of restoring descriptors — attachment
+    /// key material — that those builds cannot confine. The number is content-derived at
+    /// snapshot and re-derived at validation, so an archive can neither smuggle v2 bodies
+    /// under the legacy number nor claim the v2 number without carrying one.
     static let currentSchemaVersion = 1
+    static let mediaV2SchemaVersion = 2
+
+    static func requiredSchemaVersion(forMessages messages: [LocalMessage]) -> Int {
+        messages.contains(where: { KitMediaMessageV2Descriptor.parse($0.body) != nil })
+            ? mediaV2SchemaVersion
+            : currentSchemaVersion
+    }
 
     var schemaVersion: Int = MessageBackupPayload.currentSchemaVersion
     let userID: String
@@ -142,13 +155,26 @@ struct MessageBackupPayload: Codable, Equatable, Sendable {
             switch message.state {
             case .sent, .delivered, .read, .received:
                 guard message.pendingAttachment == nil,
+                    // A pending v2 batch is outbox state by definition — its plaintexts live in
+                    // the local media cache a restore cannot reach — and its caption/placeholder
+                    // body would otherwise ride under the legacy schema number. A committed row
+                    // still carrying one is inconsistent; keep it out of the archive entirely.
+                    message.pendingMediaBatch == nil,
                     // Membership notices are projections of authenticated sync events, but the
                     // local message shape does not retain that server-event provenance. Exclude
                     // them instead of backing up a trusted namespace that restore cannot prove.
                     !SecureMessageReservedPrefixPolicy.beginsWithReservedPrefix(
                         message.body,
                         prefix: KitSystemMessage.prefix
-                    )
+                    ),
+                    // A reserved media-family body that parses as neither strict v1 nor strict
+                    // v2 lives in the timeline only as a generic placeholder row. Its raw text
+                    // is a maybe-descriptor this build cannot confine, so it never enters an
+                    // archive — validation rejects it on sight, meaning omission here is what
+                    // keeps every legitimately produced backup restorable.
+                    !KitMediaMessageFamilyPolicy.isReservedFamilyText(message.body)
+                        || KitMediaMessageDescriptor.parse(message.body) != nil
+                        || KitMediaMessageV2Descriptor.parse(message.body) != nil
                 else { return false }
                 // A message written before sender-bound history metadata existed remains useful
                 // while its author is in the roster. Once that member departs, however, the
@@ -172,6 +198,7 @@ struct MessageBackupPayload: Codable, Equatable, Sendable {
             }
         }
         return MessageBackupPayload(
+            schemaVersion: requiredSchemaVersion(forMessages: messages),
             userID: userID.lowercased(),
             createdAt: createdAt,
             deviceName: deviceName,
@@ -186,6 +213,7 @@ struct MessageBackupPayload: Codable, Equatable, Sendable {
 enum MessageBackupError: LocalizedError, Equatable {
     case iCloudUnavailable
     case keyUnavailable
+    case assetUnavailable
     case authenticationFailed
     case incompatibleBackup
     case invalidBackup
@@ -199,6 +227,8 @@ enum MessageBackupError: LocalizedError, Equatable {
             "Sign in to iCloud in iPhone Settings to back up your encrypted chats."
         case .keyUnavailable:
             "The backup key could not be read from your iCloud Keychain."
+        case .assetUnavailable:
+            "The encrypted backup is still downloading from iCloud. Nothing was changed. Please try again."
         case .authenticationFailed:
             "This backup could not be authenticated with the key currently in iCloud Keychain. "
                 + "Keep it and try again after iCloud Keychain finishes syncing."
@@ -237,7 +267,8 @@ enum MessageBackupValidationPolicy {
         expectedUserID: String? = nil,
         now: Date = Date()
     ) throws {
-        guard payload.schemaVersion == MessageBackupPayload.currentSchemaVersion,
+        guard payload.schemaVersion
+                == MessageBackupPayload.requiredSchemaVersion(forMessages: payload.messages),
               SecureMessagingWirePolicy.isCanonicalUUID(payload.userID),
               expectedUserID.map({
                   payload.userID.caseInsensitiveCompare($0) == .orderedSame
@@ -349,6 +380,11 @@ enum MessageBackupValidationPolicy {
                   (message.failureReason?.utf8.count ?? 0) <= 4_096,
                   [.sent, .delivered, .read, .received].contains(message.state),
                   message.pendingAttachment == nil,
+                  // Mirrors the snapshot fence: a committed archive row may never carry pending
+                  // v2 batch state. Decoders that predate the field would silently drop it, so
+                  // a forged archive could otherwise smuggle a plain-bodied pending batch
+                  // through schema 1; require the field absent in both directions instead.
+                  message.pendingMediaBatch == nil,
                   message.serverMessageId.map(SecureMessagingWirePolicy.isCanonicalUUID) ?? true,
                   message.replyToServerMessageID
                     .map(SecureMessagingWirePolicy.isCanonicalUUID) ?? true,
@@ -394,12 +430,18 @@ enum MessageBackupValidationPolicy {
                 guard message.attachmentData.map({ $0.count == descriptor.plaintextByteSize })
                     ?? true
                 else { throw MessageBackupError.invalidBackup }
+            } else if KitMediaMessageV2Descriptor.parse(message.body) != nil {
+                // v2 media never rides inline: every blob lives re-downloadably behind its
+                // storage key, so a backup row pairing a v2 descriptor with inline bytes
+                // is forged.
+                guard message.attachmentData == nil
+                else { throw MessageBackupError.invalidBackup }
             } else {
+                // Family-wide, strictly wider than the literal v1-prefix check it replaces:
+                // a reserved media-family body of any version that failed both strict parses
+                // must not enter or leave a backup as plain text.
                 guard message.attachmentData == nil,
-                      !SecureMessageReservedPrefixPolicy.beginsWithReservedPrefix(
-                          message.body,
-                          prefix: KitMediaMessageDescriptor.prefix
-                      )
+                      !KitMediaMessageFamilyPolicy.isReservedFamilyText(message.body)
                 else { throw MessageBackupError.invalidBackup }
             }
             if let history = message.secureMessagingHistory {
@@ -420,7 +462,9 @@ enum MessageBackupValidationPolicy {
                       SecureMessagingContentBindingPolicy.kind(
                           for: message.body,
                           replyToMessageID: history.replyToMessageID,
-                          attachments: KitMediaMessageDescriptor.attachments(for: message.body)
+                          attachments: KitMediaMessageFamilyPolicy.attachmentRequests(
+                              for: message.body
+                          )
                       ) == history.kind,
                       history.kind != .encryptedReaction
                         || (message.serverMessageId != nil
@@ -584,17 +628,35 @@ enum MessageBackupKeyStore {
     }
 
     static func existingKey(forUserID userID: String) throws -> Data? {
-        guard let data = try KeychainStore.synchronizableData(
+        try validatedStoredKey(KeychainStore.synchronizableData(
             for: account(forUserID: userID)
-        ), data.count == MessageBackupCrypto.keyBytes else { return nil }
+        ))
+    }
+
+    static func validatedStoredKey(_ data: Data?) throws -> Data? {
+        guard let data else { return nil }
+        // A malformed Keychain value is not an absent value. Treating it as absent would let the
+        // creation path replace it and could permanently separate an existing CloudKit archive
+        // from the only key another enrolled device still holds.
+        guard data.count == MessageBackupCrypto.keyBytes else {
+            throw MessageBackupError.keyUnavailable
+        }
         return data
     }
 
     static func key(forUserID userID: String) throws -> Data {
         if let existing = try existingKey(forUserID: userID) { return existing }
         let key = SymmetricKey(size: .bits256).withUnsafeBytes { Data($0) }
-        try KeychainStore.setSynchronizable(key, for: account(forUserID: userID))
-        return key
+        let account = account(forUserID: userID)
+        if try KeychainStore.addSynchronizableIfAbsent(key, for: account) {
+            return key
+        }
+        // Another task/device won the add race. Adopt the stored winner; never update it with the
+        // candidate minted above because a CloudKit record may already be encrypted to that key.
+        guard let winner = try existingKey(forUserID: userID) else {
+            throw MessageBackupError.keyUnavailable
+        }
+        return winner
     }
 
     static func removeKey(forUserID userID: String) throws {
@@ -743,15 +805,23 @@ enum MessageBackupConflictPolicy {
         } else {
             newest = first.deviceName >= second.deviceName ? first : second
         }
+        let mergedMessages = messagesByBackupIdentity.values.sorted {
+            if $0.createdAt != $1.createdAt { return $0.createdAt < $1.createdAt }
+            return $0.id.uuidString.lowercased() < $1.id.uuidString.lowercased()
+        }
         let merged = MessageBackupPayload(
+            // Content-derived exactly like `snapshot`: a legacy archive merged with a
+            // v2-bearing one yields schema 2, and a merge whose v2 rows all deduplicated away
+            // settles back to schema 1. The re-validation below re-derives the number, so a
+            // wrong stamp here would fail the whole merge rather than ship a mismatch.
+            schemaVersion: MessageBackupPayload.requiredSchemaVersion(
+                forMessages: mergedMessages
+            ),
             userID: first.userID,
             createdAt: max(first.createdAt, second.createdAt),
             deviceName: newest.deviceName,
             conversations: conversations.values.sorted { $0.id < $1.id },
-            messages: messagesByBackupIdentity.values.sorted {
-                if $0.createdAt != $1.createdAt { return $0.createdAt < $1.createdAt }
-                return $0.id.uuidString.lowercased() < $1.id.uuidString.lowercased()
-            },
+            messages: mergedMessages,
             pinnedConversationIds: mergedReferences(
                 first.pinnedConversationIds,
                 second.pinnedConversationIds

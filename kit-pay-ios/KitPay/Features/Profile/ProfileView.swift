@@ -331,7 +331,7 @@ struct ProfileView: View {
     private var profileEmailPresentation: ProfileEmailPresentation {
         ProfileEmailPresentationPolicy.presentation(
             profile: model.profile,
-            attachmentAvailable: model.emailRegistrationAvailable
+            attachmentAvailable: model.emailRecoveryAvailable
         )
     }
 }

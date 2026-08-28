@@ -25,6 +25,8 @@ jobs:
         run: python3 -m unittest discover -s .github/scripts/tests -p 'test_*screenshots.py'
       - name: Test contact-sync recovery source contract
         run: python3 -m unittest discover -s .github/scripts/tests -p 'test_contact_sync_recovery.py'
+      - name: Test media-message-v2 source contract
+        run: python3 -m unittest discover -s .github/scripts/tests -p 'test_media_message_v2_contract.py'
       - name: Select current Xcode
         run: sudo xcode-select --switch /Applications/Xcode.app
       - name: Install pinned native dependencies

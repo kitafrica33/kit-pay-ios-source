@@ -23,14 +23,24 @@ enum ScheduledSendPolicy {
         now: Date,
         calendar: Calendar = .autoupdatingCurrent
     ) -> Date? {
+        let candidate = canonicalMinute(date, calendar: calendar)
+        guard isSchedulable(candidate, now: now) else { return nil }
+        return candidate
+    }
+
+    /// The minute a request would normalize to, independent of the clock. Idempotent retries
+    /// compare this against a stored schedule whose eligibility window has since moved: the
+    /// instant was admissible when first queued, and a later retry is still the same send.
+    static func canonicalMinute(
+        _ date: Date,
+        calendar: Calendar = .autoupdatingCurrent
+    ) -> Date {
         var components = calendar.dateComponents(
             [.era, .year, .month, .day, .hour, .minute],
             from: date
         )
         components.second = 0
-        let candidate = calendar.date(from: components) ?? date
-        guard isSchedulable(candidate, now: now) else { return nil }
-        return candidate
+        return calendar.date(from: components) ?? date
     }
 
     static func isSchedulable(_ date: Date, now: Date) -> Bool {

@@ -84,9 +84,10 @@ struct SharedInboxDestinationRequest: Codable, Equatable, Sendable {
 
 /// One safe-to-display row published by the containing app for the extension's picker.
 ///
-/// The snapshot intentionally contains only presentation text and opaque routing UUIDs. It never
-/// contains phone numbers, a group roster, authentication material, encryption keys, message
-/// history, or avatar bytes/URLs.
+/// The snapshot intentionally contains only presentation text, a validated public avatar address,
+/// and opaque routing UUIDs. It never contains phone numbers, a group roster, authentication
+/// material, encryption keys, message history, or avatar bytes. The address is optional so the
+/// extension always has its generated person/group fallback while offline.
 struct SharedInboxDestination: Codable, Identifiable, Equatable, Sendable {
     enum Kind: String, Codable, Sendable {
         case direct
@@ -99,6 +100,28 @@ struct SharedInboxDestination: Codable, Identifiable, Equatable, Sendable {
     let displayName: String
     let kind: Kind
     let memberCount: Int?
+    let avatarURL: String?
+    /// Optional only for backward decoding of snapshots written before the combined Recent
+    /// section existed. New snapshots always write true/false explicitly.
+    let isRecent: Bool?
+
+    init(
+        conversationID: String?,
+        recipientUserID: String?,
+        displayName: String,
+        kind: Kind,
+        memberCount: Int?,
+        avatarURL: String? = nil,
+        isRecent: Bool = false
+    ) {
+        self.conversationID = conversationID
+        self.recipientUserID = recipientUserID
+        self.displayName = displayName
+        self.kind = kind
+        self.memberCount = memberCount
+        self.avatarURL = avatarURL
+        self.isRecent = isRecent
+    }
 
     var id: String {
         if let conversationID { return "conversation:\(conversationID)" }
@@ -143,16 +166,83 @@ struct SharedInboxDelivery: Identifiable, Equatable, Sendable {
     let batch: SharedInboxBatch
 }
 
-/// A legacy no-payload link accepted from pre-picker development builds.
+/// The no-payload link the share extension opens to bring Kit Pay forward once a share is queued.
 ///
 /// Deliberately not a ``KitDeepLink``: that type only ever selects a pre-authentication screen and
-/// refuses anything else, and a share must not widen it. The shipping extension does not attempt
-/// to open this URL: share extensions cannot launch their containing application.
+/// refuses anything else, and a share must not widen it. This URL carries no payload at all — it
+/// only says "look in the inbox", and the inbox is in our own container.
 enum KitShareHandoffLink {
     static let url = URL(string: "kitwallet://share")
 
     static func matches(_ url: URL) -> Bool {
         url.scheme?.lowercased() == "kitwallet" && url.host?.lowercased() == "share"
+    }
+}
+
+/// What the share sheet does next while walking a queued batch into the host app.
+///
+/// `extensionContext.open` is best-effort from a share extension: iOS may decline it, answer
+/// late, or never answer at all during a transition. These transitions encode the contract the
+/// controller follows — complete the extension only after iOS accepts the open (completing first
+/// tears the process down and races, usually beating, the open request), resolve a missing
+/// answer through a timeout, keep the sheet alive for an explicit user-initiated retry, and
+/// treat "Not now" as safe because the batch is already durable. An acceptance that arrives
+/// after the timeout already resolved the attempt is ignored: the sheet is showing the manual
+/// hand-off by then, and completing underneath it would dismiss UI the customer may be reading.
+/// Pure, so `SharedInboxTests` drives every path without UIKit or a live extension context.
+enum KitShareHandoffAttempt {
+    /// `queued`: the batch is durable and no open is in flight. `opening`: `open(_:)` was issued
+    /// and its completion or the timeout is pending. `finished`: the extension request completed.
+    enum Phase: Equatable {
+        case queued
+        case opening
+        case finished
+    }
+
+    enum Event: Equatable {
+        /// The automatic post-publish attempt or the customer's explicit retry; `canOpen` is
+        /// whether a hand-off URL and extension context are actually available.
+        case attemptRequested(canOpen: Bool)
+        /// iOS answered the open request, or the timeout resolved it as declined.
+        case openResolved(opened: Bool)
+        case notNowTapped
+    }
+
+    enum Decision: Equatable {
+        case ignore
+        /// Issue `extensionContext.open` and start the timeout.
+        case attemptOpen
+        /// Keep the sheet alive showing the queued state with retry and "Not now".
+        case offerManualHandoff
+        /// Only now is it safe to complete the extension request.
+        case finishExtension
+    }
+
+    /// An open with no answer by now is treated as declined, rather than leaving the customer
+    /// staring at an endless spinner if SpringBoard fails to answer during a transition.
+    static let openTimeout: TimeInterval = 4
+
+    static func decide(phase: Phase, event: Event) -> (phase: Phase, decision: Decision) {
+        switch (phase, event) {
+        case (.finished, _):
+            return (.finished, .ignore)
+        case (.queued, .attemptRequested(canOpen: true)):
+            return (.opening, .attemptOpen)
+        case (.queued, .attemptRequested(canOpen: false)):
+            return (.queued, .offerManualHandoff)
+        case (.opening, .attemptRequested):
+            return (.opening, .ignore)
+        case (.opening, .openResolved(opened: true)):
+            return (.finished, .finishExtension)
+        case (.opening, .openResolved(opened: false)):
+            return (.queued, .offerManualHandoff)
+        case (.queued, .openResolved):
+            return (.queued, .ignore)
+        case (.queued, .notNowTapped):
+            return (.finished, .finishExtension)
+        case (.opening, .notNowTapped):
+            return (.opening, .ignore)
+        }
     }
 }
 
@@ -184,6 +274,7 @@ enum SharedInboxPolicy {
     /// corrupt. Most people have far fewer chats; the most recently active rows are retained.
     static let maximumDestinations = 500
     static let maximumRecentDestinations = 5
+    static let maximumDestinationSnapshotBytes = 1 * 1_024 * 1_024
 
     /// Destination names remain useful while offline, but an old roster should not live forever.
     /// The containing app still validates a selected ID against protected current state, so a
@@ -191,6 +282,7 @@ enum SharedInboxPolicy {
     static let destinationSnapshotRetention: TimeInterval = 30 * 24 * 60 * 60
 
     static let maximumDestinationNameCharacters = 120
+    static let maximumDestinationAvatarURLCharacters = 2_048
 
     /// ImageIO normally downsamples without decoding a full-size bitmap, but an extension-provided
     /// source can still make CoreGraphics allocate aggressively while parsing. Larger images stay
@@ -228,6 +320,24 @@ enum SharedInboxPolicy {
         return String(collapsed.prefix(maximumDestinationNameCharacters))
     }
 
+    /// Avatar addresses are public presentation data, but still arrive from an untrusted server
+    /// projection by the time the extension reads them. Keep credentials, fragments, non-HTTPS
+    /// schemes, and unbounded strings out of the app-group snapshot and extension URLSession.
+    static func destinationAvatarURL(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              trimmed.count <= maximumDestinationAvatarURLCharacters,
+              let url = URL(string: trimmed),
+              url.scheme?.caseInsensitiveCompare("https") == .orderedSame,
+              url.host?.isEmpty == false,
+              url.user == nil,
+              url.password == nil,
+              url.fragment == nil
+        else { return nil }
+        return url.absoluteString
+    }
+
     static func isValidDestination(_ destination: SharedInboxDestination) -> Bool {
         let conversationID = destination.conversationID.flatMap {
             canonicalConversationID($0)
@@ -235,7 +345,10 @@ enum SharedInboxPolicy {
         let recipientUserID = destination.recipientUserID.flatMap { canonicalAccountID($0) }
         guard conversationID == destination.conversationID,
               recipientUserID == destination.recipientUserID,
-              destinationDisplayName(destination.displayName) == destination.displayName
+              destinationDisplayName(destination.displayName) == destination.displayName,
+              destination.avatarURL == nil
+                || destinationAvatarURL(destination.avatarURL) == destination.avatarURL,
+              destination.kind != .contact || destination.isRecent != true
         else { return false }
         switch destination.kind {
         case .direct:
@@ -259,7 +372,9 @@ enum SharedInboxPolicy {
             recipientUserID: request.recipientUserID,
             displayName: request.displayName,
             kind: request.kind,
-            memberCount: request.kind == .group ? 2 : nil
+            memberCount: request.kind == .group ? 2 : nil,
+            avatarURL: nil,
+            isRecent: false
         ))
     }
 
@@ -310,7 +425,18 @@ enum SharedInboxPolicy {
             }
         let recent = orderedConversations
             .prefix(maximumRecentDestinations)
-            .map { $0.destination }
+            .map { candidate in
+                let destination = candidate.destination
+                return SharedInboxDestination(
+                    conversationID: destination.conversationID,
+                    recipientUserID: destination.recipientUserID,
+                    displayName: destination.displayName,
+                    kind: destination.kind,
+                    memberCount: destination.memberCount,
+                    avatarURL: destination.avatarURL,
+                    isRecent: true
+                )
+            }
         var seenRecipientIDs = Set(recent.compactMap(\.recipientUserID))
         let recentConversationIDs = Set(recent.compactMap(\.conversationID))
         let sortedContacts = contacts
@@ -488,26 +614,67 @@ enum SharedInboxPolicy {
     }
 
     /// The longest shared text Kit Pay will carry into the composer. Long enough for a link and a
-    /// sentence about it, short enough that a whole document pasted as "text" is not silently
-    /// turned into a message.
+    /// sentence about it, short enough that a whole document pasted as "text" is not turned into
+    /// a message. Exceeding it fails the share visibly with shorten-and-retry guidance — the text
+    /// is never silently cut to fit, because a truncated caption reads as something its author
+    /// did not say.
     static let maximumTextCharacters = 4_000
 
-    static func normalizedText(_ raw: String?) -> String? {
-        guard let raw else { return nil }
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        return String(trimmed.prefix(maximumTextCharacters))
+    /// More providers than any legitimate handoff carries (eight files plus a text, a link, and
+    /// a few mirrored representations). A bound on untrusted enumeration only: exceeding it fails
+    /// the share visibly rather than silently choosing a subset to send.
+    static let maximumEnumeratedProviders = 24
+
+    /// The exact six caption-boundary scalars of the KITMEDIA2 contract: HT, LF, VT, FF, CR, SP.
+    /// This restates `KitMediaMessageCaptionPolicy.boundaryScalars` because the share extension
+    /// compiles this file but not the wire models; `SharedInboxTests` pins the two sets equal.
+    /// Foundation's `.whitespacesAndNewlines` is wider — NBSP, U+0085, U+2028, U+2029 — and those
+    /// scalars are contract-valid caption content, so no Foundation trim may ever touch shared
+    /// text: the V2 queue applies the six-scalar normalization once, at seal, and nowhere earlier.
+    static let captionBoundaryScalars: Set<Unicode.Scalar> = [
+        "\u{0009}", "\u{000A}", "\u{000B}", "\u{000C}", "\u{000D}", "\u{0020}",
+    ]
+
+    /// True when `text` holds nothing a sealed caption could keep — it is empty or consists
+    /// entirely of boundary scalars. This is the only emptiness test shared text is ever put to;
+    /// text that passes it always travels byte-for-byte.
+    static func carriesNoContent(_ text: String) -> Bool {
+        text.unicodeScalars.allSatisfy { captionBoundaryScalars.contains($0) }
+    }
+
+    /// Companion storage bound to `maximumTextCharacters`. `Character` counts graphemes, and one
+    /// extended grapheme can chain thousands of scalars — a byte bound is what actually keeps the
+    /// manifest allocation finite. Sized for a fully four-byte text (all emoji) at the character
+    /// limit, so no legitimate share can hit the byte bound before the character one.
+    static let maximumTextUTF8Bytes = 4 * maximumTextCharacters
+
+    /// Exceeding either reading fails the share visibly; accepted text is never reshaped to fit.
+    static func exceedsTextLimit(_ text: String) -> Bool {
+        text.count > maximumTextCharacters || text.utf8.count > maximumTextUTF8Bytes
+    }
+
+    /// The text a share hands onward: nil when there is nothing to carry, otherwise the source
+    /// app's string exactly as provided. No trimming and no truncation happen here — a caption's
+    /// bytes must survive unchanged into the composer so the V2 queue can apply the one permitted
+    /// normalization at seal, and over-limit text must stay visible and fail with edit guidance
+    /// rather than be quietly shortened.
+    static func carriedText(_ raw: String?) -> String? {
+        guard let raw, !carriesNoContent(raw) else { return nil }
+        return raw
     }
 
     /// Mirrors how the conversation composer appends shared text, and gives the explicit
     /// re-route action a conservative inverse. If the customer edited inside the inserted span we
-    /// return nil rather than guessing at, and possibly deleting, their words.
+    /// return nil rather than guessing at, and possibly deleting, their words. The existing draft
+    /// rides byte-for-byte — no Foundation trim, which would mutate contract-valid NBSP/U+0085/
+    /// U+2028/U+2029 the customer already typed — and is replaced outright only when it carries
+    /// no content at all under the contract's own six-scalar test.
     static func composerDraft(existingDraft: String, sharedText: String) -> String {
         if draft(existingDraft, containsSharedTextBlock: sharedText) {
             return existingDraft
         }
-        let existing = existingDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-        return existing.isEmpty ? sharedText : "\(existing)\n\(sharedText)"
+        if carriesNoContent(existingDraft) { return sharedText }
+        return "\(existingDraft)\n\(sharedText)"
     }
 
     private static func draft(_ draft: String, containsSharedTextBlock sharedText: String) -> Bool {
@@ -637,6 +804,8 @@ struct SharedInboxStore {
     ) -> Bool {
         guard let ownerAccountID = SharedInboxPolicy.canonicalAccountID(rawAccountID),
               destinations.count <= SharedInboxPolicy.maximumDestinations,
+              destinations.filter({ $0.isRecent == true }).count
+                <= SharedInboxPolicy.maximumRecentDestinations,
               Set(destinations.map(\.id)).count == destinations.count,
               destinations.allSatisfy(SharedInboxPolicy.isValidDestination),
               let destinationSnapshotURL
@@ -648,7 +817,9 @@ struct SharedInboxStore {
         )
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
-        guard let data = try? encoder.encode(snapshot) else { return false }
+        guard let data = try? encoder.encode(snapshot),
+              data.count <= SharedInboxPolicy.maximumDestinationSnapshotBytes
+        else { return false }
         do {
             try data.write(
                 to: destinationSnapshotURL,
@@ -674,7 +845,7 @@ struct SharedInboxStore {
               values.isRegularFile == true,
               values.isSymbolicLink != true,
               let size = values.fileSize,
-              (1 ... 512 * 1_024).contains(size),
+              (1 ... SharedInboxPolicy.maximumDestinationSnapshotBytes).contains(size),
               let data = try? Data(contentsOf: destinationSnapshotURL)
         else { return [] }
         let decoder = JSONDecoder()
@@ -817,14 +988,20 @@ struct SharedInboxStore {
         guard let rootURL else { throw SharedInboxError.unavailable }
         guard let ownerAccountID = SharedInboxPolicy.canonicalAccountID(rawOwnerAccountID)
         else { throw SharedInboxError.signedOut }
-        let normalizedText = SharedInboxPolicy.normalizedText(text)
+        let carriedText = SharedInboxPolicy.carriedText(text)
         guard destination.map(SharedInboxPolicy.isValidDestinationRequest) ?? true else {
             remove(batchID: id)
             throw SharedInboxError.unreadable
         }
-        guard !items.isEmpty || normalizedText != nil else {
+        guard !items.isEmpty || carriedText != nil else {
             remove(batchID: id)
             throw SharedInboxError.empty
+        }
+        // Over-limit text fails the whole share here, visibly, with the text still in the source
+        // app. Cutting it to fit would publish words the customer never chose to send.
+        if let carriedText, SharedInboxPolicy.exceedsTextLimit(carriedText) {
+            remove(batchID: id)
+            throw SharedInboxError.textTooLong
         }
         guard items.count <= SharedInboxPolicy.maximumItems,
               Set(items.map(\.id)).count == items.count,
@@ -840,7 +1017,7 @@ struct SharedInboxStore {
             ownerAccountID: ownerAccountID,
             receivedAt: receivedAt,
             items: items,
-            text: normalizedText,
+            text: carriedText,
             destination: destination
         )
         let encoder = JSONEncoder()
@@ -996,7 +1173,14 @@ struct SharedInboxStore {
               Set(batch.items.map(\.id)).count == batch.items.count,
               Set(batch.items.map(\.fileName)).count == batch.items.count,
               SharedInboxPolicy.batchFits(batch.items),
-              batch.items.allSatisfy(SharedInboxPolicy.isValidItemMetadata)
+              batch.items.allSatisfy(SharedInboxPolicy.isValidItemMetadata),
+              // Persisted text must be exactly what `carriedText` would carry — content-bearing
+              // and within the visible-failure limit. A doctored manifest cannot smuggle a
+              // contentless or over-limit caption past the extension's checks.
+              batch.text.map({
+                  SharedInboxPolicy.carriedText($0) == $0
+                      && !SharedInboxPolicy.exceedsTextLimit($0)
+              }) ?? true
         else { return nil }
         return batch
     }
@@ -1056,6 +1240,8 @@ enum SharedInboxError: LocalizedError, Equatable {
     case inboxFull
     case empty
     case unreadable
+    case tooManyItems
+    case textTooLong
 
     var errorDescription: String? {
         switch self {
@@ -1073,6 +1259,10 @@ enum SharedInboxError: LocalizedError, Equatable {
             "Nothing in that share could be sent through Kit Pay."
         case .unreadable:
             "That shared file could no longer be read."
+        case .tooManyItems:
+            "This share includes too many items. Kit Pay can send up to \(SharedInboxPolicy.maximumItems) files and their text in one message."
+        case .textTooLong:
+            "That text is too long to send as one message. Shorten it and share again."
         }
     }
 }

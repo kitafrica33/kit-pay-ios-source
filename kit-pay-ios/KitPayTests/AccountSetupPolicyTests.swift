@@ -241,6 +241,27 @@ final class AccountSetupPolicyTests: XCTestCase {
         XCTAssertEqual(response.upload.headers["Content-Type"], "image/jpeg")
     }
 
+    func testGroupPhotoUploadUsesPersistedSessionWhenNoTaskLocalSessionExists() {
+        XCTAssertEqual(
+            AuthenticatedMediaUploadSessionPolicy.sessionID(
+                inherited: nil,
+                persisted: "signed-in-session"
+            ),
+            "signed-in-session"
+        )
+        XCTAssertEqual(
+            AuthenticatedMediaUploadSessionPolicy.sessionID(
+                inherited: "operation-session",
+                persisted: "stale-session"
+            ),
+            "operation-session"
+        )
+        XCTAssertNil(AuthenticatedMediaUploadSessionPolicy.sessionID(
+            inherited: nil,
+            persisted: nil
+        ))
+    }
+
     func testProfileAvatarScanPollingIsBoundedToNinetySeconds() {
         XCTAssertEqual(ProfileAvatarUploadPolicy.maximumScanWaitSeconds, 90)
         XCTAssertEqual(ProfileAvatarUploadPolicy.maximumScanWait, .seconds(90))
@@ -1276,6 +1297,458 @@ final class AccountSetupPolicyTests: XCTestCase {
               "updated_at": \(timestamp)
             }
             """.utf8)
+        )
+    }
+}
+
+
+/// Home's first-run checklist derives every step from real state and disappears when done.
+final class HomeStarterChecklistPolicyTests: XCTestCase {
+    func testIdentityCompletesOnlyForAuthoritativeVerifiedStates() {
+        XCTAssertTrue(HomeStarterChecklistPolicy.identityVerified(kycStatus: "verified"))
+        XCTAssertTrue(HomeStarterChecklistPolicy.identityVerified(kycStatus: " Approved "))
+        XCTAssertFalse(HomeStarterChecklistPolicy.identityVerified(kycStatus: "pending"))
+        XCTAssertFalse(HomeStarterChecklistPolicy.identityVerified(kycStatus: "rejected"))
+        XCTAssertFalse(HomeStarterChecklistPolicy.identityVerified(kycStatus: ""))
+        // Fail closed: no loaded profile means not verified, never verified-by-default.
+        XCTAssertFalse(HomeStarterChecklistPolicy.identityVerified(kycStatus: nil))
+    }
+
+    func testFirstMessageCountsOnlyGenuineSentOutboundUserMessages() throws {
+        XCTAssertFalse(HomeStarterChecklistPolicy.hasSentFirstMessage(messages: []))
+        // Inbound, failed, still-queued, empty, and event-descriptor bodies never count.
+        XCTAssertFalse(HomeStarterChecklistPolicy.hasSentFirstMessage(messages: [
+            message("hello there", isOutgoing: false, state: .received),
+            message("failed send", isOutgoing: true, state: .failed),
+            message("still queued", isOutgoing: true, state: .queued),
+            message("   ", isOutgoing: true, state: .sent),
+            message(KitPaymentMessage.prefix + "v=1", isOutgoing: true, state: .sent),
+            message(KitGroupPaymentMessage.prefix + "v=1", isOutgoing: true, state: .sent),
+            message(KitSystemMessage.prefix + "v=1", isOutgoing: true, state: .sent),
+            message(KitMessageReaction.prefix + "v=1", isOutgoing: true, state: .sent),
+            message(KitMessageEdit.prefix + "v=1", isOutgoing: true, state: .sent),
+            // The shared policy catches reserved namespaces behind leading whitespace too.
+            message("  " + KitPaymentMessage.prefix + "v=1", isOutgoing: true, state: .sent),
+            message("\n\t" + KitSystemMessage.prefix + "v=1", isOutgoing: true, state: .sent),
+        ]))
+        XCTAssertTrue(HomeStarterChecklistPolicy.hasSentFirstMessage(messages: [
+            message("hi!", isOutgoing: true, state: .sent),
+        ]))
+        XCTAssertTrue(HomeStarterChecklistPolicy.hasSentFirstMessage(messages: [
+            message("delivered", isOutgoing: true, state: .delivered),
+        ]))
+        // A first photo is a first message: the media descriptor is user content.
+        let firstPhoto = try KitMediaMessageDescriptor(
+            attachmentID: "0a1b2c3d-0000-4000-8000-000000000001",
+            storageKey: "0a1b2c3d-0000-4000-8000-000000000002",
+            mediaType: "image/jpeg",
+            ciphertextByteSize: 4_064,
+            ciphertextSHA256: String(repeating: "ab", count: 32),
+            keyMaterial: Data(repeating: 7, count: SecureMediaAttachmentCipher.keyMaterialBytes),
+            plaintextByteSize: 4_000,
+            caption: nil
+        ).encoded
+        XCTAssertTrue(HomeStarterChecklistPolicy.hasSentFirstMessage(messages: [
+            message(firstPhoto, isOutgoing: true, state: .sent),
+        ]))
+        // A demo conversation's rows are synthetic and complete nothing.
+        XCTAssertFalse(HomeStarterChecklistPolicy.hasSentFirstMessage(
+            messages: [message("hi!", isOutgoing: true, state: .sent)],
+            isDemoConversation: { _ in true }
+        ))
+    }
+
+    func testFirstTransactionCountsOnlySettledMoneyMovement() {
+        XCTAssertFalse(HomeStarterChecklistPolicy.hasMadeFirstTransaction(transactions: []))
+        XCTAssertFalse(HomeStarterChecklistPolicy.hasMadeFirstTransaction(transactions: [
+            transaction(type: "transfer", status: "pending"),
+            transaction(type: "transfer", status: "failed"),
+            transaction(type: "transfer", status: "reversed"),
+            // Requests are asks, not money that moved — under either spelling, even completed.
+            transaction(type: "payment_request", status: "completed"),
+            transaction(type: "request", status: "completed"),
+            transaction(type: " Payment_Request ", status: " COMPLETED "),
+            // Money moving back is not a first transaction.
+            transaction(type: "transfer_reversal", status: "completed"),
+            transaction(type: "mobile_money_refund", status: "completed"),
+            // Zero and unparseable amounts moved nothing.
+            transaction(type: "transfer", status: "completed", amount: "0"),
+            transaction(type: "transfer", status: "completed", amount: "not-a-number"),
+            // Unknown statuses fail closed.
+            transaction(type: "transfer", status: "mystery_state"),
+            // Money the customer *received* is not a transaction they made — even settled.
+            transaction(type: "transfer", status: "completed", direction: "credit"),
+            transaction(type: "deposit", status: "settled", direction: " CREDIT "),
+            // Unknown and missing directions fail closed like unknown statuses.
+            transaction(type: "transfer", status: "completed", direction: "sideways"),
+            transaction(type: "transfer", status: "completed", direction: ""),
+        ]))
+        XCTAssertTrue(HomeStarterChecklistPolicy.hasMadeFirstTransaction(transactions: [
+            transaction(type: "transfer", status: "completed"),
+        ]))
+        // Trimming and case-folding apply to genuine rows too.
+        XCTAssertTrue(HomeStarterChecklistPolicy.hasMadeFirstTransaction(transactions: [
+            transaction(type: " Mobile_Money_Payout ", status: " Settled ", direction: " Debit "),
+        ]))
+    }
+
+    /// The persisted account-bound markers complete steps even when the live rows no longer
+    /// show the evidence: chat deletion, history pagination, and the transactions page being
+    /// only the latest slice of one wallet must not resurrect the checklist.
+    func testPersistedMilestonesCompleteStepsWithoutLiveEvidence() {
+        let checklist = HomeStarterChecklistPolicy.checklist(
+            kycStatus: nil,
+            messages: [],
+            transactions: [],
+            hasConfirmedFirstMessage: true,
+            hasConfirmedFirstTransaction: true,
+            isDemoActive: false
+        )
+        XCTAssertEqual(checklist?.completedCount, 2)
+        XCTAssertEqual(
+            checklist?.entries.first(where: { $0.step == .sendFirstMessage })?.isComplete,
+            true
+        )
+        XCTAssertEqual(
+            checklist?.entries.first(where: { $0.step == .makeFirstTransaction })?.isComplete,
+            true
+        )
+    }
+
+    /// The live KYC payload blends per-device verification into `status`, so a verified
+    /// account on a freshly enrolled iPhone reads "pending" there. The checklist consumes
+    /// `account_status` first, which stays verified.
+    func testVerifiedAccountWithPendingDeviceStatusStillCompletesIdentity() throws {
+        let live = try JSONDecoder().decode(
+            KYCStatus.self,
+            from: Data(#"{"status":"pending","account_status":"verified"}"#.utf8)
+        )
+        XCTAssertEqual(live.status, "pending")
+        XCTAssertEqual(live.accountStatus, "verified")
+
+        // Exactly Home's selection: account status first, cached profile as fallback.
+        let effective = live.accountStatus ?? "pending"
+        XCTAssertTrue(HomeStarterChecklistPolicy.identityVerified(kycStatus: effective))
+        XCTAssertFalse(HomeStarterChecklistPolicy.identityVerified(kycStatus: live.status))
+
+        // Older backends omit account_status; decoding must not fail and the fallback rules.
+        let legacy = try JSONDecoder().decode(
+            KYCStatus.self,
+            from: Data(#"{"status":"verified"}"#.utf8)
+        )
+        XCTAssertNil(legacy.accountStatus)
+        XCTAssertTrue(
+            HomeStarterChecklistPolicy.identityVerified(
+                kycStatus: legacy.accountStatus ?? "verified"
+            )
+        )
+    }
+
+    /// Identity verification is substantive and opens full-screen; the rejected half-height
+    /// sheet pattern must not come back through the checklist routes.
+    func testStarterStepRoutePresentation() {
+        XCTAssertEqual(
+            HomeStarterStepRoutePolicy.presentation(
+                for: .verifyIdentity,
+                secureMessagingAvailable: false
+            ),
+            .fullScreen
+        )
+        XCTAssertEqual(
+            HomeStarterStepRoutePolicy.presentation(
+                for: .sendFirstMessage,
+                secureMessagingAvailable: true
+            ),
+            .tabSwitch
+        )
+        XCTAssertEqual(
+            HomeStarterStepRoutePolicy.presentation(
+                for: .makeFirstTransaction,
+                secureMessagingAvailable: false
+            ),
+            .walletSheet
+        )
+    }
+
+    /// "Send first message" must never open a composer that cannot compose. When secure
+    /// messaging is not set up on this device the route explains the real next step instead,
+    /// and no other step is affected by messaging availability.
+    func testSendFirstMessageRouteGatesOnSecureMessagingAvailability() {
+        XCTAssertEqual(
+            HomeStarterStepRoutePolicy.presentation(
+                for: .sendFirstMessage,
+                secureMessagingAvailable: false
+            ),
+            .unavailable(message: HomeStarterStepRoutePolicy.messagingUnavailableMessage)
+        )
+        XCTAssertFalse(HomeStarterStepRoutePolicy.messagingUnavailableMessage.isEmpty)
+    }
+
+    /// The optional server milestone contract only ever adds confirmation, and it is judged
+    /// whole: old servers omit the capability and are never asked, a well-formed payload can
+    /// confirm, and any malformed, wrong-account, ineligible, off-policy, or off-vocabulary
+    /// payload is discarded in its entirety rather than mined for the parts that look right.
+    func testStarterMilestonesContractFailsClosed() throws {
+        // Exact-key compatibility with the backend's OpenAPI: the one canonical capability key
+        // is `starter_checklist` (route onboarding/starter-checklist). No client-side alias.
+        XCTAssertEqual(StarterMilestonesDTO.capabilityKey, "starter_checklist")
+
+        let account = "7f9c24e8-3b12-4f4f-9a3e-0c0d1e2f3a4b"
+        let otherAccount = "1e50a3c1-88d2-4c6e-b7a4-5f6a7b8c9d0e"
+
+        // The authoritative nested response with the canonical key vocabulary. All three keys
+        // are validated even though only message/transaction persist locally; `completed_at`
+        // is a required key whose value is null until the milestone completes.
+        let authoritative = try JSONDecoder().decode(
+            StarterMilestonesDTO.self,
+            from: Data(#"""
+            {"account_id":"\#(account)","eligible":true,"policy_version":1,
+             "milestones":[
+               {"key":"verify_identity","status":"completed",
+                "completed_at":"2026-08-20T09:00:00Z"},
+               {"key":"send_first_message","status":"completed",
+                "completed_at":"2026-08-27T10:00:00Z"},
+               {"key":"make_first_transaction","status":"pending","completed_at":null}
+             ]}
+            """#.utf8)
+        )
+        XCTAssertEqual(authoritative.policyVersion, 1)
+        XCTAssertEqual(
+            authoritative.confirmedMilestoneKeys(forAccountID: account),
+            [
+                StarterMilestonesDTO.verifyIdentityMilestoneKey,
+                StarterMilestonesDTO.sendFirstMessageMilestoneKey,
+            ]
+        )
+        // The active-account check is canonical UUID equality, not string equality.
+        XCTAssertEqual(
+            authoritative.confirmedMilestoneKeys(forAccountID: account.uppercased()),
+            [
+                StarterMilestonesDTO.verifyIdentityMilestoneKey,
+                StarterMilestonesDTO.sendFirstMessageMilestoneKey,
+            ]
+        )
+        // A payload speaking for any other account — or no recognisable account — is nil.
+        XCTAssertNil(authoritative.confirmedMilestoneKeys(forAccountID: otherAccount))
+        XCTAssertNil(authoritative.confirmedMilestoneKeys(forAccountID: "not-a-uuid"))
+        XCTAssertNil(authoritative.confirmedMilestoneKeys(forAccountID: ""))
+
+        // `pending` is a valid status that confirms nothing: an all-pending payload is trusted
+        // (empty set), not rejected (nil).
+        let allPending = try JSONDecoder().decode(
+            StarterMilestonesDTO.self,
+            from: Data(#"""
+            {"account_id":"\#(account)","eligible":true,"policy_version":1,
+             "milestones":[
+               {"key":"verify_identity","status":"pending","completed_at":null},
+               {"key":"send_first_message","status":"pending","completed_at":null},
+               {"key":"make_first_transaction","status":"pending","completed_at":null}
+             ]}
+            """#.utf8)
+        )
+        XCTAssertEqual(allPending.confirmedMilestoneKeys(forAccountID: account), [])
+
+        // A whitespace-corrupted account_id is evidence of a broken producer; it must be
+        // rejected as-is, never trimmed into a match. (In these raw strings `\n`/`\t` reach
+        // the decoder as JSON escapes, i.e. real control characters in the decoded ID.)
+        let corruptedAccountIDs = [
+            #" \#(account)"#,
+            #"\#(account) "#,
+            #"\n\#(account)\n"#,
+            #"\t\#(account)"#,
+        ]
+        for corrupted in corruptedAccountIDs {
+            let payload = try JSONDecoder().decode(
+                StarterMilestonesDTO.self,
+                from: Data(#"""
+                {"account_id":"\#(corrupted)","eligible":true,"policy_version":1,
+                 "milestones":[{"key":"send_first_message","status":"completed",
+                                "completed_at":"2026-08-27T10:00:00Z"}]}
+                """#.utf8)
+            )
+            XCTAssertNil(payload.confirmedMilestoneKeys(forAccountID: account), corrupted)
+        }
+
+        // `eligible` false withholds every confirmation, even of completed milestones.
+        let ineligible = try JSONDecoder().decode(
+            StarterMilestonesDTO.self,
+            from: Data(#"""
+            {"account_id":"\#(account)","eligible":false,"policy_version":1,
+             "milestones":[{"key":"send_first_message","status":"completed",
+                            "completed_at":"2026-08-27T10:00:00Z"}]}
+            """#.utf8)
+        )
+        XCTAssertNil(ineligible.confirmedMilestoneKeys(forAccountID: account))
+
+        // The policy version is an integer with minimum 1; zero and negatives reject whole.
+        for badVersion in [0, -1, -2026] {
+            let offPolicy = try JSONDecoder().decode(
+                StarterMilestonesDTO.self,
+                from: Data(#"""
+                {"account_id":"\#(account)","eligible":true,"policy_version":\#(badVersion),
+                 "milestones":[{"key":"send_first_message","status":"completed",
+                                "completed_at":"2026-08-27T10:00:00Z"}]}
+                """#.utf8)
+            )
+            XCTAssertNil(
+                offPolicy.confirmedMilestoneKeys(forAccountID: account),
+                "policy_version \(badVersion)"
+            )
+        }
+
+        // Off-vocabulary payloads reject WHOLE — a completed canonical milestone in the same
+        // payload must not survive. Covers the retired legacy key names, unknown keys,
+        // duplicate keys, and every non-exact status spelling.
+        let poisonedMilestoneLists = [
+            // Retired legacy keys are unknown vocabulary now, never a quiet synonym.
+            #"[{"key":"first_message_sent","status":"completed","completed_at":"2026-08-27T10:00:00Z"}]"#,
+            #"[{"key":"first_transaction_settled","status":"completed","completed_at":"2026-08-27T10:00:00Z"}]"#,
+            // An unknown key poisons the payload even alongside a valid completed entry.
+            #"""
+            [{"key":"send_first_message","status":"completed","completed_at":"2026-08-27T10:00:00Z"},
+             {"key":"referral_completed","status":"completed","completed_at":"2026-08-27T10:00:00Z"}]
+            """#,
+            // Duplicate known keys contradict the one-entry-per-milestone contract.
+            #"""
+            [{"key":"send_first_message","status":"completed","completed_at":"2026-08-27T10:00:00Z"},
+             {"key":"send_first_message","status":"pending","completed_at":null}]
+            """#,
+            // Status vocabulary is exact and lowercase.
+            #"[{"key":"send_first_message","status":"COMPLETED","completed_at":"2026-08-27T10:00:00Z"}]"#,
+            #"[{"key":"send_first_message","status":" completed ","completed_at":"2026-08-27T10:00:00Z"}]"#,
+            #"""
+            [{"key":"make_first_transaction","status":"in_progress","completed_at":null},
+             {"key":"send_first_message","status":"completed","completed_at":"2026-08-27T10:00:00Z"}]
+            """#,
+            #"[{"key":"verify_identity","status":"failed","completed_at":null}]"#,
+        ]
+        for poisoned in poisonedMilestoneLists {
+            let payload = try JSONDecoder().decode(
+                StarterMilestonesDTO.self,
+                from: Data(#"""
+                {"account_id":"\#(account)","eligible":true,"policy_version":1,
+                 "milestones":\#(poisoned)}
+                """#.utf8)
+            )
+            XCTAssertNil(payload.confirmedMilestoneKeys(forAccountID: account), poisoned)
+        }
+
+        // The nested contract is required in full: an empty object, a missing or mistyped
+        // field (including a string policy_version and a milestone that omits the required
+        // completed_at key) — and the retired flat projection — all fail the whole decode.
+        let malformedPayloads = [
+            "{}",
+            #"{"first_message_sent":true,"first_transaction_settled":false}"#,
+            #"{"account_id":"\#(account)","policy_version":1,"milestones":[]}"#,
+            #"{"account_id":"\#(account)","eligible":"yes","policy_version":1,"milestones":[]}"#,
+            #"{"account_id":"\#(account)","eligible":true,"milestones":[]}"#,
+            #"{"account_id":"\#(account)","eligible":true,"policy_version":"1","milestones":[]}"#,
+            #"{"account_id":"\#(account)","eligible":true,"policy_version":"2026-08","milestones":[]}"#,
+            #"{"account_id":"\#(account)","eligible":true,"policy_version":1.5,"milestones":[]}"#,
+            #"{"account_id":"\#(account)","eligible":true,"policy_version":1}"#,
+            #"{"account_id":"\#(account)","eligible":true,"policy_version":1,"milestones":[{"key":"send_first_message","completed_at":null}]}"#,
+            #"{"account_id":"\#(account)","eligible":true,"policy_version":1,"milestones":[{"status":"completed","completed_at":null}]}"#,
+            #"{"account_id":"\#(account)","eligible":true,"policy_version":1,"milestones":[{"key":"send_first_message","status":"pending"}]}"#,
+            #"{"account_id":"\#(account)","eligible":true,"policy_version":1,"milestones":[{"key":"send_first_message","status":"completed"}]}"#,
+        ]
+        for malformed in malformedPayloads {
+            XCTAssertThrowsError(
+                try JSONDecoder().decode(StarterMilestonesDTO.self, from: Data(malformed.utf8)),
+                malformed
+            )
+        }
+
+        // The capability itself fails closed: missing key, null, and false all read as off,
+        // and only the backend's exact `starter_checklist` key turns the contract on.
+        let withheld = try JSONDecoder().decode(
+            CapabilitiesDTO.self,
+            from: Data(#"{"currency":{"code":"UGX","scale":"0"},"features":{"starter_checklist":null}}"#.utf8)
+        )
+        XCTAssertFalse(withheld.supportsFeature(StarterMilestonesDTO.capabilityKey))
+        let advertised = try JSONDecoder().decode(
+            CapabilitiesDTO.self,
+            from: Data(#"{"currency":{"code":"UGX","scale":"0"},"features":{"starter_checklist":true,"starter_milestones":false}}"#.utf8)
+        )
+        XCTAssertTrue(advertised.supportsFeature(StarterMilestonesDTO.capabilityKey))
+    }
+
+    func testChecklistOrderProgressAndDisappearance() {
+        let fresh = HomeStarterChecklistPolicy.checklist(
+            kycStatus: nil,
+            messages: [],
+            transactions: [],
+            isDemoActive: false
+        )
+        XCTAssertEqual(fresh?.entries.map(\.step), [
+            .verifyIdentity, .sendFirstMessage, .makeFirstTransaction,
+        ])
+        XCTAssertEqual(fresh?.completedCount, 0)
+        XCTAssertEqual(fresh?.totalCount, 3)
+
+        let partial = HomeStarterChecklistPolicy.checklist(
+            kycStatus: "verified",
+            messages: [message("hi!", isOutgoing: true, state: .sent)],
+            transactions: [],
+            isDemoActive: false
+        )
+        XCTAssertEqual(partial?.completedCount, 2)
+
+        // 3 of 3: the checklist leaves Home entirely.
+        XCTAssertNil(HomeStarterChecklistPolicy.checklist(
+            kycStatus: "approved",
+            messages: [message("hi!", isOutgoing: true, state: .read)],
+            transactions: [transaction(type: "transfer", status: "completed")],
+            isDemoActive: false
+        ))
+
+        // The App Review demo account never sees a first-run checklist: its rows are
+        // synthetic and must neither show nor satisfy the steps.
+        XCTAssertNil(HomeStarterChecklistPolicy.checklist(
+            kycStatus: nil,
+            messages: [],
+            transactions: [],
+            isDemoActive: true
+        ))
+    }
+
+    private func message(
+        _ body: String,
+        isOutgoing: Bool,
+        state: MessageDeliveryState
+    ) -> LocalMessage {
+        LocalMessage(
+            id: UUID(),
+            conversationId: "30000000-0000-0000-0000-000000000001",
+            senderId: "10000000-0000-4000-8000-000000000001",
+            body: body,
+            createdAt: Date(timeIntervalSince1970: 1_700_000_000),
+            sentAt: nil,
+            state: state,
+            failureReason: nil,
+            isOutgoing: isOutgoing,
+            attachmentData: nil,
+            pendingAttachment: nil
+        )
+    }
+
+    private func transaction(
+        type: String,
+        status: String,
+        amount: String = "1000",
+        direction: String = "debit"
+    ) -> WalletTransaction {
+        WalletTransaction(
+            id: UUID().uuidString,
+            walletId: "wallet-1",
+            reference: "REF-1",
+            amount: amount,
+            currency: CurrencyDTO(code: "UGX", scale: "0"),
+            type: type,
+            direction: direction,
+            status: status,
+            counterparty: nil,
+            note: nil,
+            occurredAt: "2026-08-28T08:00:00Z"
         )
     }
 }

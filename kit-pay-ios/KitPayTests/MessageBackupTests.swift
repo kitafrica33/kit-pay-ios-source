@@ -312,6 +312,121 @@ final class MessageBackupTests: XCTestCase {
         XCTAssertEqual(resolved, key)
     }
 
+    func testMalformedStoredKeyIsNotTreatedAsMissing() {
+        XCTAssertThrowsError(
+            try MessageBackupKeyStore.validatedStoredKey(Data(repeating: 7, count: 16))
+        ) { error in
+            XCTAssertEqual(error as? MessageBackupError, .keyUnavailable)
+        }
+    }
+
+    func testMalformedExistingKeyNeverMintsReplacement() {
+        var createdKey = false
+
+        XCTAssertThrowsError(try MessageBackupUploadKeyPolicy.resolve(
+            existingBackup: false,
+            existingKey: Data(repeating: 7, count: 16),
+            createKey: {
+                createdKey = true
+                return self.key
+            }
+        )) { error in
+            XCTAssertEqual(error as? MessageBackupError, .keyUnavailable)
+        }
+        XCTAssertFalse(createdKey)
+    }
+
+    func testAssetReaderAcceptsValidBytesWithoutConsultingURLResourceSize() throws {
+        let payload = MessageBackupPayload.snapshot(
+            of: makeState(),
+            userID: userID,
+            deviceName: "Kit iPhone",
+            includesMedia: false,
+            createdAt: Date(timeIntervalSince1970: 1_700_001_000)
+        )
+        let encrypted = try MessageBackupCrypto.encrypt(payload, key: key)
+        var didRead = false
+
+        let loaded = try MessageBackupAssetReader.read(
+            from: URL(fileURLWithPath: "/cloudkit/provider-owned/asset"),
+            advertisedByteSize: encrypted.count,
+            readBytes: { _, maximumBytes in
+                didRead = true
+                XCTAssertEqual(
+                    maximumBytes,
+                    MessageBackupValidationPolicy.maximumEncryptedBytes
+                )
+                return encrypted
+            }
+        )
+
+        XCTAssertTrue(didRead)
+        XCTAssertEqual(try MessageBackupCrypto.decrypt(loaded, key: key), payload)
+    }
+
+    func testAssetReaderRoundTripsBoundedFile() throws {
+        let payload = MessageBackupPayload.snapshot(
+            of: makeState(),
+            userID: userID,
+            deviceName: "Kit iPhone",
+            includesMedia: false,
+            createdAt: Date(timeIntervalSince1970: 1_700_001_000)
+        )
+        let encrypted = try MessageBackupCrypto.encrypt(payload, key: key)
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kit-backup-reader-test-\(UUID().uuidString).bin")
+        try encrypted.write(to: fileURL, options: .atomic)
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+
+        let loaded = try MessageBackupAssetReader.read(
+            from: fileURL,
+            advertisedByteSize: encrypted.count
+        )
+
+        XCTAssertEqual(loaded, encrypted)
+        XCTAssertEqual(try MessageBackupCrypto.decrypt(loaded, key: key), payload)
+    }
+
+    func testMissingCloudAssetURLIsRetryableAndDoesNotRead() {
+        var didRead = false
+
+        XCTAssertThrowsError(try MessageBackupAssetReader.read(
+            from: nil,
+            advertisedByteSize: 1_024,
+            readBytes: { _, _ in
+                didRead = true
+                return Data()
+            }
+        )) { error in
+            XCTAssertEqual(error as? MessageBackupError, .assetUnavailable)
+        }
+        XCTAssertFalse(didRead)
+    }
+
+    func testIncompleteMaterializedAssetIsRetryableInsteadOfDamaged() {
+        let advertisedByteSize = 4_096
+
+        XCTAssertThrowsError(try MessageBackupAssetReader.read(
+            from: URL(fileURLWithPath: "/cloudkit/provider-owned/partial-asset"),
+            advertisedByteSize: advertisedByteSize,
+            readBytes: { _, _ in Data(repeating: 1, count: advertisedByteSize - 1) }
+        )) { error in
+            XCTAssertEqual(error as? MessageBackupError, .assetUnavailable)
+        }
+    }
+
+    func testCloudAssetReadFailureIsRetryableInsteadOfDamaged() {
+        struct ReadFailure: Error {}
+
+        XCTAssertThrowsError(try MessageBackupAssetReader.read(
+            from: URL(fileURLWithPath: "/cloudkit/provider-owned/unavailable-asset"),
+            advertisedByteSize: 4_096,
+            readBytes: { _, _ in throw ReadFailure() }
+        )) { error in
+            XCTAssertEqual(error as? MessageBackupError, .assetUnavailable)
+        }
+    }
+
     // MARK: Validation policy
 
     func testValidationAcceptsRetainedGroupAfterOwnerRemoval() throws {

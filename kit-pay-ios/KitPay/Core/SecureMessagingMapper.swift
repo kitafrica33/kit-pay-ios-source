@@ -170,14 +170,21 @@ enum SecureMessagingHistoryBackfillCodec {
               !retained.body.isEmpty,
               !retained.body.unicodeScalars.contains(where: { $0.value == 0 })
         else { throw SecureMessagingCryptoError.invalidContent }
-        let authenticatedAttachments = KitMediaMessageDescriptor.attachments(for: retained.body)
-        guard SecureMessagingContentBindingPolicy.kind(
-            for: retained.body,
-            replyToMessageID: candidate.replyToMessageID,
-            attachments: authenticatedAttachments
-        ) == candidate.kind else {
-            throw SecureMessagingCryptoError.invalidContent
-        }
+        let authenticatedAttachments = KitMediaMessageFamilyPolicy.attachmentRequests(
+            for: retained.body
+        )
+        // Family-wide fail-closed: a reserved media-family body of any version authenticates
+        // only through its strict parse. An unparseable one derives no rows, and without this
+        // line an unknown future version would fall through the binding policy as plain text
+        // and transfer a raw descriptor — key material — in a text envelope.
+        guard !KitMediaMessageFamilyPolicy.isReservedFamilyText(retained.body)
+                || !authenticatedAttachments.isEmpty,
+              SecureMessagingContentBindingPolicy.kind(
+                  for: retained.body,
+                  replyToMessageID: candidate.replyToMessageID,
+                  attachments: authenticatedAttachments
+              ) == candidate.kind
+        else { throw SecureMessagingCryptoError.invalidContent }
 
         let object: [String: Any] = [
             "schema": schema,
@@ -282,18 +289,19 @@ enum SecureMessagingHistoryBackfillCodec {
               rawAttachments.count <= SecureMessagingWire.maximumAttachments,
               rawAttachments.allSatisfy({ $0 != nil })
         else { throw SecureMessagingCryptoError.invalidContent }
-        let authenticatedAttachments = KitMediaMessageDescriptor.attachments(for: text)
+        let authenticatedAttachments = KitMediaMessageFamilyPolicy.attachmentRequests(for: text)
         guard SecureMessagingContentBindingPolicy.kind(
                   for: text,
                   replyToMessageID: decoded.replyToMessageID,
                   attachments: authenticatedAttachments
               ) == decoded.kind,
-              (!text.hasPrefix(KitMediaMessageDescriptor.prefix)
+              // Family-wide fail-closed, strictly wider than the literal v1-prefix check it
+              // replaces: any reserved media-family body — every version, whitespace-smuggled
+              // spellings included — must derive its rows from a strict parse, so malformed
+              // reserved text can never re-enter history as plain text.
+              (!KitMediaMessageFamilyPolicy.isReservedFamilyText(text)
                   || !authenticatedAttachments.isEmpty),
-              KitMediaMessageDescriptor.validates(
-                  rawAttachments,
-                  against: authenticatedAttachments
-              )
+              KitMediaMessageFamilyPolicy.validatesWireRows(rawAttachments, forBody: text)
         else { throw SecureMessagingCryptoError.invalidContent }
         return SecureMessagingAuthenticatedHistory(original: decoded, text: text)
     }

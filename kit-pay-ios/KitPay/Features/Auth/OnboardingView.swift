@@ -1,5 +1,13 @@
 import SwiftUI
 
+/// The signed-out surface: one full-bleed screen in the app's unauthenticated design language
+/// (the same light canvas, brand badge, and open layout the PIN and biometric screens use —
+/// no floating card over a decorative backdrop).
+///
+/// A phone number is the only way in for someone new: the customer enters their number and the
+/// backend decides whether that is a first-time registration or a returning login. Email and
+/// password exist solely as a restrained secondary sign-in for accounts that already attached
+/// an email, and email recovery lives inside that email path — never on the front screen.
 struct OnboardingView: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.scenePhase) private var scenePhase
@@ -8,19 +16,11 @@ struct OnboardingView: View {
     @State private var accountScreen: EmailAccountScreen = .signIn
     @State private var phone = ""
     @State private var authenticationCode = ""
+    @FocusState private var authenticationCodeFieldIsFocused: Bool
 
     @State private var email = ""
     // Passwords and account tokens intentionally live only in process-local SwiftUI state.
     @State private var password = ""
-    @State private var registrationName = ""
-    @State private var registrationTag = ""
-    @State private var registrationEmail = ""
-    @State private var registrationPassword = ""
-    @State private var registrationPasswordConfirmation = ""
-    @State private var verificationEmail = ""
-    @State private var verificationDestination: String?
-    @State private var verificationExpiresAt: Date?
-    @State private var verificationResendAvailableAt: Date?
     @State private var verificationToken = ""
     @State private var recoveryEmail = ""
     @State private var resetToken = ""
@@ -42,74 +42,47 @@ struct OnboardingView: View {
     }
 
     var body: some View {
-        ZStack {
-            LinearGradient(
-                colors: [KitColor.deepNavy, KitColor.navy, KitColor.green.opacity(0.84)],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-            .ignoresSafeArea()
+        GeometryReader { geometry in
+            ZStack {
+                KitAuthBackground()
 
-            Circle()
-                .fill(.white.opacity(0.13))
-                .frame(width: 330, height: 330)
-                .blur(radius: 4)
-                .offset(x: 150, y: -320)
-            Circle()
-                .fill(KitColor.green.opacity(0.30))
-                .frame(width: 280, height: 280)
-                .blur(radius: 18)
-                .offset(x: -170, y: 360)
-
-            ScrollView {
-                VStack(spacing: 26) {
-                    Spacer(minLength: 42)
-                    VStack(spacing: 14) {
-                        KitLogoView(tint: .white)
-                            .frame(height: 58)
-                        Text("Money, messages and calls—together.")
-                            .font(.title3.weight(.medium))
-                            .foregroundStyle(.white.opacity(0.82))
-                            .multilineTextAlignment(.center)
-                            // Launch UI tests anchor on this identifier now that the wordmark
-                            // is a Shape-based logo rather than a static text.
-                            .accessibilityIdentifier("onboarding-wordmark")
-                    }
-
-                    VStack(alignment: .leading, spacing: 18) {
-                        accessContent
-                        if model.isLoading {
-                            HStack(spacing: 10) {
-                                ProgressView()
-                                Text("Please wait…")
-                                    .font(.footnote.weight(.medium))
+                ScrollView {
+                    VStack(spacing: 24) {
+                        Spacer(minLength: 24)
+                        header
+                        VStack(alignment: .leading, spacing: 18) {
+                            accessContent
+                            if model.isLoading {
+                                HStack(spacing: 10) {
+                                    ProgressView()
+                                    Text("Please wait…")
+                                        .font(.footnote.weight(.medium))
+                                }
+                                .frame(maxWidth: .infinity)
+                                .foregroundStyle(KitColor.secondaryText)
                             }
-                            .frame(maxWidth: .infinity)
-                            .foregroundStyle(.secondary)
+                            if let feedbackMessage {
+                                Label(feedbackMessage, systemImage: "checkmark.circle.fill")
+                                    .font(.footnote.weight(.medium))
+                                    .foregroundStyle(KitColor.green)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
                         }
-                        if let feedbackMessage {
-                            Label(feedbackMessage, systemImage: "checkmark.circle.fill")
-                                .font(.footnote.weight(.medium))
-                                .foregroundStyle(KitColor.green)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                    }
-                    .padding(24)
-                    .kitGlass(cornerRadius: 32)
-                    .foregroundStyle(KitColor.primaryText)
-
-                    HStack(spacing: 14) {
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        Spacer(minLength: 12)
                         Label("End-to-end encrypted", systemImage: "lock.shield.fill")
-                        Label("Offline ready", systemImage: "icloud.and.arrow.up")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(KitColor.secondaryText)
+                        Spacer(minLength: 18)
                     }
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.white.opacity(0.8))
-                    Spacer(minLength: 30)
+                    .padding(.horizontal, 26)
+                    .frame(maxWidth: 460)
+                    .frame(maxWidth: .infinity, minHeight: geometry.size.height)
                 }
-                .padding(.horizontal, 22)
+                .scrollDismissesKeyboard(.interactively)
+                .scrollBounceBehavior(.basedOnSize)
+                .accessibilityHidden(concealSensitiveContent)
             }
-            .scrollDismissesKeyboard(.interactively)
-            .accessibilityHidden(concealSensitiveContent)
         }
         .onAppear {
             reconcileCapabilities()
@@ -122,7 +95,12 @@ struct OnboardingView: View {
             feedbackMessage = nil
         }
         .onChange(of: model.pendingChallenge?.id) { previous, current in
-            if previous != current { authenticationCode = "" }
+            if previous != current {
+                authenticationCode = ""
+                // A replacement challenge (phone code accepted, two-factor step issued) swaps
+                // the input field; put the keyboard straight back on it.
+                if current != nil { authenticationCodeFieldIsFocused = true }
+            }
         }
         .onChange(of: model.pendingDeepLink) { _, link in
             applyDeepLink(link)
@@ -146,6 +124,26 @@ struct OnboardingView: View {
         }
     }
 
+    /// The canonical Kit lockup — the master-SVG-derived brand asset used app-wide — on the
+    /// shared auth canvas.
+    private var header: some View {
+        VStack(spacing: 12) {
+            KitLogoView(tint: KitColor.navy)
+                .frame(height: 56)
+            Text("Money, messages and calls—together.")
+                .font(.title3.weight(.medium))
+                .foregroundStyle(KitColor.secondaryText)
+                .multilineTextAlignment(.center)
+                // Launch UI tests anchor on this identifier now that the wordmark
+                // is a Shape-based logo rather than a static text.
+                .accessibilityIdentifier("onboarding-wordmark")
+        }
+    }
+
+    private var accessPolicy: PhoneFirstAuthAccessPolicy {
+        PhoneFirstAuthAccessPolicy(capabilities: model.capabilities)
+    }
+
     @ViewBuilder
     private var accessContent: some View {
         if model.pendingChallenge != nil {
@@ -154,8 +152,6 @@ struct OnboardingView: View {
             switch accountScreen {
             case .signIn:
                 signInForm
-            case .registration:
-                registrationForm
             case .verification:
                 verificationForm
             case .forgotPassword:
@@ -166,72 +162,42 @@ struct OnboardingView: View {
         }
     }
 
+    @ViewBuilder
     private var signInForm: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("Welcome to Kit Pay")
                 .font(.title2.bold())
+                .foregroundStyle(KitColor.primaryText)
 
-            if model.phoneOTPAvailable || model.emailPasswordAvailable {
-                if model.phoneOTPAvailable, model.emailPasswordAvailable {
-                    Picker("Sign-in method", selection: $signInMethod) {
-                        ForEach(SignInMethod.allCases) { method in
-                            Text(method.title).tag(method)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .disabled(model.isLoading)
-                }
-
-                if signInMethod == .phone, model.phoneOTPAvailable {
-                    phoneSignInFields
-                } else if model.emailPasswordAvailable {
+            switch accessPolicy.primaryRoute {
+            case .phone:
+                if signInMethod == .email, accessPolicy.offersEmailSecondary {
                     emailSignInFields
+                } else {
+                    phoneSignInFields
                 }
-
-            } else {
+            case .email:
+                emailSignInFields
+            case .unavailable:
                 Label(
                     "Sign-in methods are temporarily unavailable. Reconnect and try again.",
                     systemImage: "wifi.exclamationmark"
                 )
-                .foregroundStyle(.secondary)
+                .foregroundStyle(KitColor.secondaryText)
                 .fixedSize(horizontal: false, vertical: true)
-            }
-
-            // Verification and reset complete already-issued tokens, so these routes intentionally
-            // remain reachable when issuance flags are later disabled.
-            HStack {
-                Button("Verify email") { openVerification() }
-                    .disabled(model.isLoading)
-                Spacer()
-                Button("Use reset token") { openResetPassword() }
-                    .disabled(model.isLoading)
-            }
-            .font(.subheadline.weight(.medium))
-
-            if model.emailRecoveryAvailable {
-                Button("Forgot password?") { openForgotPassword() }
-                    .frame(maxWidth: .infinity)
-                    .disabled(model.isLoading)
-            }
-
-            if model.emailRegistrationAvailable {
-                Button("New to Kit Pay? Create an account") {
-                    openRegistration()
-                }
-                .frame(maxWidth: .infinity)
-                .disabled(model.isLoading)
             }
         }
     }
 
     private var phoneSignInFields: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("Enter your phone number to receive a secure one-time code.")
-                .foregroundStyle(.secondary)
+            Text("Enter your phone number to continue.")
+                .foregroundStyle(KitColor.secondaryText)
+                .fixedSize(horizontal: false, vertical: true)
             HStack(spacing: 8) {
                 Text("🇺🇬 +256")
                     .font(.title3.weight(.semibold).monospacedDigit())
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(KitColor.secondaryText)
                 TextField("7XX XXX XXX", text: Binding(
                     get: { UgandaMobileMoneyPhone.spacedNationalDigits(from: phone) },
                     set: { phone = UgandaMobileMoneyPhone.nationalDigits(from: $0) }
@@ -258,14 +224,27 @@ struct OnboardingView: View {
 
             Text("Kit sends one SMS to verify this number. Carrier rates may apply.")
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(KitColor.secondaryText)
+
+            if accessPolicy.offersEmailSecondary {
+                Button("Sign in with email instead") {
+                    feedbackMessage = nil
+                    signInMethod = .email
+                }
+                .font(.subheadline.weight(.medium))
+                .foregroundStyle(KitColor.secondaryText)
+                .frame(maxWidth: .infinity)
+                .padding(.top, 2)
+                .disabled(model.isLoading)
+            }
         }
     }
 
     private var emailSignInFields: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Use the email and password for your existing account.")
-                .foregroundStyle(.secondary)
+                .foregroundStyle(KitColor.secondaryText)
+                .fixedSize(horizontal: false, vertical: true)
             TextField("Email address", text: $email)
                 .keyboardType(.emailAddress)
                 .textInputAutocapitalization(.never)
@@ -302,17 +281,54 @@ struct OnboardingView: View {
             .buttonBorderShape(.roundedRectangle(radius: 18))
             .tint(KitColor.green)
             .disabled(!EmailAccountValidation.isValidEmail(email) || password.isEmpty || model.isLoading)
+
+            // Recovery belongs to the email path alone. Verification and reset complete
+            // already-issued tokens, so those routes intentionally remain reachable when
+            // issuance flags are later disabled.
+            if model.emailRecoveryAvailable {
+                Button("Forgot password?") { openForgotPassword() }
+                    .frame(maxWidth: .infinity)
+                    .disabled(model.isLoading)
+            }
+            HStack {
+                Button("Verify email") { openVerification() }
+                    .disabled(model.isLoading)
+                Spacer()
+                Button("Use reset token") { openResetPassword() }
+                    .disabled(model.isLoading)
+            }
+            .font(.subheadline.weight(.medium))
+
+            if accessPolicy.offersEmailSecondary {
+                Button("Use phone number instead") {
+                    feedbackMessage = nil
+                    password = ""
+                    signInMethod = .phone
+                }
+                .font(.subheadline.weight(.medium))
+                .foregroundStyle(KitColor.secondaryText)
+                .frame(maxWidth: .infinity)
+                .padding(.top, 2)
+                .disabled(model.isLoading)
+            }
         }
     }
 
+    /// The one-time-code step, on the same full-bleed surface as the rest of sign-in.
+    ///
+    /// Everything scales instead of assuming a tall portrait phone: the code entry sizes with
+    /// Dynamic Type and shrinks before it clips, and the whole step lives in the shared
+    /// ScrollView, so a small iPhone with the keyboard up — or landscape — scrolls rather
+    /// than truncating the actions.
     @ViewBuilder
     private var authenticationChallengeForm: some View {
         if let challenge = model.pendingChallenge {
             VStack(alignment: .leading, spacing: 16) {
                 Text(challenge.kind == .phoneOTP ? "Check your messages" : "Two-factor verification")
                     .font(.title2.bold())
+                    .foregroundStyle(KitColor.primaryText)
                 Text(challengeInstructions(challenge))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(KitColor.secondaryText)
                     .fixedSize(horizontal: false, vertical: true)
 
                 authenticationCodeEntry(for: challenge)
@@ -346,7 +362,7 @@ struct OnboardingView: View {
                                 systemImage: "clock.badge.exclamationmark"
                             )
                             .font(.footnote.weight(.medium))
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(KitColor.secondaryText)
                             .fixedSize(horizontal: false, vertical: true)
                         } else if challenge.kind == .phoneOTP {
                             if let resendDelay {
@@ -372,7 +388,7 @@ struct OnboardingView: View {
                                     systemImage: "arrow.counterclockwise"
                                 )
                                 .font(.footnote.weight(.medium))
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(KitColor.secondaryText)
                                 .fixedSize(horizontal: false, vertical: true)
                             }
                         }
@@ -389,77 +405,14 @@ struct OnboardingView: View {
         }
     }
 
-    private var registrationForm: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            accountBackButton("Back to sign in")
-            Text("Create your account")
-                .font(.title2.bold())
-            Text("Choose the name people will see and a unique Kit Pay @tag.")
-                .foregroundStyle(.secondary)
-
-            TextField("Username / display name", text: $registrationName)
-                .textContentType(.name)
-                .disabled(model.isLoading)
-                .authField()
-            HStack(spacing: 4) {
-                Text("@")
-                    .foregroundStyle(.secondary)
-                TextField("unique_tag", text: Binding(
-                    get: { registrationTag },
-                    set: { registrationTag = EmailAccountValidation.normalizeTag($0) }
-                ))
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-            }
-            .disabled(model.isLoading)
-            .authField()
-            TextField("Email address", text: $registrationEmail)
-                .keyboardType(.emailAddress)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-                .textContentType(.username)
-                .disabled(model.isLoading)
-                .authField()
-            SecureField("Password", text: $registrationPassword)
-                .textContentType(.newPassword)
-                .disabled(model.isLoading)
-                .authField()
-            SecureField("Confirm password", text: $registrationPasswordConfirmation)
-                .textContentType(.newPassword)
-                .disabled(model.isLoading)
-                .authField()
-            Text("Use at least 12 characters with uppercase, lowercase, and a number.")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-
-            Button {
-                submitRegistration()
-            } label: {
-                Text("Create account")
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 15)
-            }
-            .buttonStyle(.borderedProminent)
-            .buttonBorderShape(.roundedRectangle(radius: 18))
-            .tint(KitColor.green)
-            .disabled(
-                registrationName.isEmpty
-                    || registrationTag.isEmpty
-                    || registrationEmail.isEmpty
-                    || registrationPassword.isEmpty
-                    || registrationPasswordConfirmation.isEmpty
-                    || model.isLoading
-            )
-        }
-    }
-
     private var verificationForm: some View {
         VStack(alignment: .leading, spacing: 14) {
             accountBackButton("Back to sign in")
             Text("Verify your email")
                 .font(.title2.bold())
-            Text(verificationInstructions)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(KitColor.primaryText)
+            Text("Paste the secure verification token from your Kit Pay email.")
+                .foregroundStyle(KitColor.secondaryText)
                 .fixedSize(horizontal: false, vertical: true)
 
             SecureField("Verification token", text: $verificationToken)
@@ -473,97 +426,28 @@ struct OnboardingView: View {
                     verificationToken = opaqueTokenInput(value)
                 }
 
-            TimelineView(.periodic(from: .now, by: 1)) { context in
-                let expired = verificationExpiresAt.map { context.date >= $0 } ?? false
-                let resendDelay = EmailVerificationChallengeTimingPolicy.secondsUntilResend(
-                    availableAt: verificationResendAvailableAt,
-                    now: context.date
-                )
-                VStack(alignment: .leading, spacing: 14) {
-                    if let verificationExpiresAt, !expired {
-                        HStack(spacing: 6) {
-                            Image(systemName: "clock")
-                            Text("Current token expires in")
-                            Text(verificationExpiresAt, style: .timer)
-                                .monospacedDigit()
-                        }
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    } else if expired {
-                        Label(
-                            "This token has expired. Send a new verification email.",
-                            systemImage: "clock.badge.exclamationmark"
-                        )
-                        .font(.footnote.weight(.medium))
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                    }
-
-                    Button {
-                        let submittedToken = verificationToken
-                        feedbackMessage = nil
-                        Task {
-                            if let verifiedEmail = await model.verifyEmail(token: submittedToken) {
-                                verificationToken = ""
-                                email = verifiedEmail
-                                returnToSignIn(message: "Email verified. Sign in to continue.")
-                            }
-                        }
-                    } label: {
-                        Text("Verify email")
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 15)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .buttonBorderShape(.roundedRectangle(radius: 18))
-                    .tint(KitColor.green)
-                    .disabled(
-                        expired
-                            || !EmailAccountValidation.isValidOpaqueToken(verificationToken)
-                            || model.isLoading
-                    )
-
-                    if model.emailRegistrationAvailable {
-                        Divider().padding(.vertical, 4)
-                        TextField("Email address for resend", text: $verificationEmail)
-                            .keyboardType(.emailAddress)
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
-                            .textContentType(.username)
-                            .disabled(model.isLoading)
-                            .authField()
-                        Button(
-                            resendDelay > 0
-                                ? "Send again in \(resendDelay)s"
-                                : "Send a new verification email"
-                        ) {
-                            let submittedEmail = verificationEmail
-                            // A transport failure can occur after the server queues delivery, so
-                            // begin the anti-throttle window at submission rather than response.
-                            verificationResendAvailableAt =
-                                EmailVerificationChallengeTimingPolicy.resendAvailableAt(from: Date())
-                            feedbackMessage = nil
-                            Task {
-                                if let message = await model.resendEmailVerification(
-                                    email: submittedEmail
-                                ) {
-                                    // The enumeration-safe resend response deliberately omits the
-                                    // new token expiry. The backend also retires the prior token.
-                                    verificationToken = ""
-                                    verificationExpiresAt = nil
-                                    feedbackMessage = message
-                                }
-                            }
-                        }
-                        .frame(maxWidth: .infinity)
-                        .disabled(
-                            resendDelay > 0
-                                || !EmailAccountValidation.isValidEmail(verificationEmail)
-                                || model.isLoading
-                        )
+            Button {
+                let submittedToken = verificationToken
+                feedbackMessage = nil
+                Task {
+                    if let verifiedEmail = await model.verifyEmail(token: submittedToken) {
+                        verificationToken = ""
+                        email = verifiedEmail
+                        returnToSignIn(message: "Email verified. Sign in to continue.")
                     }
                 }
+            } label: {
+                Text("Verify email")
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 15)
             }
+            .buttonStyle(.borderedProminent)
+            .buttonBorderShape(.roundedRectangle(radius: 18))
+            .tint(KitColor.green)
+            .disabled(
+                !EmailAccountValidation.isValidOpaqueToken(verificationToken)
+                    || model.isLoading
+            )
         }
     }
 
@@ -572,8 +456,10 @@ struct OnboardingView: View {
             accountBackButton("Back to sign in")
             Text("Reset your password")
                 .font(.title2.bold())
+                .foregroundStyle(KitColor.primaryText)
             Text("We will email reset instructions if the address belongs to an eligible account.")
-                .foregroundStyle(.secondary)
+                .foregroundStyle(KitColor.secondaryText)
+                .fixedSize(horizontal: false, vertical: true)
 
             TextField("Email address", text: $recoveryEmail)
                 .keyboardType(.emailAddress)
@@ -609,8 +495,10 @@ struct OnboardingView: View {
             accountBackButton("Back to sign in")
             Text("Choose a new password")
                 .font(.title2.bold())
+                .foregroundStyle(KitColor.primaryText)
             Text("Paste the single-use token from your password reset email.")
-                .foregroundStyle(.secondary)
+                .foregroundStyle(KitColor.secondaryText)
+                .fixedSize(horizontal: false, vertical: true)
 
             SecureField("Reset token", text: $resetToken)
                 .keyboardType(.asciiCapable)
@@ -632,7 +520,7 @@ struct OnboardingView: View {
                 .authField()
             Text("Use at least 12 characters with uppercase, lowercase, and a number.")
                 .font(.footnote)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(KitColor.secondaryText)
 
             Button {
                 submitPasswordReset()
@@ -663,18 +551,10 @@ struct OnboardingView: View {
         .disabled(model.isLoading)
     }
 
-    private var verificationInstructions: String {
-        if let verificationDestination, !verificationDestination.isEmpty {
-            return "Paste the secure verification token sent to \(verificationDestination)."
-        }
-        return "Paste the secure verification token from your Kit Pay email."
-    }
-
     private var capabilitySignature: String {
         [
             model.phoneOTPAvailable,
             model.emailPasswordAvailable,
-            model.emailRegistrationAvailable,
             model.emailRecoveryAvailable,
         ].map { String($0) }.joined(separator: ":")
     }
@@ -688,8 +568,8 @@ struct OnboardingView: View {
     private func applyDeepLink(_ link: KitDeepLink?) {
         guard let link, model.pendingChallenge == nil else { return }
         // Both screens are unconditional completion routes, so they open whatever the capability
-        // rollout currently says about email sign-in. The picker behind them only moves when
-        // email sign-in is actually offered, so backing out never lands on a disabled method.
+        // rollout currently says about email sign-in. The email path behind them only renders
+        // when email sign-in is actually offered, so backing out never lands on a disabled method.
         if model.emailPasswordAvailable { signInMethod = .email }
         accountScreen = link.screen
         switch link {
@@ -726,22 +606,9 @@ struct OnboardingView: View {
         }
     }
 
-    private func openRegistration() {
-        guard emailNavigationPolicy.allows(.registration), !model.isLoading else { return }
-        model.resetPendingAuthentication()
-        clearAccountSecrets()
-        registrationEmail = email
-        accountScreen = .registration
-        feedbackMessage = nil
-    }
-
     private func openVerification() {
         guard emailNavigationPolicy.allows(.verification), !model.isLoading else { return }
         model.resetPendingAuthentication()
-        verificationEmail = EmailAccountValidation.normalizeEmail(email)
-        verificationDestination = nil
-        verificationExpiresAt = nil
-        verificationResendAvailableAt = nil
         verificationToken = ""
         password = ""
         accountScreen = .verification
@@ -763,40 +630,6 @@ struct OnboardingView: View {
         clearAccountSecrets()
         accountScreen = .resetPassword
         feedbackMessage = nil
-    }
-
-    private func submitRegistration() {
-        let name = registrationName
-        let tag = registrationTag
-        let submittedEmail = registrationEmail
-        let submittedPassword = registrationPassword
-        let submittedConfirmation = registrationPasswordConfirmation
-        feedbackMessage = nil
-
-        Task {
-            guard let result = await model.registerWithEmail(
-                name: name,
-                tag: tag,
-                email: submittedEmail,
-                password: submittedPassword,
-                passwordConfirmation: submittedConfirmation
-            ) else { return }
-            registrationPassword = ""
-            registrationPasswordConfirmation = ""
-            verificationEmail = result.user.email ?? EmailAccountValidation.normalizeEmail(submittedEmail)
-            verificationDestination = result.challenge.destination
-            verificationExpiresAt = EmailVerificationChallengeTimingPolicy.expirationDate(
-                for: result.challenge
-            )
-            verificationResendAvailableAt =
-                EmailVerificationChallengeTimingPolicy.resendAvailableAt(from: Date())
-            registrationName = ""
-            registrationTag = ""
-            registrationEmail = ""
-            verificationToken = ""
-            accountScreen = .verification
-            feedbackMessage = "We sent a verification token to \(result.challenge.destination)."
-        }
     }
 
     private func submitPasswordReset() {
@@ -836,16 +669,12 @@ struct OnboardingView: View {
         guard !model.isLoading else { return }
         model.resetPendingAuthentication()
         clearAccountSecrets()
-        verificationExpiresAt = nil
-        verificationResendAvailableAt = nil
         accountScreen = .signIn
         feedbackMessage = message
     }
 
     private func clearAccountSecrets() {
         password = ""
-        registrationPassword = ""
-        registrationPasswordConfirmation = ""
         verificationToken = ""
         resetToken = ""
         resetPassword = ""
@@ -865,12 +694,24 @@ struct OnboardingView: View {
         return "Enter the verification code sent to \(destination)."
     }
 
+    /// One-time-code entry that keeps system autofill (`.oneTimeCode` on a real text field) and
+    /// fits everywhere: the type scales with Dynamic Type and shrinks before clipping instead
+    /// of assuming a fixed 32-point layout. The field focuses itself when the challenge appears,
+    /// and VoiceOver announces what it is — the "000000" placeholder is a visual hint only.
     private func authenticationCodeEntry(for challenge: AuthChallenge) -> some View {
         Group {
             if isAuthenticatorChallenge(challenge) {
                 SecureField("Authenticator or recovery code", text: $authenticationCode)
+                    .font(.title3.weight(.semibold).monospaced())
+                    .accessibilityLabel("Authenticator or recovery code")
+                    .accessibilityHint(
+                        "Enter the six-digit code from your authenticator app, or a saved recovery code."
+                    )
             } else {
                 TextField("000000", text: $authenticationCode)
+                    .font(.system(.largeTitle, design: .monospaced).weight(.bold))
+                    .accessibilityLabel("Verification code")
+                    .accessibilityHint("Enter the six-digit code Kit sent you.")
             }
         }
         .keyboardType(isAuthenticatorChallenge(challenge) ? .asciiCapable : .numberPad)
@@ -878,21 +719,24 @@ struct OnboardingView: View {
         .textInputAutocapitalization(.characters)
         .autocorrectionDisabled()
         .multilineTextAlignment(.center)
-        .font(.system(
-            size: isAuthenticatorChallenge(challenge) ? 22 : 32,
-            weight: .bold,
-            design: .monospaced
-        ))
+        .minimumScaleFactor(0.5)
+        .lineLimit(1)
         .privacySensitive()
         .disabled(model.isLoading)
+        .focused($authenticationCodeFieldIsFocused)
+        .accessibilityIdentifier("authentication-code-field")
         .authField()
         .onChange(of: authenticationCode) { _, value in
             if !isAuthenticatorChallenge(challenge) {
-                authenticationCode = String(value.filter(\.isNumber).prefix(6))
+                // Canonicalize, don't just filter: localized keyboards and pasted text produce
+                // numerals the strict ASCII submission policy rejects, which used to leave a
+                // visually full field with a verify button that never enabled.
+                authenticationCode = AuthenticationCodePolicy.sanitizedSixDigitEntry(value)
             } else {
                 authenticationCode = String(value.filter { !$0.isNewline }.prefix(64))
             }
         }
+        .onAppear { authenticationCodeFieldIsFocused = true }
     }
 
     private func challengeCodeIsValid(_ challenge: AuthChallenge) -> Bool {
@@ -909,22 +753,19 @@ struct OnboardingView: View {
     }
 }
 
-private enum SignInMethod: String, CaseIterable, Identifiable {
+private enum SignInMethod: Equatable {
     case phone
     case email
-
-    var id: String { rawValue }
-    var title: String {
-        switch self {
-        case .phone: "Phone"
-        case .email: "Email"
-        }
-    }
 }
 
 private extension View {
     func authField() -> some View {
         padding(16)
             .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 18))
+            .overlay {
+                RoundedRectangle(cornerRadius: 18)
+                    .stroke(.white.opacity(0.72), lineWidth: 0.8)
+                    .allowsHitTesting(false)
+            }
     }
 }

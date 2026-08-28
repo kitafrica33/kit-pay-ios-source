@@ -688,6 +688,9 @@ final class AppModel: ObservableObject {
     @Published private(set) var unresolvedAccountDeletionAttemptBlocked = false
     @Published private(set) var messageConversationNavigationRequest:
         MessageConversationNavigationRequest?
+    /// A one-shot ask from another tab (Home's starter checklist) to open the new-message
+    /// contact picker. An identity rather than a Bool so repeat taps re-trigger consumption.
+    @Published private(set) var pendingNewMessageComposeID: UUID?
     /// Files (or a link) another app shared into Kit Pay, waiting for the customer to say which
     /// chat they are for. Drives the destination picker over the chats list.
     @Published private(set) var pendingSharedInboxBatch: SharedInboxBatch?
@@ -821,16 +824,15 @@ final class AppModel: ObservableObject {
     /// in session. Demo content is projected in memory and is never written to protected storage.
     private var authenticatedAppReviewDemoOwnerID: String?
 
+    /// Guards the one-shot starter-message milestone write from re-entrant publishes.
+    private var isRecordingStarterMessageMilestone = false
+
     var phoneOTPAvailable: Bool {
         capabilities?.supportsPhoneOTP == true
     }
 
     var emailPasswordAvailable: Bool {
         capabilities?.supportsEmailPassword == true
-    }
-
-    var emailRegistrationAvailable: Bool {
-        capabilities?.supportsEmailRegistration == true
     }
 
     var emailRecoveryAvailable: Bool {
@@ -1740,7 +1742,82 @@ final class AppModel: ObservableObject {
         state = displayedState
         syncAvatarCacheAccount()
         publishSharedDestinationsIfPossible()
+        recordStarterMessageMilestoneIfNeeded(from: projection.state)
         return displayedState
+    }
+
+    /// Persists the account-bound "first message actually sent" milestone the first time the
+    /// durable store shows one, so later chat deletion or history pagination cannot resurrect
+    /// the starter checklist. Reads the RAW store projection: App Review demo rows are injected
+    /// only into the displayed copy and can never reach this write.
+    private func recordStarterMessageMilestoneIfNeeded(from persisted: PersistedState) {
+        guard persisted.starterFirstMessageAt == nil,
+              persisted.profile != nil,
+              !isRecordingStarterMessageMilestone,
+              HomeStarterChecklistPolicy.hasSentFirstMessage(messages: persisted.messages)
+        else { return }
+        isRecordingStarterMessageMilestone = true
+        Task { [weak self] in
+            guard let self else { return }
+            defer { isRecordingStarterMessageMilestone = false }
+            try? await store.update { state in
+                guard state.starterFirstMessageAt == nil,
+                      HomeStarterChecklistPolicy.hasSentFirstMessage(messages: state.messages)
+                else { return }
+                state.starterFirstMessageAt = Date()
+            }
+            await publishLatestState()
+        }
+    }
+
+    /// Confirms starter milestones from the optional server contract, which can only add: a
+    /// server-completed milestone sets the same persisted account-bound marker a locally
+    /// observed milestone sets, while a missing capability, a malformed or wrong-account
+    /// payload, `eligible` false, a bad policy version, an unknown or duplicate key, an unknown
+    /// status, and fetch failures all leave the honest device-local evidence in charge.
+    /// `verify_identity` is validated as part of the payload but maps to nothing here — KYC
+    /// keeps its own server-owned contract. A background confirmation signal on purpose — it
+    /// never surfaces an error and never touches KYC or device state.
+    private func confirmStarterMilestonesFromServerIfSupported(
+        accountEpoch expectedAccountEpoch: UUID,
+        sessionID expectedSessionID: String,
+        userID expectedUserID: String
+    ) async {
+        guard capabilities?.supportsFeature(StarterMilestonesDTO.capabilityKey) == true,
+              state.starterFirstMessageAt == nil || state.starterFirstTransactionAt == nil
+        else { return }
+        guard let checklist = try? await APIClientSessionBinding.$sessionID.withValue(
+            expectedSessionID,
+            operation: { try await api.starterMilestones() }
+        ) else { return }
+        // The payload has to speak for the signed-in account and be eligible before any key
+        // counts; those checks live in the DTO so the contract test can hold them still.
+        guard let confirmed = checklist.confirmedMilestoneKeys(forAccountID: expectedUserID),
+              !confirmed.isEmpty,
+              await callHistoryContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                sessionID: expectedSessionID,
+                userID: expectedUserID
+              )
+        else { return }
+        try? await store.update { persisted in
+            guard persisted.profile?.id.caseInsensitiveCompare(expectedUserID) == .orderedSame
+            else { throw StoreError.accountChanged }
+            if confirmed.contains(StarterMilestonesDTO.sendFirstMessageMilestoneKey),
+               persisted.starterFirstMessageAt == nil {
+                persisted.starterFirstMessageAt = Date()
+            }
+            if confirmed.contains(StarterMilestonesDTO.makeFirstTransactionMilestoneKey),
+               persisted.starterFirstTransactionAt == nil {
+                persisted.starterFirstTransactionAt = Date()
+            }
+        }
+        guard await callHistoryContextIsCurrent(
+            accountEpoch: expectedAccountEpoch,
+            sessionID: expectedSessionID,
+            userID: expectedUserID
+        ) else { return }
+        await publishLatestState()
     }
 
     /// Points the profile-photo cache at whichever account is on screen.
@@ -2596,59 +2673,6 @@ final class AppModel: ObservableObject {
         pendingChallengeReceivedAt = nil
     }
 
-    func registerWithEmail(
-        name: String,
-        tag: String,
-        email: String,
-        password: String,
-        passwordConfirmation: String
-    ) async -> EmailRegistrationResult? {
-        guard !isSignedIn else {
-            lastError = "Sign out before creating another account."
-            return nil
-        }
-        guard emailRegistrationAvailable else {
-            lastError = "Email registration is not available right now."
-            return nil
-        }
-        guard !isLoading else { return nil }
-        if let validationError = EmailAccountValidation.registrationError(
-            name: name,
-            tag: tag,
-            email: email,
-            password: password,
-            passwordConfirmation: passwordConfirmation
-        ) {
-            lastError = emailAccountValidationMessage(validationError)
-            return nil
-        }
-
-        let attempt = beginAuthenticationRequest()
-        defer { finishAuthenticationRequest(attempt) }
-        do {
-            let result = try await api.registerWithEmail(
-                name: name,
-                tag: tag,
-                email: email,
-                password: password,
-                passwordConfirmation: passwordConfirmation,
-                countryCode: "UG",
-                locale: "en",
-                timezone: TimeZone.autoupdatingCurrent.identifier
-            )
-            guard authenticationAttempt == attempt else { return nil }
-            guard EmailAccountResponsePolicy.acceptsRegistration(
-                result,
-                requestedEmail: email
-            )
-            else { throw AuthUIError.invalidResponse }
-            return result
-        } catch {
-            recordAuthenticationError(error, for: attempt)
-            return nil
-        }
-    }
-
     func verifyEmail(token: String) async -> String? {
         guard !isSignedIn, !isLoading else { return nil }
         guard EmailAccountValidation.isValidOpaqueToken(token) else {
@@ -2663,30 +2687,6 @@ final class AppModel: ObservableObject {
             guard let verifiedEmail = EmailAccountResponsePolicy.verifiedEmail(from: result)
             else { throw AuthUIError.invalidResponse }
             return verifiedEmail
-        } catch {
-            recordAuthenticationError(error, for: attempt)
-            return nil
-        }
-    }
-
-    func resendEmailVerification(email: String) async -> String? {
-        guard !isSignedIn else { return nil }
-        guard emailRegistrationAvailable else {
-            lastError = "New verification emails are not available right now."
-            return nil
-        }
-        guard !isLoading else { return nil }
-        guard EmailAccountValidation.isValidEmail(email) else {
-            lastError = "Enter a valid email address."
-            return nil
-        }
-        let attempt = beginAuthenticationRequest()
-        defer { finishAuthenticationRequest(attempt) }
-        do {
-            let result = try await api.resendEmailVerification(email: email)
-            guard authenticationAttempt == attempt else { return nil }
-            return result.message
-                ?? "If the address is eligible, a new verification email will be sent."
         } catch {
             recordAuthenticationError(error, for: attempt)
             return nil
@@ -3360,7 +3360,10 @@ final class AppModel: ObservableObject {
                         recipientUserID: nil,
                         displayName: displayName,
                         kind: .group,
-                        memberCount: memberIDs.count
+                        memberCount: memberIDs.count,
+                        avatarURL: SharedInboxPolicy.destinationAvatarURL(
+                            conversation.groupPhotoURL
+                        )
                     ), conversation.updatedAt)
                 }
 
@@ -3376,7 +3379,8 @@ final class AppModel: ObservableObject {
                     recipientUserID: recipientUserID,
                     displayName: displayName,
                     kind: .direct,
-                    memberCount: nil
+                    memberCount: nil,
+                    avatarURL: SharedInboxPolicy.destinationAvatarURL(identity.avatarURL)
                 ), conversation.updatedAt)
             }
         let contactDestinations = ContactRecipientDirectory
@@ -3396,7 +3400,8 @@ final class AppModel: ObservableObject {
                     recipientUserID: recipientUserID,
                     displayName: displayName,
                     kind: .contact,
-                    memberCount: nil
+                    memberCount: nil,
+                    avatarURL: SharedInboxPolicy.destinationAvatarURL(contact.avatarURL)
                 )
             }
         let destinations = SharedInboxPolicy.orderedDestinations(
@@ -3465,14 +3470,15 @@ final class AppModel: ObservableObject {
         routeRequestedSharedInboxDestinationIfPossible()
     }
 
-    /// Stable share item UUIDs double as outbox/message UUIDs. The protected local projection is
-    /// therefore the durable truth after a process restart: if any item already exists, the batch
-    /// is pinned to that conversation and can never be re-routed into a duplicate/collision.
+    /// A share sends as exactly one message under the batch UUID, whatever its shape —
+    /// text-only, one attachment, or a 2–8 batch — so that one UUID is the only durable
+    /// footprint to look for. The protected local projection is the durable truth after a
+    /// process restart: if that message already exists, the batch is pinned to its
+    /// conversation and can never be re-routed into a duplicate/collision. (Item UUIDs are
+    /// composer staging tags and never become message IDs.)
     private func durableSharedInboxConversationIDs(for batch: SharedInboxBatch) -> Set<String> {
-        var messageIDs = Set(batch.items.map(\.id))
-        if batch.text != nil { messageIDs.insert(batch.id) }
-        return Set(state.messages.compactMap { message in
-            guard message.isOutgoing, messageIDs.contains(message.id) else { return nil }
+        Set(state.messages.compactMap { message in
+            guard message.isOutgoing, message.id == batch.id else { return nil }
             return SharedInboxPolicy.canonicalConversationID(message.conversationId)
         })
     }
@@ -3637,9 +3643,10 @@ final class AppModel: ObservableObject {
         guard let destination = sharedInboxDestinationRequest(for: conversation) else { return }
         let pinnedBatch: SharedInboxBatch
         do {
-            // Persist the validated destination before the first queue attempt. If the process is
-            // killed after item one of eight, both the manifest and the stable local message IDs
-            // independently force the remaining seven back into this exact conversation.
+            // Persist the validated destination before the queue attempt. The whole share is
+            // one queue commit under the batch UUID, so if the process dies mid-send, both the
+            // manifest and that stable message identity independently force a retried share
+            // back into this exact conversation.
             pinnedBatch = try SharedInboxStore.shared.pinDestination(
                 for: batch,
                 to: destination
@@ -5730,6 +5737,16 @@ final class AppModel: ObservableObject {
                           persisted.selectedWalletId == selectedWalletID
                     else { throw StoreError.accountChanged }
                     persisted.transactions = transactions
+                    // The page above is only the latest slice of one wallet, so the starter
+                    // checklist's account-wide milestone is remembered the moment a settled
+                    // movement is seen in server-confirmed rows — and never recomputed away.
+                    // Demo content is projected in memory only and can never reach this write.
+                    if persisted.starterFirstTransactionAt == nil,
+                       HomeStarterChecklistPolicy.hasMadeFirstTransaction(
+                           transactions: transactions
+                       ) {
+                        persisted.starterFirstTransactionAt = Date()
+                    }
                 }
                 guard await callHistoryContextIsCurrent(
                     accountEpoch: expectedAccountEpoch,
@@ -5750,6 +5767,12 @@ final class AppModel: ObservableObject {
                 lastError = error.localizedDescription
             }
         }
+
+        await confirmStarterMilestonesFromServerIfSupported(
+            accountEpoch: expectedAccountEpoch,
+            sessionID: expectedSessionID,
+            userID: expectedUserID
+        )
 
         if callsFeatureEnabled {
             await loadCallContacts()
@@ -6345,6 +6368,18 @@ final class AppModel: ObservableObject {
             lastError = CustomerFacingMessagingCopy.openConversationFailure
             return false
         }
+    }
+
+    /// Switches to Messages and asks the chats list to open its contact picker — the starter
+    /// checklist's route into a first message.
+    func requestNewMessageCompose() {
+        selectedTab = MainTabIndex.messages
+        pendingNewMessageComposeID = UUID()
+    }
+
+    func consumeNewMessageComposeRequest(_ id: UUID) {
+        guard pendingNewMessageComposeID == id else { return }
+        pendingNewMessageComposeID = nil
     }
 
     private func routeToConversation(_ conversation: Conversation) {
@@ -6950,7 +6985,10 @@ final class AppModel: ObservableObject {
             try await api.requestProfileEmailAttachment(email: normalizedEmail)
         }
         let receivedAt = Date()
-        guard emailRegistrationAvailable,
+        // Email attachment is the setup step for later email sign-in and recovery, so every
+        // gate on this flow rides the email_recovery capability — never the retired
+        // registration flag.
+        guard emailRecoveryAvailable,
               await authenticatedSecurityContextIsCurrent(context),
               let challenge = ProfileEmailChallengePolicy.challenge(
                 from: result,
@@ -6994,7 +7032,7 @@ final class AppModel: ObservableObject {
                 code: normalizedCode
             )
         }
-        guard emailRegistrationAvailable,
+        guard emailRecoveryAvailable,
               await authenticatedSecurityContextIsCurrent(context)
         else { throw ProfileEmailAttachmentError.unavailable }
 
@@ -7038,7 +7076,7 @@ final class AppModel: ObservableObject {
 
     private func captureProfileEmailContext() async throws -> AuthenticatedSecurityContext {
         guard isOnline else { throw ProfileEmailAttachmentError.offline }
-        guard emailRegistrationAvailable,
+        guard emailRecoveryAvailable,
               isSignedIn,
               !isUpdatingProfile,
               accountSetupStep == nil,
@@ -8826,6 +8864,20 @@ final class AppModel: ObservableObject {
     }
 
     private func scheduledMessagePreview(_ message: LocalMessage) -> String {
+        if let batch = message.pendingMediaBatch {
+            // Structural gate first: a corrupt persisted batch previews as the bare
+            // placeholder — its unvalidated caption and unbounded items never drive a label.
+            // A caption that passes is canonical (non-nil is the whole test) and rides
+            // byte-exact.
+            guard batch.isStructurallyValid else {
+                return KitMediaMessageFamilyPresentation.genericAttachmentLabel
+            }
+            let label = KitMediaMessageFamilyPresentation.summaryLabel(
+                forMediaTypes: batch.items.map(\.mediaType)
+            )
+            if let caption = batch.caption { return "\(label) · \(caption)" }
+            return label
+        }
         if let pending = message.pendingAttachment {
             if let caption = pending.caption, !caption.isEmpty { return caption }
             return KitChatMediaKind(mediaType: pending.mediaType).previewLabel
@@ -8833,6 +8885,16 @@ final class AppModel: ObservableObject {
         if let descriptor = KitMediaMessageDescriptor.parse(message.body) {
             if let caption = descriptor.caption, !caption.isEmpty { return caption }
             return KitChatMediaKind(mediaType: descriptor.mediaType).previewLabel
+        }
+        if let sealed = KitMediaMessageV2Descriptor.parse(message.body) {
+            let label = KitMediaMessageFamilyPresentation.summaryLabel(for: sealed)
+            if let caption = sealed.caption, !caption.isEmpty { return "\(label) · \(caption)" }
+            return label
+        }
+        // Fail closed for anything else reserved-family shaped: a scheduled row must never
+        // surface raw descriptor text, whichever build or path wrote it.
+        if KitMediaMessageFamilyPolicy.isReservedFamilyText(message.body) {
+            return KitMediaMessageFamilyPresentation.genericAttachmentLabel
         }
         return message.body
     }
@@ -8954,6 +9016,7 @@ final class AppModel: ObservableObject {
         else { return nil }
         let expectedAccountEpoch = accountEpoch
         var removed: LocalMessage?
+        var deletableMediaKeys: [String] = []
         do {
             state = try await commitAuthenticatedMutation(
                 accountEpoch: expectedAccountEpoch,
@@ -8971,13 +9034,36 @@ final class AppModel: ObservableObject {
                     in: &persisted,
                     at: now
                 )
+                // Media-cache cleanup candidates come from every generation and phase of the
+                // cancelled row (v1 park, sealed v1 key, v2 batch park/checkpoint/sealed keys),
+                // decided against the post-removal state: a corrupt or aliased projection can
+                // carry a canonical key another live message still owns, so a blob is deleted
+                // only when no surviving message anywhere still references it. Orphaning on
+                // uncertainty is recoverable housekeeping; deleting a survivor's only
+                // plaintext is not.
+                if let cancelled = removed {
+                    let survivorKeys = Set(persisted.messages.flatMap(\.localMediaStorageKeys))
+                    deletableMediaKeys = cancelled.localMediaStorageKeys
+                        .filter { !survivorKeys.contains($0) }
+                }
             }
         } catch {
             lastError = "Kit Pay could not update this scheduled item. Please try again."
             return nil
         }
+        for storageKey in deletableMediaKeys {
+            await SecureMediaFileCache.shared.remove(
+                forStorageKey: storageKey,
+                userID: expectedUserID
+            )
+        }
         scheduleOutboxWake()
+        // Only ordinary authored text may return to the composer as a draft. A pending v1
+        // caption, a v2 batch caption or placeholder, and any KITMEDIA-family body (the
+        // tightened `allowsUserAuthoredText` refuses the whole family) all stay out: no
+        // descriptor or media projection may reappear as detached editable text.
         guard let removed, removed.pendingAttachment == nil,
+              removed.pendingMediaBatch == nil,
               KitMediaMessageDescriptor.parse(removed.body) == nil,
               SecureMessageReservedPrefixPolicy.allowsUserAuthoredText(removed.body)
         else { return nil }
@@ -9278,6 +9364,233 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Sends 2–8 attachments end-to-end encrypted as ONE multi-attachment (KITMEDIA2) message:
+    /// one bubble, one optional caption, one wire POST, one idempotency identity. The batch is
+    /// never split into per-attachment messages — every validation failure fails the whole send
+    /// visibly with the composer draft and staged files preserved. `rawCaption` is the typed
+    /// text before any platform trimming; the contract's exact six-codepoint strip inside
+    /// `KitMediaMessageV2OutboundBatch.queued` is the only normalization ever applied to it.
+    /// A shared-in handoff of any shape passes its batch UUID as `clientMessageID` — the sole
+    /// message identity for that delivery — making the whole share one idempotent send and the
+    /// durable footprint restart recovery pins the batch by.
+    @discardableResult
+    func queueMediaMessageBatch(
+        conversationId: String,
+        title: String,
+        recipientId: String?,
+        attachments: [(mediaData: Data, mediaType: String)],
+        rawCaption: String?,
+        clientMessageID: UUID? = nil,
+        submittedDraftBody: String? = nil,
+        draftClearVersion: ConversationDraftWriteVersion? = nil,
+        deliverAt: Date? = nil,
+        replyToServerMessageID: String? = nil
+    ) async -> Bool {
+        guard !isReadOnlyAppReviewDemoConversation(conversationId) else {
+            lastError = "This App Review preview is read-only."
+            return false
+        }
+        guard (submittedDraftBody == nil) == (draftClearVersion == nil) else {
+            lastError = CustomerFacingMessagingCopy.draftSaveFailure
+            return false
+        }
+        guard let cleanConversationId = OutboxPolicy.canonicalConversationID(conversationId) else {
+            lastError = "This conversation is no longer available. Nothing was sent."
+            return false
+        }
+        guard (KitMediaMessageV2Descriptor.minimumAttachmentCount
+            ... KitMediaMessageV2Descriptor.maximumAttachmentCount)
+            .contains(attachments.count)
+        else {
+            lastError = "Send between 2 and 8 attachments together."
+            return false
+        }
+        for attachment in attachments {
+            let kind = KitChatMediaKind(mediaType: attachment.mediaType)
+            guard KitChatMediaLimits.fits(attachment.mediaData.count, kind: kind) else {
+                lastError =
+                    "\(kind.previewLabel)s can be up to \(KitChatMediaLimits.maximumTransferLabel)."
+                return false
+            }
+        }
+        let replyTarget = replyToServerMessageID
+            .flatMap { UUID(uuidString: $0)?.uuidString.lowercased() }
+        if replyToServerMessageID != nil {
+            guard let replyTarget,
+                  state.messages.contains(where: { message in
+                      message.conversationId.caseInsensitiveCompare(cleanConversationId)
+                          == .orderedSame
+                          && message.serverMessageId?.lowercased() == replyTarget
+                          && message.secureMessagingHistory?.kind.isTimelineMetadata != true
+                  })
+            else {
+                lastError = "That message is no longer available to reply to."
+                return false
+            }
+        }
+        let isGroupTarget = state.conversations.first(where: {
+            $0.id.caseInsensitiveCompare(cleanConversationId) == .orderedSame
+        })?.isGroup == true
+        guard MessagingGroupCapabilityPolicy.allowsConversationMutation(
+            isGroup: isGroupTarget,
+            groupCapabilityEnabled: messagingGroupsEnabled
+        ) else {
+            lastError = "Group messaging is not available right now. You can still read this conversation."
+            return false
+        }
+        // Compose is capability-gated (§6). A server rollout can complete while this process
+        // still holds its launch snapshot, so refresh once at send time before presenting an
+        // unavailable result; a withdrawal fails the whole batch visibly — the send never
+        // silently degrades into per-attachment legacy messages from inside this API. Offline,
+        // the batch queues locally and the authoritative admission gate runs at flush.
+        if isOnline, capabilities?.enablesMessagingMediaMessageV2 != true {
+            _ = await reloadCapabilities()
+            guard capabilities?.enablesMessagingMediaMessageV2 == true else {
+                lastError =
+                    "Sending multiple attachments in one message is not available on this Kit Pay service yet."
+                return false
+            }
+        }
+        guard secureMessagingAvailable else {
+            lastError = messagingSendFailureMessage
+            return false
+        }
+        // Group threads queue without a pinned single recipient; per-member privacy and group
+        // attestation run authoritatively at flush and on the server, exactly like v1.
+        let recipientUserID: String?
+        if isGroupTarget {
+            recipientUserID = nil
+        } else {
+            guard let recipientId,
+                  let recipientUUID = UUID(
+                      uuidString: recipientId.trimmingCharacters(in: .whitespacesAndNewlines)
+                  )
+            else {
+                lastError = "Choose one valid Kit Pay recipient."
+                return false
+            }
+            recipientUserID = recipientUUID.uuidString.lowercased()
+        }
+        guard let userID = profile?.id,
+              let expectedSessionID = await sessions.current()?.sessionId
+        else {
+            lastError = "Choose one valid Kit Pay recipient."
+            return false
+        }
+        let expectedAccountEpoch = accountEpoch
+        guard await outboxContextIsCurrent(
+            accountEpoch: expectedAccountEpoch,
+            userID: userID,
+            sessionID: expectedSessionID
+        ) else { return false }
+        if let recipientUserID,
+           let denial = communicationPrivacyDenialMessage(
+               for: recipientUserID,
+               blockedMessage: "Unblock this account before sending these attachments."
+           ) {
+            lastError = denial
+            return false
+        }
+        // Offline-first: every plaintext parks in the encrypted media file cache under a fresh
+        // locally minted key BEFORE anything durable exists, so the queued bubble renders and
+        // the upload pipeline replays from the outbox with no composer state left behind. The
+        // keys are exclusively this invocation's scratch until the coordinator commit succeeds;
+        // any failure removes exactly these fresh keys and nothing else.
+        var parkedKeys: [String] = []
+        var drafts: [KitMediaMessageV2OutboundBatch.DraftAttachment] = []
+        func rollbackParks() async {
+            for key in parkedKeys {
+                await SecureMediaFileCache.shared.remove(forStorageKey: key, userID: userID)
+            }
+        }
+        for attachment in attachments {
+            let localKey = UUID().uuidString.lowercased()
+            do {
+                try await SecureMediaFileCache.shared.store(
+                    attachment.mediaData,
+                    forStorageKey: localKey,
+                    userID: userID
+                )
+            } catch {
+                await rollbackParks()
+                lastError = error.localizedDescription
+                return false
+            }
+            parkedKeys.append(localKey)
+            drafts.append(KitMediaMessageV2OutboundBatch.DraftAttachment(
+                mediaType: attachment.mediaType,
+                plaintextByteSize: attachment.mediaData.count,
+                localStorageKey: localKey
+            ))
+        }
+        guard MessagingGroupCapabilityPolicy.allowsConversationMutation(
+            isGroup: isGroupTarget,
+            groupCapabilityEnabled: messagingGroupsEnabled
+        ) else {
+            await rollbackParks()
+            lastError = "Group messaging is not available right now. You can still read this conversation."
+            return false
+        }
+        do {
+            let batch = try KitMediaMessageV2OutboundBatch.queued(
+                attachments: drafts,
+                rawCaption: rawCaption,
+                keyMaterialFactory: { try SecureMediaAttachmentCipher.randomKeyMaterial() }
+            )
+            _ = try await SecureMessagingExchangeCoordinator.shared.queueDeferredMediaBatch(
+                forUserID: userID,
+                conversationID: cleanConversationId,
+                expectedRecipientUserID: recipientUserID,
+                title: title,
+                batch: batch,
+                clientMessageID: clientMessageID,
+                submittedDraftBody: submittedDraftBody,
+                draftClearVersion: draftClearVersion,
+                deliverAt: deliverAt,
+                replyToServerMessageID: replyTarget
+            )
+            // On an idempotent replay of an already-durable batch the coordinator itself
+            // removes the redundant scratch parks this call offered; nothing to reconcile here.
+            guard await reloadOutboxStateIfCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: userID,
+                sessionID: expectedSessionID
+            ) else { return false }
+            scheduleOutboxWake()
+            if isOnline {
+                Task { [weak self] in await self?.flushOutbox() }
+            }
+            return true
+        } catch let error as KitMediaMessageV2OutboundBatch.QueueValidationError {
+            await rollbackParks()
+            guard await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: userID,
+                sessionID: expectedSessionID
+            ) else { return false }
+            // Each §4 violation fails the whole send visibly under its own reason; the staged
+            // attachments and typed draft stay untouched in the composer for another attempt.
+            switch error {
+            case .invalidItems:
+                lastError =
+                    "These attachments can't be sent together. Send 2 to 8 files, each up to \(KitChatMediaLimits.maximumTransferLabel)."
+            case .captionOverBudget:
+                lastError = "That caption is too long to send with these attachments. Shorten it and try again."
+            case .reservedCaption:
+                lastError = "This caption can't be sent. Edit it and try again."
+            }
+            return false
+        } catch {
+            await rollbackParks()
+            return await queueMediaMessageFailureResult(
+                error,
+                accountEpoch: expectedAccountEpoch,
+                userID: userID,
+                sessionID: expectedSessionID
+            )
+        }
+    }
+
     private func queueMediaMessageFailureResult(
         _ error: Error,
         accountEpoch expectedAccountEpoch: UUID,
@@ -9293,67 +9606,297 @@ final class AppModel: ObservableObject {
         return false
     }
 
-    /// Plaintext bytes for a message that is still pending upload. Small media rides inline on
-    /// the message; large media is parked in the encrypted file cache under a local key.
-    func loadPendingMedia(for message: LocalMessage) async -> Data? {
-        if let inline = message.attachmentData, !inline.isEmpty {
-            return inline
+    /// Plaintext bytes for a single-attachment message that is still pending upload — returned
+    /// together with the MIME type and caption of the very resolution that produced them —
+    /// addressed by identity like every other media load. `SecureMediaLoadPolicy
+    /// .resolvePendingSingle` gates the one current persisted row (coherent storage form, bound
+    /// body, size bounds) before anything is served; a parked read is pinned to the declared
+    /// byte count, and after the cache await the same account and identity must resolve to the
+    /// identical complete shape again — a row that sealed, vanished, or was rewritten during
+    /// the read serves nothing.
+    func loadPendingMedia(
+        messageID: UUID,
+        conversationId: String
+    ) async -> SecureMediaLoadPolicy.LoadedItem? {
+        let snapshot = await store.snapshot()
+        guard let userID = snapshot.profile?.id,
+              let pending = SecureMediaLoadPolicy.resolvePendingSingle(
+                  messageID: messageID,
+                  conversationId: conversationId,
+                  in: snapshot.messages
+              )
+        else { return nil }
+        if let inline = pending.inlineData {
+            return SecureMediaLoadPolicy.LoadedItem(
+                data: inline,
+                mediaType: pending.mediaType,
+                caption: pending.caption
+            )
         }
-        guard let localKey = message.pendingAttachment?.localStorageKey,
-              let userID = profile?.id else { return nil }
-        return await SecureMediaFileCache.shared.data(
-            forStorageKey: localKey,
-            userID: userID
+        guard let localKey = pending.localStorageKey,
+              let expected = pending.expectedByteCount,
+              let parked = await SecureMediaFileCache.shared.data(
+                  forStorageKey: localKey,
+                  userID: userID
+              ),
+              parked.count == expected
+        else { return nil }
+        // The cache read suspended; re-prove account ownership and the identical authoritative
+        // shape before the bytes leave this method — an account switch swaps the whole persisted
+        // state, and a colliding identity there must not vouch for the prior account's blob.
+        let current = await store.snapshot()
+        guard current.profile?.id == userID,
+              SecureMediaLoadPolicy.resolvePendingSingle(
+                  messageID: messageID,
+                  conversationId: conversationId,
+                  in: current.messages
+              ) == pending
+        else { return nil }
+        return SecureMediaLoadPolicy.LoadedItem(
+            data: parked,
+            mediaType: pending.mediaType,
+            caption: pending.caption
         )
     }
 
-    func loadSecureMedia(
+    /// Display-only media kind for a forward payload entry, resolved by identity from the
+    /// currently published rows — payload entries carry no wire text to label themselves with.
+    /// nil when the identity no longer resolves to a forwardable sealed single attachment.
+    func secureMediaForwardKind(messageID: UUID, conversationId: String) -> KitChatMediaKind? {
+        guard case let .single(descriptor, _, _)? = SecureMediaLoadPolicy.resolve(
+            messageID: messageID,
+            conversationId: conversationId,
+            itemIndex: nil,
+            in: state.messages
+        ) else { return nil }
+        return KitChatMediaKind(mediaType: descriptor.mediaType)
+    }
+
+    /// Plaintext bytes for one media attachment — together with the MIME type and caption of
+    /// the row they were resolved from — addressed purely by identity: message UUID,
+    /// conversation, and — for a multi-attachment (KITMEDIA2) message — the §8 display index;
+    /// nil index is the single-attachment (KITMEDIA1) shape. `SecureMediaLoadPolicy` resolves
+    /// that identity against the CURRENT persisted rows (`store.snapshot()`, not a published UI
+    /// projection) and strictly re-parses and gates the one matching row before any cache
+    /// probe, so a stale view snapshot can never serve bytes for a message that has since been
+    /// deleted, replaced, or rewritten, and no caller-supplied descriptor text ever reaches the
+    /// verifying open paths. Consumers that re-encode media (forward, share) must take the
+    /// returned facts, never facts captured from an earlier row snapshot.
+    ///
+    /// Every cache probe and download suspends, so bytes are returned only after the same
+    /// identity resolves again: the sealed shapes must produce the identical item, and the v1
+    /// shape the identical body (its inline slot is the one field this very method legitimately
+    /// fills). A row deleted or replaced during any await serves — and caches — nothing.
+    ///
+    /// A still-pending batch item serves only from the local encrypted cache — its plaintext was
+    /// parked there at queue time and copied under the server storage key at each upload
+    /// checkpoint, and no server copy is bound to the message before the seal. A sealed item
+    /// tries the cache first, then downloads through the coordinator's verifying open path and
+    /// caches the result under the item's storage key for offline rereads. Batch items are never
+    /// stored inline on the message: `attachmentData` is the single-attachment v1 slot, and one
+    /// wallet-state rewrite must not carry up to eight large blobs with it.
+    ///
+    /// `allowsDownload` false serves only bytes that are already local (the row's inline slot or
+    /// the encrypted cache) and throws before touching the network otherwise — incidental
+    /// surfaces such as video poster frames probe with it so that scrolling a conversation never
+    /// silently downloads large attachments.
+    func loadSecureMediaItem(
+        messageID: UUID,
         conversationId: String,
-        descriptorText: String
-    ) async throws -> Data {
-        if let cached = state.messages.first(where: {
-            $0.conversationId == conversationId && $0.body == descriptorText
-        })?.attachmentData,
-           !cached.isEmpty {
-            return cached
-        }
-        guard let userID = profile?.id else {
+        itemIndex: Int?,
+        allowsDownload: Bool = true
+    ) async throws -> SecureMediaLoadPolicy.LoadedItem {
+        let snapshot = await store.snapshot()
+        guard let userID = snapshot.profile?.id else {
             throw SecureMessagingExchangeError.invalidAccount
         }
-        if let descriptor = KitMediaMessageDescriptor.parse(descriptorText),
-           let cached = await SecureMediaFileCache.shared.data(
-               forStorageKey: descriptor.storageKey,
-               userID: userID
-           ),
-           cached.count == descriptor.plaintextByteSize {
-            return cached
-        }
-        guard isOnline else { throw URLError(.notConnectedToInternet) }
-        guard secureMessagingAvailable else {
-            throw SecureMessagingExchangeError.invalidAccount
-        }
-        let data = try await SecureMessagingExchangeCoordinator.shared.openImage(
-            forUserID: userID,
-            conversationID: conversationId,
-            descriptorText: descriptorText
-        )
-        if KitChatMediaLimits.shouldCacheInline(byteCount: data.count) {
-            try await store.update { persisted in
-                guard persisted.profile?.id == userID else { throw StoreError.accountChanged }
-                guard let index = persisted.messages.firstIndex(where: {
-                    $0.conversationId == conversationId && $0.body == descriptorText
-                }) else { throw SecureMessagingExchangeError.invalidConversation }
-                persisted.messages[index].attachmentData = data
-            }
-            await publishLatestState()
-        } else if let descriptor = KitMediaMessageDescriptor.parse(descriptorText) {
-            try? await SecureMediaFileCache.shared.store(
-                data,
-                forStorageKey: descriptor.storageKey,
-                userID: userID
+        guard let resolved = SecureMediaLoadPolicy.resolve(
+            messageID: messageID,
+            conversationId: conversationId,
+            itemIndex: itemIndex,
+            in: snapshot.messages
+        ) else { throw SecureMediaAttachmentError.invalidDescriptor }
+        func currentResolution() async -> SecureMediaLoadPolicy.Resolved? {
+            // Ownership first: an account switch during an await swaps the whole persisted
+            // state, and a colliding identity in the successor state must not vouch for bytes
+            // read under the prior account's cache key.
+            let current = await store.snapshot()
+            guard current.profile?.id == userID else { return nil }
+            return SecureMediaLoadPolicy.resolve(
+                messageID: messageID,
+                conversationId: conversationId,
+                itemIndex: itemIndex,
+                in: current.messages
             )
         }
-        return data
+        switch resolved {
+        case .pendingBatchItem(let batch, _, let itemIndex):
+            let item = batch.items[itemIndex]
+            for key in [item.localStorageKey, item.storageKey].compactMap({ $0 }) {
+                if let cached = await SecureMediaFileCache.shared.data(
+                    forStorageKey: key,
+                    userID: userID
+                ), cached.count == item.plaintextByteSize,
+                   await currentResolution() == resolved {
+                    return SecureMediaLoadPolicy.LoadedItem(
+                        data: cached,
+                        mediaType: item.mediaType,
+                        caption: nil
+                    )
+                }
+            }
+            throw SecureMediaAttachmentError.invalidCiphertext
+
+        case .sealedBatchItem(let descriptor, _, let itemIndex):
+            let item = descriptor.items[itemIndex]
+            if let cached = await SecureMediaFileCache.shared.data(
+                forStorageKey: item.storageKey,
+                userID: userID
+            ), cached.count == item.plaintextByteSize,
+               await currentResolution() == resolved {
+                return SecureMediaLoadPolicy.LoadedItem(
+                    data: cached,
+                    mediaType: item.mediaType,
+                    caption: nil
+                )
+            }
+            guard allowsDownload, isOnline else { throw URLError(.notConnectedToInternet) }
+            guard secureMessagingAvailable else {
+                throw SecureMessagingExchangeError.invalidAccount
+            }
+            let data = try await SecureMessagingExchangeCoordinator.shared.openMediaBatchItem(
+                forUserID: userID,
+                conversationID: conversationId,
+                messageID: messageID,
+                itemIndex: itemIndex
+            )
+            // The download suspended; only the identical sealed item may receive these bytes
+            // under its storage key.
+            guard await currentResolution() == resolved else {
+                throw SecureMediaAttachmentError.invalidDescriptor
+            }
+            let insertion = await SecureMediaFileCache.shared.insertIfAbsent(
+                data,
+                forStorageKey: item.storageKey,
+                userID: userID
+            )
+            // The cache write suspended again — nothing is returned for a row (or an account)
+            // that changed during it. Only a copy this call itself created is unwound: a
+            // deletion may already have purged this key, and an orphaned fresh copy would
+            // resurrect plaintext the user asked to be gone — while an entry that predates
+            // this call belongs to whoever created it, and stays for that owner's own
+            // revalidation or the deletion sweep to judge.
+            guard await currentResolution() == resolved else {
+                if insertion == .stored {
+                    await SecureMediaFileCache.shared.remove(
+                        forStorageKey: item.storageKey,
+                        userID: userID
+                    )
+                }
+                throw SecureMediaAttachmentError.invalidDescriptor
+            }
+            return SecureMediaLoadPolicy.LoadedItem(
+                data: data,
+                mediaType: item.mediaType,
+                caption: nil
+            )
+
+        case .single(let descriptor, let descriptorText, let inlineData):
+            // The policy carries inline bytes only at the exact declared size, and they live on
+            // the identity-resolved row itself — nothing suspends between resolution and here.
+            if let inlineData {
+                return SecureMediaLoadPolicy.LoadedItem(
+                    data: inlineData,
+                    mediaType: descriptor.mediaType,
+                    caption: descriptor.caption
+                )
+            }
+            // The v1 row's body is the identity that matters; its inline slot may be filled
+            // concurrently (by this very method in another task), so revalidation compares the
+            // current body rather than the whole resolved shape.
+            func bodyIsCurrent() async -> Bool {
+                if case .single(_, let currentText, _)? = await currentResolution() {
+                    return currentText == descriptorText
+                }
+                return false
+            }
+            if let cached = await SecureMediaFileCache.shared.data(
+                forStorageKey: descriptor.storageKey,
+                userID: userID
+            ), cached.count == descriptor.plaintextByteSize,
+               await bodyIsCurrent() {
+                return SecureMediaLoadPolicy.LoadedItem(
+                    data: cached,
+                    mediaType: descriptor.mediaType,
+                    caption: descriptor.caption
+                )
+            }
+            guard allowsDownload, isOnline else { throw URLError(.notConnectedToInternet) }
+            guard secureMessagingAvailable else {
+                throw SecureMessagingExchangeError.invalidAccount
+            }
+            let data = try await SecureMessagingExchangeCoordinator.shared.openImage(
+                forUserID: userID,
+                conversationID: conversationId,
+                messageID: messageID
+            )
+            guard await bodyIsCurrent() else {
+                throw SecureMediaAttachmentError.invalidDescriptor
+            }
+            if KitChatMediaLimits.shouldCacheInline(byteCount: data.count) {
+                try await store.update { persisted in
+                    guard persisted.profile?.id == userID else { throw StoreError.accountChanged }
+                    // The snapshot check above can race one more commit; the durable write
+                    // re-proves everything inside the same mutation that stores the bytes:
+                    // exactly one row with this identity AND body, in the sealed v1 shape.
+                    // A rewritten, duplicated, or re-pended row's inline slot never receives
+                    // bytes for a descriptor it no longer solely carries.
+                    let indices = persisted.messages.indices.filter {
+                        persisted.messages[$0].id == messageID
+                            && persisted.messages[$0].conversationId == conversationId
+                            && persisted.messages[$0].body == descriptorText
+                    }
+                    guard indices.count == 1, let index = indices.first,
+                          persisted.messages[index].pendingAttachment == nil,
+                          persisted.messages[index].pendingMediaBatch == nil
+                    else { throw SecureMessagingExchangeError.invalidConversation }
+                    persisted.messages[index].attachmentData = data
+                }
+                await publishLatestState()
+                // Publication suspended too; every await boundary re-proves the row. The bytes
+                // now legitimately live in the row's inline slot (body comparison deliberately
+                // ignores that slot), but a row deleted or replaced during publication must not
+                // have them returned under its identity.
+                guard await bodyIsCurrent() else {
+                    throw SecureMediaAttachmentError.invalidDescriptor
+                }
+            } else {
+                let insertion = await SecureMediaFileCache.shared.insertIfAbsent(
+                    data,
+                    forStorageKey: descriptor.storageKey,
+                    userID: userID
+                )
+                // The cache write suspended; nothing is returned for a row (or an account)
+                // that changed during it. Only a copy this call itself created is unwound —
+                // a deletion may already have purged this key, and an orphaned fresh copy
+                // would resurrect plaintext the user asked to be gone — while an entry that
+                // predates this call belongs to whoever created it.
+                guard await bodyIsCurrent() else {
+                    if insertion == .stored {
+                        await SecureMediaFileCache.shared.remove(
+                            forStorageKey: descriptor.storageKey,
+                            userID: userID
+                        )
+                    }
+                    throw SecureMediaAttachmentError.invalidDescriptor
+                }
+            }
+            return SecureMediaLoadPolicy.LoadedItem(
+                data: data,
+                mediaType: descriptor.mediaType,
+                caption: descriptor.caption
+            )
+        }
     }
 
     /// Direct chats must first be created/replayed by the authenticated messaging API so the
@@ -9974,20 +10517,21 @@ final class AppModel: ObservableObject {
         }
         guard !writableConversationIDs.isEmpty else { return }
         let userID = profile?.id
-        let storageKeys = state.messages
-            .filter { writableConversationIDs.contains($0.conversationId) }
-            .flatMap { message -> [String] in
-                var keys: [String] = []
-                if let key = KitMediaMessageDescriptor.parse(message.body)?.storageKey {
-                    keys.append(key)
-                }
-                if let localKey = message.pendingAttachment?.localStorageKey {
-                    keys.append(localKey)
-                }
-                return keys
-            }
+        var deletableKeys: [String] = []
         do {
             try await store.update { persisted in
+                // Candidate keys span every media generation and phase of the doomed rows
+                // (v1 park, sealed v1 key, v2 batch park/checkpoint keys, sealed v2 keys).
+                // Which blobs may actually go is decided only after the rows are removed: a
+                // corrupt or aliased projection can carry a canonical key another live message
+                // still owns, so a blob is deleted solely when no surviving message — in any
+                // conversation — still references it. Orphaning on uncertainty is recoverable
+                // housekeeping; deleting a survivor's only plaintext is not.
+                let candidateKeys = Set(
+                    persisted.messages
+                        .filter { writableConversationIDs.contains($0.conversationId) }
+                        .flatMap(\.localMediaStorageKeys)
+                )
                 persisted.conversations.removeAll { writableConversationIDs.contains($0.id) }
                 persisted.groupProjectionUpdatedAt =
                     persisted.groupProjectionUpdatedAt?.filter {
@@ -10004,10 +10548,12 @@ final class AppModel: ObservableObject {
                     .filter { !writableConversationIDs.contains($0) }
                 persisted.mutedConversationIds = persisted.mutedConversationIds?
                     .filter { !writableConversationIDs.contains($0) }
+                let survivorKeys = Set(persisted.messages.flatMap(\.localMediaStorageKeys))
+                deletableKeys = candidateKeys.subtracting(survivorKeys).sorted()
             }
             await publishLatestState()
             if let userID {
-                for storageKey in storageKeys {
+                for storageKey in deletableKeys {
                     await SecureMediaFileCache.shared.remove(
                         forStorageKey: storageKey,
                         userID: userID
@@ -10025,20 +10571,18 @@ final class AppModel: ObservableObject {
               !isReadOnlyAppReviewDemoConversation(conversationId)
         else { return }
         let userID = profile?.id
-        let storageKeys = state.messages
-            .filter { messageIDs.contains($0.id) && $0.conversationId == conversationId }
-            .flatMap { message -> [String] in
-                var keys: [String] = []
-                if let key = KitMediaMessageDescriptor.parse(message.body)?.storageKey {
-                    keys.append(key)
-                }
-                if let localKey = message.pendingAttachment?.localStorageKey {
-                    keys.append(localKey)
-                }
-                return keys
-            }
+        var deletableKeys: [String] = []
         do {
             try await store.update { persisted in
+                // Same candidate-then-survivor discipline as conversation deletion: collect
+                // every key the doomed rows may hold media under, remove the rows, then delete
+                // only blobs no surviving message anywhere still references. An aliased key in
+                // a corrupt projection is orphaned, never pulled out from under its live owner.
+                let candidateKeys = Set(
+                    persisted.messages
+                        .filter { messageIDs.contains($0.id) && $0.conversationId == conversationId }
+                        .flatMap(\.localMediaStorageKeys)
+                )
                 persisted.messages.removeAll {
                     messageIDs.contains($0.id) && $0.conversationId == conversationId
                 }
@@ -10046,10 +10590,12 @@ final class AppModel: ObservableObject {
                     command.kind == .secureMessage
                         && command.messageId.map(messageIDs.contains) == true
                 }
+                let survivorKeys = Set(persisted.messages.flatMap(\.localMediaStorageKeys))
+                deletableKeys = candidateKeys.subtracting(survivorKeys).sorted()
             }
             await publishLatestState()
             if let userID {
-                for storageKey in storageKeys {
+                for storageKey in deletableKeys {
                     await SecureMediaFileCache.shared.remove(
                         forStorageKey: storageKey,
                         userID: userID
@@ -11760,6 +12306,11 @@ final class AppModel: ObservableObject {
                         sessionID: expectedSessionID
                     ) else { return }
                 } catch SecureMessagingExchangeError.staleOutboundFanout {
+                    // Pre-encryption audience drift: the coordinator has already retired the
+                    // command and failed its message visibly (post-encryption staleness resolves
+                    // inside sendQueuedMessage the same way), so reload-only is complete
+                    // handling — no retained ready command survives to spin this flush loop,
+                    // and the audience is never silently re-derived.
                     guard await reloadOutboxStateIfCurrent(
                         accountEpoch: expectedAccountEpoch,
                         userID: expectedUserID,
@@ -11768,6 +12319,24 @@ final class AppModel: ObservableObject {
                     if reportFailures {
                         lastError = SecureMessagingExchangeError.staleOutboundFanout.localizedDescription
                     }
+                } catch SecureMessagingExchangeError.mediaMessageBlobExpired {
+                    await handleRecoverableMediaMessageFailure(
+                        activeCommand,
+                        error: .mediaMessageBlobExpired,
+                        reportFailure: reportFailures,
+                        accountEpoch: expectedAccountEpoch,
+                        userID: expectedUserID,
+                        sessionID: expectedSessionID
+                    )
+                } catch SecureMessagingExchangeError.mediaMessageRosterChanged {
+                    await handleRecoverableMediaMessageFailure(
+                        activeCommand,
+                        error: .mediaMessageRosterChanged,
+                        reportFailure: reportFailures,
+                        accountEpoch: expectedAccountEpoch,
+                        userID: expectedUserID,
+                        sessionID: expectedSessionID
+                    )
                 } catch is CancellationError {
                     return
                 } catch {
@@ -13821,6 +14390,21 @@ final class AppModel: ObservableObject {
         }
 
         guard secureMessagingAvailable else { return false }
+        // A failed KITMEDIA2 send — pending batch or sealed descriptor — retries only through
+        // the media path, which restores the whole batch under the same client message ID.
+        // The text path would send the caption alone and split the message; its own validator
+        // refuses every media shape, so this dispatch is what gives v2 a working affordance.
+        if let failed = state.messages.first(where: { $0.id == messageID }),
+           failed.pendingMediaBatch != nil
+               || KitMediaMessageV2Descriptor.parse(failed.body) != nil {
+            return SecureMessagingExchangeCoordinator.canRetryFailedMediaMessage(
+                in: state,
+                messageID: messageID,
+                userID: context.userID,
+                conversationID: context.conversationID,
+                expectedRecipientUserID: context.recipientUserID
+            )
+        }
         return SecureMessagingExchangeCoordinator.canRetryFailedTextMessage(
             in: state,
             messageID: messageID,
@@ -13886,13 +14470,29 @@ final class AppModel: ObservableObject {
                 }
             } else {
                 guard secureMessagingAvailable else { return }
-                _ = try await SecureMessagingExchangeCoordinator.shared.retryFailedTextMessage(
-                    messageID: messageID,
-                    forUserID: context.userID,
-                    conversationID: context.conversationID,
-                    expectedRecipientUserID: context.recipientUserID,
-                    commitAdmission: commitAdmission
-                )
+                // Same dispatch as `canRetryMessage`: a v2 projection may only ride the media
+                // retry, which re-queues the entire batch — never its caption as text.
+                let failed = state.messages.first(where: { $0.id == messageID })
+                if failed?.pendingMediaBatch != nil
+                    || failed.map({ KitMediaMessageV2Descriptor.parse($0.body) != nil }) == true {
+                    _ = try await SecureMessagingExchangeCoordinator.shared
+                        .retryFailedMediaMessage(
+                            messageID: messageID,
+                            forUserID: context.userID,
+                            conversationID: context.conversationID,
+                            expectedRecipientUserID: context.recipientUserID,
+                            commitAdmission: commitAdmission
+                        )
+                } else {
+                    _ = try await SecureMessagingExchangeCoordinator.shared
+                        .retryFailedTextMessage(
+                            messageID: messageID,
+                            forUserID: context.userID,
+                            conversationID: context.conversationID,
+                            expectedRecipientUserID: context.recipientUserID,
+                            commitAdmission: commitAdmission
+                        )
+                }
             }
             guard await reloadOutboxStateIfCurrent(
                 accountEpoch: expectedAccountEpoch,
@@ -13988,6 +14588,49 @@ final class AppModel: ObservableObject {
             return
         }
         if reportFailure, !(error is CancellationError) { lastError = reason }
+    }
+
+    /// A KITMEDIA2 send that failed because the world moved — blobs expired or the recipient
+    /// roster changed — was already rewritten in place by the coordinator under the same
+    /// command and client message IDs: batch reopened and pending body restored for expiry,
+    /// fanout cleared for a roster change. Reload that fresh persisted truth, then hand retry
+    /// bookkeeping ONLY the freshly resolved command value: `commitOutboxMutation` proves
+    /// whole-value outbox containment, so this pass's captured pre-mutation command — stale
+    /// fanout included — would silently cancel the retry instead of scheduling it.
+    private func handleRecoverableMediaMessageFailure(
+        _ command: OfflineCommand,
+        error: SecureMessagingExchangeError,
+        reportFailure: Bool,
+        accountEpoch expectedAccountEpoch: UUID,
+        userID expectedUserID: String,
+        sessionID expectedSessionID: String
+    ) async {
+        guard await reloadOutboxStateIfCurrent(
+            accountEpoch: expectedAccountEpoch,
+            userID: expectedUserID,
+            sessionID: expectedSessionID
+        ) else { return }
+        // Full stable identity, uniquely resolved: exactly one fresh command carrying the same
+        // command ID, secure kind, the same non-nil message projection, and the same
+        // conversation. Zero matches means retry/user/session work already replaced this send;
+        // more than one means a corrupted outbox — fail closed and touch nothing rather than
+        // reschedule whichever duplicate happens to come back first.
+        let freshMatches = state.outbox.filter {
+            $0.id == command.id
+                && $0.kind == .secureMessage
+                && $0.messageId != nil
+                && $0.messageId == command.messageId
+                && $0.conversationId == command.conversationId
+        }
+        guard freshMatches.count == 1, let freshCommand = freshMatches.first else { return }
+        await handleOutboxFailure(
+            freshCommand,
+            error: error,
+            reportFailure: reportFailure,
+            accountEpoch: expectedAccountEpoch,
+            userID: expectedUserID,
+            sessionID: expectedSessionID
+        )
     }
 
     private func drainReadyOutbox(maximumPasses: Int = 32) async {

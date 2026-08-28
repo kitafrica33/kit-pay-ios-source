@@ -47,6 +47,88 @@ final class SharedInboxTests: XCTestCase {
         XCTAssertNil(KitDeepLink.parse(KitShareHandoffLink.url!))
     }
 
+    // MARK: Hand-off attempt lifecycle
+
+    private func step(
+        _ phase: KitShareHandoffAttempt.Phase,
+        _ event: KitShareHandoffAttempt.Event
+    ) -> (phase: KitShareHandoffAttempt.Phase, decision: KitShareHandoffAttempt.Decision) {
+        KitShareHandoffAttempt.decide(phase: phase, event: event)
+    }
+
+    /// The original bug: completing the extension before iOS answered the open request tore the
+    /// process down and the app never came forward. The machine only finishes after acceptance.
+    func testHandoffCompletesTheExtensionOnlyAfterIOSAcceptsTheOpen() {
+        let attempt = step(.queued, .attemptRequested(canOpen: true))
+        XCTAssertEqual(attempt.phase, .opening)
+        XCTAssertEqual(attempt.decision, .attemptOpen)
+
+        let accepted = step(attempt.phase, .openResolved(opened: true))
+        XCTAssertEqual(accepted.phase, .finished)
+        XCTAssertEqual(accepted.decision, .finishExtension)
+    }
+
+    /// A declined or timed-out open keeps the sheet alive with the queued state, and the explicit
+    /// retry starts a fresh attempt — the batch is durable, so nothing is lost in between.
+    func testHandoffDeclineOrTimeoutKeepsTheSheetAliveAndAllowsRetry() {
+        let declined = step(.opening, .openResolved(opened: false))
+        XCTAssertEqual(declined.phase, .queued)
+        XCTAssertEqual(declined.decision, .offerManualHandoff)
+
+        let retry = step(declined.phase, .attemptRequested(canOpen: true))
+        XCTAssertEqual(retry.phase, .opening)
+        XCTAssertEqual(retry.decision, .attemptOpen)
+    }
+
+    /// After the timeout already resolved the attempt as declined, a late acceptance must not
+    /// complete the request underneath the manual hand-off UI the customer is reading.
+    func testHandoffIgnoresAnAcceptanceThatArrivesAfterTheTimeoutResolvedIt() {
+        let late = step(.queued, .openResolved(opened: true))
+        XCTAssertEqual(late.phase, .queued)
+        XCTAssertEqual(late.decision, .ignore)
+    }
+
+    /// While one open is in flight, another tap (or the automatic attempt racing a tap) must not
+    /// issue a second open, and "Not now" must not complete a request the open may still win.
+    func testHandoffIsReentrancySafeWhileAnOpenIsInFlight() {
+        let doubleTap = step(.opening, .attemptRequested(canOpen: true))
+        XCTAssertEqual(doubleTap.phase, .opening)
+        XCTAssertEqual(doubleTap.decision, .ignore)
+
+        let notNowWhileOpening = step(.opening, .notNowTapped)
+        XCTAssertEqual(notNowWhileOpening.phase, .opening)
+        XCTAssertEqual(notNowWhileOpening.decision, .ignore)
+    }
+
+    /// "Not now" is always safe from the queued state: the batch is already durable, so the
+    /// extension completes without opening and Kit Pay finds the share on its next launch.
+    func testHandoffNotNowCompletesWithoutOpeningBecauseTheBatchIsDurable() {
+        let notNow = step(.queued, .notNowTapped)
+        XCTAssertEqual(notNow.phase, .finished)
+        XCTAssertEqual(notNow.decision, .finishExtension)
+    }
+
+    /// Without a usable link or extension context the attempt degrades straight to the manual
+    /// hand-off; and once finished, every further event — late completions, stray taps, a stray
+    /// timeout — is inert, so the request can never be completed twice.
+    func testHandoffDegradesWithoutALinkAndIsInertOnceFinished() {
+        let cannotOpen = step(.queued, .attemptRequested(canOpen: false))
+        XCTAssertEqual(cannotOpen.phase, .queued)
+        XCTAssertEqual(cannotOpen.decision, .offerManualHandoff)
+
+        for event in [
+            KitShareHandoffAttempt.Event.attemptRequested(canOpen: true),
+            .attemptRequested(canOpen: false),
+            .openResolved(opened: true),
+            .openResolved(opened: false),
+            .notNowTapped,
+        ] {
+            let after = step(.finished, event)
+            XCTAssertEqual(after.phase, .finished)
+            XCTAssertEqual(after.decision, .ignore)
+        }
+    }
+
     /// The app group is named in three places — this constant and both entitlement files. Locking
     /// the value here makes a rename fail in CI rather than silently in the customer's container.
     func testAppGroupIdentifierIsTheOneBothTargetsAreEntitledFor() {
@@ -185,14 +267,75 @@ final class SharedInboxTests: XCTestCase {
 
     // MARK: Text
 
-    func testSharedTextIsTrimmedAndBounded() {
-        XCTAssertNil(SharedInboxPolicy.normalizedText("   \n "))
-        XCTAssertNil(SharedInboxPolicy.normalizedText(nil))
-        XCTAssertEqual(SharedInboxPolicy.normalizedText("  hello  "), "hello")
-        let long = String(repeating: "a", count: SharedInboxPolicy.maximumTextCharacters + 500)
+    func testSharedTextTravelsByteForByteAndIsNeverSilentlyTruncated() {
+        XCTAssertNil(SharedInboxPolicy.carriedText("   \n "), "boundary scalars alone carry nothing")
+        XCTAssertNil(SharedInboxPolicy.carriedText(""))
+        XCTAssertNil(SharedInboxPolicy.carriedText(nil))
         XCTAssertEqual(
-            SharedInboxPolicy.normalizedText(long)?.count,
-            SharedInboxPolicy.maximumTextCharacters
+            SharedInboxPolicy.carriedText("  hello  "),
+            "  hello  ",
+            "the six-scalar strip belongs to the V2 queue at seal, never to the handoff"
+        )
+        // Over-limit text is carried intact so the failure can be shown against the real text;
+        // publishing it is what `finishBatch` refuses, visibly.
+        let long = String(repeating: "a", count: SharedInboxPolicy.maximumTextCharacters + 500)
+        XCTAssertEqual(SharedInboxPolicy.carriedText(long), long)
+        XCTAssertTrue(SharedInboxPolicy.exceedsTextLimit(long))
+        XCTAssertFalse(
+            SharedInboxPolicy.exceedsTextLimit(
+                String(repeating: "a", count: SharedInboxPolicy.maximumTextCharacters)
+            )
+        )
+        // One extended grapheme can chain thousands of scalars: the character count stays 1
+        // while storage grows without bound. The UTF-8 byte reading catches it, visibly.
+        let pathological = "a" + String(
+            repeating: "\u{0301}",
+            count: SharedInboxPolicy.maximumTextUTF8Bytes
+        )
+        XCTAssertEqual(pathological.count, 1)
+        XCTAssertTrue(SharedInboxPolicy.exceedsTextLimit(pathological))
+        XCTAssertEqual(
+            SharedInboxPolicy.carriedText(pathological),
+            pathological,
+            "even refused text is carried intact to the visible failure, never reshaped"
+        )
+    }
+
+    func testSharedTextPreservesScalarsFoundationCallsWhitespace() {
+        // NBSP, NEL, LINE SEPARATOR, and PARAGRAPH SEPARATOR are inside Foundation's
+        // `.whitespacesAndNewlines` but outside the contract's six boundary scalars: they are
+        // caption content and must survive the handoff at either end of the text.
+        for scalar in ["\u{00A0}", "\u{0085}", "\u{2028}", "\u{2029}"] {
+            let text = "\(scalar)caption\(scalar)"
+            XCTAssertEqual(SharedInboxPolicy.carriedText(text), text)
+            XCTAssertEqual(
+                SharedInboxPolicy.carriedText(scalar),
+                scalar,
+                "a caption consisting of this scalar alone is content, not blank"
+            )
+            XCTAssertFalse(SharedInboxPolicy.carriesNoContent(scalar))
+        }
+        // The six contract scalars, and only they, read as no content.
+        XCTAssertTrue(SharedInboxPolicy.carriesNoContent("\u{0009}\u{000A}\u{000B}\u{000C}\u{000D}\u{0020}"))
+    }
+
+    func testExtensionBoundarySetMirrorsTheWireCaptionPolicyExactly() {
+        // SharedInbox.swift compiles into the share extension without the wire models, so it
+        // restates the caption boundary set. This pin is what keeps the copies one policy.
+        XCTAssertEqual(
+            SharedInboxPolicy.captionBoundaryScalars,
+            KitMediaMessageCaptionPolicy.boundaryScalars
+        )
+    }
+
+    func testFinishedBatchTextIsExactlyWhatTheHandoffCarried() {
+        // The persisted manifest must hold the same judgement `carriedText` makes: content-
+        // bearing text rides unchanged, so applying it to the composer is byte-identical.
+        let text = "\u{00A0}shared note\u{2028}"
+        XCTAssertEqual(SharedInboxPolicy.carriedText(text), text)
+        XCTAssertEqual(
+            SharedInboxPolicy.composerDraft(existingDraft: "", sharedText: text),
+            text
         )
     }
 
@@ -234,6 +377,31 @@ final class SharedInboxTests: XCTestCase {
                 sharedText: "Shared link"
             ),
             "an edited span is kept rather than guessed at"
+        )
+    }
+
+    func testComposerDraftPreservesTheExistingDraftsBytes() {
+        XCTAssertEqual(
+            SharedInboxPolicy.composerDraft(existingDraft: "typed \u{00A0}", sharedText: "Shared"),
+            "typed \u{00A0}\nShared",
+            "no Foundation trim may touch what the customer already typed"
+        )
+        XCTAssertEqual(
+            SharedInboxPolicy.composerDraft(existingDraft: "  \n", sharedText: "Shared"),
+            "Shared",
+            "a contentless draft is replaced, judged by the contract's own six scalars"
+        )
+        let original = "draft ends in space "
+        let applied = SharedInboxPolicy.composerDraft(existingDraft: original, sharedText: "Shared")
+        XCTAssertEqual(applied, "draft ends in space \nShared")
+        XCTAssertEqual(
+            SharedInboxPolicy.draftAfterRemovingShare(
+                currentDraft: applied,
+                originalDraft: original,
+                sharedText: "Shared"
+            ),
+            original,
+            "the re-route inverse hands back the untrimmed original"
         )
     }
 
@@ -282,6 +450,8 @@ final class SharedInboxTests: XCTestCase {
             Array(ordered.prefix(5)).map(\.displayName),
             ["Newest group", "Zoe", "Second group", "Mary", "Third group"]
         )
+        XCTAssertTrue(ordered.prefix(5).allSatisfy { $0.isRecent == true })
+        XCTAssertTrue(ordered.dropFirst(5).allSatisfy { $0.isRecent != true })
         XCTAssertEqual(
             Array(ordered.dropFirst(5)).map(\.displayName),
             ["Alice", "Bob", "charlie", "Alpha group", "Older group"]
@@ -308,6 +478,47 @@ final class SharedInboxTests: XCTestCase {
             kind: .direct,
             memberCount: nil
         )))
+    }
+
+    func testDestinationAvatarMustBeBoundedPublicHTTPSPresentationData() {
+        let avatar = "https://pay.kit.africa/avatars/emma.jpg"
+        XCTAssertEqual(SharedInboxPolicy.destinationAvatarURL("  \(avatar)\n"), avatar)
+        XCTAssertNil(SharedInboxPolicy.destinationAvatarURL("http://pay.kit.africa/emma.jpg"))
+        XCTAssertNil(SharedInboxPolicy.destinationAvatarURL("https://user:secret@pay.kit.africa/a"))
+        XCTAssertNil(SharedInboxPolicy.destinationAvatarURL("https://pay.kit.africa/a#private"))
+
+        XCTAssertTrue(SharedInboxPolicy.isValidDestination(SharedInboxDestination(
+            conversationID: conversationID(6),
+            recipientUserID: recipientID(6),
+            displayName: "Emma",
+            kind: .direct,
+            memberCount: nil,
+            avatarURL: avatar
+        )))
+        XCTAssertFalse(SharedInboxPolicy.isValidDestination(SharedInboxDestination(
+            conversationID: conversationID(6),
+            recipientUserID: recipientID(6),
+            displayName: "Emma",
+            kind: .direct,
+            memberCount: nil,
+            avatarURL: "http://pay.kit.africa/avatars/emma.jpg"
+        )))
+    }
+
+    func testDestinationAddedPresentationFieldsRemainBackwardDecodable() throws {
+        let legacy = Data("""
+        {
+          "conversationID": "\(conversationID(7))",
+          "recipientUserID": "\(recipientID(7))",
+          "displayName": "Legacy recent chat",
+          "kind": "direct",
+          "memberCount": null
+        }
+        """.utf8)
+        let decoded = try JSONDecoder().decode(SharedInboxDestination.self, from: legacy)
+        XCTAssertNil(decoded.avatarURL)
+        XCTAssertNil(decoded.isRecent)
+        XCTAssertTrue(SharedInboxPolicy.isValidDestination(decoded))
     }
 
     func testRequestedRouteMustMatchCurrentConversationKindAndParticipants() {
@@ -405,7 +616,14 @@ final class SharedInboxTests: XCTestCase {
         let store = SharedInboxStore(containerURL: try makeContainer())
         let destinations = [
             groupDestination(1, name: "Family"),
-            directDestination(2, name: "Emma"),
+            SharedInboxDestination(
+                conversationID: conversationID(2),
+                recipientUserID: recipientID(2),
+                displayName: "Emma",
+                kind: .direct,
+                memberCount: nil,
+                avatarURL: "https://pay.kit.africa/avatars/emma.jpg"
+            ),
             contactDestination(3, name: "Florence"),
         ]
         XCTAssertTrue(store.setDestinations(destinations, forAccountID: accountID))

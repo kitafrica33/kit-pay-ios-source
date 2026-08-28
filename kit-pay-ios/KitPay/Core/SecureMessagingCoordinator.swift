@@ -446,6 +446,9 @@ protocol SecureMessagingExchangeTransport: SecureMessagingActivationTransport {
         conversationId: String,
         messageId: String
     ) async throws -> MessagingMessageInfoDTO
+    /// Server + account feature surface. The media-message-v2 admission gate re-reads this at
+    /// flush time so a withdrawn rollout fails closed before any upload or ciphertext commit.
+    func capabilities() async throws -> CapabilitiesDTO
 }
 
 extension SecureMessagingExchangeTransport {
@@ -524,6 +527,12 @@ extension SecureMessagingExchangeTransport {
     ) async throws -> MessagingHistoryEnvelopeResultDTO {
         throw SecureMessagingExchangeError.invalidServerResponse
     }
+
+    /// Capability reads fail closed on transports (and test doubles) that predate them: no
+    /// advertisement means no multi-attachment admission, never a permissive default.
+    func capabilities() async throws -> CapabilitiesDTO {
+        throw SecureMessagingExchangeError.invalidServerResponse
+    }
 }
 
 extension APIClient: SecureMessagingExchangeTransport {}
@@ -540,6 +549,9 @@ enum SecureMessagingExchangeError: LocalizedError, Equatable {
     case groupCapabilityUnavailable
     case reactionCapabilityUnavailable
     case editCapabilityUnavailable
+    case mediaMessageCapabilityUnavailable
+    case mediaMessageBlobExpired
+    case mediaMessageRosterChanged
 
     var errorDescription: String? {
         switch self {
@@ -557,6 +569,12 @@ enum SecureMessagingExchangeError: LocalizedError, Equatable {
             "Everyone in this conversation needs the latest Kit Pay to use reactions."
         case .editCapabilityUnavailable:
             "Everyone in this conversation needs the latest Kit Pay to see edited messages."
+        case .mediaMessageCapabilityUnavailable:
+            "Multiple attachments aren't available for this chat right now."
+        case .mediaMessageBlobExpired:
+            "The attachments expired before sending. Kit Pay is uploading them again."
+        case .mediaMessageRosterChanged:
+            "The recipient's devices changed. Kit Pay is securing this message again."
         }
     }
 }
@@ -655,33 +673,36 @@ enum SecureMessagingHistoryContinuationPolicy {
 /// deferred pipeline against in-memory blobs.
 struct SecureMediaBlobStoreAccess {
     var read: @Sendable (_ storageKey: String, _ userID: String) async -> Data?
-    var copy: @Sendable (_ fromKey: String, _ toKey: String, _ userID: String) async throws -> Void
+    /// Non-overwriting duplication performed atomically inside the cache actor: existence
+    /// check, byte comparison, write, and verification as one uninterrupted step. There is
+    /// deliberately no overwriting copy primitive at this boundary.
+    var duplicateIfAbsent: @Sendable (
+        _ fromKey: String, _ toKey: String, _ userID: String
+    ) async -> SecureMediaDuplicateOutcome
+    /// Removes `key` only while byte-identical content survives under `keeping`, atomically
+    /// inside the cache actor — a delete that can never destroy the last copy.
+    var removeDuplicate: @Sendable (
+        _ key: String, _ keeping: String, _ userID: String
+    ) async -> Bool
     var remove: @Sendable (_ storageKey: String, _ userID: String) async -> Void
 
     static let fileCache = SecureMediaBlobStoreAccess(
         read: { key, userID in
             await SecureMediaFileCache.shared.data(forStorageKey: key, userID: userID)
         },
-        copy: { fromKey, toKey, userID in
-            guard let data = await SecureMediaFileCache.shared.data(
-                forStorageKey: fromKey,
-                userID: userID
-            ) else { throw SecureMediaAttachmentError.invalidMedia }
-            try await SecureMediaFileCache.shared.store(
-                data,
-                forStorageKey: toKey,
+        duplicateIfAbsent: { fromKey, toKey, userID in
+            await SecureMediaFileCache.shared.duplicate(
+                fromStorageKey: fromKey,
+                toStorageKey: toKey,
                 userID: userID
             )
-            guard let copied = await SecureMediaFileCache.shared.data(
-                forStorageKey: toKey,
+        },
+        removeDuplicate: { key, survivor, userID in
+            await SecureMediaFileCache.shared.removeDuplicate(
+                forStorageKey: key,
+                keeping: survivor,
                 userID: userID
-            ), copied == data else {
-                await SecureMediaFileCache.shared.remove(
-                    forStorageKey: toKey,
-                    userID: userID
-                )
-                throw SecureMediaAttachmentError.invalidMedia
-            }
+            )
         },
         remove: { key, userID in
             await SecureMediaFileCache.shared.remove(forStorageKey: key, userID: userID)
@@ -1463,6 +1484,12 @@ actor SecureMessagingExchangeCoordinator {
               body.unicodeScalars.count <= 8_000,
               !body.unicodeScalars.contains(where: { $0.value == 0 }),
               KitMediaMessageDescriptor.parse(body) == nil,
+              // Family-wide, every version: user-authored text may never be KITMEDIA-shaped.
+              // Valid v1/v2 media enters only through the dedicated media queue paths; a
+              // malformed or future family body must not become durable local "text" that
+              // the binding policy would only strand at send time — after the raw
+              // maybe-descriptor had already sat in the UI and the outbox.
+              !KitMediaMessageFamilyPolicy.blocksUserAuthoredText(body),
               !beginsReaction || reaction != nil,
               reaction == nil || deliverAt == nil,
               // A reaction carries its own pointer inside the descriptor; it is never also an
@@ -1766,7 +1793,9 @@ actor SecureMessagingExchangeCoordinator {
                 ? MessageEditAggregationPolicy.canEdit(message)
                 : message.isOutgoing
                     && MessageEditAggregationPolicy.authenticatedEdit(in: message) == nil
-                    && KitMediaMessageDescriptor.parse(message.body) == nil
+                    // Family-wide: no media generation is wording — replacing a sealed
+                    // descriptor of any version with a sentence would strand its media.
+                    && !KitMediaMessageFamilyPolicy.isReservedFamilyText(message.body)
         }
         guard matches.count == 1 else {
             throw SecureMessagingExchangeError.invalidConversation
@@ -1890,6 +1919,114 @@ actor SecureMessagingExchangeCoordinator {
         return candidate.message.state == .failed && !candidate.alreadyQueued
     }
 
+    /// Restores one commandless failed KITMEDIA2 message — pending batch or sealed descriptor
+    /// — to the encrypted outbox without network access, exactly like
+    /// `retryFailedTextMessage` but media-shaped. Commandless minting is direct-thread only;
+    /// a group message retries solely through its retained command's pinned recipient list.
+    /// The client message UUID stays the server idempotency key: flush re-gates capability
+    /// and roster, resumes any outstanding uploads, and re-encrypts, so the retry can never
+    /// split or duplicate the message.
+    func retryFailedMediaMessage(
+        messageID: UUID,
+        forUserID userID: String,
+        conversationID: String,
+        expectedRecipientUserID: String?,
+        commitAdmission: ProtectedCommunicationAdmissionLease? = nil
+    ) async throws -> SecureMessagingQueueResult {
+        let local = try canonicalUUID(userID, error: .invalidAccount)
+        let conversationID = try canonicalUUID(
+            conversationID,
+            error: .invalidConversation
+        )
+        let recipient = try expectedRecipientUserID.map {
+            try canonicalUUID($0, error: .invalidRecipient)
+        }
+        guard local != recipient else { throw SecureMessagingExchangeError.invalidRecipient }
+
+        let snapshot = await store.snapshot()
+        let candidate = try Self.failedMediaMessageRetryCandidate(
+            in: snapshot,
+            messageID: messageID,
+            userID: local,
+            conversationID: conversationID,
+            expectedRecipientUserID: recipient
+        )
+        if candidate.alreadyQueued {
+            return SecureMessagingQueueResult(
+                conversation: candidate.conversation,
+                clientMessageID: messageID
+            )
+        }
+
+        var commandID = UUID()
+        while commandID == messageID { commandID = UUID() }
+        let command = OfflineCommand(
+            id: commandID,
+            kind: .secureMessage,
+            createdAt: candidate.message.createdAt,
+            nextAttemptAt: Date(),
+            attemptCount: 0,
+            conversationId: conversationID,
+            messageId: messageID,
+            recipientUserIds: candidate.recipientUserIDs,
+            recipientName: candidate.conversation.title,
+            video: nil,
+            expiresAt: nil,
+            secureMessageFanout: nil
+        )
+        let mutation: (inout PersistedState) throws -> Void = { state in
+            let current = try Self.failedMediaMessageRetryCandidate(
+                in: state,
+                messageID: messageID,
+                userID: local,
+                conversationID: conversationID,
+                expectedRecipientUserID: recipient
+            )
+            if current.alreadyQueued { return }
+            // The command's recipient set was minted from the snapshot; a membership change
+            // since then must fail closed rather than silently widen or narrow the audience.
+            guard current.recipientUserIDs == candidate.recipientUserIDs,
+                  let messageIndex = state.messages.firstIndex(where: {
+                      $0.id == messageID
+                  })
+            else { throw SecureMessagingExchangeError.messageNotRetryable }
+            state.messages[messageIndex].state = .queued
+            state.messages[messageIndex].failureReason = nil
+            // A user-initiated retry sends now: the promised minute already passed unmet, and
+            // the fresh command deliberately carries no schedule, so the projection must not
+            // keep claiming one.
+            state.messages[messageIndex].scheduledAt = nil
+            state.outbox.append(command)
+        }
+        if let commitAdmission {
+            try await store.update(admission: commitAdmission, mutation)
+        } else {
+            try await store.update(mutation)
+        }
+
+        return SecureMessagingQueueResult(
+            conversation: candidate.conversation,
+            clientMessageID: messageID
+        )
+    }
+
+    nonisolated static func canRetryFailedMediaMessage(
+        in state: PersistedState,
+        messageID: UUID,
+        userID: String,
+        conversationID: String,
+        expectedRecipientUserID: String?
+    ) -> Bool {
+        guard let candidate = try? failedMediaMessageRetryCandidate(
+            in: state,
+            messageID: messageID,
+            userID: userID,
+            conversationID: conversationID,
+            expectedRecipientUserID: expectedRecipientUserID
+        ) else { return false }
+        return candidate.message.state == .failed && !candidate.alreadyQueued
+    }
+
     private static func existingDeferredTextResult(
         in state: PersistedState,
         clientMessageID: UUID,
@@ -1914,7 +2051,11 @@ actor SecureMessagingExchangeCoordinator {
               message.body == body,
               message.isOutgoing,
               message.attachmentData == nil,
-              message.pendingAttachment == nil
+              message.pendingAttachment == nil,
+              // A pending v2 batch projects its caption (or placeholder) as `body`, so a
+              // stable-ID text replay could otherwise "match" a message that is actually a
+              // multi-attachment send in flight. Text idempotency may vouch only for text.
+              message.pendingMediaBatch == nil
         else { throw SecureMessagingExchangeError.invalidConversation }
 
         if let command = commands.first {
@@ -2133,7 +2274,8 @@ actor SecureMessagingExchangeCoordinator {
         }
         guard message.conversationId == conversation.id,
               message.senderId == localUserID,
-              message.isOutgoing
+              message.isOutgoing,
+              message.pendingMediaBatch == nil
         else { throw SecureMessagingExchangeError.invalidConversation }
 
         if let pending = message.pendingAttachment {
@@ -2227,6 +2369,432 @@ actor SecureMessagingExchangeCoordinator {
         }
     }
 
+    /// Pre-seal bubble body for a queued multi-attachment message with no caption. Content-free
+    /// by design: once sealed the canonical descriptor replaces it, and rendering derives labels
+    /// from the durable batch or descriptor, never from this placeholder.
+    static func mediaBatchPlaceholderBody(itemCount: Int) -> String {
+        "\(max(1, itemCount)) attachments"
+    }
+
+    /// Queues one multi-attachment (KITMEDIA2) message as a single durable projection. Every
+    /// plaintext is already parked in the account-bound encrypted media cache under the batch's
+    /// locally minted keys; reconnect uploads only ciphertext, checkpoints each item durably,
+    /// seals the canonical v2 descriptor, then advances the ordinary Signal outbox. The batch is
+    /// never split into per-attachment messages, at queue time or any later stage.
+    func queueDeferredMediaBatch(
+        forUserID userID: String,
+        conversationID: String,
+        expectedRecipientUserID: String?,
+        title: String,
+        batch: KitMediaMessageV2OutboundBatch,
+        clientMessageID: UUID? = nil,
+        submittedDraftBody: String? = nil,
+        draftClearVersion: ConversationDraftWriteVersion? = nil,
+        deliverAt: Date? = nil,
+        replyToServerMessageID: String? = nil
+    ) async throws -> SecureMessagingQueueResult {
+        guard (submittedDraftBody == nil) == (draftClearVersion == nil),
+              replyToServerMessageID.map(SecureMessagingValidation.isCanonicalUUID) ?? true
+        else {
+            throw SecureMessagingCryptoError.invalidContent
+        }
+        let replyTarget = replyToServerMessageID?.lowercased()
+        let local = try canonicalUUID(userID, error: .invalidAccount)
+        let conversationID = try canonicalUUID(conversationID, error: .invalidConversation)
+        let recipient = try expectedRecipientUserID.map {
+            try canonicalUUID($0, error: .invalidRecipient)
+        }
+        // The batch arrives fully minted (fresh ids, key material, parked plaintext keys) and
+        // not yet uploaded anywhere; a torn or replayed value must never become durable state.
+        guard batch.isStructurallyValid,
+              batch.items.allSatisfy({ !$0.isUploaded })
+        else { throw SecureMediaAttachmentError.invalidMedia }
+        let snapshot = await store.snapshot()
+        guard snapshot.profile?.id == local,
+              let enrollment = snapshot.secureMessaging?.enrollment,
+              enrollment.userID == local,
+              let conversation = snapshot.conversations.first(where: {
+                  $0.id == conversationID
+              }),
+              Self.permitsDeferredQueue(
+                  conversation: conversation,
+                  localUserID: local,
+                  expectedRecipientUserID: recipient
+              )
+        else { throw SecureMessagingExchangeError.invalidConversation }
+        if let replyTarget {
+            try Self.requireLocalReplyTarget(
+                replyTarget,
+                conversationID: conversationID,
+                in: snapshot
+            )
+        }
+        let commandRecipients = Self.deferredCommandRecipients(
+            conversation: conversation,
+            localUserID: local,
+            expectedRecipientUserID: recipient
+        )
+        // No network at queue time: the offline path must succeed in airplane mode. The v2
+        // capability admission gate runs authoritatively at flush (prepareDeferredMessage) and
+        // again per-encrypt in queueText before any bytes leave the device.
+        _ = enrollment
+
+        // Every parked plaintext must exist with its declared byte count before any durable
+        // commit: a torn share hand-off surfaces here, while the draft is still recoverable,
+        // instead of as a visible retire at flush time.
+        for item in batch.items {
+            guard let parked = await mediaBlobs.read(item.localStorageKey, local),
+                  parked.count == item.plaintextByteSize
+            else { throw SecureMediaAttachmentError.invalidMedia }
+        }
+
+        let createdAt = Date()
+        // Idempotent recognition compares the canonical requested minute, deliberately without
+        // reapplying clock eligibility: the stored instant was admissible when first queued and
+        // may since have passed while the retry is still the same send.
+        let requestedMinute = deliverAt.map { ScheduledSendPolicy.canonicalMinute($0) }
+        let offeredParkKeys = Set(batch.items.map(\.localStorageKey))
+
+        if let clientMessageID,
+           let match = try await existingDeferredMediaBatchResult(
+               in: snapshot,
+               clientMessageID: clientMessageID,
+               localUserID: local,
+               recipientUserIDs: commandRecipients,
+               conversation: conversation,
+               offered: batch,
+               replyTarget: replyTarget,
+               offeredScheduledAt: requestedMinute
+           ) {
+            // The byte reads above suspend the actor, so state may have moved. Success is
+            // claimed only against the exact captured projection — whole message and command
+            // values — with offered park keys disjoint from every other message's media keys,
+            // and the requested draft clear rides inside the same mutation.
+            try await store.update { state in
+                guard state.profile?.id == local,
+                      state.secureMessaging?.enrollment?.userID == local,
+                      state.messages.filter({ $0.id == clientMessageID })
+                          == [match.message],
+                      state.outbox.filter({ $0.messageId == clientMessageID })
+                          == (match.command.map { [$0] } ?? []),
+                      state.messages.allSatisfy({
+                          $0.id == clientMessageID
+                              || Set($0.localMediaStorageKeys)
+                                  .isDisjoint(with: offeredParkKeys)
+                      })
+                else { throw StoreError.accountChanged }
+                if let submittedDraftBody, let draftClearVersion {
+                    _ = ConversationDraftPolicy.clearAfterSuccessfulQueue(
+                        submittedBody: submittedDraftBody,
+                        conversationID: conversationID,
+                        ownerUserID: local,
+                        writeVersion: draftClearVersion,
+                        in: &state
+                    )
+                }
+            }
+            // The durable projection owns its bytes. Remove only scratch offered park keys:
+            // anything referenced by ANY live message stays, or this cleanup could delete
+            // another message's blob through a key alias. The snapshot below suspends again
+            // after the exact CAS, so the captured target's keys are protected unconditionally
+            // and the wider union is trusted only while the state still belongs to this
+            // account — on a switch the scratch parks are left behind, because an orphaned
+            // scratch blob is recoverable and a deleted parked plaintext is not.
+            let latest = await store.snapshot()
+            guard latest.profile?.id == local,
+                  latest.secureMessaging?.enrollment?.userID == local
+            else { return match.result }
+            let liveKeys = Set(match.message.localMediaStorageKeys)
+                .union(latest.messages.flatMap(\.localMediaStorageKeys))
+            for item in batch.items where !liveKeys.contains(item.localStorageKey) {
+                await mediaBlobs.remove(item.localStorageKey, local)
+            }
+            return match.result
+        }
+
+        // A fresh queue of a schedule that cannot normalize fails closed: silently sending
+        // now is never what "later" meant. Scheduling otherwise only moves the upload-and-send
+        // attempt to a later minute — the plaintext is already parked in the encrypted cache.
+        let scheduledAt = try deliverAt.map { requested -> Date in
+            guard let normalized = ScheduledSendPolicy.normalize(requested, now: createdAt)
+            else { throw SecureMessagingCryptoError.invalidContent }
+            return normalized
+        }
+        let messageID = clientMessageID ?? UUID()
+        let commandID = UUID()
+        let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let localMessage = LocalMessage(
+            id: messageID,
+            conversationId: conversationID,
+            senderId: local,
+            body: batch.caption
+                ?? Self.mediaBatchPlaceholderBody(itemCount: batch.items.count),
+            createdAt: createdAt,
+            sentAt: nil,
+            state: .queued,
+            failureReason: nil,
+            isOutgoing: true,
+            attachmentData: nil,
+            pendingAttachment: nil,
+            pendingMediaBatch: batch,
+            replyToServerMessageID: replyTarget,
+            scheduledAt: scheduledAt
+        )
+        let command = OfflineCommand(
+            id: commandID,
+            kind: .secureMessage,
+            createdAt: createdAt,
+            nextAttemptAt: scheduledAt ?? createdAt,
+            attemptCount: 0,
+            conversationId: conversationID,
+            messageId: messageID,
+            recipientUserIds: commandRecipients,
+            recipientName: cleanTitle.isEmpty ? conversation.title : cleanTitle,
+            video: nil,
+            expiresAt: nil,
+            secureMessageFanout: nil,
+            scheduledAt: scheduledAt
+        )
+        // The blob reads above suspended the actor N times, so the opening snapshot is stale
+        // by commit time. The mutation re-proves everything it makes durable against live
+        // state — account owner, current conversation membership and recipients, the reply
+        // target, and park keys unclaimed by any other message — and never upserts the
+        // snapshot's conversation back over a newer one.
+        try await store.update { state in
+            guard state.profile?.id == local,
+                  state.secureMessaging?.enrollment?.userID == local,
+                  !state.messages.contains(where: { $0.id == messageID }),
+                  !state.outbox.contains(where: { $0.id == commandID }),
+                  // One message, one command: a torn or orphaned command already claiming this
+                  // stable client message id must block the append, not silently coexist.
+                  !state.outbox.contains(where: { $0.messageId == messageID }),
+                  state.messages.allSatisfy({
+                      Set($0.localMediaStorageKeys).isDisjoint(with: offeredParkKeys)
+                  }),
+                  let liveConversation = state.conversations.first(where: {
+                      $0.id == conversationID
+                  }),
+                  Self.permitsDeferredQueue(
+                      conversation: liveConversation,
+                      localUserID: local,
+                      expectedRecipientUserID: recipient
+                  ),
+                  Self.deferredCommandRecipients(
+                      conversation: liveConversation,
+                      localUserID: local,
+                      expectedRecipientUserID: recipient
+                  ) == commandRecipients
+            else { throw StoreError.accountChanged }
+            if let replyTarget {
+                try Self.requireLocalReplyTarget(
+                    replyTarget,
+                    conversationID: conversationID,
+                    in: state
+                )
+            }
+            var live = liveConversation
+            if scheduledAt == nil {
+                live.updatedAt = max(live.updatedAt, createdAt)
+            }
+            Self.upsert(conversation: live, in: &state)
+            state.messages.append(localMessage)
+            state.outbox.append(command)
+            if let submittedDraftBody, let draftClearVersion {
+                _ = ConversationDraftPolicy.clearAfterSuccessfulQueue(
+                    submittedBody: submittedDraftBody,
+                    conversationID: conversationID,
+                    ownerUserID: local,
+                    writeVersion: draftClearVersion,
+                    in: &state
+                )
+            }
+        }
+        let latest = await store.snapshot()
+        let committedConversation: Conversation
+        if latest.profile?.id == local,
+           let live = latest.conversations.first(where: { $0.id == conversationID }) {
+            committedConversation = live
+        } else {
+            committedConversation = conversation
+        }
+        return SecureMessagingQueueResult(
+            conversation: committedConversation,
+            clientMessageID: messageID
+        )
+    }
+
+    /// Synchronous projection identity for idempotent batch retries: durable caption, item
+    /// metadata, reply pointer, and schedule intent must all match the offered send. Reused as
+    /// the final compare-and-set inside the draft-clear mutation because async cache reads make
+    /// the actor reentrant — the projection can change between validation and commit.
+    private static func batchProjectionMatchesOffered(
+        _ message: LocalMessage,
+        offered: KitMediaMessageV2OutboundBatch,
+        replyTarget: String?,
+        offeredScheduledAt: Date?
+    ) -> Bool {
+        // Idempotent identity is exact: the reply pointer and the canonical requested minute
+        // (quantized by the caller, deliberately without clock eligibility) must equal the
+        // durable projection precisely — a send-now retry of a scheduled message, or any
+        // different scheduled minute, is a different send. A batch message also owns exactly
+        // one media projection: coexisting v1 pending or inline payload is never the same send.
+        guard message.replyToServerMessageID == replyTarget,
+              message.scheduledAt == offeredScheduledAt,
+              message.pendingAttachment == nil,
+              message.attachmentData == nil
+        else { return false }
+        if let existing = message.pendingMediaBatch {
+            // The pre-seal body is bound byte-for-byte to the batch: a valid batch riding a
+            // foreign body could leak that body into display or search before sealing.
+            return message.body == (
+                existing.caption
+                    ?? mediaBatchPlaceholderBody(itemCount: existing.items.count)
+            )
+                && existing.isStructurallyValid
+                && existing.caption == offered.caption
+                && existing.items.count == offered.items.count
+                && zip(existing.items, offered.items).allSatisfy {
+                    $0.mediaType == $1.mediaType
+                        && $0.plaintextByteSize == $1.plaintextByteSize
+                }
+        }
+        if let sealed = KitMediaMessageV2Descriptor.parse(message.body) {
+            return sealed.caption == offered.caption
+                && sealed.items.count == offered.items.count
+                && zip(sealed.items, offered.items).allSatisfy {
+                    $0.mediaType == $1.mediaType
+                        && $0.plaintextByteSize == $1.plaintextByteSize
+                }
+        }
+        return false
+    }
+
+    /// Stable IDs are used by retained share-sheet batches, but an ID alone is not proof that a
+    /// previous queue operation is the same batch. Validate the complete durable projection —
+    /// caption, item count, per-item media type and byte size, reply pointer, schedule intent,
+    /// and the exact bytes — before treating a retry as success; collisions fail closed instead
+    /// of silently discarding newly shared bytes.
+    private func existingDeferredMediaBatchResult(
+        in state: PersistedState,
+        clientMessageID: UUID,
+        localUserID: String,
+        recipientUserIDs: [String],
+        conversation: Conversation,
+        offered: KitMediaMessageV2OutboundBatch,
+        replyTarget: String?,
+        offeredScheduledAt: Date?
+    ) async throws -> (
+        result: SecureMessagingQueueResult,
+        message: LocalMessage,
+        command: OfflineCommand?
+    )? {
+        let messages = state.messages.filter { $0.id == clientMessageID }
+        let commands = state.outbox.filter { $0.messageId == clientMessageID }
+        guard messages.count <= 1, commands.count <= 1 else {
+            throw SecureMessagingExchangeError.invalidConversation
+        }
+        guard let message = messages.first else {
+            guard commands.isEmpty else {
+                throw SecureMessagingExchangeError.invalidConversation
+            }
+            return nil
+        }
+        guard message.conversationId == conversation.id,
+              message.senderId == localUserID,
+              message.isOutgoing,
+              Self.batchProjectionMatchesOffered(
+                  message,
+                  offered: offered,
+                  replyTarget: replyTarget,
+                  offeredScheduledAt: offeredScheduledAt
+              )
+        else { throw SecureMessagingExchangeError.invalidConversation }
+
+        if let existing = message.pendingMediaBatch {
+            for (existingItem, offeredItem) in zip(existing.items, offered.items) {
+                // A checkpointed item's park key may already be removed; its bytes live under
+                // the uploaded cache copy. Both sides must be readable and byte-identical.
+                let existingKey = existingItem.storageKey ?? existingItem.localStorageKey
+                guard let retained = await mediaBlobs.read(existingKey, localUserID),
+                      retained.count == existingItem.plaintextByteSize,
+                      let offeredBytes = await mediaBlobs.read(
+                          offeredItem.localStorageKey,
+                          localUserID
+                      ),
+                      retained == offeredBytes
+                else { throw SecureMessagingExchangeError.invalidConversation }
+            }
+        } else if let sealed = KitMediaMessageV2Descriptor.parse(message.body) {
+            for (sealedItem, offeredItem) in zip(sealed.items, offered.items) {
+                // Matching metadata is not proof of matching content: a different same-sized
+                // retry must never be silently discarded, so the retained copy has to exist
+                // and equal the offered bytes exactly, or the retry fails closed.
+                guard let offeredBytes = await mediaBlobs.read(
+                          offeredItem.localStorageKey,
+                          localUserID
+                      ),
+                      offeredBytes.count == offeredItem.plaintextByteSize,
+                      let retained = await mediaBlobs.read(sealedItem.storageKey, localUserID),
+                      retained == offeredBytes
+                else { throw SecureMessagingExchangeError.invalidConversation }
+            }
+        } else {
+            throw SecureMessagingExchangeError.invalidConversation
+        }
+
+        if let command = commands.first {
+            guard command.kind == .secureMessage,
+                  command.conversationId == conversation.id,
+                  command.messageId == clientMessageID,
+                  command.recipientUserIds == recipientUserIDs,
+                  command.scheduledAt == message.scheduledAt
+            else { throw SecureMessagingExchangeError.invalidConversation }
+        } else {
+            guard [.sent, .delivered, .read, .failed].contains(message.state) else {
+                throw SecureMessagingExchangeError.invalidConversation
+            }
+        }
+        // The captured exact values let the caller re-prove this projection at commit time:
+        // async byte reads above make the actor reentrant, so success may only be claimed
+        // against precisely what was validated here.
+        return (
+            result: SecureMessagingQueueResult(
+                conversation: conversation,
+                clientMessageID: clientMessageID
+            ),
+            message: message,
+            command: commands.first
+        )
+    }
+
+    /// Resolves a queued command whose pinned group audience no longer matches live membership:
+    /// the command retires and the message fails visibly, atomically against the exact
+    /// projection (a replaced projection aborts as a cancellation and mutates nothing). The
+    /// audience is never silently widened or narrowed — a direct thread's failed message can
+    /// re-mint commandlessly because its one-peer audience is structural, while a group message
+    /// ends here as a deliberate user re-compose against the roster that now exists. The
+    /// pending v1/v2 media projection survives on the failed message untouched: retirement is
+    /// about audience, and destroying parked plaintext is never its business.
+    private func retireStaleAudienceCommand(
+        _ command: OfflineCommand,
+        message: LocalMessage,
+        forUserID userID: String
+    ) async throws {
+        try await store.update { state in
+            guard state.profile?.id == userID,
+                  let indices = Self.exactPendingProjectionIndices(
+                      in: state,
+                      command: command,
+                      message: message
+                  )
+            else { throw CancellationError() }
+            state.outbox.remove(at: indices.command)
+            state.messages[indices.message].state = .failed
+            state.messages[indices.message].failureReason =
+                SecureMessagingExchangeError.staleOutboundFanout.localizedDescription
+        }
+    }
+
     func prepareDeferredMessage(
         commandID: UUID,
         forUserID userID: String
@@ -2245,7 +2813,16 @@ actor SecureMessagingExchangeCoordinator {
               let recipients = command.recipientUserIds,
               (1 ... SecureMessagingWire.maximumGroupMembers - 1).contains(recipients.count),
               message.conversationId == conversationID,
-              message.senderId == local
+              message.senderId == local,
+              // Only a genuinely unsent outbound projection may reach network or upload work:
+              // anything already sent, received, failed, or carrying accepted-history
+              // metadata fails closed before the first side effect.
+              message.isOutgoing,
+              message.state == .queued,
+              message.serverMessageId == nil,
+              message.sentAt == nil,
+              message.failureReason == nil,
+              message.secureMessagingHistory == nil
         else { throw SecureMessagingExchangeError.invalidConversation }
         // A stored group thread flushes with no pinned single recipient; every other command
         // keeps the exact direct two-party pin (fail closed on nil).
@@ -2274,11 +2851,15 @@ actor SecureMessagingExchangeCoordinator {
                 throw SecureMessagingExchangeError.invalidConversation
             }
             // Never widen an offline message's audience. If group membership changed after the
-            // message was queued, leave the old projection intact for an explicit user retry
-            // instead of encrypting it to a newly added member (or a now-removed member).
+            // message was queued, the pinned audience is unservable and no fresh one may be
+            // minted for the same client message id — so resolve it here, atomically against
+            // the exact projection: retire the command and fail the message visibly. Leaving
+            // the ready command intact would spin the flush loop forever, because this check
+            // throws before any fanout exists for the post-encryption stale handling to clear.
             guard command.recipientUserIds == conversation.outboundRecipientUserIDs(
                 excluding: local
             ) else {
+                try await retireStaleAudienceCommand(command, message: message, forUserID: local)
                 throw SecureMessagingExchangeError.staleOutboundFanout
             }
             try await requireExactPendingProjection(
@@ -2287,6 +2868,16 @@ actor SecureMessagingExchangeCoordinator {
                 forUserID: local
             )
             var preparedMessage = message
+            // A message owns exactly one media projection. A v2 batch or sealed v2 body with
+            // leftover v1 pending fields is corrupt: fail visibly here instead of letting the
+            // single-attachment branch silently win and overwrite the v2 projection.
+            if message.pendingMediaBatch != nil
+                || KitMediaMessageV2Descriptor.parse(message.body) != nil {
+                guard message.pendingAttachment == nil, message.attachmentData == nil else {
+                    throw SecureMediaAttachmentError.invalidMedia
+                }
+            }
+            var mediaMessageV2Items: [MessagingMediaMessageV2CapabilityPolicy.DraftItem]? = nil
             if let pending = message.pendingAttachment {
                 // Plaintext lives inline for small attachments; large deferred media was parked
                 // in the encrypted media file cache under a locally minted key at queue time.
@@ -2338,10 +2929,23 @@ actor SecureMessagingExchangeCoordinator {
                     caption: pending.caption
                 )
                 if let localKey = pending.localStorageKey {
-                    // Copy-then-checkpoint-then-remove: the pending projection stays consistent
-                    // at every step, and a failed checkpoint removes the copy again so the only
-                    // blob left is the still-referenced parked original.
-                    try await mediaBlobs.copy(localKey, descriptor.storageKey, local)
+                    // Duplicate-then-checkpoint-then-remove: the cache actor's non-overwriting
+                    // duplicate is the only write primitive here. A fresh server-issued key
+                    // must land on an ABSENT destination — even byte-identical content means
+                    // the key is not exclusively ours (two sends of the same bytes can collide
+                    // on a key, and accepting the alias would let this message's unwind delete
+                    // the other's checkpointed blob). Only `.stored` proves exclusive
+                    // ownership, which is what licenses the unwind below.
+                    switch await mediaBlobs.duplicateIfAbsent(
+                        localKey,
+                        descriptor.storageKey,
+                        local
+                    ) {
+                    case .stored:
+                        break
+                    case .alreadyIdentical, .conflict, .sourceMissing:
+                        throw SecureMediaAttachmentError.invalidMedia
+                    }
                 }
                 do {
                     preparedMessage = try await checkpointDeferredImageDescriptor(
@@ -2351,15 +2955,253 @@ actor SecureMessagingExchangeCoordinator {
                         forUserID: local
                     )
                 } catch {
-                    if pending.localStorageKey != nil {
-                        await mediaBlobs.remove(descriptor.storageKey, local)
+                    if let localKey = pending.localStorageKey {
+                        _ = await mediaBlobs.removeDuplicate(
+                            descriptor.storageKey,
+                            localKey,
+                            local
+                        )
                     }
                     throw error
                 }
                 if let localKey = pending.localStorageKey {
-                    await mediaBlobs.remove(localKey, local)
+                    _ = await mediaBlobs.removeDuplicate(
+                        localKey,
+                        descriptor.storageKey,
+                        local
+                    )
                 }
                 ownedMessage = preparedMessage
+            } else if message.pendingMediaBatch != nil {
+                guard var batch = message.pendingMediaBatch,
+                      batch.isStructurallyValid,
+                      message.body == (
+                          batch.caption
+                              ?? Self.mediaBatchPlaceholderBody(itemCount: batch.items.count)
+                      )
+                else { throw SecureMediaAttachmentError.invalidMedia }
+                // Activation precedes the admission gate so a rotated device enrollment is
+                // attested first and the gate judges the device that actually uploads.
+                let activated = try await activation.activate(forUserID: local)
+                guard let enrollment = activated.enrollment, enrollment.userID == local
+                else { throw SecureMessagingExchangeError.invalidAccount }
+                // §7: a capability withdrawn after queue fails the whole message closed before
+                // any upload; a multi-attachment message is never split into fragments.
+                let capabilities = try await transport.capabilities()
+                let roster = try await transport.messagingDeviceRoster(
+                    conversationId: conversationID
+                )
+                let draftItems = batch.items.map {
+                    MessagingMediaMessageV2CapabilityPolicy.DraftItem(
+                        mediaType: $0.mediaType,
+                        plaintextByteSize: $0.plaintextByteSize
+                    )
+                }
+                guard MessagingMediaMessageV2CapabilityPolicy.admitsComposition(
+                    capabilities: capabilities,
+                    roster: roster,
+                    conversationID: conversationID,
+                    currentDeviceID: enrollment.serverDeviceID,
+                    currentUserID: local,
+                    memberUserIDs: conversation.memberUserIDs,
+                    items: draftItems
+                ) else {
+                    throw SecureMessagingExchangeError.mediaMessageCapabilityUnavailable
+                }
+                var currentMessage = message
+                // §5/§7: ciphertext leaves the device in ascending fresh-random attachment-id
+                // order — never display order — and each uploaded item becomes durable in its
+                // own checkpoint so a crash resumes exactly where the last checkpoint stopped.
+                for index in batch.pendingUploadIndicesInUploadOrder {
+                    let item = batch.items[index]
+                    guard let keyMaterial = Data(base64Encoded: item.keyMaterialBase64),
+                          keyMaterial.count == SecureMediaAttachmentCipher.keyMaterialBytes,
+                          let plaintext = await mediaBlobs.read(item.localStorageKey, local),
+                          plaintext.count == item.plaintextByteSize
+                    else { throw SecureMediaAttachmentError.invalidMedia }
+                    let encrypted = try await Task.detached(priority: .userInitiated) {
+                        try SecureMediaAttachmentCipher.encrypt(
+                            plaintext,
+                            keyMaterial: keyMaterial
+                        )
+                    }.value
+                    let upload = try await transport.uploadMessagingAttachment(
+                        mediaType: item.mediaType,
+                        ciphertext: encrypted.ciphertext
+                    )
+                    guard let storageKey = upload.storageKey?.lowercased(),
+                          let byteSize = upload.byteSize,
+                          let digest = upload.ciphertextSha256?.lowercased(),
+                          SecureMessagingWirePolicy.isCanonicalUUID(storageKey),
+                          byteSize == Int64(encrypted.ciphertext.count),
+                          digest == encrypted.sha256Hex,
+                          let uploadedItem = item.uploaded(
+                              storageKey: storageKey,
+                              ciphertextByteSize: byteSize,
+                              ciphertextSHA256: digest
+                          )
+                    else { throw SecureMediaAttachmentError.serverMetadataMismatch }
+                    // Stage the checkpoint candidate and prove global key distinctness BEFORE
+                    // copying: a colliding server-issued storage key must never overwrite
+                    // another item's parked plaintext or retained copy.
+                    var stagedBatch = batch
+                    stagedBatch.items[index] = uploadedItem
+                    guard stagedBatch.isStructurallyValid else {
+                        throw SecureMediaAttachmentError.serverMetadataMismatch
+                    }
+                    // A server-issued key that aliases ANY other live message's blob must
+                    // still fail here — the non-overwriting duplicate protects the bytes, but
+                    // only this state-level proof keeps a foreign message's key out of our
+                    // durable projection; the checkpoint mutation below re-proves the same
+                    // distinctness after this read suspends the actor.
+                    let liveState = await store.snapshot()
+                    guard liveState.profile?.id == local,
+                          liveState.messages.allSatisfy({
+                              $0.id == messageID
+                                  || !$0.localMediaStorageKeys.contains(storageKey)
+                          })
+                    else { throw SecureMediaAttachmentError.serverMetadataMismatch }
+                    // Duplicate-then-checkpoint-then-remove, exactly like single-attachment
+                    // media. A fresh, not-yet-checkpointed key must land on an ABSENT
+                    // destination: two messages can carry byte-identical plaintext, so
+                    // `.alreadyIdentical` here could be the OTHER message's checkpointed blob
+                    // — accepting it would let this message's failed-checkpoint unwind delete
+                    // that live blob. Only `.stored` proves exclusive ownership, which is what
+                    // licenses the unwind; the park delete afterwards is licensed separately
+                    // by byte-identical survival under the checkpointed key.
+                    switch await mediaBlobs.duplicateIfAbsent(
+                        item.localStorageKey,
+                        storageKey,
+                        local
+                    ) {
+                    case .stored:
+                        break
+                    case .alreadyIdentical, .conflict, .sourceMissing:
+                        throw SecureMediaAttachmentError.serverMetadataMismatch
+                    }
+                    var checkpointed = currentMessage
+                    checkpointed.pendingMediaBatch = stagedBatch
+                    do {
+                        currentMessage = try await replaceDeferredMessageProjection(
+                            checkpointed,
+                            command: command,
+                            message: currentMessage,
+                            forUserID: local,
+                            requiringDistinctCacheKeys: [storageKey]
+                        )
+                    } catch {
+                        _ = await mediaBlobs.removeDuplicate(
+                            storageKey,
+                            item.localStorageKey,
+                            local
+                        )
+                        throw error
+                    }
+                    batch = stagedBatch
+                    ownedMessage = currentMessage
+                    _ = await mediaBlobs.removeDuplicate(
+                        item.localStorageKey,
+                        storageKey,
+                        local
+                    )
+                }
+                // The awaits since the last checkpoint suspended the actor; re-prove the exact
+                // projection and account-wide key ownership once more immediately before the
+                // destructive reconcile pass below and the seal after it.
+                currentMessage = try await replaceDeferredMessageProjection(
+                    currentMessage,
+                    command: command,
+                    message: currentMessage,
+                    forUserID: local,
+                    requiringDistinctCacheKeys: batch.items.compactMap(\.storageKey)
+                )
+                // Crash-resume reconciliation: an item checkpointed by an earlier pass may
+                // have died before its park blob was removed. Sealing clears the batch, so
+                // stale park keys must go now or they orphan in the encrypted cache forever.
+                // Every write here is the cache actor's non-overwriting duplicate and every
+                // delete is its byte-identical-survivor license, so nothing in this pass can
+                // destroy information whatever raced in between; byte-different content under
+                // a checkpointed key fails the whole prepare closed instead of being
+                // overwritten. When the park is already gone there is nothing to license: the
+                // retained copy was written by this pipeline from queue-verified bytes, the
+                // frozen descriptor carries no plaintext digest to re-prove it against, and
+                // no destructive action rides on trusting it.
+                for item in batch.items where item.isUploaded {
+                    guard let storageKey = item.storageKey,
+                          storageKey != item.localStorageKey,
+                          let parked = await mediaBlobs.read(item.localStorageKey, local),
+                          parked.count == item.plaintextByteSize
+                    else { continue }
+                    switch await mediaBlobs.duplicateIfAbsent(
+                        item.localStorageKey,
+                        storageKey,
+                        local
+                    ) {
+                    case .stored:
+                        // The repair may stand only while the projection is still exactly
+                        // ours and the key still unaliased — undone on any doubt, and the
+                        // undo itself removes only a blob still byte-identical to the park.
+                        do {
+                            currentMessage = try await replaceDeferredMessageProjection(
+                                currentMessage,
+                                command: command,
+                                message: currentMessage,
+                                forUserID: local,
+                                requiringDistinctCacheKeys: [storageKey]
+                            )
+                        } catch {
+                            _ = await mediaBlobs.removeDuplicate(
+                                storageKey,
+                                item.localStorageKey,
+                                local
+                            )
+                            throw error
+                        }
+                    case .alreadyIdentical:
+                        // Safe ONLY in this reconcile pass: the durable projection already
+                        // owns this checkpointed key — proven exclusively ours against every
+                        // other live message by the projection CAS immediately above this
+                        // loop — so identical bytes here are our own earlier copy, and this
+                        // branch deletes nothing under the key itself.
+                        break
+                    case .conflict, .sourceMissing:
+                        throw SecureMediaAttachmentError.serverMetadataMismatch
+                    }
+                    _ = await mediaBlobs.removeDuplicate(
+                        item.localStorageKey,
+                        storageKey,
+                        local
+                    )
+                }
+                // SEALED (§7): the canonical descriptor becomes the durable body before any
+                // Signal encryption; from here retries re-derive everything from the body.
+                guard let sealed = batch.sealedDescriptor() else {
+                    throw SecureMediaAttachmentError.invalidMedia
+                }
+                var sealedMessage = currentMessage
+                sealedMessage.body = sealed.encoded
+                sealedMessage.pendingMediaBatch = nil
+                preparedMessage = try await replaceDeferredMessageProjection(
+                    sealedMessage,
+                    command: command,
+                    message: currentMessage,
+                    forUserID: local,
+                    requiringDistinctCacheKeys: batch.items.compactMap(\.storageKey)
+                )
+                ownedMessage = preparedMessage
+                mediaMessageV2Items = draftItems
+            } else if let sealed = KitMediaMessageV2Descriptor.parse(message.body) {
+                // A sealed v2 message resuming after a crash or a blob-expiry reopen that
+                // already re-sealed: the descriptor body alone is sufficient to replay the
+                // send. Admission re-runs inside queueText against a capabilities document
+                // and roster both fetched fresh on every attempt of its retry loop, so no
+                // stale snapshot needs to travel from here.
+                mediaMessageV2Items = sealed.items.map {
+                    MessagingMediaMessageV2CapabilityPolicy.DraftItem(
+                        mediaType: $0.mediaType,
+                        plaintextByteSize: $0.plaintextByteSize
+                    )
+                }
             } else if let descriptor = KitMediaMessageDescriptor.parse(message.body) {
                 guard SecureMessagingWire.allowedAttachmentMediaTypes.contains(
                     descriptor.mediaType
@@ -2392,8 +3234,15 @@ actor SecureMessagingExchangeCoordinator {
                 requiredRichMediaType: preparedMessage.pendingAttachment?.mediaType
                     ?? preparedDescriptor?.mediaType,
                 requiredPlaintextBytes: preparedMessage.pendingAttachment?.byteCount
-                    ?? preparedDescriptor?.plaintextByteSize
+                    ?? preparedDescriptor?.plaintextByteSize,
+                mediaMessageV2Items: mediaMessageV2Items
             )
+        } catch let error as SecureMessagingExchangeError where error == .staleOutboundFanout {
+            // The audience-drift retirement above already resolved this projection itself —
+            // command retired, message visibly failed — so the liveness re-check below would
+            // only masquerade that deliberate transition as a cancellation. The caller's
+            // handling of this error is reload-only, which cannot harm a newer command.
+            throw error
         } catch {
             // A transport, validation, activation, roster, or crypto failure belongs only to the
             // exact deferred projection that initiated it. If retry/user/session work replaced
@@ -2568,19 +3417,58 @@ actor SecureMessagingExchangeCoordinator {
         return finalized
     }
 
+    /// Durable checkpoint shared by the multi-attachment upload loop, its reconcile pass, and
+    /// its seal step: replace the exact pending message projection or surface cancellation —
+    /// if retry, user, or session work already replaced the projection, the caller's work no
+    /// longer applies. `requiringDistinctCacheKeys` re-proves, inside the mutation itself,
+    /// that copied cache destinations still alias no other live message's blob.
+    private func replaceDeferredMessageProjection(
+        _ finalized: LocalMessage,
+        command: OfflineCommand,
+        message: LocalMessage,
+        forUserID userID: String,
+        requiringDistinctCacheKeys: [String] = []
+    ) async throws -> LocalMessage {
+        try await store.update { state in
+            guard state.profile?.id == userID,
+                  let indices = Self.exactPendingProjectionIndices(
+                      in: state,
+                      command: command,
+                      message: message
+                  ),
+                  requiringDistinctCacheKeys.allSatisfy({ key in
+                      state.messages.allSatisfy {
+                          $0.id == message.id || !$0.localMediaStorageKeys.contains(key)
+                      }
+                  })
+            else { throw CancellationError() }
+            state.messages[indices.message] = finalized
+        }
+        return finalized
+    }
+
+    /// Downloads and decrypts the attachment of a sealed single-attachment (KITMEDIA1) message,
+    /// addressed by local message identity — never by caller-supplied descriptor text. Exactly
+    /// one current persisted row may match, and every field used here (storage key, expected
+    /// sizes, digest, key material) is re-read from that row's body at open time, so a caller
+    /// can only ever open exactly what a message it can already see currently declares.
+    /// Verification is fail-closed: server byte size, ciphertext digest, plaintext byte count.
     func openImage(
         forUserID userID: String,
         conversationID: String,
-        descriptorText: String
+        messageID: UUID
     ) async throws -> Data {
         let local = try canonicalUUID(userID, error: .invalidAccount)
         let conversationID = try canonicalUUID(conversationID, error: .invalidConversation)
         let snapshot = await store.snapshot()
+        let rows = snapshot.messages.filter {
+            $0.id == messageID && $0.conversationId == conversationID
+        }
         guard snapshot.profile?.id == local,
-              snapshot.messages.contains(where: {
-                  $0.conversationId == conversationID && $0.body == descriptorText
-              }),
-              let descriptor = KitMediaMessageDescriptor.parse(descriptorText),
+              rows.count == 1, let message = rows.first,
+              message.pendingAttachment == nil,
+              message.pendingMediaBatch == nil,
+              let descriptor = KitMediaMessageDescriptor.parse(message.body),
               let keyMaterial = descriptor.keyMaterial
         else { throw SecureMediaAttachmentError.invalidDescriptor }
         let ciphertext = try await transport.downloadMessagingAttachment(
@@ -2600,6 +3488,52 @@ actor SecureMessagingExchangeCoordinator {
         return plaintext
     }
 
+    /// Downloads and decrypts one attachment of a sealed KITMEDIA2 message, addressed by local
+    /// message identity and display index. Addressing by identity — never by caller-supplied
+    /// descriptor text — means every field used here (storage key, expected sizes, digest, key
+    /// material) is re-read from the persisted row at open time, so a caller can only ever open
+    /// exactly what a message it can already see declares. Verification is fail-closed and
+    /// mirrors `openImage`: server byte size, ciphertext digest, then plaintext byte count.
+    func openMediaBatchItem(
+        forUserID userID: String,
+        conversationID: String,
+        messageID: UUID,
+        itemIndex: Int
+    ) async throws -> Data {
+        let local = try canonicalUUID(userID, error: .invalidAccount)
+        let conversationID = try canonicalUUID(conversationID, error: .invalidConversation)
+        let snapshot = await store.snapshot()
+        let rows = snapshot.messages.filter {
+            $0.id == messageID && $0.conversationId == conversationID
+        }
+        guard snapshot.profile?.id == local,
+              rows.count == 1, let message = rows.first,
+              message.pendingAttachment == nil,
+              message.pendingMediaBatch == nil,
+              let descriptor = KitMediaMessageV2Descriptor.parse(message.body),
+              descriptor.items.indices.contains(itemIndex)
+        else { throw SecureMediaAttachmentError.invalidDescriptor }
+        let item = descriptor.items[itemIndex]
+        guard let keyMaterial = item.keyMaterial else {
+            throw SecureMediaAttachmentError.invalidDescriptor
+        }
+        let ciphertext = try await transport.downloadMessagingAttachment(
+            storageKey: item.storageKey,
+            expectedByteSize: item.ciphertextByteSize
+        )
+        let plaintext = try await Task.detached(priority: .userInitiated) {
+            try SecureMediaAttachmentCipher.decrypt(
+                ciphertext,
+                keyMaterial: keyMaterial,
+                expectedSHA256Hex: item.ciphertextSHA256
+            )
+        }.value
+        guard plaintext.count == item.plaintextByteSize else {
+            throw SecureMediaAttachmentError.invalidCiphertext
+        }
+        return plaintext
+    }
+
     private func queueText(
         forUserID userID: String,
         conversation: ValidatedDirectConversation,
@@ -2614,6 +3548,7 @@ actor SecureMessagingExchangeCoordinator {
         draftClearVersion: ConversationDraftWriteVersion? = nil,
         requiredRichMediaType: String? = nil,
         requiredPlaintextBytes: Int? = nil,
+        mediaMessageV2Items: [MessagingMediaMessageV2CapabilityPolicy.DraftItem]? = nil,
         replyToServerMessageID: String? = nil
     ) async throws -> SecureMessagingQueueResult {
         let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2654,6 +3589,38 @@ actor SecureMessagingExchangeCoordinator {
               submittedDraftBody == nil || existingMessageID == nil
         else {
             throw SecureMessagingExchangeError.invalidConversation
+        }
+        // A KITMEDIA2 descriptor rides this path only when the deferred pipeline hands over
+        // its own verified projection: the sealed rows must mirror the declared items exactly,
+        // and a v2 body arriving without them is a smuggled descriptor, not a text message.
+        if let mediaMessageV2Items {
+            guard let sealed = KitMediaMessageV2Descriptor.parse(body),
+                  requiredRichMediaType == nil,
+                  attachmentData == nil,
+                  sealed.items.count == mediaMessageV2Items.count,
+                  zip(sealed.items, mediaMessageV2Items).allSatisfy({
+                      $0.mediaType == $1.mediaType
+                          && $0.plaintextByteSize == $1.plaintextByteSize
+                  })
+            else { throw SecureMessagingExchangeError.invalidConversation }
+        } else if KitMediaMessageV2Descriptor.parse(body) != nil {
+            throw SecureMessagingExchangeError.invalidConversation
+        }
+        // Family-wide ingress allowlist, mirroring `queueDeferredText`. A KITMEDIA body may
+        // pass only with its own dedicated media-path provenance: sealed v2 was vouched for
+        // above by the handover items, and valid v1 must arrive announcing the exact media
+        // type and byte size the deferred pipeline derived from its blob — public text
+        // callers pass neither, so even a well-formed descriptor pasted as "text" is
+        // rejected here. Every other family spelling — malformed v1/v2 or an unknown future
+        // version — is a smuggled maybe-descriptor and never becomes durable local "text".
+        if mediaMessageV2Items == nil {
+            if let v1Descriptor = KitMediaMessageDescriptor.parse(body) {
+                guard requiredRichMediaType == v1Descriptor.mediaType,
+                      requiredPlaintextBytes == v1Descriptor.plaintextByteSize
+                else { throw SecureMessagingCryptoError.invalidContent }
+            } else if KitMediaMessageFamilyPolicy.isReservedFamilyText(body) {
+                throw SecureMessagingCryptoError.invalidContent
+            }
         }
         if let expectedExistingCommand, let expectedExistingMessage {
             try await requireExactPendingProjection(
@@ -2738,6 +3705,27 @@ actor SecureMessagingExchangeCoordinator {
                 // Fail closed rather than let a peer whose client predates the descriptor render
                 // a correction as a bubble of raw protocol text.
                 throw SecureMessagingExchangeError.editCapabilityUnavailable
+            }
+            if let mediaMessageV2Items {
+                // §7 freshness: the pre-upload capabilities document proved admission when
+                // upload work began, but eight 200 MiB uploads can run for minutes. The gate
+                // that authorizes Signal encryption therefore fetches its own document on
+                // every attempt of this loop — the same liveness as the roster beside it — so
+                // a rollout or quota withdrawal during upload fails the whole message closed
+                // here, before any ciphertext exists. A stale pre-upload DTO is deliberately
+                // not accepted; a multi-attachment message is never split or downgraded.
+                let freshCapabilities = try await transport.capabilities()
+                guard MessagingMediaMessageV2CapabilityPolicy.admitsComposition(
+                    capabilities: freshCapabilities,
+                    roster: rosterDTO,
+                    conversationID: conversation.id,
+                    currentDeviceID: enrollment.serverDeviceID,
+                    currentUserID: userID,
+                    memberUserIDs: conversation.memberUserIDs,
+                    items: mediaMessageV2Items
+                ) else {
+                    throw SecureMessagingExchangeError.mediaMessageCapabilityUnavailable
+                }
             }
             if let requiredRichMediaType,
                KitChatMediaKind(mediaType: requiredRichMediaType) != .image {
@@ -2842,7 +3830,10 @@ actor SecureMessagingExchangeCoordinator {
                 failureReason: nil,
                 isOutgoing: true,
                 attachmentData: attachmentData,
-                replyToServerMessageID: replyTarget
+                replyToServerMessageID: replyTarget,
+                // Sealing and fanout replace the pending projection wholesale; the scheduled
+                // instant the user chose must survive both replacements.
+                scheduledAt: existingMessage?.scheduledAt
             )
             let command = OfflineCommand(
                 id: commandID,
@@ -2856,7 +3847,8 @@ actor SecureMessagingExchangeCoordinator {
                 recipientName: conversation.title,
                 video: nil,
                 expiresAt: nil,
-                secureMessageFanout: encrypted.fanout
+                secureMessageFanout: encrypted.fanout,
+                scheduledAt: existingCommand?.scheduledAt
             )
             var updatedConversation = conversation.localProjection
             updatedConversation.updatedAt = max(updatedConversation.updatedAt, now)
@@ -2928,7 +3920,9 @@ actor SecureMessagingExchangeCoordinator {
               localMessage.senderId == userID,
               localMessage.isOutgoing
         else { throw SecureMessagingExchangeError.invalidConversation }
-        let attachments = KitMediaMessageDescriptor.attachments(for: localMessage.body)
+        let attachments = KitMediaMessageFamilyPolicy.attachmentRequests(
+            for: localMessage.body
+        )
 
         do {
             let response = try await transport.sendEncryptedMessage(
@@ -2963,11 +3957,44 @@ actor SecureMessagingExchangeCoordinator {
                 state.messages[indices.message].secureMessagingHistory = outbound.historyMetadata
             }
             return response
+        } catch let error as APIErrorPayload
+            where error.code == "ATTACHMENT_REFERENCE_INVALID"
+            && KitMediaMessageV2Descriptor.parse(localMessage.body) != nil {
+            // Only the contract's expiry code takes this recovery: ATTACHMENT_ALREADY_ATTACHED
+            // signals an attachment-identity conflict — the server already holds one of these
+            // uploads bound to a message — and reopening would mint a whole new upload set
+            // under the same client message id against blobs the server just said it has. That
+            // conflict takes the ordinary visible failure path instead.
+            // §7 blob expiry: the sealed descriptor's uploads lapsed server-side. Reopen the
+            // batch from the descriptor — same client message id, same key material, retained
+            // plaintext as source — and clear the now-unusable fanout so flush re-uploads,
+            // re-seals, and re-encrypts. The command survives: this is a transport lapse, not
+            // a user-confirmation event, and the message is never split or abandoned.
+            try await reopenExpiredMediaBatch(
+                command,
+                message: localMessage,
+                userID: userID
+            )
+            throw SecureMessagingExchangeError.mediaMessageBlobExpired
         } catch let error as APIErrorPayload where [
             "MESSAGING_ROSTER_CHANGED",
             "DEVICE_ENVELOPES_INCOMPLETE",
             "MESSAGING_ROSTER_PROTOCOL_MISMATCH",
         ].contains(error.code) {
+            if KitMediaMessageV2Descriptor.parse(localMessage.body) != nil {
+                // A sealed KITMEDIA2 message outlives a roster change as the SAME message and
+                // command: only the fanout was encrypted to the vanished device set, so only
+                // the fanout clears. The next flush pass re-gates the new roster and
+                // re-encrypts the same descriptor under the same client message id. Uploads
+                // are untouched — blob references survive roster changes; re-upload rides the
+                // expiry path above. v1 keeps its audited visible stop below.
+                try await resetStaleFanoutForRetry(
+                    command,
+                    message: localMessage,
+                    userID: userID
+                )
+                throw SecureMessagingExchangeError.mediaMessageRosterChanged
+            }
             try await abandonStaleFanout(
                 command,
                 message: localMessage,
@@ -3149,6 +4176,62 @@ actor SecureMessagingExchangeCoordinator {
             state.messages[indices.message].state = .failed
             state.messages[indices.message].failureReason =
                 SecureMessagingExchangeError.staleOutboundFanout.localizedDescription
+        }
+    }
+
+    /// A sealed KITMEDIA2 send rejected for a roster change keeps its message and command
+    /// whole — same ids, same schedule, same descriptor body — and clears only the fanout,
+    /// which was encrypted to a device set that no longer exists. Flush re-prepares and
+    /// re-encrypts to the new roster under the same client message id.
+    private func resetStaleFanoutForRetry(
+        _ command: OfflineCommand,
+        message: LocalMessage,
+        userID: String
+    ) async throws {
+        try await store.update { state in
+            guard state.profile?.id == userID,
+                  let indices = Self.exactPendingProjectionIndices(
+                      in: state,
+                      command: command,
+                      message: message
+                  )
+            else { throw CancellationError() }
+            state.outbox[indices.command].secureMessageFanout = nil
+        }
+    }
+
+    /// §7 blob expiry: rebuild the pending batch from the sealed descriptor under the SAME
+    /// client message id — identical ids, key material, media types, sizes, caption, and
+    /// display order; each item's lapsed storage key becomes its plaintext pointer so every
+    /// item re-uploads fresh. The body returns to its canonical pending form (caption, or the
+    /// placeholder when captionless): the deferred pipeline replays this exactly like a first
+    /// send, the raw descriptor stops being display text, and message id, command id,
+    /// schedule, and reply target all survive untouched. Only the fanout clears.
+    private func reopenExpiredMediaBatch(
+        _ command: OfflineCommand,
+        message: LocalMessage,
+        userID: String
+    ) async throws {
+        guard let descriptor = KitMediaMessageV2Descriptor.parse(message.body) else {
+            throw SecureMessagingExchangeError.messageNotRetryable
+        }
+        let reopened = KitMediaMessageV2OutboundBatch.reopened(from: descriptor)
+        guard reopened.isStructurallyValid else {
+            throw SecureMessagingExchangeError.messageNotRetryable
+        }
+        let pendingBody = reopened.caption
+            ?? Self.mediaBatchPlaceholderBody(itemCount: reopened.items.count)
+        try await store.update { state in
+            guard state.profile?.id == userID,
+                  let indices = Self.exactPendingProjectionIndices(
+                      in: state,
+                      command: command,
+                      message: message
+                  )
+            else { throw CancellationError() }
+            state.messages[indices.message].body = pendingBody
+            state.messages[indices.message].pendingMediaBatch = reopened
+            state.outbox[indices.command].secureMessageFanout = nil
         }
     }
 
@@ -3913,8 +4996,21 @@ actor SecureMessagingExchangeCoordinator {
         }
         guard matches.count <= 1 else { throw SecureMessagingCryptoError.invalidContent }
         guard let retained = matches.first else { return nil }
+        // A family-unparseable body is a placeholder row, never donatable evidence: omit the
+        // candidate (nil skips it at every call site) instead of failing validation. Placeholder
+        // projections already carry no history metadata, but this must hold even for a corrupt
+        // or migrated row that somehow does — a throw here is mapped to `.retryLater` by
+        // `historyAttemptDisposition`, so one such body would otherwise pin its backfill task
+        // to the same page forever.
+        if KitMediaMessageFamilyPolicy.isReservedFamilyText(retained.body),
+           KitMediaMessageDescriptor.parse(retained.body) == nil,
+           KitMediaMessageV2Descriptor.parse(retained.body) == nil {
+            return nil
+        }
         guard let metadata = retained.secureMessagingHistory else { return nil }
-        let expectedAttachments = KitMediaMessageDescriptor.attachments(for: retained.body)
+        let expectedAttachments = KitMediaMessageFamilyPolicy.attachmentRequests(
+            for: retained.body
+        )
         guard SecureMessagingMapper.retainedMetadataMatches(
                   metadata,
                   identity: candidate.identity,
@@ -3933,9 +5029,9 @@ actor SecureMessagingExchangeCoordinator {
                   replyToMessageID: candidate.identity.replyToMessageID,
                   attachments: expectedAttachments
               ) == candidate.identity.kind,
-              KitMediaMessageDescriptor.validates(
+              KitMediaMessageFamilyPolicy.validatesWireRows(
                   candidate.dto.attachments,
-                  against: expectedAttachments
+                  forBody: retained.body
               )
         else { throw SecureMessagingCryptoError.invalidContent }
         return retained
@@ -4298,7 +5394,66 @@ actor SecureMessagingExchangeCoordinator {
               let messageID = UUID(uuidString: envelope.messageID)
         else { throw SecureMessagingCryptoError.invalidContent }
 
-        let attachments = KitMediaMessageDescriptor.attachments(for: plaintext)
+        // §4 rule 6, receive confinement: a v2-family body that fails the strict parse — an
+        // unknown future version included — is authenticated peer content this build cannot
+        // confine as media, and must not render as text either (the raw body is a
+        // maybe-descriptor, possibly carrying key material). It lands as ONE visible
+        // generic-placeholder row: the raw body persists for a future build that can parse
+        // it, every presentation/copy/search/forward/report surface renders it only through
+        // the family-safe "Attachment" placeholder, and it carries no history metadata — a
+        // body that binds to no kind is not donatable, not restorable, and never quotable
+        // evidence. Reactions and edits keep their strict handling: an annotation kind never
+        // becomes a placeholder bubble.
+        //
+        // Malformed vector 12 takes the same exit: a descriptor that parses cleanly but whose
+        // authenticated outer rows do not set-match it — or whose declared kind does not
+        // bind — is rejected as media yet still shows the one generic placeholder, never a
+        // usable v2 bubble. Its persisted body is the canonical empty-descriptor spelling
+        // rather than the raw text: the outer rows are consumed at receive, so no future
+        // build could ever re-validate the pairing, and a raw valid-parse body would read as
+        // a working v2 message to every body-driven surface while carrying key material the
+        // server never tied to this message. The strictly-unparseable spelling routes the row
+        // through the identical family-confined placeholder machinery everywhere. Both legs
+        // are flag-independent; a v2 body that completes binding and row set-match continues
+        // below into ordered-media rendering through the ordinary kind binding.
+        let strictV2 = KitMediaMessageV2Descriptor.parse(plaintext)
+        if strictV2 != nil
+            || KitMediaMessageFamilyPolicy.requiresGenericAttachmentPlaceholder(plaintext) {
+            guard let rawKind = dto.kind,
+                  let kind = SecureMessagingMessageKind(rawValue: rawKind),
+                  !kind.isTimelineMetadata
+            else { return nil }
+            let completesMediaBinding = strictV2 != nil
+                && SecureMessagingContentBindingPolicy.kind(
+                    for: plaintext,
+                    replyToMessageID: envelope.replyToMessageID,
+                    attachments: KitMediaMessageFamilyPolicy.attachmentRequests(for: plaintext)
+                ) == kind
+                && KitMediaMessageFamilyPolicy.validatesWireRows(
+                    dto.attachments,
+                    forBody: plaintext
+                )
+            if !completesMediaBinding {
+                let authoredOnCurrentAccount = envelope.sender.address.userID == currentUserID
+                return LocalMessage(
+                    id: messageID,
+                    serverMessageId: envelope.messageID,
+                    conversationId: envelope.conversationID,
+                    senderId: envelope.sender.address.userID,
+                    body: strictV2 == nil
+                        ? plaintext
+                        : KitMediaMessageFamilyPolicy.confinedPlaceholderBody,
+                    createdAt: sentAt,
+                    sentAt: sentAt,
+                    state: authoredOnCurrentAccount ? .sent : .received,
+                    failureReason: nil,
+                    isOutgoing: authoredOnCurrentAccount,
+                    secureMessagingHistory: nil,
+                    replyToServerMessageID: nil
+                )
+            }
+        }
+        let attachments = KitMediaMessageFamilyPolicy.attachmentRequests(for: plaintext)
         guard let rawKind = dto.kind,
               let kind = SecureMessagingMessageKind(rawValue: rawKind),
               SecureMessagingContentBindingPolicy.kind(
@@ -4312,7 +5467,7 @@ actor SecureMessagingExchangeCoordinator {
                   plaintext,
                   prefix: KitSystemMessage.prefix
               ),
-              KitMediaMessageDescriptor.validates(dto.attachments, against: attachments)
+              KitMediaMessageFamilyPolicy.validatesWireRows(dto.attachments, forBody: plaintext)
         else { return nil }
 
         let authoredOnCurrentAccount = envelope.sender.address.userID == currentUserID
@@ -4699,9 +5854,8 @@ actor SecureMessagingExchangeCoordinator {
                                 conversation: conversation,
                                 enrollment: enrollment,
                                 expectedPlaintext: localMessage.body,
-                                expectedAttachments: KitMediaMessageDescriptor.attachments(
-                                    for: localMessage.body
-                                ),
+                                expectedAttachments: KitMediaMessageFamilyPolicy
+                                    .attachmentRequests(for: localMessage.body),
                                 userID: userID
                             )
                             outboundEchoes.append(echo)
@@ -5311,9 +6465,9 @@ actor SecureMessagingExchangeCoordinator {
               dto.envelope == nil,
               let rawAttachments = dto.attachments,
               rawAttachments.allSatisfy({ $0 != nil }),
-              KitMediaMessageDescriptor.validates(
+              KitMediaMessageFamilyPolicy.validatesWireRows(
                   rawAttachments,
-                  against: expectedAttachments
+                  forBody: expectedPlaintext
               ),
               dto.reactions?.isEmpty == true,
               dto.revokedAt == nil
@@ -5367,9 +6521,9 @@ actor SecureMessagingExchangeCoordinator {
               dto.envelope == nil,
               let rawAttachments = dto.attachments,
               rawAttachments.allSatisfy({ $0 != nil }),
-              KitMediaMessageDescriptor.validates(
+              KitMediaMessageFamilyPolicy.validatesWireRows(
                   rawAttachments,
-                  against: expectedAttachments
+                  forBody: expectedPlaintext
               ),
               dto.reactions?.isEmpty == true,
               dto.revokedAt == nil
@@ -5684,6 +6838,10 @@ actor SecureMessagingExchangeCoordinator {
               message.sentAt == nil,
               message.attachmentData == nil,
               message.pendingAttachment == nil,
+              // A pending v2 batch shows its caption as body text; retrying it HERE would
+              // send the caption alone and split the message. Media retries have their own
+              // path that carries the whole batch.
+              message.pendingMediaBatch == nil,
               message.secureMessagingHistory == nil
         else { throw SecureMessagingExchangeError.messageNotRetryable }
         let body = message.body.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -5693,6 +6851,12 @@ actor SecureMessagingExchangeCoordinator {
               !body.unicodeScalars.contains(where: { $0.value == 0 }),
               !body.hasPrefix(KitMediaMessageDescriptor.prefix),
               KitMediaMessageDescriptor.parse(body) == nil,
+              // Family-wide, every version: a failed sealed KITMEDIA body — key material —
+              // must never retry as plain text. `allowsUserAuthoredText` below now refuses
+              // the family too; this line stays as the explicit media boundary so the intent
+              // survives any future loosening of that shared policy. Media retries ride
+              // `retryFailedMediaMessage` under the same client id.
+              !KitMediaMessageFamilyPolicy.isReservedFamilyText(body),
               SecureMessageReservedPrefixPolicy.allowsUserAuthoredText(body)
         else { throw SecureMessagingExchangeError.messageNotRetryable }
 
@@ -5736,6 +6900,121 @@ actor SecureMessagingExchangeCoordinator {
         return FailedTextRetryCandidate(
             conversation: conversation,
             message: message,
+            alreadyQueued: true
+        )
+    }
+
+    private nonisolated static func failedMediaMessageRetryCandidate(
+        in state: PersistedState,
+        messageID: UUID,
+        userID: String,
+        conversationID: String,
+        expectedRecipientUserID: String?
+    ) throws -> FailedMediaMessageRetryCandidate {
+        guard SecureMessagingValidation.isCanonicalUUID(userID),
+              SecureMessagingValidation.isCanonicalUUID(conversationID),
+              expectedRecipientUserID.map(SecureMessagingValidation.isCanonicalUUID) ?? true,
+              expectedRecipientUserID != userID,
+              state.profile?.id == userID,
+              state.communicationOwnerUserID == userID,
+              state.secureMessaging?.enrollment?.userID == userID
+        else { throw SecureMessagingExchangeError.messageNotRetryable }
+
+        let conversations = state.conversations.filter { $0.id == conversationID }
+        guard conversations.count == 1,
+              let conversation = conversations.first,
+              conversation.participantUserIds.allSatisfy(
+                  SecureMessagingValidation.isCanonicalUUID
+              ),
+              permitsDeferredQueue(
+                  conversation: conversation,
+                  localUserID: userID,
+                  expectedRecipientUserID: expectedRecipientUserID
+              )
+        else { throw SecureMessagingExchangeError.messageNotRetryable }
+        let recipientUserIDs = deferredCommandRecipients(
+            conversation: conversation,
+            localUserID: userID,
+            expectedRecipientUserID: expectedRecipientUserID
+        )
+
+        let messages = state.messages.filter { $0.id == messageID }
+        guard messages.count == 1,
+              let message = messages.first,
+              message.conversationId == conversationID,
+              message.senderId == userID,
+              message.isOutgoing,
+              message.serverMessageId == nil,
+              message.sentAt == nil,
+              message.attachmentData == nil,
+              message.pendingAttachment == nil,
+              message.secureMessagingHistory == nil
+        else { throw SecureMessagingExchangeError.messageNotRetryable }
+        // The projection must be one whole v2 message: a structurally valid pending batch
+        // bound to its canonical caption-or-placeholder body, or a sealed descriptor body
+        // with no leftover pending state. Anything else is not this path's to retry.
+        if let batch = message.pendingMediaBatch {
+            guard batch.isStructurallyValid,
+                  message.body == (batch.caption
+                      ?? mediaBatchPlaceholderBody(itemCount: batch.items.count))
+            else { throw SecureMessagingExchangeError.messageNotRetryable }
+        } else {
+            guard KitMediaMessageV2Descriptor.parse(message.body) != nil else {
+                throw SecureMessagingExchangeError.messageNotRetryable
+            }
+        }
+
+        let relatedCommands = state.outbox.filter {
+            $0.id == messageID || $0.messageId == messageID
+        }
+        if relatedCommands.isEmpty {
+            // Without a retained command the original audience is not durably known: a group
+            // roster may have changed since the failed attempt, so minting a fresh command
+            // from current membership could silently widen or narrow who receives this client
+            // message ID. A direct thread's audience is structural — the one pinned peer — so
+            // only it may mint here; a group message retries solely through its retained
+            // command and that command's pinned recipient list.
+            guard message.state == .failed, !conversation.isGroup else {
+                throw SecureMessagingExchangeError.messageNotRetryable
+            }
+            return FailedMediaMessageRetryCandidate(
+                conversation: conversation,
+                message: message,
+                recipientUserIDs: recipientUserIDs,
+                alreadyQueued: false
+            )
+        }
+
+        guard relatedCommands.count == 1,
+              let command = relatedCommands.first,
+              state.outbox.filter({ $0.id == command.id }).count == 1,
+              message.state == .queued,
+              message.failureReason == nil,
+              command.kind == .secureMessage,
+              command.createdAt == message.createdAt,
+              command.attemptCount >= 0,
+              command.conversationId == conversationID,
+              command.messageId == messageID,
+              command.recipientUserIds == recipientUserIDs,
+              command.video == nil,
+              command.expiresAt == nil,
+              command.callId == nil,
+              command.terminationKind == nil,
+              command.terminationReason == nil,
+              command.failureDisposition == nil,
+              command.lastFailureReason == nil,
+              // A live scheduled command still carries the message's promised minute; a
+              // user-retried one sends immediately and carries none.
+              command.scheduledAt.map({ $0 == message.scheduledAt }) ?? true,
+              command.secureMessageFanout.map({
+                  $0.clientMessageID == messageID.uuidString.lowercased()
+                      && $0.conversationID == conversationID
+              }) ?? true
+        else { throw SecureMessagingExchangeError.messageNotRetryable }
+        return FailedMediaMessageRetryCandidate(
+            conversation: conversation,
+            message: message,
+            recipientUserIDs: recipientUserIDs,
             alreadyQueued: true
         )
     }
@@ -5815,6 +7094,13 @@ actor SecureMessagingExchangeCoordinator {
 private struct FailedTextRetryCandidate {
     let conversation: Conversation
     let message: LocalMessage
+    let alreadyQueued: Bool
+}
+
+private struct FailedMediaMessageRetryCandidate {
+    let conversation: Conversation
+    let message: LocalMessage
+    let recipientUserIDs: [String]
     let alreadyQueued: Bool
 }
 

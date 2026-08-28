@@ -1,5 +1,6 @@
 import PhotosUI
 import SwiftUI
+import UIKit
 
 // MARK: - Member presentation
 
@@ -55,6 +56,10 @@ struct GroupProfileView: View {
     @State private var isLeaving = false
     @State private var leaveFailed = false
     @State private var selectedPhotoItem: PhotosPickerItem?
+    /// The prepared local square is visible immediately while upload/scan/attach runs. Keeping it
+    /// until the server-published URL arrives prevents the photo picker from appearing to dismiss
+    /// without doing anything on a slower connection.
+    @State private var selectedPhotoPreview: UIImage?
     @State private var isUpdatingPhoto = false
     @State private var photoUpdateFailed = false
     @State private var showRemovePhotoConfirmation = false
@@ -107,6 +112,9 @@ struct GroupProfileView: View {
         .onChange(of: selectedPhotoItem) { _, item in
             guard let item else { return }
             submitPhoto(item)
+        }
+        .onChange(of: photoURL) { _, updatedURL in
+            if updatedURL != nil { selectedPhotoPreview = nil }
         }
         .confirmationDialog(
             "Remove the group photo?",
@@ -252,13 +260,41 @@ struct GroupProfileView: View {
     }
 
     private var groupAvatar: some View {
-        GroupAvatarView(
-            title: displayedTitle,
-            photoURL: photoURL,
-            size: 96,
-            showsBadge: photoURL != nil
-        )
+        ZStack {
+            GroupAvatarView(
+                title: displayedTitle,
+                photoURL: photoURL,
+                size: 96,
+                showsBadge: photoURL != nil || selectedPhotoPreview != nil
+            )
+            if let selectedPhotoPreview {
+                Image(uiImage: selectedPhotoPreview)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: 96, height: 96)
+                    .clipShape(Circle())
+                    .transition(.opacity)
+                    .overlay(alignment: .bottomTrailing) {
+                        Image(systemName: "person.2.fill")
+                            .font(.system(size: 16, weight: .bold))
+                            .foregroundStyle(.white)
+                            .frame(width: 35, height: 35)
+                            .background(KitColor.green, in: Circle())
+                            .overlay { Circle().stroke(.white, lineWidth: 1.5) }
+                            .offset(x: 4, y: 4)
+                            .accessibilityHidden(true)
+                    }
+            }
+            if isUpdatingPhoto {
+                Circle()
+                    .fill(.black.opacity(0.24))
+                    .frame(width: 96, height: 96)
+                ProgressView()
+                    .tint(.white)
+            }
+        }
         .kitCircularGlass(diameter: 116, interactive: false)
+        .animation(.easeOut(duration: 0.18), value: selectedPhotoPreview == nil)
         .accessibilityLabel("Group avatar for \(displayedTitle)")
     }
 
@@ -612,11 +648,16 @@ struct GroupProfileView: View {
                       ProfileAvatarImagePreparer.prepareJPEG(from: sourceData)
                   }).value
             else {
+                selectedPhotoPreview = nil
                 photoUpdateFailed = true
                 return
             }
+            selectedPhotoPreview = UIImage(data: jpeg)
             let updated = await updatePhoto(jpeg)
-            if !updated { photoUpdateFailed = true }
+            if !updated {
+                selectedPhotoPreview = nil
+                photoUpdateFailed = true
+            }
         }
     }
 

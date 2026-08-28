@@ -136,7 +136,9 @@ struct CapabilitiesDTO: Decodable {
     var supportsPhoneOTP: Bool { authentication?["phone_otp"] == true }
     var supportsEmailPassword: Bool { authentication?["email_password"] == true }
     var supportsMFA: Bool { authentication?["mfa"] == true }
-    var supportsEmailRegistration: Bool { supportsFeature("email_registration") }
+    // `email_registration` is deliberately unread. Registration happens through a phone number
+    // alone — the backend decides whether a number is new or returning — so a stale server
+    // capability advertising email registration must not be able to resurrect the retired form.
     var supportsEmailRecovery: Bool { supportsFeature("email_recovery") }
 
     /// Feature flags fail closed identically: a missing key, an explicit null and `false` all mean
@@ -155,9 +157,10 @@ struct CapabilitiesDTO: Decodable {
     }
 }
 
+/// The email-path screens. There is deliberately no registration case: a phone number is the
+/// only way to create a Kit Pay account, so the type itself cannot express a registration form.
 enum EmailAccountScreen: Equatable {
     case signIn
-    case registration
     case verification
     case forgotPassword
     case resetPassword
@@ -167,23 +170,19 @@ enum EmailAccountScreen: Equatable {
 /// once a user has received a token, a later rollout change must not strand that flow.
 struct EmailAccountNavigationPolicy: Equatable {
     let emailPasswordEnabled: Bool
-    let registrationEnabled: Bool
     let recoveryEnabled: Bool
 
     init(
         emailPasswordEnabled: Bool,
-        registrationEnabled: Bool,
         recoveryEnabled: Bool
     ) {
         self.emailPasswordEnabled = emailPasswordEnabled
-        self.registrationEnabled = registrationEnabled
         self.recoveryEnabled = recoveryEnabled
     }
 
     init(capabilities: CapabilitiesDTO?) {
         self.init(
             emailPasswordEnabled: capabilities?.supportsEmailPassword == true,
-            registrationEnabled: capabilities?.supportsEmailRegistration == true,
             recoveryEnabled: capabilities?.supportsEmailRecovery == true
         )
     }
@@ -192,8 +191,6 @@ struct EmailAccountNavigationPolicy: Equatable {
         switch screen {
         case .signIn:
             emailPasswordEnabled
-        case .registration:
-            registrationEnabled
         case .verification:
             true
         case .forgotPassword:
@@ -201,6 +198,37 @@ struct EmailAccountNavigationPolicy: Equatable {
         case .resetPassword:
             true
         }
+    }
+}
+
+/// What the phone-first sign-in surface offers, derived from server capabilities alone.
+///
+/// Phone is the sole registration route: the customer enters a number and the backend decides
+/// whether it is a first-time registration or a returning login. Email exists only as a
+/// restrained secondary sign-in for accounts that already attached one, so this policy can
+/// never produce a registration affordance — the retired `email_registration` capability is
+/// not even an input.
+struct PhoneFirstAuthAccessPolicy: Equatable {
+    enum PrimaryRoute: Equatable {
+        case phone
+        case email
+        case unavailable
+    }
+
+    let primaryRoute: PrimaryRoute
+    /// "Sign in with email instead" from the phone screen; offered only when both exist.
+    let offersEmailSecondary: Bool
+
+    init(phoneOTPEnabled: Bool, emailPasswordEnabled: Bool) {
+        primaryRoute = phoneOTPEnabled ? .phone : (emailPasswordEnabled ? .email : .unavailable)
+        offersEmailSecondary = phoneOTPEnabled && emailPasswordEnabled
+    }
+
+    init(capabilities: CapabilitiesDTO?) {
+        self.init(
+            phoneOTPEnabled: capabilities?.supportsPhoneOTP == true,
+            emailPasswordEnabled: capabilities?.supportsEmailPassword == true
+        )
     }
 }
 
@@ -392,22 +420,6 @@ enum EmailAccountValidation {
         return nil
     }
 
-    static func registrationError(
-        name: String,
-        tag: String,
-        email: String,
-        password: String,
-        passwordConfirmation: String
-    ) -> EmailAccountValidationError? {
-        if let identityError = profileIdentityError(name: name, tag: tag) {
-            return identityError
-        }
-        guard isValidEmail(email) else { return .invalidEmail }
-        guard isStrongPassword(password) else { return .weakPassword }
-        guard password == passwordConfirmation else { return .passwordMismatch }
-        return nil
-    }
-
     static func passwordResetError(
         token: String,
         password: String,
@@ -475,6 +487,16 @@ extension CapabilitiesDTO {
     /// are available together.
     var enablesMessagingRichMedia: Bool {
         protocols?.messaging?.richMedia?.supportsIOSV1 == true
+    }
+
+    /// Multi-attachment media messages (KITMEDIA2) ride the same attachment service but are a
+    /// separately attested profile. §6 advertises the readiness twice — the features key and the
+    /// `protocols.messaging.media_message` block — and both must agree; false, missing, null, or
+    /// a malformed/incoherent block all fail closed. This only ever answers for the server leg:
+    /// every destination device must additionally attest the capability at flush time.
+    var enablesMessagingMediaMessageV2: Bool {
+        supportsFeature(MessagingMediaMessageV2CapabilityPolicy.featureKey)
+            && protocols?.messaging?.mediaMessage?.supportsIOSV2 == true
     }
 }
 
@@ -657,11 +679,47 @@ struct MessagingProtocolCapabilityDTO: Decodable {
     let suite: String?
     let postQuantum: Bool?
     var richMedia: MessagingRichMediaProtocolCapabilityDTO? = nil
+    /// Media-message v2 is an additive block. A malformed advertisement must disable only the
+    /// multi-attachment path — never the messaging protocol block it rides in.
+    var mediaMessage: MessagingMediaMessageProtocolCapabilityDTO? = nil
 
     enum CodingKeys: String, CodingKey {
         case ready, version, suite
         case postQuantum = "post_quantum"
         case richMedia = "rich_media"
+        case mediaMessage = "media_message"
+    }
+
+    init(
+        ready: Bool?,
+        version: String?,
+        suite: String?,
+        postQuantum: Bool?,
+        richMedia: MessagingRichMediaProtocolCapabilityDTO? = nil,
+        mediaMessage: MessagingMediaMessageProtocolCapabilityDTO? = nil
+    ) {
+        self.ready = ready
+        self.version = version
+        self.suite = suite
+        self.postQuantum = postQuantum
+        self.richMedia = richMedia
+        self.mediaMessage = mediaMessage
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        ready = try values.decodeIfPresent(Bool.self, forKey: .ready)
+        version = try values.decodeIfPresent(String.self, forKey: .version)
+        suite = try values.decodeIfPresent(String.self, forKey: .suite)
+        postQuantum = try values.decodeIfPresent(Bool.self, forKey: .postQuantum)
+        richMedia = try values.decodeIfPresent(
+            MessagingRichMediaProtocolCapabilityDTO.self,
+            forKey: .richMedia
+        )
+        mediaMessage = try? values.decodeIfPresent(
+            MessagingMediaMessageProtocolCapabilityDTO.self,
+            forKey: .mediaMessage
+        )
     }
 
     var supportsReviewedV2: Bool {
@@ -793,6 +851,23 @@ enum AuthenticationCodePolicy {
               challenge.method?.caseInsensitiveCompare("totp") == .orderedSame
         else { return nil }
         return MFAFactorCodePolicy.normalizedRecoveryCode(value)
+    }
+
+    /// Canonicalizes live code entry: any single numeral a localized keyboard, SMS autofill, or
+    /// paste can produce — Arabic-Indic, Devanagari, full-width, and friends — becomes its ASCII
+    /// digit, everything else is dropped, and the result caps at six digits. Submission stays
+    /// strictly ASCII above; without this mapping, six digits typed on a non-Latin keyboard fill
+    /// the field yet never validate, leaving the verify button disabled with no visible reason.
+    static func sanitizedSixDigitEntry(_ value: String) -> String {
+        var digits = ""
+        for character in value {
+            guard let digit = character.wholeNumberValue, (0 ... 9).contains(digit) else {
+                continue
+            }
+            digits.append(Character("\(digit)"))
+            if digits.count == 6 { break }
+        }
+        return digits
     }
 
     private static func normalizedSixDigitCode(_ value: String) -> String? {
@@ -1341,61 +1416,10 @@ enum AuthResultPolicy {
     }
 }
 
-struct EmailVerificationChallenge: Decodable, Equatable {
-    let type: String
-    let method: String
-    let destination: String
-    let expiresAt: String
-
-    enum CodingKeys: String, CodingKey {
-        case type, method, destination
-        case expiresAt = "expires_at"
-    }
-}
-
-enum EmailVerificationChallengeTimingPolicy {
-    /// The production resend endpoint permits three attempts per minute. A one-minute local
-    /// cooldown is deliberately conservative and avoids presenting backend throttling as an error.
-    static let resendCooldownSeconds: TimeInterval = 60
-
-    static func expirationDate(for challenge: EmailVerificationChallenge) -> Date? {
-        let formatter = ISO8601DateFormatter()
-        if let date = formatter.date(from: challenge.expiresAt) { return date }
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.date(from: challenge.expiresAt)
-    }
-
-    static func isValid(_ challenge: EmailVerificationChallenge, at date: Date = Date()) -> Bool {
-        challenge.type.caseInsensitiveCompare("email_verification") == .orderedSame
-            && challenge.method.caseInsensitiveCompare("email") == .orderedSame
-            && !challenge.destination.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && challenge.destination.unicodeScalars.count <= 254
-            && expirationDate(for: challenge).map { $0 > date } == true
-    }
-
-    static func resendAvailableAt(from date: Date) -> Date {
-        date.addingTimeInterval(resendCooldownSeconds)
-    }
-
-    static func secondsUntilResend(availableAt: Date?, now: Date = Date()) -> Int {
-        guard let availableAt else { return 0 }
-        let remaining = max(0, availableAt.timeIntervalSince(now))
-        guard remaining.isFinite else { return 0 }
-        return Int(ceil(min(remaining, resendCooldownSeconds)))
-    }
-}
-
 enum AuthenticationSecretLifecyclePolicy {
     static func shouldClear(afterSuccessfulRequest succeeded: Bool) -> Bool { succeeded }
 
     static func shouldConceal(sceneIsActive: Bool) -> Bool { !sceneIsActive }
-}
-
-struct EmailRegistrationResult: Decodable {
-    let state: String
-    let challenge: EmailVerificationChallenge
-    let session: SessionTokens?
-    let user: UserProfile
 }
 
 struct EmailVerificationResult: Decodable {
@@ -1404,22 +1428,6 @@ struct EmailVerificationResult: Decodable {
 }
 
 enum EmailAccountResponsePolicy {
-    static func acceptsRegistration(
-        _ result: EmailRegistrationResult,
-        requestedEmail: String,
-        at date: Date = Date()
-    ) -> Bool {
-        let expectedEmail = EmailAccountValidation.normalizeEmail(requestedEmail)
-        guard result.state.caseInsensitiveCompare("verification_required") == .orderedSame,
-              result.session == nil,
-              EmailVerificationChallengeTimingPolicy.isValid(result.challenge, at: date),
-              let returnedEmail = result.user.email.map(EmailAccountValidation.normalizeEmail),
-              EmailAccountValidation.isValidEmail(expectedEmail),
-              EmailAccountValidation.isValidEmail(returnedEmail)
-        else { return false }
-        return returnedEmail.caseInsensitiveCompare(expectedEmail) == .orderedSame
-    }
-
     static func verifiedEmail(from result: EmailVerificationResult) -> String? {
         guard result.verified == true,
               let email = result.user.email.map(EmailAccountValidation.normalizeEmail),
@@ -2520,6 +2528,298 @@ enum MessageDeliveryState: String, Codable, Hashable {
     case queued, encrypting, sending, sent, delivered, read, failed, received
 }
 
+// MARK: - Home starter checklist
+
+/// How each starter step's destination is presented. Identity verification is a substantive
+/// flow and must open as a true full screen — the half-height sheet pattern was explicitly
+/// rejected for flows like it.
+enum HomeStarterStepRoutePolicy {
+    enum Presentation: Equatable {
+        case fullScreen
+        case tabSwitch
+        case walletSheet
+        /// The destination cannot work right now. Explain the real next step instead of
+        /// dropping the customer into a disabled surface.
+        case unavailable(message: String)
+    }
+
+    static let messagingUnavailableMessage =
+        "Secure messaging is still being set up for this device. Connect to the internet, then try again from the Messages tab."
+
+    static func presentation(
+        for step: HomeStarterStep,
+        secureMessagingAvailable: Bool
+    ) -> Presentation {
+        switch step {
+        case .verifyIdentity: .fullScreen
+        case .sendFirstMessage:
+            // Switching tabs into a composer that cannot compose would read as broken and
+            // could never complete the step; say what is actually missing instead.
+            secureMessagingAvailable
+                ? .tabSwitch
+                : .unavailable(message: messagingUnavailableMessage)
+        case .makeFirstTransaction: .walletSheet
+        }
+    }
+}
+
+/// The three first-run steps Home shows above Recent activity, each proven by real state.
+/// The declaration order is the display order the checklist promises.
+enum HomeStarterStep: String, CaseIterable, Hashable {
+    case verifyIdentity
+    case sendFirstMessage
+    case makeFirstTransaction
+}
+
+struct HomeStarterChecklist: Equatable {
+    struct Entry: Equatable {
+        let step: HomeStarterStep
+        let isComplete: Bool
+    }
+
+    let entries: [Entry]
+
+    var completedCount: Int { entries.filter(\.isComplete).count }
+    var totalCount: Int { entries.count }
+}
+
+/// Decides each starter step from authoritative state alone — never a manual or demo toggle.
+///
+/// Everything fails closed: missing or not-yet-loaded state reads as "not done", an unknown
+/// transaction status reads as "not settled", and App Review demo content can complete nothing
+/// because the checklist is withheld for the demo account entirely. The checklist disappears
+/// once all three steps are genuinely complete.
+enum HomeStarterChecklistPolicy {
+    /// The app's authoritative "identity verified" KYC states (see KYCView/ProfileView).
+    static let verifiedKYCStatuses: Set<String> = ["verified", "approved"]
+
+    /// Wallet statuses that mean money actually moved and stayed moved. An allowlist on
+    /// purpose: pending, failed, reversed, and anything unrecognized all fail closed.
+    static let settledTransactionStatuses: Set<String> = [
+        "completed", "settled", "success", "succeeded",
+    ]
+
+    static func identityVerified(kycStatus: String?) -> Bool {
+        guard let kycStatus else { return false }
+        return verifiedKYCStatuses.contains(
+            kycStatus.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        )
+    }
+
+    /// A genuine outbound user message: authored by this account, actually sent — not failed
+    /// and not still waiting in the outbox — and not a payment, system, or reaction event
+    /// riding the message wire. Demo conversations never count.
+    static func hasSentFirstMessage(
+        messages: [LocalMessage],
+        isDemoConversation: (String) -> Bool = { _ in false }
+    ) -> Bool {
+        messages.contains { message in
+            message.isOutgoing
+                && [.sent, .delivered, .read].contains(message.state)
+                && !message.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                // A first photo (valid `KITMEDIA1`) or a first media batch (valid `KITMEDIA2`)
+                // is a first message, so the strict parses count explicitly — the shared
+                // reserved-namespace policy now refuses the whole KITMEDIA family as authored
+                // text. Everything else counts only as allowed ordinary text: a malformed or
+                // unknown-version family body is nobody's first message.
+                && (KitMediaMessageDescriptor.parse(message.body) != nil
+                    || KitMediaMessageV2Descriptor.parse(message.body) != nil
+                    || SecureMessageReservedPrefixPolicy.allowsUserAuthoredText(message.body))
+                && !isDemoConversation(message.conversationId)
+        }
+    }
+
+    /// Types that are not money movement however they are spelled: a request is an ask, and a
+    /// reversal or refund is money moving *back*, which must not read as a first transaction.
+    static let nonMovementTransactionTypes: Set<String> = ["payment_request", "request"]
+    static let reversalTypeFragments: [String] = ["reversal", "reversed", "refund"]
+
+    /// The step is "make first transaction" — money the customer sent, so only the ledger's
+    /// outgoing direction counts. `credit` is a received deposit, and an unrecognized direction
+    /// fails closed like an unrecognized status. (`debit` is the wallet ledger's outgoing word;
+    /// see `KitMoney.signed`.)
+    static let outgoingTransactionDirections: Set<String> = ["debit"]
+
+    /// A genuine settled money-moving transaction the customer made: a recognized settled
+    /// status, an outgoing direction, a type that is neither a request nor a reversal/refund,
+    /// and an amount that actually moved value. Unknown statuses, unknown directions,
+    /// unparseable amounts, and zero amounts all fail closed.
+    static func isSettledMoneyMovement(_ transaction: WalletTransaction) -> Bool {
+        let type = transaction.type
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let status = transaction.status
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let direction = transaction.direction
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard settledTransactionStatuses.contains(status),
+              outgoingTransactionDirections.contains(direction),
+              !nonMovementTransactionTypes.contains(type),
+              !reversalTypeFragments.contains(where: type.contains),
+              // POSIX locale: API amounts use a dot decimal separator regardless of the
+              // device's region format.
+              let amount = Decimal(
+                  string: transaction.amount.trimmingCharacters(in: .whitespacesAndNewlines),
+                  locale: Locale(identifier: "en_US_POSIX")
+              ),
+              amount.magnitude > 0
+        else { return false }
+        return true
+    }
+
+    static func hasMadeFirstTransaction(transactions: [WalletTransaction]) -> Bool {
+        transactions.contains(where: isSettledMoneyMovement)
+    }
+
+    /// Nil means Home shows no checklist: either every step is done, or the signed-in account
+    /// is the App Review demo, whose synthetic rows must neither show nor satisfy first-run
+    /// steps.
+    static func checklist(
+        kycStatus: String?,
+        messages: [LocalMessage],
+        transactions: [WalletTransaction],
+        hasConfirmedFirstMessage: Bool = false,
+        hasConfirmedFirstTransaction: Bool = false,
+        isDemoActive: Bool,
+        isDemoConversation: (String) -> Bool = { _ in false }
+    ) -> HomeStarterChecklist? {
+        guard !isDemoActive else { return nil }
+        let entries = [
+            HomeStarterChecklist.Entry(
+                step: .verifyIdentity,
+                isComplete: identityVerified(kycStatus: kycStatus)
+            ),
+            HomeStarterChecklist.Entry(
+                step: .sendFirstMessage,
+                // Chats can be deleted and history paginated away; the persisted marker keeps
+                // a genuinely sent first message from un-completing later.
+                isComplete: hasConfirmedFirstMessage
+                    || hasSentFirstMessage(
+                        messages: messages,
+                        isDemoConversation: isDemoConversation
+                    )
+            ),
+            HomeStarterChecklist.Entry(
+                step: .makeFirstTransaction,
+                // The live rows are only the latest page of the selected wallet; the persisted
+                // marker is the account-wide memory of a settled movement once observed.
+                isComplete: hasConfirmedFirstTransaction
+                    || hasMadeFirstTransaction(transactions: transactions)
+            ),
+        ]
+        guard entries.contains(where: { !$0.isComplete }) else { return nil }
+        return HomeStarterChecklist(entries: entries)
+    }
+}
+
+/// Optional server-owned account-wide starter checklist (feature key `starter_checklist`,
+/// `GET onboarding/starter-checklist`). The authoritative response is nested: the account it
+/// speaks for, an eligibility flag, an integer policy version, and one entry per milestone.
+/// Device evidence stays one-directional — seeing a sent message or a settled outgoing movement
+/// proves the milestone, but a fresh device or paginated-away history proves nothing — so the
+/// backend's account-wide truth may confirm the same persisted markers. Everything here fails
+/// closed, and it fails whole: a missing capability, a missing or mistyped field, a payload
+/// naming another account, `eligible` false, a policy version below 1, an unknown or duplicate
+/// milestone key, and an unknown status each discard the entire confirmation rather than the
+/// parts that look wrong. Nothing here can un-complete a step.
+struct StarterMilestonesDTO: Decodable, Equatable, Sendable {
+    static let capabilityKey = "starter_checklist"
+
+    /// The status vocabulary this build understands. `completed` — exact, lowercase — is the
+    /// only status that confirms; `pending` is valid and confirms nothing; anything else means
+    /// the contract has moved and the whole payload is beyond this build's judgement.
+    static let completedStatus = "completed"
+    static let pendingStatus = "pending"
+
+    /// The canonical milestone vocabulary, mirroring the checklist's own steps. All three are
+    /// part of validation even though identity verification keeps its own server-owned KYC
+    /// contract and never persists a checklist marker on the device.
+    static let verifyIdentityMilestoneKey = "verify_identity"
+    static let sendFirstMessageMilestoneKey = "send_first_message"
+    static let makeFirstTransactionMilestoneKey = "make_first_transaction"
+    static let knownMilestoneKeys: Set<String> = [
+        verifyIdentityMilestoneKey,
+        sendFirstMessageMilestoneKey,
+        makeFirstTransactionMilestoneKey,
+    ]
+
+    struct Milestone: Decodable, Equatable, Sendable {
+        let key: String
+        let status: String
+        /// Server bookkeeping, never part of the gating decision. The key itself is required —
+        /// a payload that omits it entirely is not the documented contract — but its value is
+        /// null until the milestone completes.
+        let completedAt: String?
+
+        enum CodingKeys: String, CodingKey {
+            case key, status
+            case completedAt = "completed_at"
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            key = try container.decode(String.self, forKey: .key)
+            status = try container.decode(String.self, forKey: .status)
+            // Synthesized decoding would treat a missing key and an explicit null the same;
+            // the contract requires the key, so its absence must fail the decode.
+            guard container.contains(.completedAt) else {
+                throw DecodingError.keyNotFound(CodingKeys.completedAt, DecodingError.Context(
+                    codingPath: container.codingPath,
+                    debugDescription: "completed_at is required; null marks an open milestone"
+                ))
+            }
+            completedAt = try container.decodeIfPresent(String.self, forKey: .completedAt)
+        }
+    }
+
+    /// The account this checklist speaks for; a payload naming any other account is discarded
+    /// whole rather than mined for the parts that look right.
+    let accountId: String
+    /// The server's own gate on the programme; `false` withholds every confirmation.
+    let eligible: Bool
+    /// Integer policy revision, 1 or greater.
+    let policyVersion: Int
+    let milestones: [Milestone]
+
+    enum CodingKeys: String, CodingKey {
+        case accountId = "account_id"
+        case eligible
+        case policyVersion = "policy_version"
+        case milestones
+    }
+
+    /// The milestone keys the server confirms for the given account — or nil when the payload
+    /// must not be trusted at all. The account comparison parses both IDs as they are: a
+    /// whitespace-corrupted `account_id` is evidence of a broken producer, not something to
+    /// repair into a match.
+    func confirmedMilestoneKeys(forAccountID activeAccountID: String) -> Set<String>? {
+        guard let payloadAccount = UUID(uuidString: accountId),
+              let activeAccount = UUID(uuidString: activeAccountID),
+              payloadAccount == activeAccount,
+              eligible,
+              policyVersion >= 1
+        else { return nil }
+        var confirmed: Set<String> = []
+        var seenKeys: Set<String> = []
+        for milestone in milestones {
+            guard Self.knownMilestoneKeys.contains(milestone.key),
+                  seenKeys.insert(milestone.key).inserted
+            else { return nil }
+            switch milestone.status {
+            case Self.completedStatus:
+                confirmed.insert(milestone.key)
+            case Self.pendingStatus:
+                continue
+            default:
+                return nil
+            }
+        }
+        return confirmed
+    }
+}
+
 struct ConversationDraftWriteVersion: Codable, Hashable, Sendable {
     let writerID: UUID
     let sequence: UInt64
@@ -2582,6 +2882,12 @@ struct LocalMessage: Codable, Hashable, Identifiable {
     /// upload its ciphertext and replace this marker with the canonical cross-platform media
     /// descriptor. Optional keeps state written by earlier builds backward-decodable.
     var pendingAttachment: LocalPendingAttachment? = nil
+    /// Durable send-side state of a queued multi-attachment (KITMEDIA2) message: every item's
+    /// park key, its queue-minted key material, and the per-item upload checkpoints. Present
+    /// exactly from queue time until the sealed descriptor replaces `body`, so a crash at any
+    /// point resumes the same one-message identity instead of re-queueing or splitting.
+    /// Optional keeps state written by earlier builds decodable.
+    var pendingMediaBatch: KitMediaMessageV2OutboundBatch? = nil
     /// Exact authenticated metadata needed to donate this plaintext through the history-backfill
     /// protocol. A missing value is fail-closed: the message remains visible locally but is never
     /// offered as a trusted history source to another enrollment.
@@ -2612,6 +2918,239 @@ struct LocalPendingAttachment: Codable, Hashable, Sendable {
     var localStorageKey: String? = nil
     /// Plaintext size for pending bubbles that carry no inline data. Optional for old state.
     var byteCount: Int? = nil
+}
+
+extension LocalMessage {
+    /// Every key this message may hold media under in the encrypted file cache, across both
+    /// media generations and every outbound phase: the v1 pending park key, a sealed v1
+    /// descriptor's storage key, every v2 batch park/checkpoint key, and every storage key of a
+    /// sealed v2 descriptor. Local deletion and scheduled-send cancellation must remove exactly
+    /// this set — enumerating any less leaves recoverable media behind after a local delete.
+    var localMediaStorageKeys: [String] {
+        var keys: [String] = []
+        if let parked = pendingAttachment?.localStorageKey { keys.append(parked) }
+        // Structural gate before trusting any batch key field: a corrupt batch's keys are
+        // arbitrary persisted bytes that can name blobs owned by *other* messages even while
+        // individually canonical-shaped, so deletion driven by them could destroy another
+        // conversation's cached media. Fail closed; retiring the damaged row is the visible
+        // path for its own residue.
+        if let batch = pendingMediaBatch, batch.isStructurallyValid {
+            keys.append(contentsOf: batch.allLocalStorageKeys)
+        }
+        if let v1 = KitMediaMessageDescriptor.parse(body) { keys.append(v1.storageKey) }
+        if let v2 = KitMediaMessageV2Descriptor.parse(body) {
+            keys.append(contentsOf: v2.items.map { $0.storageKey })
+        }
+        // Only canonical lowercase UUIDs may reach the file cache: damaged persisted state must
+        // never turn local deletion into removal under a malformed or attacker-shaped key.
+        var seen = Set<String>()
+        return keys.filter {
+            UUID(uuidString: $0)?.uuidString.lowercased() == $0 && seen.insert($0).inserted
+        }
+    }
+}
+
+/// The identity step of every secure media load. Views hand loaders nothing but identity — a
+/// message UUID, its conversation, and (for a multi-attachment message) the display index —
+/// and this policy resolves that identity against the CURRENT persisted rows: exactly one row
+/// must match, its body (or pending batch) is parsed and gated fresh, and the index is bounds-
+/// checked, all before any cache is consulted. A snapshot a view captured earlier — an entire
+/// `LocalMessage`, or worse its raw descriptor text — can therefore never serve bytes for a
+/// message that has since been deleted, replaced, or rewritten, and no caller-supplied wire
+/// text ever reaches the verifying open paths. Anything that does not resolve cleanly is nil:
+/// fail closed, surface nothing.
+enum SecureMediaLoadPolicy {
+    enum Resolved: Equatable {
+        /// A sealed single-attachment (KITMEDIA1) message. `descriptorText` is the current
+        /// persisted body re-read here — the one string the legacy open path may see — and
+        /// `inlineData` is the v1 inline plaintext slot, when the row still carries it.
+        case single(
+            descriptor: KitMediaMessageDescriptor,
+            descriptorText: String,
+            inlineData: Data?
+        )
+        /// One §8-ordered item of a batch still pending upload, addressed by index into its
+        /// complete logical projection: the whole structurally valid batch plus the row body
+        /// bound to it. Pending plaintext lives only in the local encrypted cache; there is
+        /// nothing on the server bound to this message yet.
+        case pendingBatchItem(
+            batch: KitMediaMessageV2OutboundBatch,
+            body: String,
+            itemIndex: Int
+        )
+        /// One §8-ordered item of a sealed KITMEDIA2 message, addressed by index into the
+        /// complete sealed projection: the parsed descriptor plus the exact body it came from.
+        case sealedBatchItem(
+            descriptor: KitMediaMessageV2Descriptor,
+            descriptorText: String,
+            itemIndex: Int
+        )
+    }
+    // The batch cases deliberately carry the whole message projection rather than the selected
+    // item: a loader's post-await revalidation compares entire resolutions, and equality must
+    // fail when a replacement row preserves the one selected item while changing the shared
+    // caption or any sibling. Consumers derive the item by subscripting the carried projection
+    // with the carried index (bounds-proven at resolution).
+
+    /// `itemIndex` nil addresses the single-attachment (v1) shape; non-nil addresses one item
+    /// of a multi-attachment batch. A version/shape mismatch, a missing or duplicated row, a
+    /// structurally invalid pending batch, an unparseable body, or an out-of-bounds index all
+    /// resolve to nil.
+    static func resolve(
+        messageID: UUID,
+        conversationId: String,
+        itemIndex: Int?,
+        in messages: [LocalMessage]
+    ) -> Resolved? {
+        let rows = messages.filter {
+            $0.id == messageID && $0.conversationId == conversationId
+        }
+        guard rows.count == 1, let row = rows.first else { return nil }
+        if let itemIndex {
+            if let batch = row.pendingMediaBatch {
+                // A pending row is coherent only in the exact shape the queue wrote: no v1
+                // pending slot, no inline v1 bytes, and a body that is the batch caption (or
+                // the content-free placeholder) — nothing else. A row where a v1 shape and a
+                // v2 batch coexist, or whose body stopped being bound to its own batch, is
+                // damaged or forged state; serve nothing from it.
+                guard batch.isStructurallyValid,
+                      row.pendingAttachment == nil,
+                      row.attachmentData == nil,
+                      row.body == (batch.caption
+                          ?? SecureMessagingExchangeCoordinator.mediaBatchPlaceholderBody(
+                              itemCount: batch.items.count
+                          )),
+                      batch.items.indices.contains(itemIndex)
+                else { return nil }
+                return .pendingBatchItem(batch: batch, body: row.body, itemIndex: itemIndex)
+            }
+            // Sealed batch items are never stored inline — `attachmentData` is the v1 slot —
+            // so a sealed v2 row carrying either v1 field is likewise incoherent.
+            guard row.pendingAttachment == nil,
+                  row.attachmentData == nil,
+                  let descriptor = KitMediaMessageV2Descriptor.parse(row.body),
+                  descriptor.items.indices.contains(itemIndex)
+            else { return nil }
+            return .sealedBatchItem(
+                descriptor: descriptor,
+                descriptorText: row.body,
+                itemIndex: itemIndex
+            )
+        }
+        guard row.pendingAttachment == nil,
+              row.pendingMediaBatch == nil,
+              let descriptor = KitMediaMessageDescriptor.parse(row.body)
+        else { return nil }
+        // The inline slot is trusted only at the exact declared plaintext size: a truncated
+        // write or foreign bytes on a rewritten row must fall through to the verifying open
+        // paths rather than display as this attachment.
+        return .single(
+            descriptor: descriptor,
+            descriptorText: row.body,
+            inlineData: row.attachmentData.flatMap {
+                $0.count == descriptor.plaintextByteSize ? $0 : nil
+            }
+        )
+    }
+
+    /// Plaintext bytes together with the display facts of the row they were resolved from.
+    /// Consumers that go on to re-encode media (forward, share) must take the MIME type and
+    /// caption from here — bound to the same authoritative resolution that produced the bytes —
+    /// never from a row snapshot captured earlier, where only the bytes would be current.
+    struct LoadedItem {
+        let data: Data
+        let mediaType: String
+        /// The v1 message caption. nil for batch items: a batch caption belongs to the whole
+        /// message, and forwarding one item must never smuggle the message's text with it.
+        let caption: String?
+    }
+
+    /// A single-attachment (KITMEDIA1) message still waiting for upload. Exactly one storage
+    /// form is ever populated: the small-media inline slot, or the canonical encrypted-cache
+    /// park key for large media. `expectedByteCount` is the declared plaintext size; the parked
+    /// form requires it (every cache read is pinned to it), while inline rows written by builds
+    /// that predate the size field may carry nil — their bytes live on the identity-resolved
+    /// row itself and cannot alias another blob.
+    ///
+    /// This is the complete authoritative pending projection, not just the storage locator:
+    /// post-await equality compares whole values, and it must fail when a replacement row
+    /// reuses the storage form while changing the MIME type, caption, or bound body. Display
+    /// facts shown with the loaded bytes must come from this same value.
+    struct ResolvedPendingSingle: Equatable {
+        let inlineData: Data?
+        let localStorageKey: String?
+        let expectedByteCount: Int?
+        let mediaType: String
+        let caption: String?
+        /// The row body the resolution validated (the caption, or the kind's preview label).
+        let body: String
+    }
+
+    /// Identity resolution for the pending single-attachment shape, under the same rule as
+    /// `resolve`: exactly one current row, gated fresh at load time. A row that has since
+    /// sealed, vanished, duplicated, or grown a coexisting batch resolves to nil — and so does
+    /// every shape no queue writer produces: both storage forms or neither, a non-canonical
+    /// park key, a body no longer bound to the attachment's own caption or preview label, a
+    /// declared size outside the transfer bounds, or inline bytes that contradict it.
+    static func resolvePendingSingle(
+        messageID: UUID,
+        conversationId: String,
+        in messages: [LocalMessage]
+    ) -> ResolvedPendingSingle? {
+        let rows = messages.filter {
+            $0.id == messageID && $0.conversationId == conversationId
+        }
+        guard rows.count == 1, let row = rows.first,
+              let pending = row.pendingAttachment,
+              row.pendingMediaBatch == nil,
+              // The queue writes the caption as the body, or the kind's preview label when
+              // there is none. A pending row whose body stopped being bound to its own
+              // attachment facts is damaged or forged state; serve nothing from it.
+              row.body == (pending.caption
+                  ?? KitChatMediaKind(mediaType: pending.mediaType).previewLabel)
+        else { return nil }
+        // The MIME type must be one this wire actually carries — `KitChatMediaKind` classifies
+        // any string into a bucket and the size check is kind-agnostic, so without this gate a
+        // forged pending row could smuggle an arbitrary type through to display and forward.
+        guard SecureMessagingWire.allowedAttachmentMediaTypes.contains(pending.mediaType)
+        else { return nil }
+        let kind = KitChatMediaKind(mediaType: pending.mediaType)
+        if let declared = pending.byteCount,
+           !KitChatMediaLimits.fits(declared, kind: kind) {
+            return nil
+        }
+        switch (row.attachmentData, pending.localStorageKey) {
+        case (let inline?, nil):
+            guard KitChatMediaLimits.shouldCacheInline(byteCount: inline.count),
+                  pending.byteCount.map({ $0 == inline.count }) ?? true
+            else { return nil }
+            return ResolvedPendingSingle(
+                inlineData: inline,
+                localStorageKey: nil,
+                expectedByteCount: pending.byteCount,
+                mediaType: pending.mediaType,
+                caption: pending.caption,
+                body: row.body
+            )
+        case (nil, let key?):
+            // Parked bytes come back through the shared encrypted cache, so the key must be
+            // canonical and the declared size present — a legacy row with no declared size
+            // never serves cache bytes unpinned.
+            guard UUID(uuidString: key)?.uuidString.lowercased() == key,
+                  let declared = pending.byteCount
+            else { return nil }
+            return ResolvedPendingSingle(
+                inlineData: nil,
+                localStorageKey: key,
+                expectedByteCount: declared,
+                mediaType: pending.mediaType,
+                caption: pending.caption,
+                body: row.body
+            )
+        default:
+            return nil
+        }
+    }
 }
 
 struct Conversation: Codable, Hashable, Identifiable {
@@ -2825,6 +3364,14 @@ struct PersistedState: Codable {
     var registeredDeviceProjectionRevision: UInt64?
     var selectedWalletId: String?
     var transactions: [WalletTransaction] = []
+    /// When this account was first seen to have a settled money-moving transaction, recorded at
+    /// the server-confirmed transactions write. `transactions` holds only the latest page of the
+    /// selected wallet, so an account-wide "has ever transacted" milestone must not be recomputed
+    /// from it — once true it stays true here. Optional keeps older encrypted state decodable.
+    var starterFirstTransactionAt: Date? = nil
+    /// Same idea for the first genuinely sent message: chat deletion or history pagination must
+    /// not resurrect the starter checklist. Optional for the same decodability reason.
+    var starterFirstMessageAt: Date? = nil
     /// The authoritative result of the most recent address-book sync.
     /// Optional keeps encrypted state written by older app versions decodable.
     var contacts: [WalletContactDTO]?
@@ -2899,6 +3446,8 @@ struct PersistedState: Codable {
             || pinnedConversationIds?.isEmpty == false
             || mutedConversationIds?.isEmpty == false
             || messageBackupPreferences != nil
+            || starterFirstTransactionAt != nil
+            || starterFirstMessageAt != nil
 
         if let previousOwner {
             if previousOwner.caseInsensitiveCompare(authenticatedProfile.id) != .orderedSame {
@@ -3103,7 +3652,13 @@ enum ConversationDraftPolicy {
 }
 
 struct KYCStatus: Decodable, Hashable {
+    /// The blended status the KYC screen renders: the backend overrides it with per-device
+    /// verification, so it can read "pending" for a fully verified account on a new iPhone.
     let status: String
+    /// The account's own identity status, independent of this device. Optional keeps older
+    /// backend responses decodable; account-identity consumers (the Home starter checklist)
+    /// read this first and fall back to the cached profile.
+    let accountStatus: String?
     let `case`: KYCCase?
     let providerSession: KYCProviderSession?
     let documents: [KYCDocument]?
@@ -3111,6 +3666,7 @@ struct KYCStatus: Decodable, Hashable {
 
     enum CodingKeys: String, CodingKey {
         case status, `case`, documents
+        case accountStatus = "account_status"
         case providerSession = "provider_session"
         case deviceVerification = "device_verification"
     }

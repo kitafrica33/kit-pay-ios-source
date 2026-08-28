@@ -5,6 +5,16 @@ import UIKit
 /// The small state boundary between asking AVKit to start Picture in Picture and AVKit reporting
 /// that the window is active. Starting is asynchronous, so teardown must already be retained in
 /// that interval or the gallery can delete the protected plaintext file from under the player.
+/// Exact gallery identity of a handed-off video. A KITMEDIA2 message can carry several videos
+/// inside its one bubble, so restoring the floating window must reopen the very item that was
+/// handed off — message ID alone would silently land on the message's first visual entry.
+struct ChatVideoGalleryIdentity: Equatable {
+    let messageID: UUID
+    /// Index into the multi-attachment message's display-ordered items; nil for a
+    /// single-attachment (KITMEDIA1) video.
+    let itemIndex: Int?
+}
+
 enum ChatVideoPictureInPictureHandoffPolicy {
     static func shouldRetainTeardown(
         ownerMatches: Bool,
@@ -39,10 +49,10 @@ final class ChatVideoPictureInPicture: NSObject {
     /// The viewer currently allowed to drive the window. Identity only — never dereferenced.
     private var ownerID: ObjectIdentifier?
     private weak var attachedPlayer: AVPlayer?
-    private var messageID: UUID?
-    /// Bound to the same viewer as `messageID`. A later gallery can never redirect restore for a
-    /// video that is already floating over the app.
-    private var restoreHandler: ((UUID) -> Void)?
+    private var galleryIdentity: ChatVideoGalleryIdentity?
+    /// Bound to the same viewer as `galleryIdentity`. A later gallery can never redirect restore
+    /// for a video that is already floating over the app.
+    private var restoreHandler: ((ChatVideoGalleryIdentity) -> Void)?
     /// Set before calling AVKit and cleared only when AVKit confirms success/failure. This closes
     /// the start→active race in which the gallery disappears while `isPictureInPictureActive` is
     /// still false.
@@ -68,8 +78,8 @@ final class ChatVideoPictureInPicture: NSObject {
     func attach(
         playerLayer: AVPlayerLayer,
         owner: AnyObject,
-        messageID: UUID,
-        restore: @escaping (UUID) -> Void
+        galleryIdentity: ChatVideoGalleryIdentity,
+        restore: @escaping (ChatVideoGalleryIdentity) -> Void
     ) {
         guard AVPictureInPictureController.isPictureInPictureSupported() else { return }
         // A live call owns the audio route; a chat video must never take it, and a voice note
@@ -79,7 +89,7 @@ final class ChatVideoPictureInPicture: NSObject {
 
         let identity = ObjectIdentifier(owner)
         if ownerID == identity, controller?.contentSource?.playerLayer === playerLayer {
-            self.messageID = messageID
+            self.galleryIdentity = galleryIdentity
             restoreHandler = restore
             return
         }
@@ -101,7 +111,7 @@ final class ChatVideoPictureInPicture: NSObject {
         controller = pictureInPicture
         ownerID = identity
         attachedPlayer = playerLayer.player
-        self.messageID = messageID
+        self.galleryIdentity = galleryIdentity
         restoreHandler = restore
     }
 
@@ -184,7 +194,7 @@ final class ChatVideoPictureInPicture: NSObject {
         controller = nil
         ownerID = nil
         attachedPlayer = nil
-        messageID = nil
+        galleryIdentity = nil
         restoreHandler = nil
         startRequested = false
     }
@@ -238,8 +248,9 @@ extension ChatVideoPictureInPicture: AVPictureInPictureControllerDelegate {
                 completionHandler(false)
                 return
             }
-            if let messageID = self.messageID, let restoreHandler = self.restoreHandler {
-                restoreHandler(messageID)
+            if let galleryIdentity = self.galleryIdentity,
+               let restoreHandler = self.restoreHandler {
+                restoreHandler(galleryIdentity)
                 completionHandler(true)
             } else {
                 completionHandler(false)

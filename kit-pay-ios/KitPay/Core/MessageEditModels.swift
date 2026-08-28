@@ -231,7 +231,9 @@ enum MessageEditAggregationPolicy {
               [.sent, .delivered, .read].contains(message.state),
               let sentAt = message.sentAt,
               message.serverMessageId != nil,
-              KitMediaMessageDescriptor.parse(message.body) == nil,
+              // Family-wide, every media generation: a descriptor body is not wording, and a
+              // malformed reserved body is nobody's to reword either.
+              !KitMediaMessageFamilyPolicy.isReservedFamilyText(message.body),
               message.secureMessagingHistory?.kind != .encryptedAttachment,
               MessageReplyQuotePolicy.canReply(to: message),
               authenticatedEdit(in: message) == nil
@@ -285,7 +287,7 @@ enum MessageEditAggregationPolicy {
                   message.secureMessagingHistory?.kind != .encryptedAttachment,
                   KitMessageReaction.parse(message.body) == nil,
                   KitMessageEdit.parse(message.body) == nil,
-                  KitMediaMessageDescriptor.parse(message.body) == nil,
+                  !KitMediaMessageFamilyPolicy.isReservedFamilyText(message.body),
                   KitSystemMessage.parse(message.body) == nil,
                   let serverMessageID = message.serverMessageId?.lowercased(),
                   SecureMessagingWirePolicy.isCanonicalUUID(serverMessageID)

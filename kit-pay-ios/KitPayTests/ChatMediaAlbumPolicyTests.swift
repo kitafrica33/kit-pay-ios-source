@@ -271,7 +271,7 @@ final class ChatMediaAlbumPolicyTests: XCTestCase {
         )
     }
 
-    func testAlbumItemsCarryTheParseableDescriptorText() throws {
+    func testAlbumItemsCarryIdentityAndDisplayFactsButNeverDescriptorText() throws {
         let messages = [
             try makeMediaMessage(secondsAfterBase: 0),
             try makeMediaMessage(mediaType: "video/quicktime", secondsAfterBase: 5),
@@ -280,13 +280,26 @@ final class ChatMediaAlbumPolicyTests: XCTestCase {
         let albums = ChatMediaAlbumPolicy.albums(for: messages)
         XCTAssertEqual(albums.count, 1)
         for (item, message) in zip(albums[0].items, messages) {
-            XCTAssertEqual(item.descriptorText, message.body)
+            let descriptor = try XCTUnwrap(KitMediaMessageDescriptor.parse(message.body))
+            XCTAssertEqual(item.messageID, message.id)
+            XCTAssertEqual(item.conversationID, message.conversationId)
+            XCTAssertEqual(item.thumbnailKey, descriptor.storageKey)
+            XCTAssertEqual(item.mediaType, descriptor.mediaType)
+            XCTAssertEqual(item.plaintextByteSize, descriptor.plaintextByteSize)
             XCTAssertEqual(item.isOutgoing, message.isOutgoing)
             XCTAssertEqual(item.createdAt, message.createdAt)
-            let parsed = KitMediaMessageDescriptor.parse(item.descriptorText)
-            XCTAssertNotNil(parsed)
-            XCTAssertEqual(parsed?.mediaType, item.mediaType)
-            XCTAssertNil(parsed?.caption)
+            XCTAssertNil(descriptor.caption)
+        }
+        // A descriptor holds the attachment's key material, so the album item type must never
+        // carry the raw descriptor text. Mirror makes that omission an executable assertion.
+        for (item, message) in zip(albums[0].items, messages) {
+            let carriesDescriptorText = Mirror(reflecting: item).children.contains { _, value in
+                (value as? String) == message.body
+            }
+            XCTAssertFalse(
+                carriesDescriptorText,
+                "album items must carry identity and display facts only, never descriptor text"
+            )
         }
     }
 }

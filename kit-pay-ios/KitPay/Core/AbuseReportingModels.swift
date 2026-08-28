@@ -167,15 +167,18 @@ struct AbuseReportSelectedMessage: Encodable, Equatable, Sendable {
         case plaintext
     }
 
+    /// Only prose a person typed may be attached to a report. The entire `KITMEDIA` family is
+    /// rejected here — every version, parseable or not — because a descriptor carries the
+    /// decryption keys for its attachments, and submitting one would hand moderators (and any
+    /// transport log) the keys to media the reporter never consented to share. Captions are not
+    /// extracted from descriptors either: sharing part of a media message it has no dedicated
+    /// consent language for is worse than omitting it from the picker.
     init(messageID rawMessageID: String, plaintext: String) throws {
         guard let messageID = CommunicationPrivacyIdentifier.canonicalUUID(rawMessageID),
               !plaintext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               plaintext.unicodeScalars.count <= AbuseReportContract.maximumMessageCharacters,
               plaintext.utf8.count <= AbuseReportContract.maximumSelectedMessageBytes,
-              !SecureMessageReservedPrefixPolicy.beginsWithReservedPrefix(
-                  plaintext,
-                  prefix: KitMediaMessageDescriptor.prefix
-              ),
+              !KitMediaMessageFamilyPolicy.isReservedFamilyText(plaintext),
               !SecureMessageReservedPrefixPolicy.beginsWithReservedPrefix(
                   plaintext,
                   prefix: KitPaymentMessage.prefix
@@ -225,6 +228,7 @@ enum AbuseReportMessageSelectionPolicy {
                             ? context.currentUserID
                             : context.reportedUserID),
                       message.pendingAttachment == nil,
+                      message.pendingMediaBatch == nil,
                       message.attachmentData == nil,
                       [.sent, .delivered, .read, .received].contains(message.state),
                       let messageID = CommunicationPrivacyIdentifier.canonicalUUID(

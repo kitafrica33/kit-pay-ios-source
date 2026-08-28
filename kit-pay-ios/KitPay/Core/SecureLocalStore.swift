@@ -211,6 +211,12 @@ actor SecureLocalStore {
             candidate.pinnedConversationIds = state.pinnedConversationIds
             candidate.mutedConversationIds = state.mutedConversationIds
             candidate.messageBackupPreferences = state.messageBackupPreferences
+            // The starter milestones are facts about this same owner; forgetting them on a
+            // routine sign-out would resurrect a completed checklist. A different account
+            // never inherits them: bindAuthenticatedProfile wipes the whole state on an owner
+            // change, and both markers count as unowned data for ownerless legacy state.
+            candidate.starterFirstTransactionAt = state.starterFirstTransactionAt
+            candidate.starterFirstMessageAt = state.starterFirstMessageAt
         }
         // Signal identity, prekeys, sessions, and replay markers are account-bound. Never carry
         // them through logout into a later account activation, even though display history stays.

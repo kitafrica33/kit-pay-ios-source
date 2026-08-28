@@ -208,10 +208,16 @@ struct MessagesView: View {
         .onChange(of: model.messageConversationNavigationRequest) { _, _ in
             applyMessageNotificationNavigation()
         }
+        .onChange(of: model.pendingNewMessageComposeID) { _, _ in
+            applyPendingNewMessageCompose()
+        }
         .onChange(of: model.state.conversations) { _, _ in
             applyMessageNotificationNavigation()
         }
         .onAppear {
+            // The Messages tab can be built lazily AFTER Home has already raised the request,
+            // in which case onChange never fires for it — apply on appearance too.
+            applyPendingNewMessageCompose()
             isConversationPresented = !navigationPath.isEmpty
             applyMessageNotificationNavigation()
         }
@@ -852,6 +858,16 @@ struct MessagesView: View {
         queuedNewMessageConversation = nil
         newMessageContact = contact
         showNewMessage = true
+    }
+
+    /// Opens the contact picker for a cross-tab compose request, consuming the request only
+    /// after the presentation state is set so a consumed-but-unpresented ask cannot occur.
+    private func applyPendingNewMessageCompose() {
+        guard let requestID = model.pendingNewMessageComposeID else { return }
+        newMessageContact = nil
+        newMessagePresentationID = UUID()
+        showNewMessage = true
+        model.consumeNewMessageComposeRequest(requestID)
     }
 
     private func finishNewMessagePresentation() {
@@ -1539,7 +1555,10 @@ struct ConversationView: View {
 
     private var recipientPresentation: ConversationContactPresentation {
         ConversationContactPresentationPolicy.presentation(
-            for: conversation,
+            // Group identity can change while this screen and its full-screen profile remain
+            // mounted. Resolve from the latest store projection so a newly attached group photo
+            // replaces the generated avatar without requiring the chat to be closed and reopened.
+            for: currentConversation,
             currentUserID: model.profile?.id,
             contacts: model.contactDirectory
         )
@@ -1599,7 +1618,7 @@ struct ConversationView: View {
 
     private var currentUserIsGroupMember: Bool {
         guard let currentUserID = canonicalUserID(model.profile?.id) else { return false }
-        return conversation.participantUserIds.contains {
+        return currentConversation.participantUserIds.contains {
             canonicalUserID($0) == currentUserID
         }
     }
@@ -1741,7 +1760,7 @@ struct ConversationView: View {
     /// Members of this group who could be paid: everyone but the account holder.
     private var groupPaymentMembers: [GroupPaymentDraftPolicy.Member] {
         let selfID = model.profile?.id.lowercased()
-        return conversation.participantUserIds
+        return currentConversation.participantUserIds
             .map { $0.lowercased() }
             .filter { $0 != selfID }
             .map {
@@ -1770,7 +1789,7 @@ struct ConversationView: View {
 
     // MARK: Presence & typing
 
-    private var isGroupConversation: Bool { conversation.isGroup }
+    private var isGroupConversation: Bool { currentConversation.isGroup }
 
     /// "typing…" (or names in groups) — sourced from the realtime presence center; empty until
     /// the realtime transport is connected, never guessed.
@@ -1791,7 +1810,7 @@ struct ConversationView: View {
     private var presenceSubtitle: String? {
         if let typing = conversationTypingLabel { return typing }
         if isGroupConversation {
-            let count = conversation.participantUserIds.count
+            let count = currentConversation.participantUserIds.count
             return "\(count) member\(count == 1 ? "" : "s")"
         }
         guard model.messagingPresenceEnabled, presence.broadcastsPresence else { return nil }
@@ -2524,18 +2543,29 @@ struct ConversationView: View {
                         .onChanged { _ in updateCameraPullArming() }
                         .onEnded { _ in releaseCameraPull() }
                 )
-                .task(
-                    id: "\(conversation.id.lowercased()):\(timelineItems.last?.id ?? "empty")"
-                ) {
-                    guard !timelineItems.isEmpty else { return }
-                    // Let the LazyVStack install its bottom anchor before addressing it. This is
-                    // needed when protected history is already present as the screen opens.
+                .task(id: openingPositionTaskID) {
+                    guard ConversationLatestPositionPolicy.openingLayoutIsReady(
+                        hasTimelineContent: !timelineItems.isEmpty,
+                        contentHeight: conversationContentHeight,
+                        viewportHeight: conversationViewportHeight
+                    ) else { return }
+                    // Geometry has now confirmed both the viewport and the LazyVStack's content,
+                    // so the bottom anchor exists. Claiming before that layout pass made an early
+                    // no-op permanent: the thread looked caught between offsets and the first
+                    // upward drag only started working after a compensating downward drag.
                     await Task.yield()
                     guard !Task.isCancelled,
                           latestPositionPolicy.claimOpening(
                               conversationID: conversation.id,
                               hasTimelineContent: !timelineItems.isEmpty
                           )
+                    else { return }
+                    scrollToBottom(using: scrollProxy, animated: false)
+                    // A second transaction after the first offset change lets SwiftUI settle the
+                    // lazy rows and composer inset. It is non-animated and only occurs on entry.
+                    await Task.yield()
+                    guard !Task.isCancelled,
+                          latestPositionPolicy.hasPositioned(conversationID: conversation.id)
                     else { return }
                     scrollToBottom(using: scrollProxy, animated: false)
                 }
@@ -2827,13 +2857,18 @@ struct ConversationView: View {
                     showContactProfile = false
                     beginMessageSearch()
                 },
-                showMessageInChat: { messageID in
+                showMessageInChat: { messageID, itemIndex in
                     showContactProfile = false
-                    if galleryItems.contains(where: { $0.messageID == messageID }) {
+                    if galleryItems.contains(where: {
+                        $0.messageID == messageID && $0.itemIndex == itemIndex
+                    }) {
                         // Give the sheet a beat to dismiss before presenting the cover.
                         Task { @MainActor in
                             try? await Task.sleep(nanoseconds: 350_000_000)
-                            galleryTarget = ConversationGalleryTarget(id: messageID)
+                            galleryTarget = ConversationGalleryTarget(
+                                messageID: messageID,
+                                itemIndex: itemIndex
+                            )
                         }
                     } else {
                         pendingScrollTargetMessageID = messageID
@@ -2861,11 +2896,14 @@ struct ConversationView: View {
                 ConversationMediaLibraryView(
                     conversationID: conversation.id,
                     conversationTitle: currentConversation.title,
-                    openGallery: { messageID in
+                    openGallery: { messageID, itemIndex in
                         showGroupMediaLibrary = false
                         Task { @MainActor in
                             try? await Task.sleep(nanoseconds: 350_000_000)
-                            galleryTarget = ConversationGalleryTarget(id: messageID)
+                            galleryTarget = ConversationGalleryTarget(
+                                messageID: messageID,
+                                itemIndex: itemIndex
+                            )
                         }
                     }
                 )
@@ -2901,18 +2939,28 @@ struct ConversationView: View {
         .fullScreenCover(item: $galleryTarget) { target in
             KitMediaGalleryView(
                 items: galleryItems,
-                initialItemID: target.id,
+                initialItemID: target.messageID,
+                initialItemIndex: target.itemIndex,
                 loadData: { item in
-                    try await model.loadSecureMedia(
+                    // Identity-addressed: the model resolves the current persisted row and
+                    // re-parses its descriptor at load time, so a gallery entry can never
+                    // smuggle stale or forged wire text into the verifying open paths. The
+                    // whole LoadedItem is returned so render/save/share facts stay bound to
+                    // the same resolution as the bytes.
+                    try await model.loadSecureMediaItem(
+                        messageID: item.messageID,
                         conversationId: item.conversationID,
-                        descriptorText: item.descriptorText
+                        itemIndex: item.itemIndex
                     )
                 },
                 showInChat: { item in
                     pendingScrollTargetMessageID = item.messageID
                 },
-                restoreFromPictureInPicture: { messageID in
-                    galleryTarget = ConversationGalleryTarget(id: messageID)
+                restoreFromPictureInPicture: { identity in
+                    galleryTarget = ConversationGalleryTarget(
+                        messageID: identity.messageID,
+                        itemIndex: identity.itemIndex
+                    )
                 },
                 onDismiss: { galleryTarget = nil }
             )
@@ -4227,11 +4275,13 @@ struct ConversationView: View {
         .opacity(selectedMessageIDs.isEmpty ? 0.55 : 1)
     }
 
+    /// Defers to `copyableText(for:)` — the same predicate Copy itself runs — so the button can
+    /// never be enabled for a selection Copy would put nothing on the pasteboard for: captionless
+    /// media of either wire version, unparseable/future family bodies, pending batches without a
+    /// caption.
     private var selectionHasCopyableText: Bool {
         messages.contains { message in
-            guard selectedMessageIDs.contains(message.id) else { return false }
-            let descriptor = KitMediaMessageDescriptor.parse(message.body)
-            return descriptor == nil || descriptor?.caption?.isEmpty == false
+            selectedMessageIDs.contains(message.id) && copyableText(for: message) != nil
         }
     }
 
@@ -4355,9 +4405,6 @@ struct ConversationView: View {
                 ChatMediaAlbumGridView(
                     album: album,
                     isOutgoing: isOutgoing,
-                    cachedData: { item in
-                        messages.first(where: { $0.id == item.messageID })?.attachmentData
-                    },
                     onTap: { item in openGallery(at: item.messageID) },
                     cellMenu: { item in
                         guard let message = messages.first(where: { $0.id == item.messageID })
@@ -4426,32 +4473,65 @@ struct ConversationView: View {
     }
 
     /// Chronological photos/videos of this conversation for the shared gallery pager.
+    ///
+    /// A sealed KITMEDIA2 message contributes one entry per visual item — indexed by
+    /// (message ID, item index) — while remaining one logical message with one bubble.
+    /// Still-uploading rows and family bodies that fail both strict parses contribute
+    /// nothing: the pager only ever addresses rows whose load path can verify them, and
+    /// no entry carries descriptor text.
     private var galleryItems: [KitGalleryItem] {
-        messages.compactMap { message in
+        messages.flatMap { message -> [KitGalleryItem] in
             guard message.pendingAttachment == nil,
-                  let descriptor = KitMediaMessageDescriptor.parse(message.body)
-            else { return nil }
-            let kind = KitChatMediaKind(mediaType: descriptor.mediaType)
-            guard kind == .image || kind == .video else { return nil }
-            return KitGalleryItem(
-                messageID: message.id,
-                conversationID: conversation.id,
-                descriptorText: message.body,
-                mediaType: descriptor.mediaType,
-                isOutgoing: message.isOutgoing,
-                createdAt: message.createdAt,
-                senderName: message.isOutgoing
-                    ? "You"
-                    : isGroupConversation
-                        ? participantDisplayName(for: message.senderId)
-                        : recipientDisplayName
-            )
+                  message.pendingMediaBatch == nil
+            else { return [] }
+            let senderName = message.isOutgoing
+                ? "You"
+                : isGroupConversation
+                    ? participantDisplayName(for: message.senderId)
+                    : recipientDisplayName
+            if let descriptor = KitMediaMessageDescriptor.parse(message.body) {
+                let kind = KitChatMediaKind(mediaType: descriptor.mediaType)
+                guard kind == .image || kind == .video else { return [] }
+                return [KitGalleryItem(
+                    messageID: message.id,
+                    itemIndex: nil,
+                    conversationID: conversation.id,
+                    mediaType: descriptor.mediaType,
+                    plaintextByteSize: descriptor.plaintextByteSize,
+                    thumbnailKey: descriptor.storageKey,
+                    isOutgoing: message.isOutgoing,
+                    createdAt: message.createdAt,
+                    senderName: senderName
+                )]
+            }
+            guard let batch = KitMediaMessageV2Descriptor.parse(message.body) else { return [] }
+            return batch.items.enumerated().compactMap { index, item in
+                let kind = KitChatMediaKind(mediaType: item.mediaType)
+                guard kind == .image || kind == .video else { return nil }
+                return KitGalleryItem(
+                    messageID: message.id,
+                    itemIndex: index,
+                    conversationID: conversation.id,
+                    mediaType: item.mediaType,
+                    plaintextByteSize: item.plaintextByteSize,
+                    thumbnailKey: item.storageKey,
+                    isOutgoing: message.isOutgoing,
+                    createdAt: message.createdAt,
+                    senderName: senderName
+                )
+            }
         }
     }
 
     private func openGallery(at messageID: UUID) {
-        guard galleryItems.contains(where: { $0.messageID == messageID }) else { return }
-        galleryTarget = ConversationGalleryTarget(id: messageID)
+        openGalleryItem(at: messageID, itemIndex: nil)
+    }
+
+    private func openGalleryItem(at messageID: UUID, itemIndex: Int?) {
+        guard galleryItems.contains(where: {
+            $0.messageID == messageID && (itemIndex == nil || $0.itemIndex == itemIndex)
+        }) else { return }
+        galleryTarget = ConversationGalleryTarget(messageID: messageID, itemIndex: itemIndex)
     }
 
     @ViewBuilder
@@ -4500,6 +4580,25 @@ struct ConversationView: View {
                         Text(caption)
                             .foregroundStyle(message.isOutgoing ? .white : KitColor.primaryText)
                     }
+                // One bubble for the whole multi-attachment message, in every phase: the items
+                // stack inside it in display order, the shared caption renders once below them,
+                // and the one status/retry row in `messageMetadata` speaks for the batch.
+                } else if let batch = message.pendingMediaBatch {
+                    SecureMediaBatchMessageView(message: message)
+                    // Structural gate before the caption: a corrupt persisted batch renders
+                    // only the damaged placeholder above, never its unvalidated caption bytes.
+                    // A caption that passes is canonical — non-nil is the whole test, and its
+                    // bytes render exactly as sent.
+                    if batch.isStructurallyValid, let caption = batch.caption {
+                        Text(caption)
+                            .foregroundStyle(message.isOutgoing ? .white : KitColor.primaryText)
+                    }
+                } else if let mediaBatch = KitMediaMessageV2Descriptor.parse(message.body) {
+                    SecureMediaBatchMessageView(message: message)
+                    if let caption = mediaBatch.caption {
+                        Text(caption)
+                            .foregroundStyle(message.isOutgoing ? .white : KitColor.primaryText)
+                    }
                 } else if let descriptor {
                     SecureMediaMessageView(message: message, descriptor: descriptor)
                     if mediaKind != .document,
@@ -4531,11 +4630,28 @@ struct ConversationView: View {
         .foregroundStyle(message.isOutgoing ? .white.opacity(0.72) : .secondary)
     }
 
+    /// What Copy puts on the pasteboard. For any media message that is only ever its caption —
+    /// a descriptor is wire text carrying attachment keys, and an unparseable family body has
+    /// no safe text at all (§4 rule 6).
     private func copyableText(for message: LocalMessage) -> String? {
-        if let descriptor = KitMediaMessageDescriptor.parse(message.body) {
-            return descriptor.caption?.nilIfBlank
+        if let batch = message.pendingMediaBatch {
+            // A batch that fails the structural gate has no trustworthy caption to copy; a
+            // batch that passes has a canonical one whose bytes — including boundary scalars
+            // Foundation trims would eat — must reach the pasteboard exactly as typed.
+            guard batch.isStructurallyValid else { return nil }
+            return batch.caption
         }
-        return message.body.nilIfBlank
+        switch KitMediaMessageFamilyPresentation.content(for: message.body) {
+        case .text:
+            return message.body.nilIfBlank
+        case .mediaV1(let media):
+            return media.caption?.nilIfBlank
+        case .mediaV2(let media):
+            // Validated by parse: non-nil is canonical, bytes preserved exactly.
+            return media.caption
+        case .confinedPlaceholder:
+            return nil
+        }
     }
 
     private func copySelectedMessages() {
@@ -4547,26 +4663,31 @@ struct ConversationView: View {
         finishMessageSelection()
     }
 
-    /// Messages the forward sheet can carry: delivered text and media with a durable
+    /// Messages the forward sheet can carry: delivered text and v1 media with a durable
     /// descriptor. Still-uploading and failed media cannot be re-encrypted for a new
-    /// conversation yet, so they are skipped.
+    /// conversation yet, so they are skipped. Multi-attachment messages are not forwardable
+    /// in this build — and no other KITMEDIA-family body, valid or not, may ever leave as
+    /// forwarded *text*, because a descriptor is wire data carrying attachment keys.
     private func forwardPayloadItems(for ids: Set<UUID>) -> [ForwardPayloadItem] {
         messages
             .filter { ids.contains($0.id) }
             .compactMap { message in
-                guard message.pendingAttachment == nil, message.state != .failed else {
-                    return nil
-                }
+                guard message.pendingAttachment == nil,
+                      message.pendingMediaBatch == nil,
+                      message.state != .failed
+                else { return nil }
                 if KitMediaMessageDescriptor.parse(message.body) != nil {
+                    // Eligibility only — the payload carries pure identity, and the forward
+                    // sheet resolves bytes and MIME/caption together at send time.
                     return .media(
                         id: message.id,
-                        sourceConversationID: conversation.id,
-                        descriptorText: message.body
+                        sourceConversationID: conversation.id
                     )
                 }
                 guard let body = message.body.nilIfBlank,
                       KitPaymentMessage.parse(body) == nil,
                       !KitMessageReaction.isReactionText(body),
+                      !KitMediaMessageFamilyPolicy.isReservedFamilyText(body),
                       !SecureMessageReservedPrefixPolicy.beginsWithReservedPrefix(
                           body,
                           prefix: KitSystemMessage.prefix
@@ -5526,9 +5647,11 @@ struct ConversationView: View {
             else { return nil }
             return delivery
         }
-        let sharedTextClientMessageID = submittedSharedDelivery?.batch.text == nil
-            ? nil
-            : submittedSharedDelivery?.batch.id
+        // One shared-inbox delivery is one message whatever shape it takes — text-only, one
+        // attachment with or without text, or a 2–8 batch — so its batch UUID is the sole
+        // client identity for the send. The share extension can then hand the same batch
+        // over twice without the conversation ever queueing it twice.
+        let sharedBatchClientMessageID = submittedSharedDelivery?.batch.id
         let persistenceVersion = model.nextConversationDraftWriteVersion()
         immediateDraftPersistenceTask?.cancel()
         immediateDraftPersistenceTask = nil
@@ -5553,7 +5676,7 @@ struct ConversationView: View {
                     title: recipientDisplayName,
                     recipientId: recipientUserID,
                     body: submittedDraft,
-                    clientMessageID: sharedTextClientMessageID,
+                    clientMessageID: sharedBatchClientMessageID,
                     draftClearVersion: clearVersion,
                     deliverAt: deliverAt,
                     replyToServerMessageID: answering
@@ -5564,7 +5687,7 @@ struct ConversationView: View {
                     text: submittedText,
                     submittedDraft: submittedDraft,
                     clearVersion: clearVersion,
-                    sharedTextClientMessageID: sharedTextClientMessageID,
+                    sharedBatchClientMessageID: sharedBatchClientMessageID,
                     deliverAt: deliverAt,
                     replyToServerMessageID: answering
                 )
@@ -5583,75 +5706,74 @@ struct ConversationView: View {
         }
     }
 
-    /// Queues every staged attachment and returns whether everything, including any typed
-    /// text, ended up durably queued.
+    /// Queues everything staged — attachments and typed text together — as exactly one message,
+    /// and returns whether that one message ended up durably queued.
+    ///
+    /// One attachment sends the legacy single-attachment message with the typed text as its
+    /// caption. For a document the caption otherwise carries the filename; typed text wins,
+    /// because one send must never split into two messages and the v1 wire has no second text
+    /// field — the filename simply does not survive when text rides along.
+    ///
+    /// Two to eight attachments send one KITMEDIA2 batch: one bubble, one shared caption, one
+    /// queue/retry identity. The caption travels as the RAW submitted draft — the contract's
+    /// six-codepoint boundary strip is the only normalization allowed, and a platform
+    /// whitespace trim here would eat bytes (NBSP, U+0085, U+2028) every other client
+    /// preserves. Nothing is unstaged unless the one queue commit succeeds, so a failed send
+    /// keeps every staged byte and the draft exactly where they were.
     private func sendStagedAttachments(
         _ attachments: [ChatStagedAttachment],
         text: String,
         submittedDraft: String,
         clearVersion: ConversationDraftWriteVersion,
-        sharedTextClientMessageID: UUID?,
+        sharedBatchClientMessageID: UUID?,
         deliverAt: Date? = nil,
         replyToServerMessageID: String? = nil
     ) async -> Bool {
-        // A single non-document attachment carries the typed text as its caption. Documents
-        // keep the filename in the caption (the wire descriptor has no filename field), and
-        // multi-attachment sends stay captionless so photo runs can group into one album;
-        // both send the typed text as a separate follow-up message.
-        let textRidesOnMedia = attachments.count == 1 && attachments[0].kind != .document
-        var queuedAllMedia = true
-        // Only the first attachment answers. A run of photos is one act of answering, not one
-        // answer per photo, and the follow-up text belongs to that same run.
-        var pendingReplyTarget = replyToServerMessageID
-        for attachment in attachments {
-            let caption: String? = if attachment.kind == .document {
-                attachment.displayName
-            } else if textRidesOnMedia {
-                text.nilIfBlank
-            } else {
-                nil
-            }
-            let queued = await model.queueMediaMessage(
+        let queued: Bool
+        if attachments.count == 1, let attachment = attachments.first {
+            let caption = text.nilIfBlank
+                ?? (attachment.kind == .document ? attachment.displayName : nil)
+            queued = await model.queueMediaMessage(
                 conversationId: conversation.id,
                 title: recipientDisplayName,
                 recipientId: recipientUserID,
                 mediaData: attachment.data,
                 mediaType: attachment.mediaType,
                 caption: caption,
-                clientMessageID: attachment.clientMessageID,
-                submittedDraftBody: textRidesOnMedia ? submittedDraft : nil,
-                draftClearVersion: textRidesOnMedia ? clearVersion : nil,
+                // A shared-in delivery keeps its batch UUID as the message identity even
+                // when it boiled down to a single attachment; only picker-only sends keep
+                // the attachment's own (usually minted-at-queue) identity.
+                clientMessageID: sharedBatchClientMessageID ?? attachment.clientMessageID,
+                submittedDraftBody: submittedDraft,
+                draftClearVersion: clearVersion,
                 deliverAt: deliverAt,
-                replyToServerMessageID: pendingReplyTarget
+                replyToServerMessageID: replyToServerMessageID
             )
-            if queued {
-                // Durably queued: unstage it even if a later attachment fails, so a retry
-                // can never duplicate this one.
-                stagedAttachments.removeAll { $0.id == attachment.id }
-                pendingReplyTarget = nil
-            } else {
-                queuedAllMedia = false
+        } else {
+            // A share retained in the app-group inbox retries the whole batch under its
+            // one source identity; ordinary picker sends let the queue mint the identity.
+            queued = await model.queueMediaMessageBatch(
+                conversationId: conversation.id,
+                title: recipientDisplayName,
+                recipientId: recipientUserID,
+                attachments: attachments.map {
+                    (mediaData: $0.data, mediaType: $0.mediaType)
+                },
+                rawCaption: submittedDraft,
+                clientMessageID: sharedBatchClientMessageID,
+                submittedDraftBody: submittedDraft,
+                draftClearVersion: clearVersion,
+                deliverAt: deliverAt,
+                replyToServerMessageID: replyToServerMessageID
+            )
+        }
+        if queued {
+            stagedAttachments.removeAll { staged in
+                attachments.contains { $0.id == staged.id }
             }
+            if stagedAttachments.isEmpty { selectedPhotoItems = [] }
         }
-        if stagedAttachments.isEmpty { selectedPhotoItems = [] }
-        guard queuedAllMedia else { return false }
-        if textRidesOnMedia { return true }
-        guard let followUp = text.nilIfBlank else { return true }
-        let textQueued = await model.queueMessage(
-            conversationId: conversation.id,
-            title: recipientDisplayName,
-            recipientId: recipientUserID,
-            body: followUp,
-            clientMessageID: sharedTextClientMessageID,
-            draftClearVersion: clearVersion,
-            deliverAt: deliverAt,
-            replyToServerMessageID: pendingReplyTarget
-        )
-        if !textQueued {
-            model.lastError =
-                "The attachments were queued, but the message text was not. Your draft is still here."
-        }
-        return textQueued
+        return queued
     }
 
     private func persistDraftImmediately() {
@@ -6274,6 +6396,15 @@ struct ConversationView: View {
         }
     }
 
+    private var openingPositionTaskID: String {
+        let ready = ConversationLatestPositionPolicy.openingLayoutIsReady(
+            hasTimelineContent: !timelineItems.isEmpty,
+            contentHeight: conversationContentHeight,
+            viewportHeight: conversationViewportHeight
+        )
+        return "\(conversation.id.lowercased()):\(timelineItems.last?.id ?? "empty"):\(ready)"
+    }
+
     private func scrollToBottom(using proxy: ScrollViewProxy, animated: Bool = true) {
         unseenIncomingCount = 0
         let position = {
@@ -6435,17 +6566,33 @@ enum ConversationMessageSearchPolicy {
         if let pending = message.pendingAttachment {
             return pending.caption?.nilIfBlank
         }
-        if let descriptor = KitMediaMessageDescriptor.parse(message.body) {
-            return descriptor.caption?.nilIfBlank
+        if let batch = message.pendingMediaBatch {
+            // Structurally invalid persisted batches have no searchable text at all; a valid
+            // batch's caption is canonical and searches byte-exact (a Foundation trim would
+            // mutate or drop contract-valid boundary scalars).
+            guard batch.isStructurallyValid else { return nil }
+            return batch.caption
         }
-        guard KitPaymentMessage.parse(message.body) == nil,
-              !KitMessageReaction.isReactionText(message.body),
-              !SecureMessageReservedPrefixPolicy.beginsWithReservedPrefix(
-                  message.body,
-                  prefix: KitSystemMessage.prefix
-              )
-        else { return nil }
-        return message.body.nilIfBlank
+        // Any KITMEDIA body searches by its caption alone; the descriptor is wire text, and an
+        // unparseable family body has no searchable text at all (§4 rule 6).
+        switch KitMediaMessageFamilyPresentation.content(for: message.body) {
+        case .mediaV1(let media):
+            return media.caption?.nilIfBlank
+        case .mediaV2(let media):
+            // Validated by parse: non-nil is canonical, bytes preserved exactly.
+            return media.caption
+        case .confinedPlaceholder:
+            return nil
+        case .text(let body):
+            guard KitPaymentMessage.parse(body) == nil,
+                  !KitMessageReaction.isReactionText(body),
+                  !SecureMessageReservedPrefixPolicy.beginsWithReservedPrefix(
+                      body,
+                      prefix: KitSystemMessage.prefix
+                  )
+            else { return nil }
+            return body.nilIfBlank
+        }
     }
 }
 
@@ -6617,6 +6764,18 @@ struct ConversationLatestPositionPolicy: Equatable {
         positionedConversationID == conversationID.lowercased()
     }
 
+    static func openingLayoutIsReady(
+        hasTimelineContent: Bool,
+        contentHeight: CGFloat,
+        viewportHeight: CGFloat
+    ) -> Bool {
+        hasTimelineContent
+            && contentHeight.isFinite
+            && viewportHeight.isFinite
+            && contentHeight > 0
+            && viewportHeight > 0
+    }
+
     static func shouldFollowTimelineChange(
         hasPositionedCurrentConversation: Bool,
         latestMessageIsOutgoing: Bool,
@@ -6647,7 +6806,16 @@ private struct ConversationAbuseReportPresentation: Identifiable {
 }
 
 private struct ConversationGalleryTarget: Identifiable {
-    let id: UUID
+    let messageID: UUID
+    /// Which item of a multi-attachment message to land on; nil = the first visual entry.
+    var itemIndex: Int? = nil
+
+    /// Presentation identity is the exact (message, item) pair. Keyed on the message alone,
+    /// `fullScreenCover(item:)` would treat two targets into the same multi-attachment message
+    /// as one presentation and keep the previous item's page state on screen.
+    var id: String {
+        itemIndex.map { "\(messageID.uuidString):\($0)" } ?? messageID.uuidString
+    }
 }
 
 /// The message the delivery-details sheet is asking about.
@@ -6857,8 +7025,10 @@ private struct ConversationContactProfileView: View {
     let startVideoCall: () -> Void
     /// Dismisses this sheet and opens the in-chat message search.
     let searchChat: () -> Void
-    /// Dismisses this sheet and scrolls the conversation to the given message.
-    let showMessageInChat: (UUID) -> Void
+    /// Dismisses this sheet and shows the given message in the conversation. A visual media
+    /// item also carries its index within a multi-attachment message so the gallery opens on
+    /// that exact item; ordinary rows pass nil and scroll by message ID.
+    let showMessageInChat: (UUID, Int?) -> Void
 
     var body: some View {
         NavigationStack {
@@ -6942,8 +7112,8 @@ private struct ConversationContactProfileView: View {
                         ConversationMediaLibraryView(
                             conversationID: conversation.id,
                             conversationTitle: displayName,
-                            openGallery: { tappedMessageID in
-                                showMessageInChat(tappedMessageID)
+                            openGallery: { tappedMessageID, itemIndex in
+                                showMessageInChat(tappedMessageID, itemIndex)
                             }
                         )
                         .environmentObject(model)
@@ -7313,6 +7483,21 @@ enum ChatMessagePresentationPolicy {
                 nil
             )
         }
+        if let batch = message.pendingMediaBatch {
+            // A corrupt persisted batch previews as the bare placeholder and never surfaces
+            // its unvalidated caption or derives labels from unbounded items. A valid batch's
+            // caption rides byte-exact — non-nil is canonical, no Foundation trim.
+            guard batch.isStructurallyValid else {
+                return (KitMediaMessageFamilyPresentation.genericAttachmentLabel, nil)
+            }
+            let label = KitMediaMessageFamilyPresentation.summaryLabel(
+                forMediaTypes: batch.items.map(\.mediaType)
+            )
+            if let caption = batch.caption {
+                return ("\(label) · \(caption)", caption)
+            }
+            return (label, nil)
+        }
 
         if let reaction = KitMessageReaction.parse(message.body) {
             let label = reaction.operation == .add
@@ -7362,17 +7547,23 @@ enum ChatMessagePresentationPolicy {
             return (paymentPreview, paymentPreview)
         }
 
-        if let media = KitMediaMessageDescriptor.parse(message.body) {
+        // The whole KITMEDIA family routes through one policy so no version — parseable,
+        // malformed, or future — can surface its wire text (§4 rule 6). Only a valid caption
+        // is user prose: v2 captions join search, while the descriptor itself never does.
+        switch KitMediaMessageFamilyPresentation.content(for: message.body) {
+        case .mediaV1(let media):
             return (mediaPreview(mediaType: media.mediaType, caption: media.caption), nil)
+        case .mediaV2(let media):
+            // Validated by parse: non-nil is canonical, and search must see the exact bytes.
+            return (
+                KitMediaMessageFamilyPresentation.previewText(for: message.body),
+                media.caption
+            )
+        case .confinedPlaceholder:
+            return (KitMediaMessageFamilyPresentation.genericAttachmentLabel, nil)
+        case .text(let body):
+            return (body, body)
         }
-        // Apply the same fail-closed presentation to unsupported media descriptor versions.
-        if SecureMessageReservedPrefixPolicy.beginsWithReservedPrefix(
-            message.body,
-            prefix: KitMediaMessageDescriptor.prefix
-        ) {
-            return ("Photo", nil)
-        }
-        return (message.body, message.body)
     }
 
     private static func mediaPreview(mediaType: String, caption: String?) -> String {

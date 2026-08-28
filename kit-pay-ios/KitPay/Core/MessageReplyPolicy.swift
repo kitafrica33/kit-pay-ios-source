@@ -56,15 +56,39 @@ struct MessageReplyQuote: Equatable, Hashable, Sendable {
 /// history it already holds — the wire carries only the pointer, never a second copy of the
 /// quoted plaintext, so answering a message can never republish it to anyone.
 enum MessageReplyQuotePolicy {
-    /// Stand-in text for a message that has no words of its own.
+    /// Stand-in text for a message that has no words of its own. A v1 body contributes at most
+    /// its caption; a multi-attachment body quotes §8-style — kind label, +count, caption
+    /// garnish — through `mediaAlbumQuoteLabel`, with a validated caption's bytes preserved
+    /// exactly (nil/non-nil is the whole test; Foundation trims would eat NBSP/U+0085/U+2028/
+    /// U+2029, which the contract admits). A reserved-family body this build cannot parse —
+    /// and a pending batch whose persisted bytes fail the structural gate — is never quotable
+    /// prose (§4 rule 6) and reads as the generic placeholder instead.
     static func previewText(for message: LocalMessage) -> String {
-        if let descriptor = KitMediaMessageDescriptor.parse(message.body) {
+        if let batch = message.pendingMediaBatch {
+            guard batch.isStructurallyValid else {
+                return KitMediaMessageFamilyPresentation.genericAttachmentLabel
+            }
+            return KitMediaMessageFamilyPresentation.mediaAlbumQuoteLabel(
+                forMediaTypes: batch.items.map(\.mediaType),
+                caption: batch.caption
+            )
+        }
+        switch KitMediaMessageFamilyPresentation.content(for: message.body) {
+        case .mediaV1(let descriptor):
             let caption = descriptor.caption?.trimmingCharacters(in: .whitespacesAndNewlines)
             if let caption, !caption.isEmpty { return caption }
             return KitChatMediaKind(mediaType: descriptor.mediaType).previewLabel
+        case .mediaV2(let descriptor):
+            return KitMediaMessageFamilyPresentation.mediaAlbumQuoteLabel(
+                forMediaTypes: descriptor.items.map(\.mediaType),
+                caption: descriptor.caption
+            )
+        case .confinedPlaceholder:
+            return KitMediaMessageFamilyPresentation.genericAttachmentLabel
+        case .text(let body):
+            let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? "Message" : trimmed
         }
-        let trimmed = message.body.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? "Message" : trimmed
     }
 
     /// Whether a message can be answered at all. It has to exist on the server for the pointer

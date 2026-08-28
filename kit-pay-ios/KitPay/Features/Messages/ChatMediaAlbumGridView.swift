@@ -3,14 +3,14 @@ import UIKit
 
 /// In-bubble grid for a `ChatMediaAlbum` (2+ consecutive captionless photos/videos).
 ///
-/// The grid only shows thumbnails/placeholders from locally cached plaintext — it never triggers
-/// downloads itself. Tapping any cell reports the item so the presenter can open the gallery
-/// (which does load on demand).
+/// The grid only shows thumbnails/placeholders from locally available plaintext — it never
+/// triggers downloads itself. Every cell performs its own fresh local-only identity resolution
+/// (account, current persisted row, full projection) and nothing — including an in-memory
+/// thumbnail-cache hit — is shown for a row that does not currently resolve. Tapping any cell
+/// reports the item so the presenter can open the gallery (which does load on demand).
 struct ChatMediaAlbumGridView: View {
     let album: ChatMediaAlbum
     let isOutgoing: Bool
-    /// Provides the decoded plaintext if already cached locally (inline or file cache).
-    let cachedData: (ChatMediaAlbumItem) -> Data?
     /// Tap on any cell (an item from `album.items`).
     let onTap: (ChatMediaAlbumItem) -> Void
     /// Long-press menu for one cell. Album members are ordinary messages: each can be answered,
@@ -18,6 +18,11 @@ struct ChatMediaAlbumGridView: View {
     var cellMenu: ((ChatMediaAlbumItem) -> AnyView)? = nil
     /// Anything that belongs on top of one cell — today, that cell's own reaction chips.
     var cellBadge: ((ChatMediaAlbumItem) -> AnyView)? = nil
+
+    /// Message IDs whose cells resolved a clearly portrait image; drives the tall two-up
+    /// variant. Populated by the cells themselves after their identity-gated load, so layout
+    /// never reads bytes or caches directly.
+    @State private var portraitCells: Set<UUID> = []
 
     private enum Metrics {
         static let gap: CGFloat = 2
@@ -68,22 +73,10 @@ struct ChatMediaAlbumGridView: View {
         }
     }
 
-    /// Aspect is derived from an already-available thumbnail; a cell with no cached bytes (or a
-    /// video, whose bytes do not decode as an image) is assumed square.
+    /// Aspect facts come from the cells' own identity-gated loads; a cell that has not resolved
+    /// (or a video, whose bytes do not decode as an image) is assumed square.
     private var bothTwoUpItemsArePortrait: Bool {
-        album.items.allSatisfy { item in
-            guard KitChatMediaKind(mediaType: item.mediaType) == .image,
-                  let key = storageKey(for: item),
-                  let thumbnail = ChatMediaThumbnailStore.shared.thumbnail(
-                      forKey: key,
-                      maxPixel: Metrics.squareEdge,
-                      from: cachedData(item)
-                  ),
-                  thumbnail.size.height > 0
-            else { return false }
-            return thumbnail.size.width / thumbnail.size.height
-                < Metrics.portraitAspectThreshold
-        }
+        album.items.allSatisfy { portraitCells.contains($0.messageID) }
     }
 
     // MARK: 3 items: featured left + two stacked right.
@@ -158,10 +151,16 @@ struct ChatMediaAlbumGridView: View {
             size: size,
             isOutgoing: isOutgoing,
             overflowCount: overflowCount,
-            data: cachedData(item),
             cornerRadius: Metrics.cellCornerRadius,
             onTap: { onTap(item) },
-            badge: cellBadge?(item)
+            badge: cellBadge?(item),
+            onImageAspectRatio: { ratio in
+                if ratio < Metrics.portraitAspectThreshold {
+                    portraitCells.insert(item.messageID)
+                } else {
+                    portraitCells.remove(item.messageID)
+                }
+            }
         )
         // Attached only when there is a menu to show, so a thread that offers none keeps the
         // plain, undelayed tap.
@@ -172,10 +171,6 @@ struct ChatMediaAlbumGridView: View {
                 content
             }
         }
-    }
-
-    private func storageKey(for item: ChatMediaAlbumItem) -> String? {
-        KitMediaMessageDescriptor.parse(item.descriptorText)?.storageKey
     }
 }
 
@@ -189,40 +184,42 @@ private struct ChatMediaAlbumGridCell: View {
     let isOutgoing: Bool
     /// > 0 renders the "+N" scrim over this cell.
     let overflowCount: Int
-    let data: Data?
     let cornerRadius: CGFloat
     let onTap: () -> Void
     /// Drawn over this cell's bottom-trailing corner; nil when there is nothing to show.
     var badge: AnyView? = nil
+    /// Reports width/height of a resolved image so the parent can pick the tall two-up layout.
+    var onImageAspectRatio: ((CGFloat) -> Void)? = nil
 
+    @EnvironmentObject private var model: AppModel
+    /// Bytes and facts of this cell's own fresh identity resolution (local-only; the grid never
+    /// downloads). Every rendered pixel is gated on this being non-nil, so a thumbnail-cache hit
+    /// can never outlive the persisted row it was cut from: the cache key is the row's
+    /// content-bound storage key, and it is only consulted after that row re-resolves.
+    @State private var loaded: SecureMediaLoadPolicy.LoadedItem?
     @State private var videoPoster: UIImage?
 
     private var kind: KitChatMediaKind {
-        KitChatMediaKind(mediaType: item.mediaType)
+        KitChatMediaKind(mediaType: loaded?.mediaType ?? item.mediaType)
     }
-
-    private var descriptor: KitMediaMessageDescriptor? {
-        KitMediaMessageDescriptor.parse(item.descriptorText)
-    }
-
-    private var storageKey: String? { descriptor?.storageKey }
 
     /// The requested thumbnail bucket is the cell's larger edge so scaledToFill never upscales.
     private var maxPixel: CGFloat { max(size.width, size.height) }
 
     private var thumbnail: UIImage? {
-        guard let storageKey else { return nil }
+        // Identity gate: no current resolution, no pixels — not even already-cached ones.
+        guard let loaded else { return nil }
         switch kind {
         case .video:
             return ChatMediaThumbnailStore.shared.cachedThumbnail(
-                forKey: storageKey,
+                forKey: item.thumbnailKey,
                 maxPixel: maxPixel
             ) ?? videoPoster
         default:
             return ChatMediaThumbnailStore.shared.thumbnail(
-                forKey: storageKey,
+                forKey: item.thumbnailKey,
                 maxPixel: maxPixel,
-                from: data
+                from: loaded.data
             )
         }
     }
@@ -252,14 +249,37 @@ private struct ChatMediaAlbumGridCell: View {
         }
         .buttonStyle(.plain)
         .accessibilityLabel(accessibilityLabel)
-        .task(id: item.messageID) {
-            guard kind == .video, videoPoster == nil, let storageKey, data != nil else { return }
-            videoPoster = await ChatMediaThumbnailStore.shared.videoThumbnail(
-                forKey: storageKey,
-                maxPixel: maxPixel,
-                from: data,
-                mediaType: item.mediaType
+        .task(id: "\(item.messageID):\(item.thumbnailKey)") {
+            // Fresh local-only identity resolution per (message, sealed-descriptor) key; a
+            // replaced row changes the key and re-fires this. Failure clears any previously
+            // shown pixels instead of serving stale state.
+            loaded = try? await model.loadSecureMediaItem(
+                messageID: item.messageID,
+                conversationId: item.conversationID,
+                itemIndex: nil,
+                allowsDownload: false
             )
+            guard let loaded else { return }
+            switch KitChatMediaKind(mediaType: loaded.mediaType) {
+            case .video:
+                videoPoster = await ChatMediaThumbnailStore.shared.videoThumbnail(
+                    forKey: item.thumbnailKey,
+                    maxPixel: maxPixel,
+                    from: loaded.data,
+                    mediaType: loaded.mediaType
+                )
+            case .image:
+                let thumb = ChatMediaThumbnailStore.shared.thumbnail(
+                    forKey: item.thumbnailKey,
+                    maxPixel: maxPixel,
+                    from: loaded.data
+                )
+                if let thumb, thumb.size.height > 0 {
+                    onImageAspectRatio?(thumb.size.width / thumb.size.height)
+                }
+            default:
+                break
+            }
         }
     }
 
@@ -280,15 +300,13 @@ private struct ChatMediaAlbumGridCell: View {
         }
     }
 
-    /// Not-yet-downloaded cells stay neutral: kind icon plus the descriptor's plaintext byte size.
+    /// Cells without locally resolved bytes stay neutral: kind icon plus the plaintext byte size.
     private var placeholder: some View {
         VStack(spacing: 5) {
             Image(systemName: kind.symbolName)
                 .font(.system(size: 17, weight: .semibold))
-            if let descriptor {
-                Text(ChatMediaBytes.label(descriptor.plaintextByteSize))
-                    .font(.caption2.weight(.semibold))
-            }
+            Text(ChatMediaBytes.label(item.plaintextByteSize))
+                .font(.caption2.weight(.semibold))
         }
         .foregroundStyle(isOutgoing ? .white : KitColor.secondaryText)
         .frame(width: size.width, height: size.height)

@@ -451,6 +451,12 @@ enum OutboxPolicy {
                     .invalidServerResponse,
                     .unsupportedEvent, .staleOutboundFanout:
                 return .permanent
+            case .mediaMessageCapabilityUnavailable:
+                return .permanent
+            // Both leave the message and command in place with only the fanout cleared; the
+            // next pass re-prepares the same client message id.
+            case .mediaMessageRosterChanged, .mediaMessageBlobExpired:
+                return .retry(after: nil)
             }
         }
 

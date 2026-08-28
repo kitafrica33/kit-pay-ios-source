@@ -1,6 +1,27 @@
 import CryptoKit
 import Foundation
 
+/// Result of the cache's atomic non-overwriting duplicate. `conflict` means byte-different
+/// content already lives under the destination key — the caller must fail closed, never
+/// overwrite.
+enum SecureMediaDuplicateOutcome: Equatable, Sendable {
+    case stored
+    case alreadyIdentical
+    case conflict
+    case sourceMissing
+}
+
+/// Result of the cache's atomic non-overwriting insert. `alreadyPresent` means some copy —
+/// even an unreadable one — already lives under the key; it stays untouched and the caller
+/// does not own it. `stored` means this call created the entry, which licenses exactly that
+/// caller to remove it if its own revalidation fails. `rejected` covers what the cache
+/// refuses to hold (non-UUID key, empty payload, unwritable or unverifiable destination).
+enum SecureMediaInsertOutcome: Equatable, Sendable {
+    case stored
+    case alreadyPresent
+    case rejected
+}
+
 /// Encrypted-at-rest cache for large decrypted chat media (videos, documents, long voice notes).
 ///
 /// The single AES-GCM state file must stay small — every `SecureLocalStore.update` rewrites it in
@@ -63,6 +84,85 @@ actor SecureMediaFileCache {
               let fileURL = fileURL(forStorageKey: storageKey, accountID: accountID)
         else { return }
         try? FileManager.default.removeItem(at: fileURL)
+    }
+
+    /// Atomic non-overwriting insert: writes `data` under `storageKey` only when the key is
+    /// absent, never replacing existing bytes — whoever created an existing entry (a concurrent
+    /// load, a pending-batch park, a forward duplication) keeps its copy authoritative. Runs as
+    /// one uninterrupted actor step — no awaits — so no interleaved store or remove can slip
+    /// between the existence check and the write. The outcome is the caller's ownership fact:
+    /// only `.stored` licenses that caller to remove the entry on a failed revalidation.
+    func insertIfAbsent(
+        _ data: Data,
+        forStorageKey storageKey: String,
+        userID: String
+    ) -> SecureMediaInsertOutcome {
+        guard let accountID = canonicalAccountID(userID),
+              let fileURL = fileURL(forStorageKey: storageKey, accountID: accountID),
+              !data.isEmpty
+        else { return .rejected }
+        if FileManager.default.fileExists(atPath: fileURL.path) { return .alreadyPresent }
+        do {
+            try store(data, forStorageKey: storageKey, userID: userID)
+        } catch {
+            return .rejected
+        }
+        // Only a byte-verified destination counts as stored, and an unverifiable write is
+        // unwound as ours to unwind because the key was absent moments ago within this same
+        // actor step.
+        guard self.data(forStorageKey: storageKey, userID: userID) == data else {
+            remove(forStorageKey: storageKey, userID: userID)
+            return .rejected
+        }
+        return .stored
+    }
+
+    /// Non-overwriting duplication: copies `sourceKey`'s plaintext to `destinationKey` only
+    /// when the destination is absent, and classifies an existing destination by byte
+    /// comparison instead of replacing it. Runs as one uninterrupted actor step — no awaits —
+    /// so no interleaved store or remove can slip between the existence check and the write;
+    /// state-level ownership checks cannot close that window, only this boundary can.
+    func duplicate(
+        fromStorageKey sourceKey: String,
+        toStorageKey destinationKey: String,
+        userID: String
+    ) -> SecureMediaDuplicateOutcome {
+        guard let source = data(forStorageKey: sourceKey, userID: userID) else {
+            return .sourceMissing
+        }
+        if let existing = data(forStorageKey: destinationKey, userID: userID) {
+            return existing == source ? .alreadyIdentical : .conflict
+        }
+        do {
+            try store(source, forStorageKey: destinationKey, userID: userID)
+        } catch {
+            return .conflict
+        }
+        // `store` silently declines invalid keys and empty payloads; only a byte-verified
+        // destination counts as stored, and an unverifiable write is unwound as ours to unwind
+        // because the destination was absent moments ago within this same actor step.
+        guard data(forStorageKey: destinationKey, userID: userID) == source else {
+            remove(forStorageKey: destinationKey, userID: userID)
+            return .conflict
+        }
+        return .stored
+    }
+
+    /// Deletion license: removes `storageKey` only while its plaintext is byte-identical to
+    /// the plaintext readable under `survivorKey`, so the delete can never destroy the last
+    /// copy of anything. One uninterrupted actor step for the same reason as `duplicate`.
+    func removeDuplicate(
+        forStorageKey storageKey: String,
+        keeping survivorKey: String,
+        userID: String
+    ) -> Bool {
+        guard storageKey != survivorKey,
+              let doomed = data(forStorageKey: storageKey, userID: userID),
+              let survivor = data(forStorageKey: survivorKey, userID: userID),
+              doomed == survivor
+        else { return false }
+        remove(forStorageKey: storageKey, userID: userID)
+        return true
     }
 
     /// Removes both ciphertext and the device-only wrapping key for exactly one account.

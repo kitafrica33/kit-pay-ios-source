@@ -263,37 +263,6 @@ final class WalletAPIEncodingTests: XCTestCase {
         )
     }
 
-    func testEmailRegistrationRequestUsesExactIdentityAndConfirmationFields() throws {
-        let request = EmailRegistrationRequest(
-            name: "Amina Yusuf",
-            tag: "amina_01",
-            email: "amina@example.test",
-            password: "NotPersisted123",
-            passwordConfirmation: "NotPersisted123",
-            countryCode: "UG",
-            locale: "en",
-            timezone: "Africa/Kampala"
-        )
-
-        let object = try jsonObject(request)
-
-        XCTAssertEqual(object["name"] as? String, "Amina Yusuf")
-        XCTAssertEqual(object["tag"] as? String, "amina_01")
-        XCTAssertEqual(object["email"] as? String, "amina@example.test")
-        XCTAssertEqual(object["password"] as? String, "NotPersisted123")
-        XCTAssertEqual(object["password_confirmation"] as? String, "NotPersisted123")
-        XCTAssertEqual(object["country_code"] as? String, "UG")
-        XCTAssertEqual(object["locale"] as? String, "en")
-        XCTAssertEqual(object["timezone"] as? String, "Africa/Kampala")
-        XCTAssertEqual(
-            Set(object.keys),
-            [
-                "name", "tag", "email", "password", "password_confirmation", "country_code",
-                "locale", "timezone",
-            ]
-        )
-    }
-
     func testEmailTokenMessageResetAndTwoFactorRequestsUseExactKeys() throws {
         let token = String(repeating: "t", count: 64)
         let verification = try jsonObject(EmailVerificationRequest(token: token))
@@ -329,26 +298,6 @@ final class WalletAPIEncodingTests: XCTestCase {
     }
 
     func testEmailAccountResponsesDecodeBackendShapes() throws {
-        let registration: EmailRegistrationResult = try decode(
-            """
-            {
-              "state": "verification_required",
-              "challenge": {
-                "type": "email_verification",
-                "method": "email",
-                "destination": "am•••@example.test",
-                "expires_at": "2026-08-20T12:05:00Z"
-              },
-              "session": null,
-              "user": {
-                "id": "user-1",
-                "name": "Amina Yusuf",
-                "email": "amina@example.test",
-                "tag": "amina_01"
-              }
-            }
-            """
-        )
         let verification: EmailVerificationResult = try decode(
             """
             {
@@ -359,31 +308,7 @@ final class WalletAPIEncodingTests: XCTestCase {
         )
         let message: EmailMessageResult = try decode(#"{"message":null}"#)
         let reset: PasswordResetResult = try decode(#"{"password_reset":true}"#)
-        let responseTime = try XCTUnwrap(
-            ISO8601DateFormatter().date(from: "2026-08-20T12:00:00Z")
-        )
 
-        XCTAssertEqual(registration.state, "verification_required")
-        XCTAssertEqual(registration.challenge.type, "email_verification")
-        XCTAssertEqual(registration.challenge.method, "email")
-        XCTAssertEqual(registration.challenge.destination, "am•••@example.test")
-        XCTAssertEqual(registration.challenge.expiresAt, "2026-08-20T12:05:00Z")
-        XCTAssertNil(registration.session)
-        XCTAssertEqual(registration.user.tag, "amina_01")
-        XCTAssertTrue(
-            EmailAccountResponsePolicy.acceptsRegistration(
-                registration,
-                requestedEmail: " AMINA@example.test ",
-                at: responseTime
-            )
-        )
-        XCTAssertFalse(
-            EmailAccountResponsePolicy.acceptsRegistration(
-                registration,
-                requestedEmail: "other@example.test",
-                at: responseTime
-            )
-        )
         XCTAssertEqual(verification.verified, true)
         XCTAssertEqual(verification.user.email, "amina@example.test")
         XCTAssertEqual(
@@ -444,51 +369,91 @@ final class WalletAPIEncodingTests: XCTestCase {
         XCTAssertTrue(enabled.supportsPhoneOTP)
         XCTAssertTrue(enabled.supportsEmailPassword)
         XCTAssertTrue(enabled.supportsMFA)
-        XCTAssertTrue(enabled.supportsEmailRegistration)
         XCTAssertTrue(enabled.supportsEmailRecovery)
         XCTAssertFalse(unknown.supportsPhoneOTP)
         XCTAssertFalse(unknown.supportsEmailPassword)
         XCTAssertFalse(unknown.supportsMFA)
-        XCTAssertFalse(unknown.supportsEmailRegistration)
         XCTAssertFalse(unknown.supportsEmailRecovery)
+        // `email_registration` is retired: even served as true (the `enabled` payload above),
+        // it is not a capability the app can read, and recovery does not inherit from it.
+        XCTAssertFalse(enabled.featureIsWithdrawn("email_recovery"))
     }
 
     func testEmailNavigationGatesEntryButNeverStrandsTokenCompletion() {
         let unavailable = EmailAccountNavigationPolicy(capabilities: nil)
         XCTAssertFalse(unavailable.allows(.signIn))
-        XCTAssertFalse(unavailable.allows(.registration))
         XCTAssertFalse(unavailable.allows(.forgotPassword))
         XCTAssertTrue(unavailable.allows(.verification))
         XCTAssertTrue(unavailable.allows(.resetPassword))
 
         let disabled = EmailAccountNavigationPolicy(
             emailPasswordEnabled: false,
-            registrationEnabled: false,
             recoveryEnabled: false
         )
         XCTAssertFalse(disabled.allows(.signIn))
-        XCTAssertFalse(disabled.allows(.registration))
         XCTAssertFalse(disabled.allows(.forgotPassword))
         XCTAssertTrue(disabled.allows(.verification))
         XCTAssertTrue(disabled.allows(.resetPassword))
 
-        let independentlyEnabledFeatures = EmailAccountNavigationPolicy(
+        let recoveryOnly = EmailAccountNavigationPolicy(
             emailPasswordEnabled: false,
-            registrationEnabled: true,
             recoveryEnabled: true
         )
-        XCTAssertFalse(independentlyEnabledFeatures.allows(.signIn))
-        XCTAssertTrue(independentlyEnabledFeatures.allows(.registration))
-        XCTAssertTrue(independentlyEnabledFeatures.allows(.forgotPassword))
+        XCTAssertFalse(recoveryOnly.allows(.signIn))
+        XCTAssertTrue(recoveryOnly.allows(.forgotPassword))
 
         let enabled = EmailAccountNavigationPolicy(
             emailPasswordEnabled: true,
-            registrationEnabled: true,
             recoveryEnabled: true
         )
         XCTAssertTrue(enabled.allows(.signIn))
-        XCTAssertTrue(enabled.allows(.registration))
         XCTAssertTrue(enabled.allows(.forgotPassword))
+    }
+
+    /// The registration affordance cannot come back through a stale server capability: the
+    /// screen enum has no registration case, and the phone-first surface derives every route
+    /// it offers from phone/email sign-in alone.
+    func testStaleEmailRegistrationCapabilityGrantsNoAffordance() throws {
+        let stale: CapabilitiesDTO = try decode(
+            """
+            {
+              "currency": {"code": "UGX", "scale": "2"},
+              "features": {"email_registration": true},
+              "authentication": {"phone_otp": true, "email_password": true}
+            }
+            """
+        )
+
+        let access = PhoneFirstAuthAccessPolicy(capabilities: stale)
+        XCTAssertEqual(access.primaryRoute, .phone)
+        XCTAssertTrue(access.offersEmailSecondary)
+
+        // Every reachable email screen is a sign-in or token-completion surface.
+        let navigation = EmailAccountNavigationPolicy(capabilities: stale)
+        XCTAssertTrue(navigation.allows(.signIn))
+        XCTAssertTrue(navigation.allows(.verification))
+        XCTAssertTrue(navigation.allows(.resetPassword))
+        XCTAssertFalse(navigation.allows(.forgotPassword), "Recovery must gate on email_recovery alone.")
+    }
+
+    /// Phone is the sole primary route; email is a restrained secondary and the whole surface
+    /// fails closed when the server has said nothing.
+    func testPhoneFirstAccessPolicyRoutes() {
+        let both = PhoneFirstAuthAccessPolicy(phoneOTPEnabled: true, emailPasswordEnabled: true)
+        XCTAssertEqual(both.primaryRoute, .phone)
+        XCTAssertTrue(both.offersEmailSecondary)
+
+        let phoneOnly = PhoneFirstAuthAccessPolicy(phoneOTPEnabled: true, emailPasswordEnabled: false)
+        XCTAssertEqual(phoneOnly.primaryRoute, .phone)
+        XCTAssertFalse(phoneOnly.offersEmailSecondary)
+
+        let emailOnly = PhoneFirstAuthAccessPolicy(phoneOTPEnabled: false, emailPasswordEnabled: true)
+        XCTAssertEqual(emailOnly.primaryRoute, .email)
+        XCTAssertFalse(emailOnly.offersEmailSecondary)
+
+        let none = PhoneFirstAuthAccessPolicy(capabilities: nil)
+        XCTAssertEqual(none.primaryRoute, .unavailable)
+        XCTAssertFalse(none.offersEmailSecondary)
     }
 
     func testEmailValidationMatchesServerAndAndroidBoundaries() {
@@ -554,15 +519,6 @@ final class WalletAPIEncodingTests: XCTestCase {
                 passwordConfirmation: "Different1234"
             ),
             .passwordMismatch
-        )
-        XCTAssertNil(
-            EmailAccountValidation.registrationError(
-                name: "Amina Yusuf",
-                tag: "@Amina_01",
-                email: "amina@example.test",
-                password: "NotPersisted123",
-                passwordConfirmation: "NotPersisted123"
-            )
         )
     }
 
@@ -727,6 +683,41 @@ final class WalletAPIEncodingTests: XCTestCase {
             AuthenticationCodePolicy.normalizedCode("ab12-cd34-ef56-7890-abcd", for: emailMFA)
         )
         XCTAssertEqual(AuthenticationCodePolicy.normalizedCode("654321", for: emailMFA), "654321")
+    }
+
+    /// Live entry canonicalizes every numeral a localized keyboard or paste produces into the
+    /// ASCII digits the strict submission policy requires; the policy itself stays strict.
+    func testAuthenticationCodeEntrySanitizationCanonicalizesLocalizedDigits() {
+        XCTAssertEqual(AuthenticationCodePolicy.sanitizedSixDigitEntry("123456"), "123456")
+        // Full-width, Arabic-Indic, and Devanagari numerals become ASCII instead of jamming
+        // the field with characters the verify button silently rejects.
+        XCTAssertEqual(AuthenticationCodePolicy.sanitizedSixDigitEntry("１２３４５６"), "123456")
+        XCTAssertEqual(AuthenticationCodePolicy.sanitizedSixDigitEntry("٠١٢٣٤٥"), "012345")
+        XCTAssertEqual(AuthenticationCodePolicy.sanitizedSixDigitEntry("०१२३४५"), "012345")
+        // Pasted codes shed separators and prose around the digits.
+        XCTAssertEqual(AuthenticationCodePolicy.sanitizedSixDigitEntry("123 456"), "123456")
+        XCTAssertEqual(AuthenticationCodePolicy.sanitizedSixDigitEntry("123-456"), "123456")
+        XCTAssertEqual(
+            AuthenticationCodePolicy.sanitizedSixDigitEntry("Your Kit code is 987654."),
+            "987654"
+        )
+        // Entry caps at six digits and drops everything that is not a single decimal digit —
+        // including multi-digit numerals like Roman numerals and non-digit numerics.
+        XCTAssertEqual(AuthenticationCodePolicy.sanitizedSixDigitEntry("1234567890"), "123456")
+        XCTAssertEqual(AuthenticationCodePolicy.sanitizedSixDigitEntry("Ⅻ½abc"), "")
+        XCTAssertEqual(AuthenticationCodePolicy.sanitizedSixDigitEntry(""), "")
+        // The sanitized result satisfies the strict submission policy.
+        let phone = AuthChallenge(
+            id: "550e8400-e29b-41d4-a716-446655440000",
+            type: "phone_otp"
+        )
+        XCTAssertEqual(
+            AuthenticationCodePolicy.normalizedCode(
+                AuthenticationCodePolicy.sanitizedSixDigitEntry("٠١٢٣٤٥"),
+                for: phone
+            ),
+            "012345"
+        )
     }
 
     func testAuthenticationChallengeTimingHonorsExpiryAndRelativeResendCooldown() throws {
@@ -954,36 +945,7 @@ final class WalletAPIEncodingTests: XCTestCase {
         )
     }
 
-    func testEmailVerificationExpiryCooldownAndSensitiveInputLifecycle() throws {
-        let issuedAt = try XCTUnwrap(
-            ISO8601DateFormatter().date(from: "2026-08-20T12:00:00Z")
-        )
-        let challenge = EmailVerificationChallenge(
-            type: "email_verification",
-            method: "email",
-            destination: "am•••@example.test",
-            expiresAt: "2026-08-20T12:10:00Z"
-        )
-        let availableAt = EmailVerificationChallengeTimingPolicy.resendAvailableAt(from: issuedAt)
-
-        XCTAssertTrue(EmailVerificationChallengeTimingPolicy.isValid(challenge, at: issuedAt))
-        XCTAssertEqual(
-            EmailVerificationChallengeTimingPolicy.secondsUntilResend(
-                availableAt: availableAt,
-                now: issuedAt
-            ),
-            60
-        )
-        XCTAssertEqual(
-            EmailVerificationChallengeTimingPolicy.secondsUntilResend(
-                availableAt: availableAt,
-                now: availableAt
-            ),
-            0
-        )
-        XCTAssertFalse(
-            EmailVerificationChallengeTimingPolicy.isValid(challenge, at: availableAt.addingTimeInterval(600))
-        )
+    func testSensitiveInputLifecyclePolicy() throws {
         XCTAssertTrue(
             AuthenticationSecretLifecyclePolicy.shouldClear(afterSuccessfulRequest: true)
         )

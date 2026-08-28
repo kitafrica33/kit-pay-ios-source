@@ -285,7 +285,9 @@ final class MessagingAPIContractTests: XCTestCase {
         let disguisedMedia = localMessage(
             body: "\n KITMEDIA1:v=2&sk=private&key=do-not-display"
         )
-        XCTAssertEqual(ChatMessagePresentationPolicy.previewText(for: disguisedMedia), "Photo")
+        // A malformed or future-version media family body has no trustworthy kind; the shared
+        // fail-closed presentation policy confines it to the generic placeholder.
+        XCTAssertEqual(ChatMessagePresentationPolicy.previewText(for: disguisedMedia), "Attachment")
         XCTAssertNil(ChatMessagePresentationPolicy.searchableText(for: disguisedMedia))
     }
 

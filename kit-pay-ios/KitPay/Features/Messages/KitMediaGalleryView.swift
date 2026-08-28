@@ -4,18 +4,28 @@ import UIKit
 
 // MARK: - Gallery item
 
-/// One visual-media message (image or video) shown by the unified full-screen gallery.
+/// One visual-media item (image or video) shown by the unified full-screen gallery.
+///
+/// A KITMEDIA1 message contributes one entry; a KITMEDIA2 message contributes one entry per
+/// visual item — same `messageID`, distinct `itemIndex` — while remaining one logical message.
+/// Entries carry identity and display facts only, never descriptor text: a descriptor holds
+/// attachment key material, so loaders re-read the persisted row by identity instead.
 struct KitGalleryItem: Identifiable, Equatable {
     let messageID: UUID
+    /// Index into the KITMEDIA2 descriptor's display-ordered items; nil for KITMEDIA1.
+    let itemIndex: Int?
     let conversationID: String
-    /// The raw message body; parseable via `KitMediaMessageDescriptor.parse(_:)`.
-    let descriptorText: String
     let mediaType: String
+    let plaintextByteSize: Int
+    /// Opaque thumbnail-store key (the item's storage key); carries no key material.
+    let thumbnailKey: String
     let isOutgoing: Bool
     let createdAt: Date
     let senderName: String
 
-    var id: UUID { messageID }
+    var id: String {
+        itemIndex.map { "\(messageID.uuidString):\($0)" } ?? messageID.uuidString
+    }
 }
 
 // MARK: - Gallery view
@@ -29,14 +39,21 @@ struct KitMediaGalleryView: View {
     /// Chronological; images and videos only.
     let items: [KitGalleryItem]
     let initialItemID: UUID
-    /// Loads decrypted plaintext for an item (cache-first upstream). Throws on failure.
-    let loadData: (KitGalleryItem) async throws -> Data
+    /// Opens a specific item of a multi-attachment message; nil lands on the message's
+    /// first visual entry.
+    let initialItemIndex: Int?
+    /// Loads decrypted plaintext for an item (cache-first upstream) together with the
+    /// MIME/caption facts of the same authoritative resolution — render, temp-file, save, and
+    /// share decisions must use those returned facts, never the constructed item's captured
+    /// fields. Throws on failure.
+    let loadData: (KitGalleryItem) async throws -> SecureMediaLoadPolicy.LoadedItem
     /// Optional 'Show in chat' action; gallery dismisses itself first, then calls this.
     let showInChat: ((KitGalleryItem) -> Void)?
-    /// Reopens the conversation gallery at the handed-off video when the system PiP window asks
-    /// to restore. This closure is bound to that video at attach time, not kept as mutable global
-    /// state that a later conversation could overwrite.
-    let restoreFromPictureInPicture: (UUID) -> Void
+    /// Reopens the conversation gallery at the handed-off video — the exact (message, item)
+    /// identity, so item 3 of a multi-attachment message restores to item 3 — when the system
+    /// PiP window asks to restore. This closure is bound to that video at attach time, not kept
+    /// as mutable global state that a later conversation could overwrite.
+    let restoreFromPictureInPicture: (ChatVideoGalleryIdentity) -> Void
     let onDismiss: () -> Void
 
     @StateObject private var loader = GalleryPageLoader()
@@ -46,25 +63,32 @@ struct KitMediaGalleryView: View {
     @State private var dismissDrag: CGFloat = 0
     @State private var isDragDismissing = false
     @State private var shareURL: URL?
+    @State private var isPreparingShare = false
     @State private var toastText: String?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     init(
         items: [KitGalleryItem],
         initialItemID: UUID,
-        loadData: @escaping (KitGalleryItem) async throws -> Data,
+        initialItemIndex: Int? = nil,
+        loadData: @escaping (KitGalleryItem) async throws -> SecureMediaLoadPolicy.LoadedItem,
         showInChat: ((KitGalleryItem) -> Void)?,
-        restoreFromPictureInPicture: @escaping (UUID) -> Void,
+        restoreFromPictureInPicture: @escaping (ChatVideoGalleryIdentity) -> Void,
         onDismiss: @escaping () -> Void
     ) {
         self.items = items
         self.initialItemID = initialItemID
+        self.initialItemIndex = initialItemIndex
         self.loadData = loadData
         self.showInChat = showInChat
         self.restoreFromPictureInPicture = restoreFromPictureInPicture
         self.onDismiss = onDismiss
         _selection = State(
-            initialValue: items.firstIndex(where: { $0.messageID == initialItemID }) ?? 0
+            initialValue: items.firstIndex(where: {
+                $0.messageID == initialItemID && $0.itemIndex == initialItemIndex
+            })
+                ?? items.firstIndex(where: { $0.messageID == initialItemID })
+                ?? 0
         )
     }
 
@@ -109,7 +133,7 @@ struct KitMediaGalleryView: View {
 
     private var pager: some View {
         TabView(selection: $selection) {
-            ForEach(Array(items.enumerated()), id: \.element.messageID) { index, item in
+            ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
                 page(for: item, index: index)
                     .tag(index)
             }
@@ -117,8 +141,15 @@ struct KitMediaGalleryView: View {
         .tabViewStyle(.page(indexDisplayMode: .never))
         .ignoresSafeArea()
         .simultaneousGesture(dismissDragGesture)
-        .task(id: shareTaskIdentity) {
-            await prepareShareFile()
+        .sheet(
+            isPresented: Binding(
+                get: { shareURL != nil },
+                set: { if !$0 { cleanUpShareFile() } }
+            )
+        ) {
+            if let shareURL {
+                GalleryShareSheet(items: [shareURL])
+            }
         }
     }
 
@@ -126,9 +157,9 @@ struct KitMediaGalleryView: View {
     private func page(for item: KitGalleryItem, index: Int) -> some View {
         let isActive = index == selection
         Group {
-            switch loader.state(for: item.messageID) {
-            case let .loaded(data):
-                loadedPage(for: item, data: data, isActive: isActive)
+            switch loader.state(for: item.id) {
+            case let .loaded(loaded):
+                loadedPage(for: item, loaded: loaded, isActive: isActive)
             case .failed:
                 failedPage(for: item)
             case .idle, .loading:
@@ -140,12 +171,18 @@ struct KitMediaGalleryView: View {
     }
 
     @ViewBuilder
-    private func loadedPage(for item: KitGalleryItem, data: Data, isActive: Bool) -> some View {
-        switch KitChatMediaKind(mediaType: item.mediaType) {
+    private func loadedPage(
+        for item: KitGalleryItem,
+        loaded: SecureMediaLoadPolicy.LoadedItem,
+        isActive: Bool
+    ) -> some View {
+        // Render branch and playback facts come from the same resolution as the bytes —
+        // never from the constructed item's captured mediaType.
+        switch KitChatMediaKind(mediaType: loaded.mediaType) {
         case .video:
             GalleryVideoPage(
                 item: item,
-                data: data,
+                loaded: loaded,
                 isActive: isActive,
                 chromeVisible: chromeVisible,
                 onToggleChrome: toggleChrome,
@@ -153,7 +190,7 @@ struct KitMediaGalleryView: View {
             )
         default:
             GalleryImagePage(
-                data: data,
+                data: loaded.data,
                 isActive: isActive,
                 onZoomChanged: { zoomed in
                     if isActive { currentPageIsZoomed = zoomed }
@@ -254,24 +291,26 @@ struct KitMediaGalleryView: View {
 
     private var bottomBar: some View {
         HStack(spacing: 6) {
-            if let shareURL {
-                ShareLink(item: shareURL) {
-                    bottomBarLabel(systemName: "square.and.arrow.up", title: "Share")
-                }
-                .accessibilityLabel("Share media")
-            } else {
+            Button {
+                Task { await shareCurrentItem() }
+            } label: {
                 bottomBarLabel(systemName: "square.and.arrow.up", title: "Share")
-                    .opacity(0.4)
-                    .accessibilityLabel("Share media, unavailable while loading")
             }
+            .disabled(currentLoadedItem == nil || isPreparingShare)
+            .opacity(currentLoadedItem == nil ? 0.4 : 1)
+            .accessibilityLabel(
+                currentLoadedItem == nil
+                    ? "Share media, unavailable while loading"
+                    : "Share media"
+            )
 
             Button {
-                saveCurrentItem()
+                Task { await saveCurrentItem() }
             } label: {
                 bottomBarLabel(systemName: "square.and.arrow.down", title: "Save")
             }
-            .disabled(currentLoadedData == nil)
-            .opacity(currentLoadedData == nil ? 0.4 : 1)
+            .disabled(currentLoadedItem == nil)
+            .opacity(currentLoadedItem == nil ? 0.4 : 1)
             .accessibilityLabel("Save media to Photos")
 
             if let showInChat, let currentItem {
@@ -374,14 +413,13 @@ struct KitMediaGalleryView: View {
         loader.cancelLoadsFar(from: index, items: items)
     }
 
-    private var currentLoadedData: Data? {
+    private var currentLoadedItem: SecureMediaLoadPolicy.LoadedItem? {
         guard let currentItem else { return nil }
-        return loader.loadedData(for: currentItem.messageID)
+        return loader.loadedItem(for: currentItem.id)
     }
 
     private func byteLabel(for item: KitGalleryItem) -> String? {
-        KitMediaMessageDescriptor.parse(item.descriptorText)
-            .map { ChatMediaBytes.label($0.plaintextByteSize) }
+        ChatMediaBytes.label(item.plaintextByteSize)
     }
 
     private func dateLabel(for item: KitGalleryItem) -> String {
@@ -395,26 +433,34 @@ struct KitMediaGalleryView: View {
 
     // MARK: Share
 
-    private var shareTaskIdentity: String {
-        "\(selection)-\(currentLoadedData != nil)"
-    }
-
-    /// Stages the current item's loaded plaintext in a file-protected temp file so ShareLink can
-    /// hand a real file to the share sheet. Images are shared as JPEG; videos in their own type.
-    private func prepareShareFile() async {
+    /// Exporting is a user-triggered presentation: the tap re-resolves the item's identity —
+    /// account, current persisted row, full projection — and stages ONLY that fresh result in a
+    /// file-protected temp file for the share sheet. The page's already-displayed bytes are
+    /// never authority for what leaves the app. Images are shared as JPEG; videos in the fresh
+    /// resolution's own type.
+    private func shareCurrentItem() async {
+        guard !isPreparingShare, let currentItem else { return }
+        isPreparingShare = true
+        defer { isPreparingShare = false }
         cleanUpShareFile()
-        guard let currentItem, let data = currentLoadedData else { return }
-        switch KitChatMediaKind(mediaType: currentItem.mediaType) {
+        guard let fresh = try? await loadData(currentItem) else {
+            showToast("Could not share")
+            return
+        }
+        switch KitChatMediaKind(mediaType: fresh.mediaType) {
         case .video:
             shareURL = try? ChatMediaTempFiles.writeTemporaryFile(
-                data: data,
-                mediaType: currentItem.mediaType,
+                data: fresh.data,
+                mediaType: fresh.mediaType,
                 suggestedName: "Kit video"
             )
         default:
-            guard let image = UIImage(data: data),
+            guard let image = UIImage(data: fresh.data),
                   let jpeg = image.jpegData(compressionQuality: 0.9)
-            else { return }
+            else {
+                showToast("Could not share")
+                return
+            }
             shareURL = try? ChatMediaTempFiles.writeTemporaryFile(
                 data: jpeg,
                 mediaType: "image/jpeg",
@@ -430,13 +476,19 @@ struct KitMediaGalleryView: View {
 
     // MARK: Save to Photos
 
-    private func saveCurrentItem() {
-        guard let currentItem, let data = currentLoadedData else { return }
-        switch KitChatMediaKind(mediaType: currentItem.mediaType) {
+    /// Same rule as sharing: the save tap re-resolves the item's identity and exports exactly
+    /// that fresh result — bytes and kind together — not the page's already-displayed state.
+    private func saveCurrentItem() async {
+        guard let currentItem else { return }
+        guard let fresh = try? await loadData(currentItem) else {
+            showToast("Could not save")
+            return
+        }
+        switch KitChatMediaKind(mediaType: fresh.mediaType) {
         case .video:
-            saveVideo(data: data, mediaType: currentItem.mediaType)
+            saveVideo(data: fresh.data, mediaType: fresh.mediaType)
         default:
-            saveImage(data: data)
+            saveImage(data: fresh.data)
         }
     }
 
@@ -503,55 +555,58 @@ private final class GalleryPageLoader: ObservableObject {
     enum PageState {
         case idle
         case loading
-        case loaded(Data)
+        /// Bytes plus the MIME/caption facts of the same authoritative resolution.
+        case loaded(SecureMediaLoadPolicy.LoadedItem)
         case failed
     }
 
-    @Published private(set) var states: [UUID: PageState] = [:]
+    @Published private(set) var states: [String: PageState] = [:]
 
-    private var tasks: [UUID: Task<Void, Never>] = [:]
-    private var loadData: ((KitGalleryItem) async throws -> Data)?
+    private var tasks: [String: Task<Void, Never>] = [:]
+    private var loadData: ((KitGalleryItem) async throws -> SecureMediaLoadPolicy.LoadedItem)?
 
-    func configure(_ loadData: @escaping (KitGalleryItem) async throws -> Data) {
+    func configure(
+        _ loadData: @escaping (KitGalleryItem) async throws -> SecureMediaLoadPolicy.LoadedItem
+    ) {
         self.loadData = loadData
     }
 
-    func state(for id: UUID) -> PageState {
+    func state(for id: String) -> PageState {
         states[id] ?? .idle
     }
 
-    func loadedData(for id: UUID) -> Data? {
-        if case let .loaded(data) = state(for: id) { return data }
+    func loadedItem(for id: String) -> SecureMediaLoadPolicy.LoadedItem? {
+        if case let .loaded(loaded) = state(for: id) { return loaded }
         return nil
     }
 
     func ensureLoaded(_ item: KitGalleryItem) {
-        switch state(for: item.messageID) {
+        switch state(for: item.id) {
         case .loading, .loaded:
             return
         case .idle, .failed:
             break
         }
         guard let loadData else { return }
-        states[item.messageID] = .loading
-        tasks[item.messageID] = Task { [weak self] in
+        states[item.id] = .loading
+        tasks[item.id] = Task { [weak self] in
             do {
-                let data = try await loadData(item)
-                self?.states[item.messageID] = .loaded(data)
+                let loaded = try await loadData(item)
+                self?.states[item.id] = .loaded(loaded)
             } catch {
                 if error is CancellationError || Task.isCancelled {
-                    self?.states[item.messageID] = .idle
+                    self?.states[item.id] = .idle
                 } else {
-                    self?.states[item.messageID] = .failed
+                    self?.states[item.id] = .failed
                 }
             }
-            self?.tasks[item.messageID] = nil
+            self?.tasks[item.id] = nil
         }
     }
 
     func retry(_ item: KitGalleryItem) {
-        if case .failed = state(for: item.messageID) {
-            states[item.messageID] = .idle
+        if case .failed = state(for: item.id) {
+            states[item.id] = .idle
         }
         ensureLoaded(item)
     }
@@ -562,13 +617,13 @@ private final class GalleryPageLoader: ObservableObject {
     /// pages reload instantly from the encrypted file cache when paged back to.
     func cancelLoadsFar(from index: Int, items: [KitGalleryItem]) {
         for (offset, item) in items.enumerated() where abs(offset - index) >= 2 {
-            if let task = tasks[item.messageID] {
+            if let task = tasks[item.id] {
                 task.cancel()
-                tasks[item.messageID] = nil
+                tasks[item.id] = nil
             }
-            switch state(for: item.messageID) {
+            switch state(for: item.id) {
             case .loading, .loaded:
-                states[item.messageID] = .idle
+                states[item.id] = .idle
             case .idle, .failed:
                 break
             }
@@ -771,18 +826,16 @@ final class ZoomableImageScrollView: UIScrollView, UIScrollViewDelegate {
 
 private struct GalleryVideoPage: View {
     let item: KitGalleryItem
-    let data: Data
+    /// Bytes plus the facts of the same resolution; playback and poster use these, never the
+    /// constructed item's captured mediaType.
+    let loaded: SecureMediaLoadPolicy.LoadedItem
     let isActive: Bool
     let chromeVisible: Bool
     let onToggleChrome: () -> Void
-    let restoreFromPictureInPicture: (UUID) -> Void
+    let restoreFromPictureInPicture: (ChatVideoGalleryIdentity) -> Void
 
     @StateObject private var controller = GalleryVideoController()
     @State private var poster: UIImage?
-
-    private var storageKey: String? {
-        KitMediaMessageDescriptor.parse(item.descriptorText)?.storageKey
-    }
 
     var body: some View {
         ZStack {
@@ -804,19 +857,22 @@ private struct GalleryVideoPage: View {
         }
         .contentShape(Rectangle())
         .onTapGesture { onToggleChrome() }
-        .task(id: item.messageID) {
-            if let storageKey {
-                poster = await ChatMediaThumbnailStore.shared.videoThumbnail(
-                    forKey: storageKey,
-                    maxPixel: 400,
-                    from: data,
-                    mediaType: item.mediaType
-                )
-            }
+        .task(id: item.id) {
+            poster = await ChatMediaThumbnailStore.shared.videoThumbnail(
+                forKey: item.thumbnailKey,
+                maxPixel: 400,
+                from: loaded.data,
+                mediaType: loaded.mediaType
+            )
+            // Picture in Picture restores at exact gallery identity: item 3 of a
+            // multi-attachment message reopens on item 3, still within its one bubble.
             controller.prepare(
-                data: data,
-                mediaType: item.mediaType,
-                messageID: item.messageID,
+                data: loaded.data,
+                mediaType: loaded.mediaType,
+                galleryIdentity: ChatVideoGalleryIdentity(
+                    messageID: item.messageID,
+                    itemIndex: item.itemIndex
+                ),
                 restoreFromPictureInPicture: restoreFromPictureInPicture
             )
         }
@@ -915,18 +971,19 @@ private final class GalleryVideoController: ObservableObject {
     /// The layer this page is drawing into, reported by `PlayerLayerView`. Picture in Picture
     /// hands off a *layer*, so the window can only be armed once one exists.
     private weak var playerLayer: AVPlayerLayer?
-    /// Identifies the handed-off video, so restoring from the floating window can reopen the
-    /// gallery on it rather than wherever the thread happens to be.
-    private var messageID: UUID?
-    private var restoreFromPictureInPicture: ((UUID) -> Void)?
+    /// Identifies the handed-off video — down to the item within a multi-attachment message —
+    /// so restoring from the floating window reopens the gallery on that exact item rather than
+    /// wherever the thread happens to be.
+    private var galleryIdentity: ChatVideoGalleryIdentity?
+    private var restoreFromPictureInPicture: ((ChatVideoGalleryIdentity) -> Void)?
 
     func prepare(
         data: Data,
         mediaType: String,
-        messageID: UUID,
-        restoreFromPictureInPicture: @escaping (UUID) -> Void
+        galleryIdentity: ChatVideoGalleryIdentity,
+        restoreFromPictureInPicture: @escaping (ChatVideoGalleryIdentity) -> Void
     ) {
-        self.messageID = messageID
+        self.galleryIdentity = galleryIdentity
         self.restoreFromPictureInPicture = restoreFromPictureInPicture
         guard player == nil else { return }
         guard let url = try? ChatMediaTempFiles.writeTemporaryFile(
@@ -997,6 +1054,7 @@ private final class GalleryVideoController: ObservableObject {
         currentTime = 0
         ChatMediaTempFiles.removeTemporaryFile(fileURL)
         fileURL = nil
+        galleryIdentity = nil
         restoreFromPictureInPicture = nil
     }
 
@@ -1021,11 +1079,11 @@ private final class GalleryVideoController: ObservableObject {
     /// Points the floating window at this page's video. Armed on every play, so the hand-off
     /// always follows the video the user is actually watching.
     private func armPictureInPicture() {
-        guard let playerLayer, let messageID, let restoreFromPictureInPicture else { return }
+        guard let playerLayer, let galleryIdentity, let restoreFromPictureInPicture else { return }
         ChatVideoPictureInPicture.shared.attach(
             playerLayer: playerLayer,
             owner: self,
-            messageID: messageID,
+            galleryIdentity: galleryIdentity,
             restore: restoreFromPictureInPicture
         )
     }
@@ -1133,4 +1191,19 @@ final class MediaSaveCompletion: NSObject {
         onFinish(error)
         Self.active.removeAll { $0 === self }
     }
+}
+
+// MARK: - Share sheet
+
+/// The share sheet is presented only after the tap's own fresh identity resolution has staged
+/// its result, so it is a plain sheet rather than a `ShareLink` (which would hand over a file
+/// staged before the tap).
+private struct GalleryShareSheet: UIViewControllerRepresentable {
+    let items: [Any]
+
+    func makeUIViewController(context _: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: items, applicationActivities: nil)
+    }
+
+    func updateUIViewController(_: UIActivityViewController, context _: Context) {}
 }

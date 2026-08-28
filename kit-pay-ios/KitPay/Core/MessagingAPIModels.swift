@@ -11,14 +11,17 @@ enum SecureMessageReservedPrefixPolicy {
     }
 
     /// User-authored text must never enter a trusted event namespace (payment events, group
-    /// system notices, reactions). This check is shared by every composer, forwarding and
-    /// notification-reply boundary.
+    /// system notices, reactions, edits) — nor the KITMEDIA family, any version, parseable or
+    /// not: a media descriptor carries attachment key material and is minted only by the
+    /// dedicated media queue paths, which never route through this check. This check is shared
+    /// by every composer, forwarding and notification-reply boundary.
     static func allowsUserAuthoredText(_ text: String) -> Bool {
         !beginsWithReservedPrefix(text, prefix: KitPaymentMessage.prefix)
             && !beginsWithReservedPrefix(text, prefix: KitGroupPaymentMessage.prefix)
             && !beginsWithReservedPrefix(text, prefix: KitSystemMessage.prefix)
             && !beginsWithReservedPrefix(text, prefix: KitMessageReaction.prefix)
             && !beginsWithReservedPrefix(text, prefix: KitMessageEdit.prefix)
+            && !KitMediaMessageFamilyPolicy.blocksUserAuthoredText(text)
     }
 }
 
@@ -211,11 +214,29 @@ enum SecureMediaAttachmentCipher {
         _ plaintext: Data,
         randomBytes: ((Int) throws -> Data)? = nil
     ) throws -> Encrypted {
+        let random = randomBytes ?? secureRandomBytes
+        return try encrypt(plaintext, keyMaterial: random(keyMaterialBytes), randomBytes: randomBytes)
+    }
+
+    /// Fresh 64-byte key material from the system CSPRNG, for callers that must mint the key
+    /// long before the encryption happens: the media-message-v2 outbound batch fixes its key
+    /// bytes at queue time so the descriptor's byte budget is exact up front and stable across
+    /// retries and blob-expiry re-uploads.
+    static func randomKeyMaterial() throws -> Data {
+        try secureRandomBytes(count: keyMaterialBytes)
+    }
+
+    /// Encrypts under caller-supplied key material; the IV is still fresh per call, so reusing
+    /// key material across a re-upload of the same plaintext yields a new ciphertext and digest.
+    static func encrypt(
+        _ plaintext: Data,
+        keyMaterial: Data,
+        randomBytes: ((Int) throws -> Data)? = nil
+    ) throws -> Encrypted {
         guard !plaintext.isEmpty, plaintext.count <= maximumPlaintextBytes else {
             throw SecureMediaAttachmentError.invalidMedia
         }
         let random = randomBytes ?? secureRandomBytes
-        let keyMaterial = try random(keyMaterialBytes)
         let iv = try random(ivBytes)
         guard keyMaterial.count == keyMaterialBytes, iv.count == ivBytes else {
             throw SecureMediaAttachmentError.cryptographyFailed
@@ -528,6 +549,84 @@ struct KitMediaMessageDescriptor: Equatable, Sendable {
     }
 }
 
+extension KitMediaMessageV2Descriptor {
+    /// Outer wire rows in the §5 canonical order: ascending lexicographic lowercase attachment
+    /// id — never display order, so row order tells the server nothing about arrangement.
+    /// Nil when any item cannot form a valid outer row (unreachable for a parsed descriptor;
+    /// fail-closed rather than partial regardless).
+    var attachmentRequests: [EncryptedAttachmentRequest]? {
+        let rows = canonicalOuterOrderItems.compactMap { item in
+            try? EncryptedAttachmentRequest(
+                id: item.attachmentID,
+                storageKey: item.storageKey,
+                mediaType: item.mediaType,
+                byteSize: item.ciphertextByteSize,
+                ciphertextSha256: item.ciphertextSHA256
+            )
+        }
+        guard rows.count == items.count else { return nil }
+        return rows
+    }
+
+    /// §4 rule 4: outer rows and descriptor items must be the same unordered set — same
+    /// cardinality, no repeats or extras, matched on id + storage key + media type + byte size
+    /// + digest. The outer digest is lowercased first (defense-in-depth; senders must put
+    /// lowercase on the wire); the descriptor digest was lowercase or the parse failed.
+    func validates(_ descriptors: [EncryptedAttachmentDTO?]?) -> Bool {
+        let rows = descriptors ?? []
+        let received = rows.compactMap { dto -> KitMediaMessageOuterAttachmentRow? in
+            guard let dto,
+                  let id = dto.id,
+                  let storageKey = dto.storageKey,
+                  let mediaType = dto.mediaType,
+                  let byteSize = dto.byteSize,
+                  let digest = dto.ciphertextSha256,
+                  dto.encryptionMetadataCiphertext == nil
+            else { return nil }
+            return KitMediaMessageOuterAttachmentRow(
+                id: id,
+                storageKey: storageKey,
+                mediaType: mediaType,
+                byteSize: byteSize,
+                ciphertextSHA256Lowercased: digest.lowercased()
+            )
+        }
+        guard received.count == rows.count else { return false }
+        return matchesOuterRows(received)
+    }
+}
+
+extension KitMediaMessageFamilyPolicy {
+    /// Family-wide body → outer-row derivation: one v1 row, canonical-order v2 rows, [] for
+    /// plain text and for reserved-family bodies that fail their strict parse (those bind to
+    /// no wire kind; display renders the generic placeholder instead).
+    static func attachmentRequests(for text: String) -> [EncryptedAttachmentRequest] {
+        if let descriptor = KitMediaMessageV2Descriptor.parse(text) {
+            return descriptor.attachmentRequests ?? []
+        }
+        return KitMediaMessageDescriptor.attachments(for: text)
+    }
+
+    /// Family-wide row authentication for a body already bound by
+    /// `SecureMessagingContentBindingPolicy.kind`: v2 compares as an unordered set (§4 rule 4),
+    /// v1 keeps its exact single-row check, plain text requires no rows.
+    static func validatesWireRows(
+        _ descriptors: [EncryptedAttachmentDTO?]?,
+        forBody text: String
+    ) -> Bool {
+        if let descriptor = KitMediaMessageV2Descriptor.parse(text) {
+            return descriptor.validates(descriptors)
+        }
+        let v1Attachments = KitMediaMessageDescriptor.attachments(for: text)
+        if v1Attachments.isEmpty, isReservedFamilyText(text) {
+            // An unparseable reserved-family body authenticates nothing: it binds to no wire
+            // kind, so no row set — including the empty one — can vouch for it.
+            return false
+        }
+        return KitMediaMessageDescriptor.validates(descriptors, against: v1Attachments)
+    }
+}
+
 private extension Data {
     func prefixData(_ count: Int) -> Data { Data(prefix(count)) }
     func suffixData(_ count: Int) -> Data { Data(suffix(count)) }
@@ -613,6 +712,22 @@ enum SecureMessagingContentBindingPolicy {
             return .encryptedEdit
         }
 
+        // Media-message v2: the descriptor is the entire plaintext, byte-exact. A v2-prefixed
+        // body that fails the strict parse binds to no kind at all — so `encrypted` cannot
+        // smuggle a raw multi-attachment descriptor (it carries every attachment key) into a
+        // text bubble, and `encrypted_attachment` cannot carry rows the descriptor does not
+        // authenticate. Expected rows are compared in the §5 canonical outer order.
+        if SecureMessageReservedPrefixPolicy.beginsWithReservedPrefix(
+            plaintext,
+            prefix: KitMediaMessageV2Descriptor.prefix
+        ) {
+            guard let descriptor = KitMediaMessageV2Descriptor.parse(plaintext),
+                  let expected = descriptor.attachmentRequests,
+                  attachments == expected
+            else { return nil }
+            return .encryptedAttachment
+        }
+
         let mediaAttachments = KitMediaMessageDescriptor.attachments(for: plaintext)
         if SecureMessageReservedPrefixPolicy.beginsWithReservedPrefix(
             plaintext,
@@ -624,6 +739,11 @@ enum SecureMessagingContentBindingPolicy {
             guard attachments == mediaAttachments else { return nil }
             return .encryptedAttachment
         }
+        // Family-wide fail-closed: any other KITMEDIA spelling — malformed v1/v2, or a version
+        // this build has never heard of — binds to no kind at all rather than falling through
+        // as ordinary text, because "ordinary text" is exactly how a raw descriptor (attachment
+        // key material) would reach a bubble, a backup, or a retry composer.
+        if KitMediaMessageFamilyPolicy.isReservedFamilyText(plaintext) { return nil }
         guard attachments.isEmpty else { return nil }
         return .encrypted
     }
@@ -1405,6 +1525,45 @@ enum MessagingRichMediaCapabilityPolicy {
         }
     }
 
+    /// Roster-wide §6 variant for multi-attachment admission: unanimous rich-media attestation
+    /// across the whole accepted roster — the sender's other enrolled devices included, since
+    /// each of them re-renders the sent batch — with exactly the running device self-attesting
+    /// (this binary is its own attestation). The per-recipient overload above serves the v1
+    /// single-attachment path unchanged.
+    static func supportsAcrossRoster(
+        mediaType: String,
+        roster: MessagingDeviceRosterDTO,
+        conversationID: String,
+        currentDeviceID: String,
+        memberUserIDs: Set<String>
+    ) -> Bool {
+        guard KitChatMediaKind(mediaType: mediaType) != .image else { return true }
+        guard MessagingRosterCapabilityPolicy.supports(
+            deviceCapabilityKey: deviceCapabilityKey,
+            roster: roster,
+            conversationID: conversationID,
+            currentDeviceID: currentDeviceID,
+            memberUserIDs: memberUserIDs
+        ), let devices = roster.devices?.compactMap({ $0 }) else { return false }
+        return devices.allSatisfy { device in
+            if device.deviceId == currentDeviceID { return true }
+            guard let client = device.client else { return false }
+            // Same local iOS version floor as the per-recipient overload: defense in depth
+            // for a server that asserts the capability flag without platform context.
+            if client.platform?.lowercased() == "ios" {
+                guard let version = client.version,
+                      MessagingBuild24CompatibilityPolicy.supportsIOS(
+                          version: version,
+                          build: client.build,
+                          minimumVersion: minimumIOSVersion,
+                          minimumBuild: minimumIOSBuild
+                      )
+                else { return false }
+            }
+            return true
+        }
+    }
+
     static func supportsPlaintextByteSize(
         _ plaintextByteSize: Int,
         roster: MessagingDeviceRosterDTO,
@@ -1425,6 +1584,41 @@ enum MessagingRichMediaCapabilityPolicy {
             currentDeviceSelfAttests: false
         ), let devices = roster.devices?.compactMap({ $0 }) else { return false }
         return devices.allSatisfy { device in
+            guard device.client?.platform?.lowercased() == "ios" else { return true }
+            return MessagingBuild24CompatibilityPolicy.supportsIOS(
+                version: device.client?.version,
+                build: device.client?.build
+            )
+        }
+    }
+
+    /// Extended-size admission for the multi-attachment (§6) gate: the running device
+    /// self-attests — this binary is its own attestation — while every sibling and peer
+    /// device must advertise the server-attested 200M key, with the same iOS version floor
+    /// defense on each of them. The v1 single-attachment check above deliberately keeps its
+    /// stricter no-self-attest posture; loosening an audited legacy gate is not this
+    /// feature's business.
+    static func supportsPlaintextByteSizeAcrossRoster(
+        _ plaintextByteSize: Int,
+        roster: MessagingDeviceRosterDTO,
+        conversationID: String,
+        currentDeviceID: String,
+        memberUserIDs: Set<String>
+    ) -> Bool {
+        guard (1 ... SecureMediaAttachmentCipher.maximumPlaintextBytes)
+            .contains(plaintextByteSize)
+        else { return false }
+        guard plaintextByteSize > broadlyCompatibleMaximumPlaintextBytes else { return true }
+        guard MessagingRosterCapabilityPolicy.supports(
+            deviceCapabilityKey: extendedSizeDeviceCapabilityKey,
+            roster: roster,
+            conversationID: conversationID,
+            currentDeviceID: currentDeviceID,
+            memberUserIDs: memberUserIDs,
+            currentDeviceSelfAttests: true
+        ), let devices = roster.devices?.compactMap({ $0 }) else { return false }
+        return devices.allSatisfy { device in
+            if device.deviceId == currentDeviceID { return true }
             guard device.client?.platform?.lowercased() == "ios" else { return true }
             return MessagingBuild24CompatibilityPolicy.supportsIOS(
                 version: device.client?.version,
@@ -1517,6 +1711,90 @@ enum MessagingRosterCapabilityPolicy {
             if currentDeviceSelfAttests, device.deviceId == currentDeviceID { return true }
             return device.client?.capabilities?[deviceCapabilityKey] == true
         }
+    }
+}
+
+extension MessagingMediaMessageV2CapabilityPolicy {
+    /// One attachment of a multi-attachment draft as known at admission time — before upload has
+    /// minted ids, storage keys, or digests.
+    struct DraftItem: Equatable, Sendable {
+        let mediaType: String
+        let plaintextByteSize: Int
+    }
+
+    /// §4 size arithmetic — IV(16) ‖ CBC-PKCS7 ‖ HMAC(32) — for a plaintext size, so aggregate
+    /// admission can be answered before anything is encrypted. The descriptor initializer
+    /// re-checks the same arithmetic against the real ciphertext after sealing.
+    static func ciphertextByteSize(forPlaintextByteSize plaintextByteSize: Int) -> Int64 {
+        Int64(plaintextByteSize + 64 - (plaintextByteSize % 16))
+    }
+
+    /// §6 sender admission, answered as one question so no call site can pair a fresh answer for
+    /// one leg with a stale answer for another. Every leg must hold at once: the server advertises
+    /// the feature key AND the exact `protocols.messaging.media_message` profile; every enrolled
+    /// device of every member attests `messaging_media_message_v2` (the running device
+    /// self-attests — this binary is its own attestation); each item fits the §4 envelope
+    /// individually and aggregately; and each item additionally passes the per-item v1
+    /// rich-media/extended-size keys across the whole accepted roster — the sender's sibling
+    /// devices included. Absent capabilities, absent roster rows, or an empty draft all
+    /// refuse; refusal never splits the draft into single sends.
+    static func admitsComposition(
+        capabilities: CapabilitiesDTO?,
+        roster: MessagingDeviceRosterDTO,
+        conversationID: String,
+        currentDeviceID: String,
+        currentUserID: String,
+        memberUserIDs: Set<String>,
+        items: [DraftItem]
+    ) -> Bool {
+        // A message is a communication to someone else. Without at least one recipient peer the
+        // per-item recipient checks below would pass vacuously, so a currentUser-only or empty
+        // member set refuses here rather than admitting on an unexercised leg.
+        let recipientUserIDs = memberUserIDs.subtracting([currentUserID])
+        guard capabilities?.enablesMessagingMediaMessageV2 == true,
+              memberUserIDs.contains(currentUserID),
+              !recipientUserIDs.isEmpty,
+              (KitMediaMessageV2Descriptor.minimumAttachmentCount
+                  ... KitMediaMessageV2Descriptor.maximumAttachmentCount)
+                  .contains(items.count),
+              MessagingRosterCapabilityPolicy.supports(
+                  deviceCapabilityKey: deviceCapabilityKey,
+                  roster: roster,
+                  conversationID: conversationID,
+                  currentDeviceID: currentDeviceID,
+                  memberUserIDs: memberUserIDs
+              )
+        else { return false }
+        var aggregateCiphertextBytes: Int64 = 0
+        for item in items {
+            guard KitMediaMessageV2Descriptor.allowedAttachmentMediaTypes
+                      .contains(item.mediaType),
+                  (1 ... KitMediaMessageV2Descriptor.maximumPlaintextBytes)
+                      .contains(item.plaintextByteSize),
+                  // §6 unanimity is roster-wide, not recipient-wide: the sender's OTHER
+                  // enrolled devices re-render this batch too, so each non-image item needs
+                  // the rich-media attestation on every accepted device, with exactly the
+                  // running device self-attesting.
+                  MessagingRichMediaCapabilityPolicy.supportsAcrossRoster(
+                      mediaType: item.mediaType,
+                      roster: roster,
+                      conversationID: conversationID,
+                      currentDeviceID: currentDeviceID,
+                      memberUserIDs: memberUserIDs
+                  ),
+                  MessagingRichMediaCapabilityPolicy.supportsPlaintextByteSizeAcrossRoster(
+                      item.plaintextByteSize,
+                      roster: roster,
+                      conversationID: conversationID,
+                      currentDeviceID: currentDeviceID,
+                      memberUserIDs: memberUserIDs
+                  )
+            else { return false }
+            aggregateCiphertextBytes +=
+                ciphertextByteSize(forPlaintextByteSize: item.plaintextByteSize)
+        }
+        return aggregateCiphertextBytes
+            <= KitMediaMessageV2Descriptor.maximumAggregateCiphertextBytes
     }
 }
 
@@ -1694,6 +1972,18 @@ struct SendEncryptedMessageRequest: Encodable, Equatable, Sendable {
               attachments.count <= SecureMessagingWire.maximumAttachments,
               Set(attachments.map(\.id)).count == attachments.count,
               Set(attachments.map(\.storageKey)).count == attachments.count,
+              // §5 media-message v2: multi-row sends carry at most 8 rows, in the canonical
+              // outer order (ascending lexicographic lowercase id — never display order), with
+              // lowercase digests on the wire. Single-row v1 sends are untouched: their digest
+              // stays mixed-case-tolerant and one row has no order to get wrong.
+              attachments.count <= 1
+                  || (attachments.count <= KitMediaMessageV2Descriptor.maximumAttachmentCount
+                      && KitMediaMessageV2Descriptor.isCanonicalOuterOrder(
+                          attachmentIDs: attachments.map(\.id)
+                      )
+                      && attachments.allSatisfy {
+                          SecureMessagingWirePolicy.isLowercaseSHA256($0.ciphertextSha256)
+                      }),
               SecureMessagingContentBindingPolicy.validatesOuterEnvelope(
                   kind: kind,
                   replyToMessageID: replyToMessageId,

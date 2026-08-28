@@ -119,6 +119,34 @@ final class ConversationInteractionPolicyTests: XCTestCase {
         )
     }
 
+    func testOpeningJumpWaitsUntilTimelineAndViewportHaveRealLayout() {
+        XCTAssertFalse(ConversationLatestPositionPolicy.openingLayoutIsReady(
+            hasTimelineContent: false,
+            contentHeight: 900,
+            viewportHeight: 700
+        ))
+        XCTAssertFalse(ConversationLatestPositionPolicy.openingLayoutIsReady(
+            hasTimelineContent: true,
+            contentHeight: 0,
+            viewportHeight: 700
+        ))
+        XCTAssertFalse(ConversationLatestPositionPolicy.openingLayoutIsReady(
+            hasTimelineContent: true,
+            contentHeight: 900,
+            viewportHeight: 0
+        ))
+        XCTAssertFalse(ConversationLatestPositionPolicy.openingLayoutIsReady(
+            hasTimelineContent: true,
+            contentHeight: .infinity,
+            viewportHeight: 700
+        ))
+        XCTAssertTrue(ConversationLatestPositionPolicy.openingLayoutIsReady(
+            hasTimelineContent: true,
+            contentHeight: 900,
+            viewportHeight: 700
+        ))
+    }
+
     func testTimelineFollowsOwnSendsAndNearbyIncomingMessagesOnly() {
         XCTAssertFalse(ConversationLatestPositionPolicy.shouldFollowTimelineChange(
             hasPositionedCurrentConversation: false,

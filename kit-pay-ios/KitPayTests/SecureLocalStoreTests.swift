@@ -142,6 +142,64 @@ final class SecureLocalStoreTests: XCTestCase {
         XCTAssertEqual(restored.messages, original.messages)
     }
 
+    /// The starter milestones are facts about one owner: a routine history-preserving sign-out
+    /// keeps them, a different account never inherits them, and ownerless legacy state carrying
+    /// one cannot be assigned to a replacement account.
+    func testStarterMilestonesFollowTheOwnerAndNeverAnotherAccount() async throws {
+        let store = SecureLocalStore(
+            stateURL: temporaryDirectory.appendingPathComponent("state.secure"),
+            keyData: Data(repeating: 0x47, count: 32)
+        )
+        var original = communicationState()
+        original.starterFirstTransactionAt = Date(timeIntervalSince1970: 1_756_000_000)
+        original.starterFirstMessageAt = Date(timeIntervalSince1970: 1_756_000_100)
+        let originalProfile = try XCTUnwrap(original.profile)
+        try await store.replace(original)
+
+        try await store.clearFinancialAndSessionProjections(preserveCommunicationHistory: true)
+        let signedOut = await store.snapshot()
+        XCTAssertEqual(
+            signedOut.starterFirstTransactionAt,
+            original.starterFirstTransactionAt,
+            "A same-owner sign-out forgot the transaction milestone."
+        )
+        XCTAssertEqual(signedOut.starterFirstMessageAt, original.starterFirstMessageAt)
+
+        try await store.update { state in
+            state.bindAuthenticatedProfile(originalProfile)
+        }
+        let sameOwner = await store.snapshot()
+        XCTAssertEqual(sameOwner.starterFirstTransactionAt, original.starterFirstTransactionAt)
+        XCTAssertEqual(sameOwner.starterFirstMessageAt, original.starterFirstMessageAt)
+
+        let replacement = UserProfile(
+            id: "different-user",
+            name: "Different User",
+            email: nil,
+            phone: "+256700000002",
+            tag: "different_user",
+            kycStatus: "pending",
+            paymentPinSet: true,
+            mfaEnabled: false,
+            profileSetupRequired: false
+        )
+        try await store.update { state in
+            state.bindAuthenticatedProfile(replacement)
+        }
+        let differentOwner = await store.snapshot()
+        XCTAssertNil(differentOwner.starterFirstTransactionAt)
+        XCTAssertNil(differentOwner.starterFirstMessageAt)
+
+        // Ownerless legacy state carrying only a milestone is unowned account data: binding a
+        // new profile must wipe rather than adopt it.
+        var legacy = PersistedState.empty
+        legacy.starterFirstMessageAt = Date(timeIntervalSince1970: 1_756_000_200)
+        legacy.bindAuthenticatedProfile(replacement)
+        XCTAssertNil(legacy.starterFirstMessageAt)
+        XCTAssertNil(legacy.starterFirstTransactionAt)
+        XCTAssertEqual(legacy.profile, replacement)
+    }
+
     func testAccountProjectionClearRemovesCachedContactsButKeepsCommunicationHistory() async throws {
         let url = temporaryDirectory.appendingPathComponent("state.secure")
         let store = SecureLocalStore(
