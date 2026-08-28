@@ -24,6 +24,23 @@ enum ContactSyncSnapshotScope: String, Codable, Equatable, Sendable {
     case partial
 }
 
+/// Decides whether an unchanged device snapshot may reuse its persisted server projection.
+/// Recipient pickers opt out because a Kit user can register or relink their account without
+/// changing anything in the sender's iOS address book.
+enum ContactSyncServerRefreshPolicy {
+    static func canReuseLocalProjection(
+        snapshotIsUnchanged: Bool,
+        recentlyRefreshed: Bool,
+        requiresAuthorizationRefresh: Bool,
+        forceServerRefresh: Bool
+    ) -> Bool {
+        snapshotIsUnchanged
+            && recentlyRefreshed
+            && !requiresAuthorizationRefresh
+            && !forceServerRefresh
+    }
+}
+
 struct ContactSyncProgress: Equatable, Sendable {
     let phase: ContactSyncPhase
     let completedUnitCount: Int

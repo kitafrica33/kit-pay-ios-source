@@ -17,6 +17,10 @@ final class VoiceNoteOverlayWindowController {
 
     private init() {}
 
+    func installNavigationHandler(_ handler: @escaping (String, UUID) -> Void) {
+        presenter.open = handler
+    }
+
     /// Brings the bar up or takes it down to match the player. Called by `VoiceNotePlayer` on every
     /// transition that can change the answer: a note starting or stopping, and its source bubble
     /// coming on or off screen.
@@ -91,6 +95,7 @@ private final class VoiceNoteOverlayPresenter: ObservableObject {
     /// Where the bar is drawn, in window coordinates. Written outside the SwiftUI update cycle and
     /// read by the window's hit test, so touches anywhere else reach the app underneath.
     let hitRegion = OverlayHitRegion()
+    var open: (String, UUID) -> Void = { _, _ in }
 }
 
 private struct VoiceNoteOverlayRootView: View {
@@ -100,7 +105,11 @@ private struct VoiceNoteOverlayRootView: View {
     var body: some View {
         VStack(spacing: 0) {
             if presenter.isVisible, let playing = player.playing {
-                VoiceNoteMiniPlayerBar(note: playing, player: player)
+                VoiceNoteMiniPlayerBar(
+                    note: playing,
+                    player: player,
+                    open: { presenter.open(playing.context.conversationID, playing.id) }
+                )
                     .background {
                         GeometryReader { proxy in
                             Color.clear
@@ -124,6 +133,7 @@ private struct VoiceNoteOverlayRootView: View {
 struct VoiceNoteMiniPlayerBar: View {
     let note: VoiceNotePlayingNote
     @ObservedObject var player: VoiceNotePlayer
+    let open: () -> Void
 
     /// Fraction playback was at when the current slide began, so a scrub is relative to where the
     /// finger went down rather than jumping to it.
@@ -132,50 +142,65 @@ struct VoiceNoteMiniPlayerBar: View {
     private var isPlaying: Bool { !player.isPaused }
 
     var body: some View {
-        HStack(spacing: 12) {
-            Button {
-                player.toggleCurrent()
-            } label: {
-                Image(systemName: isPlaying ? "pause.fill" : "play.fill")
-                    .font(.system(size: 15, weight: .bold))
-                    .foregroundStyle(.white)
-                    .frame(width: 34, height: 34)
-                    .background(KitColor.green, in: Circle())
+        ZStack {
+            // Every non-control part of the strip is one generous route back to the exact source
+            // message. Playback, scrubbing and dismiss stay independent controls above it.
+            Button(action: open) {
+                Color.clear
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .accessibilityLabel(isPlaying ? "Pause voice note" : "Resume voice note")
+            .accessibilityLabel("Show this voice note in chat")
+            .accessibilityValue("\(note.context.title), \(note.context.subtitle)")
 
-            VStack(alignment: .leading, spacing: 3) {
-                Text(note.context.title)
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(KitColor.primaryText)
-                    .lineLimit(1)
-                Text(note.context.subtitle)
-                    .font(.caption2)
+            HStack(spacing: 12) {
+                Button {
+                    player.toggleCurrent()
+                } label: {
+                    Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+                        .font(.system(size: 15, weight: .bold))
+                        .foregroundStyle(.white)
+                        .frame(width: 34, height: 34)
+                        .background(KitColor.green, in: Circle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(isPlaying ? "Pause voice note" : "Resume voice note")
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(note.context.title)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(KitColor.primaryText)
+                        .lineLimit(1)
+                    Text(note.context.subtitle)
+                        .font(.caption2)
+                        .foregroundStyle(KitColor.secondaryText)
+                        .lineLimit(1)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+
+                scrubber
+
+                Text(remainingLabel)
+                    .font(.caption2.monospacedDigit())
                     .foregroundStyle(KitColor.secondaryText)
-                    .lineLimit(1)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+
+                Button {
+                    player.stop()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundStyle(KitColor.secondaryText)
+                        .frame(width: 34, height: 34)
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Stop voice note")
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .accessibilityElement(children: .combine)
-
-            scrubber
-
-            Text(remainingLabel)
-                .font(.caption2.monospacedDigit())
-                .foregroundStyle(KitColor.secondaryText)
-                .accessibilityLabel("\(remainingLabel) left")
-
-            Button {
-                player.stop()
-            } label: {
-                Image(systemName: "xmark")
-                    .font(.system(size: 13, weight: .bold))
-                    .foregroundStyle(KitColor.secondaryText)
-                    .frame(width: 34, height: 34)
-                    .contentShape(Circle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Stop voice note")
         }
         .padding(.horizontal, 14)
         .frame(height: VoiceNoteMiniBarPolicy.contentHeight)

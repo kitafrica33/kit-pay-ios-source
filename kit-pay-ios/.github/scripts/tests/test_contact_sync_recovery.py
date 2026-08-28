@@ -72,6 +72,38 @@ class ContactSyncRecoverySourceContractTests(unittest.TestCase):
         self.assertIn('"contact-sync-recovery.open-settings"', policy)
         self.assertIn('"contact-sync-recovery.retry"', policy)
 
+    def test_money_recipient_pickers_force_an_authenticated_directory_refresh(self) -> None:
+        path = ROOT / "KitPay/Features/Home/WalletFlowViews.swift"
+
+        for declaration in ("struct SendMoneyView", "struct RequestMoneyView"):
+            with self.subTest(surface=declaration):
+                body = declaration_body(path, declaration)
+                self.assertIn(
+                    "await model.loadContactDirectory(forceServerRefresh: true)",
+                    body,
+                )
+
+    def test_forced_refresh_bypasses_only_the_recent_projection_reuse_gate(self) -> None:
+        app_model = (ROOT / "KitPay/App/AppModel.swift").read_text(encoding="utf-8")
+        policy = (ROOT / "KitPay/Core/ContactSynchronizer.swift").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("forceServerRefresh: Bool = false", app_model)
+        self.assertIn("forceServerRefresh: forceServerRefresh", app_model)
+        self.assertIn("if snapshotIsUnchanged {", app_model)
+        self.assertIn("return try await self.api.contacts()", app_model)
+        self.assertIn("return try await self.api.syncContacts(", app_model)
+        self.assertIn("&& !forceServerRefresh", policy)
+
+        retry = declaration_body(
+            ROOT / "KitPay/App/AppModel.swift",
+            "func retryAutomaticContactSync()",
+        )
+        self.assertIn(
+            "scheduleAutomaticContactSync(forceServerRefresh: true)", retry
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

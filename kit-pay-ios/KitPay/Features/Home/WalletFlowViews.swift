@@ -330,7 +330,7 @@ struct SendMoneyView: View {
         }
         .task {
             flow.errorMessage = nil
-            await model.loadContactDirectory()
+            await model.loadContactDirectory(forceServerRefresh: true)
             updateContacts(model.contactDirectory)
         }
         .onChange(of: model.contactDirectory) { _, contacts in
@@ -865,7 +865,7 @@ struct RequestMoneyView: View {
         .task {
             flow.errorMessage = nil
             secureShareNeedsRetry = flow.secureShareSession.hasPendingRequest
-            await model.loadContactDirectory()
+            await model.loadContactDirectory(forceServerRefresh: true)
             updateContacts(model.contactDirectory)
         }
         .onChange(of: model.contactDirectory) { _, contacts in

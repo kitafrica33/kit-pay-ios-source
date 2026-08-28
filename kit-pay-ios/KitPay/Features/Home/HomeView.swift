@@ -135,6 +135,21 @@ struct HomeView: View {
                 .environmentObject(model)
             }
         }
+        .onAppear { applyWalletClaimNavigation() }
+        .onChange(of: model.walletClaimNavigationRequest) { _, _ in
+            applyWalletClaimNavigation()
+        }
+        .onChange(of: model.homeAccessGranted) { _, granted in
+            if granted { applyWalletClaimNavigation() }
+        }
+    }
+
+    private func applyWalletClaimNavigation() {
+        guard model.homeAccessGranted,
+              let request = model.walletClaimNavigationRequest
+        else { return }
+        modal = .wallet(.transactions)
+        model.consumeWalletClaimNavigationRequest(request.id)
     }
 
     private var header: some View {

@@ -688,6 +688,9 @@ final class AppModel: ObservableObject {
     @Published private(set) var unresolvedAccountDeletionAttemptBlocked = false
     @Published private(set) var messageConversationNavigationRequest:
         MessageConversationNavigationRequest?
+    /// A validated payment-claim alert that belongs to this account but not to one exact local
+    /// group conversation. Home consumes it by opening the authoritative wallet activity surface.
+    @Published private(set) var walletClaimNavigationRequest: WalletClaimNavigationRequest?
     /// A one-shot ask from another tab (Home's starter checklist) to open the new-message
     /// contact picker. An identity rather than a Bool so repeat taps re-trigger consumption.
     @Published private(set) var pendingNewMessageComposeID: UUID?
@@ -737,6 +740,9 @@ final class AppModel: ObservableObject {
     private var contactAuthorizationRevision: UInt64 = 0
     private var refreshedContactAuthorizationRevision: UInt64 = 0
     private var contactSyncTask: Task<Bool, Never>?
+    /// Records whether the active sync is guaranteed to consult the authenticated server. A
+    /// recipient picker can upgrade an in-flight background/cache-eligible pass when needed.
+    private var contactSyncCurrentTaskForcesServerRefresh = false
     private var contactSyncGeneration: UInt64 = 0
     private var contactChangeDebounceTask: Task<Void, Never>?
     private var resolvingSharedInboxBatchID: UUID?
@@ -1097,6 +1103,12 @@ final class AppModel: ObservableObject {
             await MessageNotificationActionDispatcher.shared.install { [weak self] action in
                 guard let self else { return false }
                 return await self.handleMessageNotificationAction(action)
+            }
+        }
+        Task { [weak self] in
+            await ClaimablePaymentNotificationActionDispatcher.shared.install { [weak self] action in
+                guard let self else { return false }
+                return await self.handleClaimablePaymentNotificationAction(action)
             }
         }
         NotificationCoordinator.shared.replayPendingCallEvents()
@@ -3900,6 +3912,7 @@ final class AppModel: ObservableObject {
         NotificationCoordinator.shared.suspendRegistrationAfterSignOut()
         contactSyncTask?.cancel()
         contactSyncTask = nil
+        contactSyncCurrentTaskForcesServerRefresh = false
         contactSyncGeneration &+= 1
         contactChangeDebounceTask?.cancel()
         contactChangeDebounceTask = nil
@@ -4016,6 +4029,7 @@ final class AppModel: ObservableObject {
         callContacts = []
         activeConversationID = nil
         messageConversationNavigationRequest = nil
+        walletClaimNavigationRequest = nil
         let deletedAccountFingerprint = acceptedDeletion.flatMap {
             MessageNotificationContract.accountFingerprint(for: $0.accountID)
         }
@@ -6293,8 +6307,11 @@ final class AppModel: ObservableObject {
               isSignedIn,
               accountSetupStep == nil,
               let currentUserID = profile?.id,
+              let canonicalCurrentUserID = MessageNotificationContract.canonicalUUID(
+                  currentUserID
+              ),
               MessageNotificationContract.canonicalUUID(state.communicationOwnerUserID)
-                == MessageNotificationContract.canonicalUUID(currentUserID),
+                == canonicalCurrentUserID,
               let activeCall,
               CallMediaCoordinator.shared.activeCall?.id.caseInsensitiveCompare(activeCall.id)
                 == .orderedSame
@@ -6382,11 +6399,47 @@ final class AppModel: ObservableObject {
         pendingNewMessageComposeID = nil
     }
 
-    private func routeToConversation(_ conversation: Conversation) {
+    @discardableResult
+    func requestConversationNavigation(
+        conversationID: String,
+        messageID: UUID? = nil
+    ) -> Bool {
+        guard !isSigningOut,
+              !isSubmittingAccountDeletion,
+              !acceptedAccountDeletionCleanupBlocked,
+              !protectedLocalStateRecoveryBlocked,
+              !unresolvedAccountDeletionAttemptBlocked,
+              isSignedIn,
+              accountSetupStep == nil,
+              let currentUserID = profile?.id,
+              let canonicalCurrentUserID = MessageNotificationContract.canonicalUUID(
+                  currentUserID
+              ),
+              MessageNotificationContract.canonicalUUID(state.communicationOwnerUserID)
+                == canonicalCurrentUserID,
+              let conversation = MessageNotificationConversationPolicy.conversation(
+                  id: conversationID,
+                  in: state.conversations
+              )
+        else { return false }
+        if let messageID {
+            let matches = state.messages.filter {
+                $0.id == messageID
+                    && MessageNotificationContract.canonicalUUID($0.conversationId)
+                        == MessageNotificationContract.canonicalUUID(conversation.id)
+            }
+            guard matches.count == 1 else { return false }
+        }
         selectedTab = MainTabIndex.messages
         messageConversationNavigationRequest = MessageConversationNavigationRequest(
-            conversationID: conversation.id
+            conversationID: conversation.id,
+            messageID: messageID
         )
+        return true
+    }
+
+    private func routeToConversation(_ conversation: Conversation) {
+        _ = requestConversationNavigation(conversationID: conversation.id)
     }
 
     private func activeCallConversation(
@@ -6400,6 +6453,13 @@ final class AppModel: ObservableObject {
             conversations: state.conversations,
             currentUserID: profile?.id
         )
+    }
+
+    /// Resolves a chat binding through the same strict path used by the call screen. Newer call
+    /// handoffs carry a conversation id directly; older one-to-one calls may use their exact
+    /// persisted call roster only when it maps to one unambiguous direct conversation.
+    func resolvedConversationID(forActiveCall activeCall: ActiveCallPresentation?) -> String? {
+        activeCallConversation(for: activeCall)?.id
     }
 
     private func activeCallConversationCreationTarget(
@@ -6418,6 +6478,11 @@ final class AppModel: ObservableObject {
     func consumeMessageConversationNavigationRequest(_ requestID: UUID) {
         guard messageConversationNavigationRequest?.id == requestID else { return }
         messageConversationNavigationRequest = nil
+    }
+
+    func consumeWalletClaimNavigationRequest(_ requestID: UUID) {
+        guard walletClaimNavigationRequest?.id == requestID else { return }
+        walletClaimNavigationRequest = nil
     }
 
     private func handleMessageNotificationAction(
@@ -6457,16 +6522,90 @@ final class AppModel: ObservableObject {
                   in: state.conversations
               )
         else { return false }
-        selectedTab = MainTabIndex.messages
-        messageConversationNavigationRequest = MessageConversationNavigationRequest(
-            conversationID: conversation.id
+        let targetMessageID = MessageNotificationTargetPolicy.messageID(
+            forDigest: action.messageDigest,
+            conversationID: conversation.id,
+            messages: state.messages
         )
+        guard requestConversationNavigation(
+            conversationID: conversation.id,
+            messageID: targetMessageID
+        ) else { return false }
         // Clear only after the final account/deletion routing gate has succeeded. A failed cold
         // launch remains retryable and cannot consume another account's delivered notification.
         await NotificationCoordinator.shared.clearMessageNotifications(
             accountFingerprint: action.accountFingerprint,
             conversationID: action.conversationID
         )
+        return true
+    }
+
+    private func handleClaimablePaymentNotificationAction(
+        _ action: ClaimablePaymentNotificationAction
+    ) async -> Bool {
+        if let restoreTask { await restoreTask.value }
+        guard !isSigningOut,
+              !isSubmittingAccountDeletion,
+              !acceptedAccountDeletionCleanupBlocked,
+              !protectedLocalStateRecoveryBlocked,
+              !unresolvedAccountDeletionAttemptBlocked,
+              isSignedIn,
+              accountSetupStep == nil,
+              sessionAssurance?.grantsFullAccess == true,
+              let currentUserID = profile?.id,
+              MessageNotificationContract.canonicalUUID(state.communicationOwnerUserID)
+                == MessageNotificationContract.canonicalUUID(currentUserID),
+              let session = await sessions.current(),
+              session.accountId?.caseInsensitiveCompare(currentUserID) == .orderedSame
+        else { return false }
+        let context = AuthenticatedSecurityContext(
+            accountEpoch: accountEpoch,
+            userID: currentUserID,
+            sessionID: session.sessionId
+        )
+        guard await authenticatedSecurityContextIsCurrent(context) else { return false }
+
+        if isOnline,
+           TransferAcceptancePolicy(features: capabilities?.features).acceptanceEnabled,
+           let claim = try? await APIClientSessionBinding.$sessionID.withValue(
+               context.sessionID,
+               operation: {
+                   try await api.transferAcceptance(transferId: action.claimID)
+               }
+           ) {
+            guard await authenticatedSecurityContextIsCurrent(context),
+                  ClaimablePaymentNotificationRoutingPolicy.authorizesWallet(
+                      action: action,
+                      claim: claim,
+                      currentUserID: currentUserID
+                  )
+            else { return false }
+            if let conversation = ClaimablePaymentNotificationRoutingPolicy.conversation(
+                action: action,
+                claim: claim,
+                conversations: state.conversations,
+                currentUserID: currentUserID
+            ) {
+                let targetMessageID = ClaimablePaymentNotificationRoutingPolicy.targetMessageID(
+                    action: action,
+                    claim: claim,
+                    conversation: conversation,
+                    messages: state.messages
+                )
+                if requestConversationNavigation(
+                    conversationID: conversation.id,
+                    messageID: targetMessageID
+                ) {
+                    return true
+                }
+            }
+        }
+
+        // No payload URL is opened. A missing/offline/contradictory group binding falls back to
+        // the signed-in account's own wallet activity, whose next load is server-authoritative.
+        guard await authenticatedSecurityContextIsCurrent(context) else { return false }
+        selectedTab = MainTabIndex.home
+        walletClaimNavigationRequest = WalletClaimNavigationRequest(claimID: action.claimID)
         return true
     }
 
@@ -12796,7 +12935,9 @@ final class AppModel: ObservableObject {
 
     func retryAutomaticContactSync() {
         guard appReviewDemoMutationsAllowed else { return }
-        scheduleAutomaticContactSync()
+        // A visible retry follows a failed server pass. Reusing a recent local projection here
+        // would hide the error without discovering the newly joined or relinked recipient.
+        scheduleAutomaticContactSync(forceServerRefresh: true)
     }
 
     private func handleBackgroundContactRefresh(_ refreshTask: BGAppRefreshTask) async {
@@ -12810,6 +12951,7 @@ final class AppModel: ObservableObject {
                 self.expiredBackgroundContactTasks.insert(taskID)
                 self.contactSyncTask?.cancel()
                 self.contactSyncTask = nil
+                self.contactSyncCurrentTaskForcesServerRefresh = false
                 self.contactSyncGeneration &+= 1
                 self.contactSyncNeedsAnotherPass = false
                 refreshTask.setTaskCompleted(success: false)
@@ -12881,6 +13023,7 @@ final class AppModel: ObservableObject {
     private func invalidateContactSyncForRevocation() {
         contactSyncTask?.cancel()
         contactSyncTask = nil
+        contactSyncCurrentTaskForcesServerRefresh = false
         contactSyncGeneration &+= 1
         contactSyncNeedsAnotherPass = false
         contactDirectoryRevision &+= 1
@@ -12916,7 +13059,9 @@ final class AppModel: ObservableObject {
     }
 
     @discardableResult
-    private func scheduleAutomaticContactSync() -> Task<Bool, Never>? {
+    private func scheduleAutomaticContactSync(
+        forceServerRefresh: Bool = false
+    ) -> Task<Bool, Never>? {
         guard appReviewDemoMutationsAllowed,
               isSignedIn,
               isOnline,
@@ -12926,23 +13071,37 @@ final class AppModel: ObservableObject {
         else { return nil }
         guard [.allowed, .limited].contains(contactSource.accessState()) else { return nil }
         if let contactSyncTask {
-            contactSyncNeedsAnotherPass = true
-            return contactSyncTask
+            if forceServerRefresh, !contactSyncCurrentTaskForcesServerRefresh {
+                // The picker must not finish behind a cache-eligible pass. Invalidate that pass
+                // and return a new task which is guaranteed to consult the server. Generation and
+                // session fences prevent the cancelled task from publishing stale state.
+                contactSyncTask.cancel()
+                self.contactSyncTask = nil
+                contactSyncCurrentTaskForcesServerRefresh = false
+                contactSyncGeneration &+= 1
+                contactSyncNeedsAnotherPass = false
+            } else {
+                if !forceServerRefresh { contactSyncNeedsAnotherPass = true }
+                return contactSyncTask
+            }
         }
 
         let expectedAccountEpoch = accountEpoch
         contactSyncGeneration &+= 1
         let expectedSyncGeneration = contactSyncGeneration
+        contactSyncCurrentTaskForcesServerRefresh = forceServerRefresh
         let task = Task { [weak self] in
             guard let self else { return false }
             let succeeded = await self.performAutomaticContactSync(
                 expectedAccountEpoch: expectedAccountEpoch,
-                expectedSyncGeneration: expectedSyncGeneration
+                expectedSyncGeneration: expectedSyncGeneration,
+                forceServerRefresh: forceServerRefresh
             )
             guard self.accountEpoch == expectedAccountEpoch,
                   self.contactSyncGeneration == expectedSyncGeneration
             else { return false }
             self.contactSyncTask = nil
+            self.contactSyncCurrentTaskForcesServerRefresh = false
             if self.contactSyncNeedsAnotherPass {
                 self.contactSyncNeedsAnotherPass = false
                 self.scheduleAutomaticContactSync()
@@ -12955,7 +13114,8 @@ final class AppModel: ObservableObject {
 
     private func performAutomaticContactSync(
         expectedAccountEpoch: UUID,
-        expectedSyncGeneration: UInt64
+        expectedSyncGeneration: UInt64,
+        forceServerRefresh: Bool
     ) async -> Bool {
         guard appReviewDemoMutationsAllowed,
               isSignedIn, isOnline,
@@ -13022,7 +13182,12 @@ final class AppModel: ObservableObject {
                 && state.contactSyncSnapshotScope == snapshotScope
             let requiresAuthorizationRefresh = refreshedContactAuthorizationRevision
                 < expectedContactAuthorizationRevision
-            if snapshotIsUnchanged, recentlyRefreshed, !requiresAuthorizationRefresh {
+            if ContactSyncServerRefreshPolicy.canReuseLocalProjection(
+                snapshotIsUnchanged: snapshotIsUnchanged,
+                recentlyRefreshed: recentlyRefreshed,
+                requiresAuthorizationRefresh: requiresAuthorizationRefresh,
+                forceServerRefresh: forceServerRefresh
+            ) {
                 contactSyncState = .synced(
                     uploaded: snapshot.contacts.count,
                     matched: contactDirectory.filter { $0.isKitUser == true }.count,
@@ -13237,9 +13402,13 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func loadContactDirectory() async {
+    func loadContactDirectory(forceServerRefresh: Bool = false) async {
         rebuildCallContacts()
-        if let runningTask = scheduleAutomaticContactSync() { _ = await runningTask.value }
+        if let runningTask = scheduleAutomaticContactSync(
+            forceServerRefresh: forceServerRefresh
+        ) {
+            _ = await runningTask.value
+        }
     }
 
     func loadCallContacts() async {

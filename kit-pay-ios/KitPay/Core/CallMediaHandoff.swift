@@ -201,19 +201,42 @@ struct ActiveCallPresentation: Identifiable, Equatable, Sendable {
 }
 
 enum ConversationCallIndicatorPolicy {
-    static func label(
+    static func isLive(
         for conversationId: String,
         activeCall: ActiveCallPresentation?,
+        resolvedConversationId: String?,
         isConnected: Bool,
         hasRemoteParticipant: Bool
-    ) -> String? {
+    ) -> Bool {
         guard isConnected,
               hasRemoteParticipant,
               let activeCall,
-              let activeConversationId = activeCall.conversationId,
+              let activeConversationId = resolvedConversationId,
               activeConversationId.caseInsensitiveCompare(conversationId) == .orderedSame
+        else { return false }
+        return true
+    }
+
+    static func label(
+        for conversationId: String,
+        activeCall: ActiveCallPresentation?,
+        resolvedConversationId: String?,
+        isConnected: Bool,
+        hasRemoteParticipant: Bool,
+        elapsedSeconds: Int? = nil
+    ) -> String? {
+        guard isLive(
+            for: conversationId,
+            activeCall: activeCall,
+            resolvedConversationId: resolvedConversationId,
+            isConnected: isConnected,
+            hasRemoteParticipant: hasRemoteParticipant
+        ), let activeCall
         else { return nil }
-        return activeCall.video ? "Video call • In call" : "Voice call • In call"
+        let state = elapsedSeconds.map {
+            ConversationCallPresentationPolicy.durationText(max(0, $0))
+        } ?? "In call"
+        return "\(activeCall.video ? "Video call" : "Voice call") • \(state)"
     }
 }
 

@@ -22,6 +22,9 @@ UUID_PATTERN = re.compile(
 )
 BUNDLE_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]{2,254}")
 APP_GROUP_KEY = "com.apple.security.application-groups"
+TIME_SENSITIVE_NOTIFICATIONS_KEY = (
+    "com.apple.developer.usernotifications.time-sensitive"
+)
 
 
 def fail(message: str) -> "NoReturn":
@@ -117,6 +120,10 @@ def main() -> None:
     if args.role == "app":
         if entitlements.get("aps-environment") != "production":
             fail("The App Store profile must include aps-environment=production")
+        if entitlements.get(TIME_SENSITIVE_NOTIFICATIONS_KEY) is not True:
+            fail(
+                "The App Store profile must authorize Time Sensitive Notifications"
+            )
         expected_icloud_container = f"iCloud.{args.bundle_id}"
         icloud_containers = entitlements.get(
             "com.apple.developer.icloud-container-identifiers"
@@ -136,6 +143,10 @@ def main() -> None:
         # can is a profile that was generated for the wrong App ID.
         if "aps-environment" in entitlements:
             fail("The share extension profile must not authorize push notifications")
+        if TIME_SENSITIVE_NOTIFICATIONS_KEY in entitlements:
+            fail(
+                "The share extension profile must not authorize Time Sensitive Notifications"
+            )
         if "com.apple.developer.icloud-container-identifiers" in entitlements:
             fail("The share extension profile must not authorize iCloud containers")
     if profile.get("ProvisionedDevices") or profile.get("ProvisionsAllDevices"):

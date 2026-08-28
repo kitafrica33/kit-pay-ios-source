@@ -3,6 +3,44 @@ import XCTest
 @testable import KitPay
 
 final class ContactSyncTests: XCTestCase {
+    func testRecentUnchangedProjectionCanBeReusedOnlyForBackgroundRefresh() {
+        XCTAssertTrue(
+            ContactSyncServerRefreshPolicy.canReuseLocalProjection(
+                snapshotIsUnchanged: true,
+                recentlyRefreshed: true,
+                requiresAuthorizationRefresh: false,
+                forceServerRefresh: false
+            )
+        )
+        XCTAssertFalse(
+            ContactSyncServerRefreshPolicy.canReuseLocalProjection(
+                snapshotIsUnchanged: true,
+                recentlyRefreshed: true,
+                requiresAuthorizationRefresh: false,
+                forceServerRefresh: true
+            )
+        )
+    }
+
+    func testProjectionReuseStillRejectsChangedStaleOrAuthorizationInvalidatedSnapshots() {
+        let inputs = [
+            (snapshotIsUnchanged: false, recentlyRefreshed: true, authorization: false),
+            (snapshotIsUnchanged: true, recentlyRefreshed: false, authorization: false),
+            (snapshotIsUnchanged: true, recentlyRefreshed: true, authorization: true),
+        ]
+
+        for input in inputs {
+            XCTAssertFalse(
+                ContactSyncServerRefreshPolicy.canReuseLocalProjection(
+                    snapshotIsUnchanged: input.snapshotIsUnchanged,
+                    recentlyRefreshed: input.recentlyRefreshed,
+                    requiresAuthorizationRefresh: input.authorization,
+                    forceServerRefresh: false
+                )
+            )
+        }
+    }
+
     func testContactFingerprintIsStableAndChangesWithTheSnapshot() {
         let first = ContactSyncSnapshot(
             contacts: [

@@ -54,6 +54,7 @@ _ICLOUD_SETTINGS = [
         "options": [{"key": "XCODE_6"}],
     }
 ]
+_TIME_SENSITIVE_NOTIFICATIONS_CAPABILITY = "USERNOTIFICATIONS_TIMESENSITIVE"
 
 
 class ProvisioningError(RuntimeError):
@@ -532,6 +533,75 @@ def _ensure_app_groups_enabled(
     _fail("The bundle ID does not have the verified APP_GROUPS capability.")
 
 
+def _load_time_sensitive_notifications_capability(
+    client: object,
+    bundle_resource_id: str,
+) -> str | None:
+    response = client.request(
+        "GET",
+        f"/v1/bundleIds/{urllib.parse.quote(bundle_resource_id, safe='')}/bundleIdCapabilities",
+        query={"fields[bundleIdCapabilities]": "capabilityType"},
+        expected_status=200,
+        operation="Time Sensitive Notifications capability lookup",
+    )
+    matches: list[str] = []
+    for candidate in _collection(response, "bundle capability"):
+        resource_id, attributes = _resource(
+            candidate,
+            "bundleIdCapabilities",
+            "bundle capability",
+        )
+        if attributes.get("capabilityType") == _TIME_SENSITIVE_NOTIFICATIONS_CAPABILITY:
+            matches.append(resource_id)
+    if len(matches) > 1:
+        _fail(
+            "The bundle ID has ambiguous Time Sensitive Notifications capability records."
+        )
+    return matches[0] if matches else None
+
+
+def _ensure_time_sensitive_notifications_enabled(
+    client: object,
+    bundle_resource_id: str,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    if _load_time_sensitive_notifications_capability(client, bundle_resource_id) is not None:
+        return
+    client.request(
+        "POST",
+        "/v1/bundleIdCapabilities",
+        body={
+            "data": {
+                "type": "bundleIdCapabilities",
+                "attributes": {
+                    "capabilityType": _TIME_SENSITIVE_NOTIFICATIONS_CAPABILITY
+                },
+                "relationships": {
+                    "bundleId": {
+                        "data": {"type": "bundleIds", "id": bundle_resource_id}
+                    }
+                },
+            }
+        },
+        expected_status=201,
+        operation="Time Sensitive Notifications capability creation",
+    )
+    for attempt in range(len(_CAPABILITY_PROPAGATION_DELAYS_SECONDS) + 1):
+        if (
+            _load_time_sensitive_notifications_capability(
+                client, bundle_resource_id
+            )
+            is not None
+        ):
+            return
+        if attempt < len(_CAPABILITY_PROPAGATION_DELAYS_SECONDS):
+            sleep(_CAPABILITY_PROPAGATION_DELAYS_SECONDS[attempt])
+    _fail(
+        "The bundle ID does not have the verified USERNOTIFICATIONS_TIMESENSITIVE capability."
+    )
+
+
 def _parse_api_date(value: object, label: str) -> dt.datetime:
     if not isinstance(value, str):
         _fail(f"App Store Connect returned an invalid {label} date.")
@@ -692,6 +762,7 @@ def provision_profile(
     certificate_der: bytes,
     profile_name: str,
     icloud: bool = True,
+    time_sensitive_notifications: bool = True,
     register_bundle_name: str | None = None,
 ) -> bytes:
     bundle_resource_id = _ensure_bundle_id(client, bundle_id, register_bundle_name)
@@ -700,6 +771,8 @@ def provision_profile(
     # cannot misuse.
     if icloud:
         _ensure_icloud_xcode6(client, bundle_resource_id)
+    if time_sensitive_notifications:
+        _ensure_time_sensitive_notifications_enabled(client, bundle_resource_id)
     _ensure_app_groups_enabled(client, bundle_resource_id)
     certificate_resource_id = _find_distribution_certificate(client, certificate_der)
     return _create_profile(
@@ -755,6 +828,13 @@ def _arguments() -> argparse.Namespace:
         help="For the share extension App ID, which has no iCloud capability.",
     )
     parser.add_argument(
+        "--skip-time-sensitive-notifications-capability",
+        action="store_true",
+        help=(
+            "For an extension App ID, which must not receive time-sensitive notifications."
+        ),
+    )
+    parser.add_argument(
         "--register-bundle-name",
         help="Register the explicit iOS bundle ID with this name when it does not exist.",
     )
@@ -780,6 +860,9 @@ def _main() -> None:
         certificate_der=certificate_der,
         profile_name=args.profile_name,
         icloud=not args.skip_icloud_capability,
+        time_sensitive_notifications=(
+            not args.skip_time_sensitive_notifications_capability
+        ),
         register_bundle_name=args.register_bundle_name,
     )
     _write_private_file(args.profile_output, profile)

@@ -157,6 +157,23 @@ enum MessageNotificationContract {
     }
 }
 
+/// The APNs category used by the backend for claimable Kit-to-Kit payment state changes.
+/// The category deliberately has no one-tap money-movement action: accepting or reversing still
+/// requires the authenticated in-app flow and its existing step-up checks. A visible alert is
+/// rendered by iOS even while Kit Pay is suspended or terminated.
+enum ClaimablePaymentNotificationContract {
+    static let categoryIdentifier = "africa.kit.pay.payment.claimable"
+
+    static var category: UNNotificationCategory {
+        UNNotificationCategory(
+            identifier: categoryIdentifier,
+            actions: [],
+            intentIdentifiers: [],
+            options: []
+        )
+    }
+}
+
 private struct MessageNotificationMetadata {
     let conversationID: String
     let accountFingerprint: String
@@ -277,10 +294,49 @@ struct MessageNotificationAction: Equatable, Sendable {
 struct MessageConversationNavigationRequest: Equatable, Identifiable, Sendable {
     let id: UUID
     let conversationID: String
+    let messageID: UUID?
 
-    init(id: UUID = UUID(), conversationID: String) {
+    init(id: UUID = UUID(), conversationID: String, messageID: UUID? = nil) {
         self.id = id
         self.conversationID = conversationID
+        self.messageID = messageID
+    }
+}
+
+struct WalletClaimNavigationRequest: Equatable, Identifiable, Sendable {
+    let id: UUID
+    let claimID: String
+
+    init(id: UUID = UUID(), claimID: String) {
+        self.id = id
+        self.claimID = claimID
+    }
+}
+
+enum MessageNotificationTargetPolicy {
+    /// Resolves the privacy-preserving digest from a locally generated notification back to one
+    /// exact, already authenticated server message. Ambiguous or stale projections open the
+    /// conversation without inventing a target.
+    static func messageID(
+        forDigest digest: String?,
+        conversationID: String,
+        messages: [LocalMessage]
+    ) -> UUID? {
+        guard let digest,
+              MessageNotificationContract.isIdentifierDigest(digest),
+              let conversationID = MessageNotificationContract.canonicalUUID(conversationID)
+        else { return nil }
+        let matches = messages.filter { message in
+            guard MessageNotificationContract.canonicalUUID(message.conversationId)
+                    == conversationID,
+                  let serverMessageID = MessageNotificationContract.canonicalUUID(
+                      message.serverMessageId
+                  )
+            else { return false }
+            return MessageNotificationContract.messageDigest(for: serverMessageID) == digest
+        }
+        guard matches.count == 1 else { return nil }
+        return matches[0].id
     }
 }
 
@@ -396,6 +452,229 @@ actor MessageNotificationActionDispatcher {
     }
 
     func dispatch(_ action: MessageNotificationAction) async {
+        guard !completedKeys.contains(action.deduplicationKey),
+              !pendingKeys.contains(action.deduplicationKey),
+              activeKeys.insert(action.deduplicationKey).inserted
+        else { return }
+        guard let handler else {
+            activeKeys.remove(action.deduplicationKey)
+            pending.append(action)
+            pendingKeys.insert(action.deduplicationKey)
+            return
+        }
+        let completed = await handler(action)
+        activeKeys.remove(action.deduplicationKey)
+        if completed { recordCompletion(action.deduplicationKey) }
+    }
+
+    private func recordCompletion(_ key: String) {
+        guard completedKeys.insert(key).inserted else { return }
+        completedOrder.append(key)
+        while completedOrder.count > maximumCompletedKeys {
+            completedKeys.remove(completedOrder.removeFirst())
+        }
+    }
+}
+
+struct ClaimablePaymentNotificationAction: Equatable, Sendable {
+    let notificationID: String
+    let claimID: String
+    let conversationID: String?
+    let groupPaymentID: String?
+
+    var deduplicationKey: String {
+        "\(notificationID):\(claimID)"
+    }
+}
+
+enum ClaimablePaymentNotificationResponsePolicy {
+    private static let supportedTypes: Set<String> = [
+        "wallet.transfer_claim.opened",
+        "wallet.transfer_claim.reminder",
+        "wallet.transfer_claim.accepted",
+        "wallet.transfer_claim.rejected",
+        "wallet.transfer_claim.reversed",
+        "wallet.transfer_claim.expired",
+    ]
+
+    static func action(
+        actionIdentifier: String,
+        categoryIdentifier: String,
+        threadIdentifier: String,
+        userInfo: [AnyHashable: Any]
+    ) -> ClaimablePaymentNotificationAction? {
+        guard actionIdentifier == UNNotificationDefaultActionIdentifier,
+              categoryIdentifier == ClaimablePaymentNotificationContract.categoryIdentifier,
+              userInfo["action"] as? String == "open_transfer_claim",
+              let type = userInfo["type"] as? String,
+              supportedTypes.contains(type),
+              let notificationID = MessageNotificationContract.canonicalUUID(
+                  userInfo["notification_id"] as? String
+              ),
+              let claimID = MessageNotificationContract.canonicalUUID(
+                  userInfo["claim_id"] as? String
+              )
+        else { return nil }
+
+        let expectedTag = "wallet-transfer-claim:\(claimID)"
+        guard userInfo["notification_tag"] as? String == expectedTag,
+              threadIdentifier == expectedTag,
+              userInfo["deep_link"] as? String
+                == "kitwallet://payment/claim?claim_id=\(claimID)"
+        else { return nil }
+
+        let conversationID: String?
+        if let rawConversationID = userInfo["conversation_id"] {
+            guard let rawConversationID = rawConversationID as? String,
+                  let canonical = MessageNotificationContract.canonicalUUID(rawConversationID)
+            else { return nil }
+            conversationID = canonical
+        } else {
+            conversationID = nil
+        }
+
+        let groupPaymentID: String?
+        if let rawGroupPaymentID = userInfo["group_payment_id"] {
+            guard let rawGroupPaymentID = rawGroupPaymentID as? String,
+                  let canonical = MessageNotificationContract.canonicalUUID(rawGroupPaymentID)
+            else { return nil }
+            groupPaymentID = canonical
+        } else {
+            groupPaymentID = nil
+        }
+
+        // Pending notifications carry a server expiry. It is routing metadata only, but malformed
+        // values are refused so arbitrary strings never gain influence over an authenticated path.
+        if let expiresAt = userInfo["expires_at"] {
+            let fractionalFormatter = ISO8601DateFormatter()
+            fractionalFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            guard let expiresAt = expiresAt as? String,
+                  ISO8601DateFormatter().date(from: expiresAt) != nil
+                    || fractionalFormatter.date(from: expiresAt) != nil
+            else { return nil }
+        }
+
+        return ClaimablePaymentNotificationAction(
+            notificationID: notificationID,
+            claimID: claimID,
+            conversationID: conversationID,
+            groupPaymentID: groupPaymentID
+        )
+    }
+
+}
+
+enum ClaimablePaymentNotificationRoutingPolicy {
+    static func authorizesWallet(
+        action: ClaimablePaymentNotificationAction,
+        claim: TransferAcceptanceDTO,
+        currentUserID: String?
+    ) -> Bool {
+        guard let claimID = canonicalUUID(claim.id),
+              claimID == action.claimID,
+              claim.knownStatus != nil,
+              let currentUserID = canonicalUUID(currentUserID),
+              let senderID = canonicalUUID(claim.senderUserId),
+              let recipientID = canonicalUUID(claim.recipientUserId),
+              senderID != recipientID
+        else { return false }
+        return currentUserID == senderID || currentUserID == recipientID
+    }
+
+    static func conversation(
+        action: ClaimablePaymentNotificationAction,
+        claim: TransferAcceptanceDTO,
+        conversations: [Conversation],
+        currentUserID: String?
+    ) -> Conversation? {
+        guard authorizesWallet(action: action, claim: claim, currentUserID: currentUserID),
+              let conversationID = action.conversationID,
+              let currentUserID = canonicalUUID(currentUserID),
+              let senderID = canonicalUUID(claim.senderUserId),
+              let recipientID = canonicalUUID(claim.recipientUserId)
+        else { return nil }
+        let matches = conversations.filter {
+            canonicalUUID($0.id) == conversationID
+        }
+        guard matches.count == 1,
+              let conversation = matches.first,
+              conversation.isGroup,
+              let participants = canonicalRoster(conversation.participantUserIds),
+              participants.contains(currentUserID),
+              participants.contains(senderID),
+              participants.contains(recipientID)
+        else { return nil }
+        return conversation
+    }
+
+    static func targetMessageID(
+        action: ClaimablePaymentNotificationAction,
+        claim: TransferAcceptanceDTO,
+        conversation: Conversation,
+        messages: [LocalMessage]
+    ) -> UUID? {
+        let matches = messages.filter { message in
+            guard canonicalUUID(message.conversationId) == canonicalUUID(conversation.id)
+            else { return false }
+            if let descriptor = KitPaymentMessage.parse(message.body) {
+                return descriptor.action == .transfer
+                    && descriptor.paymentRequestId == action.claimID
+                    && descriptor.matchesAuthoritativeTransfer(claim)
+            }
+            if let groupPaymentID = action.groupPaymentID,
+               let descriptor = KitGroupPaymentMessage.parse(message.body) {
+                return descriptor.groupPaymentId == groupPaymentID
+            }
+            return false
+        }
+        guard matches.count == 1 else { return nil }
+        return matches[0].id
+    }
+
+    private static func canonicalRoster(_ values: [String]) -> Set<String>? {
+        var roster: Set<String> = []
+        for value in values {
+            guard let participantID = canonicalUUID(value),
+                  roster.insert(participantID).inserted
+            else { return nil }
+        }
+        return roster
+    }
+
+    private static func canonicalUUID(_ value: String?) -> String? {
+        MessageNotificationContract.canonicalUUID(value)
+    }
+}
+
+actor ClaimablePaymentNotificationActionDispatcher {
+    typealias Handler = @MainActor @Sendable (ClaimablePaymentNotificationAction) async -> Bool
+
+    static let shared = ClaimablePaymentNotificationActionDispatcher()
+
+    private var handler: Handler?
+    private var pending: [ClaimablePaymentNotificationAction] = []
+    private var pendingKeys: Set<String> = []
+    private var activeKeys: Set<String> = []
+    private var completedKeys: Set<String> = []
+    private var completedOrder: [String] = []
+    private let maximumCompletedKeys = 128
+
+    func install(_ handler: @escaping Handler) async {
+        self.handler = handler
+        let buffered = pending
+        pending.removeAll()
+        pendingKeys.removeAll()
+        for action in buffered {
+            guard !completedKeys.contains(action.deduplicationKey),
+                  activeKeys.insert(action.deduplicationKey).inserted
+            else { continue }
+            let completed = await handler(action)
+            activeKeys.remove(action.deduplicationKey)
+            if completed { recordCompletion(action.deduplicationKey) }
+        }
+    }
+
+    func dispatch(_ action: ClaimablePaymentNotificationAction) async {
         guard !completedKeys.contains(action.deduplicationKey),
               !pendingKeys.contains(action.deduplicationKey),
               activeKeys.insert(action.deduplicationKey).inserted
@@ -1500,7 +1779,10 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
         callProvider = CXProvider(configuration: configuration)
         super.init()
         let notificationCenter = UNUserNotificationCenter.current()
-        notificationCenter.setNotificationCategories([MessageNotificationContract.category])
+        notificationCenter.setNotificationCategories([
+            MessageNotificationContract.category,
+            ClaimablePaymentNotificationContract.category,
+        ])
         notificationCenter.delegate = self
         callProvider.setDelegate(self, queue: .main)
     }
@@ -1525,7 +1807,9 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
     @MainActor
     func requestAuthorizationAndRegister(forAccountID accountID: String) {
         guard enableRegistration(afterOwnershipRecoveryFor: accountID) else { return }
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge, .sound]) { _, _ in
+        UNUserNotificationCenter.current().requestAuthorization(
+            options: [.alert, .badge, .sound, .timeSensitive]
+        ) { _, _ in
             // Alert permission and APNs registration are independent. Keep a normal APNs token
             // for silent call-state synchronization even when the user declines visible alerts.
             //
@@ -2572,6 +2856,18 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
         ) {
             Task {
                 await MessageNotificationActionDispatcher.shared.dispatch(action)
+                completionHandler()
+            }
+            return
+        }
+        if let action = ClaimablePaymentNotificationResponsePolicy.action(
+            actionIdentifier: response.actionIdentifier,
+            categoryIdentifier: content.categoryIdentifier,
+            threadIdentifier: content.threadIdentifier,
+            userInfo: content.userInfo
+        ) {
+            Task {
+                await ClaimablePaymentNotificationActionDispatcher.shared.dispatch(action)
                 completionHandler()
             }
             return

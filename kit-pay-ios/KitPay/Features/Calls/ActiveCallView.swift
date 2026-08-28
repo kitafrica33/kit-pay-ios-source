@@ -2064,8 +2064,17 @@ struct MinimizedCallView: View {
             width: geometry.size.width,
             height: topInset + barContentHeight
         )
-        return HStack(spacing: 10) {
+        return ZStack {
             Button(action: reopen) {
+                Color.clear
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Return to call with \(call.participantName)")
+            .accessibilityValue(compactStatus(for: call))
+
+            HStack(spacing: 10) {
                 HStack(spacing: 10) {
                     CallParticipantAvatarView(
                         name: call.participantName,
@@ -2099,38 +2108,36 @@ struct MinimizedCallView: View {
                     .frame(width: 52, height: 22)
                 }
                 .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Return to call with \(call.participantName)")
-            .accessibilityValue(compactStatus(for: call))
+                .allowsHitTesting(false)
 
-            minimizedControl(
-                icon: media.isMicrophoneEnabled ? "mic.fill" : "mic.slash.fill",
-                label: media.isMicrophoneEnabled ? "Mute" : "Unmute",
-                foreground: media.isMicrophoneEnabled ? KitColor.primaryText : .white,
-                background: media.isMicrophoneEnabled
-                    ? AnyShapeStyle(.thinMaterial)
-                    : AnyShapeStyle(KitColor.navy),
-                enabled: CallControlAvailabilityPolicy.microphoneControlIsEnabled(
-                    isConnected: coordinator.state == .connected,
-                    isReconnecting: coordinator.state == .reconnecting
-                )
-            ) {
-                coordinator.requestMuted(media.isMicrophoneEnabled)
+                minimizedControl(
+                    icon: media.isMicrophoneEnabled ? "mic.fill" : "mic.slash.fill",
+                    label: media.isMicrophoneEnabled ? "Mute" : "Unmute",
+                    foreground: media.isMicrophoneEnabled ? KitColor.primaryText : .white,
+                    background: media.isMicrophoneEnabled
+                        ? AnyShapeStyle(.thinMaterial)
+                        : AnyShapeStyle(KitColor.navy),
+                    enabled: CallControlAvailabilityPolicy.microphoneControlIsEnabled(
+                        isConnected: coordinator.state == .connected,
+                        isReconnecting: coordinator.state == .reconnecting
+                    )
+                ) {
+                    coordinator.requestMuted(media.isMicrophoneEnabled)
+                }
+                minimizedControl(
+                    icon: "phone.down.fill",
+                    label: "End call",
+                    foreground: .white,
+                    background: AnyShapeStyle(Color(red: 0.98, green: 0.02, blue: 0.25)),
+                    enabled: coordinator.state != .ending
+                ) {
+                    coordinator.requestEnd()
+                }
             }
-            minimizedControl(
-                icon: "phone.down.fill",
-                label: "End call",
-                foreground: .white,
-                background: AnyShapeStyle(Color(red: 0.98, green: 0.02, blue: 0.25)),
-                enabled: coordinator.state != .ending
-            ) {
-                coordinator.requestEnd()
-            }
+            .padding(.horizontal, 14)
+            .frame(height: barContentHeight)
         }
-        .padding(.horizontal, 14)
-        .frame(height: barContentHeight)
-        .padding(.top, topInset)
+        .frame(height: topInset + barContentHeight, alignment: .bottom)
         .frame(maxWidth: .infinity)
         .background {
             // The material runs edge to edge and up behind the island, so the strip reads as one

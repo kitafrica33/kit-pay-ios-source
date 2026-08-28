@@ -163,6 +163,7 @@ def main() -> None:
     expected_application_id = f"{args.team_id}.{args.bundle_id}"
     expected_icloud_container = f"iCloud.{args.bundle_id}"
     expected_icloud_containers = [expected_icloud_container]
+    time_sensitive_key = "com.apple.developer.usernotifications.time-sensitive"
     checks = (
         (info.get("CFBundleIdentifier") == args.bundle_id, "Unexpected signed bundle identifier"),
         (info.get("CFBundleShortVersionString") == args.version, "Unexpected marketing version"),
@@ -180,6 +181,10 @@ def main() -> None:
         (
             profile_entitlements.get("aps-environment") == "production",
             "Embedded profile does not authorize production APNs",
+        ),
+        (
+            profile_entitlements.get(time_sensitive_key) is True,
+            "Embedded profile does not authorize Time Sensitive Notifications",
         ),
         (
             authorizes_app_group(
@@ -219,6 +224,10 @@ def main() -> None:
         ),
         (signed.get("aps-environment") == "production", "Signed app APNs entitlement is not production"),
         (
+            signed.get(time_sensitive_key) is True,
+            "Signed app is not entitled to Time Sensitive Notifications",
+        ),
+        (
             signed.get("com.apple.developer.icloud-container-identifiers")
             == expected_icloud_containers,
             "Signed app iCloud container entitlement is incorrect",
@@ -236,6 +245,10 @@ def main() -> None:
         (
             valid_processing_metadata,
             "Background processing requires BGTaskSchedulerPermittedIdentifiers",
+        ),
+        (
+            "remote-notification" in background_modes,
+            "Signed app must retain remote-notification background delivery",
         ),
         (valid_accessed_api_types, "Privacy manifest required-reason APIs are malformed"),
         (
@@ -338,6 +351,14 @@ def main() -> None:
         (
             "aps-environment" not in extension_profile_entitlements,
             "The share extension profile must not authorize push notifications",
+        ),
+        (
+            time_sensitive_key not in extension_signed,
+            "The share extension must not be entitled to Time Sensitive Notifications",
+        ),
+        (
+            time_sensitive_key not in extension_profile_entitlements,
+            "The share extension profile must not authorize Time Sensitive Notifications",
         ),
         (
             "com.apple.developer.icloud-container-identifiers" not in extension_signed,

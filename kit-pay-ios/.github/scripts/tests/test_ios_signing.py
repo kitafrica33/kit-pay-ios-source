@@ -36,6 +36,9 @@ ICLOUD_CONTAINER = f"iCloud.{BUNDLE}"
 ICLOUD_ENVIRONMENT_KEY = "com.apple.developer.icloud-container-environment"
 APP_GROUP_KEY = "com.apple.security.application-groups"
 APP_GROUP = "group.africa.kit.pay.ios"
+TIME_SENSITIVE_NOTIFICATIONS_KEY = (
+    "com.apple.developer.usernotifications.time-sensitive"
+)
 SHARE_BUNDLE = "africa.kit.pay.ios.share"
 SHARE_PROFILE_UUID = "66666666-7777-8888-9999-aaaaaaaaaaaa"
 
@@ -94,6 +97,7 @@ def profile(aps_environment: str = "production") -> dict:
             "application-identifier": f"{TEAM}.{BUNDLE}",
             "com.apple.developer.team-identifier": TEAM,
             "aps-environment": aps_environment,
+            TIME_SENSITIVE_NOTIFICATIONS_KEY: True,
             "get-task-allow": False,
             "com.apple.developer.icloud-container-identifiers": [ICLOUD_CONTAINER],
             "com.apple.developer.icloud-services": ["CloudKit"],
@@ -166,6 +170,16 @@ def app_groups_capability_resource(
         "type": "bundleIdCapabilities",
         "id": resource_id,
         "attributes": {"capabilityType": "APP_GROUPS"},
+    }
+
+
+def time_sensitive_notifications_capability_resource(
+    *, resource_id: str = "time-sensitive-capability"
+) -> dict[str, object]:
+    return {
+        "type": "bundleIdCapabilities",
+        "id": resource_id,
+        "attributes": {"capabilityType": "USERNOTIFICATIONS_TIMESENSITIVE"},
     }
 
 
@@ -483,6 +497,75 @@ class PrepareIOSSigningTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("push notifications", result.stderr)
 
+            overreaching = share_profile()
+            overreaching["Entitlements"][TIME_SENSITIVE_NOTIFICATIONS_KEY] = True
+            write_plist(profile_path, overreaching)
+            result = subprocess.run(
+                [
+                    "python3",
+                    str(PREPARE),
+                    "--app-group",
+                    APP_GROUP,
+                    "--profile-plist",
+                    str(profile_path),
+                    "--certificate-der",
+                    str(certificate_path),
+                    "--bundle-id",
+                    SHARE_BUNDLE,
+                    "--team-id",
+                    TEAM,
+                    "--role",
+                    "extension",
+                    "--export-options",
+                    str(root / "ExportOptions.plist"),
+                    "--profile-uuid-output",
+                    str(root / "uuid"),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Time Sensitive Notifications", result.stderr)
+
+    def test_rejects_app_profile_without_time_sensitive_notifications(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = pathlib.Path(raw)
+            profile_path = root / "profile.plist"
+            certificate_path = root / "distribution.der"
+            candidate = profile()
+            candidate["Entitlements"].pop(TIME_SENSITIVE_NOTIFICATIONS_KEY)
+            write_plist(profile_path, candidate)
+            certificate_path.write_bytes(CERTIFICATE_DER)
+
+            result = subprocess.run(
+                [
+                    "python3",
+                    str(PREPARE),
+                    "--app-group",
+                    APP_GROUP,
+                    "--profile-plist",
+                    str(profile_path),
+                    "--certificate-der",
+                    str(certificate_path),
+                    "--bundle-id",
+                    BUNDLE,
+                    "--team-id",
+                    TEAM,
+                    "--export-options",
+                    str(root / "ExportOptions.plist"),
+                    "--profile-uuid-output",
+                    str(root / "uuid"),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Time Sensitive Notifications", result.stderr)
+
     def test_accepts_profile_icloud_authorization_supersets(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = pathlib.Path(raw)
@@ -798,6 +881,45 @@ class AppStoreProfileGeneratorTests(unittest.TestCase):
                     "relationships": {
                         "bundleId": {
                             "data": {"type": "bundleIds", "id": "bundle-resource"}
+                        }
+                    },
+                }
+            },
+        )
+
+    def test_time_sensitive_notifications_capability_is_enabled_and_verified(self) -> None:
+        capability = time_sensitive_notifications_capability_resource()
+        client = FakeAppStoreConnectClient(
+            [
+                api_collection([]),
+                {"data": capability},
+                api_collection([capability]),
+            ]
+        )
+
+        PROFILE_GENERATOR._ensure_time_sensitive_notifications_enabled(
+            client,
+            "bundle-resource",
+            sleep=lambda _: None,
+        )
+
+        mutation = client.calls[1]
+        self.assertEqual(mutation["method"], "POST")
+        self.assertEqual(mutation["path"], "/v1/bundleIdCapabilities")
+        self.assertEqual(
+            mutation["body"],
+            {
+                "data": {
+                    "type": "bundleIdCapabilities",
+                    "attributes": {
+                        "capabilityType": "USERNOTIFICATIONS_TIMESENSITIVE"
+                    },
+                    "relationships": {
+                        "bundleId": {
+                            "data": {
+                                "type": "bundleIds",
+                                "id": "bundle-resource",
+                            }
                         }
                     },
                 }
@@ -1197,6 +1319,7 @@ class AppStoreProfileGeneratorTests(unittest.TestCase):
             certificate_der=CERTIFICATE_DER,
             profile_name="Kit Pay Share App Store 123-1",
             icloud=False,
+            time_sensitive_notifications=False,
         )
 
         self.assertEqual(result, profile_bytes)
@@ -1441,17 +1564,17 @@ class AppStoreProfileGeneratorTests(unittest.TestCase):
 
 
 class SigningConfigurationTests(unittest.TestCase):
-    def test_build_34_release_identity_is_consistent(self) -> None:
+    def test_build_35_release_identity_is_consistent(self) -> None:
         workflow = (ROOT / ".github/workflows/ios-app-store-archive.yml").read_text()
         project = (ROOT / "KitPay.xcodeproj/project.pbxproj").read_text()
 
         self.assertIn("default: 1.0.16", workflow)
-        self.assertIn('default: "34"', workflow)
-        self.assertIn("v1.0.16-build34", workflow)
+        self.assertIn('default: "35"', workflow)
+        self.assertIn("v1.0.16-build35", workflow)
         # Four each: Debug and Release of the app and of the share extension. iOS refuses to
         # install an app whose extension carries a different version, so they move together.
         self.assertEqual(project.count("MARKETING_VERSION = 1.0.16;"), 4)
-        self.assertEqual(project.count("CURRENT_PROJECT_VERSION = 34;"), 4)
+        self.assertEqual(project.count("CURRENT_PROJECT_VERSION = 35;"), 4)
         self.assertNotIn("MARKETING_VERSION = 1.0.1;", project)
 
     def test_message_edit_floor_stays_pinned_to_the_first_kitedit1_release(self) -> None:
@@ -1892,6 +2015,7 @@ class VerifyIOSArchiveTests(unittest.TestCase):
                     "CFBundleVersion": "42",
                     "KitCorrespondingSourceURL": SOURCE_URL,
                     "ITSAppUsesNonExemptEncryption": False,
+                    "UIBackgroundModes": ["remote-notification"],
                 },
             )
             write_plist(
@@ -1940,6 +2064,7 @@ class VerifyIOSArchiveTests(unittest.TestCase):
                     "application-identifier": f"{TEAM}.{BUNDLE}",
                     "com.apple.developer.team-identifier": TEAM,
                     "aps-environment": "production",
+                    TIME_SENSITIVE_NOTIFICATIONS_KEY: True,
                     "get-task-allow": False,
                     "com.apple.developer.icloud-container-identifiers": [
                         ICLOUD_CONTAINER
@@ -2024,6 +2149,102 @@ class VerifyIOSArchiveTests(unittest.TestCase):
                 result["artifacts"]["ipa"]["sha256"],
                 hashlib.sha256(b"ipa").hexdigest(),
             )
+
+            app_profile_without_time_sensitive = profile()
+            app_profile_without_time_sensitive["Entitlements"].pop(
+                TIME_SENSITIVE_NOTIFICATIONS_KEY
+            )
+            write_plist(embedded, app_profile_without_time_sensitive)
+            missing_profile_authorization = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(missing_profile_authorization.returncode, 0)
+            self.assertIn(
+                "Embedded profile does not authorize Time Sensitive Notifications",
+                missing_profile_authorization.stderr,
+            )
+            write_plist(embedded, profile())
+
+            with signed.open("rb") as source:
+                signed_without_time_sensitive = plistlib.load(source)
+            signed_without_time_sensitive.pop(TIME_SENSITIVE_NOTIFICATIONS_KEY)
+            write_plist(signed, signed_without_time_sensitive)
+            missing_signed_entitlement = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(missing_signed_entitlement.returncode, 0)
+            self.assertIn(
+                "Signed app is not entitled to Time Sensitive Notifications",
+                missing_signed_entitlement.stderr,
+            )
+            signed_without_time_sensitive[TIME_SENSITIVE_NOTIFICATIONS_KEY] = True
+            write_plist(signed, signed_without_time_sensitive)
+
+            with (app / "Info.plist").open("rb") as source:
+                info_without_remote_notifications = plistlib.load(source)
+            info_without_remote_notifications.pop("UIBackgroundModes")
+            write_plist(app / "Info.plist", info_without_remote_notifications)
+            missing_remote_notifications = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(missing_remote_notifications.returncode, 0)
+            self.assertIn(
+                "must retain remote-notification background delivery",
+                missing_remote_notifications.stderr,
+            )
+            info_without_remote_notifications["UIBackgroundModes"] = [
+                "remote-notification"
+            ]
+            write_plist(app / "Info.plist", info_without_remote_notifications)
+
+            extension_with_time_sensitive = share_profile()
+            extension_with_time_sensitive["Entitlements"][
+                TIME_SENSITIVE_NOTIFICATIONS_KEY
+            ] = True
+            write_plist(extension_embedded, extension_with_time_sensitive)
+            overreaching_extension_profile = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(overreaching_extension_profile.returncode, 0)
+            self.assertIn(
+                "share extension profile must not authorize Time Sensitive Notifications",
+                overreaching_extension_profile.stderr,
+            )
+            write_plist(extension_embedded, share_profile())
+
+            with extension_signed.open("rb") as source:
+                overreaching_extension_entitlements = plistlib.load(source)
+            overreaching_extension_entitlements[
+                TIME_SENSITIVE_NOTIFICATIONS_KEY
+            ] = True
+            write_plist(extension_signed, overreaching_extension_entitlements)
+            overreaching_signed_extension = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(overreaching_signed_extension.returncode, 0)
+            self.assertIn(
+                "share extension must not be entitled to Time Sensitive Notifications",
+                overreaching_signed_extension.stderr,
+            )
+            overreaching_extension_entitlements.pop(
+                TIME_SENSITIVE_NOTIFICATIONS_KEY
+            )
+            write_plist(extension_signed, overreaching_extension_entitlements)
 
             app_profile_without_group = profile()
             app_profile_without_group["Entitlements"].pop(APP_GROUP_KEY)
@@ -2240,6 +2461,7 @@ class VerifyIOSArchiveTests(unittest.TestCase):
                     "CFBundleVersion": "42",
                     "KitCorrespondingSourceURL": SOURCE_URL,
                     "ITSAppUsesNonExemptEncryption": True,
+                    "UIBackgroundModes": ["remote-notification"],
                 },
             )
             nonexempt_encryption = subprocess.run(
@@ -2260,7 +2482,7 @@ class VerifyIOSArchiveTests(unittest.TestCase):
                     "CFBundleVersion": "42",
                     "KitCorrespondingSourceURL": SOURCE_URL,
                     "ITSAppUsesNonExemptEncryption": False,
-                    "UIBackgroundModes": ["processing"],
+                    "UIBackgroundModes": ["processing", "remote-notification"],
                 },
             )
             missing_task_identifiers = subprocess.run(
@@ -2284,6 +2506,7 @@ class VerifyIOSArchiveTests(unittest.TestCase):
                     "CFBundleVersion": "42",
                     "KitCorrespondingSourceURL": SOURCE_URL,
                     "ITSAppUsesNonExemptEncryption": False,
+                    "UIBackgroundModes": ["remote-notification"],
                 },
             )
 
@@ -2308,6 +2531,7 @@ class VerifyIOSArchiveTests(unittest.TestCase):
                 "CFBundleVersion": "42",
                 "KitCorrespondingSourceURL": SOURCE_URL + "/",
                 "ITSAppUsesNonExemptEncryption": False,
+                "UIBackgroundModes": ["remote-notification"],
             }
             write_plist(app / "Info.plist", info)
             wrong_signed_url = subprocess.run(
@@ -2347,11 +2571,13 @@ class VerifyIOSArchiveTests(unittest.TestCase):
                     "application-identifier": f"{TEAM}.{BUNDLE}",
                     "com.apple.developer.team-identifier": TEAM,
                     "aps-environment": "production",
+                    TIME_SENSITIVE_NOTIFICATIONS_KEY: True,
                     "com.apple.developer.icloud-container-identifiers": [
                         ICLOUD_CONTAINER
                     ],
                     "com.apple.developer.icloud-services": ["CloudKit"],
                     ICLOUD_ENVIRONMENT_KEY: "Production",
+                    APP_GROUP_KEY: [APP_GROUP],
                 },
             )
             missing_debug_restriction = subprocess.run(

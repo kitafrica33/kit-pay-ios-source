@@ -618,6 +618,204 @@ final class ConversationSoundTests: XCTestCase {
         XCTAssertFalse(action.options.contains(.foreground))
     }
 
+    func testClaimablePaymentNotificationCategoryHasNoMoneyMovementAction() {
+        let category = ClaimablePaymentNotificationContract.category
+
+        XCTAssertEqual(
+            category.identifier,
+            ClaimablePaymentNotificationContract.categoryIdentifier
+        )
+        XCTAssertEqual(category.identifier, "africa.kit.pay.payment.claimable")
+        XCTAssertTrue(category.actions.isEmpty)
+    }
+
+    func testMessageNotificationTargetResolvesOneExactLocalMessage() throws {
+        let target = message(
+            id: 4,
+            createdAt: visibleAt,
+            serverMessageID: "30000000-0000-4000-8000-000000000004"
+        )
+        let digest = try XCTUnwrap(
+            MessageNotificationContract.messageDigest(for: target.serverMessageId!)
+        )
+
+        XCTAssertEqual(
+            MessageNotificationTargetPolicy.messageID(
+                forDigest: digest,
+                conversationID: conversationID.uppercased(),
+                messages: [target]
+            ),
+            target.id
+        )
+        XCTAssertNil(MessageNotificationTargetPolicy.messageID(
+            forDigest: digest,
+            conversationID: "20000000-0000-4000-8000-000000000002",
+            messages: [target]
+        ))
+        XCTAssertNil(MessageNotificationTargetPolicy.messageID(
+            forDigest: digest,
+            conversationID: conversationID,
+            messages: [target, target]
+        ))
+        XCTAssertNil(MessageNotificationTargetPolicy.messageID(
+            forDigest: "not-a-digest",
+            conversationID: conversationID,
+            messages: [target]
+        ))
+
+        let request = MessageConversationNavigationRequest(
+            conversationID: conversationID,
+            messageID: target.id
+        )
+        XCTAssertEqual(request.messageID, target.id)
+    }
+
+    func testClaimablePaymentNotificationAcceptsOnlyTheCanonicalTapContract() throws {
+        let payload = claimNotificationUserInfo()
+        let expectedThread = "wallet-transfer-claim:\(claimID)"
+        let action = try XCTUnwrap(ClaimablePaymentNotificationResponsePolicy.action(
+            actionIdentifier: UNNotificationDefaultActionIdentifier,
+            categoryIdentifier: ClaimablePaymentNotificationContract.categoryIdentifier,
+            threadIdentifier: expectedThread,
+            userInfo: payload
+        ))
+
+        XCTAssertEqual(action.notificationID, claimNotificationID)
+        XCTAssertEqual(action.claimID, claimID)
+        XCTAssertEqual(action.conversationID, conversationID)
+        XCTAssertEqual(action.groupPaymentID, claimGroupPaymentID)
+
+        var hostileLink = payload
+        hostileLink["deep_link"] = "https://attacker.example/payment/claim?claim_id=\(claimID)"
+        XCTAssertNil(claimNotificationAction(hostileLink))
+
+        var wrongClaim = payload
+        wrongClaim["claim_id"] = "70000000-0000-4000-8000-000000000099"
+        XCTAssertNil(claimNotificationAction(wrongClaim))
+
+        var malformedConversation = payload
+        malformedConversation["conversation_id"] = "not-a-uuid"
+        XCTAssertNil(claimNotificationAction(malformedConversation))
+
+        var unsupportedType = payload
+        unsupportedType["type"] = "wallet.transfer_claim.unknown"
+        XCTAssertNil(claimNotificationAction(unsupportedType))
+
+        var malformedExpiry = payload
+        malformedExpiry["expires_at"] = "tomorrow"
+        XCTAssertNil(claimNotificationAction(malformedExpiry))
+
+        XCTAssertNil(ClaimablePaymentNotificationResponsePolicy.action(
+            actionIdentifier: UNNotificationDismissActionIdentifier,
+            categoryIdentifier: ClaimablePaymentNotificationContract.categoryIdentifier,
+            threadIdentifier: expectedThread,
+            userInfo: payload
+        ))
+    }
+
+    func testClaimablePaymentRoutingRequiresAnAuthenticatedPartyAndExactGroup() throws {
+        let peerID = "40000000-0000-4000-8000-000000000002"
+        let outsiderID = "40000000-0000-4000-8000-000000000003"
+        let action = try XCTUnwrap(claimNotificationAction(claimNotificationUserInfo()))
+        let claim = claimTransfer(senderID: ownerUserID, recipientID: peerID)
+        var group = Conversation(
+            id: conversationID,
+            title: "Trip",
+            participantUserIds: [ownerUserID, peerID],
+            unreadCount: 1,
+            updatedAt: visibleAt
+        )
+        group.conversationType = SecureMessagingWire.groupConversationType
+
+        XCTAssertTrue(ClaimablePaymentNotificationRoutingPolicy.authorizesWallet(
+            action: action,
+            claim: claim,
+            currentUserID: ownerUserID
+        ))
+        XCTAssertFalse(ClaimablePaymentNotificationRoutingPolicy.authorizesWallet(
+            action: action,
+            claim: claim,
+            currentUserID: outsiderID
+        ))
+        XCTAssertEqual(
+            ClaimablePaymentNotificationRoutingPolicy.conversation(
+                action: action,
+                claim: claim,
+                conversations: [group],
+                currentUserID: ownerUserID
+            ),
+            group
+        )
+        XCTAssertNil(ClaimablePaymentNotificationRoutingPolicy.conversation(
+            action: action,
+            claim: claim,
+            conversations: [group, group],
+            currentUserID: ownerUserID
+        ))
+
+        var wrongRoster = group
+        wrongRoster.participantUserIds = [ownerUserID, outsiderID]
+        XCTAssertNil(ClaimablePaymentNotificationRoutingPolicy.conversation(
+            action: action,
+            claim: claim,
+            conversations: [wrongRoster],
+            currentUserID: ownerUserID
+        ))
+
+        let descriptor = try XCTUnwrap(KitPaymentMessage(
+            action: .transfer,
+            paymentRequestId: claimID,
+            amountMinor: 100_000,
+            currencyCode: "UGX",
+            currencyScale: 2,
+            note: "Group contribution"
+        ))
+        let message = LocalMessage(
+            id: UUID(uuidString: "50000000-0000-4000-8000-000000000099")!,
+            serverMessageId: "30000000-0000-4000-8000-000000000099",
+            conversationId: conversationID,
+            senderId: ownerUserID,
+            body: descriptor.encoded,
+            createdAt: visibleAt,
+            sentAt: visibleAt,
+            state: .sent,
+            failureReason: nil,
+            isOutgoing: true
+        )
+        XCTAssertEqual(
+            ClaimablePaymentNotificationRoutingPolicy.targetMessageID(
+                action: action,
+                claim: claim,
+                conversation: group,
+                messages: [message]
+            ),
+            message.id
+        )
+        XCTAssertNil(ClaimablePaymentNotificationRoutingPolicy.targetMessageID(
+            action: action,
+            claim: claim,
+            conversation: group,
+            messages: [message, message]
+        ))
+    }
+
+    @MainActor
+    func testClaimablePaymentDispatcherBuffersAndDeduplicatesOneTap() async throws {
+        let action = try XCTUnwrap(claimNotificationAction(claimNotificationUserInfo()))
+        let dispatcher = ClaimablePaymentNotificationActionDispatcher()
+        let probe = ClaimablePaymentNotificationActionProbe()
+
+        await dispatcher.dispatch(action)
+        await dispatcher.dispatch(action)
+        await dispatcher.install { received in
+            probe.actions.append(received)
+            return true
+        }
+        await dispatcher.dispatch(action)
+
+        XCTAssertEqual(probe.actions, [action])
+    }
+
     func testMessageNotificationResponseRoutesTapAndTrimsInlineReply() throws {
         let descriptor = try XCTUnwrap(notificationDescriptor())
         let userInfo = notificationUserInfo(descriptor)
@@ -1167,6 +1365,62 @@ final class ConversationSoundTests: XCTestCase {
             userText: userText
         )
     }
+
+    private var claimID: String { "70000000-0000-4000-8000-000000000001" }
+    private var claimNotificationID: String { "71000000-0000-4000-8000-000000000001" }
+    private var claimGroupPaymentID: String { "72000000-0000-4000-8000-000000000001" }
+
+    private func claimNotificationUserInfo() -> [AnyHashable: Any] {
+        [
+            "type": "wallet.transfer_claim.opened",
+            "action": "open_transfer_claim",
+            "notification_id": claimNotificationID,
+            "claim_id": claimID,
+            "conversation_id": conversationID,
+            "group_payment_id": claimGroupPaymentID,
+            "notification_tag": "wallet-transfer-claim:\(claimID)",
+            "deep_link": "kitwallet://payment/claim?claim_id=\(claimID)",
+            "expires_at": "2026-09-04T10:15:30.123Z",
+        ]
+    }
+
+    private func claimNotificationAction(
+        _ userInfo: [AnyHashable: Any]
+    ) -> ClaimablePaymentNotificationAction? {
+        ClaimablePaymentNotificationResponsePolicy.action(
+            actionIdentifier: UNNotificationDefaultActionIdentifier,
+            categoryIdentifier: ClaimablePaymentNotificationContract.categoryIdentifier,
+            threadIdentifier: "wallet-transfer-claim:\(claimID)",
+            userInfo: userInfo
+        )
+    }
+
+    private func claimTransfer(
+        senderID: String,
+        recipientID: String
+    ) -> TransferAcceptanceDTO {
+        try! JSONDecoder().decode(
+            TransferAcceptanceDTO.self,
+            from: JSONSerialization.data(withJSONObject: [
+                "id": claimID,
+                "transaction_id": "73000000-0000-4000-8000-000000000001",
+                "status": "pending",
+                "amount": "1000.00",
+                "currency": ["code": "UGX", "scale": "2"],
+                "sender": ["id": senderID],
+                "recipient": ["id": recipientID],
+                "note": "Group contribution",
+                "can_accept": true,
+                "can_reject": true,
+                "can_reverse": true,
+            ])
+        )
+    }
+}
+
+@MainActor
+private final class ClaimablePaymentNotificationActionProbe {
+    var actions: [ClaimablePaymentNotificationAction] = []
 }
 
 final class ChatPresentationPolicyTests: XCTestCase {

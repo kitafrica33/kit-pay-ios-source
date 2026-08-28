@@ -87,9 +87,13 @@ and Apple Liquid Glass.
   while an absent proof remains compatible with Android. Statuses are
   `pending|accepted|rejected|reversed|expired`.
   The backend must return all statuses when the list filter is omitted, auto-return unaccepted
-  transfers after 7 days, and push-notify both parties. The sender's device also records expiry
-  once with a deterministic encrypted receipt. Without the flag, transfers settle immediately
-  and use `sent`; no claim action is exposed.
+  transfers after 7 days, and push-notify both parties. Claim-state APNs alerts use category
+  `africa.kit.pay.payment.claimable` and interruption level `time-sensitive`; they remain subject
+  to the customer's notification permission and Focus settings and never use critical-alert
+  privileges. The main App ID/profile must therefore authorize Time Sensitive Notifications,
+  while the share extension must not. The sender's device also records expiry once with a
+  deterministic encrypted receipt. Without the flag, transfers settle immediately and use
+  `sent`; no claim action is exposed.
   Transfer and response chat cards use deterministic message IDs, so retries cannot duplicate
   them. The post-transfer share is still best-effort across the narrow interval between the
   server committing the money movement and iOS durably queuing its encrypted card; a process

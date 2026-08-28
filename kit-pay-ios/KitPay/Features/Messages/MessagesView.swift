@@ -62,6 +62,7 @@ struct MessagesView: View {
     @State private var queuedNewMessageConversation: Conversation?
     @State private var showGlobalSearch = false
     @State private var pendingSearchConversation: Conversation?
+    @State private var pendingSearchMessageID: UUID?
     @State private var pendingSearchContact: WalletContactDTO?
     @State private var selectedFilter: ConversationListFilter = .all
     @State private var showBackupSettings = false
@@ -157,6 +158,12 @@ struct MessagesView: View {
                     MessageGlobalSearchView(
                         selectConversation: { conversation in
                             pendingSearchConversation = conversation
+                            pendingSearchMessageID = nil
+                            showGlobalSearch = false
+                        },
+                        selectMessage: { hit in
+                            pendingSearchConversation = hit.conversation
+                            pendingSearchMessageID = hit.message.id
                             showGlobalSearch = false
                         },
                         selectContact: { contact in
@@ -237,6 +244,9 @@ struct MessagesView: View {
         // in long histories (the old per-row scan was the source of the delayed-tap defect).
         let lastByConversation = latestMessagesByConversation()
         let visibleConversations = conversations
+        let resolvedActiveCallConversationID = model.resolvedConversationID(
+            forActiveCall: callMedia.activeCall
+        )
 
         if model.state.conversations.isEmpty {
             // A fresh device with no chats is exactly when the iCloud restore offer matters most.
@@ -293,6 +303,7 @@ struct MessagesView: View {
                                 activeCallLabel: ConversationCallIndicatorPolicy.label(
                                     for: conversation.id,
                                     activeCall: callMedia.activeCall,
+                                    resolvedConversationId: resolvedActiveCallConversationID,
                                     isConnected: callMedia.state == .connected,
                                     hasRemoteParticipant: callTransport.hasRemoteParticipant
                                 ),
@@ -548,10 +559,21 @@ struct MessagesView: View {
             .disabled(model.isReadOnlyAppReviewDemoConversation(conversation.id))
             .accessibilityAddTraits(context.isSelected ? .isSelected : [])
         } else {
-            NavigationLink(value: conversation) {
+            Button {
+                if context.activeCallLabel != nil {
+                    CallOverlayWindowController.shared.reopenActiveCall()
+                } else {
+                    navigationPath.append(conversation)
+                }
+            } label: {
                 chatRowContent(conversation, context: context)
             }
             .buttonStyle(.plain)
+            .accessibilityHint(
+                context.activeCallLabel == nil
+                    ? "Opens this conversation"
+                    : "Returns to the ongoing call"
+            )
             .contextMenu {
                 if model.isReadOnlyAppReviewDemoConversation(conversation.id) {
                     Label("Read-only App Review preview", systemImage: "eye.fill")
@@ -649,13 +671,30 @@ struct MessagesView: View {
 
                 HStack(spacing: 5) {
                     if let activeCallLabel = context.activeCallLabel {
-                        Image(systemName: context.isVideoCall ? "video.fill" : "phone.fill")
-                            .font(.caption2)
-                            .foregroundStyle(KitColor.green)
-                        Text(activeCallLabel)
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(KitColor.green)
-                            .lineLimit(1)
+                        HStack(spacing: 5) {
+                            Image(systemName: context.isVideoCall ? "video.fill" : "phone.fill")
+                                .font(.caption2)
+                            TimelineView(.periodic(from: .now, by: 1)) { _ in
+                                Text(
+                                    ConversationCallIndicatorPolicy.label(
+                                        for: conversation.id,
+                                        activeCall: callMedia.activeCall,
+                                        resolvedConversationId: model.resolvedConversationID(
+                                            forActiveCall: callMedia.activeCall
+                                        ),
+                                        isConnected: callMedia.state == .connected,
+                                        hasRemoteParticipant: callTransport.hasRemoteParticipant,
+                                        elapsedSeconds: callMedia.presentedCallDurationSeconds()
+                                    ) ?? activeCallLabel
+                                )
+                                .lineLimit(1)
+                            }
+                        }
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(KitColor.green)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(KitColor.green.opacity(0.11), in: Capsule())
                     } else if let typingLabel = context.typingLabel {
                         Text(typingLabel)
                             .font(.subheadline.weight(.semibold))
@@ -843,10 +882,13 @@ struct MessagesView: View {
         queuedNewMessageConversation = nil
         showGlobalSearch = false
         pendingSearchConversation = nil
+        pendingSearchMessageID = nil
         pendingSearchContact = nil
         navigationPath = [conversation]
         isConversationPresented = true
-        model.consumeMessageConversationNavigationRequest(request.id)
+        if request.messageID == nil {
+            model.consumeMessageConversationNavigationRequest(request.id)
+        }
     }
 
     private func openNewMessage(contact: WalletContactDTO? = nil) {
@@ -879,9 +921,18 @@ struct MessagesView: View {
 
     private func finishGlobalSearch() {
         if let conversation = pendingSearchConversation {
+            let messageID = pendingSearchMessageID
             pendingSearchConversation = nil
+            pendingSearchMessageID = nil
             pendingSearchContact = nil
-            navigationPath.append(conversation)
+            if let messageID {
+                _ = model.requestConversationNavigation(
+                    conversationID: conversation.id,
+                    messageID: messageID
+                )
+            } else {
+                navigationPath.append(conversation)
+            }
             return
         }
         if let contact = pendingSearchContact {
@@ -933,6 +984,7 @@ private struct MessageGlobalSearchView: View {
     @FocusState private var searchIsFocused: Bool
 
     let selectConversation: (Conversation) -> Void
+    let selectMessage: (MessageGlobalMessageHit) -> Void
     let selectContact: (WalletContactDTO) -> Void
 
     var body: some View {
@@ -982,7 +1034,7 @@ private struct MessageGlobalSearchView: View {
                         if !results.messages.isEmpty {
                             resultSectionTitle("Messages")
                             ForEach(results.messages) { hit in
-                                Button { selectConversation(hit.conversation) } label: {
+                                Button { selectMessage(hit) } label: {
                                     messageResultRow(hit)
                                 }
                                 .buttonStyle(.plain)
@@ -1376,6 +1428,8 @@ struct ConversationView: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.dismiss) private var dismissConversation
+    @StateObject private var callMedia = CallMediaCoordinator.shared
+    @ObservedObject private var callTransport = CallMediaCoordinator.shared.media
     let conversation: Conversation
     @State private var draft = ""
     @State private var showPhotoPicker = false
@@ -1422,6 +1476,9 @@ struct ConversationView: View {
     @State private var conversationContentHeight: CGFloat = 0
     @State private var conversationViewportHeight: CGFloat = 0
     @State private var pendingScrollTargetMessageID: UUID?
+    /// A notification, global result, or floating player can address one exact local message.
+    /// The short-lived treatment confirms arrival without leaving a permanent selected state.
+    @State private var highlightedMessageID: UUID?
     @State private var galleryTarget: ConversationGalleryTarget?
     @State private var editorSession: MediaEditorSession?
     @State private var reactionPickerTarget: LocalMessage?
@@ -3305,6 +3362,29 @@ struct ConversationView: View {
                 )
             }
             applySharedInboxDeliveryIfNeeded()
+            applyTargetedMessageNavigationIfNeeded()
+        }
+        .onChange(of: model.messageConversationNavigationRequest) { _, _ in
+            applyTargetedMessageNavigationIfNeeded()
+        }
+        .onChange(of: messages) { _, _ in
+            // A cold notification can navigate before its just-synced row reaches the published
+            // projection. Keep the request pending and claim it when that exact row appears.
+            applyTargetedMessageNavigationIfNeeded()
+        }
+        .task(id: highlightedMessageID) {
+            guard let highlightedMessageID else { return }
+            do {
+                try await Task.sleep(for: .seconds(2))
+            } catch {
+                return
+            }
+            guard !Task.isCancelled, self.highlightedMessageID == highlightedMessageID else {
+                return
+            }
+            withAnimation(.easeOut(duration: 0.35)) {
+                self.highlightedMessageID = nil
+            }
         }
         .onChange(of: model.sharedInboxDelivery) { _, _ in
             applySharedInboxDeliveryIfNeeded()
@@ -3388,6 +3468,19 @@ struct ConversationView: View {
             presence.stopLocalTyping(conversationID: conversation.id)
             if !isReadOnlyAppReviewPreview, !isSending { persistDraftImmediately() }
         }
+    }
+
+    private func applyTargetedMessageNavigationIfNeeded() {
+        guard let request = model.messageConversationNavigationRequest,
+              request.conversationID.caseInsensitiveCompare(conversation.id) == .orderedSame,
+              let messageID = request.messageID,
+              messages.filter({ $0.id == messageID }).count == 1
+        else { return }
+        pendingScrollTargetMessageID = messageID
+        withAnimation(.easeIn(duration: 0.16)) {
+            highlightedMessageID = messageID
+        }
+        model.consumeMessageConversationNavigationRequest(request.id)
     }
 
     private func paymentErrorBanner(_ message: String) -> some View {
@@ -4353,9 +4446,19 @@ struct ConversationView: View {
                 editedAt: editedAt
             )
                 .overlay {
-                    if isSearchingMessages, currentSearchMatchID == message.id {
+                    if (isSearchingMessages && currentSearchMatchID == message.id)
+                        || highlightedMessageID == message.id {
                         RoundedRectangle(cornerRadius: 20, style: .continuous)
-                            .stroke(KitColor.green, lineWidth: 2)
+                            .stroke(
+                                KitColor.green,
+                                lineWidth: highlightedMessageID == message.id ? 3 : 2
+                            )
+                            .shadow(
+                                color: KitColor.green.opacity(
+                                    highlightedMessageID == message.id ? 0.34 : 0
+                                ),
+                                radius: 8
+                            )
                             .allowsHitTesting(false)
                     }
                 }
@@ -5418,25 +5521,68 @@ struct ConversationView: View {
         )
     }
 
+    @ViewBuilder
     private func callBubble(_ call: CallRecord) -> some View {
         let presentation = ConversationCallPresentationPolicy.presentation(for: call)
+        if currentLiveCallMatches(call) {
+            TimelineView(.periodic(from: .now, by: 1)) { timeline in
+                callBubbleRow(
+                    call,
+                    presentation: presentation,
+                    liveElapsedSeconds: liveCallElapsedSeconds(for: call, at: timeline.date)
+                )
+            }
+        } else {
+            callBubbleRow(call, presentation: presentation, liveElapsedSeconds: nil)
+        }
+    }
+
+    private func callBubbleRow(
+        _ call: CallRecord,
+        presentation: ConversationCallPresentation,
+        liveElapsedSeconds: Int?
+    ) -> some View {
+        let isLive = currentLiveCallMatches(call)
         let callbackAvailable = presentation.callbackEnabled
+            && !isLive
             && !isReadOnlyAppReviewPreview
             && model.mayCreateCall
             && recipientUserID != nil
             && recipientCommunicationAllowed
-        let accessibilityLabel = "\(presentation.title), \(callSubtitle(call, presentation: presentation))"
+        let subtitle = callSubtitle(
+            call,
+            presentation: presentation,
+            liveElapsedSeconds: liveElapsedSeconds
+        )
+        let accessibilityLabel = "\(presentation.title), \(subtitle)"
 
         return HStack {
             if presentation.isOutgoing { Spacer(minLength: 52) }
-            if callbackAvailable {
+            if isLive {
+                Button {
+                    CallOverlayWindowController.shared.reopenActiveCall()
+                } label: {
+                    callBubbleCard(
+                        call,
+                        presentation: presentation,
+                        callbackAvailable: false,
+                        isLive: true,
+                        liveElapsedSeconds: liveElapsedSeconds
+                    )
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(accessibilityLabel)
+                .accessibilityHint("Returns to the ongoing call")
+            } else if callbackAvailable {
                 Button {
                     queueCall(video: call.isVideoCall)
                 } label: {
                     callBubbleCard(
                         call,
                         presentation: presentation,
-                        callbackAvailable: true
+                        callbackAvailable: true,
+                        isLive: false,
+                        liveElapsedSeconds: nil
                     )
                 }
                 .buttonStyle(.plain)
@@ -5446,7 +5592,9 @@ struct ConversationView: View {
                 callBubbleCard(
                     call,
                     presentation: presentation,
-                    callbackAvailable: false
+                    callbackAvailable: false,
+                    isLive: false,
+                    liveElapsedSeconds: nil
                 )
                 .accessibilityElement(children: .combine)
                 .accessibilityLabel(accessibilityLabel)
@@ -5459,20 +5607,28 @@ struct ConversationView: View {
     private func callBubbleCard(
         _ call: CallRecord,
         presentation: ConversationCallPresentation,
-        callbackAvailable: Bool
+        callbackAvailable: Bool,
+        isLive: Bool,
+        liveElapsedSeconds: Int?
     ) -> some View {
-        let foreground = presentation.isOutgoing ? Color.white : KitColor.primaryText
-        let secondary = presentation.isOutgoing
+        let foreground = presentation.isOutgoing && !isLive
+            ? Color.white
+            : KitColor.primaryText
+        let secondary = presentation.isOutgoing && !isLive
             ? Color.white.opacity(0.72)
             : KitColor.secondaryText
-        let callbackSymbol: String = if presentation.callbackEnabled {
+        let callbackSymbol: String = if isLive {
+            "arrow.up.left.and.arrow.down.right"
+        } else if presentation.callbackEnabled {
             call.isVideoCall ? "video.fill" : "phone.fill"
         } else if call.state == .queued {
             "icloud.and.arrow.up"
         } else {
             "waveform"
         }
-        let callbackColor: Color = if call.state == .queued {
+        let callbackColor: Color = if isLive {
+            KitColor.green
+        } else if call.state == .queued {
             .orange
         } else if presentation.callbackEnabled && !callbackAvailable {
             secondary
@@ -5490,7 +5646,11 @@ struct ConversationView: View {
                 Text(presentation.title)
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(presentation.isMissed ? Color.red : foreground)
-                Text(callSubtitle(call, presentation: presentation))
+                Text(callSubtitle(
+                    call,
+                    presentation: presentation,
+                    liveElapsedSeconds: liveElapsedSeconds
+                ))
                     .font(.caption2)
                     .foregroundStyle(secondary)
                     .lineLimit(1)
@@ -5512,14 +5672,21 @@ struct ConversationView: View {
         .padding(.vertical, 8)
         .frame(maxWidth: 300, alignment: .leading)
         .background(
-            presentation.isOutgoing
+            isLive
+                ? AnyShapeStyle(KitColor.green.opacity(0.16))
+                : presentation.isOutgoing
                 ? AnyShapeStyle(KitColor.navy.opacity(0.94))
                 : AnyShapeStyle(.ultraThinMaterial),
             in: RoundedRectangle(cornerRadius: 20, style: .continuous)
         )
         .overlay {
             RoundedRectangle(cornerRadius: 20, style: .continuous)
-                .stroke(.white.opacity(presentation.isOutgoing ? 0.22 : 0.6), lineWidth: 0.7)
+                .stroke(
+                    isLive
+                        ? KitColor.green.opacity(0.72)
+                        : Color.white.opacity(presentation.isOutgoing ? 0.22 : 0.6),
+                    lineWidth: isLive ? 1.2 : 0.7
+                )
                 .allowsHitTesting(false)
         }
         .shadow(color: .black.opacity(0.06), radius: 10, y: 4)
@@ -5527,8 +5694,13 @@ struct ConversationView: View {
 
     private func callSubtitle(
         _ call: CallRecord,
-        presentation: ConversationCallPresentation
+        presentation: ConversationCallPresentation,
+        liveElapsedSeconds: Int? = nil
     ) -> String {
+        if let liveElapsedSeconds {
+            let duration = ConversationCallPresentationPolicy.durationText(liveElapsedSeconds)
+            return "In call · \(duration)"
+        }
         var values: [String] = []
         if let status = presentation.statusText { values.append(status) }
         values.append(AppPresentationClock.shortTime(call.startedAt))
@@ -5536,6 +5708,28 @@ struct ConversationView: View {
             values.append(ConversationCallPresentationPolicy.durationText(duration))
         }
         return values.joined(separator: " · ")
+    }
+
+    private func currentLiveCallMatches(_ call: CallRecord) -> Bool {
+        guard let activeCall = callMedia.activeCall,
+              activeCall.id.caseInsensitiveCompare(call.id) == .orderedSame
+        else { return false }
+        return ConversationCallIndicatorPolicy.isLive(
+            for: conversation.id,
+            activeCall: activeCall,
+            resolvedConversationId: model.resolvedConversationID(forActiveCall: activeCall),
+            isConnected: callMedia.state == .connected,
+            hasRemoteParticipant: callTransport.hasRemoteParticipant
+        )
+    }
+
+    private func liveCallElapsedSeconds(for call: CallRecord, at date: Date) -> Int? {
+        guard currentLiveCallMatches(call) else { return nil }
+        if let elapsed = callMedia.presentedCallDurationSeconds() {
+            return elapsed
+        }
+        guard let answeredAt = call.answeredAt else { return nil }
+        return max(0, Int(date.timeIntervalSince(answeredAt)))
     }
 
     private func queueCall(video: Bool) {

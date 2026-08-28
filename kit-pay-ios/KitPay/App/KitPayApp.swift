@@ -51,7 +51,16 @@ struct KitPayApp: App {
                             appDelegate.setActiveCallPresented(true)
                         }
                 }
-                .onAppear { syncMinimizedCallSurface() }
+                .onAppear {
+                    VoiceNoteOverlayWindowController.shared.installNavigationHandler {
+                        [weak model] conversationID, messageID in
+                        _ = model?.requestConversationNavigation(
+                            conversationID: conversationID,
+                            messageID: messageID
+                        )
+                    }
+                    syncMinimizedCallSurface()
+                }
                 .onChange(of: hasPresentableCall) { _, _ in syncMinimizedCallSurface() }
                 .onChange(of: showsMinimizedCall) { _, _ in syncMinimizedCallSurface() }
                 .onChange(of: callMedia.activeCall) { previous, current in

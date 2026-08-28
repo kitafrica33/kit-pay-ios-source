@@ -227,6 +227,13 @@ final class CallOverlayWindowController {
         pictureInPicture.stopForForegroundIfNeeded()
     }
 
+    /// Returns to the already-running call. This never starts a second call and deliberately
+    /// shares the same closure as the minimized strip/tile and Picture in Picture restoration.
+    func reopenActiveCall() {
+        guard CallMediaCoordinator.shared.activeCall != nil else { return }
+        presenter.reopen()
+    }
+
     /// Publishes which minimized surface is on screen and updates the app window's audio-strip
     /// reservation. Uses the same video definition as the surface itself (`callCarriesVideo`),
     /// so the reservation flips together with the strip↔tile swap on escalation.

@@ -3631,15 +3631,44 @@ final class CallLifecycleTests: XCTestCase {
             ConversationCallIndicatorPolicy.label(
                 for: "550e8400-e29b-41d4-a716-446655440099",
                 activeCall: activeCall,
+                resolvedConversationId: activeCall.conversationId,
                 isConnected: true,
                 hasRemoteParticipant: true
             ),
             "Video call • In call"
         )
+        XCTAssertEqual(
+            ConversationCallIndicatorPolicy.label(
+                for: "550e8400-e29b-41d4-a716-446655440099",
+                activeCall: activeCall,
+                resolvedConversationId: activeCall.conversationId,
+                isConnected: true,
+                hasRemoteParticipant: true,
+                elapsedSeconds: 65
+            ),
+            "Video call • 1:05"
+        )
+        XCTAssertEqual(
+            ConversationCallIndicatorPolicy.label(
+                for: "550e8400-e29b-41d4-a716-446655440099",
+                activeCall: ActiveCallPresentation(
+                    id: activeCall.id,
+                    participantName: activeCall.participantName,
+                    video: activeCall.video,
+                    direction: activeCall.direction
+                ),
+                resolvedConversationId: "550e8400-e29b-41d4-a716-446655440099",
+                isConnected: true,
+                hasRemoteParticipant: true,
+                elapsedSeconds: 65
+            ),
+            "Video call • 1:05"
+        )
         XCTAssertNil(
             ConversationCallIndicatorPolicy.label(
                 for: "550e8400-e29b-41d4-a716-446655440098",
                 activeCall: activeCall,
+                resolvedConversationId: activeCall.conversationId,
                 isConnected: true,
                 hasRemoteParticipant: true
             )
@@ -3653,6 +3682,7 @@ final class CallLifecycleTests: XCTestCase {
                     video: activeCall.video,
                     direction: activeCall.direction
                 ),
+                resolvedConversationId: nil,
                 isConnected: true,
                 hasRemoteParticipant: true
             )
@@ -3661,6 +3691,7 @@ final class CallLifecycleTests: XCTestCase {
             ConversationCallIndicatorPolicy.label(
                 for: "550e8400-e29b-41d4-a716-446655440099",
                 activeCall: activeCall,
+                resolvedConversationId: activeCall.conversationId,
                 isConnected: false,
                 hasRemoteParticipant: true
             )
@@ -3669,6 +3700,7 @@ final class CallLifecycleTests: XCTestCase {
             ConversationCallIndicatorPolicy.label(
                 for: "550e8400-e29b-41d4-a716-446655440099",
                 activeCall: activeCall,
+                resolvedConversationId: activeCall.conversationId,
                 isConnected: true,
                 hasRemoteParticipant: false
             )
