@@ -1564,18 +1564,31 @@ class AppStoreProfileGeneratorTests(unittest.TestCase):
 
 
 class SigningConfigurationTests(unittest.TestCase):
-    def test_build_35_release_identity_is_consistent(self) -> None:
+    def test_build_36_release_identity_is_consistent(self) -> None:
         workflow = (ROOT / ".github/workflows/ios-app-store-archive.yml").read_text()
         project = (ROOT / "KitPay.xcodeproj/project.pbxproj").read_text()
 
         self.assertIn("default: 1.0.16", workflow)
-        self.assertIn('default: "35"', workflow)
-        self.assertIn("v1.0.16-build35", workflow)
+        self.assertIn('default: "36"', workflow)
+        self.assertIn("v1.0.16-build36", workflow)
         # Four each: Debug and Release of the app and of the share extension. iOS refuses to
         # install an app whose extension carries a different version, so they move together.
         self.assertEqual(project.count("MARKETING_VERSION = 1.0.16;"), 4)
-        self.assertEqual(project.count("CURRENT_PROJECT_VERSION = 35;"), 4)
+        self.assertEqual(project.count("CURRENT_PROJECT_VERSION = 36;"), 4)
         self.assertNotIn("MARKETING_VERSION = 1.0.1;", project)
+
+    def test_archive_unit_tests_are_ad_hoc_signed_for_keychain_entitlements(self) -> None:
+        workflow = (ROOT / ".github/workflows/ios-app-store-archive.yml").read_text()
+        unit_test_step = workflow.split(
+            "      - name: Build and run unit tests without protected signing material\n",
+            1,
+        )[1].split("\n\n  archive:\n", 1)[0]
+
+        self.assertIn("CODE_SIGN_IDENTITY=-", unit_test_step)
+        self.assertIn("CODE_SIGN_STYLE=Manual", unit_test_step)
+        self.assertIn("PROVISIONING_PROFILE_SPECIFIER=", unit_test_step)
+        self.assertIn("DEVELOPMENT_TEAM=", unit_test_step)
+        self.assertNotIn("CODE_SIGNING_ALLOWED=NO", unit_test_step)
 
     def test_message_edit_floor_stays_pinned_to_the_first_kitedit1_release(self) -> None:
         """The edit capability floor is compatibility data, not build identity.
