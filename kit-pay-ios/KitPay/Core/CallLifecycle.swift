@@ -801,6 +801,167 @@ enum RetainedCallOwnerRecoveryPolicy {
     }
 }
 
+/// Lets the process restore only its authenticated call boundary while the app-owned interface
+/// remains behind Face ID. CallKit is already the system-owned answer surface on the Lock Screen;
+/// requiring the SwiftUI unlock first would make a valid incoming call ring but reject Answer.
+/// Every account/session/capability fence still has to be proven before this policy permits the
+/// lease, and no wallet or conversation surface is unlocked by it.
+enum ProtectedCallRecoveryPolicy {
+    static func permits(
+        isSignedIn: Bool,
+        isSigningOut: Bool,
+        accountSetupComplete: Bool,
+        sessionGrantsFullAccess: Bool,
+        hasAuthenticatedCapabilities: Bool,
+        accountMutationsAllowed: Bool,
+        callsFeatureEnabled: Bool,
+        communicationSurfacesConcealed: Bool,
+        localInterfaceRequiresBiometricUnlock: Bool
+    ) -> Bool {
+        // The local-interface lock is deliberately not an authority input here. The exact
+        // account/session lease and authenticated call lookup remain the authority boundary.
+        _ = localInterfaceRequiresBiometricUnlock
+        return isSignedIn
+            && !isSigningOut
+            && accountSetupComplete
+            && sessionGrantsFullAccess
+            && hasAuthenticatedCapabilities
+            && accountMutationsAllowed
+            && callsFeatureEnabled
+            && !communicationSurfacesConcealed
+    }
+}
+
+/// A generation-scoped latch for CallKit work that can arrive before `AppModel` has recovered its
+/// exact account/session lease. Unlike waiting on the whole restore task, `.ready` releases callers
+/// immediately even if the foreground biometric prompt is still suspended. Resetting for a new
+/// account epoch supersedes every old waiter so no prior resolution can authorize the next session.
+actor ProtectedCallRecoveryLatch {
+    enum Resolution: Equatable, Sendable {
+        case ready
+        case unavailable
+        case superseded
+    }
+
+    struct Ticket: Equatable, Sendable {
+        static let initial = Ticket(generation: 0)
+
+        let generation: UInt64
+    }
+
+    struct ResetResult: Equatable, Sendable {
+        let ticket: Ticket
+        let accepted: Bool
+    }
+
+    private var generation: UInt64 = 0
+    private var latestResetSequence: UInt64 = 0
+    private var resolution: Resolution?
+    private var waiters: [CheckedContinuation<Resolution, Never>] = []
+
+    func wait(for ticket: Ticket) async -> Resolution {
+        guard ticket.generation == generation else { return .superseded }
+        if let resolution { return resolution }
+        return await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    @discardableResult
+    func resolve(_ resolution: Resolution, for ticket: Ticket) -> Bool {
+        guard resolution != .superseded,
+              ticket.generation == generation
+        else { return false }
+        if self.resolution == resolution { return true }
+        guard self.resolution == nil else { return false }
+        self.resolution = resolution
+        let pending = waiters
+        waiters.removeAll()
+        pending.forEach { $0.resume(returning: resolution) }
+        return true
+    }
+
+    func reset(requestSequence: UInt64) -> ResetResult {
+        guard requestSequence > latestResetSequence else {
+            return ResetResult(ticket: Ticket(generation: generation), accepted: false)
+        }
+        latestResetSequence = requestSequence
+        let superseded = waiters
+        waiters.removeAll()
+        resolution = nil
+        generation &+= 1
+        superseded.forEach { $0.resume(returning: .superseded) }
+        return ResetResult(ticket: Ticket(generation: generation), accepted: true)
+    }
+
+    func pendingWaiterCount() -> Int { waiters.count }
+}
+
+/// Tracks an Answer intent received while CallKit still shows the generic, pre-verification call.
+/// The gate carries no caller identity or media authority. It can be consumed only after the exact
+/// call has been authenticated in the same admission generation. Initial cold-launch recovery may
+/// rebind an unowned intent; every later owner/generation transition invalidates it.
+struct DeferredCallKitAnswerGate: Sendable {
+    private(set) var admissionGenerations: [UUID: UInt64] = [:]
+
+    mutating func retain(
+        callUUID: UUID,
+        admissionGeneration: UInt64?,
+        currentGeneration: UInt64
+    ) -> Bool {
+        guard admissionGeneration == currentGeneration,
+              admissionGenerations.isEmpty
+        else { return false }
+        admissionGenerations[callUUID] = currentGeneration
+        return true
+    }
+
+    /// Returns the intents that must be failed. A nil previous owner is the one cold-launch state
+    /// whose generic intents can be rebound; an authenticated prior owner always invalidates them,
+    /// including a same-owner recovery, so no action silently crosses an account generation.
+    mutating func rebindForInitialOwnershipRecovery(
+        previousOwnerFingerprint: String?,
+        quarantinedCallUUIDs: Set<UUID>,
+        newGeneration: UInt64
+    ) -> Set<UUID> {
+        let pending = Set(admissionGenerations.keys)
+        guard previousOwnerFingerprint == nil else {
+            admissionGenerations.removeAll()
+            return pending
+        }
+
+        let invalidated = pending.subtracting(quarantinedCallUUIDs)
+        invalidated.forEach { admissionGenerations.removeValue(forKey: $0) }
+        for callUUID in pending.intersection(quarantinedCallUUIDs) {
+            admissionGenerations[callUUID] = newGeneration
+        }
+        return invalidated
+    }
+
+    mutating func consumeAuthenticated(
+        callUUID: UUID,
+        admissionGeneration: UInt64?,
+        currentGeneration: UInt64
+    ) -> Bool {
+        guard let retainedGeneration = admissionGenerations.removeValue(forKey: callUUID),
+              retainedGeneration == currentGeneration,
+              admissionGeneration == currentGeneration
+        else { return false }
+        return true
+    }
+
+    @discardableResult
+    mutating func remove(callUUID: UUID) -> Bool {
+        admissionGenerations.removeValue(forKey: callUUID) != nil
+    }
+
+    mutating func invalidateAll() -> Set<UUID> {
+        let invalidated = Set(admissionGenerations.keys)
+        admissionGenerations.removeAll()
+        return invalidated
+    }
+}
+
 struct IncomingCallNotice: Equatable, Sendable {
     let eventId: UUID
     let call: AuthenticatedIncomingCall

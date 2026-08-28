@@ -1753,6 +1753,10 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
     /// the exact active call. It cannot publish until `admit` establishes caller authority, and it
     /// is discarded rather than retargeted if that active room changes first.
     private var pendingAuthenticatedMergeIntents: [UUID: UUID] = [:]
+    /// Retains only the system Answer action while an opaque PushKit call is being authenticated.
+    /// Caller identity, media credentials, and backend authority remain absent until promotion.
+    private var deferredPrimaryAnswerGate = DeferredCallKitAnswerGate()
+    private var deferredPrimaryAnswerActions: [UUID: CXAnswerCallAction] = [:]
     /// Fences CallKit audio callbacks that were queued before a later deactivate, reset, or account
     /// transition. The expected-active bit prevents an older activation task from winning last.
     private var callKitAudioTransitionGeneration: UInt64 = 0
@@ -1787,11 +1791,30 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
         callProvider.setDelegate(self, queue: .main)
     }
 
-    private func invalidateCallActionOwnership() {
+    private func invalidateCallActionOwnership(
+        includingDeferredPrimaryAnswers: Bool = true
+    ) {
         explicitlyRequestedEndCallUUIDs.removeAll(keepingCapacity: true)
         waitingCallMergeUUIDs.removeAll(keepingCapacity: true)
         callKitAnswerMergeOwners.removeAll(keepingCapacity: true)
         pendingAuthenticatedMergeIntents.removeAll(keepingCapacity: true)
+        if includingDeferredPrimaryAnswers {
+            failDeferredPrimaryAnswers(
+                deferredPrimaryAnswerGate.invalidateAll()
+                    .union(deferredPrimaryAnswerActions.keys)
+            )
+        }
+    }
+
+    private func failDeferredPrimaryAnswers(_ callUUIDs: Set<UUID>) {
+        for callUUID in callUUIDs {
+            deferredPrimaryAnswerActions.removeValue(forKey: callUUID)?.fail()
+        }
+    }
+
+    private func failDeferredPrimaryAnswer(for callUUID: UUID) {
+        deferredPrimaryAnswerGate.remove(callUUID: callUUID)
+        deferredPrimaryAnswerActions.removeValue(forKey: callUUID)?.fail()
     }
 
     private func invalidateCallKitAudio(resetSounds: Bool) {
@@ -1885,7 +1908,14 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
                 recoveredOwnerFingerprint: recoveredFingerprint
             )
         callRegistryGeneration &+= 1
-        invalidateCallActionOwnership()
+        invalidateCallActionOwnership(includingDeferredPrimaryAnswers: false)
+        failDeferredPrimaryAnswers(
+            deferredPrimaryAnswerGate.rebindForInitialOwnershipRecovery(
+                previousOwnerFingerprint: previousOwner,
+                quarantinedCallUUIDs: Set(quarantinedIncomingCalls.keys),
+                newGeneration: callRegistryGeneration
+            )
+        )
         privacyQuarantineActive = false
         registrationEnabled = true
         communicationOwnerFingerprint = recoveredFingerprint
@@ -2451,6 +2481,7 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
     private func clearCall(_ callUUID: UUID) {
         let callID = backendCallIds[callUUID] ?? callUUID.uuidString.lowercased()
         callSounds.callEnded(callID: callID)
+        failDeferredPrimaryAnswer(for: callUUID)
         explicitlyRequestedEndCallUUIDs.remove(callUUID)
         let authenticatedDependents = callKitAnswerMergeOwners.compactMap {
             waitingCallUUID, activeCallUUID in
@@ -2603,6 +2634,20 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
               incoming.record.id == request.push.callId,
               incoming.ringExpiryDate > Date()
         else { return false }
+        let deferredAnswer: CXAnswerCallAction?
+        if deferredPrimaryAnswerActions[incoming.callUUID] != nil,
+           deferredPrimaryAnswerGate.consumeAuthenticated(
+               callUUID: incoming.callUUID,
+               admissionGeneration: callAdmissionGenerations[incoming.callUUID],
+               currentGeneration: callRegistryGeneration
+           ) {
+            deferredAnswer = deferredPrimaryAnswerActions.removeValue(
+                forKey: incoming.callUUID
+            )
+        } else {
+            deferredAnswer = nil
+            failDeferredPrimaryAnswer(for: incoming.callUUID)
+        }
         quarantineExpiryTasks.removeValue(forKey: incoming.callUUID)?.cancel()
         quarantinedIncomingCalls.removeValue(forKey: incoming.callUUID)
         callProvider.reportCall(
@@ -2610,6 +2655,9 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
             updated: callUpdate(for: incoming)
         )
         admit(incoming)
+        if let deferredAnswer {
+            performAnswerCallAction(deferredAnswer)
+        }
         return true
     }
 
@@ -3152,6 +3200,20 @@ extension NotificationCoordinator: CXProviderDelegate {
 
     @MainActor
     private func performAnswerCallAction(_ action: CXAnswerCallAction) {
+        if quarantinedIncomingCalls[action.callUUID] != nil,
+           callAdmissionGenerations[action.callUUID] == callRegistryGeneration,
+           connectedActiveMediaCallUUID() == nil {
+            guard deferredPrimaryAnswerGate.retain(
+                callUUID: action.callUUID,
+                admissionGeneration: callAdmissionGenerations[action.callUUID],
+                currentGeneration: callRegistryGeneration
+            ) else {
+                action.fail()
+                return
+            }
+            deferredPrimaryAnswerActions[action.callUUID] = action
+            return
+        }
         guard registrationEnabled, !privacyQuarantineActive else {
             action.fail()
             return
@@ -3233,6 +3295,18 @@ extension NotificationCoordinator: CXProviderDelegate {
                 )
             ))
         )
+    }
+
+    func provider(_ provider: CXProvider, timedOutPerforming action: CXAction) {
+        Task { @MainActor [weak self] in
+            if let answer = action as? CXAnswerCallAction,
+               let retained = self?.deferredPrimaryAnswerActions[answer.callUUID],
+               retained === answer {
+                self?.deferredPrimaryAnswerGate.remove(callUUID: answer.callUUID)
+                self?.deferredPrimaryAnswerActions.removeValue(forKey: answer.callUUID)
+            }
+            action.fail()
+        }
     }
 
     func provider(_ provider: CXProvider, perform action: CXEndCallAction) {

@@ -781,6 +781,9 @@ final class AppModel: ObservableObject {
     /// rather than a repeated fetch on every publish.
     private var warmedOwnAvatarURL: String?
     private var callEventDrainTask: Task<Void, Never>?
+    private let protectedCallRecoveryLatch = ProtectedCallRecoveryLatch()
+    private var protectedCallRecoveryTicket = ProtectedCallRecoveryLatch.Ticket.initial
+    private var protectedCallRecoveryResetSequence: UInt64 = 0
     private var callHistoryRefreshTask: Task<Void, Never>?
     private var callHistoryRefreshGeneration: UInt64 = 0
     private var callHistoryBackfillTask: Task<Void, Never>?
@@ -1376,11 +1379,29 @@ final class AppModel: ObservableObject {
             return
         }
         queuedCallEvents.append(event)
+        startCallEventDrainIfNeeded()
+    }
+
+    private func startCallEventDrainIfNeeded() {
         guard callEventDrainTask == nil else { return }
+        let recoveryTicket = protectedCallRecoveryTicket
+        let recoveryAccountEpoch = accountEpoch
         callEventDrainTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            if let restoreTask = self.restoreTask { await restoreTask.value }
-            while !Task.isCancelled, !self.queuedCallEvents.isEmpty {
+            defer {
+                if self.protectedCallRecoveryTicket == recoveryTicket,
+                   self.accountEpoch == recoveryAccountEpoch {
+                    self.callEventDrainTask = nil
+                }
+            }
+            guard await self.awaitProtectedCallRecovery(
+                ticket: recoveryTicket,
+                accountEpoch: recoveryAccountEpoch
+            ) else { return }
+            while !Task.isCancelled,
+                  self.protectedCallRecoveryTicket == recoveryTicket,
+                  self.accountEpoch == recoveryAccountEpoch,
+                  !self.queuedCallEvents.isEmpty {
                 let event = self.queuedCallEvents.removeFirst()
                 guard !self.acceptedAccountDeletionCleanupBlocked,
                       !self.protectedLocalStateRecoveryBlocked,
@@ -1399,16 +1420,29 @@ final class AppModel: ObservableObject {
                 }
                 NotificationCoordinator.shared.acknowledgeCallEvent(event.id)
             }
-            self.callEventDrainTask = nil
         }
     }
 
     private func startCallSystemEventDrainIfNeeded() {
         guard callSystemEventDrainTask == nil else { return }
+        let recoveryTicket = protectedCallRecoveryTicket
+        let recoveryAccountEpoch = accountEpoch
         callSystemEventDrainTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            if let restoreTask = self.restoreTask { await restoreTask.value }
-            while !Task.isCancelled, !self.queuedCallSystemActions.isEmpty {
+            defer {
+                if self.protectedCallRecoveryTicket == recoveryTicket,
+                   self.accountEpoch == recoveryAccountEpoch {
+                    self.callSystemEventDrainTask = nil
+                }
+            }
+            guard await self.awaitProtectedCallRecovery(
+                ticket: recoveryTicket,
+                accountEpoch: recoveryAccountEpoch
+            ) else { return }
+            while !Task.isCancelled,
+                  self.protectedCallRecoveryTicket == recoveryTicket,
+                  self.accountEpoch == recoveryAccountEpoch,
+                  !self.queuedCallSystemActions.isEmpty {
                 let action = self.queuedCallSystemActions.removeFirst()
                 if self.isSubmittingAccountDeletion
                     || self.acceptedAccountDeletionCleanupBlocked
@@ -1420,7 +1454,53 @@ final class AppModel: ObservableObject {
                 }
                 NotificationCoordinator.shared.acknowledgeCallEvent(action.eventId)
             }
-            self.callSystemEventDrainTask = nil
+        }
+    }
+
+    private func awaitProtectedCallRecovery(
+        ticket: ProtectedCallRecoveryLatch.Ticket,
+        accountEpoch expectedAccountEpoch: UUID
+    ) async -> Bool {
+        let expectedSession = await sessions.current()
+        guard !Task.isCancelled,
+              protectedCallRecoveryTicket == ticket,
+              accountEpoch == expectedAccountEpoch
+        else { return false }
+
+        let resolution = await protectedCallRecoveryLatch.wait(for: ticket)
+        guard !Task.isCancelled,
+              resolution != .superseded,
+              protectedCallRecoveryTicket == ticket,
+              accountEpoch == expectedAccountEpoch
+        else { return false }
+
+        let currentSession = await sessions.current()
+        guard !Task.isCancelled,
+              protectedCallRecoveryTicket == ticket,
+              accountEpoch == expectedAccountEpoch
+        else { return false }
+
+        switch resolution {
+        case .ready:
+            guard let currentSession,
+                  let expectedUserID = currentSession.accountId,
+                  let lease = callMediaAccountLease,
+                  lease.accountEpoch == expectedAccountEpoch,
+                  lease.userID.caseInsensitiveCompare(expectedUserID) == .orderedSame,
+                  lease.sessionID.caseInsensitiveCompare(currentSession.sessionId) == .orderedSame
+            else { return false }
+            if let expectedSession,
+               !SessionAccountBindingPolicy.identifiesSameAccountSession(
+                   expectedSession,
+                   currentSession
+               ) {
+                return false
+            }
+            return true
+        case .unavailable:
+            return false
+        case .superseded:
+            return false
         }
     }
 
@@ -1966,6 +2046,7 @@ final class AppModel: ObservableObject {
 
     func retryProtectedLocalStateRecovery() async {
         guard protectedLocalStateRecoveryBlocked else { return }
+        guard await resetProtectedCallRecoveryCycle(retiringQueuedEvents: false) else { return }
         await restore()
     }
 
@@ -1974,7 +2055,88 @@ final class AppModel: ObservableObject {
         lastError = nil
         isLoading = true
         guard await resumeAcceptedAccountDeletionCleanupBeforeRestore() else { return }
+        guard await resetProtectedCallRecoveryCycle(retiringQueuedEvents: true) else { return }
         await restore()
+    }
+
+    @discardableResult
+    private func resetProtectedCallRecoveryCycle(
+        retiringQueuedEvents: Bool
+    ) async -> Bool {
+        guard protectedCallRecoveryResetSequence < UInt64.max else { return false }
+        protectedCallRecoveryResetSequence += 1
+        let resetSequence = protectedCallRecoveryResetSequence
+        callEventDrainTask?.cancel()
+        callEventDrainTask = nil
+        callSystemEventDrainTask?.cancel()
+        callSystemEventDrainTask = nil
+        if retiringQueuedEvents {
+            for event in queuedCallEvents {
+                NotificationCoordinator.shared.acknowledgeCallEvent(event.id)
+            }
+            for action in queuedCallSystemActions {
+                NotificationCoordinator.shared.acknowledgeCallEvent(action.eventId)
+            }
+            queuedCallEvents.removeAll()
+            queuedCallSystemActions.removeAll()
+        }
+        let reset = await protectedCallRecoveryLatch.reset(requestSequence: resetSequence)
+        guard protectedCallRecoveryResetSequence == resetSequence,
+              reset.accepted
+        else { return false }
+        protectedCallRecoveryTicket = reset.ticket
+        if !retiringQueuedEvents {
+            if !queuedCallEvents.isEmpty { startCallEventDrainIfNeeded() }
+            if !queuedCallSystemActions.isEmpty { startCallSystemEventDrainIfNeeded() }
+        }
+        return true
+    }
+
+    private func releaseProtectedCallRecovery(
+        ticket: ProtectedCallRecoveryLatch.Ticket,
+        lease: CallMediaAccountLease
+    ) async -> Bool {
+        guard protectedCallRecoveryTicket == ticket,
+              callMediaAccountLease == lease,
+              await outboxContextIsCurrent(
+                  accountEpoch: lease.accountEpoch,
+                  userID: lease.userID,
+                  sessionID: lease.sessionID
+              )
+        else { return false }
+        var readyTicket = ticket
+        let existingCycleBecameReady = await protectedCallRecoveryLatch.resolve(
+            .ready,
+            for: readyTicket
+        )
+        if !existingCycleBecameReady {
+            guard protectedCallRecoveryTicket == readyTicket,
+                  callMediaAccountLease == lease,
+                  await outboxContextIsCurrent(
+                      accountEpoch: lease.accountEpoch,
+                      userID: lease.userID,
+                      sessionID: lease.sessionID
+                  )
+            else { return false }
+            guard await resetProtectedCallRecoveryCycle(retiringQueuedEvents: false) else {
+                return false
+            }
+            readyTicket = protectedCallRecoveryTicket
+            guard await protectedCallRecoveryLatch.resolve(.ready, for: readyTicket) else {
+                return false
+            }
+        }
+        guard protectedCallRecoveryTicket == readyTicket,
+              callMediaAccountLease == lease,
+              await outboxContextIsCurrent(
+                  accountEpoch: lease.accountEpoch,
+                  userID: lease.userID,
+                  sessionID: lease.sessionID
+              )
+        else { return false }
+        if !queuedCallEvents.isEmpty { startCallEventDrainIfNeeded() }
+        if !queuedCallSystemActions.isEmpty { startCallSystemEventDrainIfNeeded() }
+        return true
     }
 
     /// Finishes one exact accepted-deletion target without touching a replacement account or a
@@ -2060,6 +2222,21 @@ final class AppModel: ObservableObject {
     }
 
     func restore() async {
+        let recoveryLatch = protectedCallRecoveryLatch
+        let recoveryTicket = protectedCallRecoveryTicket
+        let recoveryAccountEpoch = accountEpoch
+        var recoverySessionID: String?
+        defer {
+            let hasExactLease = recoverySessionID.map { expectedSessionID in
+                callMediaAccountLease?.accountEpoch == recoveryAccountEpoch
+                    && callMediaAccountLease?.sessionID.caseInsensitiveCompare(expectedSessionID)
+                        == .orderedSame
+            } ?? false
+            let resolution: ProtectedCallRecoveryLatch.Resolution = hasExactLease
+                ? .ready
+                : .unavailable
+            Task { await recoveryLatch.resolve(resolution, for: recoveryTicket) }
+        }
         guard await resumeAcceptedAccountDeletionCleanupBeforeRestore() else { return }
         let restorationAccountEpoch = accountEpoch
         var restoredState = await store.snapshot()
@@ -2086,6 +2263,7 @@ final class AppModel: ObservableObject {
             restoredState = migratedState
         }
         var restoredSession = await sessions.current()
+        recoverySessionID = restoredSession?.sessionId
         if let session = restoredSession, session.accountId == nil {
             let expectedProjection = await store.snapshot()
             let expectedProfileID = expectedProjection.profile?.id
@@ -2343,6 +2521,10 @@ final class AppModel: ObservableObject {
                 isLoading = false
                 return
             }
+            await prepareProtectedCallRecoveryIfPermitted(
+                context: restorationContext,
+                recoveryTicket: recoveryTicket
+            )
             if accountSetupStep == nil, biometricUnlockEnabled {
                 biometricAccessState = .locked
                 homeBiometricState = .locked
@@ -2867,6 +3049,9 @@ final class AppModel: ObservableObject {
         stopVisibleConversationSync()
         pendingDeepLink = nil
         accountEpoch = UUID()
+        guard await resetProtectedCallRecoveryCycle(retiringQueuedEvents: true) else {
+            throw AuthUIError.staleResponse
+        }
         paymentRequestChatShareLeases.removeAll()
         resetCommunicationPrivacyState()
         resetSecurityPreferencesState()
@@ -3840,6 +4025,9 @@ final class AppModel: ObservableObject {
         // user-initiated and silent avatar work unwind before credentials or encrypted state
         // are cleared.
         accountEpoch = UUID()
+        guard await resetProtectedCallRecoveryCycle(retiringQueuedEvents: true) else {
+            return .contextChanged
+        }
         capabilitiesRequestTracker.invalidate()
         authenticatedAppReviewDemoOwnerID = nil
         capabilities = nil
@@ -5484,6 +5672,23 @@ final class AppModel: ObservableObject {
         }
         privacyQuarantineTargetAccountID = nil
         if didResumeAuthenticatedSession {
+            let recoveryTicket = protectedCallRecoveryTicket
+            guard let lease = callMediaAccountLease,
+                  lease.accountEpoch == expectedAccountEpoch,
+                  lease.userID.caseInsensitiveCompare(expectedUserID) == .orderedSame,
+                  lease.sessionID.caseInsensitiveCompare(expectedSessionID) == .orderedSame,
+                  await releaseProtectedCallRecovery(ticket: recoveryTicket, lease: lease),
+                  callMediaAccountLease == lease,
+                  await outboxContextIsCurrent(
+                      accountEpoch: expectedAccountEpoch,
+                      userID: expectedUserID,
+                      sessionID: expectedSessionID
+                  )
+            else {
+                didResumeAuthenticatedSession = false
+                isLoading = false
+                return
+            }
             NotificationCoordinator.shared.resumeRegistration(
                 afterOwnershipRecoveryFor: expectedUserID
             )
@@ -5516,6 +5721,19 @@ final class AppModel: ObservableObject {
             sessionID: expectedSessionID
         ) else { return }
         guard appReviewDemoMutationsAllowed, capabilities != nil else {
+            didResumeAuthenticatedSession = false
+            isLoading = false
+            return
+        }
+        let recoveryTicket = protectedCallRecoveryTicket
+        guard await releaseProtectedCallRecovery(ticket: recoveryTicket, lease: lease),
+              callMediaAccountLease == lease,
+              await outboxContextIsCurrent(
+                  accountEpoch: expectedAccountEpoch,
+                  userID: expectedUserID,
+                  sessionID: expectedSessionID
+              )
+        else {
             didResumeAuthenticatedSession = false
             isLoading = false
             return
@@ -5555,6 +5773,59 @@ final class AppModel: ObservableObject {
             await self?.checkForRestorableBackup()
             await self?.runAutomaticMessageBackupIfDue()
         }
+    }
+
+    /// Restores the exact account/session call lease before the app-owned interface asks for
+    /// biometric unlock. This is deliberately narrower than full session resume: it lets PushKit
+    /// authenticate and CallKit answer a Lock Screen call, but does not unlock wallet, messaging,
+    /// outbox, or foreground UI state.
+    private func prepareProtectedCallRecoveryIfPermitted(
+        context: AuthenticatedSecurityContext,
+        recoveryTicket: ProtectedCallRecoveryLatch.Ticket
+    ) async {
+        guard ProtectedCallRecoveryPolicy.permits(
+            isSignedIn: isSignedIn,
+            isSigningOut: isSigningOut,
+            accountSetupComplete: accountSetupStep == nil,
+            sessionGrantsFullAccess: sessionAssurance?.grantsFullAccess == true,
+            hasAuthenticatedCapabilities: capabilities != nil,
+            accountMutationsAllowed: appReviewDemoMutationsAllowed,
+            callsFeatureEnabled: callsFeatureEnabled,
+            communicationSurfacesConcealed: communicationSurfacesConcealed,
+            localInterfaceRequiresBiometricUnlock: requiresBiometricSignIn
+        ), accountEpoch == context.accountEpoch,
+           profile?.id.caseInsensitiveCompare(context.userID) == .orderedSame,
+           let currentSession = await sessions.current(),
+           currentSession.sessionId.caseInsensitiveCompare(context.sessionID) == .orderedSame,
+           currentSession.accountId?.caseInsensitiveCompare(context.userID) == .orderedSame,
+           await outboxContextIsCurrent(
+               accountEpoch: context.accountEpoch,
+               userID: context.userID,
+               sessionID: context.sessionID
+           )
+        else { return }
+
+        let lease = CallMediaAccountLease(
+            accountEpoch: context.accountEpoch,
+            userID: context.userID,
+            sessionID: context.sessionID
+        )
+        guard callMediaAccountLease == nil || callMediaAccountLease == lease,
+              CallMediaCoordinator.shared.activateAccountLease(lease)
+        else { return }
+        callMediaAccountLease = lease
+        guard await releaseProtectedCallRecovery(ticket: recoveryTicket, lease: lease),
+              callMediaAccountLease == lease,
+              await outboxContextIsCurrent(
+                  accountEpoch: context.accountEpoch,
+                  userID: context.userID,
+                  sessionID: context.sessionID
+              )
+        else { return }
+        NotificationCoordinator.shared.resumeRegistration(
+            afterOwnershipRecoveryFor: context.userID
+        )
+        NotificationCoordinator.shared.replayCurrentPushTokens()
     }
 
     private func unregisterApplePushProvidersBeforeSignOut(sessionID: String) async {

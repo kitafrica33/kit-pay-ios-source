@@ -2002,6 +2002,263 @@ final class CallLifecycleTests: XCTestCase {
         ))
     }
 
+    func testProtectedCallRecoveryPermitsBiometricLockedColdLaunchOnlyAfterAccountProof() {
+        func permits(
+            isSignedIn: Bool = true,
+            isSigningOut: Bool = false,
+            accountSetupComplete: Bool = true,
+            sessionGrantsFullAccess: Bool = true,
+            hasAuthenticatedCapabilities: Bool = true,
+            accountMutationsAllowed: Bool = true,
+            callsFeatureEnabled: Bool = true,
+            communicationSurfacesConcealed: Bool = false,
+            localInterfaceRequiresBiometricUnlock: Bool = true
+        ) -> Bool {
+            ProtectedCallRecoveryPolicy.permits(
+                isSignedIn: isSignedIn,
+                isSigningOut: isSigningOut,
+                accountSetupComplete: accountSetupComplete,
+                sessionGrantsFullAccess: sessionGrantsFullAccess,
+                hasAuthenticatedCapabilities: hasAuthenticatedCapabilities,
+                accountMutationsAllowed: accountMutationsAllowed,
+                callsFeatureEnabled: callsFeatureEnabled,
+                communicationSurfacesConcealed: communicationSurfacesConcealed,
+                localInterfaceRequiresBiometricUnlock: localInterfaceRequiresBiometricUnlock
+            )
+        }
+
+        XCTAssertTrue(permits(localInterfaceRequiresBiometricUnlock: true))
+        XCTAssertTrue(permits(localInterfaceRequiresBiometricUnlock: false))
+        XCTAssertFalse(permits(isSignedIn: false))
+        XCTAssertFalse(permits(isSigningOut: true))
+        XCTAssertFalse(permits(accountSetupComplete: false))
+        XCTAssertFalse(permits(sessionGrantsFullAccess: false))
+        XCTAssertFalse(permits(hasAuthenticatedCapabilities: false))
+        XCTAssertFalse(permits(accountMutationsAllowed: false))
+        XCTAssertFalse(permits(callsFeatureEnabled: false))
+        XCTAssertFalse(permits(communicationSurfacesConcealed: true))
+    }
+
+    func testProtectedCallRecoveryReleasesQueuedEventBeforeRestoreCompletes() async {
+        let latch = ProtectedCallRecoveryLatch()
+        let ticket = ProtectedCallRecoveryLatch.Ticket.initial
+        let queuedEvent = Task { await latch.wait(for: ticket) }
+
+        for _ in 0..<100 {
+            if await latch.pendingWaiterCount() > 0 { break }
+            await Task.yield()
+        }
+        let waitingBeforeRecovery = await latch.pendingWaiterCount()
+        XCTAssertEqual(waitingBeforeRecovery, 1)
+
+        // This models the exact account/session lease becoming ready while the separate
+        // foreground biometric restore remains suspended.
+        let didResolve = await latch.resolve(.ready, for: ticket)
+        let resolution = await queuedEvent.value
+        let waitingAfterRecovery = await latch.pendingWaiterCount()
+        XCTAssertTrue(didResolve)
+        XCTAssertEqual(resolution, .ready)
+        XCTAssertEqual(waitingAfterRecovery, 0)
+    }
+
+    func testProtectedCallRecoveryResetSupersedesOldCycleAndWaitsForNewOne() async {
+        let latch = ProtectedCallRecoveryLatch()
+        let firstTicket = ProtectedCallRecoveryLatch.Ticket.initial
+        let oldQueuedEvent = Task { await latch.wait(for: firstTicket) }
+
+        for _ in 0..<100 {
+            if await latch.pendingWaiterCount() > 0 { break }
+            await Task.yield()
+        }
+        let firstCycleWaiterCount = await latch.pendingWaiterCount()
+        XCTAssertEqual(firstCycleWaiterCount, 1)
+
+        let secondReset = await latch.reset(requestSequence: 1)
+        XCTAssertTrue(secondReset.accepted)
+        let secondTicket = secondReset.ticket
+        XCTAssertNotEqual(secondTicket, firstTicket)
+        let oldResolution = await oldQueuedEvent.value
+        let staleResolveSucceeded = await latch.resolve(.ready, for: firstTicket)
+        XCTAssertEqual(oldResolution, .superseded)
+        XCTAssertFalse(staleResolveSucceeded)
+
+        let newQueuedEvent = Task { await latch.wait(for: secondTicket) }
+        for _ in 0..<100 {
+            if await latch.pendingWaiterCount() > 0 { break }
+            await Task.yield()
+        }
+        let secondCycleWaiterCount = await latch.pendingWaiterCount()
+        let secondResolveSucceeded = await latch.resolve(.ready, for: secondTicket)
+        let newResolution = await newQueuedEvent.value
+        let finalWaiterCount = await latch.pendingWaiterCount()
+        XCTAssertEqual(secondCycleWaiterCount, 1)
+        XCTAssertTrue(secondResolveSucceeded)
+        XCTAssertEqual(newResolution, .ready)
+        XCTAssertEqual(finalWaiterCount, 0)
+    }
+
+    func testProtectedCallRecoveryRequiresNewCycleAfterUnavailableResolution() async {
+        let latch = ProtectedCallRecoveryLatch()
+        let unavailableTicket = ProtectedCallRecoveryLatch.Ticket.initial
+
+        let unavailableSucceeded = await latch.resolve(.unavailable, for: unavailableTicket)
+        let unavailable = await latch.wait(for: unavailableTicket)
+        let staleReadySucceeded = await latch.resolve(.ready, for: unavailableTicket)
+        let readyReset = await latch.reset(requestSequence: 1)
+        XCTAssertTrue(readyReset.accepted)
+        let readyTicket = readyReset.ticket
+        let readySucceeded = await latch.resolve(.ready, for: readyTicket)
+        let ready = await latch.wait(for: readyTicket)
+
+        XCTAssertTrue(unavailableSucceeded)
+        XCTAssertEqual(unavailable, .unavailable)
+        XCTAssertFalse(staleReadySucceeded)
+        XCTAssertTrue(readySucceeded)
+        XCTAssertEqual(ready, .ready)
+    }
+
+    func testProtectedCallRecoveryRejectsResetThatReachesActorOutOfOrder() async {
+        let latch = ProtectedCallRecoveryLatch()
+
+        // MainActor callers allocate these sequences synchronously before either actor hop. This
+        // deliberately delivers the newer request first, modeling the older task being delayed.
+        let newerReset = await latch.reset(requestSequence: 2)
+        XCTAssertTrue(newerReset.accepted)
+        let queuedEvent = Task { await latch.wait(for: newerReset.ticket) }
+        for _ in 0..<100 {
+            if await latch.pendingWaiterCount() > 0 { break }
+            await Task.yield()
+        }
+        let waiterCountBeforeDelayedReset = await latch.pendingWaiterCount()
+        XCTAssertEqual(waiterCountBeforeDelayedReset, 1)
+
+        let delayedOlderReset = await latch.reset(requestSequence: 1)
+        XCTAssertFalse(delayedOlderReset.accepted)
+        XCTAssertEqual(delayedOlderReset.ticket, newerReset.ticket)
+        let waiterCountAfterDelayedReset = await latch.pendingWaiterCount()
+        XCTAssertEqual(waiterCountAfterDelayedReset, 1)
+
+        let didResolve = await latch.resolve(.ready, for: newerReset.ticket)
+        let resolution = await queuedEvent.value
+        XCTAssertTrue(didResolve)
+        XCTAssertEqual(resolution, .ready)
+
+        let followingReset = await latch.reset(requestSequence: 3)
+        XCTAssertTrue(followingReset.accepted)
+        XCTAssertEqual(
+            followingReset.ticket.generation,
+            newerReset.ticket.generation + 1,
+            "The rejected stale request must not advance the latch generation"
+        )
+    }
+
+    func testDeferredCallKitAnswerSurvivesOnlyInitialColdLaunchOwnershipRecovery() {
+        let callUUID = UUID(uuidString: "550e8400-e29b-41d4-a716-446655440020")!
+        let competingCallUUID = UUID(uuidString: "550e8400-e29b-41d4-a716-446655440025")!
+        var gate = DeferredCallKitAnswerGate()
+
+        XCTAssertTrue(gate.retain(
+            callUUID: callUUID,
+            admissionGeneration: 4,
+            currentGeneration: 4
+        ))
+        XCTAssertFalse(gate.retain(
+            callUUID: callUUID,
+            admissionGeneration: 4,
+            currentGeneration: 4
+        ), "Only one system Answer action may wait on a generic call")
+        XCTAssertFalse(gate.retain(
+            callUUID: competingCallUUID,
+            admissionGeneration: 4,
+            currentGeneration: 4
+        ), "A second generic call must not gain a concurrent primary Answer intent")
+        XCTAssertEqual(
+            gate.rebindForInitialOwnershipRecovery(
+                previousOwnerFingerprint: nil,
+                quarantinedCallUUIDs: [callUUID],
+                newGeneration: 5
+            ),
+            []
+        )
+        XCTAssertTrue(gate.consumeAuthenticated(
+            callUUID: callUUID,
+            admissionGeneration: 5,
+            currentGeneration: 5
+        ))
+        XCTAssertTrue(gate.admissionGenerations.isEmpty)
+        XCTAssertTrue(gate.retain(
+            callUUID: competingCallUUID,
+            admissionGeneration: 5,
+            currentGeneration: 5
+        ), "The next call may retain Answer after the first intent is consumed")
+    }
+
+    func testDeferredCallKitAnswerFailsAcrossReplacementAccountGeneration() {
+        let callUUID = UUID(uuidString: "550e8400-e29b-41d4-a716-446655440021")!
+        var gate = DeferredCallKitAnswerGate()
+        XCTAssertTrue(gate.retain(
+            callUUID: callUUID,
+            admissionGeneration: 8,
+            currentGeneration: 8
+        ))
+
+        XCTAssertEqual(
+            gate.rebindForInitialOwnershipRecovery(
+                previousOwnerFingerprint: "authenticated-owner-a",
+                quarantinedCallUUIDs: [callUUID],
+                newGeneration: 9
+            ),
+            [callUUID]
+        )
+        XCTAssertFalse(gate.consumeAuthenticated(
+            callUUID: callUUID,
+            admissionGeneration: 9,
+            currentGeneration: 9
+        ))
+        XCTAssertTrue(gate.admissionGenerations.isEmpty)
+    }
+
+    func testDeferredCallKitAnswerFailsOnSignOutAndTerminalRetirement() {
+        let first = UUID(uuidString: "550e8400-e29b-41d4-a716-446655440022")!
+        let second = UUID(uuidString: "550e8400-e29b-41d4-a716-446655440023")!
+        var gate = DeferredCallKitAnswerGate()
+        XCTAssertTrue(gate.retain(
+            callUUID: first,
+            admissionGeneration: 12,
+            currentGeneration: 12
+        ))
+        XCTAssertFalse(gate.retain(
+            callUUID: second,
+            admissionGeneration: 12,
+            currentGeneration: 12
+        ), "A second Answer intent cannot coexist with the primary one")
+
+        XCTAssertTrue(gate.remove(callUUID: first), "A terminal lookup retires its exact intent")
+        XCTAssertTrue(gate.retain(
+            callUUID: second,
+            admissionGeneration: 12,
+            currentGeneration: 12
+        ), "The next Answer intent may be retained after terminal retirement")
+        XCTAssertEqual(gate.invalidateAll(), [second], "Sign-out retires every remaining intent")
+        XCTAssertTrue(gate.admissionGenerations.isEmpty)
+    }
+
+    func testDeferredCallKitAnswerRejectsStaleAuthenticationGeneration() {
+        let callUUID = UUID(uuidString: "550e8400-e29b-41d4-a716-446655440024")!
+        var gate = DeferredCallKitAnswerGate()
+        XCTAssertTrue(gate.retain(
+            callUUID: callUUID,
+            admissionGeneration: 20,
+            currentGeneration: 20
+        ))
+        XCTAssertFalse(gate.consumeAuthenticated(
+            callUUID: callUUID,
+            admissionGeneration: 20,
+            currentGeneration: 21
+        ))
+        XCTAssertTrue(gate.admissionGenerations.isEmpty)
+    }
+
     func testIncomingCallLookupFailurePolicyRetiresTerminalButRetriesTransientFailures() {
         XCTAssertEqual(
             IncomingCallLookupFailurePolicy.disposition(for: APIErrorPayload(
