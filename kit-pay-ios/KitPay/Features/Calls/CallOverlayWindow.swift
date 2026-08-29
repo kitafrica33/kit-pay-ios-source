@@ -545,7 +545,8 @@ private struct CallPictureInPictureContent: View {
                 RemoteAvatarView(
                     name: call.participantName,
                     avatarURL: call.participantAvatarURL,
-                    size: 88
+                    size: 88,
+                    verification: call.participantVerification
                 )
             }
         }

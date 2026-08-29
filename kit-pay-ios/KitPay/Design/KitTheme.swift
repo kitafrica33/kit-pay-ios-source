@@ -807,7 +807,10 @@ struct RemoteAvatarView: View {
         }
         .animation(.easeOut(duration: 0.18), value: image == nil)
         .task(id: avatarURL) { await load() }
-        .accessibilityLabel("Profile photo for \(name)")
+        .accessibilityLabel(
+            verification.map { "Profile photo for \(name), \($0.accessibilityLabel)" }
+                ?? "Profile photo for \(name)"
+        )
     }
 
     private func load() async {

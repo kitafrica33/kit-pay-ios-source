@@ -1073,11 +1073,42 @@ struct MessagingConversationMemberDTO: Decodable, Equatable, Sendable {
     let name: String?
     let role: String?
     let joinedAt: String?
+    let avatarUrl: String?
+    let verification: AccountVerificationDTO?
 
     enum CodingKeys: String, CodingKey {
-        case name, role
+        case name, role, verification
         case userId = "user_id"
         case joinedAt = "joined_at"
+        case avatarUrl = "avatar_url"
+    }
+
+    init(
+        userId: String? = nil,
+        name: String? = nil,
+        role: String? = nil,
+        joinedAt: String? = nil,
+        avatarUrl: String? = nil,
+        verification: AccountVerificationDTO? = nil
+    ) {
+        self.userId = userId
+        self.name = name
+        self.role = role
+        self.joinedAt = joinedAt
+        self.avatarUrl = avatarUrl
+        self.verification = verification
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        userId = try values.decodeIfPresent(String.self, forKey: .userId)
+        name = try values.decodeIfPresent(String.self, forKey: .name)
+        role = try values.decodeIfPresent(String.self, forKey: .role)
+        joinedAt = try values.decodeIfPresent(String.self, forKey: .joinedAt)
+        // These fields are additive presentation metadata. Treat malformed values as absent so
+        // they can never grant a badge or suppress an otherwise valid encrypted conversation.
+        avatarUrl = try? values.decode(String.self, forKey: .avatarUrl)
+        verification = try? values.decode(AccountVerificationDTO.self, forKey: .verification)
     }
 }
 

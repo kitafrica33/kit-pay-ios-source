@@ -133,6 +133,14 @@ and Apple Liquid Glass.
   from unauthenticated display text. Existing
   group history becomes read-only whenever `features.messaging_groups` is absent or withdrawn;
   queued group ciphertext remains local until the gate returns, or is failed if membership ends.
+  To render first-contact identity without requiring an address-book match, each authenticated
+  conversation `members[]` row may also carry `avatar_url` and the canonical `verification`
+  object. Call payloads retain legacy `name` and `participant_user_ids` and may add
+  `participants:[{user_id,name,avatar_url,verification}]`. iOS accepts the richer call identity
+  only when its canonical, duplicate-free user IDs exactly match `participant_user_ids`; malformed
+  optional identity metadata is ignored and can never grant a badge. Older payloads continue to
+  use the synchronized contact directory. Only `verified`, `official`, and `official_support`
+  display a public verification seal; KYC status never does.
 - Collaborative group payment requests and chat-bound scheduled payments are a build-39 protocol
   boundary. The backend must emit the five
   `group_payment_request.{created,contributed,completed,cancelled,expired}`, three

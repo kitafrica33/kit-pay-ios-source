@@ -245,7 +245,12 @@ struct CommunicationPrivacyView: View {
 
     private func blockedPersonRow(_ person: CommunicationBlockedPerson) -> some View {
         HStack(spacing: 13) {
-            RemoteAvatarView(name: person.displayName, avatarURL: person.avatarURL, size: 46)
+            RemoteAvatarView(
+                name: person.displayName,
+                avatarURL: person.avatarURL,
+                size: 46,
+                verification: person.verification
+            )
             VStack(alignment: .leading, spacing: 3) {
                 Text(person.displayName)
                     .font(.body.weight(.semibold))
@@ -393,7 +398,8 @@ private struct CommunicationBlockPickerView: View {
                                 RemoteAvatarView(
                                     name: candidate.displayName,
                                     avatarURL: candidate.avatarURL,
-                                    size: 46
+                                    size: 46,
+                                    verification: candidate.verification
                                 )
                                 VStack(alignment: .leading, spacing: 3) {
                                     Text(candidate.displayName)

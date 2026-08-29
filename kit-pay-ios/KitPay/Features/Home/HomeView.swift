@@ -157,7 +157,8 @@ struct HomeView: View {
             RemoteAvatarView(
                 name: model.profile?.name ?? "Kit Pay",
                 avatarURL: model.profile?.avatarURL,
-                size: 54
+                size: 54,
+                verification: model.profile?.verification?.designation
             )
             VStack(alignment: .leading, spacing: 2) {
                 Text(greeting)

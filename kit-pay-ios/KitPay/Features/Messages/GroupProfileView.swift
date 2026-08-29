@@ -14,6 +14,8 @@ struct GroupMemberPresentation: Identifiable, Equatable {
     /// Resolved by the caller from the contact directory; nil for members whose photo this
     /// device has never been given.
     var avatarURL: String?
+    /// Server-assigned public verification, separate from identity/KYC completion.
+    var verification: AccountVerificationDesignation? = nil
     var id: String { userID }
 }
 
@@ -439,7 +441,12 @@ struct GroupProfileView: View {
 
     private func memberRow(_ member: GroupMemberPresentation) -> some View {
         HStack(spacing: 12) {
-            RemoteAvatarView(name: member.displayName, avatarURL: member.avatarURL, size: 44)
+            RemoteAvatarView(
+                name: member.displayName,
+                avatarURL: member.avatarURL,
+                size: 44,
+                verification: member.verification
+            )
             HStack(spacing: 8) {
                 Text(member.displayName)
                     .font(.headline)

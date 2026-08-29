@@ -107,8 +107,9 @@ struct CallsView: View {
         return HStack(spacing: 13) {
             RemoteAvatarView(
                 name: call.name,
-                avatarURL: model.contactAvatarURL(forUserID: recipientUserID),
-                size: 56
+                avatarURL: model.callParticipantAvatarURL(for: call),
+                size: 56,
+                verification: model.callParticipantVerification(for: call)
             )
             VStack(alignment: .leading, spacing: 5) {
                 Text(call.name)
@@ -283,7 +284,8 @@ private struct NewCallSheet: View {
             RemoteAvatarView(
                 name: contact.name,
                 avatarURL: contact.source?.avatarURL,
-                size: 42
+                size: 42,
+                verification: contact.source?.verification?.designation
             )
             VStack(alignment: .leading, spacing: 3) {
                 Text(contact.name).font(.headline)

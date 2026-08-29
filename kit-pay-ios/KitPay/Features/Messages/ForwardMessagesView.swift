@@ -34,6 +34,7 @@ private struct ForwardTargetRow: Identifiable, Equatable {
     let displayName: String
     let subtitle: String
     let avatarURL: String?
+    let verification: AccountVerificationDesignation?
     let recipientUserID: String
 }
 
@@ -203,7 +204,12 @@ struct ForwardMessagesView: View {
             toggleSelection(row.id)
         } label: {
             HStack(spacing: 12) {
-                RemoteAvatarView(name: row.displayName, avatarURL: row.avatarURL, size: 44)
+                RemoteAvatarView(
+                    name: row.displayName,
+                    avatarURL: row.avatarURL,
+                    size: 44,
+                    verification: row.verification
+                )
                 VStack(alignment: .leading, spacing: 3) {
                     Text(row.displayName)
                         .font(.headline)
@@ -453,6 +459,7 @@ struct ForwardMessagesView: View {
                     displayName: presentation.displayName,
                     subtitle: presentation.contact?.phone.forwardingNilIfBlank ?? "Chat on Kit Pay",
                     avatarURL: presentation.avatarURL,
+                    verification: presentation.contact?.verification?.designation,
                     recipientUserID: recipientUserID
                 )
             )
@@ -480,6 +487,7 @@ struct ForwardMessagesView: View {
                     displayName: contact.name,
                     subtitle: contact.phone.forwardingNilIfBlank ?? "Kit Pay member",
                     avatarURL: contact.avatarURL,
+                    verification: contact.verification?.designation,
                     recipientUserID: recipientUserID
                 )
             )

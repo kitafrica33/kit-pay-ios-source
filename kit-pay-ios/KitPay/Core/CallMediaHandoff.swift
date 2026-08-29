@@ -15,6 +15,7 @@ struct CallMediaHandoff: Sendable {
     let conversationId: String?
     let participantName: String
     let participantAvatarURL: String?
+    let participantVerification: AccountVerificationDesignation?
     let direction: String
     let video: Bool
     let url: URL
@@ -28,11 +29,16 @@ struct CallMediaHandoff: Sendable {
     let answeredAt: String?
     let serverTime: String?
 
-    init(session: CallSessionDTO, participantAvatarURL: String? = nil) throws {
+    init(
+        session: CallSessionDTO,
+        participantAvatarURL: String? = nil,
+        participantVerification: AccountVerificationDesignation? = nil
+    ) throws {
         try self.init(
             call: session.call,
             rtc: session.rtc,
             participantAvatarURL: participantAvatarURL,
+            participantVerification: participantVerification,
             serverTime: session.serverTime
         )
     }
@@ -41,6 +47,7 @@ struct CallMediaHandoff: Sendable {
         call: CallDTO,
         rtc: RTCDetails,
         participantAvatarURL: String? = nil,
+        participantVerification: AccountVerificationDesignation? = nil,
         serverTime: String? = nil
     ) throws {
         try self.init(
@@ -48,6 +55,7 @@ struct CallMediaHandoff: Sendable {
             conversationId: call.conversationId,
             participantName: call.name?.nilIfEmpty ?? "Kit Pay contact",
             participantAvatarURL: participantAvatarURL,
+            participantVerification: participantVerification,
             direction: call.direction,
             video: call.isVideoCall,
             rtc: rtc,
@@ -65,6 +73,7 @@ struct CallMediaHandoff: Sendable {
             conversationId: conversationId,
             participantName: participantName,
             participantAvatarURL: participantAvatarURL,
+            participantVerification: participantVerification,
             direction: direction,
             video: video,
             rtc: rtc,
@@ -79,6 +88,7 @@ struct CallMediaHandoff: Sendable {
         conversationId: String?,
         participantName: String,
         participantAvatarURL: String?,
+        participantVerification: AccountVerificationDesignation?,
         direction: String,
         video: Bool,
         rtc: RTCDetails,
@@ -106,6 +116,7 @@ struct CallMediaHandoff: Sendable {
         }
         self.participantName = participantName
         self.participantAvatarURL = participantAvatarURL
+        self.participantVerification = participantVerification
         self.direction = direction.lowercased()
         self.video = video
         self.url = url
@@ -165,6 +176,7 @@ struct ActiveCallPresentation: Identifiable, Equatable, Sendable {
     let conversationId: String?
     let participantName: String
     let participantAvatarURL: String?
+    let participantVerification: AccountVerificationDesignation?
     let video: Bool
     let direction: String
 
@@ -174,6 +186,7 @@ struct ActiveCallPresentation: Identifiable, Equatable, Sendable {
             conversationId: handoff.conversationId,
             participantName: handoff.participantName,
             participantAvatarURL: handoff.participantAvatarURL,
+            participantVerification: handoff.participantVerification,
             video: handoff.video,
             direction: handoff.direction
         )
@@ -184,6 +197,7 @@ struct ActiveCallPresentation: Identifiable, Equatable, Sendable {
         conversationId: String? = nil,
         participantName: String,
         participantAvatarURL: String? = nil,
+        participantVerification: AccountVerificationDesignation? = nil,
         video: Bool,
         direction: String
     ) {
@@ -195,6 +209,7 @@ struct ActiveCallPresentation: Identifiable, Equatable, Sendable {
         }
         self.participantName = participantName
         self.participantAvatarURL = participantAvatarURL
+        self.participantVerification = participantVerification
         self.video = video
         self.direction = direction.lowercased()
     }

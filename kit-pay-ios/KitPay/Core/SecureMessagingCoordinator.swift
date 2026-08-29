@@ -867,7 +867,10 @@ actor SecureMessagingExchangeCoordinator {
                     unreadCount: existing.unreadCount,
                     updatedAt: max(existing.updatedAt, projection.updatedAt),
                     conversationType: projection.conversationType,
-                    groupMemberRoles: projection.groupMemberRoles
+                    groupMemberRoles: projection.groupMemberRoles,
+                    groupDescription: projection.groupDescription,
+                    groupPhotoURL: projection.groupPhotoURL,
+                    memberIdentities: projection.memberIdentities
                 )
             } else {
                 state.conversations.append(projection)
@@ -960,7 +963,10 @@ actor SecureMessagingExchangeCoordinator {
                         unreadCount: existing.unreadCount,
                         updatedAt: max(existing.updatedAt, projection.updatedAt),
                         conversationType: projection.conversationType,
-                        groupMemberRoles: projection.groupMemberRoles
+                        groupMemberRoles: projection.groupMemberRoles,
+                        groupDescription: projection.groupDescription,
+                        groupPhotoURL: projection.groupPhotoURL,
+                        memberIdentities: projection.memberIdentities
                     )
                     Self.recordServerProjection(
                         conversationID: projection.id,
@@ -1324,7 +1330,8 @@ actor SecureMessagingExchangeCoordinator {
                     conversationType: SecureMessagingWire.groupConversationType,
                     groupMemberRoles: projection.groupMemberRoles,
                     groupDescription: projection.groupDescription,
-                    groupPhotoURL: projection.groupPhotoURL
+                    groupPhotoURL: projection.groupPhotoURL,
+                    memberIdentities: projection.memberIdentities
                 )
                 Self.recordServerProjection(
                     conversationID: projection.id,
@@ -1387,6 +1394,7 @@ actor SecureMessagingExchangeCoordinator {
         }
         var memberIDs: [String] = []
         var roles: [String: MessagingGroupRole] = [:]
+        var memberIdentities: [String: AccountIdentityProjection] = [:]
         for member in members {
             guard let userID = try? canonicalUUID(member.userId, error: .invalidConversation),
                   let rawRole = member.role,
@@ -1395,6 +1403,13 @@ actor SecureMessagingExchangeCoordinator {
             else { throw SecureMessagingExchangeError.invalidServerResponse }
             memberIDs.append(userID)
             roles[userID] = role
+            if let identity = AccountIdentityProjection(
+                displayName: member.name,
+                avatarURL: member.avatarUrl,
+                verification: member.verification
+            ) {
+                memberIdentities[userID] = identity
+            }
         }
         guard !memberIDs.contains(currentUserID),
               let title = dto.title.map(MessagingGroupTitlePolicy.normalized),
@@ -1407,7 +1422,8 @@ actor SecureMessagingExchangeCoordinator {
             unreadCount: 0,
             updatedAt: updatedAt,
             conversationType: SecureMessagingWire.groupConversationType,
-            groupMemberRoles: roles
+            groupMemberRoles: roles,
+            memberIdentities: memberIdentities.isEmpty ? nil : memberIdentities
         )
     }
 
@@ -6521,6 +6537,8 @@ actor SecureMessagingExchangeCoordinator {
                                 participants.removeAll { $0 == transition.subjectUserID }
                                 state.conversations[index].groupMemberRoles?
                                     .removeValue(forKey: transition.subjectUserID)
+                                state.conversations[index].memberIdentities?
+                                    .removeValue(forKey: transition.subjectUserID)
                             }
                             state.conversations[index].participantUserIds = participants
                             state.conversations[index].updatedAt = max(
@@ -6768,9 +6786,21 @@ actor SecureMessagingExchangeCoordinator {
         else { throw SecureMessagingExchangeError.invalidConversation }
         let id = try canonicalUUID(rawID, error: .invalidConversation)
         let values = members.compactMap { $0 }
-        let memberIDs = try Set(values.map {
-            try canonicalUUID($0.userId, error: .invalidConversation)
-        })
+        var memberIDs: Set<String> = []
+        var memberIdentities: [String: AccountIdentityProjection] = [:]
+        for member in values {
+            let userID = try canonicalUUID(member.userId, error: .invalidConversation)
+            guard memberIDs.insert(userID).inserted else {
+                throw SecureMessagingExchangeError.invalidConversation
+            }
+            if let identity = AccountIdentityProjection(
+                displayName: member.name,
+                avatarURL: member.avatarUrl,
+                verification: member.verification
+            ) {
+                memberIdentities[userID] = identity
+            }
+        }
         let parsedUpdatedAt = try? parseServerDate(dto.updatedAt)
 
         switch type {
@@ -6783,8 +6813,7 @@ actor SecureMessagingExchangeCoordinator {
             else { throw SecureMessagingExchangeError.invalidConversation }
             let serverTitle = dto.title?.trimmingCharacters(in: .whitespacesAndNewlines)
             // Direct titles are server-null by contract; prefer the viewer-scoped peer alias.
-            let peerName = values.first(where: { $0.userId == recipient })?.name?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let peerName = memberIdentities[recipient]?.displayName
             let fallback = fallbackTitle.trimmingCharacters(in: .whitespacesAndNewlines)
             let title = [peerName, serverTitle, fallback, "Kit Pay contact"]
                 .compactMap { $0 }
@@ -6803,7 +6832,8 @@ actor SecureMessagingExchangeCoordinator {
                 conversationType: type,
                 groupMemberRoles: nil,
                 groupDescription: nil,
-                groupPhotoURL: nil
+                groupPhotoURL: nil,
+                memberIdentities: memberIdentities.isEmpty ? nil : memberIdentities
             )
 
         case SecureMessagingWire.groupConversationType:
@@ -6875,7 +6905,8 @@ actor SecureMessagingExchangeCoordinator {
                 conversationType: type,
                 groupMemberRoles: memberRoles,
                 groupDescription: description,
-                groupPhotoURL: photoURL
+                groupPhotoURL: photoURL,
+                memberIdentities: memberIdentities.isEmpty ? nil : memberIdentities
             )
 
         default:
@@ -7763,6 +7794,7 @@ actor SecureMessagingExchangeCoordinator {
                 state.conversations[index].conversationType = conversationType
             }
             state.conversations[index].groupMemberRoles = conversation.groupMemberRoles
+            state.conversations[index].memberIdentities = conversation.memberIdentities
             if advancesActivity {
                 state.conversations[index].updatedAt = max(
                     state.conversations[index].updatedAt,
@@ -7837,6 +7869,7 @@ private struct ValidatedDirectConversation {
     /// Server-visible group identity; always nil for a direct thread, which discloses nothing.
     let groupDescription: String?
     let groupPhotoURL: String?
+    let memberIdentities: [String: AccountIdentityProjection]?
 
     var isGroup: Bool { conversationType == SecureMessagingWire.groupConversationType }
 
@@ -7856,7 +7889,8 @@ private struct ValidatedDirectConversation {
             conversationType: conversationType,
             groupMemberRoles: groupMemberRoles,
             groupDescription: groupDescription,
-            groupPhotoURL: groupPhotoURL
+            groupPhotoURL: groupPhotoURL,
+            memberIdentities: memberIdentities
         )
     }
 }

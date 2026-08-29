@@ -296,7 +296,7 @@ struct MessagesView: View {
                                 lastMessage: lastByConversation[conversation.id],
                                 displayName: identity.displayName,
                                 avatarURL: identity.avatarURL,
-                                verification: identity.contact?.verification?.designation,
+                                verification: identity.verification,
                                 isPinned: model.pinnedConversationIds.contains(conversation.id),
                                 isMuted: model.mutedConversationIds.contains(conversation.id),
                                 isSelecting: isSelectingChats,
@@ -1167,7 +1167,7 @@ private struct MessageGlobalSearchView: View {
                     conversation: conversation,
                     displayName: identity.displayName,
                     avatarURL: identity.avatarURL,
-                    verification: identity.contact?.verification?.designation,
+                    verification: identity.verification,
                     lastMessage: lastMessage
                 )
             }
@@ -1201,7 +1201,7 @@ private struct MessageGlobalSearchView: View {
                     conversation: conversation,
                     displayName: identity.displayName,
                     avatarURL: identity.avatarURL,
-                    verification: identity.contact?.verification?.designation
+                    verification: identity.verification
                 )
             }
 
@@ -2549,8 +2549,23 @@ struct ConversationView: View {
         }) {
             return contact.name
         }
+        if let displayName = currentConversation.memberIdentity(for: canonical)?.displayName {
+            return displayName
+        }
         if canonical == recipientUserID?.lowercased() { return recipientDisplayName }
         return "Kit Pay user"
+    }
+
+    private func participantAvatarURL(for userID: String) -> String? {
+        currentConversation.memberIdentity(for: userID)?.avatarURL
+            ?? model.contactAvatarURL(forUserID: userID)
+    }
+
+    private func participantVerification(
+        for userID: String
+    ) -> AccountVerificationDesignation? {
+        currentConversation.memberIdentity(for: userID)?.verification?.designation
+            ?? model.contactVerification(forUserID: userID)
     }
 
     private var conversationLayout: some View {
@@ -3069,7 +3084,8 @@ struct ConversationView: View {
                         isCurrentUser: userID.lowercased()
                             == model.profile?.id.lowercased(),
                         role: group.groupRole(for: userID)?.rawValue,
-                        avatarURL: model.contactAvatarURL(forUserID: userID)
+                        avatarURL: participantAvatarURL(for: userID),
+                        verification: participantVerification(for: userID)
                     )
                 },
                 renameGroup: model.canRenameGroupConversation(group.id) ? { title in
@@ -3120,6 +3136,7 @@ struct ConversationView: View {
                 name: recipientDisplayName,
                 contact: recipientContact,
                 avatarURL: recipientPresentation.avatarURL,
+                verification: recipientPresentation.verification,
                 userID: recipientUserID,
                 conversation: conversation,
                 messages: messages,
@@ -3263,7 +3280,8 @@ struct ConversationView: View {
                 conversationID: target.conversationID,
                 serverMessageID: target.serverMessageID,
                 nameForUserID: { participantDisplayName(for: $0) },
-                avatarURLForUserID: { model.contactAvatarURL(forUserID: $0) }
+                avatarURLForUserID: { participantAvatarURL(for: $0) },
+                verificationForUserID: { participantVerification(for: $0) }
             )
             .environmentObject(model)
         }
@@ -7892,6 +7910,7 @@ private struct ConversationContactProfileView: View {
     let name: String
     let contact: WalletContactDTO?
     let avatarURL: String?
+    let verification: AccountVerificationDesignation?
     let userID: String?
     let conversation: Conversation
     let messages: [LocalMessage]
@@ -7914,7 +7933,7 @@ private struct ConversationContactProfileView: View {
                             name: displayName,
                             avatarURL: avatarURL ?? contact?.avatarURL,
                             size: 96,
-                            verification: contact?.verification?.designation
+                            verification: verification ?? contact?.verification?.designation
                         )
                             .kitCircularGlass(diameter: 116, interactive: false)
 

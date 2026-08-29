@@ -463,7 +463,8 @@ final class CommunicationPrivacyContractTests: XCTestCase {
                 status: nil,
                 tag: "example_contact",
                 avatarURL: "https://objects.example.test/example_contact.jpg",
-                receivingWalletId: nil
+                receivingWalletId: nil,
+                verification: AccountVerificationDTO(designation: .verified)
             ),
         ]
         let conversations = [
@@ -487,6 +488,7 @@ final class CommunicationPrivacyContractTests: XCTestCase {
         XCTAssertEqual(people.map(\.displayName), ["ExampleContact", "ExampleMerchant", "Kit Pay user"])
         XCTAssertEqual(people[0].detail, "@example_contact")
         XCTAssertEqual(people[0].avatarURL, "https://objects.example.test/example_contact.jpg")
+        XCTAssertEqual(people[0].verification, .verified)
         XCTAssertNil(people[1].detail)
         XCTAssertNil(people[2].detail)
         XCTAssertFalse(people[2].displayName.contains(thirdUserId))
@@ -540,7 +542,8 @@ final class CommunicationPrivacyContractTests: XCTestCase {
                 userId: secondUserId,
                 name: "Amina",
                 tag: "amina_pay",
-                avatarURL: "https://objects.example.test/amina.jpg"
+                avatarURL: "https://objects.example.test/amina.jpg",
+                verification: .official
             ),
             contact(userId: thirdUserId, name: "Zed", phone: "+256700000003"),
             WalletContactDTO(
@@ -567,6 +570,7 @@ final class CommunicationPrivacyContractTests: XCTestCase {
         XCTAssertEqual(candidates.map(\.displayName), ["Amina", "Zed"])
         XCTAssertEqual(candidates[0].detail, "@amina_pay")
         XCTAssertEqual(candidates[0].avatarURL, "https://objects.example.test/amina.jpg")
+        XCTAssertEqual(candidates[0].verification, .official)
         XCTAssertEqual(candidates[1].detail, "+256700000003")
     }
 
@@ -899,7 +903,8 @@ final class CommunicationPrivacyContractTests: XCTestCase {
         name: String,
         phone: String = "+256700000000",
         tag: String? = nil,
-        avatarURL: String? = nil
+        avatarURL: String? = nil,
+        verification: AccountVerificationDesignation? = nil
     ) -> WalletContactDTO {
         WalletContactDTO(
             id: userId,
@@ -911,7 +916,8 @@ final class CommunicationPrivacyContractTests: XCTestCase {
             status: nil,
             tag: tag,
             avatarURL: avatarURL,
-            receivingWalletId: nil
+            receivingWalletId: nil,
+            verification: AccountVerificationDTO(designation: verification)
         )
     }
 

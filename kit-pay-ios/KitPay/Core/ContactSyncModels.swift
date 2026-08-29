@@ -619,6 +619,7 @@ struct ConversationContactPresentation: Equatable, Sendable {
     let recipientUserID: String?
     let displayName: String
     let avatarURL: String?
+    let verification: AccountVerificationDesignation?
     let contact: WalletContactDTO?
 }
 
@@ -658,6 +659,7 @@ enum ConversationContactPresentationPolicy {
                 avatarURL: conversation.isGroup
                     ? cleanHTTPSURL(conversation.groupPhotoURL)
                     : nil,
+                verification: nil,
                 contact: nil
             )
         }
@@ -671,13 +673,19 @@ enum ConversationContactPresentationPolicy {
         let contact = savedContact ?? matches.first
         let displayName = savedContact.flatMap { cleanName($0.name) }
             ?? contact.flatMap { cleanName($0.name) }
+            ?? conversation.memberIdentity(for: recipientUserID)?.displayName
             ?? fallbackName
-        let avatarURL = matches.lazy.compactMap { cleanHTTPSURL($0.avatarURL) }.first
+        let memberIdentity = conversation.memberIdentity(for: recipientUserID)
+        let avatarURL = cleanHTTPSURL(memberIdentity?.avatarURL)
+            ?? matches.lazy.compactMap { cleanHTTPSURL($0.avatarURL) }.first
+        let verification = memberIdentity?.verification?.designation
+            ?? contact?.verification?.designation
 
         return ConversationContactPresentation(
             recipientUserID: recipientUserID,
             displayName: displayName,
             avatarURL: avatarURL,
+            verification: verification,
             contact: contact
         )
     }
@@ -687,6 +695,7 @@ enum ConversationContactPresentationPolicy {
             recipientUserID: nil,
             displayName: name,
             avatarURL: nil,
+            verification: nil,
             contact: nil
         )
     }

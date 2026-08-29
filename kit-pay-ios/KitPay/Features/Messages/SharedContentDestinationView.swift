@@ -140,6 +140,8 @@ struct SharedContentDestinationView: View {
         let conversation: Conversation
         let displayName: String
         let avatarURL: String?
+        let verification: AccountVerificationDesignation?
+        let isGroup: Bool
         let subtitle: String
     }
 
@@ -169,6 +171,8 @@ struct SharedContentDestinationView: View {
                     conversation: conversation,
                     displayName: identity.displayName,
                     avatarURL: identity.avatarURL,
+                    verification: identity.verification,
+                    isGroup: conversation.isGroup,
                     subtitle: conversation.isGroup
                         ? "\(conversation.participantUserIds.count) members"
                         : "Chat on Kit Pay"
@@ -185,11 +189,20 @@ struct SharedContentDestinationView: View {
             onChoose(destination.conversation)
         } label: {
             HStack(spacing: 12) {
-                RemoteAvatarView(
-                    name: destination.displayName,
-                    avatarURL: destination.avatarURL,
-                    size: 44
-                )
+                if destination.isGroup {
+                    GroupAvatarView(
+                        title: destination.displayName,
+                        photoURL: destination.avatarURL,
+                        size: 44
+                    )
+                } else {
+                    RemoteAvatarView(
+                        name: destination.displayName,
+                        avatarURL: destination.avatarURL,
+                        size: 44,
+                        verification: destination.verification
+                    )
+                }
                 VStack(alignment: .leading, spacing: 3) {
                     Text(destination.displayName)
                         .font(.headline)

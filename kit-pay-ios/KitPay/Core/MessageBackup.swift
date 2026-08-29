@@ -273,6 +273,37 @@ struct MessageBackupPayload: Codable, Equatable, Sendable {
                 return false
             }
         }
+        // Delete-for-me intentionally removes only the selected visible row. Reactions and edits
+        // are hidden metadata rows, so an event can remain after its target is deleted; older
+        // builds can also retain these rows without the sender binding required for a safe
+        // restore. Neither row has standalone meaning. Omit it from the snapshot instead of
+        // letting one invisible orphan make the customer's entire new backup fail validation.
+        let committedMessages = messages
+        messages = committedMessages.filter { message in
+            if KitMessageReaction.isReactionText(message.body) {
+                guard let history = message.secureMessagingHistory,
+                      message.serverMessageId != nil,
+                      history.senderUserID == message.senderId,
+                      history.kind == .encryptedReaction
+                else { return false }
+                return MessageReactionAggregationPolicy.hasValidTarget(
+                    for: message,
+                    among: committedMessages
+                )
+            }
+            if KitMessageEdit.isEditText(message.body) {
+                guard let history = message.secureMessagingHistory,
+                      message.serverMessageId != nil,
+                      history.senderUserID == message.senderId,
+                      history.kind == .encryptedEdit
+                else { return false }
+                return MessageEditAggregationPolicy.hasValidTarget(
+                    for: message,
+                    among: committedMessages
+                )
+            }
+            return true
+        }
         if !includesMedia {
             for index in messages.indices {
                 messages[index].attachmentData = nil
@@ -435,14 +466,30 @@ enum MessageBackupValidationPolicy {
                           && Set(roles.keys) == Set(conversation.participantUserIds)
                           && roles.keys.allSatisfy(SecureMessagingWirePolicy.isCanonicalUUID)
                   }) ?? true,
+                  conversation.memberIdentities.map({ identities in
+                      Set(identities.keys).isSubset(of: Set(conversation.participantUserIds))
+                          && identities.keys.allSatisfy(
+                              SecureMessagingWirePolicy.isCanonicalUUID
+                          )
+                          && identities.values.allSatisfy(\.isValid)
+                  }) ?? true,
                   // The owner may have left/been removed from a group whose history they keep.
                   conversation.isGroup
                     || conversation.participantUserIds.contains(payload.userID)
             else { throw MessageBackupError.invalidBackup }
+            let identityBytes = conversation.memberIdentities?.reduce(0) { total, entry in
+                total
+                    + entry.key.utf8.count
+                    + (entry.value.displayName?.utf8.count ?? 0)
+                    + (entry.value.avatarURL?.utf8.count ?? 0)
+                    + (entry.value.verification?.designation?.rawValue.utf8.count ?? 0)
+                    + (entry.value.verification?.since?.utf8.count ?? 0)
+            } ?? 0
             guard addBounded(
                 conversation.title.utf8.count
                     + conversation.id.utf8.count
                     + conversation.participantUserIds.reduce(0) { $0 + $1.utf8.count }
+                    + identityBytes
                     + 256,
                 to: &aggregateTextAndMetadataBytes,
                 limit: maximumAggregateTextAndMetadataBytes

@@ -12,6 +12,7 @@ struct MessageInfoView: View {
     /// address book calls them rather than whatever the server last knew.
     let nameForUserID: (String) -> String
     let avatarURLForUserID: (String) -> String?
+    let verificationForUserID: (String) -> AccountVerificationDesignation?
 
     @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
@@ -132,7 +133,8 @@ struct MessageInfoView: View {
                     RemoteAvatarView(
                         name: name,
                         avatarURL: avatarURLForUserID(recipient.userID),
-                        size: 40
+                        size: 40,
+                        verification: verificationForUserID(recipient.userID)
                     )
                     VStack(alignment: .leading, spacing: 2) {
                         Text(name)

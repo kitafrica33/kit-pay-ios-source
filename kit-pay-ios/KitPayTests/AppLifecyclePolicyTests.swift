@@ -50,6 +50,165 @@ final class AppLifecyclePolicyTests: XCTestCase {
         )
     }
 
+    // MARK: - Foreground authoritative refresh
+
+    func testOnlyARealBackgroundVisitRequestsForegroundRefresh() {
+        var gate = ForegroundAuthoritativeRefreshGate()
+
+        // `.inactive` -> `.active` never calls didEnterBackground().
+        XCTAssertEqual(
+            gate.admission(
+                at: Date(timeIntervalSinceReferenceDate: 100),
+                appIsActive: true,
+                isOnline: true,
+                sessionIsEligible: true
+            ),
+            .none
+        )
+
+        gate.didEnterBackground()
+        XCTAssertEqual(
+            gate.admission(
+                at: Date(timeIntervalSinceReferenceDate: 100),
+                appIsActive: true,
+                isOnline: true,
+                sessionIsEligible: true
+            ),
+            .start(generation: 1)
+        )
+    }
+
+    func testConcurrentForegroundCallbacksCoalesceOntoOneGeneration() {
+        var gate = ForegroundAuthoritativeRefreshGate()
+        let now = Date(timeIntervalSinceReferenceDate: 100)
+        gate.didEnterBackground()
+
+        XCTAssertEqual(
+            gate.admission(
+                at: now,
+                appIsActive: true,
+                isOnline: true,
+                sessionIsEligible: true
+            ),
+            .start(generation: 1)
+        )
+        XCTAssertEqual(
+            gate.admission(
+                at: now,
+                appIsActive: true,
+                isOnline: true,
+                sessionIsEligible: true
+            ),
+            .none
+        )
+        gate.authoritativeRefreshDidCommit(upTo: 1)
+        gate.finishAttempt(generation: 1)
+        XCTAssertFalse(gate.hasPendingRefresh)
+    }
+
+    func testOfflineForegroundLeavesRefreshPendingAndRapidChurnIsThrottled() {
+        var gate = ForegroundAuthoritativeRefreshGate()
+        let firstStart = Date(timeIntervalSinceReferenceDate: 100)
+        gate.didEnterBackground()
+
+        XCTAssertEqual(
+            gate.admission(
+                at: firstStart,
+                appIsActive: true,
+                isOnline: false,
+                sessionIsEligible: true
+            ),
+            .none
+        )
+        XCTAssertTrue(gate.hasPendingRefresh)
+        XCTAssertEqual(
+            gate.admission(
+                at: firstStart,
+                appIsActive: true,
+                isOnline: true,
+                sessionIsEligible: true
+            ),
+            .start(generation: 1)
+        )
+        gate.authoritativeRefreshDidCommit(upTo: 1)
+        gate.finishAttempt(generation: 1)
+
+        gate.didEnterBackground()
+        XCTAssertEqual(
+            gate.admission(
+                at: firstStart.addingTimeInterval(2),
+                appIsActive: true,
+                isOnline: true,
+                sessionIsEligible: true
+            ),
+            .wait(8)
+        )
+        XCTAssertTrue(gate.hasPendingRefresh)
+    }
+
+    func testTransientForegroundRefreshFailureKeepsGenerationPendingForRetry() {
+        var gate = ForegroundAuthoritativeRefreshGate()
+        let firstStart = Date(timeIntervalSinceReferenceDate: 100)
+        gate.didEnterBackground()
+        XCTAssertEqual(
+            gate.admission(
+                at: firstStart,
+                appIsActive: true,
+                isOnline: true,
+                sessionIsEligible: true
+            ),
+            .start(generation: 1)
+        )
+
+        // No authoritativeRefreshDidCommit call: bootstrap failed transiently.
+        gate.finishAttempt(generation: 1)
+        XCTAssertTrue(gate.hasPendingRefresh)
+        XCTAssertEqual(
+            gate.admission(
+                at: firstStart.addingTimeInterval(11),
+                appIsActive: true,
+                isOnline: true,
+                sessionIsEligible: true
+            ),
+            .start(generation: 1)
+        )
+    }
+
+    func testForegroundBootstrapReplacesAStaleCachedBalance() {
+        let currency = CurrencyDTO(code: "UGX", scale: "2")
+        let cachedWallet = Wallet(
+            id: "wallet-1",
+            name: "Kit Pay",
+            accountNumber: nil,
+            accountType: nil,
+            currency: currency,
+            balances: WalletBalances(available: "3000", ledger: "3000"),
+            status: "active",
+            isPrimary: true
+        )
+        let authoritativeWallet = Wallet(
+            id: cachedWallet.id,
+            name: cachedWallet.name,
+            accountNumber: nil,
+            accountType: nil,
+            currency: currency,
+            balances: WalletBalances(available: "150000", ledger: "150000"),
+            status: "active",
+            isPrimary: true
+        )
+        var state = PersistedState.empty
+        state.wallets = [cachedWallet]
+        state.selectedWalletId = cachedWallet.id
+
+        state.replaceAuthoritativeWalletProjection(
+            [authoritativeWallet],
+            selectedWalletID: authoritativeWallet.id
+        )
+
+        XCTAssertEqual(state.wallets, [authoritativeWallet])
+        XCTAssertEqual(state.wallets.first?.balances.available, "150000")
+    }
+
     // MARK: - Inbound links
 
     /// A token of the shortest length the opaque-token validator accepts.

@@ -2083,6 +2083,56 @@ struct AccountVerificationDTO: Codable, Hashable, Sendable {
     }
 }
 
+/// A small, authenticated identity projection carried beside messaging and calling rosters.
+///
+/// Contacts remain a useful fallback, but they are not guaranteed to contain a person the first
+/// time they message or call. Persisting only these public fields lets that first interaction draw
+/// the same avatar and verification seal without coupling a public badge to KYC or phone-book
+/// access. Every field stays optional so payloads from servers predating this projection continue
+/// to decode.
+struct AccountIdentityProjection: Codable, Hashable, Sendable {
+    let displayName: String?
+    let avatarURL: String?
+    let verification: AccountVerificationDTO?
+
+    init?(
+        displayName: String?,
+        avatarURL: String?,
+        verification: AccountVerificationDTO?
+    ) {
+        let cleanName = Self.validatedDisplayName(displayName)
+        let cleanAvatarURL = Self.validatedAvatarURL(avatarURL)
+        let cleanVerification = verification?.designation == nil ? nil : verification
+        guard cleanName != nil || cleanAvatarURL != nil || cleanVerification != nil else {
+            return nil
+        }
+        self.displayName = cleanName
+        self.avatarURL = cleanAvatarURL
+        self.verification = cleanVerification
+    }
+
+    static func validatedDisplayName(_ rawValue: String?) -> String? {
+        guard let rawValue else { return nil }
+        let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty,
+              value.utf8.count <= 512,
+              !value.unicodeScalars.contains(where: { $0.value == 0 })
+        else { return nil }
+        return value
+    }
+
+    static func validatedAvatarURL(_ rawValue: String?) -> String? {
+        ProfileAvatarCache.validatedURL(rawValue)?.absoluteString
+    }
+
+    var isValid: Bool {
+        displayName == Self.validatedDisplayName(displayName)
+            && avatarURL == Self.validatedAvatarURL(avatarURL)
+            && (verification.map({ $0.designation != nil }) ?? true)
+            && (displayName != nil || avatarURL != nil || verification != nil)
+    }
+}
+
 /// A Kit Pay account carries two deliberately separate names.
 ///
 /// `legalName` is read off the identity document during verification and is never replaced by
@@ -3263,12 +3313,26 @@ struct Conversation: Codable, Hashable, Identifiable {
     var groupDescription: String? = nil
     /// The group photo's public content address; nil shows the generated group avatar.
     var groupPhotoURL: String? = nil
+    /// Authenticated public identity metadata for active members. Optional keeps state written by
+    /// older builds readable and lets clients fall back to the synchronized contact directory.
+    var memberIdentities: [String: AccountIdentityProjection]? = nil
 
     var isGroup: Bool { conversationType == SecureMessagingWire.groupConversationType }
 
     func groupRole(for userID: String?) -> MessagingGroupRole? {
         guard let userID else { return nil }
         return groupMemberRoles?[userID.lowercased()]
+    }
+
+    func memberIdentity(for userID: String?) -> AccountIdentityProjection? {
+        guard let userID,
+              userID == userID.trimmingCharacters(in: .whitespacesAndNewlines),
+              let identifier = UUID(uuidString: userID)
+        else { return nil }
+        guard let identity = memberIdentities?[identifier.uuidString.lowercased()],
+              identity.isValid
+        else { return nil }
+        return identity
     }
 }
 
@@ -3292,11 +3356,47 @@ struct CallRecord: Codable, Hashable, Identifiable, Sendable {
     var conversationId: String? = nil
     /// A connected duration is derived only from authenticated answer/end timestamps.
     var answeredAt: Date? = nil
+    /// Viewer-safe public identities for the authenticated participant roster. Older call rows
+    /// omit this and resolve through contacts exactly as before.
+    var participantIdentities: [String: AccountIdentityProjection]? = nil
 
     /// Android treats either authenticated signal as authoritative. This also keeps media type
     /// stable when an older or partially deployed backend sends a contradictory optional flag.
     var isVideoCall: Bool {
         video || type.caseInsensitiveCompare("video") == .orderedSame
+    }
+}
+
+struct CallParticipantDTO: Decodable, Equatable, Sendable {
+    let userId: String?
+    let name: String?
+    let avatarUrl: String?
+    let verification: AccountVerificationDTO?
+
+    private enum CodingKeys: String, CodingKey {
+        case name, verification
+        case userId = "user_id"
+        case avatarUrl = "avatar_url"
+    }
+
+    init(
+        userId: String? = nil,
+        name: String? = nil,
+        avatarUrl: String? = nil,
+        verification: AccountVerificationDTO? = nil
+    ) {
+        self.userId = userId
+        self.name = name
+        self.avatarUrl = avatarUrl
+        self.verification = verification
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        userId = try? values.decode(String.self, forKey: .userId)
+        name = try? values.decode(String.self, forKey: .name)
+        avatarUrl = try? values.decode(String.self, forKey: .avatarUrl)
+        verification = try? values.decode(AccountVerificationDTO.self, forKey: .verification)
     }
 }
 
@@ -3313,6 +3413,7 @@ struct CallDTO: Decodable {
     let answeredAt: String?
     let endedAt: String?
     let ringExpiresAt: String?
+    let participants: [CallParticipantDTO]?
 
     enum CodingKeys: String, CodingKey {
         case id, name, direction, type, video, state
@@ -3322,10 +3423,103 @@ struct CallDTO: Decodable {
         case answeredAt = "answered_at"
         case endedAt = "ended_at"
         case ringExpiresAt = "ring_expires_at"
+        case participants
+    }
+
+    init(
+        id: String,
+        conversationId: String?,
+        name: String?,
+        participantUserIds: [String]?,
+        direction: String,
+        type: String,
+        video: Bool?,
+        state: String,
+        startedAt: String,
+        answeredAt: String?,
+        endedAt: String?,
+        ringExpiresAt: String?,
+        participants: [CallParticipantDTO]? = nil
+    ) {
+        self.id = id
+        self.conversationId = conversationId
+        self.name = name
+        self.participantUserIds = participantUserIds
+        self.direction = direction
+        self.type = type
+        self.video = video
+        self.state = state
+        self.startedAt = startedAt
+        self.answeredAt = answeredAt
+        self.endedAt = endedAt
+        self.ringExpiresAt = ringExpiresAt
+        self.participants = participants
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(String.self, forKey: .id)
+        conversationId = try values.decodeIfPresent(String.self, forKey: .conversationId)
+        name = try values.decodeIfPresent(String.self, forKey: .name)
+        participantUserIds = try values.decodeIfPresent([String].self, forKey: .participantUserIds)
+        direction = try values.decode(String.self, forKey: .direction)
+        type = try values.decode(String.self, forKey: .type)
+        video = try values.decodeIfPresent(Bool.self, forKey: .video)
+        state = try values.decode(String.self, forKey: .state)
+        startedAt = try values.decode(String.self, forKey: .startedAt)
+        answeredAt = try values.decodeIfPresent(String.self, forKey: .answeredAt)
+        endedAt = try values.decodeIfPresent(String.self, forKey: .endedAt)
+        ringExpiresAt = try values.decodeIfPresent(String.self, forKey: .ringExpiresAt)
+        // This is additive presentation metadata. A malformed optional projection must not hide
+        // an otherwise valid call; validation below simply declines to grant it identity data.
+        participants = try? values.decode([CallParticipantDTO].self, forKey: .participants)
     }
 
     var isVideoCall: Bool {
         video == true || type.caseInsensitiveCompare("video") == .orderedSame
+    }
+}
+
+enum CallParticipantIdentityPolicy {
+    static func validated(
+        _ participants: [CallParticipantDTO]?,
+        matching rawParticipantUserIDs: [String]?
+    ) -> [String: AccountIdentityProjection]? {
+        guard let participants,
+              let rawParticipantUserIDs,
+              !participants.isEmpty,
+              participants.count == rawParticipantUserIDs.count
+        else { return nil }
+
+        let roster = rawParticipantUserIDs.compactMap(canonicalUserID)
+        guard roster.count == rawParticipantUserIDs.count,
+              Set(roster).count == roster.count
+        else { return nil }
+
+        var identities: [String: AccountIdentityProjection] = [:]
+        var participantIDs: Set<String> = []
+        for participant in participants {
+            guard let userID = canonicalUserID(participant.userId),
+                  participantIDs.insert(userID).inserted
+            else { return nil }
+            if let identity = AccountIdentityProjection(
+                displayName: participant.name,
+                avatarURL: participant.avatarUrl,
+                verification: participant.verification
+            ) {
+                identities[userID] = identity
+            }
+        }
+        guard participantIDs == Set(roster) else { return nil }
+        return identities.isEmpty ? nil : identities
+    }
+
+    private static func canonicalUserID(_ rawValue: String?) -> String? {
+        guard let rawValue,
+              rawValue == rawValue.trimmingCharacters(in: .whitespacesAndNewlines),
+              let identifier = UUID(uuidString: rawValue)
+        else { return nil }
+        return identifier.uuidString.lowercased()
     }
 }
 
@@ -3564,6 +3758,21 @@ struct PersistedState: Codable {
     var messageBackupPreferences: MessageBackupPreferences?
 
     static let empty = PersistedState()
+
+    /// Replaces every cached balance with the authenticated bootstrap projection. Wallet balances
+    /// are server-owned; retaining an older local entry by id would show stale money after another
+    /// device changed the account while this installation was in the background.
+    mutating func replaceAuthoritativeWalletProjection(
+        _ authoritativeWallets: [Wallet],
+        selectedWalletID: String?
+    ) {
+        let previousSelectedWalletID = selectedWalletId
+        wallets = authoritativeWallets
+        selectedWalletId = selectedWalletID
+        if previousSelectedWalletID != selectedWalletID {
+            transactions = []
+        }
+    }
 
     mutating func bindAuthenticatedProfile(_ authenticatedProfile: UserProfile) {
         let previousOwner = communicationOwnerUserID ?? profile?.id

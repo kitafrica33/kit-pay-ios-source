@@ -43,6 +43,7 @@ private struct GroupCreateSelectedMember: Identifiable, Equatable {
     let userID: String
     let name: String
     let avatarURL: String?
+    let verification: AccountVerificationDesignation?
     var id: String { userID }
 }
 
@@ -218,7 +219,8 @@ struct GroupCreateView: View {
                             RemoteAvatarView(
                                 name: member.name,
                                 avatarURL: member.avatarURL,
-                                size: 28
+                                size: 28,
+                                verification: member.verification
                             )
                             Text(member.name)
                                 .font(.subheadline.weight(.semibold))
@@ -461,7 +463,8 @@ struct GroupCreateView: View {
                     GroupCreateSelectedMember(
                         userID: userID,
                         name: contact.name,
-                        avatarURL: contact.avatarURL
+                        avatarURL: contact.avatarURL,
+                        verification: contact.verification?.designation
                     )
                 )
             }

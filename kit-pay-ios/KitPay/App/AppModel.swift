@@ -424,6 +424,88 @@ enum ConnectivityTransitionPolicy {
     }
 }
 
+/// Admits one authoritative bootstrap after a real background visit.
+///
+/// SwiftUI reports `.active` again after transient interruptions such as Control Center and
+/// permission alerts. Those transitions never call `didEnterBackground()`, so they cannot turn a
+/// cached wallet refresh into a foreground refresh storm. A real background visit advances the
+/// generation; concurrent active callbacks can claim that generation only once, and a short
+/// throttle absorbs rapid app-switcher churn without forgetting the outstanding refresh.
+struct ForegroundAuthoritativeRefreshGate {
+    enum Admission: Equatable {
+        case none
+        case wait(TimeInterval)
+        case start(generation: UInt64)
+    }
+
+    static let minimumStartInterval: TimeInterval = 10
+
+    private(set) var backgroundGeneration: UInt64 = 0
+    private(set) var completedGeneration: UInt64 = 0
+    private(set) var inFlightGeneration: UInt64?
+    private(set) var lastStartedAt: Date?
+
+    var hasPendingRefresh: Bool {
+        completedGeneration < backgroundGeneration
+    }
+
+    mutating func didEnterBackground() {
+        backgroundGeneration &+= 1
+    }
+
+    mutating func admission(
+        at now: Date,
+        appIsActive: Bool,
+        isOnline: Bool,
+        sessionIsEligible: Bool
+    ) -> Admission {
+        guard appIsActive,
+              isOnline,
+              sessionIsEligible,
+              hasPendingRefresh,
+              inFlightGeneration == nil
+        else { return .none }
+
+        if let lastStartedAt {
+            let elapsed = now.timeIntervalSince(lastStartedAt)
+            let remaining = Self.minimumStartInterval - elapsed
+            if remaining > 0 { return .wait(remaining) }
+        }
+
+        let generation = backgroundGeneration
+        inFlightGeneration = generation
+        lastStartedAt = now
+        return .start(generation: generation)
+    }
+
+    /// Records a bootstrap only through the background generation captured before its request.
+    /// A response that began before a newer background visit cannot satisfy that newer visit.
+    mutating func authoritativeRefreshDidCommit(upTo generation: UInt64) {
+        completedGeneration = max(
+            completedGeneration,
+            min(generation, backgroundGeneration)
+        )
+        if let inFlightGeneration,
+           inFlightGeneration <= completedGeneration {
+            self.inFlightGeneration = nil
+        }
+    }
+
+    func hasCompleted(generation: UInt64) -> Bool {
+        completedGeneration >= generation
+    }
+
+    /// Releases a failed or cancelled attempt without consuming its pending generation.
+    mutating func finishAttempt(generation: UInt64) {
+        guard inFlightGeneration == generation else { return }
+        inFlightGeneration = nil
+    }
+
+    mutating func reset() {
+        self = Self()
+    }
+}
+
 /// A merge invitation is a non-idempotent signalling request whose response can be lost after the
 /// backend has already updated the roster. Only narrowly ambiguous failures justify one read-back;
 /// definitive authorization, validation, and not-found failures remain failures.
@@ -779,6 +861,13 @@ final class AppModel: ObservableObject {
     private var deferredInvalidatedSessionID: String?
     private var authenticatedRefreshCount = 0
     private var profileAvatarResumeRequestedAfterRefresh = false
+    /// A real background visit must reconcile cached wallet and account state when the protected
+    /// foreground is visible again. The gate coalesces duplicate SwiftUI callbacks and retains the
+    /// request while offline; connectivity recovery already performs the same bootstrap.
+    private var foregroundAuthoritativeRefreshGate = ForegroundAuthoritativeRefreshGate()
+    private var foregroundAuthoritativeRefreshTask: Task<Void, Never>?
+    private var foregroundAuthoritativeRefreshTaskID: UUID?
+    private var appIsInBackground = false
     /// Mirrors what `ProfileAvatarCache` was last told, so publishing state stays a cheap
     /// comparison instead of an actor hop on every projection.
     private var avatarCacheAccountID: String?
@@ -1521,13 +1610,21 @@ final class AppModel: ObservableObject {
         let storedCall = state.calls.first {
             $0.id.caseInsensitiveCompare(action.callId) == .orderedSame
         }
-        let avatarURL = callParticipantAvatarURL(for: storedCall?.participantUserIds)
+        let avatarURL = callParticipantAvatarURL(
+            for: storedCall?.participantUserIds,
+            identities: storedCall?.participantIdentities
+        )
         if let presentation = action.presentation {
             return ActiveCallPresentation(
                 id: presentation.id,
                 conversationId: presentation.conversationId,
                 participantName: presentation.participantName,
                 participantAvatarURL: presentation.participantAvatarURL ?? avatarURL,
+                participantVerification: presentation.participantVerification
+                    ?? callParticipantVerification(
+                        for: storedCall?.participantUserIds,
+                        identities: storedCall?.participantIdentities
+                    ),
                 video: presentation.video,
                 direction: presentation.direction
             )
@@ -1536,6 +1633,10 @@ final class AppModel: ObservableObject {
             id: action.callId,
             participantName: storedCall?.name ?? "Kit Pay contact",
             participantAvatarURL: avatarURL,
+            participantVerification: callParticipantVerification(
+                for: storedCall?.participantUserIds,
+                identities: storedCall?.participantIdentities
+            ),
             video: storedCall?.isVideoCall ?? false,
             direction: "incoming"
         )
@@ -1588,11 +1689,50 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func callParticipantAvatarURL(for participantUserIds: [String]?) -> String? {
+    private func callParticipantAvatarURL(
+        for participantUserIds: [String]?,
+        identities: [String: AccountIdentityProjection]? = nil
+    ) -> String? {
         guard let remoteUserId = participantUserIds?.first(where: {
             $0.caseInsensitiveCompare(profile?.id ?? "") != .orderedSame
         }) else { return nil }
+        if let identity = identities?[remoteUserId.lowercased()],
+           identity.isValid,
+           let avatarURL = identity.avatarURL {
+            return avatarURL
+        }
         return contactAvatarURL(forUserID: remoteUserId)
+    }
+
+    private func callParticipantVerification(
+        for participantUserIds: [String]?,
+        identities: [String: AccountIdentityProjection]? = nil
+    ) -> AccountVerificationDesignation? {
+        guard let remoteUserId = participantUserIds?.first(where: {
+            $0.caseInsensitiveCompare(profile?.id ?? "") != .orderedSame
+        }) else { return nil }
+        if let identity = identities?[remoteUserId.lowercased()],
+           identity.isValid,
+           let verification = identity.verification?.designation {
+            return verification
+        }
+        return contactVerification(forUserID: remoteUserId)
+    }
+
+    func callParticipantAvatarURL(for call: CallRecord) -> String? {
+        callParticipantAvatarURL(
+            for: call.participantUserIds,
+            identities: call.participantIdentities
+        )
+    }
+
+    func callParticipantVerification(
+        for call: CallRecord
+    ) -> AccountVerificationDesignation? {
+        callParticipantVerification(
+            for: call.participantUserIds,
+            identities: call.participantIdentities
+        )
     }
 
     /// The profile photo the contact directory holds for a Kit Pay user, if any.
@@ -1608,11 +1748,51 @@ final class AppModel: ObservableObject {
             // to come from the profile or a group list would show them as initials alone.
             rawValue = profile.avatarURL
         } else {
-            rawValue = contactDirectory.first(where: {
-                $0.id.caseInsensitiveCompare(userID) == .orderedSame
-            })?.avatarURL
+            rawValue = contactDirectory.first(where: { contact in
+                guard let recipientUserID = ContactRecipientDirectory.recipientUserId(for: contact)
+                else { return false }
+                return recipientUserID.caseInsensitiveCompare(userID) == .orderedSame
+            })?.avatarURL ?? persistedAccountIdentity(forUserID: userID)?.avatarURL
         }
         return ProfileAvatarCache.validatedURL(rawValue)?.absoluteString
+    }
+
+    /// The public verification designation published for a user, if any.
+    ///
+    /// Like avatar resolution, this reads only the authenticated profile/contact projection and
+    /// remains available offline. It deliberately never consults KYC, legal-name, phone, or email
+    /// verification: those checks grant capabilities, not Kit's public blue badge.
+    func contactVerification(forUserID userID: String?) -> AccountVerificationDesignation? {
+        guard let userID else { return nil }
+        if let profile, profile.id.caseInsensitiveCompare(userID) == .orderedSame {
+            return profile.verification?.designation
+        }
+        return contactDirectory.first(where: { contact in
+            guard let recipientUserID = ContactRecipientDirectory.recipientUserId(for: contact)
+            else { return false }
+            return recipientUserID.caseInsensitiveCompare(userID) == .orderedSame
+        })?.verification?.designation
+            ?? persistedAccountIdentity(forUserID: userID)?.verification?.designation
+    }
+
+    private func persistedAccountIdentity(forUserID rawUserID: String) -> AccountIdentityProjection? {
+        guard rawUserID == rawUserID.trimmingCharacters(in: .whitespacesAndNewlines),
+              let identifier = UUID(uuidString: rawUserID)
+        else { return nil }
+        let userID = identifier.uuidString.lowercased()
+        let conversationIdentity = state.conversations
+            .filter { $0.memberIdentity(for: userID) != nil }
+            .max(by: { $0.updatedAt < $1.updatedAt })?
+            .memberIdentity(for: userID)
+        if let conversationIdentity, conversationIdentity.isValid {
+            return conversationIdentity
+        }
+        let callIdentity = state.calls
+            .filter { $0.participantIdentities?[userID] != nil }
+            .max(by: { $0.startedAt < $1.startedAt })?
+            .participantIdentities?[userID]
+        guard callIdentity?.isValid == true else { return nil }
+        return callIdentity
     }
 
     private func resumeAcceptedAccountDeletionCleanupBeforeRestore() async -> Bool {
@@ -3062,6 +3242,7 @@ final class AppModel: ObservableObject {
         clearAllCallWaitingState()
         activeConversationID = nil
         stopVisibleConversationSync()
+        resetForegroundAuthoritativeRefresh()
         pendingDeepLink = nil
         accountEpoch = UUID()
         guard await resetProtectedCallRecoveryCycle(retiringQueuedEvents: true) else {
@@ -4011,6 +4192,7 @@ final class AppModel: ObservableObject {
             else { return .contextChanged }
         }
         isSigningOut = true
+        resetForegroundAuthoritativeRefresh()
         // Revoke the non-idempotent waiting invitation before sign-out reaches its first await.
         // The normal teardown below still clears the retained waiting presentation and CallKit.
         cancelWaitingCallMergeOperation()
@@ -5139,6 +5321,8 @@ final class AppModel: ObservableObject {
 #if DEBUG && APP_STORE_SCREENSHOTS
         guard !AppStoreScreenshotFixture.isActive else { return }
 #endif
+        appIsInBackground = true
+        foregroundAuthoritativeRefreshGate.didEnterBackground()
         KitPresenceCenter.shared.setForeground(false)
         stopVisibleConversationSync()
         cancelRealtimeMessagingSync()
@@ -5195,6 +5379,7 @@ final class AppModel: ObservableObject {
 #if DEBUG && APP_STORE_SCREENSHOTS
         guard !AppStoreScreenshotFixture.isActive else { return }
 #endif
+        appIsInBackground = false
         if let restoreTask { await restoreTask.value }
         if protectedLocalStateRecoveryBlocked {
             await retryProtectedLocalStateRecovery()
@@ -5212,6 +5397,75 @@ final class AppModel: ObservableObject {
             await resumeAuthenticatedSessionIfNeeded()
         }
         applicationDidBecomeActive()
+        scheduleForegroundAuthoritativeRefreshIfNeeded()
+    }
+
+    /// Starts at most one foreground bootstrap task. The request remains pending when the phone is
+    /// offline and is retried by the next foreground callback; the connectivity recovery path also
+    /// performs an authoritative refresh as soon as a usable path returns.
+    private func scheduleForegroundAuthoritativeRefreshIfNeeded() {
+        guard foregroundAuthoritativeRefreshGate.hasPendingRefresh,
+              foregroundAuthoritativeRefreshTask == nil
+        else { return }
+        let taskID = UUID()
+        foregroundAuthoritativeRefreshTaskID = taskID
+        foregroundAuthoritativeRefreshTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.drainForegroundAuthoritativeRefresh()
+            self.finishForegroundAuthoritativeRefreshTask(taskID)
+        }
+    }
+
+    private func drainForegroundAuthoritativeRefresh() async {
+        while !Task.isCancelled {
+            let sessionIsEligible = !isSigningOut
+                && isSignedIn
+                && accountSetupStep == nil
+                && sessionAssurance?.grantsFullAccess == true
+                && !requiresBiometricSignIn
+                && !acceptedAccountDeletionCleanupBlocked
+                && !protectedLocalStateRecoveryBlocked
+                && !unresolvedAccountDeletionAttemptBlocked
+            switch foregroundAuthoritativeRefreshGate.admission(
+                at: Date(),
+                appIsActive: !appIsInBackground,
+                isOnline: isOnline,
+                sessionIsEligible: sessionIsEligible
+            ) {
+            case .none:
+                return
+            case .wait(let delay):
+                do {
+                    try await Task.sleep(
+                        nanoseconds: UInt64(delay * 1_000_000_000)
+                    )
+                } catch {
+                    return
+                }
+            case .start(let generation):
+                await refresh()
+                let committed = foregroundAuthoritativeRefreshGate.hasCompleted(
+                    generation: generation
+                )
+                foregroundAuthoritativeRefreshGate.finishAttempt(generation: generation)
+                // Do not spin against a transient bootstrap failure. The generation remains
+                // pending for connectivity recovery or the next true foreground transition.
+                if !committed { return }
+            }
+        }
+    }
+
+    private func finishForegroundAuthoritativeRefreshTask(_ taskID: UUID) {
+        guard foregroundAuthoritativeRefreshTaskID == taskID else { return }
+        foregroundAuthoritativeRefreshTask = nil
+        foregroundAuthoritativeRefreshTaskID = nil
+    }
+
+    private func resetForegroundAuthoritativeRefresh() {
+        foregroundAuthoritativeRefreshTask?.cancel()
+        foregroundAuthoritativeRefreshTask = nil
+        foregroundAuthoritativeRefreshTaskID = nil
+        foregroundAuthoritativeRefreshGate.reset()
     }
 
     func homeDidBecomeActive() async {
@@ -5916,6 +6170,8 @@ final class AppModel: ObservableObject {
               let expectedUserID = profile?.id
         else { return }
         let expectedAccountEpoch = accountEpoch
+        let foregroundGenerationAtStart =
+            foregroundAuthoritativeRefreshGate.backgroundGeneration
         authenticatedRefreshCount += 1
         if state.pendingProfileAvatarAttachment != nil {
             profileAvatarResumeRequestedAfterRefresh = true
@@ -5992,19 +6248,17 @@ final class AppModel: ObservableObject {
             try await store.update { persisted in
                 guard persisted.profile?.id.caseInsensitiveCompare(expectedUserID) == .orderedSame
                 else { throw AccountSetupError.accountChanged }
-                let previousSelectedWalletID = persisted.selectedWalletId
                 persisted.bindAuthenticatedProfile(bootstrap.user)
                 persisted.sessionAssurance = bootstrap.sessionAssurance
-                persisted.wallets = bootstrap.wallets
+                persisted.replaceAuthoritativeWalletProjection(
+                    bootstrap.wallets,
+                    selectedWalletID: selectedId
+                )
                 if canCommitDeviceProjection,
                    let verifiedDevices,
                    persisted.currentRegisteredDeviceProjectionRevision
                         == expectedDeviceProjectionRevision {
                     persisted.replaceRegisteredDeviceProjection(verifiedDevices)
-                }
-                persisted.selectedWalletId = selectedId
-                if previousSelectedWalletID != selectedId {
-                    persisted.transactions = []
                 }
             }
             guard await callHistoryContextIsCurrent(
@@ -6014,6 +6268,9 @@ final class AppModel: ObservableObject {
             ) else { return }
             await publishLatestState()
             sessionAssurance = bootstrap.sessionAssurance
+            foregroundAuthoritativeRefreshGate.authoritativeRefreshDidCommit(
+                upTo: foregroundGenerationAtStart
+            )
             accountSetupStep = AccountSetupPolicy.reconcile(
                 accountSetupStep,
                 with: bootstrap.user,
@@ -11547,6 +11804,7 @@ final class AppModel: ObservableObject {
             participantAvatarURL: callParticipantAvatarURL(
                 for: [cleanRecipientId]
             ),
+            participantVerification: contactVerification(forUserID: cleanRecipientId),
             video: video,
             direction: "outgoing"
         )
@@ -12625,12 +12883,18 @@ final class AppModel: ObservableObject {
             return
         }
 
+        let mapped = mapCall(result.call)
         let handoff: CallMediaHandoff
         do {
             handoff = try CallMediaHandoff(
                 session: result,
                 participantAvatarURL: callParticipantAvatarURL(
-                    for: result.call.participantUserIds
+                    for: mapped.participantUserIds,
+                    identities: mapped.participantIdentities
+                ),
+                participantVerification: callParticipantVerification(
+                    for: mapped.participantUserIds,
+                    identities: mapped.participantIdentities
                 )
             )
         } catch {
@@ -12671,7 +12935,6 @@ final class AppModel: ObservableObject {
             ephemeralOutgoingCallTaskID = nil
         }
 
-        let mapped = mapCall(result.call)
         do {
             try await store.update { persisted in
                 guard persisted.profile?.id.caseInsensitiveCompare(attempt.lease.userID)
@@ -14424,7 +14687,12 @@ final class AppModel: ObservableObject {
                     try CallMediaHandoff(
                         session: session,
                         participantAvatarURL: callParticipantAvatarURL(
-                            for: session.call.participantUserIds
+                            for: activeRecord.participantUserIds,
+                            identities: activeRecord.participantIdentities
+                        ),
+                        participantVerification: callParticipantVerification(
+                            for: activeRecord.participantUserIds,
+                            identities: activeRecord.participantIdentities
                         )
                     )
                 }
@@ -15664,7 +15932,11 @@ private func mapCall(_ dto: CallDTO, stateOverride: CallState? = nil) -> CallRec
         endedAt: CallLifecyclePolicy.serverTimestamp(dto.endedAt),
         isDeferredAttempt: false,
         conversationId: dto.conversationId,
-        answeredAt: CallLifecyclePolicy.serverTimestamp(dto.answeredAt)
+        answeredAt: CallLifecyclePolicy.serverTimestamp(dto.answeredAt),
+        participantIdentities: CallParticipantIdentityPolicy.validated(
+            dto.participants,
+            matching: dto.participantUserIds
+        )
     )
 }
 

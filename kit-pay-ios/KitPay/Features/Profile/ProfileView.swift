@@ -446,7 +446,8 @@ private struct ProfileEditorView: View {
                                         ? (model.profile?.identityDisplayName ?? "Kit Pay")
                                         : name,
                                     avatarURL: model.profile?.avatarURL,
-                                    size: 112
+                                    size: 112,
+                                    verification: model.profile?.verification?.designation
                                 )
                             }
 
@@ -456,6 +457,17 @@ private struct ProfileEditorView: View {
                                     .frame(width: 112, height: 112)
                                 ProgressView()
                                     .tint(.white)
+                            }
+                        }
+                        .overlay(alignment: .topTrailing) {
+                            if preparedAvatarPreview != nil,
+                               let verification = model.profile?.verification?.designation {
+                                VerifiedAccountBadge(
+                                    designation: verification,
+                                    diameter: 34,
+                                    hasContrastBorder: true
+                                )
+                                .offset(x: 5, y: -5)
                             }
                         }
                         .frame(maxWidth: .infinity)

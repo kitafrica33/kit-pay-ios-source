@@ -529,6 +529,7 @@ struct CommunicationBlockedPerson: Equatable, Identifiable, Sendable {
     let displayName: String
     let detail: String?
     let avatarURL: String?
+    let verification: AccountVerificationDesignation?
 
     var id: String { userId }
 }
@@ -538,6 +539,7 @@ struct CommunicationBlockCandidate: Equatable, Identifiable, Sendable {
     let displayName: String
     let detail: String?
     let avatarURL: String?
+    let verification: AccountVerificationDesignation?
 
     var id: String { userId }
 }
@@ -704,7 +706,8 @@ enum CommunicationBlockedPersonResolver {
                 userId: block.userId,
                 displayName: displayName,
                 detail: detail(for: contact),
-                avatarURL: contact?.avatarURL
+                avatarURL: contact?.avatarURL,
+                verification: contact?.verification?.designation
             )
         }
     }
@@ -720,6 +723,10 @@ enum CommunicationBlockedPersonResolver {
         }
         if (existing.tag == nil) != (candidate.tag == nil) {
             return existing.tag == nil ? candidate : existing
+        }
+        if (existing.verification?.designation == nil)
+            != (candidate.verification?.designation == nil) {
+            return existing.verification?.designation == nil ? candidate : existing
         }
         if (existing.avatarURL == nil) != (candidate.avatarURL == nil) {
             return existing.avatarURL == nil ? candidate : existing
@@ -800,7 +807,8 @@ enum CommunicationBlockCandidateResolver {
                 displayName: contact.name.trimmingCharacters(in: .whitespacesAndNewlines)
                     .nilIfEmpty ?? "Kit Pay user",
                 detail: detail(for: contact),
-                avatarURL: contact.avatarURL
+                avatarURL: contact.avatarURL,
+                verification: contact.verification?.designation
             )
         }.sorted { lhs, rhs in
             let nameOrder = lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName)
@@ -820,6 +828,10 @@ enum CommunicationBlockCandidateResolver {
         }
         if (existing.tag == nil) != (candidate.tag == nil) {
             return existing.tag == nil ? candidate : existing
+        }
+        if (existing.verification?.designation == nil)
+            != (candidate.verification?.designation == nil) {
+            return existing.verification?.designation == nil ? candidate : existing
         }
         if (existing.avatarURL == nil) != (candidate.avatarURL == nil) {
             return existing.avatarURL == nil ? candidate : existing

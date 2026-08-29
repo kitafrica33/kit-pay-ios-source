@@ -102,6 +102,125 @@ final class MessageBackupTests: XCTestCase {
         XCTAssertEqual(payload.messages.map(\.body), ["hello"])
     }
 
+    func testSnapshotOmitsOrphanedAndLegacyTimelineMetadataBeforeCreateAndRestore() throws {
+        var state = makeState()
+        let targetID = try XCTUnwrap(state.messages[0].serverMessageId)
+        let validReaction = try XCTUnwrap(KitMessageReaction(
+            operation: .add,
+            targetServerMessageID: targetID,
+            emoji: "❤️"
+        ))
+        let validReactionID = UUID(
+            uuidString: "0a1b2c3d-0000-4000-8000-000000000007"
+        )!
+        state.messages.append(LocalMessage(
+            id: validReactionID,
+            serverMessageId: validReactionID.uuidString.lowercased(),
+            conversationId: conversationID,
+            senderId: otherUserID,
+            body: validReaction.encoded,
+            createdAt: Date(timeIntervalSince1970: 1_700_000_050),
+            sentAt: Date(timeIntervalSince1970: 1_700_000_051),
+            state: .received,
+            failureReason: nil,
+            isOutgoing: false,
+            secureMessagingHistory: SecureMessagingRetainedMessageMetadata(
+                clientMessageID: "0a1b2c3d-0000-4000-8000-000000000008",
+                senderUserID: otherUserID,
+                senderDeviceID: "0a1b2c3d-0000-4000-8000-000000000009",
+                senderEnrollmentEpoch: 1,
+                senderSignalDeviceID: 2,
+                rosterRevision: "v1:sha256:" + String(repeating: "c", count: 64),
+                kind: .encryptedReaction,
+                replyToMessageID: targetID
+            )
+        ))
+
+        let missingTargetID = "0a1b2c3d-0000-4000-8000-00000000eeee"
+        let reaction = try XCTUnwrap(KitMessageReaction(
+            operation: .add,
+            targetServerMessageID: missingTargetID,
+            emoji: "👍"
+        ))
+        let reactionID = UUID(uuidString: "0a1b2c3d-0000-4000-8000-000000000001")!
+        state.messages.append(LocalMessage(
+            id: reactionID,
+            serverMessageId: reactionID.uuidString.lowercased(),
+            conversationId: conversationID,
+            senderId: otherUserID,
+            body: reaction.encoded,
+            createdAt: Date(timeIntervalSince1970: 1_700_000_100),
+            sentAt: Date(timeIntervalSince1970: 1_700_000_101),
+            state: .received,
+            failureReason: nil,
+            isOutgoing: false,
+            secureMessagingHistory: SecureMessagingRetainedMessageMetadata(
+                clientMessageID: "0a1b2c3d-0000-4000-8000-000000000002",
+                senderUserID: otherUserID,
+                senderDeviceID: "0a1b2c3d-0000-4000-8000-000000000003",
+                senderEnrollmentEpoch: 1,
+                senderSignalDeviceID: 2,
+                rosterRevision: "v1:sha256:" + String(repeating: "a", count: 64),
+                kind: .encryptedReaction,
+                replyToMessageID: missingTargetID
+            )
+        ))
+
+        let edit = try XCTUnwrap(KitMessageEdit(
+            targetServerMessageID: targetID,
+            body: "Corrected wording"
+        ))
+        let editID = UUID(uuidString: "0a1b2c3d-0000-4000-8000-000000000004")!
+        state.messages.append(LocalMessage(
+            id: editID,
+            serverMessageId: editID.uuidString.lowercased(),
+            conversationId: conversationID,
+            senderId: userID,
+            body: edit.encoded,
+            createdAt: Date(timeIntervalSince1970: 1_700_000_200),
+            sentAt: Date(timeIntervalSince1970: 1_700_000_201),
+            state: .sent,
+            failureReason: nil,
+            isOutgoing: true,
+            secureMessagingHistory: SecureMessagingRetainedMessageMetadata(
+                clientMessageID: "0a1b2c3d-0000-4000-8000-000000000005",
+                // A pre-sender-binding build cannot prove who authored this correction.
+                senderUserID: nil,
+                senderDeviceID: "0a1b2c3d-0000-4000-8000-000000000006",
+                senderEnrollmentEpoch: 1,
+                senderSignalDeviceID: 2,
+                rosterRevision: "v1:sha256:" + String(repeating: "b", count: 64),
+                kind: .encryptedEdit,
+                replyToMessageID: targetID
+            )
+        ))
+
+        let payload = MessageBackupPayload.snapshot(
+            of: state,
+            userID: userID,
+            deviceName: "Kit iPhone",
+            includesMedia: false,
+            createdAt: Date(timeIntervalSince1970: 1_700_001_000)
+        )
+
+        XCTAssertEqual(payload.messages.map(\.body), ["hello", validReaction.encoded])
+        XCTAssertNoThrow(try MessageBackupValidationPolicy.validate(
+            payload,
+            expectedUserID: userID,
+            now: validationNow
+        ))
+
+        let encrypted = try MessageBackupCrypto.encrypt(payload, key: key)
+        let restoredPayload = try MessageBackupCrypto.decrypt(encrypted, key: key)
+        var restored = PersistedState.empty
+        try MessageBackupRestorePolicy.merge(
+            restoredPayload,
+            into: &restored,
+            currentUserID: userID
+        )
+        XCTAssertEqual(restored.messages.map(\.body), ["hello", validReaction.encoded])
+    }
+
     func testSnapshotExcludesServerLifecycleNoticesWithoutRestorableProvenance() throws {
         var state = makeState()
         state.messages.append(LocalMessage(

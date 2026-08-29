@@ -123,6 +123,24 @@ final class MessagingAPIContractTests: XCTestCase {
         XCTAssertNil(legacy.photoUrl)
     }
 
+    func testConversationMemberDecodesPublicIdentityAndFailsClosedPerField() throws {
+        let decoder = JSONDecoder()
+        let member = try decoder.decode(
+            MessagingConversationMemberDTO.self,
+            from: Data(#"{"user_id":"11111111-1111-4111-8111-111111111111","name":"Amina","role":"member","avatar_url":"https://pay.kit.africa/amina.jpg","verification":{"designation":"official","since":"2026-08-29T08:00:00Z"}}"#.utf8)
+        )
+        XCTAssertEqual(member.avatarUrl, "https://pay.kit.africa/amina.jpg")
+        XCTAssertEqual(member.verification?.designation, .official)
+
+        let malformed = try decoder.decode(
+            MessagingConversationMemberDTO.self,
+            from: Data(#"{"user_id":"11111111-1111-4111-8111-111111111111","name":"Amina","role":"member","avatar_url":42,"verification":"verified"}"#.utf8)
+        )
+        XCTAssertEqual(malformed.name, "Amina")
+        XCTAssertNil(malformed.avatarUrl)
+        XCTAssertNil(malformed.verification)
+    }
+
     func testConversationModelDecodesStateWrittenBeforeGroupIdentity() throws {
         // The PersistedState rule: every added field is Optional with a default, so encrypted
         // state written by earlier builds keeps decoding. This is that rule, held by a test.
@@ -131,6 +149,7 @@ final class MessagingAPIContractTests: XCTestCase {
         let decoded = try JSONDecoder().decode(Conversation.self, from: Data(legacy.utf8))
         XCTAssertNil(decoded.groupDescription)
         XCTAssertNil(decoded.groupPhotoURL)
+        XCTAssertNil(decoded.memberIdentities)
     }
 
     func testConversationFiltersMatchAllAndUnreadSemantics() {

@@ -190,7 +190,8 @@ struct RootView: View {
                     unreadMessageCount: model.state.conversations.reduce(0) { $0 + $1.unreadCount },
                     queuedCount: model.queuedCount,
                     profileName: model.profile?.identityDisplayName ?? "Kit Pay",
-                    profileAvatarURL: model.profile?.avatarURL
+                    profileAvatarURL: model.profile?.avatarURL,
+                    profileVerification: model.profile?.verification?.designation
                 )
                 .background {
                     GeometryReader { proxy in
@@ -659,6 +660,7 @@ private struct FloatingTabBar: View {
     /// The signed-in customer, for the Profile tab's own photo.
     let profileName: String
     let profileAvatarURL: String?
+    let profileVerification: AccountVerificationDesignation?
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
@@ -890,7 +892,8 @@ private struct FloatingTabBar: View {
                 name: profileName,
                 avatarURL: profileAvatarURL,
                 size: tabIconSize + 4,
-                ringOpacity: nil
+                ringOpacity: nil,
+                verification: profileVerification
             )
             .overlay {
                 Circle()

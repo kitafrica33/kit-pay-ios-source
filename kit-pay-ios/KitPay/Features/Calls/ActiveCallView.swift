@@ -639,7 +639,8 @@ struct ActiveCallView: View {
                             CallParticipantAvatarView(
                                 name: call.participantName,
                                 avatarURL: call.participantAvatarURL,
-                                size: avatarSize
+                                size: avatarSize,
+                                verification: call.participantVerification
                             )
                         }
                         if !compactLandscape {
@@ -1157,7 +1158,8 @@ struct ActiveCallView: View {
     private var groupParticipantTiles: [GroupCallParticipantTileModel] {
         var contactsByUserID: [String: WalletContactDTO] = [:]
         for contact in model.contactDirectory where contact.isKitUser == true {
-            guard let id = UUID(uuidString: contact.id)?.uuidString.lowercased(),
+            guard let rawID = ContactRecipientDirectory.recipientUserId(for: contact),
+                  let id = UUID(uuidString: rawID)?.uuidString.lowercased(),
                   contactsByUserID[id] == nil
             else { continue }
             contactsByUserID[id] = contact
@@ -1174,7 +1176,8 @@ struct ActiveCallView: View {
                     contactName: contact?.name,
                     serverName: participant.name
                 ),
-                avatarURL: contact?.avatarURL,
+                avatarURL: userID.flatMap { model.contactAvatarURL(forUserID: $0) },
+                verification: userID.flatMap { model.contactVerification(forUserID: $0) },
                 videoTrack: participant.preferredVideoTrack,
                 isScreenSharing: participant.isScreenSharing,
                 isSpeaking: participant.isSpeaking
@@ -1464,6 +1467,7 @@ private struct GroupCallParticipantTileModel: Identifiable {
     let id: String
     let name: String
     let avatarURL: String?
+    let verification: AccountVerificationDesignation?
     let videoTrack: VideoTrack?
     let isScreenSharing: Bool
     let isSpeaking: Bool
@@ -1556,7 +1560,8 @@ private struct GroupCallParticipantTile: View {
                     CallParticipantAvatarView(
                         name: participant.name,
                         avatarURL: participant.avatarURL,
-                        size: avatarSize
+                        size: avatarSize,
+                        verification: participant.verification
                     )
                 }
             }
@@ -1712,7 +1717,8 @@ private struct ActiveCallParticipantSheet: View {
                                     RemoteAvatarView(
                                         name: contact.name,
                                         avatarURL: contact.source?.avatarURL,
-                                        size: 42
+                                        size: 42,
+                                        verification: contact.source?.verification?.designation
                                     )
                                     VStack(alignment: .leading, spacing: 3) {
                                         Text(contact.name)
@@ -2079,7 +2085,8 @@ struct MinimizedCallView: View {
                     CallParticipantAvatarView(
                         name: call.participantName,
                         avatarURL: call.participantAvatarURL,
-                        size: 38
+                        size: 38,
+                        verification: call.participantVerification
                     )
                     VStack(alignment: .leading, spacing: 2) {
                         Text(call.participantName)
@@ -2406,7 +2413,8 @@ struct MinimizedCallView: View {
                     CallParticipantAvatarView(
                         name: call.participantName,
                         avatarURL: call.participantAvatarURL,
-                        size: min(size.width * 0.58, 82)
+                        size: min(size.width * 0.58, 82),
+                        verification: call.participantVerification
                     )
                 }
             }
@@ -2859,9 +2867,16 @@ private struct CallParticipantAvatarView: View {
     let name: String
     let avatarURL: String?
     let size: CGFloat
+    var verification: AccountVerificationDesignation? = nil
 
     var body: some View {
-        RemoteAvatarView(name: name, avatarURL: avatarURL, size: size, ringOpacity: 0.22)
+        RemoteAvatarView(
+            name: name,
+            avatarURL: avatarURL,
+            size: size,
+            ringOpacity: 0.22,
+            verification: verification
+        )
     }
 }
 

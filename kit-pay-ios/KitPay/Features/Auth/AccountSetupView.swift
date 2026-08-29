@@ -185,12 +185,24 @@ private struct ProfileSetupView: View {
                     RemoteAvatarView(
                         name: displayNamePreview,
                         avatarURL: model.profile?.avatarURL,
-                        size: 96
+                        size: 96,
+                        verification: model.profile?.verification?.designation
                     )
                 }
                 if isPreparingPhoto {
                     Circle().fill(.black.opacity(0.32)).frame(width: 96, height: 96)
                     ProgressView().tint(.white)
+                }
+            }
+            .overlay(alignment: .topTrailing) {
+                if preparedAvatarPreview != nil,
+                   let verification = model.profile?.verification?.designation {
+                    VerifiedAccountBadge(
+                        designation: verification,
+                        diameter: 29,
+                        hasContrastBorder: true
+                    )
+                    .offset(x: 4, y: -4)
                 }
             }
             .accessibilityElement(children: .ignore)

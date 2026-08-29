@@ -1340,7 +1340,8 @@ struct BankTransferView: View {
                         name: contact.name,
                         avatarURL: contact.avatarURL,
                         size: 46,
-                        ringOpacity: nil
+                        ringOpacity: nil,
+                        verification: contact.verification?.designation
                     )
                     .overlay(alignment: .bottomTrailing) {
                         Image(systemName: "building.columns.fill")

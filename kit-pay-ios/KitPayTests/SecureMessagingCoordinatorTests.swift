@@ -687,7 +687,9 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
             id: conversationID,
             userID: userID,
             peerID: peerID,
-            peerName: "ExampleContact"
+            peerName: "ExampleContact",
+            peerAvatarURL: "https://pay.kit.africa/media/example-contact.jpg",
+            peerVerification: AccountVerificationDTO(designation: .verified)
         )
         let transport = SuspendedMessagingExchangeTransport(
             scenario: .createConversation(response)
@@ -715,6 +717,14 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
         XCTAssertEqual(stored.count, 1)
         XCTAssertEqual(stored[0].id, conversationID)
         XCTAssertEqual(stored[0].unreadCount, 9)
+        XCTAssertEqual(
+            stored[0].memberIdentity(for: peerID)?.avatarURL,
+            "https://pay.kit.africa/media/example-contact.jpg"
+        )
+        XCTAssertEqual(
+            stored[0].memberIdentity(for: peerID)?.verification?.designation,
+            .verified
+        )
     }
 
     func testEnsureDirectConversationRejectsUnexpectedBoundConversationIDWithoutPersisting() async throws {
@@ -4625,7 +4635,9 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
         id: String,
         userID: String,
         peerID: String,
-        peerName: String
+        peerName: String,
+        peerAvatarURL: String? = nil,
+        peerVerification: AccountVerificationDTO? = nil
     ) -> MessagingConversationDTO {
         MessagingConversationDTO(
             id: id,
@@ -4645,7 +4657,9 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
                     userId: peerID,
                     name: peerName,
                     role: "member",
-                    joinedAt: "2026-08-22T10:00:00Z"
+                    joinedAt: "2026-08-22T10:00:00Z",
+                    avatarUrl: peerAvatarURL,
+                    verification: peerVerification
                 ),
             ],
             createdAt: "2026-08-22T10:00:00Z",

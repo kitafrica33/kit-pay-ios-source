@@ -954,6 +954,36 @@ final class ContactSyncTests: XCTestCase {
         )
     }
 
+    func testConversationPresentationUsesAuthenticatedMemberIdentityBeforeContactSync() throws {
+        let currentUserID = "550e8400-e29b-41d4-a716-446655440001"
+        let strangerID = "550e8400-e29b-41d4-a716-446655440015"
+        let identity = try XCTUnwrap(AccountIdentityProjection(
+            displayName: "Amina",
+            avatarURL: "https://pay.kit.africa/media/amina.jpg",
+            verification: AccountVerificationDTO(designation: .verified)
+        ))
+        let conversation = Conversation(
+            id: "550e8400-e29b-41d4-a716-446655440099",
+            title: "Amina",
+            participantUserIds: [currentUserID, strangerID],
+            unreadCount: 0,
+            updatedAt: Date(timeIntervalSince1970: 1_700_000_000),
+            memberIdentities: [strangerID: identity]
+        )
+
+        let presentation = ConversationContactPresentationPolicy.presentation(
+            for: conversation,
+            currentUserID: currentUserID,
+            contacts: []
+        )
+
+        XCTAssertEqual(presentation.recipientUserID, strangerID)
+        XCTAssertEqual(presentation.displayName, "Amina")
+        XCTAssertEqual(presentation.avatarURL, "https://pay.kit.africa/media/amina.jpg")
+        XCTAssertEqual(presentation.verification, .verified)
+        XCTAssertNil(presentation.contact)
+    }
+
     func testConversationPresentationNeverGuessesRecipientFromAmbiguousRoster() {
         let conversation = Conversation(
             id: "550e8400-e29b-41d4-a716-446655440099",

@@ -673,7 +673,8 @@ struct SendMoneyView: View {
                         RemoteAvatarView(
                             name: selectedContact.name,
                             avatarURL: selectedContact.avatarURL,
-                            size: 38
+                            size: 38,
+                            verification: selectedContact.verification?.designation
                         )
                         VStack(alignment: .leading) {
                             Text(selectedContact.name).font(.headline)
@@ -778,7 +779,8 @@ struct SendMoneyView: View {
                     RemoteAvatarView(
                         name: selectedContact.name,
                         avatarURL: selectedContact.avatarURL,
-                        size: 70
+                        size: 70,
+                        verification: selectedContact.verification?.designation
                     )
                     Text(selectedContact.name).font(.title2.bold())
                     Text(displayedAmount)
@@ -1139,7 +1141,8 @@ struct RequestMoneyView: View {
                                         RemoteAvatarView(
                                             name: contact.name,
                                             avatarURL: contact.avatarURL,
-                                            size: 50
+                                            size: 50,
+                                            verification: contact.verification?.designation
                                         )
                                         // A tile this narrow cannot show most full names, and a
                                         // first name alone is ambiguous between contacts. Long
@@ -1682,7 +1685,8 @@ struct TransactionDetailView: View {
                 RemoteAvatarView(
                     name: transaction.counterparty?.name ?? "Kit Pay",
                     avatarURL: model.contactAvatarURL(forUserID: transaction.counterparty?.id),
-                    size: 68
+                    size: 68,
+                    verification: model.contactVerification(forUserID: transaction.counterparty?.id)
                 )
                 Text(transaction.counterparty?.name ?? transaction.type.displayLabel)
                     .font(.title2.bold())

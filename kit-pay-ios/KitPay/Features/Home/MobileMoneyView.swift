@@ -1161,7 +1161,8 @@ struct MobileMoneyView: View {
                 name: contact.name,
                 avatarURL: contact.avatarURL,
                 size: 44,
-                ringOpacity: nil
+                ringOpacity: nil,
+                verification: contact.verification?.designation
             )
         } else {
             Image(systemName: "iphone.gen3")

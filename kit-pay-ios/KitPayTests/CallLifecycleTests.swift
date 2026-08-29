@@ -3787,7 +3787,8 @@ final class CallLifecycleTests: XCTestCase {
         let avatarURL = "https://cdn.example.test/alice.jpg"
         let handoff = try CallMediaHandoff(
             session: session,
-            participantAvatarURL: avatarURL
+            participantAvatarURL: avatarURL,
+            participantVerification: .official
         )
         let presentation = ActiveCallPresentation(handoff)
 
@@ -3800,9 +3801,75 @@ final class CallLifecycleTests: XCTestCase {
         XCTAssertEqual(handoff.url.absoluteString, "wss://calls.example.test")
         XCTAssertEqual(handoff.token, "room-token")
         XCTAssertEqual(handoff.participantAvatarURL, avatarURL)
+        XCTAssertEqual(handoff.participantVerification, .official)
         XCTAssertEqual(presentation.participantAvatarURL, avatarURL)
+        XCTAssertEqual(presentation.participantVerification, .official)
         XCTAssertEqual(presentation.conversationId, handoff.conversationId)
         XCTAssertTrue(handoff.video)
+    }
+
+    func testCallParticipantsProvideFirstSightingIdentityAndRequireExactRoster() throws {
+        let localID = "550e8400-e29b-41d4-a716-446655440001"
+        let remoteID = "550e8400-e29b-41d4-a716-446655440002"
+        let json = """
+        {
+          "id": "550e8400-e29b-41d4-a716-446655440000",
+          "name": "Amina",
+          "participant_user_ids": ["\(localID)", "\(remoteID)"],
+          "participants": [
+            {"user_id":"\(localID)","name":"Arnold"},
+            {"user_id":"\(remoteID)","name":"Amina","avatar_url":"https://pay.kit.africa/amina.jpg","verification":{"designation":"official_support"}}
+          ],
+          "direction": "incoming",
+          "type": "voice",
+          "state": "ringing",
+          "started_at": "2026-08-29T08:00:00Z"
+        }
+        """
+        let call = try JSONDecoder().decode(CallDTO.self, from: Data(json.utf8))
+        let identities = try XCTUnwrap(CallParticipantIdentityPolicy.validated(
+            call.participants,
+            matching: call.participantUserIds
+        ))
+        XCTAssertEqual(identities[remoteID]?.displayName, "Amina")
+        XCTAssertEqual(identities[remoteID]?.avatarURL, "https://pay.kit.africa/amina.jpg")
+        XCTAssertEqual(identities[remoteID]?.verification?.designation, .officialSupport)
+
+        XCTAssertNil(CallParticipantIdentityPolicy.validated(
+            call.participants,
+            matching: [localID]
+        ))
+    }
+
+    func testMalformedOptionalCallParticipantIdentityDoesNotDropCallOrGrantBadge() throws {
+        let json = """
+        {
+          "id": "550e8400-e29b-41d4-a716-446655440000",
+          "name": "Amina",
+          "participant_user_ids": ["550e8400-e29b-41d4-a716-446655440002"],
+          "participants": [{
+            "user_id":"550e8400-e29b-41d4-a716-446655440002",
+            "name":"Amina",
+            "avatar_url":42,
+            "verification":"verified"
+          }],
+          "direction": "incoming",
+          "type": "voice",
+          "state": "ringing",
+          "started_at": "2026-08-29T08:00:00Z"
+        }
+        """
+        let call = try JSONDecoder().decode(CallDTO.self, from: Data(json.utf8))
+        let identities = try XCTUnwrap(CallParticipantIdentityPolicy.validated(
+            call.participants,
+            matching: call.participantUserIds
+        ))
+        let identity = try XCTUnwrap(
+            identities["550e8400-e29b-41d4-a716-446655440002"]
+        )
+        XCTAssertEqual(identity.displayName, "Amina")
+        XCTAssertNil(identity.avatarURL)
+        XCTAssertNil(identity.verification)
     }
 
     func testMediaHandoffRefreshesOnlyRTCForTheSameRoom() throws {
@@ -3830,7 +3897,8 @@ final class CallLifecycleTests: XCTestCase {
                 room: "call-room",
                 expiresAt: "2026-08-18T12:05:00Z"
             ),
-            participantAvatarURL: avatarURL
+            participantAvatarURL: avatarURL,
+            participantVerification: .officialSupport
         )
 
         let refreshed = try original.refreshingRTC(
@@ -3846,6 +3914,7 @@ final class CallLifecycleTests: XCTestCase {
         XCTAssertEqual(refreshed.conversationId, conversationId)
         XCTAssertEqual(refreshed.participantName, original.participantName)
         XCTAssertEqual(refreshed.participantAvatarURL, avatarURL)
+        XCTAssertEqual(refreshed.participantVerification, .officialSupport)
         XCTAssertEqual(refreshed.direction, "incoming")
         XCTAssertEqual(refreshed.video, original.video)
         XCTAssertEqual(refreshed.room, original.room)
