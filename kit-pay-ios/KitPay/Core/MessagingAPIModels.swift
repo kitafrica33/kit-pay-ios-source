@@ -17,7 +17,13 @@ enum SecureMessageReservedPrefixPolicy {
     /// by every composer, forwarding and notification-reply boundary.
     static func allowsUserAuthoredText(_ text: String) -> Bool {
         !beginsWithReservedPrefix(text, prefix: KitPaymentMessage.prefix)
+            && !beginsWithReservedPrefix(text, prefix: KitScheduledPaymentMessage.prefix)
+            && !beginsWithReservedPrefix(
+                text,
+                prefix: KitScheduledGroupPaymentOutcomeMessage.prefix
+            )
             && !beginsWithReservedPrefix(text, prefix: KitGroupPaymentMessage.prefix)
+            && !beginsWithReservedPrefix(text, prefix: KitGroupPaymentRequestMessage.prefix)
             && !beginsWithReservedPrefix(text, prefix: KitSystemMessage.prefix)
             && !beginsWithReservedPrefix(text, prefix: KitMessageReaction.prefix)
             && !beginsWithReservedPrefix(text, prefix: KitMessageEdit.prefix)
@@ -2171,6 +2177,37 @@ struct MessagingSyncEventDataDTO: Decodable, Equatable, Sendable {
     /// Reserved for older event families. Build-24 membership events carry only the subject and
     /// optional role; an actor is not part of the authenticated lifecycle contract.
     let actorUserId: String?
+    /// Server-authoritative collaborative-payment metadata. These fields deliberately contain
+    /// no wallet identifiers, transaction identifiers, note text, or approval material. They are
+    /// optional because the same sync envelope carries unrelated messaging event families.
+    var schema: String? = nil
+    var groupPaymentRequestId: String? = nil
+    var requesterUserId: String? = nil
+    var status: String? = nil
+    var targetAmountMinor: String? = nil
+    var contributedAmountMinor: String? = nil
+    var remainingAmountMinor: String? = nil
+    var currency: String? = nil
+    var currencyScale: Int? = nil
+    var progressBasisPoints: Int? = nil
+    var contributionId: String? = nil
+    var contributorUserId: String? = nil
+    var contributionAmountMinor: String? = nil
+    /// Server-authoritative scheduled-payment terminal metadata. These stay optional because the
+    /// same envelope carries ordinary messaging and group-payment events.
+    var scheduledPaymentId: String? = nil
+    var scheduledGroupPaymentId: String? = nil
+    var groupPaymentId: String? = nil
+    var senderUserId: String? = nil
+    var recipientUserId: String? = nil
+    var amountMinor: String? = nil
+    var scheduledFor: String? = nil
+    var walletTransactionId: String? = nil
+    var failureCode: String? = nil
+    var failureMessage: String? = nil
+    var completedAt: String? = nil
+    var cancelledAt: String? = nil
+    var note: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case id, sender, kind, envelope, attachments, reactions, role
@@ -2208,6 +2245,30 @@ struct MessagingSyncEventDataDTO: Decodable, Equatable, Sendable {
         case deliveryState = "delivery_state"
         case deliveredAt = "delivered_at"
         case actorUserId = "actor_user_id"
+        case schema, status, currency
+        case groupPaymentRequestId = "group_payment_request_id"
+        case requesterUserId = "requester_user_id"
+        case targetAmountMinor = "target_amount_minor"
+        case contributedAmountMinor = "contributed_amount_minor"
+        case remainingAmountMinor = "remaining_amount_minor"
+        case currencyScale = "currency_scale"
+        case progressBasisPoints = "progress_basis_points"
+        case contributionId = "contribution_id"
+        case contributorUserId = "contributor_user_id"
+        case contributionAmountMinor = "contribution_amount_minor"
+        case scheduledPaymentId = "scheduled_payment_id"
+        case scheduledGroupPaymentId = "scheduled_group_payment_id"
+        case groupPaymentId = "group_payment_id"
+        case senderUserId = "sender_user_id"
+        case recipientUserId = "recipient_user_id"
+        case amountMinor = "amount_minor"
+        case scheduledFor = "scheduled_for"
+        case walletTransactionId = "wallet_transaction_id"
+        case failureCode = "failure_code"
+        case failureMessage = "failure_message"
+        case completedAt = "completed_at"
+        case cancelledAt = "cancelled_at"
+        case note
     }
 }
 

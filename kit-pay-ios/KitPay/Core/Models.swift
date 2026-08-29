@@ -512,6 +512,9 @@ extension CapabilitiesDTO {
 
 struct CapabilityProtocolsDTO: Decodable {
     let messaging: MessagingProtocolCapabilityDTO?
+    /// Additive payment protocols. A malformed advertisement disables only the affected payment
+    /// surface; it must never invalidate authentication or ordinary wallet capabilities.
+    var payments: PaymentProtocolsCapabilityDTO? = nil
     /// Realtime is an additive transport hint. A malformed advertisement must disable only the
     /// socket path rather than making the entire capabilities response unusable.
     var realtime: RealtimeProtocolCapabilityDTO? = nil
@@ -522,15 +525,17 @@ struct CapabilityProtocolsDTO: Decodable {
     var support: SupportProtocolDTO? = nil
 
     private enum CodingKeys: String, CodingKey {
-        case messaging, realtime, support
+        case messaging, payments, realtime, support
     }
 
     init(
         messaging: MessagingProtocolCapabilityDTO?,
+        payments: PaymentProtocolsCapabilityDTO? = nil,
         realtime: RealtimeProtocolCapabilityDTO? = nil,
         support: SupportProtocolDTO? = nil
     ) {
         self.messaging = messaging
+        self.payments = payments
         self.realtime = realtime
         self.support = support
     }
@@ -540,6 +545,10 @@ struct CapabilityProtocolsDTO: Decodable {
         messaging = try values.decodeIfPresent(
             MessagingProtocolCapabilityDTO.self,
             forKey: .messaging
+        )
+        payments = try? values.decodeIfPresent(
+            PaymentProtocolsCapabilityDTO.self,
+            forKey: .payments
         )
         realtime = try? values.decodeIfPresent(
             RealtimeProtocolCapabilityDTO.self,
@@ -3317,6 +3326,61 @@ struct ScheduledPaymentRequestPayload: Codable, Hashable, Sendable {
     let recipientName: String
     /// The chat the confirmed request should be shared into, when it was scheduled from one.
     let conversationID: String?
+    /// Set only after the idempotent server create returned an exact, validated request. The
+    /// schedule command remains durable with this receipt until the matching encrypted chat card
+    /// is also durable, closing the crash window between those two commits.
+    var confirmedRequest: ScheduledPaymentRequestConfirmation? = nil
+}
+
+struct ScheduledPaymentRequestConfirmation: Codable, Hashable, Sendable {
+    let requestID: String
+    let encodedDescriptor: String
+
+    var clientMessageID: UUID? { UUID(uuidString: requestID) }
+
+    init?(
+        request: PaymentRequestDTO,
+        payload: ScheduledPaymentRequestPayload
+    ) {
+        guard let requestID = Self.canonicalUUID(request.id),
+              let recipientID = Self.canonicalUUID(request.requestedFromUserId),
+              recipientID == Self.canonicalUUID(payload.requestedFromUserID),
+              request.type == "payment_request",
+              request.knownStatus == .pending,
+              request.destinationWalletId == payload.destinationWalletID,
+              request.currency.code == payload.currencyCode,
+              request.amount == payload.amount,
+              request.note == payload.note,
+              let descriptor = KitPaymentMessage(action: .request, paymentRequest: request)
+        else { return nil }
+        self.requestID = requestID
+        encodedDescriptor = descriptor.encoded
+    }
+
+    func isValid(for payload: ScheduledPaymentRequestPayload) -> Bool {
+        guard let requestID = Self.canonicalUUID(requestID),
+              let clientMessageID,
+              clientMessageID.uuidString.lowercased() == requestID,
+              let descriptor = KitPaymentMessage.parse(encodedDescriptor),
+              descriptor.action == .request,
+              descriptor.paymentRequestId == requestID,
+              descriptor.currencyCode == payload.currencyCode,
+              KitPaymentMessage.minorUnits(
+                  for: payload.amount,
+                  scale: descriptor.currencyScale
+              ) == descriptor.amountMinor,
+              descriptor.note == payload.note
+        else { return false }
+        return true
+    }
+
+    private static func canonicalUUID(_ value: String?) -> String? {
+        guard let value,
+              value == value.trimmingCharacters(in: .whitespacesAndNewlines),
+              let uuid = UUID(uuidString: value)
+        else { return nil }
+        return uuid.uuidString.lowercased()
+    }
 }
 
 enum OfflineCommandFailureDisposition: String, Codable, Hashable {

@@ -25,6 +25,7 @@ final class WalletFlowModel: ObservableObject {
     @Published private(set) var isLoadingContacts = false
     @Published private(set) var isSubmitting = false
     @Published private(set) var sentTransaction: WalletTransaction?
+    @Published private(set) var scheduledPayment: ScheduledPaymentDTO?
     @Published private(set) var createdRequest: PaymentRequestDTO?
     @Published private(set) var paymentPinConfigured = false
     /// The debit the server refused for want of funds. The device's own balance can be a moment
@@ -35,6 +36,7 @@ final class WalletFlowModel: ObservableObject {
 
     private let api: APIClient
     private var pendingRequestSubmission: (fingerprint: String, idempotencyKey: String)?
+    private var pendingScheduledPaymentSubmission: (fingerprint: String, idempotencyKey: String)?
     let secureShareSession = KitPaymentRequestSecureShareSession()
 
     init(api: APIClient = .shared) {
@@ -79,6 +81,7 @@ final class WalletFlowModel: ObservableObject {
         ]
 
         do {
+            scheduledPayment = nil
             let verification = try await authorize(
                 "wallet_transfer",
                 intent,
@@ -93,6 +96,127 @@ final class WalletFlowModel: ObservableObject {
                 idempotencyKey: "ios-transfer-\(UUID().uuidString.lowercased())",
                 stepUpToken: verification.stepUpToken
             )
+            return true
+        } catch {
+            if WalletTopUpPolicy.isInsufficientFunds(error) {
+                insufficientFundsDebitAmount = amount
+            }
+            errorMessage = message(for: error)
+            return false
+        }
+    }
+
+    /// Creates a server-side instruction after one exact biometric/PIN approval. The server, not
+    /// this phone, owns execution, so locking or terminating the app cannot make the payment miss
+    /// its time. A retained idempotency key makes an ambiguous network retry safe.
+    func schedule(
+        from wallet: Wallet,
+        to contact: WalletContactDTO,
+        enteredAmount: String,
+        note: String,
+        deliverAt requestedDate: Date,
+        conversationID rawConversationID: String?,
+        pin: String,
+        authorize: KitFinancialStepUpAuthorization,
+        now: Date = Date()
+    ) async -> Bool {
+        guard !isSubmitting else { return false }
+        guard let destinationWalletID = contact.receivingWalletId,
+              ScheduledPaymentValidation.canonicalUUID(wallet.id) != nil,
+              ScheduledPaymentValidation.canonicalUUID(destinationWalletID) != nil
+        else {
+            errorMessage = "This contact cannot receive Kit Pay transfers yet."
+            return false
+        }
+        guard let amount = WalletMoney.apiAmount(
+            enteredAmount,
+            scale: wallet.currency.decimalScale
+        ) else {
+            errorMessage = "Enter an amount greater than zero."
+            return false
+        }
+        guard let scheduledFor = ScheduledSendPolicy.normalize(requestedDate, now: now) else {
+            errorMessage = "Choose a time from one minute to one year from now."
+            return false
+        }
+        let conversationID: String?
+        if let rawConversationID {
+            guard let canonical = ScheduledPaymentValidation.canonicalUUID(rawConversationID) else {
+                errorMessage = "This conversation is no longer available. Nothing was scheduled."
+                return false
+            }
+            conversationID = canonical
+        } else {
+            conversationID = nil
+        }
+        let cleanNote = note.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        guard (cleanNote?.utf16.count ?? 0) <= 280 else {
+            errorMessage = "Keep the payment note to 280 characters or fewer."
+            return false
+        }
+        let scheduledForText = ScheduledPaymentDates.apiString(scheduledFor)
+        let fingerprint = [
+            wallet.id.lowercased(),
+            destinationWalletID.lowercased(),
+            amount,
+            cleanNote ?? "",
+            scheduledForText,
+            conversationID ?? "",
+        ].joined(separator: "\u{1F}")
+        let idempotencyKey: String
+        if let pendingScheduledPaymentSubmission,
+           pendingScheduledPaymentSubmission.fingerprint == fingerprint {
+            idempotencyKey = pendingScheduledPaymentSubmission.idempotencyKey
+        } else {
+            idempotencyKey = "ios-scheduled-payment-\(UUID().uuidString.lowercased())"
+            pendingScheduledPaymentSubmission = (fingerprint, idempotencyKey)
+        }
+
+        isSubmitting = true
+        errorMessage = nil
+        insufficientFundsDebitAmount = nil
+        defer { isSubmitting = false }
+        let intent = ScheduledPaymentPolicy.intent(
+            sourceWalletID: wallet.id,
+            destinationWalletID: destinationWalletID,
+            amount: amount,
+            currencyCode: wallet.currency.code,
+            note: cleanNote,
+            scheduledFor: scheduledFor,
+            conversationID: conversationID
+        )
+        do {
+            let verification = try await authorize(
+                "scheduled_payment",
+                intent,
+                pin,
+                "Approve scheduling \(KitMoney.formatted(amount, currency: wallet.currency)) to \(contact.name)"
+            )
+            let created = try await api.createScheduledPayment(
+                body: CreateScheduledPaymentBody(
+                    sourceWalletId: wallet.id,
+                    destinationWalletId: destinationWalletID,
+                    conversationId: conversationID,
+                    amount: amount,
+                    note: cleanNote,
+                    scheduledFor: scheduledForText
+                ),
+                idempotencyKey: idempotencyKey,
+                stepUpToken: verification.stepUpToken
+            )
+            guard ScheduledPaymentPolicy.confirms(
+                created,
+                sourceWalletID: wallet.id,
+                destinationWalletID: destinationWalletID,
+                amount: amount,
+                currency: wallet.currency,
+                note: cleanNote,
+                scheduledFor: scheduledFor,
+                conversationID: conversationID
+            ) else { throw WalletFlowError.unconfirmedScheduledPayment }
+            sentTransaction = nil
+            scheduledPayment = created
+            pendingScheduledPaymentSubmission = nil
             return true
         } catch {
             if WalletTopUpPolicy.isInsufficientFunds(error) {
@@ -241,13 +365,17 @@ struct SendMoneyView: View {
     @State private var setupPin = ""
     @State private var setupPinConfirmation = ""
     @State private var showingConfirmation = false
+    @State private var isPickingScheduledTime = false
+    @State private var scheduledFor: Date?
     /// Non-nil while the customer is topping up to cover this very payment.
     @State private var topUpRequest: WalletTopUpRequirement?
     private let preselectedRecipientUserID: String?
+    private let conversationID: String?
     private let locksRecipientSelection: Bool
     /// Set by chat: after a confirmed transfer, shares the transaction into the conversation as
     /// an encrypted payment event. Best-effort — a failed share never affects the transfer.
     private let shareTransferInChat: ((WalletTransaction) async -> Bool)?
+    private let scheduledPaymentCreated: ((ScheduledPaymentDTO) -> Void)?
 
     /// Chat opens this flow with the conversation's recipient already chosen, mirroring
     /// `RequestMoneyView`: the amount step comes first and the recipient cannot be swapped.
@@ -255,16 +383,20 @@ struct SendMoneyView: View {
         flow: WalletFlowModel,
         preselectedContact: WalletContactDTO? = nil,
         preselectedRecipientUserID: String? = nil,
+        conversationID: String? = nil,
         locksRecipientSelection: Bool = false,
-        shareTransferInChat: ((WalletTransaction) async -> Bool)? = nil
+        shareTransferInChat: ((WalletTransaction) async -> Bool)? = nil,
+        scheduledPaymentCreated: ((ScheduledPaymentDTO) -> Void)? = nil
     ) {
         self.flow = flow
         self.preselectedRecipientUserID = preselectedRecipientUserID
             ?? preselectedContact.flatMap {
                 ContactRecipientDirectory.recipientUserId(for: $0)
             }
+        self.conversationID = conversationID
         self.locksRecipientSelection = locksRecipientSelection
         self.shareTransferInChat = shareTransferInChat
+        self.scheduledPaymentCreated = scheduledPaymentCreated
         let initialContact = preselectedContact?.canReceiveTransfer == true
             ? preselectedContact
             : nil
@@ -337,6 +469,20 @@ struct SendMoneyView: View {
             updateContacts(contacts)
         }
         .sheet(isPresented: $showingConfirmation) { confirmationSheet }
+        .sheet(isPresented: $isPickingScheduledTime) {
+            ScheduleSendSheet(
+                title: "Schedule payment",
+                confirmTitle: "Continue",
+                preview: schedulePreview,
+                initialDate: scheduledFor,
+                onSchedule: { date in
+                    scheduledFor = date
+                    WalletTopUpPresentation.afterDismissal {
+                        showingConfirmation = true
+                    }
+                }
+            )
+        }
         .sheet(item: $topUpRequest) { requirement in
             WalletTopUpView(requirement: requirement) { covered in
                 // Straight back to the approval the customer was already committed to.
@@ -571,6 +717,7 @@ struct SendMoneyView: View {
                     if let requirement = topUpRequirement {
                         topUpRequest = requirement
                     } else {
+                        scheduledFor = nil
                         showingConfirmation = true
                     }
                 } label: {
@@ -588,6 +735,27 @@ struct SendMoneyView: View {
                             scale: model.selectedWallet?.currency.decimalScale ?? 2
                         ) == nil
                 )
+
+                if canSchedulePayment {
+                    Button {
+                        guard model.isOnline else {
+                            flow.errorMessage = "Connect to the internet to schedule a payment."
+                            return
+                        }
+                        isPickingScheduledTime = true
+                    } label: {
+                        Label("Send later", systemImage: "clock.badge.checkmark")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(KitSecondaryButtonStyle())
+                    .disabled(
+                        !model.appReviewDemoMutationsAllowed
+                            || WalletMoney.apiAmount(
+                                amount,
+                                scale: model.selectedWallet?.currency.decimalScale ?? 2
+                            ) == nil
+                    )
+                }
             }
             .padding(20)
         }
@@ -617,6 +785,20 @@ struct SendMoneyView: View {
                 }
                 .padding(17)
                 .kitGlass(cornerRadius: 18)
+
+                if let scheduledFor {
+                    Label {
+                        Text("Kit will send this payment from the server on \(scheduledFor.formatted(date: .abbreviated, time: .shortened)), even if this iPhone is offline.")
+                            .font(.footnote)
+                            .foregroundStyle(KitColor.secondaryText)
+                    } icon: {
+                        Image(systemName: "clock.badge.checkmark")
+                            .foregroundStyle(KitColor.green)
+                    }
+                    .padding(17)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .kitGlass(cornerRadius: 18, tint: KitColor.paleGreen, shadow: false)
+                }
 
                 if model.financialApprovalUsesBiometrics {
                     Label {
@@ -649,21 +831,38 @@ struct SendMoneyView: View {
                 Button {
                     guard let wallet = model.selectedWallet, let selectedContact else { return }
                     Task {
-                        if await flow.send(
-                            from: wallet,
-                            to: selectedContact,
-                            enteredAmount: amount,
-                            note: note,
-                            pin: pin,
-                            authorize: model.authorizeFinancialStepUp
-                        ) {
+                        let succeeded: Bool
+                        if let scheduledFor {
+                            succeeded = await flow.schedule(
+                                from: wallet,
+                                to: selectedContact,
+                                enteredAmount: amount,
+                                note: note,
+                                deliverAt: scheduledFor,
+                                conversationID: conversationID,
+                                pin: pin,
+                                authorize: model.authorizeFinancialStepUp
+                            )
+                        } else {
+                            succeeded = await flow.send(
+                                from: wallet,
+                                to: selectedContact,
+                                enteredAmount: amount,
+                                note: note,
+                                pin: pin,
+                                authorize: model.authorizeFinancialStepUp
+                            )
+                        }
+                        if succeeded {
                             showingConfirmation = false
                             step = .success
                             // Every Kit Pay → Kit Pay transfer documents itself as an encrypted
                             // chat event; the transfer's success never depends on it (the event
                             // queues durably offline-first). Chat-initiated sends share into
                             // their conversation; standalone sends go as a direct message.
-                            if let transaction = flow.sentTransaction {
+                            if let payment = flow.scheduledPayment {
+                                scheduledPaymentCreated?(payment)
+                            } else if let transaction = flow.sentTransaction {
                                 if let shareTransferInChat {
                                     _ = await shareTransferInChat(transaction)
                                 } else if let recipientUserID = preselectedRecipientUserID
@@ -687,7 +886,9 @@ struct SendMoneyView: View {
                         ProgressView().tint(.white).frame(maxWidth: .infinity)
                     } else {
                         Label(
-                            "Send \(displayedAmount)",
+                            scheduledFor == nil
+                                ? "Send \(displayedAmount)"
+                                : "Schedule \(displayedAmount)",
                             systemImage: model.financialApprovalUsesBiometrics
                                 ? model.biometricSymbolName
                                 : "lock.fill"
@@ -727,11 +928,17 @@ struct SendMoneyView: View {
                 .frame(width: 92, height: 92)
                 .background(KitColor.green.gradient, in: Circle())
                 .shadow(color: KitColor.green.opacity(0.32), radius: 22, y: 10)
-            Text("Sent!").font(.largeTitle.bold()).foregroundStyle(KitColor.primaryText)
-            Text("\(displayedAmount) is on its way to \(selectedContact?.name ?? "your contact").")
+            Text(scheduledFor == nil ? "Sent!" : "Payment scheduled")
+                .font(.largeTitle.bold())
+                .foregroundStyle(KitColor.primaryText)
+            Text(successDetail)
                 .multilineTextAlignment(.center)
                 .foregroundStyle(KitColor.secondaryText)
-            if let transaction = flow.sentTransaction {
+            if let payment = flow.scheduledPayment {
+                Text("Schedule \(payment.id)")
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+            } else if let transaction = flow.sentTransaction {
                 Text("Ref \(transaction.reference)")
                     .font(.caption.monospaced())
                     .foregroundStyle(.secondary)
@@ -761,6 +968,21 @@ struct SendMoneyView: View {
     private var availableBalance: String {
         guard let wallet = model.selectedWallet else { return "UGX 0" }
         return KitMoney.formatted(wallet.balances.available, currency: wallet.currency)
+    }
+
+    private var canSchedulePayment: Bool {
+        let policy = ScheduledPaymentPolicy(capabilities: model.capabilities)
+        return conversationID == nil ? policy.enabled : policy.chatEnabled
+    }
+
+    private var schedulePreview: String {
+        "Send \(displayedAmount) to \(selectedContact?.name ?? "your contact")"
+    }
+
+    private var successDetail: String {
+        let recipient = selectedContact?.name ?? "your contact"
+        guard let scheduledFor else { return "\(displayedAmount) is on its way to \(recipient)." }
+        return "Kit will send \(displayedAmount) to \(recipient) on \(scheduledFor.formatted(date: .abbreviated, time: .shortened))."
     }
 
     private func shortfallNotice(_ requirement: WalletTopUpRequirement) -> some View {
@@ -1609,11 +1831,13 @@ private enum WalletShare {
 private enum WalletFlowError: LocalizedError {
     case pinSetupRejected
     case unconfirmedPaymentRequest
+    case unconfirmedScheduledPayment
 
     var errorDescription: String? {
         switch self {
         case .pinSetupRejected: "Kit Pay did not confirm the new wallet PIN. Please try again."
         case .unconfirmedPaymentRequest: "Kit Pay did not confirm the exact payment request. Check your requests before trying again."
+        case .unconfirmedScheduledPayment: "Kit Pay did not confirm the exact scheduled payment. Nothing new was scheduled."
         }
     }
 }

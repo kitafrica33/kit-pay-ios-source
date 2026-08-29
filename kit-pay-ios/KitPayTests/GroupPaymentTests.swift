@@ -875,6 +875,396 @@ final class GroupPaymentTests: XCTestCase {
         )
     }
 
+    // MARK: - Scheduled group payments
+
+    func testScheduledGroupPaymentRejectsMalformedPresentRecipientAmount() throws {
+        let malformed = try JSONDecoder().decode(
+            ScheduledGroupPaymentDTO.self,
+            from: Data(scheduledGroupPaymentJSON(firstAmount: "not-money").utf8)
+        )
+
+        XCTAssertFalse(
+            malformed.isStructurallyValid,
+            "null may redact a custom share, but malformed present money must fail closed"
+        )
+    }
+
+    func testScheduledGroupPlanPinsFrozenRosterAndExactStepUpIntent() throws {
+        let plan = try JSONDecoder().decode(
+            ScheduledGroupPaymentPlanDTO.self,
+            from: Data(scheduledGroupPaymentPlanJSON().utf8)
+        )
+        let wallet = Wallet(
+            id: "80000000-0000-4000-8000-000000000001",
+            name: "Primary",
+            accountNumber: nil,
+            accountType: nil,
+            currency: CurrencyDTO(code: "UGX", scale: "0"),
+            balances: WalletBalances(available: "50000", ledger: "50000"),
+            status: "active",
+            isPrimary: true
+        )
+        let draft = CreateGroupPaymentBody(
+            sourceWalletId: wallet.id,
+            splitMode: "even",
+            audience: "selected",
+            totalAmount: "30000",
+            note: "Team lunch",
+            recipients: [ama, ben, cara].map {
+                CreateGroupPaymentBody.Recipient(userId: $0, amount: nil)
+            }
+        )
+        let now = try XCTUnwrap(ScheduledPaymentDates.parse("2026-08-29T10:00:00Z"))
+        let scheduled = try XCTUnwrap(
+            ScheduledPaymentDates.parse("2026-08-29T12:05:00Z")
+        )
+
+        XCTAssertTrue(plan.isStructurallyValid(now: now))
+        XCTAssertTrue(plan.matches(
+            draft: draft,
+            conversationID: conversationID,
+            wallet: wallet,
+            scheduledFor: scheduled,
+            allowedRecipientIDs: [ama, ben, cara],
+            now: now
+        ))
+        XCTAssertEqual(plan.stepUp.intent.fields["plan_hash"]!, plan.planHash)
+        XCTAssertEqual(plan.stepUp.intent.fields["frozen_recipients"]!, plan.frozenRecipients)
+
+        let damaged = try JSONDecoder().decode(
+            ScheduledGroupPaymentPlanDTO.self,
+            from: Data(
+                scheduledGroupPaymentPlanJSON()
+                    .replacingOccurrences(of: ":10000,\(ben)", with: ":9999,\(ben)")
+                    .utf8
+            )
+        )
+        XCTAssertFalse(damaged.isStructurallyValid(now: now))
+    }
+
+    func testScheduledGroupCompletionProjectsCanonicalCardForEveryGroupMember() throws {
+        let schedule = try JSONDecoder().decode(
+            ScheduledGroupPaymentDTO.self,
+            from: Data(scheduledGroupPaymentJSON().utf8)
+        )
+        let eventJSON = """
+        {
+          "id":"901",
+          "type":"scheduled_group_payment.completed",
+          "conversation_id":"\(conversationID)",
+          "resource_type":"scheduled_group_payment",
+          "resource_id":"70000000-0000-4000-8000-000000000090",
+          "data":{
+            "schema":"kit.scheduled-group-payment.v1",
+            "scheduled_group_payment_id":"70000000-0000-4000-8000-000000000090",
+            "conversation_id":"\(conversationID)",
+            "status":"completed",
+            "group_payment_id":"\(paymentID)",
+            "scheduled_for":"2026-08-29T12:05:00Z",
+            "completed_at":"2026-08-29T12:05:01Z",
+            "cancelled_at":null
+          },
+          "occurred_at":"2026-08-29T12:05:01Z"
+        }
+        """
+        let event = try JSONDecoder().decode(
+            MessagingSyncEventDTO.self,
+            from: Data(eventJSON.utf8)
+        )
+        let envelope = try XCTUnwrap(ScheduledGroupPaymentSyncEnvelope(event: event))
+        let authoritative = try payment(
+            splitMode: "even",
+            audience: "selected",
+            totalAmount: "30000",
+            note: "Team lunch"
+        )
+
+        XCTAssertTrue(envelope.matchesAuthoritative(schedule))
+        let projection = try XCTUnwrap(ScheduledGroupPaymentProjectionPolicy.completion(
+            envelope: envelope,
+            schedule: schedule,
+            payment: authoritative,
+            memberUserIDs: [sender, ama, ben, cara]
+        ))
+        XCTAssertEqual(projection.senderUserID, sender)
+        XCTAssertEqual(projection.descriptor.groupPaymentId, paymentID)
+        XCTAssertEqual(projection.descriptor.recipientUserIds, [ama, ben, cara])
+        XCTAssertEqual(
+            ScheduledGroupPaymentProjectionPolicy.deterministicMessageID(
+                scheduledGroupPaymentID: schedule.id,
+                groupPaymentID: paymentID
+            ),
+            ScheduledGroupPaymentProjectionPolicy.deterministicMessageID(
+                scheduledGroupPaymentID: schedule.id,
+                groupPaymentID: paymentID
+            )
+        )
+    }
+
+    // MARK: - Collaborative requests
+
+    func testGroupRequestWireRoundTripsAndIsReservedFromTypedText() throws {
+        let request = try groupRequest()
+        let descriptor = try XCTUnwrap(KitGroupPaymentRequestMessage(requesting: request))
+
+        XCTAssertEqual(
+            descriptor.encoded,
+            "KITGREQ1:v=1&a=requested&id=70000000-0000-4000-8000-000000000001&amt=1000000&cur=UGX&sc=0&note=Team%20equipment"
+        )
+        XCTAssertEqual(KitGroupPaymentRequestMessage.parse(descriptor.encoded), descriptor)
+        XCTAssertFalse(SecureMessageReservedPrefixPolicy.allowsUserAuthoredText(descriptor.encoded))
+    }
+
+    func testGroupRequestWireRejectsNonCanonicalAndOverclaimedEvents() {
+        let requestID = "70000000-0000-4000-8000-000000000001"
+        XCTAssertNil(KitGroupPaymentRequestMessage.parse(
+            "KITGREQ1:a=requested&v=1&id=\(requestID)&amt=100&cur=UGX&sc=0"
+        ))
+        XCTAssertNil(KitGroupPaymentRequestMessage.parse(
+            "KITGREQ1:v=1&a=contributed&id=\(requestID)&cid=bad&amt=100"
+        ))
+        XCTAssertNil(KitGroupPaymentRequestMessage.parse(
+            "KITGREQ1:v=1&a=completed&id=\(requestID)&amt=100"
+        ))
+        XCTAssertNil(KitGroupPaymentRequestMessage.parse(
+            "KITGREQ1:v=1&a=completed&id=\(requestID)"
+        ))
+        XCTAssertNil(KitGroupPaymentRequestMessage.parse(
+            "KITGREQ1:v=1&a=cancelled&id=\(requestID)&x=1"
+        ))
+    }
+
+    func testGroupRequestAuthorityBindsContributorAndFinalCompleter() throws {
+        let request = try groupRequest(status: "completed", contributed: 1_000_000)
+        let first = try XCTUnwrap(request.contributions.first)
+        let last = try XCTUnwrap(request.contributions.last)
+        let contribution = try XCTUnwrap(KitGroupPaymentRequestMessage(
+            contributing: first,
+            requestID: request.id
+        ))
+        XCTAssertNotNil(GroupPaymentRequestAuthorityPolicy.matchingContribution(
+            for: contribution,
+            in: request,
+            messageAuthorID: first.contributorUserId
+        ))
+        XCTAssertNil(GroupPaymentRequestAuthorityPolicy.matchingContribution(
+            for: contribution,
+            in: request,
+            messageAuthorID: last.contributorUserId
+        ))
+
+        let completed = try XCTUnwrap(KitGroupPaymentRequestMessage(
+            completing: last,
+            requestID: request.id
+        ))
+        XCTAssertEqual(
+            completed.encoded,
+            "KITGREQ1:v=1&a=completed&id=\(request.id)&cid=\(last.id)&amt=750000"
+        )
+        XCTAssertTrue(GroupPaymentRequestAuthorityPolicy.terminalEventMatches(
+            completed,
+            request: request,
+            messageAuthorID: last.contributorUserId,
+            exactContribution: last
+        ))
+        XCTAssertFalse(GroupPaymentRequestAuthorityPolicy.terminalEventMatches(
+            completed,
+            request: request,
+            messageAuthorID: sender,
+            exactContribution: last
+        ))
+        XCTAssertFalse(GroupPaymentRequestAuthorityPolicy.terminalEventMatches(
+            completed,
+            request: request,
+            messageAuthorID: last.contributorUserId,
+            exactContribution: nil
+        ))
+    }
+
+    func testGroupRequestRejectsAContributionTotalThatContradictsTheRequest() throws {
+        let valid = try groupRequest(status: "open", contributed: 250_000)
+        XCTAssertTrue(valid.isStructurallyValid)
+
+        let json = groupRequestJSON(
+            status: "open",
+            contributed: 300_000,
+            contributionRows: """
+            {
+              "id": "70000000-0000-4000-8000-000000000002",
+              "contributor_user_id": "\(ama)",
+              "amount": "250000",
+              "amount_minor": "250000",
+              "wallet_transaction_id": null,
+              "created_at": "2026-08-29T12:05:00Z",
+              "is_yours": true
+            }
+            """,
+            contributorCount: 1
+        )
+        let contradictory = try JSONDecoder().decode(
+            GroupPaymentRequestDTO.self,
+            from: Data(json.utf8)
+        )
+        XCTAssertFalse(contradictory.isStructurallyValid)
+    }
+
+    func testGroupRequestAcceptsBoundedRecentContributionWindowAndRepeatedContributor() throws {
+        let rows = (0..<50).map { index in
+            let suffix = String(format: "%012d", index + 2)
+            return """
+            {
+              "id": "70000000-0000-4000-8000-\(suffix)",
+              "contributor_user_id": "\(ama)",
+              "amount": "1",
+              "amount_minor": "1",
+              "wallet_transaction_id": null,
+              "created_at": "2026-08-29T12:05:00Z",
+              "is_yours": true
+            }
+            """
+        }.joined(separator: ",")
+        let cursor = "70000000-0000-4000-8000-000000000002"
+        let json = groupRequestJSON(
+            status: "open",
+            contributed: 55,
+            contributionRows: rows,
+            contributorCount: 1,
+            contributionCount: 55,
+            contributionsHasMore: true,
+            contributionsNextBefore: cursor
+        )
+        let request = try JSONDecoder().decode(
+            GroupPaymentRequestDTO.self,
+            from: Data(json.utf8)
+        )
+
+        XCTAssertTrue(request.isStructurallyValid)
+        XCTAssertEqual(request.contributionCount, 55)
+        XCTAssertEqual(request.contributorCount, 1)
+        XCTAssertEqual(request.contributions.count, 50)
+    }
+
+    func testGroupRequestRejectsMalformedContributionPaginationCursor() throws {
+        let rows = (0..<50).map { index in
+            let suffix = String(format: "%012d", index + 2)
+            return """
+            {
+              "id": "70000000-0000-4000-8000-\(suffix)",
+              "contributor_user_id": "\(ama)",
+              "amount": "1",
+              "amount_minor": "1",
+              "wallet_transaction_id": null,
+              "created_at": "2026-08-29T12:05:00Z",
+              "is_yours": true
+            }
+            """
+        }.joined(separator: ",")
+        let json = groupRequestJSON(
+            status: "open",
+            contributed: 55,
+            contributionRows: rows,
+            contributorCount: 1,
+            contributionCount: 55,
+            contributionsHasMore: true,
+            contributionsNextBefore: "not-a-cursor"
+        )
+        let request = try JSONDecoder().decode(
+            GroupPaymentRequestDTO.self,
+            from: Data(json.utf8)
+        )
+
+        XCTAssertFalse(request.isStructurallyValid)
+    }
+
+    func testForgedEarlyRequestCannotSuppressTheRequesterCard() throws {
+        let request = try groupRequest()
+        let body = try XCTUnwrap(KitGroupPaymentRequestMessage(requesting: request)).encoded
+        let items = timeline([
+            message(ama, body),
+            message(sender, body),
+        ])
+        let cards = items.compactMap { item -> LocalMessage? in
+            guard case .groupPaymentRequest(let message, _) = item else { return nil }
+            return message
+        }
+        XCTAssertEqual(cards.map(\.senderId), [ama, sender])
+    }
+
+    func testGroupRequestProgressCopyIsExactAndDropsTrailingZeroes() {
+        XCTAssertEqual(GroupPaymentRequestCopy.progressPercent(0), "0%")
+        XCTAssertEqual(GroupPaymentRequestCopy.progressPercent(1_250), "12.5%")
+        XCTAssertEqual(GroupPaymentRequestCopy.progressPercent(1_234), "12.34%")
+        XCTAssertEqual(GroupPaymentRequestCopy.progressPercent(10_000), "100%")
+        XCTAssertEqual(
+            GroupPaymentRequestCopy.completedContribution(
+                contributorName: "Florence",
+                isViewerContributor: false,
+                formattedAmount: "UGX 250,000"
+            ),
+            "Florence contributed UGX 250,000 and completed this request."
+        )
+        XCTAssertEqual(
+            GroupPaymentRequestCopy.completedContribution(
+                contributorName: "Florence",
+                isViewerContributor: true,
+                formattedAmount: "UGX 250,000"
+            ),
+            "You contributed UGX 250,000 and completed this request."
+        )
+    }
+
+    func testGroupRequestDraftUsesCanonicalMoneyAndBoundsExpiry() {
+        let walletID = "80000000-0000-4000-8000-000000000001"
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let outcome = GroupPaymentRequestDraftPolicy.draft(
+            destinationWalletID: walletID.uppercased(),
+            amountInput: "1,000,000",
+            note: "  Team equipment  ",
+            expiresAt: now.addingTimeInterval(7 * 24 * 60 * 60),
+            currencyScale: 0,
+            now: now
+        )
+        guard case .ready(let body) = outcome else { return XCTFail("expected a ready request") }
+        XCTAssertEqual(body.destinationWalletId, walletID)
+        XCTAssertEqual(body.totalAmount, "1000000")
+        XCTAssertEqual(body.note, "Team equipment")
+
+        XCTAssertNotNil(problem(GroupPaymentRequestDraftPolicy.draft(
+            destinationWalletID: walletID,
+            amountInput: "1000",
+            note: nil,
+            expiresAt: now.addingTimeInterval(91 * 24 * 60 * 60),
+            currencyScale: 0,
+            now: now
+        )))
+    }
+
+    func testGroupRequestGateNeedsExactProtocolAdvertisement() throws {
+        let enabled = try capabilities(groupRequestReady: true, minimumIOS: "1.0.16-r39")
+        XCTAssertTrue(GroupPaymentRequestPolicy(capabilities: enabled).enabled)
+
+        let wrongFloor = try capabilities(groupRequestReady: true, minimumIOS: "1.0.16-r38")
+        XCTAssertFalse(GroupPaymentRequestPolicy(capabilities: wrongFloor).enabled)
+
+        let notReady = try capabilities(groupRequestReady: false, minimumIOS: "1.0.16-r39")
+        XCTAssertFalse(GroupPaymentRequestPolicy(capabilities: notReady).enabled)
+    }
+
+    func testContributionApprovalPinsRequestWalletAmountAndCurrency() {
+        let walletID = "80000000-0000-4000-8000-000000000001"
+        let intent = GroupPaymentRequestContributionPolicy.intent(
+            requestID: "70000000-0000-4000-8000-000000000001",
+            sourceWalletID: walletID,
+            amount: "250000",
+            currencyCode: "UGX"
+        )
+        XCTAssertEqual(field(intent, "action"), "contribute")
+        XCTAssertEqual(field(intent, "group_payment_request_id"), "70000000-0000-4000-8000-000000000001")
+        XCTAssertEqual(field(intent, "source_wallet_id"), walletID)
+        XCTAssertEqual(field(intent, "amount"), "250000")
+        XCTAssertEqual(field(intent, "currency"), "UGX")
+    }
+
     // MARK: - Helpers
 
     private func members() -> [GroupPaymentDraftPolicy.Member] {
@@ -888,6 +1278,227 @@ final class GroupPaymentTests: XCTestCase {
     private func problem(_ outcome: GroupPaymentDraftPolicy.Outcome) -> String? {
         guard case .problem(let message) = outcome else { return nil }
         return message
+    }
+
+    private func problem(_ outcome: GroupPaymentRequestDraftPolicy.Outcome) -> String? {
+        guard case .problem(let message) = outcome else { return nil }
+        return message
+    }
+
+    private func capabilities(
+        groupRequestReady: Bool,
+        minimumIOS: String
+    ) throws -> CapabilitiesDTO {
+        let json = """
+        {
+          "api_version": "v1",
+          "currency": {"code": "UGX", "scale": "0"},
+          "features": {
+            "wallets": true,
+            "internal_transfers": true,
+            "group_payment_requests_v1": true
+          },
+          "authentication": {},
+          "protocols": {
+            "payments": {
+              "group_payment_requests": {
+                "version": "v1",
+                "ready": \(groupRequestReady),
+                "partial_contributions": true,
+                "progress_basis_points_max": 10000,
+                "minimum_ios_version": "\(minimumIOS)"
+              }
+            }
+          }
+        }
+        """
+        return try JSONDecoder().decode(CapabilitiesDTO.self, from: Data(json.utf8))
+    }
+
+    private func groupRequest(
+        status: String = "open",
+        contributed: Int64 = 250_000
+    ) throws -> GroupPaymentRequestDTO {
+        let rows: String
+        let contributorCount: Int
+        switch contributed {
+        case 0:
+            rows = ""
+            contributorCount = 0
+        case 250_000:
+            rows = """
+            {
+              "id": "70000000-0000-4000-8000-000000000002",
+              "contributor_user_id": "\(ama)",
+              "amount": "250000",
+              "amount_minor": "250000",
+              "wallet_transaction_id": null,
+              "created_at": "2026-08-29T12:05:00Z",
+              "is_yours": true
+            }
+            """
+            contributorCount = 1
+        default:
+            rows = """
+            {
+              "id": "70000000-0000-4000-8000-000000000002",
+              "contributor_user_id": "\(ama)",
+              "amount": "250000",
+              "amount_minor": "250000",
+              "wallet_transaction_id": null,
+              "created_at": "2026-08-29T12:05:00Z",
+              "is_yours": true
+            },
+            {
+              "id": "70000000-0000-4000-8000-000000000003",
+              "contributor_user_id": "\(ben)",
+              "amount": "750000",
+              "amount_minor": "750000",
+              "wallet_transaction_id": null,
+              "created_at": "2026-08-29T12:10:00Z",
+              "is_yours": false
+            }
+            """
+            contributorCount = 2
+        }
+        let json = groupRequestJSON(
+            status: status,
+            contributed: contributed,
+            contributionRows: rows,
+            contributorCount: contributorCount
+        )
+        return try JSONDecoder().decode(GroupPaymentRequestDTO.self, from: Data(json.utf8))
+    }
+
+    private func scheduledGroupPaymentJSON(firstAmount: String = "10000") -> String {
+        """
+        {
+          "id":"70000000-0000-4000-8000-000000000090",
+          "type":"scheduled_group_payment",
+          "conversation_id":"\(conversationID)",
+          "status":"completed",
+          "source_wallet_id":null,
+          "split_mode":"even",
+          "audience":"selected",
+          "total_amount":"30000",
+          "currency":{"code":"UGX","scale":"0"},
+          "note":"Team lunch",
+          "recipient_count":3,
+          "recipients":[
+            {"user_id":"\(ama)","name":"Ama","amount":"\(firstAmount)"},
+            {"user_id":"\(ben)","name":"Ben","amount":"10000"},
+            {"user_id":"\(cara)","name":"Cara","amount":"10000"}
+          ],
+          "group_payment_id":"\(paymentID)",
+          "failure":null,
+          "scheduled_for":"2026-08-29T12:05:00Z",
+          "queued_at":"2026-08-29T12:05:00Z",
+          "started_at":"2026-08-29T12:05:00Z",
+          "completed_at":"2026-08-29T12:05:01Z",
+          "cancelled_at":null,
+          "created_at":"2026-08-29T11:00:00Z"
+        }
+        """
+    }
+
+    private func scheduledGroupPaymentPlanJSON() -> String {
+        let sourceWallet = "80000000-0000-4000-8000-000000000001"
+        let amaWallet = "80000000-0000-4000-8000-000000000002"
+        let benWallet = "80000000-0000-4000-8000-000000000003"
+        let caraWallet = "80000000-0000-4000-8000-000000000004"
+        let frozen = "\(ama):\(amaWallet):10000,\(ben):\(benWallet):10000,\(cara):\(caraWallet):10000"
+        return """
+        {
+          "plan_id":"70000000-0000-4000-8000-000000000091",
+          "conversation_id":"\(conversationID)",
+          "source_wallet_id":"\(sourceWallet)",
+          "split_mode":"even",
+          "audience":"selected",
+          "total_amount":"30000",
+          "currency":{"code":"UGX","scale":"0"},
+          "note":"Team lunch",
+          "recipient_count":3,
+          "recipients":[
+            {"user_id":"\(ama)","destination_wallet_id":"\(amaWallet)","amount":"10000"},
+            {"user_id":"\(ben)","destination_wallet_id":"\(benWallet)","amount":"10000"},
+            {"user_id":"\(cara)","destination_wallet_id":"\(caraWallet)","amount":"10000"}
+          ],
+          "roster_fingerprint":"\(String(repeating: "a", count: 64))",
+          "frozen_recipients":"\(frozen)",
+          "plan_hash":"\(String(repeating: "b", count: 64))",
+          "scheduled_for":"2026-08-29T12:05:00Z",
+          "expires_at":"2026-08-29T10:10:00Z",
+          "step_up":{
+            "purpose":"scheduled_group_payment",
+            "intent":{
+              "action":"create",
+              "plan_id":"70000000-0000-4000-8000-000000000091",
+              "plan_hash":"\(String(repeating: "b", count: 64))",
+              "conversation_id":"\(conversationID)",
+              "source_wallet_id":"\(sourceWallet)",
+              "split_mode":"even",
+              "audience":"selected",
+              "total_amount":"30000",
+              "currency":"UGX",
+              "note":"Team lunch",
+              "scheduled_for":"2026-08-29T12:05:00Z",
+              "roster_fingerprint":"\(String(repeating: "a", count: 64))",
+              "frozen_recipients":"\(frozen)"
+            }
+          }
+        }
+        """
+    }
+
+    private func groupRequestJSON(
+        status: String,
+        contributed: Int64,
+        contributionRows: String,
+        contributorCount: Int,
+        contributionCount: Int? = nil,
+        contributionsHasMore: Bool = false,
+        contributionsNextBefore: String? = nil
+    ) -> String {
+        let contributionCount = contributionCount ?? contributorCount
+        let remaining = 1_000_000 - contributed
+        let progress = GroupPaymentRequestValidation.progressBasisPoints(
+            contributed: contributed,
+            target: 1_000_000
+        )
+        return """
+        {
+          "id": "70000000-0000-4000-8000-000000000001",
+          "type": "group_payment_request",
+          "conversation_id": "\(conversationID)",
+          "requester_user_id": "\(sender)",
+          "status": "\(status)",
+          "destination_wallet_id": null,
+          "target_amount": "1000000",
+          "target_amount_minor": "1000000",
+          "contributed_amount": "\(contributed)",
+          "contributed_amount_minor": "\(contributed)",
+          "remaining_amount": "\(remaining)",
+          "remaining_amount_minor": "\(remaining)",
+          "progress_basis_points": \(progress),
+          "contribution_count": \(contributionCount),
+          "contributor_count": \(contributorCount),
+          "your_contributed_amount": "0",
+          "your_contributed_amount_minor": "0",
+          "currency": {"code": "UGX", "scale": "0"},
+          "note": "Team equipment",
+          "expires_at": "2026-09-05T12:00:00Z",
+          "completed_at": \(status == "completed" ? "\"2026-08-29T12:10:00Z\"" : "null"),
+          "cancelled_at": \(status == "cancelled" ? "\"2026-08-29T12:10:00Z\"" : "null"),
+          "expired_at": \(status == "expired" ? "\"2026-08-29T12:10:00Z\"" : "null"),
+          "created_at": "2026-08-29T12:00:00Z",
+          "updated_at": "2026-08-29T12:10:00Z",
+          "can_contribute": \(status == "open"),
+          "can_cancel": false,
+          "contributions_has_more": \(contributionsHasMore),
+          "contributions_next_before": \(contributionsNextBefore.map { "\"\($0)\"" } ?? "null"),
+          "contributions": [\(contributionRows)]
+        }
+        """
     }
 
     private func field(_ intent: [String: String?], _ key: String) -> String? {
@@ -983,11 +1594,13 @@ final class GroupPaymentTests: XCTestCase {
         splitMode: String,
         audience: String,
         totalAmount: String?,
+        note: String? = nil,
         pendingCount: Int = 3,
         acceptedCount: Int = 0,
         returnedCount: Int = 0
     ) throws -> GroupPaymentDTO {
         let total = totalAmount.map { "\"total_amount\":\"\($0)\"," } ?? ""
+        let noteField = note.map { "\"note\":\"\($0)\"," } ?? ""
         let json = """
         {
           "id": "\(paymentID)",
@@ -998,6 +1611,7 @@ final class GroupPaymentTests: XCTestCase {
           "sender": {"id": "\(sender)", "name": "Sender"},
           "recipient_count": 3,
           \(total)
+          \(noteField)
           "status": "pending",
           "pending_count": \(pendingCount),
           "accepted_count": \(acceptedCount),

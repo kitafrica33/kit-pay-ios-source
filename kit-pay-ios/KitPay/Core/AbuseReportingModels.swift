@@ -178,11 +178,7 @@ struct AbuseReportSelectedMessage: Encodable, Equatable, Sendable {
               !plaintext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               plaintext.unicodeScalars.count <= AbuseReportContract.maximumMessageCharacters,
               plaintext.utf8.count <= AbuseReportContract.maximumSelectedMessageBytes,
-              !KitMediaMessageFamilyPolicy.isReservedFamilyText(plaintext),
-              !SecureMessageReservedPrefixPolicy.beginsWithReservedPrefix(
-                  plaintext,
-                  prefix: KitPaymentMessage.prefix
-              )
+              SecureMessageReservedPrefixPolicy.allowsUserAuthoredText(plaintext)
         else { throw AbuseReportContractError.invalidSelectedMessage }
         self.messageID = messageID
         self.plaintext = plaintext

@@ -117,6 +117,60 @@ final class ScheduledSendTests: XCTestCase {
         )
     }
 
+    func testOverdueMessageFromRelaunchRequestsTheFirstAvailableBackgroundRun() throws {
+        let scheduled = scheduledMessageCommand(
+            id: "41500000-0000-0000-0000-000000000001",
+            createdAt: now,
+            scheduledAt: now.addingTimeInterval(3_600)
+        )
+        // Codable round-trip models the outbox being read by a fresh process rather than relying
+        // on an in-memory timer left over from the process that created the schedule.
+        let restored = try JSONDecoder().decode(
+            OfflineCommand.self,
+            from: JSONEncoder().encode(scheduled)
+        )
+        let relaunchedAt = now.addingTimeInterval(3_900)
+
+        XCTAssertEqual(
+            CommunicationBackgroundReplayPolicy.earliestBeginDate(
+                for: [restored],
+                now: relaunchedAt
+            ),
+            relaunchedAt,
+            "An overdue durable row must ask iOS for the first available run, not move its promise."
+        )
+        XCTAssertEqual(
+            OutboxPolicy.readyCommands([restored], at: relaunchedAt).map(\.id),
+            [scheduled.id]
+        )
+        XCTAssertEqual(restored.scheduledAt, scheduled.scheduledAt)
+        XCTAssertNil(restored.secureMessageFanout)
+    }
+
+    @MainActor
+    func testCommunicationReplayBackgroundRegistrationIsDeclared() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let data = try Data(
+            contentsOf: repositoryRoot.appendingPathComponent("KitPay/Info.plist")
+        )
+        let plist = try XCTUnwrap(
+            PropertyListSerialization.propertyList(
+                from: data,
+                options: [],
+                format: nil
+            ) as? [String: Any]
+        )
+        let identifiers = try XCTUnwrap(
+            plist["BGTaskSchedulerPermittedIdentifiers"] as? [String]
+        )
+        let modes = try XCTUnwrap(plist["UIBackgroundModes"] as? [String])
+
+        XCTAssertTrue(identifiers.contains(CommunicationBackgroundReplayScheduler.identifier))
+        XCTAssertTrue(modes.contains("processing"))
+    }
+
     func testScheduledMessageBecomesRunnableAtItsMinuteAndKeepsItsPlaceInOrder() {
         let scheduled = scheduledMessageCommand(
             id: "42000000-0000-0000-0000-000000000001",
@@ -138,6 +192,58 @@ final class ScheduledSendTests: XCTestCase {
             [scheduled.id],
             "Once due it is an ordinary message again: oldest first, one head per conversation."
         )
+    }
+
+    func testScheduledGroupMessageStaysVisibleAndRunsOnlyWithGroupCapabilityAndRoster() throws {
+        let localUserID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        let peerUserID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        let currentDeviceID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        let peerDeviceID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+        let scheduled = scheduledMessageCommand(
+            id: "42500000-0000-4000-8000-000000000001",
+            createdAt: now,
+            scheduledAt: now.addingTimeInterval(3_600)
+        )
+        let local = localMessage(for: scheduled)
+        XCTAssertEqual(local.state, .queued)
+        XCTAssertEqual(local.scheduledAt, scheduled.scheduledAt)
+        XCTAssertEqual(local.body, "Locally encrypted text")
+        XCTAssertTrue(OutboxPolicy.readyCommands([scheduled], at: now).isEmpty)
+        XCTAssertEqual(
+            OutboxPolicy.readyCommands(
+                [scheduled],
+                at: now.addingTimeInterval(3_600)
+            ).map(\.id),
+            [scheduled.id]
+        )
+
+        XCTAssertTrue(MessagingGroupCapabilityPolicy.allowsConversationMutation(
+            isGroup: true,
+            groupCapabilityEnabled: true
+        ))
+        let rosterJSON = """
+        {
+          "conversation_id": "\(conversationID)",
+          "devices": [
+            {"device_id":"\(currentDeviceID)","user_id":"\(localUserID)"},
+            {
+              "device_id":"\(peerDeviceID)",
+              "user_id":"\(peerUserID)",
+              "client":{"platform":"android","capabilities":{"messaging_groups_v1":true}}
+            }
+          ]
+        }
+        """
+        let roster = try JSONDecoder().decode(
+            MessagingDeviceRosterDTO.self,
+            from: Data(rosterJSON.utf8)
+        )
+        XCTAssertTrue(MessagingGroupCapabilityPolicy.supports(
+            roster: roster,
+            conversationID: conversationID,
+            currentDeviceID: currentDeviceID,
+            memberUserIDs: [localUserID, peerUserID]
+        ))
     }
 
     func testReleasingAScheduledItemKeepsTheSameCommandSoNothingIsSentTwice() {
@@ -289,6 +395,110 @@ final class ScheduledSendTests: XCTestCase {
         XCTAssertEqual(message.timelineDate, composed)
     }
 
+    func testConfirmedScheduledRequestSurvivesRestartUntilChatCardIsDurable() throws {
+        var payload = scheduledRequestPayload()
+        let request = PaymentRequestDTO(
+            id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            type: "payment_request",
+            status: "pending",
+            destinationWalletId: payload.destinationWalletID,
+            requestedFromUserId: payload.requestedFromUserID,
+            amount: payload.amount,
+            currency: CurrencyDTO(code: payload.currencyCode, scale: "2"),
+            note: payload.note,
+            expiresAt: nil,
+            walletTransactionId: nil,
+            paidAt: nil,
+            createdAt: "2026-08-29T00:00:00Z"
+        )
+        let confirmation = try XCTUnwrap(
+            ScheduledPaymentRequestConfirmation(request: request, payload: payload)
+        )
+        payload.confirmedRequest = confirmation
+        var command = OfflineCommand(
+            id: UUID(uuidString: "47000000-0000-0000-0000-000000000002")!,
+            kind: .scheduledPaymentRequest,
+            createdAt: now,
+            nextAttemptAt: now,
+            attemptCount: 0,
+            conversationId: conversationID,
+            messageId: nil,
+            recipientUserIds: [payload.requestedFromUserID],
+            recipientName: payload.recipientName,
+            video: nil,
+            expiresAt: nil,
+            scheduledAt: now,
+            scheduledPaymentRequest: payload
+        )
+
+        let encoded = try JSONEncoder().encode(command)
+        command = try JSONDecoder().decode(OfflineCommand.self, from: encoded)
+
+        let restored = try XCTUnwrap(command.scheduledPaymentRequest?.confirmedRequest)
+        XCTAssertTrue(restored.isValid(for: try XCTUnwrap(command.scheduledPaymentRequest)))
+        XCTAssertEqual(restored.clientMessageID, UUID(uuidString: request.id))
+    }
+
+    @MainActor
+    func testCommunicationBackgroundWakeSurvivesFailedEarlierReplacement() {
+        struct SubmissionFailure: Error {}
+        let scheduler = CommunicationBackgroundReplayScheduler()
+        let existing = Date(timeIntervalSince1970: 1_800_000_100)
+        var submissions = 0
+
+        XCTAssertEqual(
+            scheduler.schedule(earliestBeginDate: existing) { request in
+                submissions += 1
+                XCTAssertTrue(request.requiresNetworkConnectivity)
+                XCTAssertFalse(request.requiresExternalPower)
+            },
+            .armed(earliestBeginDate: existing)
+        )
+        XCTAssertEqual(
+            scheduler.schedule(earliestBeginDate: existing.addingTimeInterval(60)) { _ in
+                submissions += 1
+                throw SubmissionFailure()
+            },
+            .armed(earliestBeginDate: existing)
+        )
+        XCTAssertEqual(submissions, 1)
+
+        XCTAssertEqual(
+            scheduler.schedule(earliestBeginDate: existing.addingTimeInterval(-60)) { _ in
+                submissions += 1
+                throw SubmissionFailure()
+            },
+            .armed(earliestBeginDate: existing),
+            "a failed earlier replacement must preserve the existing scheduled-message wake"
+        )
+        XCTAssertEqual(submissions, 2)
+    }
+
+    func testScheduledRequestConfirmationRejectsChangedFinancialIntent() throws {
+        let payload = scheduledRequestPayload()
+        let request = PaymentRequestDTO(
+            id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            type: "payment_request",
+            status: "pending",
+            destinationWalletId: payload.destinationWalletID,
+            requestedFromUserId: payload.requestedFromUserID,
+            amount: payload.amount,
+            currency: CurrencyDTO(code: payload.currencyCode, scale: "2"),
+            note: payload.note,
+            expiresAt: nil,
+            walletTransactionId: nil,
+            paidAt: nil,
+            createdAt: "2026-08-29T00:00:00Z"
+        )
+        let confirmation = try XCTUnwrap(
+            ScheduledPaymentRequestConfirmation(request: request, payload: payload)
+        )
+        var altered = scheduledRequestPayload(amount: "500001.00")
+        altered.confirmedRequest = confirmation
+
+        XCTAssertFalse(confirmation.isValid(for: altered))
+    }
+
     // MARK: - Fixtures
 
     private func messageCommand(
@@ -337,6 +547,21 @@ final class ScheduledSendTests: XCTestCase {
             failureReason: nil,
             isOutgoing: true,
             scheduledAt: command.scheduledAt
+        )
+    }
+
+    private func scheduledRequestPayload(
+        amount: String = "500000.00"
+    ) -> ScheduledPaymentRequestPayload {
+        ScheduledPaymentRequestPayload(
+            destinationWalletID: "wallet-1",
+            requestedFromUserID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            amount: amount,
+            currencyCode: "UGX",
+            note: "School fees",
+            idempotencyKey: "scheduled-request-key",
+            recipientName: "Florence",
+            conversationID: conversationID
         )
     }
 }

@@ -1683,6 +1683,123 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
         )
     }
 
+    func testScheduledTextSurvivesRelaunchLocallyEncryptedAndUnsealedUntilDue() async throws {
+        let localUserID = "10000000-0000-4000-8000-000000000091"
+        let recipientUserID = "10000000-0000-4000-8000-000000000092"
+        let conversationID = "30000000-0000-4000-8000-000000000091"
+        let clientMessageID = UUID(uuidString: "40000000-0000-4000-8000-000000000091")!
+        let plaintext = "Keep this scheduled secret on this iPhone"
+        let requestedDate = Date().addingTimeInterval(3_600)
+        let expectedDate = ScheduledSendPolicy.canonicalMinute(requestedDate)
+        let store = try await makeStore(userID: localUserID)
+        var crypto = SecureMessagingPersistentState.empty
+        crypto.enrollment = raceEnrollment(userID: localUserID)
+        let originalConversationDate = Date(timeIntervalSince1970: 1_700_000_000)
+        try await store.update { state in
+            state.communicationOwnerUserID = localUserID
+            state.secureMessaging = crypto
+            state.conversations = [Conversation(
+                id: conversationID,
+                title: "Scheduled recipient",
+                participantUserIds: [localUserID, recipientUserID],
+                unreadCount: 0,
+                updatedAt: originalConversationDate
+            )]
+        }
+        let transport = OfflineExchangeTransport()
+        let coordinator = SecureMessagingExchangeCoordinator(
+            transport: transport,
+            store: store,
+            engine: SecureMessagingCryptoEngine(),
+            provisioningPreKeyCount: 1
+        )
+
+        let first = try await coordinator.queueDeferredText(
+            forUserID: localUserID,
+            conversationID: conversationID,
+            expectedRecipientUserID: recipientUserID,
+            title: "Scheduled recipient",
+            text: plaintext,
+            clientMessageID: clientMessageID,
+            deliverAt: requestedDate
+        )
+
+        XCTAssertEqual(first.clientMessageID, clientMessageID)
+        let initialNetworkCallCount = await transport.networkCallCount()
+        XCTAssertEqual(initialNetworkCallCount, 0)
+        let snapshot = await store.snapshot()
+        let message = try XCTUnwrap(snapshot.messages.first)
+        let command = try XCTUnwrap(snapshot.outbox.first)
+        XCTAssertEqual(message.body, plaintext)
+        XCTAssertEqual(message.scheduledAt, expectedDate)
+        XCTAssertEqual(command.scheduledAt, expectedDate)
+        XCTAssertEqual(command.nextAttemptAt, expectedDate)
+        XCTAssertNil(command.secureMessageFanout, "Signal encryption must wait until the item is due.")
+        XCTAssertEqual(snapshot.conversations.first?.updatedAt, originalConversationDate)
+        XCTAssertTrue(OutboxPolicy.readyCommands(snapshot.outbox, at: Date()).isEmpty)
+
+        let stateURL = temporaryDirectory.appendingPathComponent("state.secure")
+        let protectedBytes = try Data(contentsOf: stateURL)
+        XCTAssertNil(
+            protectedBytes.range(of: Data(plaintext.utf8)),
+            "Scheduled plaintext must never appear unencrypted in the state file."
+        )
+        let reopened = SecureLocalStore(
+            stateURL: stateURL,
+            keyData: Data(repeating: 0x91, count: 32)
+        )
+        let restored = await reopened.snapshot()
+        XCTAssertEqual(restored.messages.first?.body, plaintext)
+        XCTAssertEqual(restored.outbox.first?.id, command.id)
+        XCTAssertEqual(restored.outbox.first?.scheduledAt, expectedDate)
+        XCTAssertNil(restored.outbox.first?.secureMessageFanout)
+
+        // A retry after process uncertainty resolves to the same durable identity only when its
+        // complete intent—including the promised minute—matches.
+        let replay = try await coordinator.queueDeferredText(
+            forUserID: localUserID,
+            conversationID: conversationID,
+            expectedRecipientUserID: recipientUserID,
+            title: "Scheduled recipient",
+            text: plaintext,
+            clientMessageID: clientMessageID,
+            deliverAt: requestedDate
+        )
+        XCTAssertEqual(replay.clientMessageID, clientMessageID)
+        do {
+            _ = try await coordinator.queueDeferredText(
+                forUserID: localUserID,
+                conversationID: conversationID,
+                expectedRecipientUserID: recipientUserID,
+                title: "Scheduled recipient",
+                text: plaintext,
+                clientMessageID: clientMessageID,
+                deliverAt: requestedDate.addingTimeInterval(60)
+            )
+            XCTFail("A stable message id must not alias a different scheduled minute.")
+        } catch let error as SecureMessagingExchangeError {
+            XCTAssertEqual(error, .invalidConversation)
+        }
+        do {
+            _ = try await coordinator.queueDeferredText(
+                forUserID: localUserID,
+                conversationID: conversationID,
+                expectedRecipientUserID: recipientUserID,
+                title: "Scheduled recipient",
+                text: "Do not send a stale schedule now",
+                deliverAt: Date().addingTimeInterval(-60)
+            )
+            XCTFail("A stale fresh schedule must fail rather than becoming an immediate send.")
+        } catch let error as SecureMessagingCryptoError {
+            XCTAssertEqual(error, .invalidContent)
+        }
+        let final = await store.snapshot()
+        XCTAssertEqual(final.messages.count, 1)
+        XCTAssertEqual(final.outbox.count, 1)
+        let finalNetworkCallCount = await transport.networkCallCount()
+        XCTAssertEqual(finalNetworkCallCount, 0)
+    }
+
     func testDeferredReactionDoesNotAdvanceConversationActivity() async throws {
         let localUserID = "10000000-0000-0000-0000-000000000019"
         let recipientUserID = "10000000-0000-0000-0000-000000000020"

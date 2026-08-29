@@ -190,3 +190,16 @@ struct ScheduledChatItem: Identifiable, Equatable, Sendable {
         return false
     }
 }
+
+/// Converts the durable outbox clock into the earliest-date request iOS accepts. Explicitly
+/// clamping overdue work to `now` documents the intended cold-launch behavior and keeps the request
+/// deterministic in tests: a process that slept through the promised minute asks to run at the
+/// first opportunity rather than inventing a new schedule.
+enum CommunicationBackgroundReplayPolicy {
+    static func earliestBeginDate(
+        for commands: [OfflineCommand],
+        now: Date
+    ) -> Date? {
+        OutboxPolicy.nextWakeDate(commands, at: now).map { max(now, $0) }
+    }
+}

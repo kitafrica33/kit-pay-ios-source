@@ -1564,18 +1564,23 @@ class AppStoreProfileGeneratorTests(unittest.TestCase):
 
 
 class SigningConfigurationTests(unittest.TestCase):
-    def test_build_38_release_identity_is_consistent(self) -> None:
+    def test_build_39_release_identity_is_consistent(self) -> None:
         workflow = (ROOT / ".github/workflows/ios-app-store-archive.yml").read_text()
         project = (ROOT / "KitPay.xcodeproj/project.pbxproj").read_text()
+        readme = (ROOT / "README.md").read_text()
 
         self.assertIn("default: 1.0.16", workflow)
-        self.assertIn('default: "38"', workflow)
-        self.assertIn("v1.0.16-build38", workflow)
+        self.assertIn('default: "39"', workflow)
+        self.assertIn("v1.0.16-build39", workflow)
         # Four each: Debug and Release of the app and of the share extension. iOS refuses to
         # install an app whose extension carries a different version, so they move together.
         self.assertEqual(project.count("MARKETING_VERSION = 1.0.16;"), 4)
-        self.assertEqual(project.count("CURRENT_PROJECT_VERSION = 38;"), 4)
+        self.assertEqual(project.count("CURRENT_PROJECT_VERSION = 39;"), 4)
         self.assertNotIn("MARKETING_VERSION = 1.0.1;", project)
+        self.assertIn("1.0.16-r39", readme)
+        self.assertIn("group_payment_request.{created,contributed,completed,cancelled,expired}", readme)
+        self.assertIn("scheduled_payment.{completed,failed,cancelled}", readme)
+        self.assertIn("scheduled_group_payment.{completed,failed,cancelled}", readme)
 
     def test_archive_unit_tests_are_ad_hoc_signed_for_keychain_entitlements(self) -> None:
         workflow = (ROOT / ".github/workflows/ios-app-store-archive.yml").read_text()
@@ -2508,6 +2513,34 @@ class VerifyIOSArchiveTests(unittest.TestCase):
             self.assertIn(
                 "BGTaskSchedulerPermittedIdentifiers",
                 missing_task_identifiers.stderr,
+            )
+
+            write_plist(
+                app / "Info.plist",
+                {
+                    "CFBundleIdentifier": BUNDLE,
+                    "CFBundleExecutable": EXECUTABLE,
+                    "CFBundleShortVersionString": "1.2.3",
+                    "CFBundleVersion": "42",
+                    "KitCorrespondingSourceURL": SOURCE_URL,
+                    "ITSAppUsesNonExemptEncryption": False,
+                    "UIBackgroundModes": ["processing", "remote-notification"],
+                    "BGTaskSchedulerPermittedIdentifiers": [
+                        "africa.kit.pay.ios.contacts-refresh",
+                        "africa.kit.pay.ios.message-backup",
+                    ],
+                },
+            )
+            missing_communication_replay = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(missing_communication_replay.returncode, 0)
+            self.assertIn(
+                "every Kit Pay BGTaskSchedulerPermittedIdentifiers entry",
+                missing_communication_replay.stderr,
             )
 
             write_plist(

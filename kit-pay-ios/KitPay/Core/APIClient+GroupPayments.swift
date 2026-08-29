@@ -73,4 +73,168 @@ extension APIClient {
             headers: headers
         )
     }
+
+    // MARK: Collaborative requests
+
+    func groupPaymentRequests(
+        conversationId: String,
+        status: GroupPaymentRequestStatus? = nil
+    ) async throws -> GroupPaymentRequestListDTO {
+        try await send(
+            path: "conversations/\(conversationId)/group-payment-requests",
+            method: "GET",
+            body: GroupPaymentEmptyBody(),
+            queryItems: status.map { [URLQueryItem(name: "status", value: $0.rawValue)] } ?? []
+        )
+    }
+
+    func createGroupPaymentRequest(
+        conversationId: String,
+        body: CreateGroupPaymentRequestBody,
+        idempotencyKey: String
+    ) async throws -> GroupPaymentRequestDTO {
+        try await send(
+            path: "conversations/\(conversationId)/group-payment-requests",
+            method: "POST",
+            body: body,
+            headers: ["Idempotency-Key": idempotencyKey]
+        )
+    }
+
+    func groupPaymentRequest(id: String) async throws -> GroupPaymentRequestDTO {
+        try await send(
+            path: "group-payment-requests/\(id)",
+            method: "GET",
+            body: GroupPaymentEmptyBody()
+        )
+    }
+
+    func groupPaymentRequestContributions(
+        requestId: String,
+        before: String? = nil,
+        limit: Int = 50
+    ) async throws -> GroupPaymentRequestContributionListDTO {
+        var queryItems = [URLQueryItem(name: "limit", value: String(limit))]
+        if let before { queryItems.append(URLQueryItem(name: "before", value: before)) }
+        let page: GroupPaymentRequestContributionListDTO = try await send(
+            path: "group-payment-requests/\(requestId)/contributions",
+            method: "GET",
+            body: GroupPaymentEmptyBody(),
+            queryItems: queryItems
+        )
+        return page
+    }
+
+    func groupPaymentRequestContribution(
+        requestId: String,
+        contributionId: String
+    ) async throws -> GroupPaymentRequestContributionDTO {
+        try await send(
+            path: "group-payment-requests/\(requestId)/contributions/\(contributionId)",
+            method: "GET",
+            body: GroupPaymentEmptyBody()
+        )
+    }
+
+    func contributeToGroupPaymentRequest(
+        id: String,
+        sourceWalletId: String,
+        amount: String,
+        idempotencyKey: String,
+        stepUpToken: String
+    ) async throws -> GroupPaymentRequestContributionResultDTO {
+        try await send(
+            path: "group-payment-requests/\(id)/contributions",
+            method: "POST",
+            body: ContributeGroupPaymentRequestBody(
+                sourceWalletId: sourceWalletId,
+                amount: amount
+            ),
+            headers: [
+                "Idempotency-Key": idempotencyKey,
+                "X-Kit-Wallet-Step-Up": stepUpToken,
+            ]
+        )
+    }
+
+    func cancelGroupPaymentRequest(
+        id: String,
+        idempotencyKey: String
+    ) async throws -> GroupPaymentRequestDTO {
+        try await send(
+            path: "group-payment-requests/\(id)/cancel",
+            method: "POST",
+            body: GroupPaymentEmptyBody(),
+            headers: ["Idempotency-Key": idempotencyKey]
+        )
+    }
+
+    // MARK: Server-side scheduled group payments
+
+    func previewScheduledGroupPayment(
+        conversationId: String,
+        body: PreviewScheduledGroupPaymentBody
+    ) async throws -> ScheduledGroupPaymentPlanDTO {
+        try await send(
+            path: "conversations/\(conversationId)/scheduled-group-payments/preview",
+            method: "POST",
+            body: body
+        )
+    }
+
+    func createScheduledGroupPayment(
+        conversationId: String,
+        planId: String,
+        idempotencyKey: String,
+        stepUpToken: String
+    ) async throws -> ScheduledGroupPaymentDTO {
+        try await send(
+            path: "conversations/\(conversationId)/scheduled-group-payments",
+            method: "POST",
+            body: CreateScheduledGroupPaymentBody(planId: planId),
+            headers: [
+                "Idempotency-Key": idempotencyKey,
+                "X-Kit-Wallet-Step-Up": stepUpToken,
+            ]
+        )
+    }
+
+    func scheduledGroupPayments(
+        conversationId: String,
+        status: ScheduledGroupPaymentStatus,
+        before: String? = nil,
+        limit: Int = 100
+    ) async throws -> ScheduledGroupPaymentListDTO {
+        var queryItems = [
+            URLQueryItem(name: "status", value: status.rawValue),
+            URLQueryItem(name: "limit", value: String(limit)),
+        ]
+        if let before { queryItems.append(URLQueryItem(name: "before", value: before)) }
+        return try await send(
+            path: "conversations/\(conversationId)/scheduled-group-payments",
+            method: "GET",
+            body: GroupPaymentEmptyBody(),
+            queryItems: queryItems
+        )
+    }
+
+    func scheduledGroupPayment(id: String) async throws -> ScheduledGroupPaymentDTO {
+        try await send(
+            path: "scheduled-group-payments/\(id)",
+            method: "GET",
+            body: GroupPaymentEmptyBody()
+        )
+    }
+
+    func cancelScheduledGroupPayment(
+        id: String,
+        idempotencyKey: String
+    ) async throws -> ScheduledGroupPaymentDTO {
+        try await send(
+            path: "scheduled-group-payments/\(id)/cancel",
+            method: "POST",
+            body: GroupPaymentEmptyBody(),
+            headers: ["Idempotency-Key": idempotencyKey]
+        )
+    }
 }

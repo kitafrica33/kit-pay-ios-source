@@ -1532,10 +1532,18 @@ struct ConversationTimelineDateSeparator: Equatable, Sendable {
 enum ConversationTimelineItem: Identifiable, Equatable {
     case message(LocalMessage)
     case payment(LocalMessage, KitPaymentMessage)
+    /// A terminal direct scheduled-payment outcome authenticated by the server sync stream.
+    case scheduledPayment(LocalMessage, KitScheduledPaymentMessage)
+    /// Creator-only failed/cancelled outcome for a server-owned scheduled group payment.
+    case scheduledGroupPaymentOutcome(LocalMessage, KitScheduledGroupPaymentOutcomeMessage)
     /// A group payment's announcement: the golden card each recipient claims their own share from.
     case groupPayment(LocalMessage, KitGroupPaymentMessage)
     /// Somebody answering a group payment, shown as a small centred line like a date heading.
     case groupPaymentEvent(LocalMessage, KitGroupPaymentMessage)
+    /// One collaborative target that members can fund in parts until it reaches 100%.
+    case groupPaymentRequest(LocalMessage, KitGroupPaymentRequestMessage)
+    /// A contribution or authoritative terminal transition shown beneath the request card.
+    case groupPaymentRequestEvent(LocalMessage, KitGroupPaymentRequestMessage)
     case call(CallRecord)
     case dateSeparator(ConversationTimelineDateSeparator)
 
@@ -1545,10 +1553,18 @@ enum ConversationTimelineItem: Identifiable, Equatable {
             "message:\(message.id.uuidString.lowercased())"
         case .payment(let message, _):
             "payment:\(message.id.uuidString.lowercased())"
+        case .scheduledPayment(let message, _):
+            "scheduled-payment:\(message.id.uuidString.lowercased())"
+        case .scheduledGroupPaymentOutcome(let message, _):
+            "scheduled-group-payment-outcome:\(message.id.uuidString.lowercased())"
         case .groupPayment(let message, _):
             "group-payment:\(message.id.uuidString.lowercased())"
         case .groupPaymentEvent(let message, _):
             "group-payment-event:\(message.id.uuidString.lowercased())"
+        case .groupPaymentRequest(let message, _):
+            "group-payment-request:\(message.id.uuidString.lowercased())"
+        case .groupPaymentRequestEvent(let message, _):
+            "group-payment-request-event:\(message.id.uuidString.lowercased())"
         case .call(let call):
             "call:\(call.id.lowercased())"
         case .dateSeparator(let separator):
@@ -1563,8 +1579,12 @@ enum ConversationTimelineItem: Identifiable, Equatable {
         // time would file it under yesterday's date separator.
         case .message(let message): message.timelineDate
         case .payment(let message, _): message.timelineDate
+        case .scheduledPayment(let message, _): message.timelineDate
+        case .scheduledGroupPaymentOutcome(let message, _): message.timelineDate
         case .groupPayment(let message, _): message.timelineDate
         case .groupPaymentEvent(let message, _): message.timelineDate
+        case .groupPaymentRequest(let message, _): message.timelineDate
+        case .groupPaymentRequestEvent(let message, _): message.timelineDate
         case .call(let call): call.startedAt
         case .dateSeparator(let separator): separator.day
         }
@@ -1642,10 +1662,84 @@ enum ConversationTimelinePolicy {
         let groupPayments = canonicalUUID(conversation.id) != nil && conversation.isGroup
             ? groupPaymentAnnouncements(in: matchingMessages)
             : [:]
+        let groupPaymentRequests = canonicalUUID(conversation.id) != nil && conversation.isGroup
+            ? groupPaymentRequestAnnouncements(in: matchingMessages)
+            : [:]
         var claimedGroupPayments: Set<String> = []
         var answeredGroupPayments: Set<String> = []
+        var claimedGroupPaymentRequests: Set<String> = []
+        var groupPaymentRequestEvents: Set<String> = []
         for message in matchingMessages {
             let item: ConversationTimelineItem
+            if SecureMessageReservedPrefixPolicy.beginsWithReservedPrefix(
+                message.body,
+                prefix: KitScheduledPaymentMessage.prefix
+            ) {
+                guard !conversation.isGroup,
+                      let paymentRecipient,
+                      paymentMessageSenderIsValid(
+                          message,
+                          currentUserID: currentUserID,
+                          recipientUserID: paymentRecipient
+                      ),
+                      let descriptor = KitScheduledPaymentMessage.parse(message.body),
+                      descriptor.isTrustedProjection(message)
+                else {
+                    // This namespace is minted only from authenticated server sync. Malformed or
+                    // E2EE-authored lookalikes stay invisible instead of impersonating a receipt.
+                    continue
+                }
+                candidates.append(
+                    Candidate(
+                        item: .scheduledPayment(message, descriptor),
+                        kindOrder: 0,
+                        stableID: message.id.uuidString.lowercased()
+                    )
+                )
+                continue
+            }
+            if SecureMessageReservedPrefixPolicy.beginsWithReservedPrefix(
+                message.body,
+                prefix: KitScheduledGroupPaymentOutcomeMessage.prefix
+            ) {
+                guard conversation.isGroup,
+                      message.isOutgoing,
+                      message.senderId.caseInsensitiveCompare(currentUserID ?? "") == .orderedSame,
+                      let descriptor = KitScheduledGroupPaymentOutcomeMessage.parse(message.body),
+                      descriptor.isTrustedProjection(message)
+                else { continue }
+                candidates.append(
+                    Candidate(
+                        item: .scheduledGroupPaymentOutcome(message, descriptor),
+                        kindOrder: 0,
+                        stableID: message.id.uuidString.lowercased()
+                    )
+                )
+                continue
+            }
+            if !groupPaymentRequests.isEmpty
+                || KitGroupPaymentRequestMessage.isGroupPaymentRequestText(message.body) {
+                switch groupPaymentRequestItem(
+                    for: message,
+                    announcements: groupPaymentRequests,
+                    claimedAnnouncements: &claimedGroupPaymentRequests,
+                    claimedEvents: &groupPaymentRequestEvents
+                ) {
+                case .project(let projected):
+                    candidates.append(
+                        Candidate(
+                            item: projected,
+                            kindOrder: 0,
+                            stableID: message.id.uuidString.lowercased()
+                        )
+                    )
+                    continue
+                case .drop:
+                    continue
+                case .notAGroupPayment:
+                    break
+                }
+            }
             if !groupPayments.isEmpty || KitGroupPaymentMessage.isGroupPaymentText(message.body) {
                 switch groupPaymentItem(
                     for: message,
@@ -1830,6 +1924,66 @@ enum ConversationTimelinePolicy {
                   answeredShares.insert("\(descriptor.groupPaymentId):\(author)").inserted
             else { return .drop }
             return .project(.groupPaymentEvent(message, descriptor))
+        }
+    }
+
+    private static func groupPaymentRequestAnnouncements(
+        in messages: [LocalMessage]
+    ) -> [String: Set<String>] {
+        var announcements: [String: Set<String>] = [:]
+        for message in messages {
+            guard KitGroupPaymentRequestMessage.isGroupPaymentRequestText(message.body),
+                  let descriptor = KitGroupPaymentRequestMessage.parse(message.body),
+                  descriptor.action == .requested,
+                  let senderUserID = canonicalUUID(message.senderId)
+            else { continue }
+            announcements[descriptor.requestID, default: []].insert(senderUserID)
+        }
+        return announcements
+    }
+
+    private static func groupPaymentRequestItem(
+        for message: LocalMessage,
+        announcements: [String: Set<String>],
+        claimedAnnouncements: inout Set<String>,
+        claimedEvents: inout Set<String>
+    ) -> GroupPaymentProjection {
+        guard KitGroupPaymentRequestMessage.isGroupPaymentRequestText(message.body) else {
+            return .notAGroupPayment
+        }
+        guard let descriptor = KitGroupPaymentRequestMessage.parse(message.body),
+              let author = canonicalUUID(message.senderId),
+              let announcementAuthors = announcements[descriptor.requestID]
+        else { return .drop }
+
+        switch descriptor.action {
+        case .requested:
+            // Deduplicate per author, not merely per request. A member who sends a forged hint
+            // before the real requester must not be able to suppress the later authoritative
+            // card; the view model will render the forged row neutral and inert after API checks.
+            guard announcementAuthors.contains(author),
+                  claimedAnnouncements.insert("\(descriptor.requestID):\(author)").inserted
+            else { return .drop }
+            return .project(.groupPaymentRequest(message, descriptor))
+        case .contributed:
+            guard let contributionID = descriptor.contributionID,
+                  claimedEvents.insert(
+                      "\(descriptor.requestID):contribution:\(contributionID):\(author)"
+                  )
+                    .inserted
+            else { return .drop }
+            return .project(.groupPaymentRequestEvent(message, descriptor))
+        case .completed:
+            guard claimedEvents.insert("\(descriptor.requestID):completed:\(author)").inserted
+            else { return .drop }
+            return .project(.groupPaymentRequestEvent(message, descriptor))
+        case .cancelled, .expired:
+            guard claimedEvents.insert(
+                "\(descriptor.requestID):\(descriptor.action.rawValue):\(author)"
+            )
+                    .inserted
+            else { return .drop }
+            return .project(.groupPaymentRequestEvent(message, descriptor))
         }
     }
 

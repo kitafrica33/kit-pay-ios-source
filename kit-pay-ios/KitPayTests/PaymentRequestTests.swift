@@ -592,6 +592,327 @@ final class PaymentRequestTests: XCTestCase {
         XCTAssertEqual(shareCount, 2)
     }
 
+    func testScheduledPaymentBodyAndStepUpIntentMatchBackendExactly() throws {
+        let date = try XCTUnwrap(ScheduledPaymentDates.parse("2026-08-30T09:15:00Z"))
+        let body = CreateScheduledPaymentBody(
+            sourceWalletId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            destinationWalletId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            conversationId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            amount: "500000",
+            note: "School fees",
+            scheduledFor: ScheduledPaymentDates.apiString(date)
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(body)) as? [String: Any]
+        )
+        XCTAssertEqual(Set(object.keys), [
+            "source_wallet_id", "destination_wallet_id", "conversation_id", "amount", "note",
+            "scheduled_for",
+        ])
+        XCTAssertEqual(object["scheduled_for"] as? String, "2026-08-30T09:15:00Z")
+
+        let intent = ScheduledPaymentPolicy.intent(
+            sourceWalletID: body.sourceWalletId,
+            destinationWalletID: body.destinationWalletId,
+            amount: body.amount,
+            currencyCode: "UGX",
+            note: body.note,
+            scheduledFor: date,
+            conversationID: body.conversationId
+        )
+        XCTAssertEqual(Set(intent.keys), [
+            "action", "source_wallet_id", "destination_wallet_id", "amount", "currency", "note",
+            "scheduled_for", "conversation_id",
+        ])
+        XCTAssertEqual(try XCTUnwrap(intent["action"] ?? nil), "create")
+        XCTAssertEqual(try XCTUnwrap(intent["conversation_id"] ?? nil), body.conversationId)
+    }
+
+    func testScheduledPaymentDTORejectsContradictoryTerminalState() throws {
+        let valid = try decodeScheduledPayment(
+            status: "completed",
+            paymentExecutionID: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+            walletTransactionID: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+            failure: "null",
+            completedAt: "\"2026-08-30T09:15:03Z\"",
+            cancelledAt: "null"
+        )
+        XCTAssertTrue(valid.isStructurallyValid)
+
+        let contradictory = try decodeScheduledPayment(
+            status: "completed",
+            paymentExecutionID: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+            walletTransactionID: nil,
+            failure: "null",
+            completedAt: "\"2026-08-30T09:15:03Z\"",
+            cancelledAt: "null"
+        )
+        XCTAssertFalse(contradictory.isStructurallyValid)
+    }
+
+    func testScheduledPaymentReceiptIsCanonicalAndOnlyTrustedAsServerProjection() throws {
+        let scheduledAt = try XCTUnwrap(ScheduledPaymentDates.parse("2026-08-30T09:15:00Z"))
+        let descriptor = try XCTUnwrap(KitScheduledPaymentMessage(
+            action: .completed,
+            scheduledPaymentID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            amountMinor: 500_000,
+            currencyCode: "UGX",
+            currencyScale: 0,
+            scheduledAt: scheduledAt,
+            walletTransactionID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            note: "School fees",
+            reason: nil
+        ))
+        XCTAssertEqual(KitScheduledPaymentMessage.parse(descriptor.encoded), descriptor)
+        XCTAssertFalse(SecureMessageReservedPrefixPolicy.allowsUserAuthoredText(descriptor.encoded))
+
+        var projected = LocalMessage(
+            id: descriptor.deterministicMessageID,
+            conversationId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            senderId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+            body: descriptor.encoded,
+            createdAt: scheduledAt,
+            sentAt: scheduledAt,
+            state: .sent,
+            failureReason: nil,
+            isOutgoing: true
+        )
+        XCTAssertTrue(descriptor.isTrustedProjection(projected))
+        projected.serverMessageId = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+        XCTAssertFalse(descriptor.isTrustedProjection(projected))
+    }
+
+    func testScheduledPaymentSyncAllowsRecipientOnlyForCompletedOutcome() throws {
+        let completed = try decodeScheduledPaymentSyncEvent(
+            type: "scheduled_payment.completed",
+            status: "completed",
+            walletTransactionID: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+            failureCode: nil,
+            failureMessage: nil,
+            completedAt: "2026-08-30T09:15:03Z",
+            cancelledAt: nil
+        )
+        let recipientEnvelope = ScheduledPaymentSyncEnvelope(
+            event: completed,
+            currentUserID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        )
+        XCTAssertNotNil(recipientEnvelope)
+        let redactedAuthority = try decodeScheduledPayment(
+            conversationID: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            sourceWalletID: nil,
+            status: "completed",
+            paymentExecutionID: nil,
+            walletTransactionID: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+            failure: "null",
+            completedAt: "\"2026-08-30T09:15:03Z\"",
+            cancelledAt: "null"
+        )
+        XCTAssertTrue(redactedAuthority.isStructurallyValid)
+        XCTAssertTrue(try XCTUnwrap(recipientEnvelope).matchesAuthoritative(redactedAuthority))
+        let wrongConversationAuthority = try decodeScheduledPayment(
+            sourceWalletID: nil,
+            status: "completed",
+            paymentExecutionID: nil,
+            walletTransactionID: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+            failure: "null",
+            completedAt: "\"2026-08-30T09:15:03Z\"",
+            cancelledAt: "null"
+        )
+        XCTAssertFalse(
+            try XCTUnwrap(recipientEnvelope).matchesAuthoritative(wrongConversationAuthority)
+        )
+
+        let failed = try decodeScheduledPaymentSyncEvent(
+            type: "scheduled_payment.failed",
+            status: "failed",
+            walletTransactionID: nil,
+            failureCode: "INSUFFICIENT_FUNDS",
+            failureMessage: "The wallet balance was insufficient.",
+            completedAt: "2026-08-30T09:15:03Z",
+            cancelledAt: nil
+        )
+        XCTAssertNil(ScheduledPaymentSyncEnvelope(
+            event: failed,
+            currentUserID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        ))
+        XCTAssertNotNil(ScheduledPaymentSyncEnvelope(
+            event: failed,
+            currentUserID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        ))
+    }
+
+    func testScheduledPaymentGateSeparatesStandaloneFromChatRollout() throws {
+        func capabilities(chatFeature: Bool, ready: Bool, minimumIOS: String) throws
+            -> CapabilitiesDTO {
+            let json = """
+            {
+              "api_version":"v1",
+              "currency":{"code":"UGX","scale":"0"},
+              "features":{
+                "wallets":true,
+                "internal_transfers":true,
+                "scheduled_payments":true,
+                "scheduled_chat_payments_v1":\(chatFeature)
+              },
+              "authentication":{},
+              "protocols":{"payments":{"scheduled_chat_payments":{
+                "version":"v1",
+                "ready":\(ready),
+                "minimum_android_version":"0.2.35",
+                "minimum_android_version_code":46,
+                "minimum_ios_version":"\(minimumIOS)"
+              }}}
+            }
+            """
+            return try JSONDecoder().decode(CapabilitiesDTO.self, from: Data(json.utf8))
+        }
+
+        let enabled = ScheduledPaymentPolicy(capabilities: try capabilities(
+            chatFeature: true,
+            ready: true,
+            minimumIOS: "1.0.16-r39"
+        ))
+        XCTAssertTrue(enabled.enabled)
+        XCTAssertTrue(enabled.chatEnabled)
+
+        let withheld = ScheduledPaymentPolicy(capabilities: try capabilities(
+            chatFeature: false,
+            ready: true,
+            minimumIOS: "1.0.16-r39"
+        ))
+        XCTAssertTrue(withheld.enabled, "standalone scheduling has its own gate")
+        XCTAssertFalse(withheld.chatEnabled)
+
+        XCTAssertFalse(ScheduledPaymentPolicy(capabilities: try capabilities(
+            chatFeature: true,
+            ready: true,
+            minimumIOS: "1.0.16-r38"
+        )).chatEnabled)
+    }
+
+    func testPendingServerScheduleSurvivesTruncatedRefreshUntilExactTerminalRead() throws {
+        let retained = try decodeScheduledPayment(
+            id: "11111111-1111-4111-8111-111111111111",
+            status: "scheduled",
+            paymentExecutionID: nil,
+            walletTransactionID: nil,
+            failure: "null",
+            completedAt: "null",
+            cancelledAt: "null"
+        )
+        let newlyFetched = try decodeScheduledPayment(
+            id: "22222222-2222-4222-8222-222222222222",
+            status: "scheduled",
+            paymentExecutionID: nil,
+            walletTransactionID: nil,
+            failure: "null",
+            completedAt: "null",
+            cancelledAt: "null"
+        )
+        let afterTruncatedPage = ChatScheduledPaymentCollectionPolicy.reconcile(
+            previous: [retained],
+            fetched: [newlyFetched],
+            exact: [],
+            conversationID: "22222222-2222-4222-8222-222222222222"
+        )
+        XCTAssertEqual(Set(afterTruncatedPage.map(\.id)), Set([retained.id, newlyFetched.id]))
+
+        let terminal = try decodeScheduledPayment(
+            id: retained.id,
+            status: "completed",
+            paymentExecutionID: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+            walletTransactionID: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+            failure: "null",
+            completedAt: "\"2026-08-30T09:15:03Z\"",
+            cancelledAt: "null"
+        )
+        let afterExactRead = ChatScheduledPaymentCollectionPolicy.reconcile(
+            previous: afterTruncatedPage,
+            fetched: [newlyFetched],
+            exact: [terminal],
+            conversationID: "22222222-2222-4222-8222-222222222222"
+        )
+        XCTAssertEqual(afterExactRead.map(\.id), [newlyFetched.id])
+    }
+
+    private func decodeScheduledPayment(
+        id: String = "11111111-1111-4111-8111-111111111111",
+        conversationID: String = "22222222-2222-4222-8222-222222222222",
+        sourceWalletID: String? = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        status: String,
+        paymentExecutionID: String?,
+        walletTransactionID: String?,
+        failure: String,
+        completedAt: String,
+        cancelledAt: String
+    ) throws -> ScheduledPaymentDTO {
+        let execution = paymentExecutionID.map { "\"\($0)\"" } ?? "null"
+        let transaction = walletTransactionID.map { "\"\($0)\"" } ?? "null"
+        let sourceWallet = sourceWalletID.map { "\"\($0)\"" } ?? "null"
+        let json = """
+        {
+          "id":"\(id)",
+          "type":"scheduled_payment",
+          "status":"\(status)",
+          "conversation_id":"\(conversationID)",
+          "source_wallet_id":\(sourceWallet),
+          "destination_wallet_id":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+          "amount":"500000",
+          "currency":{"code":"UGX","scale":"0"},
+          "note":"School fees",
+          "scheduled_for":"2026-08-30T09:15:00Z",
+          "payment_execution_id":\(execution),
+          "wallet_transaction_id":\(transaction),
+          "failure":\(failure),
+          "completed_at":\(completedAt),
+          "cancelled_at":\(cancelledAt),
+          "created_at":"2026-08-29T09:15:00Z"
+        }
+        """
+        return try JSONDecoder().decode(ScheduledPaymentDTO.self, from: Data(json.utf8))
+    }
+
+    private func decodeScheduledPaymentSyncEvent(
+        type: String,
+        status: String,
+        walletTransactionID: String?,
+        failureCode: String?,
+        failureMessage: String?,
+        completedAt: String?,
+        cancelledAt: String?
+    ) throws -> MessagingSyncEventDTO {
+        func json(_ value: String?) -> String { value.map { "\"\($0)\"" } ?? "null" }
+        let body = """
+        {
+          "id":"event-1",
+          "type":"\(type)",
+          "conversation_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+          "resource_type":"scheduled_payment",
+          "resource_id":"11111111-1111-4111-8111-111111111111",
+          "occurred_at":"2026-08-30T09:15:04Z",
+          "data":{
+            "schema":"kit.scheduled-payment.v1",
+            "scheduled_payment_id":"11111111-1111-4111-8111-111111111111",
+            "conversation_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            "sender_user_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "recipient_user_id":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            "status":"\(status)",
+            "amount_minor":"500000",
+            "currency":"UGX",
+            "currency_scale":0,
+            "scheduled_for":"2026-08-30T09:15:00Z",
+            "wallet_transaction_id":\(json(walletTransactionID)),
+            "failure_code":\(json(failureCode)),
+            "failure_message":\(json(failureMessage)),
+            "completed_at":\(json(completedAt)),
+            "cancelled_at":\(json(cancelledAt)),
+            "note":"School fees"
+          }
+        }
+        """
+        return try JSONDecoder().decode(MessagingSyncEventDTO.self, from: Data(body.utf8))
+    }
+
     private func paymentRequest(
         id: String = "request-id",
         status: String = "pending",

@@ -313,3 +313,294 @@ struct ScheduledChatCard: View {
         return ScheduledSendPolicy.offlineFootnote
     }
 }
+
+// MARK: - Server-side scheduled payments
+
+@MainActor
+final class ChatScheduledPaymentsViewModel: ObservableObject {
+    @Published private(set) var items: [ScheduledPaymentDTO] = []
+    @Published private(set) var isLoading = false
+    @Published private(set) var cancellingID: String?
+    @Published var errorMessage: String?
+
+    private let api: any ScheduledPaymentServicing
+
+    init(api: any ScheduledPaymentServicing = APIClient.shared) {
+        self.api = api
+    }
+
+    func load(conversationID: String, enabled: Bool, isOnline: Bool) async {
+        guard enabled, isOnline, !isLoading else {
+            if !enabled { items = [] }
+            return
+        }
+        guard let canonicalConversationID = ScheduledPaymentValidation.canonicalUUID(
+            conversationID
+        ) else {
+            items = []
+            errorMessage = ChatScheduledPaymentError.invalidConversation.errorDescription
+            return
+        }
+        isLoading = true
+        errorMessage = nil
+        defer { isLoading = false }
+        let previous = items
+        do {
+            var fetched: [ScheduledPaymentDTO] = []
+            for status in [
+                ScheduledPaymentStatus.scheduled,
+                .queued,
+                .processing,
+            ] {
+                fetched.append(contentsOf: try await loadPages(
+                    conversationID: canonicalConversationID,
+                    status: status
+                ))
+            }
+
+            let fetchedIDs = Set(fetched.map { $0.id.lowercased() })
+            var exact: [ScheduledPaymentDTO] = []
+            for known in previous where !fetchedIDs.contains(known.id.lowercased()) {
+                // A list page can be truncated, or a schedule can transition while the three
+                // status pages are loading. Re-read every locally known omission exactly before
+                // removing it from the chat.
+                if let refreshed = try? await api.scheduledPayment(id: known.id) {
+                    exact.append(refreshed)
+                }
+            }
+            items = ChatScheduledPaymentCollectionPolicy.reconcile(
+                previous: previous,
+                fetched: fetched,
+                exact: exact,
+                conversationID: canonicalConversationID
+            )
+        } catch {
+            // A transient refresh must never make an already-confirmed schedule disappear.
+            items = previous
+            errorMessage = Self.message(for: error)
+        }
+    }
+
+    private func loadPages(
+        conversationID: String,
+        status: ScheduledPaymentStatus
+    ) async throws -> [ScheduledPaymentDTO] {
+        var result: [ScheduledPaymentDTO] = []
+        var before: String?
+        var seenCursors: Set<String> = []
+        for _ in 0..<100 {
+            let response = try await api.scheduledPayments(
+                conversationID: conversationID,
+                status: status,
+                before: before,
+                limit: 100
+            )
+            guard response.isStructurallyValid,
+                  response.items.allSatisfy({
+                      $0.conversationId?.caseInsensitiveCompare(conversationID) == .orderedSame
+                          && $0.knownStatus == status
+                  })
+            else { throw ChatScheduledPaymentError.invalidResponse }
+            result.append(contentsOf: response.items)
+            guard response.hasMore, let cursor = response.nextBefore else { return result }
+            guard seenCursors.insert(cursor).inserted else {
+                throw ChatScheduledPaymentError.invalidResponse
+            }
+            before = cursor
+        }
+        throw ChatScheduledPaymentError.invalidResponse
+    }
+
+    func upsert(_ payment: ScheduledPaymentDTO, conversationID: String) {
+        guard payment.isStructurallyValid,
+              payment.conversationId?.caseInsensitiveCompare(conversationID) == .orderedSame
+        else { return }
+        if payment.knownStatus?.isTerminal == true {
+            items.removeAll { $0.id.caseInsensitiveCompare(payment.id) == .orderedSame }
+            return
+        }
+        if let index = items.firstIndex(where: {
+            $0.id.caseInsensitiveCompare(payment.id) == .orderedSame
+        }) {
+            items[index] = payment
+        } else {
+            items.append(payment)
+        }
+        items.sort { ($0.scheduledDate ?? .distantFuture) < ($1.scheduledDate ?? .distantFuture) }
+    }
+
+    func cancel(_ payment: ScheduledPaymentDTO, conversationID: String, isOnline: Bool) async {
+        guard isOnline, cancellingID == nil else {
+            if !isOnline { errorMessage = "Connect to cancel this scheduled payment." }
+            return
+        }
+        cancellingID = payment.id
+        errorMessage = nil
+        defer { cancellingID = nil }
+        do {
+            let latest = try await api.scheduledPayment(id: payment.id)
+            guard latest.isStructurallyValid,
+                  latest.conversationId?.caseInsensitiveCompare(conversationID) == .orderedSame,
+                  latest.knownStatus == .scheduled
+            else { throw ChatScheduledPaymentError.notCancellable }
+            let cancelled = try await api.cancelScheduledPayment(
+                id: latest.id,
+                idempotencyKey: "ios-scheduled-payment-cancel-\(latest.id)"
+            )
+            guard cancelled.isStructurallyValid,
+                  cancelled.id.caseInsensitiveCompare(latest.id) == .orderedSame,
+                  cancelled.knownStatus == .cancelled
+            else { throw ChatScheduledPaymentError.invalidResponse }
+            items.removeAll { $0.id.caseInsensitiveCompare(latest.id) == .orderedSame }
+        } catch {
+            errorMessage = Self.message(for: error)
+        }
+    }
+
+    private static func message(for error: Error) -> String {
+        if let known = error as? ChatScheduledPaymentError {
+            return known.errorDescription ?? "Kit Pay could not update this scheduled payment."
+        }
+        let raw = (error as? APIErrorPayload)?.message ?? error.localizedDescription
+        return CustomerFacingPaymentCopy.neutralizedServiceMessage(raw)
+    }
+}
+
+private enum ChatScheduledPaymentError: LocalizedError {
+    case invalidResponse
+    case invalidConversation
+    case notCancellable
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidResponse:
+            "Kit Pay could not verify the scheduled payment. Refresh and try again."
+        case .invalidConversation:
+            "This conversation is no longer available."
+        case .notCancellable:
+            "This payment has already started and can no longer be cancelled."
+        }
+    }
+}
+
+enum ChatScheduledPaymentCollectionPolicy {
+    static func reconcile(
+        previous: [ScheduledPaymentDTO],
+        fetched: [ScheduledPaymentDTO],
+        exact: [ScheduledPaymentDTO],
+        conversationID: String
+    ) -> [ScheduledPaymentDTO] {
+        var byID: [String: ScheduledPaymentDTO] = [:]
+        for candidate in previous + fetched + exact {
+            guard candidate.isStructurallyValid,
+                  candidate.conversationId?.caseInsensitiveCompare(conversationID) == .orderedSame
+            else { continue }
+            let id = candidate.id.lowercased()
+            if candidate.knownStatus?.isTerminal == true {
+                byID[id] = nil
+            } else {
+                byID[id] = candidate
+            }
+        }
+        return byID.values.sorted {
+            if $0.scheduledDate != $1.scheduledDate {
+                return ($0.scheduledDate ?? .distantFuture) < ($1.scheduledDate ?? .distantFuture)
+            }
+            return $0.id < $1.id
+        }
+    }
+}
+
+struct ScheduledPaymentSection: View {
+    let items: [ScheduledPaymentDTO]
+    let recipientName: String
+    let isOnline: Bool
+    let cancellingID: String?
+    let errorMessage: String?
+    let onCancel: (ScheduledPaymentDTO) -> Void
+
+    var body: some View {
+        VStack(alignment: .trailing, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "building.columns.fill")
+                Text(items.count == 1 ? "Scheduled payment" : "Scheduled payments · \(items.count)")
+            }
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(KitColor.secondaryText)
+            .frame(maxWidth: .infinity, alignment: .center)
+
+            ForEach(items) { payment in
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Label(statusTitle(payment), systemImage: statusSymbol(payment))
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(KitColor.green)
+                        Spacer()
+                        if cancellingID == payment.id { ProgressView().controlSize(.small) }
+                    }
+                    Text(KitMoney.formatted(
+                        payment.amount,
+                        currency: payment.currency
+                    ))
+                    .font(.title3.bold())
+                    Text("To \(recipientName) · \(scheduledLabel(payment))")
+                        .font(.caption)
+                        .foregroundStyle(KitColor.secondaryText)
+                    if let note = payment.note, !note.isEmpty {
+                        Text(note).font(.subheadline).foregroundStyle(KitColor.secondaryText)
+                    }
+                    Text("Kit will send this from the server even if this iPhone is offline.")
+                        .font(.caption2)
+                        .foregroundStyle(KitColor.secondaryText)
+                }
+                .padding(14)
+                .frame(maxWidth: 300, alignment: .leading)
+                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .strokeBorder(KitColor.green.opacity(0.38), lineWidth: 1)
+                }
+                .contextMenu {
+                    if payment.knownStatus == .scheduled {
+                        Button(role: .destructive) { onCancel(payment) } label: {
+                            Label("Cancel payment", systemImage: "xmark.circle")
+                        }
+                        .disabled(!isOnline || cancellingID != nil)
+                    }
+                }
+            }
+
+            if let errorMessage {
+                Text(errorMessage)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .frame(maxWidth: 300, alignment: .leading)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .trailing)
+    }
+
+    private func statusTitle(_ payment: ScheduledPaymentDTO) -> String {
+        switch payment.knownStatus {
+        case .scheduled: "Scheduled"
+        case .queued: "Queued securely"
+        case .processing: "Sending"
+        case .completed: "Completed"
+        case .failed: "Not sent"
+        case .cancelled: "Cancelled"
+        case nil: "Scheduled payment"
+        }
+    }
+
+    private func statusSymbol(_ payment: ScheduledPaymentDTO) -> String {
+        switch payment.knownStatus {
+        case .queued, .processing: "arrow.triangle.2.circlepath"
+        default: "clock.badge.checkmark"
+        }
+    }
+
+    private func scheduledLabel(_ payment: ScheduledPaymentDTO) -> String {
+        guard let date = payment.scheduledDate else { return "scheduled" }
+        return date.formatted(date: .abbreviated, time: .shortened)
+    }
+}

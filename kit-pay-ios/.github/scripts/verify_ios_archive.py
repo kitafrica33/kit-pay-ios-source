@@ -23,6 +23,11 @@ SOURCE_RELEASE_URL = (
     "https://github.com/kitafrica33/kit-pay-ios-source/releases/tag/"
     "v{version}-build{build_number}"
 )
+REQUIRED_BACKGROUND_TASK_IDENTIFIERS = {
+    "africa.kit.pay.ios.communication-replay",
+    "africa.kit.pay.ios.contacts-refresh",
+    "africa.kit.pay.ios.message-backup",
+}
 
 
 def fail(message: str) -> "NoReturn":
@@ -147,6 +152,9 @@ def main() -> None:
             isinstance(identifier, str) and bool(identifier)
             for identifier in permitted_background_tasks
         )
+        and REQUIRED_BACKGROUND_TASK_IDENTIFIERS.issubset(
+            set(permitted_background_tasks)
+        )
     )
     accessed_api_types = privacy.get("NSPrivacyAccessedAPITypes")
     valid_accessed_api_types = isinstance(accessed_api_types, list) and all(
@@ -244,7 +252,7 @@ def main() -> None:
         (signed.get("get-task-allow") is False, "Signed app must explicitly prohibit debugging"),
         (
             valid_processing_metadata,
-            "Background processing requires BGTaskSchedulerPermittedIdentifiers",
+            "Background processing requires every Kit Pay BGTaskSchedulerPermittedIdentifiers entry",
         ),
         (
             "remote-notification" in background_modes,

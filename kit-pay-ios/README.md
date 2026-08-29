@@ -14,13 +14,21 @@ and Apple Liquid Glass.
   sync, progress reporting, regional phone matching, Kit Pay contacts first, and invites last.
 - Didit hosted identity collection. Final KYC approval remains controlled by backend compliance.
 - Encrypted offline projections, conversation drafts, and outbox state for wallet, messaging, and calls.
+- Send Later for direct and group messages uses the account-bound encrypted local outbox and a
+  registered iOS background-processing task. Plaintext is never uploaded or Signal-encrypted before
+  its due minute; process relaunch, connectivity recovery, and foreground entry all re-arm and drain
+  the same idempotent command. Direct and group scheduled payments use the server scheduler instead.
 - Voice notes, videos, video notes, and documents up to 200 MiB for compatible iPhone recipients,
   plus pinned/muted chat filters, multi-select, message forwarding, per-chat search across text,
   captions, and document names, and local deletion. Every message kind queues offline-first: it
   commits locally in an instant bubble (large media parks in the encrypted file cache) and the
   durable outbox uploads, encrypts, and delivers when connectivity returns.
-- Client support for encrypted iCloud chat backup and restore. Message content and included inline
-  media are sealed with ChaChaPoly before upload and the key is stored in the user's synchronizable
+- Client support for encrypted iCloud chat backup and restore, including user-confirmed replacement
+  of an unreadable or damaged remote backup and daily, weekly, or monthly automatic cadence. A due
+  backup is attempted on iOS background processing, app backgrounding, reconnect, and foreground
+  catch-up; expiration re-arms the task, while unchanged content records a successful check
+  without repeatedly uploading the same archive. Message content and included inline media are
+  sealed with ChaChaPoly before upload and the key is stored in the user's synchronizable
   Keychain; the private CloudKit record still exposes operational metadata including its
   account-derived record name, creation time, encrypted size, message count, device name, and schema
   version. Customers can explicitly delete both the encrypted record and its backup key.
@@ -125,6 +133,38 @@ and Apple Liquid Glass.
   from unauthenticated display text. Existing
   group history becomes read-only whenever `features.messaging_groups` is absent or withdrawn;
   queued group ciphertext remains local until the gate returns, or is failed if membership ends.
+- Collaborative group payment requests and chat-bound scheduled payments are a build-39 protocol
+  boundary. The backend must emit the five
+  `group_payment_request.{created,contributed,completed,cancelled,expired}`, three
+  `scheduled_payment.{completed,failed,cancelled}`, and three
+  `scheduled_group_payment.{completed,failed,cancelled}` sync event types only to iOS
+  `1.0.16-r39` or later. Builds 24–38 do not know these event types and deliberately stop before
+  advancing an unknown cursor, so advertising a gate without applying that per-device emission
+  fence can wedge messaging sync on an older installation.
+  The client fails closed unless the corresponding feature flags and exact
+  `protocols.payments` blocks are present: `group_payment_requests` must be ready `v1`, pin
+  `minimum_ios_version:"1.0.16-r39"`, enable `partial_contributions`, and set
+  `progress_basis_points_max:10000`; `scheduled_chat_payments` must be ready `v1` with the same
+  iOS floor; `scheduled_group_payments` must additionally pin `minimum_lead_seconds:60` and
+  `maximum_horizon_seconds:31536000`. Direct scheduling also requires `scheduled_payments` and
+  `scheduled_chat_payments_v1`; scheduled group sends require `scheduled_payments`,
+  `scheduled_group_payments_v1`, and the existing wallet/internal-transfer/claimable/group-payment
+  gates; collaborative requests require `group_payment_requests_v1` plus wallets and internal
+  transfers.
+  The v1 API contract comprises list/create under
+  `conversations/{id}/group-payment-requests`, exact request and paginated/exact contribution
+  reads under `group-payment-requests/{id}`, contribution and cancel POSTs; list/create/exact/
+  cancel under `payments/scheduled` plus exact `payments/executions/{id}` reads; and preview,
+  list/create, exact and cancel routes for `scheduled-group-payments`. Every mutating retry uses a
+  stable `Idempotency-Key`. Direct scheduled creation, scheduled group creation, and request
+  contributions require an intent-bound `X-Kit-Wallet-Step-Up` proof with purposes
+  `scheduled_payment`, `scheduled_group_payment`, and `group_payment_request_contribution`
+  respectively. Sync is server-authoritative: referenced requests, contributions, schedules, and
+  executions must remain readable to every entitled event recipient for the lifetime of the
+  queued event. Only a structured `CONVERSATION_NOT_FOUND` response for a conversation the member
+  can no longer access is skippable; another permanent resource-read error leaves the cursor
+  unadvanced by design. A request completes only at exactly 10,000 basis points, and the final
+  contributor attribution comes from the exact authoritative contribution rather than chat text.
 - iCloud chat backups require the `iCloud.africa.kit.pay.ios` CloudKit container to be
   provisioned in the Apple Developer portal, an App Store profile authorizing the signed CloudKit
   entitlements, and the `KitMessageBackup` record type deployed to the production schema. Release
@@ -133,6 +173,13 @@ and Apple Liquid Glass.
   the readable operational metadata. Server-authored `KITSYS1` membership notices are regenerated
   by sync rather than included in backups, whose message schema cannot prove their event
   provenance. The entitlement and client code alone do not establish production readiness.
+- iOS background execution is best-effort: `earliestBeginDate` is not an exact alarm and Low Power
+  Mode, force-quit, device state, or system scheduling can delay a Send Later message. The bubble
+  remains visibly queued with its original promised time and sends once iOS grants background time,
+  connectivity returns, or Kit Pay next enters the foreground. Expiration leaves the encrypted row
+  intact and re-arms it; it never causes a plaintext upload or a duplicate send. Physical-device
+  acceptance must cover a due message after process termination, an expired background task, and
+  offline-to-online recovery.
 
 ### CloudKit production-schema release
 

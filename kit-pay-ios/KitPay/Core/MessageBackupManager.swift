@@ -2,6 +2,27 @@ import BackgroundTasks
 import CloudKit
 import Foundation
 
+enum MessageBackupAssetRetryPolicy {
+    /// CloudKit can return a provider URL before all bytes have materialized. Give the provider a
+    /// short, bounded window without turning a restore or pre-upload merge into a busy loop.
+    private static let delaysNanoseconds: [UInt64] = [
+        250_000_000,
+        750_000_000,
+        1_500_000_000,
+        3_000_000_000,
+    ]
+
+    static func delayNanoseconds(afterFailedAttempt attempt: Int) -> UInt64? {
+        guard delaysNanoseconds.indices.contains(attempt) else { return nil }
+        return delaysNanoseconds[attempt]
+    }
+
+    static func wait(afterFailedAttempt attempt: Int) async throws {
+        guard let delay = delayNanoseconds(afterFailedAttempt: attempt) else { return }
+        try await Task.sleep(nanoseconds: delay)
+    }
+}
+
 /// Stores the end-to-end encrypted chat backup in the user's private CloudKit database.
 ///
 /// CloudKit only ever receives ciphertext produced by `MessageBackupCrypto`; the key stays in the
@@ -99,7 +120,13 @@ actor MessageBackupManager {
                     where attempt + 1 < Self.maximumConflictAttempts {
                     // A fetched CKAsset URL can briefly refer to bytes that are not materialized
                     // yet. Refetch the record, but never save over ciphertext we could not read.
+                    try await MessageBackupAssetRetryPolicy.wait(afterFailedAttempt: attempt)
                     continue
+                } catch {
+                    // An authenticated but obsolete archive (or genuinely damaged ciphertext)
+                    // must never be overwritten by an ordinary manual/automatic backup. Surface
+                    // a distinct state so the customer can explicitly replace it instead.
+                    throw MessageBackupReplacementPolicy.existingRecordError(error)
                 }
                 archive = try MessageBackupConflictPolicy.merge(remote, payload)
                 let remoteMetadata = try MessageBackupContentMetadata.make(for: remote)
@@ -196,6 +223,7 @@ actor MessageBackupManager {
                 where attempt + 1 < Self.maximumAssetReadAttempts {
                 // Each fetch gets a fresh CloudKit-managed asset URL. No record or key mutation
                 // occurs while iCloud finishes materializing the encrypted bytes.
+                try await MessageBackupAssetRetryPolicy.wait(afterFailedAttempt: attempt)
                 continue
             }
         }
@@ -210,6 +238,19 @@ actor MessageBackupManager {
         } catch let error as CKError where error.code == .notAuthenticated {
             throw MessageBackupError.iCloudUnavailable
         }
+    }
+
+    /// Destructive recovery for a record an ordinary upload refused to overwrite. Callers must
+    /// present explicit confirmation first. The old CloudKit record and synchronizable key are
+    /// removed before `upload` is allowed to mint a new key for the fresh archive.
+    func replaceUnreadableBackup(
+        with payload: MessageBackupPayload
+    ) async throws -> MessageBackupSummary {
+        guard await isICloudAvailable() else { throw MessageBackupError.iCloudUnavailable }
+        try MessageBackupValidationPolicy.validate(payload, expectedUserID: payload.userID)
+        try await deleteBackup(forUserID: payload.userID)
+        try MessageBackupKeyStore.removeKey(forUserID: payload.userID)
+        return try await upload(payload)
     }
 
     private func summary(from record: CKRecord) -> MessageBackupSummary? {
@@ -400,28 +441,29 @@ final class MessageBackupRefreshScheduler {
     static let shared = MessageBackupRefreshScheduler()
     static let identifier = "africa.kit.pay.ios.message-backup"
 
-    private var handler: ((BGAppRefreshTask) -> Void)?
-    private var pendingTask: BGAppRefreshTask?
+    private var handler: ((BGProcessingTask) -> Void)?
+    private var pendingTask: BGProcessingTask?
+    private var armedEarliestBeginDate: Date?
 
     func register() {
         BGTaskScheduler.shared.register(
             forTaskWithIdentifier: Self.identifier,
             using: .main
         ) { [weak self] task in
-            guard let refreshTask = task as? BGAppRefreshTask else {
+            guard let processingTask = task as? BGProcessingTask else {
                 task.setTaskCompleted(success: false)
                 return
             }
-            self?.schedule()
+            self?.armedEarliestBeginDate = nil
             if let handler = self?.handler {
-                handler(refreshTask)
+                handler(processingTask)
             } else {
-                self?.pendingTask = refreshTask
+                self?.pendingTask = processingTask
             }
         }
     }
 
-    func installHandler(_ handler: @escaping (BGAppRefreshTask) -> Void) {
+    func installHandler(_ handler: @escaping (BGProcessingTask) -> Void) {
         self.handler = handler
         if let pendingTask {
             self.pendingTask = nil
@@ -429,9 +471,38 @@ final class MessageBackupRefreshScheduler {
         }
     }
 
-    func schedule() {
-        let request = BGAppRefreshTaskRequest(identifier: Self.identifier)
-        request.earliestBeginDate = Date(timeIntervalSinceNow: 6 * 60 * 60)
-        try? BGTaskScheduler.shared.submit(request)
+    @discardableResult
+    func schedule(
+        earliestBeginDate: Date = Date(timeIntervalSinceNow: 6 * 60 * 60),
+        submit: (BGProcessingTaskRequest) throws -> Void = {
+            try BGTaskScheduler.shared.submit($0)
+        }
+    ) -> MessageBackupRefreshScheduleState {
+        // Repeated foreground, connectivity, and successful-backup callbacks often ask for the
+        // same (or a later) window. Keep the already-valid task instead of cancelling it and
+        // risking a failed replacement submission leaving no background work at all.
+        if let armedEarliestBeginDate,
+           armedEarliestBeginDate <= earliestBeginDate {
+            return .armed(earliestBeginDate: armedEarliestBeginDate)
+        }
+        let request = BGProcessingTaskRequest(identifier: Self.identifier)
+        request.earliestBeginDate = earliestBeginDate
+        request.requiresNetworkConnectivity = true
+        request.requiresExternalPower = false
+        do {
+            try submit(request)
+            armedEarliestBeginDate = earliestBeginDate
+            return .armed(earliestBeginDate: earliestBeginDate)
+        } catch {
+            if let armedEarliestBeginDate {
+                return .armed(earliestBeginDate: armedEarliestBeginDate)
+            }
+            return .submissionFailed
+        }
+    }
+
+    func cancel() {
+        BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: Self.identifier)
+        armedEarliestBeginDate = nil
     }
 }

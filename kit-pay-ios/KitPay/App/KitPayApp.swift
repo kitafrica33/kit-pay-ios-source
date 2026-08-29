@@ -128,7 +128,7 @@ struct KitPayApp: App {
                     } else if phase == .background {
                         model.applicationDidEnterBackgroundSecurely()
                         ContactBackgroundRefreshScheduler.shared.schedule()
-                        MessageBackupRefreshScheduler.shared.schedule()
+                        model.scheduleAutomaticMessageBackupRefresh()
                     }
                 }
         }

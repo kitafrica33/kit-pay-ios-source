@@ -37,6 +37,11 @@ struct MessageBackupPreferences: Codable, Hashable, Sendable {
     var lastBackupMessageCount: Int?
     var lastBackupGeneration: Int64?
     var lastBackupContentDigest: String?
+    /// The most recent automatic attempt, including a failed attempt. Keeping this separate from
+    /// `lastBackupAt` lets the scheduler retry a failure without spinning every time the app
+    /// becomes active, while the settings screen can tell the customer what actually happened.
+    var lastAutomaticBackupAttemptAt: Date?
+    var lastAutomaticBackupSucceeded: Bool?
 
     static let `default` = MessageBackupPreferences()
 
@@ -65,19 +70,84 @@ struct MessageBackupPreferences: Codable, Hashable, Sendable {
             String.self,
             forKey: .lastBackupContentDigest
         )
+        lastAutomaticBackupAttemptAt = try container.decodeIfPresent(
+            Date.self,
+            forKey: .lastAutomaticBackupAttemptAt
+        )
+        lastAutomaticBackupSucceeded = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .lastAutomaticBackupSucceeded
+        )
     }
 }
 
 enum MessageBackupSchedulePolicy {
+    /// A failed background attempt is retried on the next useful foreground/background window,
+    /// but not on every path update or scene activation.
+    static let failedAttemptRetryInterval: TimeInterval = 6 * 60 * 60
+
     static func isBackupDue(
         frequency: MessageBackupFrequency,
         lastBackupAt: Date?,
+        lastAutomaticBackupAttemptAt: Date? = nil,
+        lastAutomaticBackupSucceeded: Bool? = nil,
         now: Date = Date()
     ) -> Bool {
-        guard let interval = frequency.interval else { return false }
-        guard let lastBackupAt else { return true }
-        return now.timeIntervalSince(lastBackupAt) >= interval
+        guard let next = nextAttemptDate(
+            frequency: frequency,
+            lastBackupAt: lastBackupAt,
+            lastAutomaticBackupAttemptAt: lastAutomaticBackupAttemptAt,
+            lastAutomaticBackupSucceeded: lastAutomaticBackupSucceeded,
+            now: now
+        ) else { return false }
+        return now >= next
     }
+
+    static func nextAttemptDate(
+        frequency: MessageBackupFrequency,
+        lastBackupAt: Date?,
+        lastAutomaticBackupAttemptAt: Date?,
+        lastAutomaticBackupSucceeded: Bool?,
+        now: Date = Date()
+    ) -> Date? {
+        guard let interval = frequency.interval else { return nil }
+        // A restored device clock may move backwards, leaving a receipt apparently in the
+        // future. Treat that as due now; otherwise one bad clock could postpone backups for
+        // months or years.
+        let successfulAnchors: [Date?] = lastAutomaticBackupSucceeded == true
+            ? [lastBackupAt, lastAutomaticBackupAttemptAt]
+            : [lastBackupAt]
+        let presentAnchors = successfulAnchors.compactMap { $0 }
+        // An unchanged CloudKit archive legitimately returns its original creation timestamp.
+        // A successful automatic attempt is still a fresh check-in, so its attempt receipt also
+        // anchors the next frequency window and prevents every activation from uploading again.
+        let scheduled: Date
+        if presentAnchors.contains(where: { $0 > now }) {
+            scheduled = now
+        } else if let anchor = presentAnchors.max() {
+            scheduled = anchor.addingTimeInterval(interval)
+        } else {
+            scheduled = .distantPast
+        }
+        guard lastAutomaticBackupSucceeded == false,
+              let lastAutomaticBackupAttemptAt
+        else { return scheduled }
+        let retry = lastAutomaticBackupAttemptAt > now
+            ? now
+            : lastAutomaticBackupAttemptAt.addingTimeInterval(failedAttemptRetryInterval)
+        return max(
+            scheduled,
+            retry
+        )
+    }
+}
+
+enum MessageBackupRefreshScheduleState: Equatable, Sendable {
+    case inactive
+    case armed(earliestBeginDate: Date)
+    /// Non-sensitive by design: raw scheduler errors can contain implementation details and do
+    /// not help a customer. Foreground opportunistic backup remains available in this state.
+    case submissionFailed
 }
 
 enum MessageBackupAutomaticRunResult: Equatable, Sendable {
@@ -167,6 +237,17 @@ struct MessageBackupPayload: Codable, Equatable, Sendable {
                         message.body,
                         prefix: KitSystemMessage.prefix
                     ),
+                    // Scheduled-payment outcome rows are likewise authenticated server
+                    // projections. Their compact local shape deliberately carries no sync-event
+                    // signature/provenance, so a restored archive cannot prove who minted one.
+                    !SecureMessageReservedPrefixPolicy.beginsWithReservedPrefix(
+                        message.body,
+                        prefix: KitScheduledPaymentMessage.prefix
+                    ),
+                    !SecureMessageReservedPrefixPolicy.beginsWithReservedPrefix(
+                        message.body,
+                        prefix: KitScheduledGroupPaymentOutcomeMessage.prefix
+                    ),
                     // A reserved media-family body that parses as neither strict v1 nor strict
                     // v2 lives in the timeline only as a generic placeholder row. Its raw text
                     // is a maybe-descriptor this build cannot confine, so it never enters an
@@ -217,6 +298,9 @@ enum MessageBackupError: LocalizedError, Equatable {
     case authenticationFailed
     case incompatibleBackup
     case invalidBackup
+    /// An already-present record could not be opened safely. Upload never overwrites it; only an
+    /// explicit customer-confirmed replacement may delete the ciphertext and its old key.
+    case existingBackupUnreadable
     case backupNotFound
     case accountMismatch
     case conflictRetryLimitExceeded
@@ -236,6 +320,8 @@ enum MessageBackupError: LocalizedError, Equatable {
             "This backup cannot be safely restored by this version of Kit Pay."
         case .invalidBackup:
             "This backup file is damaged or incomplete."
+        case .existingBackupUnreadable:
+            "The existing encrypted backup could not be read. It was kept unchanged. You can replace it after confirming below."
         case .backupNotFound:
             "No Kit Pay chat backup was found in this iCloud account."
         case .accountMismatch:
@@ -243,6 +329,34 @@ enum MessageBackupError: LocalizedError, Equatable {
         case .conflictRetryLimitExceeded:
             "Your chat backup changed on another device. Please try again."
         }
+    }
+}
+
+enum MessageBackupReplacementPolicy {
+    static func existingRecordError(_ error: Error) -> MessageBackupError {
+        guard let backupError = error as? MessageBackupError else {
+            return .existingBackupUnreadable
+        }
+        switch backupError {
+        case .authenticationFailed, .incompatibleBackup, .invalidBackup, .accountMismatch:
+            return .existingBackupUnreadable
+        case .iCloudUnavailable, .keyUnavailable, .assetUnavailable, .backupNotFound,
+             .conflictRetryLimitExceeded, .existingBackupUnreadable:
+            return backupError
+        }
+    }
+
+    static func mayOfferReplacement(after error: Error) -> Bool {
+        (error as? MessageBackupError) == .existingBackupUnreadable
+    }
+
+    /// Restore has already downloaded the remote archive, so a typed structural/authentication
+    /// failure refers to that archive and may be normalized for explicit replacement. Unknown
+    /// errors (including protected-store account changes) return nil and can never enable a
+    /// destructive CloudKit replacement.
+    static func remoteRestoreError(_ error: Error) -> MessageBackupError? {
+        guard error is MessageBackupError else { return nil }
+        return existingRecordError(error)
     }
 }
 
@@ -374,6 +488,17 @@ enum MessageBackupValidationPolicy {
                   !SecureMessageReservedPrefixPolicy.beginsWithReservedPrefix(
                       message.body,
                       prefix: KitSystemMessage.prefix
+                  ),
+                  // A deterministic local id is enough to de-duplicate a live authenticated
+                  // projection, but not enough to authenticate it after backup/restore. Reject
+                  // the whole forged archive instead of reviving a financial receipt as trusted.
+                  !SecureMessageReservedPrefixPolicy.beginsWithReservedPrefix(
+                      message.body,
+                      prefix: KitScheduledPaymentMessage.prefix
+                  ),
+                  !SecureMessageReservedPrefixPolicy.beginsWithReservedPrefix(
+                      message.body,
+                      prefix: KitScheduledGroupPaymentOutcomeMessage.prefix
                   ),
                   isValidDate(message.createdAt, now: now),
                   message.sentAt.map({ isValidDate($0, now: now) }) ?? true,

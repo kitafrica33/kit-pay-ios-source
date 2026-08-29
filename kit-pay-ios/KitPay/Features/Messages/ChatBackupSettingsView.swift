@@ -8,6 +8,7 @@ struct ChatBackupSettingsView: View {
     @State private var isCheckingRemote = false
     @State private var showsRestoreConfirmation = false
     @State private var showsDeleteConfirmation = false
+    @State private var showsReplacementConfirmation = false
     @State private var restoreCompleted = false
 
     private var preferences: MessageBackupPreferences { model.messageBackupPreferences }
@@ -28,6 +29,9 @@ struct ChatBackupSettingsView: View {
                 }
                 explainerCard
                 backupNowCard
+                if model.messageBackupReplacementAvailable {
+                    replacementCard
+                }
                 scheduleCard
                 restoreCard
                 deleteCard
@@ -128,6 +132,12 @@ struct ChatBackupSettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.orange)
             }
+
+            if let error = model.messageBackupOperationError {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(18)
@@ -173,11 +183,100 @@ struct ChatBackupSettingsView: View {
                 )
                 .font(.caption)
                 .foregroundStyle(KitColor.secondaryText)
+
+                if let attemptedAt = preferences.lastAutomaticBackupAttemptAt,
+                   let succeeded = preferences.lastAutomaticBackupSucceeded {
+                    Label(
+                        succeeded
+                            ? "Last automatic backup succeeded \(attemptedAt.formatted(date: .abbreviated, time: .shortened))."
+                            : "Last automatic backup needs attention (\(attemptedAt.formatted(date: .abbreviated, time: .shortened))).",
+                        systemImage: succeeded ? "checkmark.circle.fill" : "exclamationmark.circle.fill"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(succeeded ? KitColor.green : .orange)
+                }
+
+                if let next = model.nextAutomaticMessageBackupAt {
+                    Text(
+                        next <= Date()
+                            ? "Next attempt: when Kit Pay is online and active."
+                            : "Next attempt: \(next.formatted(date: .abbreviated, time: .shortened))."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(KitColor.secondaryText)
+                }
+
+                switch model.messageBackupRefreshScheduleState {
+                case .inactive:
+                    EmptyView()
+                case .armed:
+                    Label("Background backup is armed with iOS.", systemImage: "checkmark.circle")
+                        .font(.caption)
+                        .foregroundStyle(KitColor.secondaryText)
+                case .submissionFailed:
+                    Label(
+                        "iOS could not arm background backup. Kit Pay will retry when you open the app.",
+                        systemImage: "exclamationmark.arrow.triangle.2.circlepath"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(18)
         .kitGlass(cornerRadius: 24, shadow: false)
+    }
+
+    private var replacementCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label("Existing backup needs replacement", systemImage: "exclamationmark.icloud.fill")
+                .font(.headline)
+                .foregroundStyle(.orange)
+            Text(
+                "Kit kept the unreadable encrypted backup unchanged. Replacing it deletes that archive and its old key, then creates a new encrypted backup from the chats on this iPhone."
+            )
+            .font(.footnote)
+            .foregroundStyle(KitColor.secondaryText)
+
+            Button(role: .destructive) {
+                showsReplacementConfirmation = true
+            } label: {
+                Label("Replace unreadable backup", systemImage: "arrow.triangle.2.circlepath.icloud")
+                    .font(.body.weight(.semibold))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 15)
+                    .kitGlass(cornerRadius: 18, shadow: false)
+            }
+            .buttonStyle(.plain)
+            .disabled(
+                model.isBackingUpMessages
+                    || model.isRestoringMessages
+                    || model.isDeletingMessageBackup
+                    || !model.isOnline
+            )
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(18)
+        .kitGlass(cornerRadius: 24, shadow: false)
+        .confirmationDialog(
+            "Replace the unreadable backup?",
+            isPresented: $showsReplacementConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Delete old backup and create new", role: .destructive) {
+                Task {
+                    if await model.replaceUnreadableMessageBackup() {
+                        await refreshRemoteSummary()
+                    }
+                }
+            }
+            Button("Keep old backup", role: .cancel) {}
+        } message: {
+            Text(
+                "The old encrypted backup and key cannot be recovered after replacement. Chats currently on this iPhone will be backed up with a fresh key."
+            )
+        }
     }
 
     private var restoreCard: some View {

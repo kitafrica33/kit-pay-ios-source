@@ -147,6 +147,75 @@ final class ConversationInteractionPolicyTests: XCTestCase {
         ))
     }
 
+    func testOpeningSettlingKeepsDirectAndGroupTimelinesPinnedThroughHydration() {
+        var policy = ConversationLatestPositionPolicy()
+
+        XCTAssertTrue(policy.claimOpening(
+            conversationID: "direct-chat",
+            hasTimelineContent: true
+        ))
+        XCTAssertTrue(policy.shouldMaintainOpeningAnchor(
+            conversationID: "DIRECT-CHAT",
+            hasExplicitTarget: false,
+            isInteracting: false
+        ), "Lazy direct-message rows may keep gaining height after the first bottom jump")
+
+        XCTAssertTrue(policy.claimOpening(
+            conversationID: "group-chat",
+            hasTimelineContent: true
+        ))
+        XCTAssertTrue(policy.shouldMaintainOpeningAnchor(
+            conversationID: "GROUP-CHAT",
+            hasExplicitTarget: false,
+            isInteracting: false
+        ), "Hydrated group payment cards must not leave the opening position above the newest row")
+        XCTAssertFalse(policy.shouldMaintainOpeningAnchor(
+            conversationID: "direct-chat",
+            hasExplicitTarget: false,
+            isInteracting: false
+        ), "Only the conversation currently being opened may own the settling anchor")
+    }
+
+    func testUserTouchEndsOpeningSettlingWithoutLosingPositionReceipt() {
+        var policy = ConversationLatestPositionPolicy()
+        XCTAssertTrue(policy.claimOpening(
+            conversationID: "group-chat",
+            hasTimelineContent: true
+        ))
+
+        policy.endOpeningSettling(conversationID: "GROUP-CHAT")
+
+        XCTAssertFalse(policy.shouldMaintainOpeningAnchor(
+            conversationID: "group-chat",
+            hasExplicitTarget: false,
+            isInteracting: false
+        ), "Once the customer touches the timeline, layout must never fight their scroll")
+        XCTAssertTrue(policy.hasPositioned(
+            conversationID: "group-chat"
+        ), "Ending the settling window must not make redraws repeat the unconditional opening jump")
+    }
+
+    func testExplicitMessageTargetSuppressesAndEndsOpeningBottomAnchor() {
+        var policy = ConversationLatestPositionPolicy()
+        XCTAssertTrue(policy.claimOpening(
+            conversationID: "direct-chat",
+            hasTimelineContent: true
+        ))
+        XCTAssertFalse(policy.shouldMaintainOpeningAnchor(
+            conversationID: "direct-chat",
+            hasExplicitTarget: true,
+            isInteracting: false
+        ), "Search, reply and call/voice-note navigation must win over the opening bottom anchor")
+
+        policy.endOpeningSettling(conversationID: "direct-chat")
+
+        XCTAssertFalse(policy.shouldMaintainOpeningAnchor(
+            conversationID: "direct-chat",
+            hasExplicitTarget: false,
+            isInteracting: false
+        ), "Clearing the target after navigation must not resurrect bottom anchoring")
+    }
+
     func testTimelineFollowsOwnSendsAndNearbyIncomingMessagesOnly() {
         XCTAssertFalse(ConversationLatestPositionPolicy.shouldFollowTimelineChange(
             hasPositionedCurrentConversation: false,

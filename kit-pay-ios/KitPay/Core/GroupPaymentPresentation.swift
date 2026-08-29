@@ -1,5 +1,27 @@
 import Foundation
 
+enum GroupPaymentRequestCopy {
+    /// Basis points retain the server's exact progress while avoiding artificial trailing zeroes:
+    /// 1,250 renders as 12.5%, 1,234 as 12.34%, and completion is exactly 100%.
+    static func progressPercent(_ basisPoints: Int) -> String {
+        let bounded = min(max(basisPoints, 0), 10_000)
+        let whole = bounded / 100
+        let remainder = bounded % 100
+        guard remainder != 0 else { return "\(whole)%" }
+        if remainder % 10 == 0 { return "\(whole).\(remainder / 10)%" }
+        return "\(whole).\(String(format: "%02d", remainder))%"
+    }
+
+    static func completedContribution(
+        contributorName: String,
+        isViewerContributor: Bool,
+        formattedAmount: String
+    ) -> String {
+        let actor = isViewerContributor ? "You" : contributorName
+        return "\(actor) contributed \(formattedAmount) and completed this request."
+    }
+}
+
 /// Turning a group payment into the one or two lines a member actually reads in the chat.
 ///
 /// Two rules run through all of it. Nobody is told an amount the server did not disclose to them,
@@ -198,7 +220,9 @@ enum ConversationSenderRunPolicy {
                     named.insert(message.id)
                     runSender = sender
                 }
-            case .payment, .groupPayment, .groupPaymentEvent, .call, .dateSeparator:
+            case .payment, .scheduledPayment, .scheduledGroupPaymentOutcome, .groupPayment,
+                 .groupPaymentEvent, .groupPaymentRequest, .groupPaymentRequestEvent, .call,
+                 .dateSeparator:
                 // A full-width card, a call row, or a new day is a visual break; whoever speaks
                 // next is introduced again.
                 runSender = nil

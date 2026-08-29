@@ -123,6 +123,8 @@ private enum SecureMessageSubmissionKind {
     /// The mirror image of `paymentEvent`: a group payment's announcement or an answer to one,
     /// allowed only in a group thread and never in a one-to-one chat.
     case groupPaymentEvent
+    /// A collaborative group request card, contribution receipt, or terminal status event.
+    case groupPaymentRequestEvent
     case reactionEvent
     /// A correction to the wording of one's own already-sent message, allowed only through the
     /// typed edit boundary and only inside the fifteen minutes the server also enforces.
@@ -702,6 +704,10 @@ final class AppModel: ObservableObject {
     @Published private(set) var isBackingUpMessages = false
     @Published private(set) var isRestoringMessages = false
     @Published private(set) var isDeletingMessageBackup = false
+    @Published private(set) var messageBackupReplacementAvailable = false
+    @Published private(set) var messageBackupOperationError: String?
+    @Published private(set) var messageBackupRefreshScheduleState:
+        MessageBackupRefreshScheduleState = .inactive
     /// A decryptable iCloud backup exists and local history is empty; drives the restore prompt.
     @Published var availableBackupToRestore: MessageBackupSummary?
     /// True when the sign-in gate should offer PIN recovery because biometrics are locked out,
@@ -793,6 +799,8 @@ final class AppModel: ObservableObject {
     private var callSystemEventDrainTask: Task<Void, Never>?
     private var outboxWakeTask: Task<Void, Never>?
     private var communicationReplayTask: Task<Bool, Never>?
+    private var automaticBackupBackgroundTransitionTask: Task<Void, Never>?
+    private var automaticBackupBackgroundTaskIdentifier: UIBackgroundTaskIdentifier = .invalid
     private var queuedCallSystemActions: [CallSystemAction] = []
     private var receivedCallEventIds: Set<UUID> = []
     private var receivedCallEventOrder: [UUID] = []
@@ -909,9 +917,13 @@ final class AppModel: ObservableObject {
                     success: !Task.isCancelled && result.backgroundTaskSucceeded
                 )
             }
-            task.expirationHandler = {
+            task.expirationHandler = { [weak self] in
                 work.cancel()
                 completion.finish(success: false)
+                // iOS consumed this request when it launched it. If expiration wins before the
+                // automatic runner reaches its own rescheduling defer, preserve the selected
+                // cadence by arming the next eligible opportunity again.
+                Task { @MainActor in self?.scheduleAutomaticMessageBackupRefresh() }
             }
         }
 
@@ -952,6 +964,7 @@ final class AppModel: ObservableObject {
                             self.resumeEphemeralOutgoingCallIfPossible()
                             await self.flushOutbox()
                             self.scheduleAutomaticContactSync()
+                            _ = await self.runAutomaticMessageBackupIfDue()
                         }
                     } else if self.isSignedIn {
                         // Incomplete accounts do not enter the full session-resume path, but
@@ -4119,7 +4132,10 @@ final class AppModel: ObservableObject {
         outboxWakeTask = nil
         communicationReplayTask?.cancel()
         communicationReplayTask = nil
+        automaticBackupBackgroundTransitionTask?.cancel()
+        finishAutomaticBackupBackgroundTransition()
         CommunicationBackgroundReplayScheduler.shared.cancel()
+        MessageBackupRefreshScheduler.shared.cancel()
         ephemeralCallCancellationTask?.cancel()
         ephemeralCallCancellationTask = nil
         pendingEphemeralCallCancellations.removeAll()
@@ -4264,6 +4280,9 @@ final class AppModel: ObservableObject {
         biometricSignInPermanentlyUnavailable = false
         biometricPINRecoveryRequiresEnrollmentRemoval = false
         availableBackupToRestore = nil
+        messageBackupReplacementAvailable = false
+        messageBackupOperationError = nil
+        messageBackupRefreshScheduleState = .inactive
         acceptedAccountDeletionCleanupBlocked = isAcceptedDeletion
             && !acceptedDeletionLocalCleanupSucceeded
         isLoading = acceptedAccountDeletionCleanupBlocked
@@ -5124,12 +5143,52 @@ final class AppModel: ObservableObject {
         stopVisibleConversationSync()
         cancelRealtimeMessagingSync()
         suspendEphemeralOutgoingCallSubmission()
+        // Re-arm first, then make one bounded best-effort attempt while iOS still grants this
+        // foreground-to-background transition execution time. The backup path itself rechecks
+        // account epoch/session ownership before every durable write, and biometric locking below
+        // conceals UI without invalidating that authenticated background lease.
+        scheduleAutomaticMessageBackupRefresh()
+        startAutomaticBackupBackgroundTransitionIfNeeded()
         returningSignInBiometricAuthorizationFence.invalidate()
         homeBiometricAuthorizationFence.invalidate()
         guard isSignedIn, accountSetupStep == nil, biometricUnlockEnabled else { return }
         biometricAccessState = .locked
         homeBiometricState = .locked
         biometricErrorMessage = nil
+    }
+
+    private func startAutomaticBackupBackgroundTransitionIfNeeded() {
+        guard automaticBackupBackgroundTransitionTask == nil,
+              MessageBackupBackgroundTransitionPolicy.shouldAttempt(
+                  isSignedIn: isSignedIn,
+                  setupComplete: accountSetupStep == nil,
+                  isOnline: isOnline,
+                  frequency: messageBackupPreferences.frequency,
+                  messageCount: state.messages.count
+              )
+        else { return }
+        let identifier = UIApplication.shared.beginBackgroundTask(
+            withName: "africa.kit.pay.message-backup"
+        ) { [weak self] in
+            Task { @MainActor in
+                self?.automaticBackupBackgroundTransitionTask?.cancel()
+                self?.finishAutomaticBackupBackgroundTransition()
+            }
+        }
+        guard identifier != .invalid else { return }
+        automaticBackupBackgroundTaskIdentifier = identifier
+        automaticBackupBackgroundTransitionTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            _ = await self.runAutomaticMessageBackupIfDue()
+            self.finishAutomaticBackupBackgroundTransition()
+        }
+    }
+
+    private func finishAutomaticBackupBackgroundTransition() {
+        automaticBackupBackgroundTransitionTask = nil
+        guard automaticBackupBackgroundTaskIdentifier != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(automaticBackupBackgroundTaskIdentifier)
+        automaticBackupBackgroundTaskIdentifier = .invalid
     }
 
     func applicationDidBecomeActiveSecurely() async {
@@ -8908,6 +8967,30 @@ final class AppModel: ObservableObject {
         )
     }
 
+    /// Queues a canonical collaborative group-request event. This is the only bypass for the
+    /// `KITGREQ1:` reservation and, like ordinary group-payment events, it is group-only.
+    @discardableResult
+    func queueGroupPaymentRequestEvent(
+        conversationId: String,
+        title: String,
+        descriptor: KitGroupPaymentRequestMessage,
+        clientMessageID: UUID? = nil
+    ) async -> Bool {
+        guard !isReadOnlyAppReviewDemoConversation(conversationId) else {
+            lastError = "This App Review preview is read-only."
+            return false
+        }
+        return await queueValidatedMessage(
+            conversationId: conversationId,
+            title: title,
+            recipientId: nil,
+            body: descriptor.encoded,
+            clientMessageID: clientMessageID,
+            draftClearVersion: nil,
+            submissionKind: .groupPaymentRequestEvent
+        )
+    }
+
     /// Queues a reaction only through the typed reaction boundary. Plain composers and
     /// notification replies reserve `KITRXN1:` so pasted text cannot impersonate a reaction.
     @discardableResult
@@ -9018,6 +9101,11 @@ final class AppModel: ObservableObject {
                 lastError = "Kit Pay could not validate this payment event."
                 return false
             }
+        case .groupPaymentRequestEvent:
+            guard KitGroupPaymentRequestMessage.parse(trimmed) != nil else {
+                lastError = "Kit Pay could not validate this group request event."
+                return false
+            }
         case .reactionEvent:
             guard KitMessageReaction.parse(trimmed) != nil else {
                 lastError = "Kit Pay could not validate this reaction."
@@ -9070,7 +9158,9 @@ final class AppModel: ObservableObject {
             lastError = "Payment events can only be sent in one-to-one chats."
             return false
         }
-        if !isGroupTarget, submissionKind == .groupPaymentEvent {
+        if !isGroupTarget,
+           (submissionKind == .groupPaymentEvent
+            || submissionKind == .groupPaymentRequestEvent) {
             // The other half of the rule above: group payment wire belongs to the group it was
             // sent into, where every member can see the same announcement and answer for
             // themselves. A one-to-one thread has no group to claim from.
@@ -9343,9 +9433,19 @@ final class AppModel: ObservableObject {
             uuidString: requestedFromUserID.trimmingCharacters(in: .whitespacesAndNewlines)
         ), let expectedUserID = profile?.id,
               recipientUUID.uuidString.caseInsensitiveCompare(expectedUserID) != .orderedSame,
-              state.wallets.contains(where: { $0.id == destinationWalletID })
+              state.wallets.contains(where: { $0.id == destinationWalletID }),
+              state.conversations.contains(where: { conversation in
+                  conversation.id.caseInsensitiveCompare(cleanConversationID) == .orderedSame
+                      && !conversation.isGroup
+                      && conversation.participantUserIds.contains(where: {
+                          $0.caseInsensitiveCompare(expectedUserID) == .orderedSame
+                      })
+                      && conversation.participantUserIds.contains(where: {
+                          $0.caseInsensitiveCompare(recipientUUID.uuidString) == .orderedSame
+                      })
+              })
         else {
-            lastError = "Choose one valid Kit Pay recipient."
+            lastError = "Choose one valid Kit Pay conversation."
             return false
         }
         if let denial = communicationPrivacyDenialMessage(
@@ -11030,6 +11130,11 @@ final class AppModel: ObservableObject {
                 persisted.messageBackupPreferences = preferences
             }
             await publishLatestState()
+            messageBackupOperationError = nil
+            scheduleAutomaticMessageBackupRefresh()
+            if frequency != .off {
+                _ = await runAutomaticMessageBackupIfDue()
+            }
         } catch {
             lastError = error.localizedDescription
         }
@@ -11044,6 +11149,7 @@ final class AppModel: ObservableObject {
                 persisted.messageBackupPreferences = preferences
             }
             await publishLatestState()
+            scheduleAutomaticMessageBackupRefresh()
         } catch {
             lastError = error.localizedDescription
         }
@@ -11051,6 +11157,32 @@ final class AppModel: ObservableObject {
 
     @discardableResult
     func backUpMessagesNow() async -> Bool {
+        let succeeded = await performMessageBackup(
+            automaticAttemptAt: nil,
+            replacingUnreadable: false
+        )
+        scheduleAutomaticMessageBackupRefresh()
+        return succeeded
+    }
+
+    /// Destructive recovery is deliberately separate from an ordinary backup. The settings UI
+    /// exposes this only after upload proved an existing archive unreadable and the customer has
+    /// confirmed that its ciphertext and key may be replaced.
+    @discardableResult
+    func replaceUnreadableMessageBackup() async -> Bool {
+        guard messageBackupReplacementAvailable else { return false }
+        let succeeded = await performMessageBackup(
+            automaticAttemptAt: nil,
+            replacingUnreadable: true
+        )
+        scheduleAutomaticMessageBackupRefresh()
+        return succeeded
+    }
+
+    private func performMessageBackup(
+        automaticAttemptAt: Date?,
+        replacingUnreadable: Bool
+    ) async -> Bool {
         guard !isBackingUpMessages,
               !isDeletingMessageBackup,
               !isRestoringMessages,
@@ -11063,6 +11195,7 @@ final class AppModel: ObservableObject {
         let expectedAccountEpoch = accountEpoch
         isBackingUpMessages = true
         defer { isBackingUpMessages = false }
+        messageBackupOperationError = nil
         let payload = MessageBackupPayload.snapshot(
             of: state,
             userID: userID,
@@ -11070,7 +11203,29 @@ final class AppModel: ObservableObject {
             includesMedia: messageBackupPreferences.includesMedia
         )
         do {
-            let summary = try await MessageBackupManager.shared.upload(payload)
+            if let automaticAttemptAt {
+                state = try await commitAuthenticatedMutation(
+                    accountEpoch: expectedAccountEpoch,
+                    userID: userID,
+                    sessionID: expectedSessionID
+                ) { persisted in
+                    var preferences = persisted.messageBackupPreferences ?? .default
+                    preferences.lastAutomaticBackupAttemptAt = automaticAttemptAt
+                    // Pessimistic until the CloudKit save and authenticated local receipt both
+                    // commit. A process kill mid-upload therefore observes a bounded retry,
+                    // never an activation loop and never a false success.
+                    preferences.lastAutomaticBackupSucceeded = false
+                    persisted.messageBackupPreferences = preferences
+                }
+            }
+            let summary: MessageBackupSummary
+            if replacingUnreadable {
+                summary = try await MessageBackupManager.shared.replaceUnreadableBackup(
+                    with: payload
+                )
+            } else {
+                summary = try await MessageBackupManager.shared.upload(payload)
+            }
             state = try await commitAuthenticatedMutation(
                 accountEpoch: expectedAccountEpoch,
                 userID: userID,
@@ -11082,13 +11237,40 @@ final class AppModel: ObservableObject {
                 preferences.lastBackupMessageCount = summary.messageCount
                 preferences.lastBackupGeneration = summary.generation
                 preferences.lastBackupContentDigest = summary.contentDigest
+                if let automaticAttemptAt {
+                    preferences.lastAutomaticBackupAttemptAt = automaticAttemptAt
+                    preferences.lastAutomaticBackupSucceeded = true
+                }
                 persisted.messageBackupPreferences = preferences
             }
+            messageBackupReplacementAvailable = false
+            messageBackupOperationError = nil
             return true
         } catch is CancellationError {
             return false
         } catch {
-            lastError = error.localizedDescription
+            if let automaticAttemptAt,
+               await outboxContextIsCurrent(
+                   accountEpoch: expectedAccountEpoch,
+                   userID: userID,
+                   sessionID: expectedSessionID
+               ) {
+                _ = try? await commitAuthenticatedMutation(
+                    accountEpoch: expectedAccountEpoch,
+                    userID: userID,
+                    sessionID: expectedSessionID
+                ) { persisted in
+                    var preferences = persisted.messageBackupPreferences ?? .default
+                    preferences.lastAutomaticBackupAttemptAt = automaticAttemptAt
+                    preferences.lastAutomaticBackupSucceeded = false
+                    persisted.messageBackupPreferences = preferences
+                }
+            }
+            let message = error.localizedDescription
+            messageBackupOperationError = message
+            messageBackupReplacementAvailable =
+                MessageBackupReplacementPolicy.mayOfferReplacement(after: error)
+            if automaticAttemptAt == nil { lastError = message }
             return false
         }
     }
@@ -11096,17 +11278,61 @@ final class AppModel: ObservableObject {
     /// Runs a due automatic backup opportunistically (app background, BG task, foreground sync).
     @discardableResult
     func runAutomaticMessageBackupIfDue() async -> MessageBackupAutomaticRunResult {
+        defer { scheduleAutomaticMessageBackupRefresh() }
         guard isSignedIn,
               appReviewDemoMutationsAllowed,
               accountSetupStep == nil,
               isOnline,
+              !isBackingUpMessages,
               !state.messages.isEmpty,
               MessageBackupSchedulePolicy.isBackupDue(
                   frequency: messageBackupPreferences.frequency,
-                  lastBackupAt: messageBackupPreferences.lastBackupAt
+                  lastBackupAt: messageBackupPreferences.lastBackupAt,
+                  lastAutomaticBackupAttemptAt:
+                    messageBackupPreferences.lastAutomaticBackupAttemptAt,
+                  lastAutomaticBackupSucceeded:
+                    messageBackupPreferences.lastAutomaticBackupSucceeded
               )
         else { return .notDue }
-        return await backUpMessagesNow() ? .succeeded : .failed
+        let result = await performMessageBackup(
+            automaticAttemptAt: Date(),
+            replacingUnreadable: false
+        ) ? MessageBackupAutomaticRunResult.succeeded : .failed
+        return result
+    }
+
+    var nextAutomaticMessageBackupAt: Date? {
+        MessageBackupSchedulePolicy.nextAttemptDate(
+            frequency: messageBackupPreferences.frequency,
+            lastBackupAt: messageBackupPreferences.lastBackupAt,
+            lastAutomaticBackupAttemptAt: messageBackupPreferences.lastAutomaticBackupAttemptAt,
+            lastAutomaticBackupSucceeded: messageBackupPreferences.lastAutomaticBackupSucceeded
+        )
+    }
+
+    func scheduleAutomaticMessageBackupRefresh(now: Date = Date()) {
+        guard isSignedIn,
+              accountSetupStep == nil,
+              !state.messages.isEmpty,
+              let nextAttempt = MessageBackupSchedulePolicy.nextAttemptDate(
+                  frequency: messageBackupPreferences.frequency,
+                  lastBackupAt: messageBackupPreferences.lastBackupAt,
+                  lastAutomaticBackupAttemptAt:
+                    messageBackupPreferences.lastAutomaticBackupAttemptAt,
+                  lastAutomaticBackupSucceeded:
+                    messageBackupPreferences.lastAutomaticBackupSucceeded,
+                  now: now
+              )
+        else {
+            MessageBackupRefreshScheduler.shared.cancel()
+            messageBackupRefreshScheduleState = .inactive
+            return
+        }
+        // Foreground activation handles anything already due. Give a background request a small
+        // runway; iOS still owns the exact execution time.
+        messageBackupRefreshScheduleState = MessageBackupRefreshScheduler.shared.schedule(
+            earliestBeginDate: max(nextAttempt, now.addingTimeInterval(60))
+        )
     }
 
     /// After sign-in on a device with no local history, offer to restore the iCloud backup.
@@ -11154,11 +11380,29 @@ final class AppModel: ObservableObject {
                 )
             }
             availableBackupToRestore = nil
+            messageBackupReplacementAvailable = false
+            messageBackupOperationError = nil
+            scheduleAutomaticMessageBackupRefresh()
             return true
         } catch is CancellationError {
             return false
         } catch {
-            lastError = error.localizedDescription
+            // A stale restore must never place a destructive recovery action into the account
+            // that replaced it. Only typed failures produced while opening the remote archive
+            // are eligible for the explicit replacement path; local store/session errors remain
+            // ordinary failures.
+            guard await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: userID,
+                sessionID: expectedSessionID
+            ) else { return false }
+            let archiveError = MessageBackupReplacementPolicy.remoteRestoreError(error)
+            let presented: Error = archiveError ?? error
+            messageBackupOperationError = presented.localizedDescription
+            messageBackupReplacementAvailable = archiveError.map {
+                MessageBackupReplacementPolicy.mayOfferReplacement(after: $0)
+            } ?? false
+            lastError = presented.localizedDescription
             return false
         }
     }
@@ -11195,6 +11439,10 @@ final class AppModel: ObservableObject {
                 persisted.messageBackupPreferences = .default
             }
             availableBackupToRestore = nil
+            messageBackupReplacementAvailable = false
+            messageBackupOperationError = nil
+            MessageBackupRefreshScheduler.shared.cancel()
+            messageBackupRefreshScheduleState = .inactive
             return true
         } catch is CancellationError {
             return false
@@ -12885,7 +13133,7 @@ final class AppModel: ObservableObject {
         userID expectedUserID: String,
         sessionID expectedSessionID: String
     ) async {
-        guard let payload = command.scheduledPaymentRequest else {
+        guard var payload = command.scheduledPaymentRequest else {
             // Nothing actionable was stored. Drop the row rather than retry it forever.
             state = (try? await commitOutboxMutation(
                 accountEpoch: expectedAccountEpoch,
@@ -12895,6 +13143,28 @@ final class AppModel: ObservableObject {
             ) { persisted in
                 persisted.outbox.removeAll { $0.id == command.id }
             }) ?? state
+            return
+        }
+        guard let conversationID = payload.conversationID,
+              state.conversations.contains(where: { conversation in
+                  conversation.id.caseInsensitiveCompare(conversationID) == .orderedSame
+                      && !conversation.isGroup
+                      && conversation.participantUserIds.contains(where: {
+                          $0.caseInsensitiveCompare(expectedUserID) == .orderedSame
+                      })
+                      && conversation.participantUserIds.contains(where: {
+                          $0.caseInsensitiveCompare(payload.requestedFromUserID) == .orderedSame
+                      })
+              })
+        else {
+            await handleOutboxFailure(
+                command,
+                error: PaymentRequestSubmissionError.invalidRecipient,
+                reportFailure: reportFailures,
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            )
             return
         }
         guard accountSetupStep == nil,
@@ -12913,30 +13183,81 @@ final class AppModel: ObservableObject {
             return
         }
         do {
-            let request = try await createPaymentRequest(
-                destinationWalletID: payload.destinationWalletID,
-                requestedFromUserID: payload.requestedFromUserID,
-                amount: payload.amount,
-                note: payload.note,
-                idempotencyKey: payload.idempotencyKey
+            let confirmation: ScheduledPaymentRequestConfirmation
+            if let stored = payload.confirmedRequest {
+                guard stored.isValid(for: payload) else {
+                    throw PaymentRequestSubmissionError.unconfirmedRequest
+                }
+                confirmation = stored
+            } else {
+                let request = try await createPaymentRequest(
+                    destinationWalletID: payload.destinationWalletID,
+                    requestedFromUserID: payload.requestedFromUserID,
+                    amount: payload.amount,
+                    note: payload.note,
+                    idempotencyKey: payload.idempotencyKey
+                )
+                guard let confirmed = ScheduledPaymentRequestConfirmation(
+                    request: request,
+                    payload: payload
+                ) else { throw PaymentRequestSubmissionError.unconfirmedRequest }
+                confirmation = confirmed
+
+                // Persist the exact server-confirmed descriptor before attempting chat. A crash
+                // from this point onward replays the same message UUID and never creates a second
+                // financial request.
+                state = try await commitOutboxMutation(
+                    accountEpoch: expectedAccountEpoch,
+                    userID: expectedUserID,
+                    sessionID: expectedSessionID,
+                    command: command
+                ) { persisted in
+                    guard let index = persisted.outbox.firstIndex(where: { $0.id == command.id }),
+                          var storedPayload = persisted.outbox[index].scheduledPaymentRequest
+                    else { throw CancellationError() }
+                    storedPayload.confirmedRequest = confirmed
+                    persisted.outbox[index].scheduledPaymentRequest = storedPayload
+                }
+                payload.confirmedRequest = confirmed
+                if paymentRequestChatShareLeases[request.id.lowercased()]?.descriptor.encoded
+                    == confirmed.encodedDescriptor {
+                    paymentRequestChatShareLeases.removeValue(forKey: request.id.lowercased())
+                }
+            }
+
+            guard confirmation.isValid(for: payload),
+                  let clientMessageID = confirmation.clientMessageID
+            else { throw PaymentRequestSubmissionError.unconfirmedRequest }
+            let queued = await queuePaymentEvent(
+                conversationId: conversationID,
+                title: payload.recipientName,
+                recipientId: payload.requestedFromUserID,
+                body: confirmation.encodedDescriptor,
+                clientMessageID: clientMessageID
             )
-            // The request exists on the server now, so the command is retired before the chat
-            // card is queued. Sharing has its own durable command; letting this one survive a
-            // sharing failure would raise the request a second time on the next flush.
+            guard queued else {
+                state = (try? await commitOutboxMutation(
+                    accountEpoch: expectedAccountEpoch,
+                    userID: expectedUserID,
+                    sessionID: expectedSessionID,
+                    command: state.outbox.first(where: { $0.id == command.id }) ?? command
+                ) { persisted in
+                    OutboxPolicy.deferScheduledCommand(command.id, in: &persisted, at: Date())
+                }) ?? state
+                return
+            }
+
+            // Only now are both halves durable: the server object exists and the idempotent E2EE
+            // card is in the ordinary outbox. Retire the scheduling instruction last.
+            let latestCommand = state.outbox.first(where: { $0.id == command.id }) ?? command
             state = try await commitOutboxMutation(
                 accountEpoch: expectedAccountEpoch,
                 userID: expectedUserID,
                 sessionID: expectedSessionID,
-                command: command
+                command: latestCommand
             ) { persisted in
                 persisted.outbox.removeAll { $0.id == command.id }
             }
-            await queuePaymentRequest(
-                request,
-                recipientId: payload.requestedFromUserID,
-                title: payload.recipientName,
-                conversationId: payload.conversationID
-            )
         } catch is CancellationError {
             return
         } catch {
@@ -13163,6 +13484,17 @@ final class AppModel: ObservableObject {
         guard appReviewDemoMutationsAllowed else { return }
         resumeEphemeralOutgoingCallIfPossible()
         schedulePendingProfileAvatarResume()
+        // Timers are suspended while the process is backgrounded. Re-arm and drain immediately
+        // on every authenticated foreground so due scheduled messages/payment requests do not
+        // wait for a later unrelated action. The same foreground is a reliable opportunistic
+        // automatic-backup window when iOS deferred its background refresh.
+        scheduleOutboxWake()
+        scheduleAutomaticMessageBackupRefresh()
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            if self.isOnline { await self.flushOutbox() }
+            _ = await self.runAutomaticMessageBackupIfDue()
+        }
         // Returning to the foreground is the first moment after a crash at which the app can see
         // that a call it thought was live has no session behind it any more.
         Task { @MainActor [weak self] in await self?.reapAbandonedCallRecords() }
@@ -13249,13 +13581,22 @@ final class AppModel: ObservableObject {
         _ processingTask: BGProcessingTask
     ) async {
         let taskID = ObjectIdentifier(processingTask)
-        processingTask.expirationHandler = { [weak self, weak processingTask] in
+        // BackgroundTasks treats a second completion as a programmer error. Expiration can race
+        // the final outbox commit, so use the same exactly-once latch as automatic backups.
+        let completion = BackgroundTaskCompletionLatch(processingTask)
+        processingTask.expirationHandler = { [weak self] in
             Task { @MainActor in
-                guard let self, let processingTask else { return }
+                guard let self else {
+                    completion.finish(success: false)
+                    return
+                }
                 self.expiredBackgroundCommunicationTasks.insert(taskID)
                 self.communicationReplayTask?.cancel()
                 self.communicationReplayTask = nil
-                processingTask.setTaskCompleted(success: false)
+                // Delivery consumed the pending system request. Keep every durable outbox row
+                // untouched and arm the earliest one again before returning the expired task.
+                self.scheduleOutboxWake()
+                completion.finish(success: false)
             }
         }
         if let restoreTask { await restoreTask.value }
@@ -13280,8 +13621,8 @@ final class AppModel: ObservableObject {
         communicationReplayTask = nil
 
         guard expiredBackgroundCommunicationTasks.remove(taskID) == nil else { return }
-        processingTask.setTaskCompleted(success: succeeded)
         scheduleOutboxWake()
+        completion.finish(success: succeeded)
     }
 
     private func contactsDidChange() {
@@ -15093,12 +15434,16 @@ final class AppModel: ObservableObject {
             CommunicationBackgroundReplayScheduler.shared.cancel()
             return
         }
-        guard let backgroundWakeDate = OutboxPolicy.nextWakeDate(state.outbox) else {
+        let now = Date()
+        guard let backgroundWakeDate = CommunicationBackgroundReplayPolicy.earliestBeginDate(
+            for: state.outbox,
+            now: now
+        ) else {
             CommunicationBackgroundReplayScheduler.shared.cancel()
             return
         }
         CommunicationBackgroundReplayScheduler.shared.schedule(
-            earliestBeginDate: max(Date(), backgroundWakeDate)
+            earliestBeginDate: backgroundWakeDate
         )
         guard isOnline,
               isSignedIn,
@@ -15162,6 +15507,7 @@ final class CommunicationBackgroundReplayScheduler {
 
     private var handler: ((BGProcessingTask) -> Void)?
     private var pendingTask: BGProcessingTask?
+    private var armedEarliestBeginDate: Date?
 
     func register() {
         BGTaskScheduler.shared.register(
@@ -15172,6 +15518,7 @@ final class CommunicationBackgroundReplayScheduler {
                 task.setTaskCompleted(success: false)
                 return
             }
+            self?.armedEarliestBeginDate = nil
             if let handler = self?.handler {
                 handler(processingTask)
             } else {
@@ -15188,17 +15535,60 @@ final class CommunicationBackgroundReplayScheduler {
         }
     }
 
-    func schedule(earliestBeginDate: Date) {
-        BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: Self.identifier)
+    @discardableResult
+    func schedule(
+        earliestBeginDate: Date,
+        submit: (BGProcessingTaskRequest) throws -> Void = {
+            try BGTaskScheduler.shared.submit($0)
+        }
+    ) -> CommunicationBackgroundReplayScheduleState {
+        // Keep an already-armed task when the replacement would be no earlier. Submitting first
+        // also means a failed attempt to improve the window cannot erase the only durable wake
+        // for a scheduled message.
+        if let armedEarliestBeginDate,
+           armedEarliestBeginDate <= earliestBeginDate {
+            return .armed(earliestBeginDate: armedEarliestBeginDate)
+        }
         let request = BGProcessingTaskRequest(identifier: Self.identifier)
         request.earliestBeginDate = earliestBeginDate
         request.requiresNetworkConnectivity = true
         request.requiresExternalPower = false
-        try? BGTaskScheduler.shared.submit(request)
+        do {
+            try submit(request)
+            armedEarliestBeginDate = earliestBeginDate
+            return .armed(earliestBeginDate: earliestBeginDate)
+        } catch {
+            if let armedEarliestBeginDate {
+                return .armed(earliestBeginDate: armedEarliestBeginDate)
+            }
+            return .submissionFailed
+        }
     }
 
     func cancel() {
         BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: Self.identifier)
+        armedEarliestBeginDate = nil
+    }
+}
+
+enum CommunicationBackgroundReplayScheduleState: Equatable, Sendable {
+    case armed(earliestBeginDate: Date)
+    case submissionFailed
+}
+
+enum MessageBackupBackgroundTransitionPolicy {
+    static func shouldAttempt(
+        isSignedIn: Bool,
+        setupComplete: Bool,
+        isOnline: Bool,
+        frequency: MessageBackupFrequency,
+        messageCount: Int
+    ) -> Bool {
+        isSignedIn
+            && setupComplete
+            && isOnline
+            && frequency != .off
+            && messageCount > 0
     }
 }
 

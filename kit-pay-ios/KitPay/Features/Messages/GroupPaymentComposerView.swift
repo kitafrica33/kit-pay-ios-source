@@ -18,6 +18,10 @@ struct GroupPaymentComposerView: View {
     let errorMessage: String?
     /// Returns the confirmed payment, so the caller can post the announcement into the thread.
     let submit: (CreateGroupPaymentBody, String) async -> GroupPaymentDTO?
+    /// Server-owned scheduling remains distinct from delayed E2EE messages: the immutable plan
+    /// executes even while this iPhone is locked or offline.
+    let schedulePayment: ((CreateGroupPaymentBody, Date, String) async
+        -> ScheduledGroupPaymentDTO?)?
 
     @State private var audience: GroupPaymentAudience = .all
     @State private var splitMode: GroupPaymentSplitMode = .even
@@ -26,6 +30,8 @@ struct GroupPaymentComposerView: View {
     @State private var customAmounts: [String: String] = [:]
     @State private var note = ""
     @State private var pin = ""
+    @State private var scheduledFor: Date?
+    @State private var showsSchedulePicker = false
     @State private var validationMessage: String?
     /// Claimed synchronously before the async task is created, closing the small window in which
     /// two fast taps could otherwise both enter `submit` before the observable view model redraws.
@@ -45,6 +51,7 @@ struct GroupPaymentComposerView: View {
                     splitPicker
                     amountSection
                     noteField
+                    deliverySection
                     reviewLine
                     approval
                     if let message = validationMessage ?? errorMessage {
@@ -85,6 +92,15 @@ struct GroupPaymentComposerView: View {
             }
         }
         .interactiveDismissDisabled(isSubmissionInFlight)
+        .sheet(isPresented: $showsSchedulePicker) {
+            ScheduleSendSheet(
+                title: "Schedule group payment",
+                confirmTitle: "Use this time",
+                preview: "Pay \(recipientSummary)",
+                initialDate: scheduledFor,
+                onSchedule: { scheduledFor = $0 }
+            )
+        }
     }
 
     // MARK: Sections
@@ -234,6 +250,39 @@ struct GroupPaymentComposerView: View {
     }
 
     @ViewBuilder
+    private var deliverySection: some View {
+        if schedulePayment != nil {
+            VStack(alignment: .leading, spacing: 10) {
+                if let scheduledFor {
+                    Label(
+                        scheduledFor.formatted(date: .abbreviated, time: .shortened),
+                        systemImage: "clock.badge.checkmark"
+                    )
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(KitColor.green)
+                    Text("Kit will send this from the server at that time, even if this iPhone is offline.")
+                        .font(.caption)
+                        .foregroundStyle(KitColor.secondaryText)
+                    HStack {
+                        Button("Change time") { showsSchedulePicker = true }
+                        Spacer()
+                        Button("Send now", role: .destructive) { self.scheduledFor = nil }
+                    }
+                    .font(.footnote.weight(.semibold))
+                } else {
+                    Button { showsSchedulePicker = true } label: {
+                        Label("Send later", systemImage: "clock.badge.checkmark")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(KitSecondaryButtonStyle())
+                }
+            }
+            .padding(16)
+            .kitGlass(cornerRadius: 18, tint: KitColor.paleGreen, shadow: false)
+        }
+    }
+
+    @ViewBuilder
     private var reviewLine: some View {
         if let total = GroupPaymentDraftPolicy.totalMinor(
             splitMode: splitMode,
@@ -298,10 +347,14 @@ struct GroupPaymentComposerView: View {
                 ProgressView().tint(.white).frame(maxWidth: .infinity)
             } else {
                 Label(
-                    "Send to \(recipientSummary)",
-                    systemImage: model.financialApprovalUsesBiometrics
-                        ? model.biometricSymbolName
-                        : "lock.fill"
+                    scheduledFor == nil
+                        ? "Send to \(recipientSummary)"
+                        : "Schedule for \(recipientSummary)",
+                    systemImage: scheduledFor == nil
+                        ? (model.financialApprovalUsesBiometrics
+                            ? model.biometricSymbolName
+                            : "lock.fill")
+                        : "clock.badge.checkmark"
                 )
                 .frame(maxWidth: .infinity)
             }
@@ -386,7 +439,12 @@ struct GroupPaymentComposerView: View {
         case .ready(let body):
             validationMessage = nil
             Task { @MainActor in
-                let succeeded = await submit(body, pin) != nil
+                let succeeded: Bool
+                if let scheduledFor, let schedulePayment {
+                    succeeded = await schedulePayment(body, scheduledFor, pin) != nil
+                } else {
+                    succeeded = await submit(body, pin) != nil
+                }
                 if submissionGate.resolve(succeeded: succeeded) {
                     pin = ""
                     dismiss()
@@ -425,5 +483,329 @@ struct GroupPaymentSubmissionGate: Equatable {
         }
         phase = .idle
         return false
+    }
+}
+
+// MARK: - Collaborative payment requests
+
+struct GroupPaymentRequestComposerView: View {
+    @Environment(\.dismiss) private var dismiss
+
+    let conversationTitle: String
+    let wallet: Wallet
+    let isSubmitting: Bool
+    let errorMessage: String?
+    let submit: (CreateGroupPaymentRequestBody) async -> GroupPaymentRequestDTO?
+
+    @State private var amount = ""
+    @State private var note = ""
+    @State private var hasExpiry = false
+    @State private var expiresAt = Date().addingTimeInterval(7 * 24 * 60 * 60)
+    @State private var validationMessage: String?
+    @State private var submissionGate = GroupPaymentSubmissionGate()
+
+    private var submissionInFlight: Bool { isSubmitting || submissionGate.isSubmitting }
+    private var scale: Int { wallet.currency.decimalScale }
+    private var amountMode: PaymentAmountInputMode {
+        scale == 0 ? .whole : .decimal(maximumFractionDigits: scale)
+    }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Label("Group payment request", systemImage: "chart.pie.fill")
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(KitColor.gold)
+                            .textCase(.uppercase)
+                        Text(conversationTitle)
+                            .font(.title2.bold())
+                            .foregroundStyle(KitColor.primaryText)
+                        Text("Set one target. Members can contribute any amount until the request reaches 100%.")
+                            .font(.footnote)
+                            .foregroundStyle(KitColor.secondaryText)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Text("Funds go directly to your \(wallet.currency.code) wallet as each contribution is approved.")
+                            .font(.footnote.weight(.semibold))
+                            .foregroundStyle(KitColor.secondaryText)
+                    }
+                    .padding(18)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .kitGlass(cornerRadius: 20, tint: KitColor.paleGold)
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Target amount")
+                            .font(.subheadline.weight(.semibold))
+                        HStack(spacing: 10) {
+                            Text(wallet.currency.code)
+                                .font(.headline)
+                                .foregroundStyle(KitColor.secondaryText)
+                            KitAmountTextField(
+                                "0",
+                                value: $amount,
+                                mode: amountMode,
+                                textStyle: .large
+                            )
+                        }
+                        .padding(16)
+                        .kitGlass(cornerRadius: 18)
+                    }
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("What is it for? (optional)")
+                            .font(.subheadline.weight(.semibold))
+                        TextField("For example, team equipment", text: $note, axis: .vertical)
+                            .lineLimit(1 ... 4)
+                            .padding(14)
+                            .kitGlass(cornerRadius: 16)
+                            .onChange(of: note) { _, value in
+                                note = GroupPaymentRequestDraftPolicy.boundedNoteInput(value)
+                            }
+                    }
+
+                    VStack(alignment: .leading, spacing: 10) {
+                        Toggle("Set a closing date", isOn: $hasExpiry)
+                            .font(.subheadline.weight(.semibold))
+                            .tint(KitColor.gold)
+                        if hasExpiry {
+                            DatePicker(
+                                "Closes",
+                                selection: $expiresAt,
+                                in: Date().addingTimeInterval(60) ... Date().addingTimeInterval(90 * 24 * 60 * 60),
+                                displayedComponents: [.date, .hourAndMinute]
+                            )
+                            .datePickerStyle(.compact)
+                        } else {
+                            Text("The request remains open until it is fully funded or you close it.")
+                                .font(.caption)
+                                .foregroundStyle(KitColor.secondaryText)
+                        }
+                    }
+                    .padding(16)
+                    .kitGlass(cornerRadius: 18, shadow: false)
+
+                    if let message = validationMessage ?? errorMessage {
+                        Text(message)
+                            .font(.footnote)
+                            .foregroundStyle(.red)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    Button {
+                        createRequest()
+                    } label: {
+                        if submissionInFlight {
+                            ProgressView().tint(.white).frame(maxWidth: .infinity)
+                        } else {
+                            Label("Create request", systemImage: "plus.circle.fill")
+                                .frame(maxWidth: .infinity)
+                        }
+                    }
+                    .buttonStyle(GroupPaymentGoldButtonStyle())
+                    .disabled(submissionInFlight)
+                }
+                .padding(22)
+            }
+            .background(KitColor.canvas.ignoresSafeArea())
+            .navigationTitle("Request from group")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                        .disabled(submissionInFlight)
+                }
+            }
+        }
+        .interactiveDismissDisabled(submissionInFlight)
+    }
+
+    private func createRequest() {
+        guard !isSubmitting, submissionGate.begin() else { return }
+        let outcome = GroupPaymentRequestDraftPolicy.draft(
+            destinationWalletID: wallet.id,
+            amountInput: amount,
+            note: note,
+            expiresAt: hasExpiry ? expiresAt : nil,
+            currencyScale: scale
+        )
+        switch outcome {
+        case .problem(let message):
+            validationMessage = message
+            submissionGate.resolve(succeeded: false)
+        case .ready(let body):
+            validationMessage = nil
+            Task { @MainActor in
+                let succeeded = await submit(body) != nil
+                if submissionGate.resolve(succeeded: succeeded) {
+                    dismiss()
+                }
+            }
+        }
+    }
+}
+
+struct GroupPaymentRequestContributionView: View {
+    @EnvironmentObject private var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+
+    let request: GroupPaymentRequestDTO
+    let wallet: Wallet
+    let startsWithRemainingAmount: Bool
+    let isSubmitting: Bool
+    let errorMessage: String?
+    let submit: (String, String) async -> GroupPaymentRequestContributionResultDTO?
+
+    @State private var amount = ""
+    @State private var pin = ""
+    @State private var validationMessage: String?
+    @State private var submissionGate = GroupPaymentSubmissionGate()
+
+    private var submissionInFlight: Bool { isSubmitting || submissionGate.isSubmitting }
+    private var scale: Int { request.currencyScale }
+    private var amountMode: PaymentAmountInputMode {
+        scale == 0 ? .whole : .decimal(maximumFractionDigits: scale)
+    }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Label("Contribute to request", systemImage: "chart.pie.fill")
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(KitColor.gold)
+                            .textCase(.uppercase)
+                        Text("\(formatted(request.remainingAmount)) remaining")
+                            .font(.title2.bold())
+                            .foregroundStyle(KitColor.primaryText)
+                        Text("Available: \(KitMoney.formatted(wallet.balances.available, currency: wallet.currency, trimZeroFraction: true))")
+                            .font(.footnote.weight(.semibold))
+                            .foregroundStyle(KitColor.secondaryText)
+                    }
+                    .padding(18)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .kitGlass(cornerRadius: 20, tint: KitColor.paleGold)
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Your contribution")
+                            .font(.subheadline.weight(.semibold))
+                        HStack(spacing: 10) {
+                            Text(request.currency.code)
+                                .font(.headline)
+                                .foregroundStyle(KitColor.secondaryText)
+                            KitAmountTextField(
+                                "0",
+                                value: $amount,
+                                mode: amountMode,
+                                textStyle: .large
+                            )
+                        }
+                        .padding(16)
+                        .kitGlass(cornerRadius: 18)
+                        Button("Use remaining amount") {
+                            amount = request.remainingAmount
+                            validationMessage = nil
+                        }
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(KitColor.gold)
+                    }
+
+                    if model.financialApprovalUsesBiometrics {
+                        Label {
+                            Text("Approve with \(model.biometricDisplayName). Your approval covers only this request, wallet and amount.")
+                                .font(.footnote)
+                                .foregroundStyle(KitColor.secondaryText)
+                        } icon: {
+                            Image(systemName: model.biometricSymbolName)
+                                .foregroundStyle(KitColor.gold)
+                        }
+                        .padding(17)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .kitGlass(cornerRadius: 18, tint: KitColor.paleGold, shadow: false)
+                    } else {
+                        SecureField("4-digit wallet PIN", text: $pin)
+                            .keyboardType(.numberPad)
+                            .textContentType(.password)
+                            .multilineTextAlignment(.center)
+                            .font(.title2.monospacedDigit())
+                            .padding(17)
+                            .kitGlass(cornerRadius: 18)
+                            .onChange(of: pin) { _, value in
+                                pin = String(value.filter(\.isNumber).prefix(4))
+                            }
+                    }
+
+                    if let message = validationMessage ?? errorMessage {
+                        Text(message)
+                            .font(.footnote)
+                            .foregroundStyle(.red)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    Button {
+                        contribute()
+                    } label: {
+                        if submissionInFlight {
+                            ProgressView().tint(.white).frame(maxWidth: .infinity)
+                        } else {
+                            Label(
+                                "Approve contribution",
+                                systemImage: model.financialApprovalUsesBiometrics
+                                    ? model.biometricSymbolName
+                                    : "lock.fill"
+                            )
+                            .frame(maxWidth: .infinity)
+                        }
+                    }
+                    .buttonStyle(GroupPaymentGoldButtonStyle())
+                    .disabled(
+                        submissionInFlight
+                            || (!model.financialApprovalUsesBiometrics && pin.count != 4)
+                    )
+                }
+                .padding(22)
+            }
+            .background(KitColor.canvas.ignoresSafeArea())
+            .navigationTitle("Contribute")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                        .disabled(submissionInFlight)
+                }
+            }
+            .onAppear {
+                if startsWithRemainingAmount, amount.isEmpty {
+                    amount = request.remainingAmount
+                }
+            }
+        }
+        .interactiveDismissDisabled(submissionInFlight)
+    }
+
+    private func contribute() {
+        guard !isSubmitting, submissionGate.begin() else { return }
+        guard GroupPaymentRequestContributionPolicy.canonicalAmount(
+            amount,
+            request: request,
+            wallet: wallet
+        ) != nil else {
+            validationMessage = "Enter an amount no greater than the remaining request or your available balance."
+            submissionGate.resolve(succeeded: false)
+            return
+        }
+        validationMessage = nil
+        Task { @MainActor in
+            let succeeded = await submit(amount, pin) != nil
+            if submissionGate.resolve(succeeded: succeeded) {
+                pin = ""
+                dismiss()
+            }
+        }
+    }
+
+    private func formatted(_ value: String) -> String {
+        KitMoney.formatted(value, currency: request.currency, trimZeroFraction: true)
     }
 }

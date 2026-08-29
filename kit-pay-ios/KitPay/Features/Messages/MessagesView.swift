@@ -1517,12 +1517,18 @@ struct ConversationView: View {
     @StateObject private var chatPaymentRequests = PaymentRequestsViewModel()
     @StateObject private var chatTransfers = ChatTransfersViewModel()
     @StateObject private var chatGroupPayments = ChatGroupPaymentsViewModel()
+    @StateObject private var chatGroupPaymentRequests = ChatGroupPaymentRequestsViewModel()
+    @StateObject private var chatScheduledPayments = ChatScheduledPaymentsViewModel()
+    @StateObject private var chatScheduledGroupPayments = ChatScheduledGroupPaymentsViewModel()
     @ObservedObject private var presence = KitPresenceCenter.shared
     @State private var transferReverseTarget: ChatTransferReverseTarget?
     @State private var transferRejectTarget: ChatTransferRejectTarget?
     @State private var groupPaymentDeclineTarget: GroupPaymentDeclineTarget?
     @State private var groupPaymentReturnTarget: GroupPaymentReturnTarget?
     @State private var groupPaymentComposer: GroupPaymentComposerTarget?
+    @State private var groupPaymentRequestComposer: GroupPaymentRequestComposerTarget?
+    @State private var groupPaymentRequestContribution: GroupPaymentRequestContributionTarget?
+    @State private var groupPaymentRequestCancellation: GroupPaymentRequestCancellationTarget?
     @StateObject private var voiceRecorder: VoiceNoteRecorder
     @FocusState private var isComposerFocused: Bool
 
@@ -1595,6 +1601,30 @@ struct ConversationView: View {
                 return nil
             }
         )
+    }
+
+    private var scheduledPaymentsEnabled: Bool {
+        !isReadOnlyAppReviewPreview
+            && !isGroupConversation
+            && ScheduledPaymentPolicy(capabilities: model.capabilities).chatEnabled
+    }
+
+    private var terminalScheduledPaymentIDs: Set<String> {
+        Set(timelineItems.compactMap { item in
+            guard case .scheduledPayment(_, let descriptor) = item else { return nil }
+            return descriptor.scheduledPaymentID
+        })
+    }
+
+    private var pendingScheduledPayments: [ScheduledPaymentDTO] {
+        chatScheduledPayments.items.filter {
+            !terminalScheduledPaymentIDs.contains($0.id.lowercased())
+        }
+    }
+
+    private var scheduledPaymentLoadID: String {
+        let terminal = terminalScheduledPaymentIDs.sorted().joined(separator: ",")
+        return "\(model.isOnline):\(scheduledPaymentsEnabled):\(conversation.id.lowercased()):\(terminal)"
     }
 
     private var timelineItems: [ConversationTimelineItem] {
@@ -1812,6 +1842,72 @@ struct ConversationView: View {
             }
         }
         return "\(model.isOnline):\(groupPaymentsEnabled):\(eventIDs.joined(separator: ","))"
+    }
+
+    private var groupPaymentRequestsEnabled: Bool {
+        !isReadOnlyAppReviewPreview
+            && isGroupConversation
+            && GroupPaymentRequestPolicy(capabilities: model.capabilities).enabled
+    }
+
+    private var scheduledGroupPaymentsEnabled: Bool {
+        !isReadOnlyAppReviewPreview
+            && isGroupConversation
+            && ScheduledGroupPaymentPolicy(capabilities: model.capabilities).enabled
+    }
+
+    private var scheduledGroupPaymentLoadID: String {
+        let known = chatScheduledGroupPayments.items.map(\.id).sorted().joined(separator: ",")
+        let terminal = timelineItems.compactMap { item -> String? in
+            switch item {
+            case .scheduledGroupPaymentOutcome(let message, _),
+                 .groupPayment(let message, _):
+                return message.id.uuidString.lowercased()
+            default:
+                return nil
+            }
+        }.joined(separator: ",")
+        return "\(model.isOnline):\(scheduledGroupPaymentsEnabled):\(conversation.id.lowercased()):\(known):\(terminal)"
+    }
+
+    private var conversationGroupPaymentRequestIDs: [String] {
+        timelineItems.compactMap { item in
+            switch item {
+            case .groupPaymentRequest(_, let descriptor),
+                 .groupPaymentRequestEvent(_, let descriptor):
+                return descriptor.requestID
+            default:
+                return nil
+            }
+        }
+    }
+
+    private var conversationGroupPaymentContributionReferences:
+        [GroupPaymentRequestContributionReference] {
+        timelineItems.compactMap { item in
+            guard case .groupPaymentRequestEvent(_, let descriptor) = item,
+                  descriptor.action == .contributed || descriptor.action == .completed,
+                  let contributionID = descriptor.contributionID
+            else { return nil }
+            return GroupPaymentRequestContributionReference(
+                requestID: descriptor.requestID,
+                contributionID: contributionID,
+                requiresExactRead: descriptor.action == .completed
+            )
+        }
+    }
+
+    private var groupPaymentRequestLoadID: String {
+        let eventIDs = timelineItems.compactMap { item -> String? in
+            switch item {
+            case .groupPaymentRequest(let message, _),
+                 .groupPaymentRequestEvent(let message, _):
+                return message.id.uuidString.lowercased()
+            default:
+                return nil
+            }
+        }
+        return "\(model.isOnline):\(groupPaymentRequestsEnabled):\(eventIDs.joined(separator: ","))"
     }
 
     /// Members of this group who could be paid: everyone but the account holder.
@@ -2518,10 +2614,22 @@ struct ConversationView: View {
                                 }
                             case .payment(let message, let descriptor):
                                 paymentBubble(message, descriptor: descriptor)
+                            case .scheduledPayment(let message, let descriptor):
+                                scheduledPaymentReceipt(message, descriptor: descriptor)
+                            case .scheduledGroupPaymentOutcome(_, let descriptor):
+                                GroupPaymentOutcomeChip(
+                                    text: descriptor.action == .failed
+                                        ? "Scheduled group payment was not sent. No money moved."
+                                        : "Scheduled group payment cancelled."
+                                )
                             case .groupPayment(let message, let descriptor):
                                 groupPaymentCard(message, descriptor: descriptor)
                             case .groupPaymentEvent(let message, let descriptor):
                                 groupPaymentOutcome(message, descriptor: descriptor)
+                            case .groupPaymentRequest(let message, let descriptor):
+                                groupPaymentRequestCard(message, descriptor: descriptor)
+                            case .groupPaymentRequestEvent(let message, let descriptor):
+                                groupPaymentRequestOutcome(message, descriptor: descriptor)
                             case .call(let call):
                                 callBubble(call)
                             case .dateSeparator(let separator):
@@ -2545,6 +2653,42 @@ struct ConversationView: View {
                                 },
                                 onCancel: { item in
                                     Task { await cancelScheduledItem(item) }
+                                }
+                            )
+                        }
+                        if !pendingScheduledPayments.isEmpty {
+                            ScheduledPaymentSection(
+                                items: pendingScheduledPayments,
+                                recipientName: recipientDisplayName,
+                                isOnline: model.isOnline,
+                                cancellingID: chatScheduledPayments.cancellingID,
+                                errorMessage: chatScheduledPayments.errorMessage,
+                                onCancel: { payment in
+                                    Task {
+                                        await chatScheduledPayments.cancel(
+                                            payment,
+                                            conversationID: conversation.id,
+                                            isOnline: model.isOnline
+                                        )
+                                    }
+                                }
+                            )
+                        }
+                        if !chatScheduledGroupPayments.items.isEmpty {
+                            ScheduledGroupPaymentSection(
+                                items: chatScheduledGroupPayments.items,
+                                isOnline: model.isOnline,
+                                actionID: chatScheduledGroupPayments.actionID,
+                                errorMessage: chatScheduledGroupPayments.errorMessage,
+                                onCancel: { schedule in
+                                    Task {
+                                        await chatScheduledGroupPayments.cancel(
+                                            schedule,
+                                            conversationID: conversation.id,
+                                            enabled: scheduledGroupPaymentsEnabled,
+                                            isOnline: model.isOnline
+                                        )
+                                    }
                                 }
                             )
                         }
@@ -2588,7 +2732,14 @@ struct ConversationView: View {
                 // so itself; below that, the drag gesture is the only thing there is.
                 .modifier(
                     ConversationScrollInteractionReporter(
-                        onInteractingChange: { isConversationScrollInteracting = $0 },
+                        onInteractingChange: { interacting in
+                            isConversationScrollInteracting = interacting
+                            if interacting {
+                                latestPositionPolicy.endOpeningSettling(
+                                    conversationID: conversation.id
+                                )
+                            }
+                        },
                         onRelease: releaseCameraPull
                     )
                 )
@@ -2612,6 +2763,7 @@ struct ConversationView: View {
                     // upward drag only started working after a compensating downward drag.
                     await Task.yield()
                     guard !Task.isCancelled,
+                          pendingScrollTargetMessageID == nil,
                           latestPositionPolicy.claimOpening(
                               conversationID: conversation.id,
                               hasTimelineContent: !timelineItems.isEmpty
@@ -2627,6 +2779,14 @@ struct ConversationView: View {
                     scrollToBottom(using: scrollProxy, animated: false)
                 }
                 .onChange(of: timelineItems.last?.id) { _, _ in
+                    if latestPositionPolicy.shouldMaintainOpeningAnchor(
+                        conversationID: conversation.id,
+                        hasExplicitTarget: pendingScrollTargetMessageID != nil,
+                        isInteracting: isConversationScrollInteracting
+                    ) {
+                        scrollToBottom(using: scrollProxy, animated: false)
+                        return
+                    }
                     // A message the user just sent always snaps to the latest position; an
                     // incoming message must never yank them away from what they are reading.
                     if ConversationLatestPositionPolicy.shouldFollowTimelineChange(
@@ -2654,11 +2814,29 @@ struct ConversationView: View {
                     // grow over the composer or leave the thread feeling stuck.
                     deferredLatestPositionRequest &+= 1
                 }
+                .onChange(of: chatGroupPaymentRequests.requests) { previous, updated in
+                    guard previous != updated,
+                          ConversationLatestPositionPolicy.shouldFollowPaymentHydration(
+                              hasPositionedCurrentConversation: latestPositionPolicy.hasPositioned(
+                                  conversationID: conversation.id
+                              ),
+                              isNearLatest: isNearLatestMessage,
+                              isInteracting: isConversationScrollInteracting
+                          )
+                    else { return }
+                    deferredLatestPositionRequest &+= 1
+                }
                 .task(id: deferredLatestPositionRequest) {
                     guard deferredLatestPositionRequest > 0 else { return }
                     await Task.yield()
-                    guard !Task.isCancelled,
-                          ConversationLatestPositionPolicy.shouldFollowPaymentHydration(
+                    guard !Task.isCancelled else { return }
+                    let maintainsOpening = latestPositionPolicy.shouldMaintainOpeningAnchor(
+                        conversationID: conversation.id,
+                        hasExplicitTarget: pendingScrollTargetMessageID != nil,
+                        isInteracting: isConversationScrollInteracting
+                    )
+                    guard maintainsOpening
+                        || ConversationLatestPositionPolicy.shouldFollowPaymentHydration(
                               hasPositionedCurrentConversation: latestPositionPolicy.hasPositioned(
                                   conversationID: conversation.id
                               ),
@@ -2670,6 +2848,7 @@ struct ConversationView: View {
                 }
                 .onChange(of: pendingScrollTargetMessageID) { _, target in
                     guard let target else { return }
+                    latestPositionPolicy.endOpeningSettling(conversationID: conversation.id)
                     withAnimation(.easeOut(duration: 0.25)) {
                         scrollProxy.scrollTo(
                             "message:\(target.uuidString.lowercased())",
@@ -2822,6 +3001,7 @@ struct ConversationView: View {
                     flow: sendMoneyFlow,
                     preselectedContact: recipientContact,
                     preselectedRecipientUserID: paymentRecipientUserID,
+                    conversationID: conversation.id,
                     locksRecipientSelection: true,
                     shareTransferInChat: { transaction in
                         guard let paymentRecipientUserID else { return false }
@@ -2830,6 +3010,12 @@ struct ConversationView: View {
                             recipientId: paymentRecipientUserID,
                             title: recipientDisplayName,
                             conversationId: conversation.id
+                        )
+                    },
+                    scheduledPaymentCreated: { payment in
+                        chatScheduledPayments.upsert(
+                            payment,
+                            conversationID: conversation.id
                         )
                     }
                 )
@@ -3198,9 +3384,11 @@ struct ConversationView: View {
                     conversationTitle: conversation.title,
                     members: groupPaymentMembers,
                     wallet: wallet,
-                    isSubmitting: chatGroupPayments.actionPaymentId != nil,
+                    isSubmitting: chatGroupPayments.actionPaymentId != nil
+                        || chatScheduledGroupPayments.actionID != nil,
                     errorMessage: chatGroupPayments.errorMessage
-                ) { body, pin in
+                        ?? chatScheduledGroupPayments.errorMessage,
+                    submit: { body, pin in
                     let payment = await chatGroupPayments.send(
                         conversationId: conversation.id,
                         body: body,
@@ -3232,10 +3420,109 @@ struct ConversationView: View {
                         }
                     }
                     return payment
-                }
+                    },
+                    schedulePayment: scheduledGroupPaymentsEnabled ? { body, date, pin in
+                        await chatScheduledGroupPayments.schedule(
+                            conversationID: conversation.id,
+                            draft: body,
+                            wallet: wallet,
+                            scheduledFor: date,
+                            allowedRecipientIDs: Set(groupPaymentMembers.map(\.userId)),
+                            pin: pin,
+                            enabled: scheduledGroupPaymentsEnabled,
+                            isOnline: model.isOnline,
+                            authorize: model.authorizeFinancialStepUp
+                        )
+                    } : nil
+                )
                 .environmentObject(model)
                 .presentationBackground(.ultraThinMaterial)
             }
+        }
+        .fullScreenCover(item: $groupPaymentRequestComposer) { composer in
+            if let wallet = model.selectedWallet {
+                GroupPaymentRequestComposerView(
+                    conversationTitle: conversation.title,
+                    wallet: wallet,
+                    isSubmitting: chatGroupPaymentRequests.actionRequestID != nil,
+                    errorMessage: chatGroupPaymentRequests.errorMessage
+                ) { body in
+                    guard let requesterUserID = model.profile?.id else { return nil }
+                    let request = await chatGroupPaymentRequests.create(
+                        conversationID: conversation.id,
+                        requesterUserID: requesterUserID,
+                        body: body,
+                        idempotencyKey: composer.id,
+                        enabled: groupPaymentRequestsEnabled,
+                        isOnline: model.isOnline
+                    )
+                    guard let request else { return nil }
+                    Task { @MainActor in
+                        let announced = await announceGroupPaymentRequest(request)
+                        await model.refresh()
+                        if !announced {
+                            model.lastError = "The request is active and will appear after the next secure sync. Do not create it again."
+                        }
+                    }
+                    return request
+                }
+                .environmentObject(model)
+            }
+        }
+        .fullScreenCover(item: $groupPaymentRequestContribution) { target in
+            if let wallet = model.selectedWallet,
+               let request = chatGroupPaymentRequests.requests[target.descriptor.requestID] {
+                GroupPaymentRequestContributionView(
+                    request: request,
+                    wallet: wallet,
+                    startsWithRemainingAmount: target.startsWithRemainingAmount,
+                    isSubmitting: chatGroupPaymentRequests.actionRequestID != nil,
+                    errorMessage: chatGroupPaymentRequests.errorMessage
+                ) { amount, pin in
+                    guard let currentUserID = model.profile?.id else { return nil }
+                    let result = await chatGroupPaymentRequests.contribute(
+                        descriptor: target.descriptor,
+                        conversationID: conversation.id,
+                        announcementSenderID: target.announcementSenderID,
+                        currentUserID: currentUserID,
+                        wallet: wallet,
+                        amountInput: amount,
+                        idempotencyKey: target.idempotencyKey,
+                        pin: pin,
+                        enabled: groupPaymentRequestsEnabled,
+                        isOnline: model.isOnline,
+                        authorize: model.authorizeFinancialStepUp
+                    )
+                    guard let result else { return nil }
+                    Task { @MainActor in
+                        await announceGroupPaymentRequestContribution(result)
+                        await model.refresh()
+                    }
+                    return result
+                }
+                .environmentObject(model)
+            }
+        }
+        .alert(item: $groupPaymentRequestCancellation) { target in
+            Alert(
+                title: Text("Close this request?"),
+                message: Text("Contributions already received stay settled. No new contributions will be accepted."),
+                primaryButton: .destructive(Text("Close request")) {
+                    Task { @MainActor in
+                        guard let request = await chatGroupPaymentRequests.cancel(
+                            descriptor: target.descriptor,
+                            conversationID: conversation.id,
+                            announcementSenderID: target.announcementSenderID,
+                            idempotencyKey: target.idempotencyKey,
+                            enabled: groupPaymentRequestsEnabled,
+                            isOnline: model.isOnline
+                        ) else { return }
+                        await announceGroupPaymentRequestTerminal(request, action: .cancelled)
+                        await model.refresh()
+                    }
+                },
+                secondaryButton: .cancel()
+            )
         }
     }
 
@@ -3324,6 +3611,33 @@ struct ConversationView: View {
             await chatGroupPayments.load(
                 isOnline: true,
                 paymentIds: conversationGroupPaymentIDs
+            )
+        }
+        .task(id: groupPaymentRequestLoadID) {
+            guard !isReadOnlyAppReviewPreview,
+                  model.isOnline,
+                  groupPaymentRequestsEnabled,
+                  !conversationGroupPaymentRequestIDs.isEmpty
+            else { return }
+            await chatGroupPaymentRequests.load(
+                conversationID: conversation.id,
+                requestIDs: conversationGroupPaymentRequestIDs,
+                contributionReferences: conversationGroupPaymentContributionReferences,
+                isOnline: true
+            )
+        }
+        .task(id: scheduledGroupPaymentLoadID) {
+            await chatScheduledGroupPayments.load(
+                conversationID: conversation.id,
+                enabled: scheduledGroupPaymentsEnabled,
+                isOnline: model.isOnline
+            )
+        }
+        .task(id: scheduledPaymentLoadID) {
+            await chatScheduledPayments.load(
+                conversationID: conversation.id,
+                enabled: scheduledPaymentsEnabled,
+                isOnline: model.isOnline
             )
         }
         .task(id: draftPersistenceTaskKey) {
@@ -3767,9 +4081,16 @@ struct ConversationView: View {
                     Button { openPaymentRequest() } label: {
                         Label("Payment request", systemImage: "banknote")
                     }
-                } else if canSendGroupPayment {
-                    Button { openGroupPayment() } label: {
-                        Label("Pay the group", systemImage: "banknote.fill")
+                } else {
+                    if canSendGroupPayment {
+                        Button { openGroupPayment() } label: {
+                            Label("Pay the group", systemImage: "banknote.fill")
+                        }
+                    }
+                    if canCreateGroupPaymentRequest {
+                        Button { openGroupPaymentRequest() } label: {
+                            Label("Request from group", systemImage: "chart.pie.fill")
+                        }
                     }
                 }
             } label: {
@@ -3780,7 +4101,7 @@ struct ConversationView: View {
                     .background(.ultraThinMaterial, in: Circle())
             }
             .accessibilityLabel(
-                isGroupConversation && !canSendGroupPayment
+                isGroupConversation && !canSendGroupPayment && !canCreateGroupPaymentRequest
                     ? "Attachments"
                     : "Attachments and payments"
             )
@@ -4746,6 +5067,9 @@ struct ConversationView: View {
         }
         switch KitMediaMessageFamilyPresentation.content(for: message.body) {
         case .text:
+            guard SecureMessageReservedPrefixPolicy.allowsUserAuthoredText(message.body) else {
+                return nil
+            }
             return message.body.nilIfBlank
         case .mediaV1(let media):
             return media.caption?.nilIfBlank
@@ -4789,6 +5113,7 @@ struct ConversationView: View {
                 }
                 guard let body = message.body.nilIfBlank,
                       KitPaymentMessage.parse(body) == nil,
+                      KitScheduledPaymentMessage.parse(body) == nil,
                       !KitMessageReaction.isReactionText(body),
                       !KitMediaMessageFamilyPolicy.isReservedFamilyText(body),
                       !SecureMessageReservedPrefixPolicy.beginsWithReservedPrefix(
@@ -4831,6 +5156,60 @@ struct ConversationView: View {
                 message.isOutgoing ? AnyShapeStyle(KitColor.navy) : AnyShapeStyle(.ultraThinMaterial),
                 in: RoundedRectangle(cornerRadius: 20, style: .continuous)
             )
+            if !message.isOutgoing { Spacer(minLength: 52) }
+        }
+    }
+
+    private func scheduledPaymentReceipt(
+        _ message: LocalMessage,
+        descriptor: KitScheduledPaymentMessage
+    ) -> some View {
+        let foreground = message.isOutgoing ? Color.white : KitColor.primaryText
+        let secondary = message.isOutgoing
+            ? Color.white.opacity(0.76)
+            : KitColor.secondaryText
+        let title: String = switch descriptor.action {
+        case .completed: message.isOutgoing ? "Scheduled payment sent" : "Scheduled payment received"
+        case .failed: "Scheduled payment not sent"
+        case .cancelled: "Scheduled payment cancelled"
+        }
+        let symbol: String = switch descriptor.action {
+        case .completed: "checkmark.circle.fill"
+        case .failed: "exclamationmark.triangle.fill"
+        case .cancelled: "xmark.circle"
+        }
+
+        return HStack {
+            if message.isOutgoing { Spacer(minLength: 52) }
+            VStack(alignment: .leading, spacing: 8) {
+                Label(title, systemImage: symbol)
+                    .font(.caption.bold())
+                    .foregroundStyle(message.isOutgoing ? Color.white.opacity(0.84) : KitColor.green)
+                Text(KitMoney.formatted(
+                    descriptor.decimalAmount,
+                    code: descriptor.currencyCode,
+                    scale: descriptor.currencyScale
+                ))
+                .font(.title3.bold())
+                .foregroundStyle(foreground)
+                if let note = descriptor.note {
+                    Text(note).font(.subheadline).foregroundStyle(secondary)
+                }
+                Text("Scheduled for \(descriptor.scheduledAt.formatted(date: .abbreviated, time: .shortened))")
+                    .font(.caption2)
+                    .foregroundStyle(secondary)
+                if let reason = descriptor.reason, descriptor.action != .completed {
+                    Text(reason).font(.caption2.weight(.semibold)).foregroundStyle(secondary)
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .frame(maxWidth: 290, alignment: .leading)
+            .background(
+                message.isOutgoing ? AnyShapeStyle(KitColor.navy) : AnyShapeStyle(.ultraThinMaterial),
+                in: RoundedRectangle(cornerRadius: 20, style: .continuous)
+            )
+            .accessibilityElement(children: .combine)
             if !message.isOutgoing { Spacer(minLength: 52) }
         }
     }
@@ -4932,6 +5311,172 @@ struct ConversationView: View {
         ) {
             GroupPaymentOutcomeChip(text: text)
         }
+    }
+
+    private func groupPaymentRequestCard(
+        _ message: LocalMessage,
+        descriptor: KitGroupPaymentRequestMessage
+    ) -> some View {
+        let request = chatGroupPaymentRequests.authoritativeRequest(
+            for: descriptor,
+            conversationID: conversation.id,
+            announcementSenderID: message.senderId
+        )
+        return HStack {
+            Spacer(minLength: 0)
+            VStack(spacing: 4) {
+                GroupPaymentRequestCardView(
+                    request: request,
+                    contradictsServer: chatGroupPaymentRequests.contradictsAuthoritativeState(
+                        descriptor,
+                        conversationID: conversation.id,
+                        announcementSenderID: message.senderId
+                    ),
+                    senderName: participantDisplayName(for: message.senderId),
+                    currentUserID: model.profile?.id,
+                    displayName: { participantDisplayName(for: $0) },
+                    isBusy: chatGroupPaymentRequests.actionRequestID != nil,
+                    contribute: {
+                        openGroupPaymentRequestContribution(
+                            descriptor,
+                            announcementSenderID: message.senderId,
+                            payRemaining: false
+                        )
+                    },
+                    payRemaining: {
+                        openGroupPaymentRequestContribution(
+                            descriptor,
+                            announcementSenderID: message.senderId,
+                            payRemaining: true
+                        )
+                    },
+                    cancel: {
+                        groupPaymentRequestCancellation = GroupPaymentRequestCancellationTarget(
+                            descriptor: descriptor,
+                            announcementSenderID: message.senderId
+                        )
+                    }
+                )
+                groupPaymentMetadata(message)
+            }
+            Spacer(minLength: 0)
+        }
+    }
+
+    @ViewBuilder
+    private func groupPaymentRequestOutcome(
+        _ message: LocalMessage,
+        descriptor: KitGroupPaymentRequestMessage
+    ) -> some View {
+        if let text = chatGroupPaymentRequests.verifiedEventCopy(
+            for: descriptor,
+            conversationID: conversation.id,
+            messageAuthorID: message.senderId,
+            isViewerAuthor: message.isOutgoing,
+            displayName: { participantDisplayName(for: $0) }
+        ) {
+            GroupPaymentOutcomeChip(text: text)
+        }
+    }
+
+    private func openGroupPaymentRequestContribution(
+        _ descriptor: KitGroupPaymentRequestMessage,
+        announcementSenderID: String,
+        payRemaining: Bool
+    ) {
+        guard groupPaymentRequestsEnabled,
+              model.isOnline,
+              model.selectedWallet != nil,
+              chatGroupPaymentRequests.authoritativeRequest(
+                  for: descriptor,
+                  conversationID: conversation.id,
+                  announcementSenderID: announcementSenderID
+              ) != nil
+        else {
+            model.lastError = "This group request is not available for a contribution right now."
+            return
+        }
+        chatGroupPaymentRequests.errorMessage = nil
+        groupPaymentRequestContribution = GroupPaymentRequestContributionTarget(
+            descriptor: descriptor,
+            announcementSenderID: announcementSenderID,
+            startsWithRemainingAmount: payRemaining
+        )
+    }
+
+    private func announceGroupPaymentRequest(_ request: GroupPaymentRequestDTO) async -> Bool {
+        guard let actorUserID = model.profile?.id,
+              GroupPaymentRequestAuthorityPolicy.matchesContext(
+                  request,
+                  conversationID: conversation.id,
+                  announcementSenderID: actorUserID
+              ),
+              let descriptor = KitGroupPaymentRequestMessage(requesting: request)
+        else { return false }
+        return await model.queueGroupPaymentRequestEvent(
+            conversationId: conversation.id,
+            title: conversation.title,
+            descriptor: descriptor,
+            clientMessageID: KitGroupPaymentRequestMessage.deterministicMessageID(
+                requestID: request.id,
+                action: .requested,
+                actorUserID: actorUserID
+            )
+        )
+    }
+
+    private func announceGroupPaymentRequestContribution(
+        _ result: GroupPaymentRequestContributionResultDTO
+    ) async {
+        guard let actorUserID = model.profile?.id,
+              result.isStructurallyValid,
+              result.contribution.contributorUserId.caseInsensitiveCompare(actorUserID)
+                == .orderedSame
+        else { return }
+        let completed = result.request.knownStatus == .completed
+        let descriptor = completed
+            ? KitGroupPaymentRequestMessage(
+                completing: result.contribution,
+                requestID: result.request.id
+            )
+            : KitGroupPaymentRequestMessage(
+                contributing: result.contribution,
+                requestID: result.request.id
+            )
+        guard let descriptor else { return }
+        _ = await model.queueGroupPaymentRequestEvent(
+            conversationId: conversation.id,
+            title: conversation.title,
+            descriptor: descriptor,
+            clientMessageID: KitGroupPaymentRequestMessage.deterministicMessageID(
+                requestID: result.request.id,
+                action: descriptor.action,
+                contributionID: result.contribution.id,
+                actorUserID: actorUserID
+            )
+        )
+    }
+
+    private func announceGroupPaymentRequestTerminal(
+        _ request: GroupPaymentRequestDTO,
+        action: KitGroupPaymentRequestMessageAction
+    ) async {
+        guard let actorUserID = model.profile?.id,
+              let descriptor = KitGroupPaymentRequestMessage(
+                  terminal: action,
+                  requestID: request.id
+              )
+        else { return }
+        _ = await model.queueGroupPaymentRequestEvent(
+            conversationId: conversation.id,
+            title: conversation.title,
+            descriptor: descriptor,
+            clientMessageID: KitGroupPaymentRequestMessage.deterministicMessageID(
+                requestID: request.id,
+                action: action,
+                actorUserID: actorUserID
+            )
+        )
     }
 
     /// This member's own share, for the decline sheet's confirmation line.
@@ -6107,6 +6652,12 @@ struct ConversationView: View {
             && model.selectedWallet != nil
     }
 
+    private var canCreateGroupPaymentRequest: Bool {
+        groupPaymentRequestsEnabled
+            && conversationMessagingAvailable
+            && model.selectedWallet?.status == "active"
+    }
+
     private func openGroupPayment() {
         guard canSendGroupPayment else {
             model.lastError = "Group payments are not available in this chat."
@@ -6119,6 +6670,20 @@ struct ConversationView: View {
         isComposerFocused = false
         chatGroupPayments.errorMessage = nil
         groupPaymentComposer = GroupPaymentComposerTarget()
+    }
+
+    private func openGroupPaymentRequest() {
+        guard canCreateGroupPaymentRequest else {
+            model.lastError = "Group payment requests are not available in this chat."
+            return
+        }
+        guard model.isOnline else {
+            model.lastError = "Connect to the internet to create a group payment request."
+            return
+        }
+        isComposerFocused = false
+        chatGroupPaymentRequests.errorMessage = nil
+        groupPaymentRequestComposer = GroupPaymentRequestComposerTarget()
     }
 
     // MARK: Attachment staging
@@ -6582,8 +7147,12 @@ struct ConversationView: View {
         switch item {
         case .message(let message),
              .payment(let message, _),
+             .scheduledPayment(let message, _),
+             .scheduledGroupPaymentOutcome(let message, _),
              .groupPayment(let message, _),
-             .groupPaymentEvent(let message, _):
+             .groupPaymentEvent(let message, _),
+             .groupPaymentRequest(let message, _),
+             .groupPaymentRequestEvent(let message, _):
             return message.isOutgoing
         case .call, .dateSeparator:
             return false
@@ -6614,8 +7183,20 @@ struct ConversationView: View {
     // MARK: Reading position, jump-to-latest, and the pull-past-the-end camera
 
     private func handleScrollMetrics(_ metrics: ConversationScrollMetrics) {
-        if conversationContentHeight != metrics.contentHeight {
+        let contentHeightChanged = conversationContentHeight != metrics.contentHeight
+        if contentHeightChanged {
             conversationContentHeight = metrics.contentHeight
+        }
+        if contentHeightChanged,
+           latestPositionPolicy.shouldMaintainOpeningAnchor(
+               conversationID: conversation.id,
+               hasExplicitTarget: pendingScrollTargetMessageID != nil,
+               isInteracting: isConversationScrollInteracting
+           ) {
+            // Lazy rows, restored history and hydrated financial cards can all gain height after
+            // the first anchor exists. Keep asking for the bottom until the user touches the
+            // thread or chooses an exact navigation target.
+            deferredLatestPositionRequest &+= 1
         }
         guard conversationViewportHeight > 0 else { return }
         let distanceFromLatest = metrics.contentMaxY - conversationViewportHeight
@@ -6940,6 +7521,7 @@ private struct RecorderLevelWave: View {
 /// while an incoming message still cannot pull somebody away from older history.
 struct ConversationLatestPositionPolicy: Equatable {
     private(set) var positionedConversationID: String?
+    private(set) var openingSettlingConversationID: String?
 
     mutating func claimOpening(
         conversationID: String,
@@ -6951,11 +7533,27 @@ struct ConversationLatestPositionPolicy: Equatable {
         let canonical = conversationID.lowercased()
         guard positionedConversationID != canonical else { return false }
         positionedConversationID = canonical
+        openingSettlingConversationID = canonical
         return true
     }
 
     func hasPositioned(conversationID: String) -> Bool {
         positionedConversationID == conversationID.lowercased()
+    }
+
+    mutating func endOpeningSettling(conversationID: String) {
+        guard openingSettlingConversationID == conversationID.lowercased() else { return }
+        openingSettlingConversationID = nil
+    }
+
+    func shouldMaintainOpeningAnchor(
+        conversationID: String,
+        hasExplicitTarget: Bool,
+        isInteracting: Bool
+    ) -> Bool {
+        openingSettlingConversationID == conversationID.lowercased()
+            && !hasExplicitTarget
+            && !isInteracting
     }
 
     static func openingLayoutIsReady(
@@ -7165,6 +7763,53 @@ private struct GroupPaymentComposerTarget: Identifiable {
 
     init(id: String = UUID().uuidString.lowercased()) {
         self.id = id
+    }
+}
+
+private struct GroupPaymentRequestComposerTarget: Identifiable {
+    let id: String
+
+    init(id: String = UUID().uuidString.lowercased()) {
+        self.id = id
+    }
+}
+
+private struct GroupPaymentRequestContributionTarget: Identifiable {
+    let descriptor: KitGroupPaymentRequestMessage
+    let announcementSenderID: String
+    let startsWithRemainingAmount: Bool
+    let idempotencyKey: String
+
+    var id: String { "\(descriptor.requestID):\(idempotencyKey)" }
+
+    init(
+        descriptor: KitGroupPaymentRequestMessage,
+        announcementSenderID: String,
+        startsWithRemainingAmount: Bool,
+        idempotencyKey: String = UUID().uuidString.lowercased()
+    ) {
+        self.descriptor = descriptor
+        self.announcementSenderID = announcementSenderID
+        self.startsWithRemainingAmount = startsWithRemainingAmount
+        self.idempotencyKey = idempotencyKey
+    }
+}
+
+private struct GroupPaymentRequestCancellationTarget: Identifiable {
+    let descriptor: KitGroupPaymentRequestMessage
+    let announcementSenderID: String
+    let idempotencyKey: String
+
+    var id: String { descriptor.requestID }
+
+    init(
+        descriptor: KitGroupPaymentRequestMessage,
+        announcementSenderID: String,
+        idempotencyKey: String = UUID().uuidString.lowercased()
+    ) {
+        self.descriptor = descriptor
+        self.announcementSenderID = announcementSenderID
+        self.idempotencyKey = idempotencyKey
     }
 }
 
@@ -7713,6 +8358,29 @@ enum ChatMessagePresentationPolicy {
             prefix: KitSystemMessage.prefix
         ) {
             return ("Group updated", nil)
+        }
+
+        if let scheduled = KitScheduledPaymentMessage.parse(message.body),
+           scheduled.isTrustedProjection(message) {
+            let label = switch scheduled.action {
+            case .completed:
+                message.isOutgoing ? "⏱ Scheduled payment sent" : "⏱ Scheduled payment received"
+            case .failed: "⚠️ Scheduled payment not sent"
+            case .cancelled: "↩️ Scheduled payment cancelled"
+            }
+            let searchableParts = [scheduled.note, scheduled.reason].compactMap { $0 }
+            return (
+                label,
+                searchableParts.isEmpty
+                    ? label
+                    : "\(label) · \(searchableParts.joined(separator: " · "))"
+            )
+        }
+        if SecureMessageReservedPrefixPolicy.beginsWithReservedPrefix(
+            message.body,
+            prefix: KitScheduledPaymentMessage.prefix
+        ) {
+            return ("Scheduled payment", "Scheduled payment")
         }
 
         if let payment = KitPaymentMessage.parse(message.body) {

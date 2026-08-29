@@ -446,6 +446,22 @@ protocol SecureMessagingExchangeTransport: SecureMessagingActivationTransport {
         conversationId: String,
         messageId: String
     ) async throws -> MessagingMessageInfoDTO
+    /// Re-read financial authority before projecting a group-request sync hint into chat. The
+    /// sync payload is intentionally insufficient to authorize money movement or contributor
+    /// attribution by itself.
+    func groupPaymentRequest(id: String) async throws -> GroupPaymentRequestDTO
+    func groupPaymentRequestContribution(
+        requestId: String,
+        contributionId: String
+    ) async throws -> GroupPaymentRequestContributionDTO
+    /// Scheduled group completion is only a sync hint. Re-read both the schedule and the money
+    /// object before projecting the ordinary group-payment card into the conversation.
+    func scheduledGroupPayment(id: String) async throws -> ScheduledGroupPaymentDTO
+    func groupPayment(id: String) async throws -> GroupPaymentDTO
+    /// Re-read a scheduled-payment terminal event before projecting it into chat. Completed
+    /// recipient reads are deliberately redacted by the server but retain the fields matched by
+    /// `ScheduledPaymentSyncEnvelope`.
+    func scheduledPayment(id: String) async throws -> ScheduledPaymentDTO
     /// Server + account feature surface. The media-message-v2 admission gate re-reads this at
     /// flush time so a withdrawn rollout fails closed before any upload or ciphertext commit.
     func capabilities() async throws -> CapabilitiesDTO
@@ -458,6 +474,29 @@ extension SecureMessagingExchangeTransport {
         conversationId: String,
         messageId: String
     ) async throws -> MessagingMessageInfoDTO {
+        throw SecureMessagingExchangeError.invalidServerResponse
+    }
+
+    func groupPaymentRequest(id: String) async throws -> GroupPaymentRequestDTO {
+        throw SecureMessagingExchangeError.invalidServerResponse
+    }
+
+    func groupPaymentRequestContribution(
+        requestId: String,
+        contributionId: String
+    ) async throws -> GroupPaymentRequestContributionDTO {
+        throw SecureMessagingExchangeError.invalidServerResponse
+    }
+
+    func scheduledGroupPayment(id: String) async throws -> ScheduledGroupPaymentDTO {
+        throw SecureMessagingExchangeError.invalidServerResponse
+    }
+
+    func groupPayment(id: String) async throws -> GroupPaymentDTO {
+        throw SecureMessagingExchangeError.invalidServerResponse
+    }
+
+    func scheduledPayment(id: String) async throws -> ScheduledPaymentDTO {
         throw SecureMessagingExchangeError.invalidServerResponse
     }
 
@@ -1399,7 +1438,8 @@ actor SecureMessagingExchangeCoordinator {
                localUserID: local,
                recipientUserIDs: [recipient],
                conversation: validated.localProjection,
-               body: body
+               body: body,
+               scheduledAt: nil
            ) {
             return existing
         }
@@ -1543,6 +1583,9 @@ actor SecureMessagingExchangeCoordinator {
             localUserID: local,
             expectedRecipientUserID: recipient
         )
+        // Stable-id replay compares the originally requested minute before reapplying clock
+        // eligibility: that minute may legitimately be in the past after a relaunch or timeout.
+        let requestedMinute = deliverAt.map { ScheduledSendPolicy.canonicalMinute($0) }
         if let clientMessageID,
            let existing = try Self.existingDeferredTextResult(
                in: snapshot,
@@ -1550,7 +1593,8 @@ actor SecureMessagingExchangeCoordinator {
                localUserID: local,
                recipientUserIDs: commandRecipients,
                conversation: conversation,
-               body: body
+               body: body,
+               scheduledAt: requestedMinute
            ) {
             try await clearDraftAfterIdempotentQueueIfNeeded(
                 clientMessageID: clientMessageID,
@@ -1569,8 +1613,12 @@ actor SecureMessagingExchangeCoordinator {
         // A Send Later item is an ordinary queued command dated forward. It is encrypted at its
         // send time against the roster that is authoritative then, exactly like every other
         // deferred message, so scheduling adds no second delivery path to keep idempotent.
-        let scheduledAt = deliverAt.flatMap {
-            ScheduledSendPolicy.normalize($0, now: createdAt)
+        // A fresh invalid schedule fails closed; silently converting it to an immediate send
+        // would violate the sender's explicit instruction.
+        let scheduledAt = try deliverAt.map { requested -> Date in
+            guard let normalized = ScheduledSendPolicy.normalize(requested, now: createdAt)
+            else { throw SecureMessagingCryptoError.invalidContent }
+            return normalized
         }
         let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
         let localMessage = LocalMessage(
@@ -1663,7 +1711,8 @@ actor SecureMessagingExchangeCoordinator {
                               expectedRecipientUserID: recipient
                           ),
                           conversation: racedConversation,
-                          body: body
+                          body: body,
+                          scheduledAt: requestedMinute
                       )
                 else { throw StoreError.accountChanged }
                 try await clearDraftAfterIdempotentQueueIfNeeded(
@@ -2033,7 +2082,8 @@ actor SecureMessagingExchangeCoordinator {
         localUserID: String,
         recipientUserIDs: [String],
         conversation: Conversation,
-        body: String
+        body: String,
+        scheduledAt: Date?
     ) throws -> SecureMessagingQueueResult? {
         let messages = state.messages.filter { $0.id == clientMessageID }
         let commands = state.outbox.filter { $0.messageId == clientMessageID }
@@ -2050,6 +2100,7 @@ actor SecureMessagingExchangeCoordinator {
               message.senderId == localUserID,
               message.body == body,
               message.isOutgoing,
+              message.scheduledAt == scheduledAt,
               message.attachmentData == nil,
               message.pendingAttachment == nil,
               // A pending v2 batch projects its caption (or placeholder) as `body`, so a
@@ -2061,7 +2112,8 @@ actor SecureMessagingExchangeCoordinator {
         if let command = commands.first {
             guard command.kind == .secureMessage,
                   command.conversationId == conversation.id,
-                  command.recipientUserIds == recipientUserIDs
+                  command.recipientUserIds == recipientUserIDs,
+                  command.scheduledAt == scheduledAt
             else { throw SecureMessagingExchangeError.invalidConversation }
         } else {
             guard [.sent, .delivered, .read, .failed].contains(message.state) else {
@@ -2146,6 +2198,9 @@ actor SecureMessagingExchangeCoordinator {
             localUserID: local,
             expectedRecipientUserID: recipient
         )
+        // Match the original minute before validating a fresh schedule: an exact retry can arrive
+        // after that minute and must resolve to the existing idempotent message, not send another.
+        let requestedMinute = deliverAt.map { ScheduledSendPolicy.canonicalMinute($0) }
         // No network at queue time: the offline path must succeed in airplane mode. The rich-media
         // recipient-capability gate still runs authoritatively at flush (prepareDeferredMessage)
         // and again per-encrypt in queueText before any bytes leave the device.
@@ -2160,7 +2215,8 @@ actor SecureMessagingExchangeCoordinator {
                conversation: conversation,
                mediaData: mediaData,
                mediaType: mediaType,
-               caption: normalizedCaption
+               caption: normalizedCaption,
+               scheduledAt: requestedMinute
            ) {
             try await clearDraftAfterIdempotentQueueIfNeeded(
                 clientMessageID: clientMessageID,
@@ -2177,9 +2233,12 @@ actor SecureMessagingExchangeCoordinator {
         let commandID = UUID()
         let createdAt = Date()
         // The photo is already parked in the account-bound encrypted cache; scheduling only moves
-        // the upload-and-send attempt to a later minute.
-        let scheduledAt = deliverAt.flatMap {
-            ScheduledSendPolicy.normalize($0, now: createdAt)
+        // the upload-and-send attempt to a later minute. A fresh stale/invalid date fails closed;
+        // it is never interpreted as permission to send immediately.
+        let scheduledAt = try deliverAt.map { requested -> Date in
+            guard let normalized = ScheduledSendPolicy.normalize(requested, now: createdAt)
+            else { throw SecureMessagingCryptoError.invalidContent }
+            return normalized
         }
         let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
         let localMessage = LocalMessage(
@@ -2259,7 +2318,8 @@ actor SecureMessagingExchangeCoordinator {
         conversation: Conversation,
         mediaData: Data,
         mediaType: String,
-        caption: String?
+        caption: String?,
+        scheduledAt: Date?
     ) async throws -> SecureMessagingQueueResult? {
         let messages = state.messages.filter { $0.id == clientMessageID }
         let commands = state.outbox.filter { $0.messageId == clientMessageID }
@@ -2275,6 +2335,7 @@ actor SecureMessagingExchangeCoordinator {
         guard message.conversationId == conversation.id,
               message.senderId == localUserID,
               message.isOutgoing,
+              message.scheduledAt == scheduledAt,
               message.pendingMediaBatch == nil
         else { throw SecureMessagingExchangeError.invalidConversation }
 
@@ -2318,7 +2379,8 @@ actor SecureMessagingExchangeCoordinator {
             guard command.kind == .secureMessage,
                   command.conversationId == conversation.id,
                   command.messageId == clientMessageID,
-                  command.recipientUserIds == recipientUserIDs
+                  command.recipientUserIds == recipientUserIDs,
+                  command.scheduledAt == scheduledAt
             else { throw SecureMessagingExchangeError.invalidConversation }
         } else {
             guard [.sent, .delivered, .read, .failed].contains(message.state) else {
@@ -3667,7 +3729,8 @@ actor SecureMessagingExchangeCoordinator {
                    localUserID: userID,
                    recipientUserIDs: outboundRecipientUserIDs,
                    conversation: conversation.localProjection,
-                   body: body
+                   body: body,
+                   scheduledAt: nil
                ) {
                 return existing
             }
@@ -5672,6 +5735,15 @@ actor SecureMessagingExchangeCoordinator {
             var deliveryTransitions: [DeliveryTransition] = []
             var readTransitions: [ReadTransition] = []
             var groupMemberTransitions: [GroupMemberTransition] = []
+            var groupPaymentRequestTransitions: [GroupPaymentRequestSyncTransition] = []
+            var groupPaymentRequestAuthority: [String: GroupPaymentRequestDTO] = [:]
+            var groupPaymentRequestContributionAuthority:
+                [String: GroupPaymentRequestContributionDTO] = [:]
+            var scheduledPaymentTransitions: [ScheduledPaymentSyncTransition] = []
+            var scheduledPaymentAuthority: [String: ScheduledPaymentDTO] = [:]
+            var scheduledGroupPaymentTransitions: [ScheduledGroupPaymentSyncTransition] = []
+            var scheduledGroupPaymentAuthority: [String: ScheduledGroupPaymentDTO] = [:]
+            var groupPaymentAuthority: [String: GroupPaymentDTO] = [:]
             var acknowledgementIDs: [String] = []
             var transitionCount = 0
             var shouldReconcileHistoryTargets = false
@@ -6022,6 +6094,218 @@ actor SecureMessagingExchangeCoordinator {
                     crypto.cachedRosters.removeAll()
                     transitionCount += 1
 
+                case "group_payment_request.created",
+                     "group_payment_request.contributed",
+                     "group_payment_request.completed",
+                     "group_payment_request.cancelled",
+                     "group_payment_request.expired":
+                    let envelope = try validatedGroupPaymentRequestSyncEnvelope(
+                        event,
+                        type: type
+                    )
+                    guard let conversation = try await loadSyncConversationIfAvailable(
+                        id: envelope.conversationID,
+                        currentUserID: userID
+                    ) else {
+                        // A durable event can outlive this account's membership. The same opaque
+                        // 404 rule used for ordinary conversation events lets the cursor advance
+                        // without recreating a locally unavailable group.
+                        continue
+                    }
+                    guard conversation.isGroup else {
+                        throw SecureMessagingExchangeError.invalidServerResponse
+                    }
+                    conversations.append(conversation.localProjection)
+                    let request: GroupPaymentRequestDTO
+                    if let cached = groupPaymentRequestAuthority[envelope.requestID] {
+                        request = cached
+                    } else {
+                        request = try await transport.groupPaymentRequest(id: envelope.requestID)
+                        groupPaymentRequestAuthority[envelope.requestID] = request
+                    }
+                    let exactContribution: GroupPaymentRequestContributionDTO?
+                    let contributionIsEmbedded = envelope.contributionID.map { contributionID in
+                        request.contributions.contains {
+                            $0.id.caseInsensitiveCompare(contributionID) == .orderedSame
+                        }
+                    } ?? false
+                    if let contributionID = envelope.contributionID,
+                       (envelope.action == .completed
+                        || (envelope.action == .contributed && !contributionIsEmbedded)) {
+                        let cacheKey = "\(envelope.requestID):\(contributionID)"
+                        if let cached = groupPaymentRequestContributionAuthority[cacheKey] {
+                            exactContribution = cached
+                        } else {
+                            let contribution = try await transport
+                                .groupPaymentRequestContribution(
+                                    requestId: envelope.requestID,
+                                    contributionId: contributionID
+                                )
+                            groupPaymentRequestContributionAuthority[cacheKey] = contribution
+                            exactContribution = contribution
+                        }
+                    } else {
+                        exactContribution = nil
+                    }
+                    groupPaymentRequestTransitions.append(
+                        try verifiedGroupPaymentRequestSyncTransition(
+                            envelope,
+                            authoritativeRequest: request,
+                            authoritativeContribution: exactContribution,
+                            currentUserID: userID
+                        )
+                    )
+                    transitionCount += 1
+
+                case "scheduled_payment.completed",
+                     "scheduled_payment.failed",
+                     "scheduled_payment.cancelled":
+                    guard let envelope = ScheduledPaymentSyncEnvelope(
+                        event: event,
+                        currentUserID: userID
+                    ) else { throw SecureMessagingExchangeError.invalidServerResponse }
+                    guard let conversation = try await loadSyncConversationIfAvailable(
+                        id: envelope.conversationID,
+                        currentUserID: userID
+                    ) else {
+                        // A sender may have deleted the direct thread locally after arranging the
+                        // payment. The financial instruction remains visible in wallet history;
+                        // do not resurrect a deliberately removed conversation.
+                        continue
+                    }
+                    guard !conversation.isGroup,
+                          envelope.matchesDirectConversation(
+                              memberUserIDs: conversation.memberUserIDs
+                          )
+                    else { throw SecureMessagingExchangeError.invalidServerResponse }
+                    let authoritative: ScheduledPaymentDTO
+                    if let cached = scheduledPaymentAuthority[envelope.scheduledPaymentID] {
+                        authoritative = cached
+                    } else {
+                        authoritative = try await transport.scheduledPayment(
+                            id: envelope.scheduledPaymentID
+                        )
+                        scheduledPaymentAuthority[envelope.scheduledPaymentID] = authoritative
+                    }
+                    guard envelope.matchesAuthoritative(authoritative) else {
+                        throw SecureMessagingExchangeError.invalidServerResponse
+                    }
+                    conversations.append(conversation.localProjection)
+                    let outgoing = envelope.senderUserID == userID
+                    let message = LocalMessage(
+                        id: envelope.descriptor.deterministicMessageID,
+                        conversationId: envelope.conversationID,
+                        senderId: envelope.senderUserID,
+                        body: envelope.descriptor.encoded,
+                        createdAt: envelope.occurredAt,
+                        sentAt: envelope.occurredAt,
+                        state: outgoing ? .sent : .received,
+                        failureReason: nil,
+                        isOutgoing: outgoing
+                    )
+                    scheduledPaymentTransitions.append(
+                        ScheduledPaymentSyncTransition(
+                            conversationID: envelope.conversationID,
+                            message: message
+                        )
+                    )
+                    transitionCount += 1
+
+                case "scheduled_group_payment.completed",
+                     "scheduled_group_payment.failed",
+                     "scheduled_group_payment.cancelled":
+                    guard let envelope = ScheduledGroupPaymentSyncEnvelope(event: event)
+                    else { throw SecureMessagingExchangeError.invalidServerResponse }
+                    guard let conversation = try await loadSyncConversationIfAvailable(
+                        id: envelope.conversationID,
+                        currentUserID: userID
+                    ) else {
+                        continue
+                    }
+                    guard conversation.isGroup else {
+                        throw SecureMessagingExchangeError.invalidServerResponse
+                    }
+                    let schedule: ScheduledGroupPaymentDTO
+                    if let cached = scheduledGroupPaymentAuthority[
+                        envelope.scheduledGroupPaymentID
+                    ] {
+                        schedule = cached
+                    } else {
+                        schedule = try await transport.scheduledGroupPayment(
+                            id: envelope.scheduledGroupPaymentID
+                        )
+                        scheduledGroupPaymentAuthority[envelope.scheduledGroupPaymentID] = schedule
+                    }
+                    guard envelope.matchesAuthoritative(schedule) else {
+                        throw SecureMessagingExchangeError.invalidServerResponse
+                    }
+                    conversations.append(conversation.localProjection)
+                    if envelope.action == .completed {
+                        guard let groupPaymentID = envelope.groupPaymentID else {
+                            throw SecureMessagingExchangeError.invalidServerResponse
+                        }
+                        let payment: GroupPaymentDTO
+                        if let cached = groupPaymentAuthority[groupPaymentID] {
+                            payment = cached
+                        } else {
+                            payment = try await transport.groupPayment(id: groupPaymentID)
+                            groupPaymentAuthority[groupPaymentID] = payment
+                        }
+                        guard let completion = ScheduledGroupPaymentProjectionPolicy.completion(
+                            envelope: envelope,
+                            schedule: schedule,
+                            payment: payment,
+                            memberUserIDs: conversation.memberUserIDs
+                        ) else { throw SecureMessagingExchangeError.invalidServerResponse }
+                        let outgoing = completion.senderUserID == userID
+                        scheduledGroupPaymentTransitions.append(
+                            ScheduledGroupPaymentSyncTransition(
+                                conversationID: envelope.conversationID,
+                                message: LocalMessage(
+                                    id: ScheduledGroupPaymentProjectionPolicy
+                                        .deterministicMessageID(
+                                            scheduledGroupPaymentID:
+                                                envelope.scheduledGroupPaymentID,
+                                            groupPaymentID: groupPaymentID
+                                        ),
+                                    conversationId: envelope.conversationID,
+                                    senderId: completion.senderUserID,
+                                    body: completion.descriptor.encoded,
+                                    createdAt: envelope.occurredAt,
+                                    sentAt: envelope.occurredAt,
+                                    state: outgoing ? .sent : .received,
+                                    failureReason: nil,
+                                    isOutgoing: outgoing
+                                )
+                            )
+                        )
+                    } else {
+                        let outcomeAction: KitScheduledGroupPaymentOutcomeAction =
+                            envelope.action == .failed ? .failed : .cancelled
+                        guard let descriptor = KitScheduledGroupPaymentOutcomeMessage(
+                            action: outcomeAction,
+                            scheduledGroupPaymentID: envelope.scheduledGroupPaymentID,
+                            scheduledAt: envelope.scheduledAt
+                        ) else { throw SecureMessagingExchangeError.invalidServerResponse }
+                        scheduledGroupPaymentTransitions.append(
+                            ScheduledGroupPaymentSyncTransition(
+                                conversationID: envelope.conversationID,
+                                message: LocalMessage(
+                                    id: descriptor.deterministicMessageID,
+                                    conversationId: envelope.conversationID,
+                                    senderId: userID,
+                                    body: descriptor.encoded,
+                                    createdAt: envelope.occurredAt,
+                                    sentAt: envelope.occurredAt,
+                                    state: .sent,
+                                    failureReason: nil,
+                                    isOutgoing: true
+                                )
+                            )
+                        )
+                    }
+                    transitionCount += 1
+
                 default:
                     throw SecureMessagingExchangeError.unsupportedEvent(type)
                 }
@@ -6095,6 +6379,16 @@ actor SecureMessagingExchangeCoordinator {
                     for message in incomingMessages where !state.messages.contains(where: {
                         $0.serverMessageId == message.serverMessageId
                     }) {
+                        if let syntheticIndex = state.messages.firstIndex(where: {
+                            $0.serverMessageId == nil
+                                && Self.sameGroupPaymentRequestEvent($0, message)
+                        }) {
+                            // The financial sync row can beat its optional encrypted descriptor.
+                            // Replace that local projection with the authenticated E2EE message
+                            // without counting the same event as unread twice.
+                            state.messages[syntheticIndex] = message
+                            continue
+                        }
                         state.messages.append(message)
                         if let index = state.conversations.firstIndex(where: {
                             $0.id == message.conversationId
@@ -6190,6 +6484,78 @@ actor SecureMessagingExchangeCoordinator {
                             $0.id == transition.systemMessage.id
                         }) {
                             state.messages.append(transition.systemMessage)
+                        }
+                    }
+                    for transition in groupPaymentRequestTransitions {
+                        let message = transition.message
+                        guard !state.messages.contains(where: {
+                            $0.id == message.id || Self.sameGroupPaymentRequestEvent($0, message)
+                        }) else { continue }
+                        state.messages.append(message)
+                        if let index = state.conversations.firstIndex(where: {
+                            $0.id == transition.conversationID
+                        }) {
+                            state.conversations[index].updatedAt = max(
+                                state.conversations[index].updatedAt,
+                                message.createdAt
+                            )
+                            if !message.isOutgoing {
+                                state.conversations[index].unreadCount += 1
+                            }
+                        }
+                    }
+                    for transition in scheduledPaymentTransitions {
+                        let message = transition.message
+                        if let existing = state.messages.firstIndex(where: {
+                            $0.id == message.id
+                        }) {
+                            // The server projection owns this deterministic namespace. Replace a
+                            // colliding untrusted E2EE row; otherwise a peer could suppress the
+                            // real financial outcome by predicting its local identifier.
+                            if let existingDescriptor = KitScheduledPaymentMessage.parse(
+                                state.messages[existing].body
+                            ), existingDescriptor.isTrustedProjection(state.messages[existing]) {
+                                continue
+                            }
+                            state.messages[existing] = message
+                        } else {
+                            state.messages.append(message)
+                        }
+                        if let index = state.conversations.firstIndex(where: {
+                            $0.id == transition.conversationID
+                        }) {
+                            state.conversations[index].updatedAt = max(
+                                state.conversations[index].updatedAt,
+                                message.createdAt
+                            )
+                            if !message.isOutgoing {
+                                state.conversations[index].unreadCount += 1
+                            }
+                        }
+                    }
+                    for transition in scheduledGroupPaymentTransitions {
+                        let message = transition.message
+                        if let existing = state.messages.firstIndex(where: {
+                            $0.id == message.id
+                        }) {
+                            // This deterministic row is an authenticated server projection. A
+                            // replay is a no-op; any colliding local/E2EE row is replaced by the
+                            // exact schedule + group-payment projection verified above.
+                            if state.messages[existing] == message { continue }
+                            state.messages[existing] = message
+                        } else {
+                            state.messages.append(message)
+                        }
+                        if let index = state.conversations.firstIndex(where: {
+                            $0.id == transition.conversationID
+                        }) {
+                            state.conversations[index].updatedAt = max(
+                                state.conversations[index].updatedAt,
+                                message.createdAt
+                            )
+                            if !message.isOutgoing {
+                                state.conversations[index].unreadCount += 1
+                            }
                         }
                     }
                     // Lifecycle pages can be delayed. Replay their ordered notices/transitions,
@@ -6623,6 +6989,287 @@ actor SecureMessagingExchangeCoordinator {
               event.conversationId.map(SecureMessagingValidation.isCanonicalUUID) ?? true
         else { throw SecureMessagingExchangeError.invalidServerResponse }
         return type
+    }
+
+    /// Validates the self-contained financial snapshot before any network authority is consulted.
+    /// Unknown, contradictory, or partially populated rows retain the cursor so a corrupt event
+    /// can never be presented as money history.
+    private func validatedGroupPaymentRequestSyncEnvelope(
+        _ event: MessagingSyncEventDTO,
+        type: String
+    ) throws -> GroupPaymentRequestSyncEnvelope {
+        guard let action = GroupPaymentRequestSyncAction(eventType: type),
+              let data = event.data,
+              data.schema == "kit.group-payment-request.v1",
+              let rawConversationID = data.conversationId,
+              let conversationID = GroupPaymentRequestValidation.canonicalUUID(rawConversationID),
+              rawConversationID == conversationID,
+              event.conversationId == conversationID,
+              let rawRequestID = data.groupPaymentRequestId,
+              let requestID = GroupPaymentRequestValidation.canonicalUUID(rawRequestID),
+              rawRequestID == requestID,
+              let rawRequesterID = data.requesterUserId,
+              let requesterUserID = GroupPaymentRequestValidation.canonicalUUID(rawRequesterID),
+              rawRequesterID == requesterUserID,
+              let status = data.status.flatMap(GroupPaymentRequestStatus.init(rawValue:)),
+              let target = data.targetAmountMinor.flatMap(
+                  GroupPaymentRequestValidation.canonicalMinorUnits
+              ),
+              let contributed = data.contributedAmountMinor.flatMap(
+                  GroupPaymentRequestValidation.canonicalMinorUnits
+              ),
+              let remaining = data.remainingAmountMinor.flatMap(
+                  GroupPaymentRequestValidation.canonicalMinorUnits
+              ),
+              target > 0,
+              target <= KitGroupPaymentMessage.maximumAmountMinor,
+              contributed >= 0,
+              contributed <= target,
+              remaining == target - contributed,
+              let currency = data.currency,
+              GroupPaymentRequestValidation.isCurrencyCode(currency),
+              let currencyScale = data.currencyScale,
+              (0 ... 6).contains(currencyScale),
+              let progress = data.progressBasisPoints,
+              progress == GroupPaymentRequestValidation.progressBasisPoints(
+                  contributed: contributed,
+                  target: target
+              )
+        else { throw SecureMessagingExchangeError.invalidServerResponse }
+
+        let contributionID: String?
+        let contributorUserID: String?
+        let contributionAmount: Int64?
+        switch action {
+        case .created:
+            guard event.resourceType == "group_payment_request",
+                  event.resourceId == requestID,
+                  status == .open,
+                  contributed == 0,
+                  remaining == target,
+                  progress == 0,
+                  data.contributionId == nil,
+                  data.contributorUserId == nil,
+                  data.contributionAmountMinor == nil
+            else { throw SecureMessagingExchangeError.invalidServerResponse }
+            contributionID = nil
+            contributorUserID = nil
+            contributionAmount = nil
+
+        case .contributed:
+            guard event.resourceType == "group_payment_request_contribution",
+                  let rawContributionID = data.contributionId,
+                  let canonicalContributionID = GroupPaymentRequestValidation.canonicalUUID(
+                      rawContributionID
+                  ),
+                  rawContributionID == canonicalContributionID,
+                  event.resourceId == canonicalContributionID,
+                  let rawContributorID = data.contributorUserId,
+                  let canonicalContributorID = GroupPaymentRequestValidation.canonicalUUID(
+                      rawContributorID
+                  ),
+                  rawContributorID == canonicalContributorID,
+                  canonicalContributorID != requesterUserID,
+                  let canonicalContributionAmount = data.contributionAmountMinor.flatMap(
+                      GroupPaymentRequestValidation.canonicalMinorUnits
+                  ),
+                  canonicalContributionAmount > 0,
+                  canonicalContributionAmount <= contributed,
+                  status == .open || status == .completed
+            else { throw SecureMessagingExchangeError.invalidServerResponse }
+            contributionID = canonicalContributionID
+            contributorUserID = canonicalContributorID
+            contributionAmount = canonicalContributionAmount
+
+        case .completed:
+            guard event.resourceType == "group_payment_request",
+                  event.resourceId == requestID,
+                  status == .completed,
+                  remaining == 0,
+                  let rawContributionID = data.contributionId,
+                  let canonicalContributionID = GroupPaymentRequestValidation.canonicalUUID(
+                      rawContributionID
+                  ),
+                  rawContributionID == canonicalContributionID,
+                  let rawContributorID = data.contributorUserId,
+                  let canonicalContributorID = GroupPaymentRequestValidation.canonicalUUID(
+                      rawContributorID
+                  ),
+                  rawContributorID == canonicalContributorID,
+                  canonicalContributorID != requesterUserID,
+                  let canonicalContributionAmount = data.contributionAmountMinor.flatMap(
+                      GroupPaymentRequestValidation.canonicalMinorUnits
+                  ),
+                  canonicalContributionAmount > 0,
+                  canonicalContributionAmount <= contributed
+            else { throw SecureMessagingExchangeError.invalidServerResponse }
+            contributionID = canonicalContributionID
+            contributorUserID = canonicalContributorID
+            contributionAmount = canonicalContributionAmount
+
+        case .cancelled, .expired:
+            let expectedStatus: GroupPaymentRequestStatus = switch action {
+            case .cancelled: .cancelled
+            case .expired: .expired
+            case .created, .contributed, .completed: .open
+            }
+            guard event.resourceType == "group_payment_request",
+                  event.resourceId == requestID,
+                  status == expectedStatus,
+                  data.contributionId == nil,
+                  data.contributorUserId == nil,
+                  data.contributionAmountMinor == nil
+            else { throw SecureMessagingExchangeError.invalidServerResponse }
+            contributionID = nil
+            contributorUserID = nil
+            contributionAmount = nil
+        }
+
+        return GroupPaymentRequestSyncEnvelope(
+            action: action,
+            requestID: requestID,
+            conversationID: conversationID,
+            requesterUserID: requesterUserID,
+            status: status,
+            targetAmountMinor: target,
+            contributedAmountMinor: contributed,
+            remainingAmountMinor: remaining,
+            currencyCode: currency,
+            currencyScale: currencyScale,
+            progressBasisPoints: progress,
+            contributionID: contributionID,
+            contributorUserID: contributorUserID,
+            contributionAmountMinor: contributionAmount,
+            occurredAt: try parseServerDate(event.occurredAt)
+        )
+    }
+
+    /// Converts a validated sync snapshot into a deterministic local chat projection only after
+    /// the authenticated resource endpoint confirms immutable context and actor attribution.
+    private func verifiedGroupPaymentRequestSyncTransition(
+        _ envelope: GroupPaymentRequestSyncEnvelope,
+        authoritativeRequest request: GroupPaymentRequestDTO,
+        authoritativeContribution exactContribution: GroupPaymentRequestContributionDTO?,
+        currentUserID: String
+    ) throws -> GroupPaymentRequestSyncTransition {
+        guard request.isStructurallyValid,
+              request.id.caseInsensitiveCompare(envelope.requestID) == .orderedSame,
+              request.conversationId.caseInsensitiveCompare(envelope.conversationID) == .orderedSame,
+              request.requesterUserId.caseInsensitiveCompare(envelope.requesterUserID) == .orderedSame,
+              request.targetMinorUnits == envelope.targetAmountMinor,
+              request.currency.code == envelope.currencyCode,
+              request.currencyScale == envelope.currencyScale,
+              let currentContributed = request.contributedMinorUnits,
+              currentContributed >= envelope.contributedAmountMinor,
+              request.progressBasisPoints >= envelope.progressBasisPoints
+        else { throw SecureMessagingExchangeError.invalidServerResponse }
+
+        let descriptor: KitGroupPaymentRequestMessage
+        let actorUserID: String
+        switch envelope.action {
+        case .created:
+            guard let value = KitGroupPaymentRequestMessage(requesting: request) else {
+                throw SecureMessagingExchangeError.invalidServerResponse
+            }
+            descriptor = value
+            actorUserID = envelope.requesterUserID
+
+        case .contributed:
+            guard let contributionID = envelope.contributionID,
+                  let contributorUserID = envelope.contributorUserID,
+                  let contributionAmount = envelope.contributionAmountMinor,
+                  let contribution = request.contributions.first(where: {
+                      $0.id.caseInsensitiveCompare(contributionID) == .orderedSame
+                  }) ?? exactContribution,
+                  contribution.id.caseInsensitiveCompare(contributionID) == .orderedSame,
+                  contribution.isStructurallyValid(currencyScale: request.currencyScale),
+                  contribution.contributorUserId.caseInsensitiveCompare(contributorUserID)
+                    == .orderedSame,
+                  contribution.minorUnits == contributionAmount,
+                  let value = KitGroupPaymentRequestMessage(
+                      contributing: contribution,
+                      requestID: request.id
+                  )
+            else { throw SecureMessagingExchangeError.invalidServerResponse }
+            descriptor = value
+            actorUserID = contributorUserID
+
+        case .completed:
+            guard request.knownStatus == .completed,
+                  request.remainingMinorUnits == 0,
+                  let contributionID = envelope.contributionID,
+                  let contributorUserID = envelope.contributorUserID,
+                  let contributionAmount = envelope.contributionAmountMinor,
+                  let finalContribution = exactContribution,
+                  finalContribution.id.caseInsensitiveCompare(contributionID) == .orderedSame,
+                  finalContribution.isStructurallyValid(currencyScale: request.currencyScale),
+                  finalContribution.contributorUserId.caseInsensitiveCompare(contributorUserID)
+                    == .orderedSame,
+                  finalContribution.minorUnits == contributionAmount,
+                  let value = KitGroupPaymentRequestMessage(
+                      completing: finalContribution,
+                      requestID: request.id
+                  )
+            else { throw SecureMessagingExchangeError.invalidServerResponse }
+            descriptor = value
+            actorUserID = contributorUserID
+
+        case .cancelled:
+            guard request.knownStatus == .cancelled,
+                  let value = KitGroupPaymentRequestMessage(
+                      terminal: .cancelled,
+                      requestID: request.id
+                  )
+            else { throw SecureMessagingExchangeError.invalidServerResponse }
+            descriptor = value
+            actorUserID = envelope.requesterUserID
+
+        case .expired:
+            guard request.knownStatus == .expired,
+                  let value = KitGroupPaymentRequestMessage(
+                      terminal: .expired,
+                      requestID: request.id
+                  )
+            else { throw SecureMessagingExchangeError.invalidServerResponse }
+            descriptor = value
+            actorUserID = envelope.requesterUserID
+        }
+
+        let canonicalCurrentUserID = currentUserID.lowercased()
+        let message = LocalMessage(
+            id: KitGroupPaymentRequestMessage.deterministicMessageID(
+                requestID: envelope.requestID,
+                action: descriptor.action,
+                contributionID: descriptor.contributionID,
+                actorUserID: actorUserID
+            ),
+            conversationId: envelope.conversationID,
+            senderId: actorUserID,
+            body: descriptor.encoded,
+            createdAt: envelope.occurredAt,
+            sentAt: envelope.occurredAt,
+            state: actorUserID == canonicalCurrentUserID ? .sent : .received,
+            failureReason: nil,
+            isOutgoing: actorUserID == canonicalCurrentUserID
+        )
+        return GroupPaymentRequestSyncTransition(
+            conversationID: envelope.conversationID,
+            message: message
+        )
+    }
+
+    private nonisolated static func sameGroupPaymentRequestEvent(
+        _ lhs: LocalMessage,
+        _ rhs: LocalMessage
+    ) -> Bool {
+        guard lhs.conversationId == rhs.conversationId,
+              lhs.senderId == rhs.senderId,
+              let left = KitGroupPaymentRequestMessage.parse(lhs.body),
+              let right = KitGroupPaymentRequestMessage.parse(rhs.body)
+        else { return false }
+        return left.action == right.action
+            && left.requestID == right.requestID
+            && left.contributionID == right.contributionID
     }
 
     /// Validates a group membership lifecycle event and pre-builds its thread-documenting system
@@ -7184,6 +7831,58 @@ private struct GroupMemberTransition {
     let role: MessagingGroupRole?
     let kind: KitSystemMessage.Kind
     let systemMessage: LocalMessage
+}
+
+private enum GroupPaymentRequestSyncAction {
+    case created
+    case contributed
+    case completed
+    case cancelled
+    case expired
+
+    init?(eventType: String) {
+        switch eventType {
+        case "group_payment_request.created": self = .created
+        case "group_payment_request.contributed": self = .contributed
+        case "group_payment_request.completed": self = .completed
+        case "group_payment_request.cancelled": self = .cancelled
+        case "group_payment_request.expired": self = .expired
+        default: return nil
+        }
+    }
+}
+
+private struct GroupPaymentRequestSyncEnvelope {
+    let action: GroupPaymentRequestSyncAction
+    let requestID: String
+    let conversationID: String
+    let requesterUserID: String
+    let status: GroupPaymentRequestStatus
+    let targetAmountMinor: Int64
+    let contributedAmountMinor: Int64
+    let remainingAmountMinor: Int64
+    let currencyCode: String
+    let currencyScale: Int
+    let progressBasisPoints: Int
+    let contributionID: String?
+    let contributorUserID: String?
+    let contributionAmountMinor: Int64?
+    let occurredAt: Date
+}
+
+private struct GroupPaymentRequestSyncTransition {
+    let conversationID: String
+    let message: LocalMessage
+}
+
+private struct ScheduledPaymentSyncTransition {
+    let conversationID: String
+    let message: LocalMessage
+}
+
+private struct ScheduledGroupPaymentSyncTransition {
+    let conversationID: String
+    let message: LocalMessage
 }
 
 private struct ValidatedDeviceLifecycle {

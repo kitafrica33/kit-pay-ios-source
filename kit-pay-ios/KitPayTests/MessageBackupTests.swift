@@ -130,6 +130,53 @@ final class MessageBackupTests: XCTestCase {
         XCTAssertEqual(payload.messages.map(\.body), ["hello"])
     }
 
+    func testScheduledPaymentProjectionIsExcludedAndRejectedWithoutServerProvenance() throws {
+        let scheduledAt = try XCTUnwrap(
+            ScheduledPaymentDates.parse("2026-08-30T09:15:00Z")
+        )
+        let descriptor = try XCTUnwrap(KitScheduledPaymentMessage(
+            action: .completed,
+            scheduledPaymentID: "11111111-1111-4111-8111-111111111111",
+            amountMinor: 500_000,
+            currencyCode: "UGX",
+            currencyScale: 0,
+            scheduledAt: scheduledAt,
+            walletTransactionID: "22222222-2222-4222-8222-222222222222",
+            note: "School fees",
+            reason: nil
+        ))
+        let projection = LocalMessage(
+            id: descriptor.deterministicMessageID,
+            conversationId: conversationID,
+            senderId: userID,
+            body: descriptor.encoded,
+            createdAt: Date(timeIntervalSince1970: 1_700_000_100),
+            sentAt: Date(timeIntervalSince1970: 1_700_000_100),
+            state: .sent,
+            failureReason: nil,
+            isOutgoing: true
+        )
+        XCTAssertTrue(descriptor.isTrustedProjection(projection))
+
+        var state = makeState()
+        state.messages.append(projection)
+        let snapshot = MessageBackupPayload.snapshot(
+            of: state,
+            userID: userID,
+            deviceName: "Kit iPhone",
+            includesMedia: false
+        )
+        XCTAssertEqual(snapshot.messages.map(\.body), ["hello"])
+
+        XCTAssertThrowsError(try MessageBackupValidationPolicy.validate(
+            backupPayload(conversation: makeState().conversations[0], messages: [projection]),
+            expectedUserID: userID,
+            now: validationNow
+        )) { error in
+            XCTAssertEqual(error as? MessageBackupError, .invalidBackup)
+        }
+    }
+
     func testSnapshotOmitsLegacyDepartedGroupMessageThatCannotBeRestored() throws {
         let departedUserID = "0a1b2c3d-0000-4000-8000-00000000dddd"
         var state = makeState()
@@ -312,6 +359,32 @@ final class MessageBackupTests: XCTestCase {
         XCTAssertEqual(resolved, key)
     }
 
+    func testLegacyArchiveKeepsUsingTheAlreadyPropagatedKey() throws {
+        let legacy = MessageBackupPayload.snapshot(
+            of: makeState(),
+            userID: userID,
+            deviceName: "Older iPhone",
+            includesMedia: false,
+            createdAt: Date(timeIntervalSince1970: 1_700_001_000)
+        )
+        XCTAssertEqual(legacy.schemaVersion, MessageBackupPayload.currentSchemaVersion)
+        let encrypted = try MessageBackupCrypto.encrypt(legacy, key: key)
+        var mintedReplacement = false
+
+        let resolved = try MessageBackupUploadKeyPolicy.resolve(
+            existingBackup: true,
+            existingKey: key,
+            createKey: {
+                mintedReplacement = true
+                return Data(repeating: 9, count: MessageBackupCrypto.keyBytes)
+            }
+        )
+
+        XCTAssertFalse(mintedReplacement)
+        XCTAssertEqual(resolved, key)
+        XCTAssertEqual(try MessageBackupCrypto.decrypt(encrypted, key: resolved), legacy)
+    }
+
     func testMalformedStoredKeyIsNotTreatedAsMissing() {
         XCTAssertThrowsError(
             try MessageBackupKeyStore.validatedStoredKey(Data(repeating: 7, count: 16))
@@ -334,6 +407,67 @@ final class MessageBackupTests: XCTestCase {
             XCTAssertEqual(error as? MessageBackupError, .keyUnavailable)
         }
         XCTAssertFalse(createdKey)
+    }
+
+    func testOnlyPermanentExistingRecordFailuresOfferExplicitReplacement() {
+        for error in [
+            MessageBackupError.authenticationFailed,
+            .incompatibleBackup,
+            .invalidBackup,
+            .accountMismatch,
+        ] {
+            let mapped = MessageBackupReplacementPolicy.existingRecordError(error)
+            XCTAssertEqual(mapped, .existingBackupUnreadable)
+            XCTAssertTrue(MessageBackupReplacementPolicy.mayOfferReplacement(after: mapped))
+        }
+
+        for error in [
+            MessageBackupError.iCloudUnavailable,
+            .keyUnavailable,
+            .assetUnavailable,
+            .conflictRetryLimitExceeded,
+        ] {
+            let mapped = MessageBackupReplacementPolicy.existingRecordError(error)
+            XCTAssertEqual(mapped, error)
+            XCTAssertFalse(MessageBackupReplacementPolicy.mayOfferReplacement(after: mapped))
+        }
+    }
+
+    func testRestoreMapsOnlyTypedRemoteArchiveFailuresToReplacement() {
+        struct LocalStoreFailure: Error {}
+
+        XCTAssertEqual(
+            MessageBackupReplacementPolicy.remoteRestoreError(
+                MessageBackupError.invalidBackup
+            ),
+            .existingBackupUnreadable
+        )
+        XCTAssertEqual(
+            MessageBackupReplacementPolicy.remoteRestoreError(
+                MessageBackupError.assetUnavailable
+            ),
+            .assetUnavailable
+        )
+        XCTAssertNil(MessageBackupReplacementPolicy.remoteRestoreError(LocalStoreFailure()))
+    }
+
+    func testLocalSnapshotAccountMismatchNeverOffersRemoteReplacement() throws {
+        let payload = MessageBackupPayload.snapshot(
+            of: makeState(),
+            userID: "10000000-0000-4000-8000-000000000001",
+            deviceName: "Test iPhone",
+            includesMedia: false
+        )
+
+        XCTAssertThrowsError(
+            try MessageBackupValidationPolicy.validate(
+                payload,
+                expectedUserID: "10000000-0000-4000-8000-000000000002"
+            )
+        ) { error in
+            XCTAssertEqual(error as? MessageBackupError, .accountMismatch)
+            XCTAssertFalse(MessageBackupReplacementPolicy.mayOfferReplacement(after: error))
+        }
     }
 
     func testAssetReaderAcceptsValidBytesWithoutConsultingURLResourceSize() throws {
@@ -425,6 +559,24 @@ final class MessageBackupTests: XCTestCase {
         )) { error in
             XCTAssertEqual(error as? MessageBackupError, .assetUnavailable)
         }
+    }
+
+    func testCloudAssetMaterializationRetriesAreBoundedAndNeverAuthorizeReplacement() {
+        XCTAssertEqual(
+            MessageBackupAssetRetryPolicy.delayNanoseconds(afterFailedAttempt: 0),
+            250_000_000
+        )
+        XCTAssertEqual(
+            MessageBackupAssetRetryPolicy.delayNanoseconds(afterFailedAttempt: 1),
+            750_000_000
+        )
+        XCTAssertNil(MessageBackupAssetRetryPolicy.delayNanoseconds(afterFailedAttempt: 4))
+
+        let retryable = MessageBackupReplacementPolicy.existingRecordError(
+            MessageBackupError.assetUnavailable
+        )
+        XCTAssertEqual(retryable, .assetUnavailable)
+        XCTAssertFalse(MessageBackupReplacementPolicy.mayOfferReplacement(after: retryable))
     }
 
     // MARK: Validation policy
@@ -677,6 +829,37 @@ final class MessageBackupTests: XCTestCase {
         }
     }
 
+    func testBackgroundTransitionAttemptsOnlyAnEligibleAutomaticBackup() {
+        XCTAssertTrue(MessageBackupBackgroundTransitionPolicy.shouldAttempt(
+            isSignedIn: true,
+            setupComplete: true,
+            isOnline: true,
+            frequency: .daily,
+            messageCount: 1
+        ))
+        XCTAssertFalse(MessageBackupBackgroundTransitionPolicy.shouldAttempt(
+            isSignedIn: true,
+            setupComplete: true,
+            isOnline: true,
+            frequency: .off,
+            messageCount: 1
+        ))
+        XCTAssertFalse(MessageBackupBackgroundTransitionPolicy.shouldAttempt(
+            isSignedIn: true,
+            setupComplete: true,
+            isOnline: false,
+            frequency: .daily,
+            messageCount: 1
+        ))
+        XCTAssertFalse(MessageBackupBackgroundTransitionPolicy.shouldAttempt(
+            isSignedIn: false,
+            setupComplete: true,
+            isOnline: true,
+            frequency: .daily,
+            messageCount: 1
+        ))
+    }
+
     func testDailyWeeklyMonthlyIntervalsGateBackups() {
         let now = Date(timeIntervalSince1970: 100 * 24 * 60 * 60)
 
@@ -712,6 +895,168 @@ final class MessageBackupTests: XCTestCase {
             lastBackupAt: now.addingTimeInterval(-30 * 24 * 60 * 60),
             now: now
         ))
+    }
+
+    func testFailedAutomaticBackupUsesBoundedRetryInsteadOfForegroundSpin() {
+        let now = Date(timeIntervalSince1970: 100 * 24 * 60 * 60)
+        let failedAt = now.addingTimeInterval(-60 * 60)
+
+        XCTAssertFalse(MessageBackupSchedulePolicy.isBackupDue(
+            frequency: .daily,
+            lastBackupAt: nil,
+            lastAutomaticBackupAttemptAt: failedAt,
+            lastAutomaticBackupSucceeded: false,
+            now: now
+        ))
+        XCTAssertEqual(
+            MessageBackupSchedulePolicy.nextAttemptDate(
+                frequency: .daily,
+                lastBackupAt: nil,
+                lastAutomaticBackupAttemptAt: failedAt,
+                lastAutomaticBackupSucceeded: false
+            ),
+            failedAt.addingTimeInterval(MessageBackupSchedulePolicy.failedAttemptRetryInterval)
+        )
+        XCTAssertTrue(MessageBackupSchedulePolicy.isBackupDue(
+            frequency: .daily,
+            lastBackupAt: nil,
+            lastAutomaticBackupAttemptAt: failedAt,
+            lastAutomaticBackupSucceeded: false,
+            now: failedAt.addingTimeInterval(
+                MessageBackupSchedulePolicy.failedAttemptRetryInterval
+            )
+        ))
+    }
+
+    func testSuccessfulAutomaticAttemptKeepsFrequencyBasedNextDate() {
+        let lastBackup = Date(timeIntervalSince1970: 1_800_000_000)
+        XCTAssertEqual(
+            MessageBackupSchedulePolicy.nextAttemptDate(
+                frequency: .weekly,
+                lastBackupAt: lastBackup,
+                lastAutomaticBackupAttemptAt: lastBackup,
+                lastAutomaticBackupSucceeded: true,
+                now: lastBackup.addingTimeInterval(60)
+            ),
+            lastBackup.addingTimeInterval(7 * 24 * 60 * 60)
+        )
+    }
+
+    func testUnchangedArchiveSuccessUsesAttemptTimeAndDoesNotSpin() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let unchangedArchiveCreatedAt = now.addingTimeInterval(-8 * 24 * 60 * 60)
+
+        XCTAssertFalse(MessageBackupSchedulePolicy.isBackupDue(
+            frequency: .weekly,
+            lastBackupAt: unchangedArchiveCreatedAt,
+            lastAutomaticBackupAttemptAt: now,
+            lastAutomaticBackupSucceeded: true,
+            now: now.addingTimeInterval(60)
+        ))
+        XCTAssertEqual(
+            MessageBackupSchedulePolicy.nextAttemptDate(
+                frequency: .weekly,
+                lastBackupAt: unchangedArchiveCreatedAt,
+                lastAutomaticBackupAttemptAt: now,
+                lastAutomaticBackupSucceeded: true,
+                now: now.addingTimeInterval(60)
+            ),
+            now.addingTimeInterval(7 * 24 * 60 * 60)
+        )
+    }
+
+    func testFutureBackupReceiptIsDueNowAfterClockMovesBackward() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let futureReceipt = now.addingTimeInterval(180 * 24 * 60 * 60)
+
+        XCTAssertTrue(MessageBackupSchedulePolicy.isBackupDue(
+            frequency: .monthly,
+            lastBackupAt: futureReceipt,
+            now: now
+        ))
+        XCTAssertEqual(
+            MessageBackupSchedulePolicy.nextAttemptDate(
+                frequency: .monthly,
+                lastBackupAt: futureReceipt,
+                lastAutomaticBackupAttemptAt: nil,
+                lastAutomaticBackupSucceeded: nil,
+                now: now
+            ),
+            now
+        )
+    }
+
+    func testFutureFailedAttemptReceiptDoesNotPostponeRetryIndefinitely() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        XCTAssertEqual(
+            MessageBackupSchedulePolicy.nextAttemptDate(
+                frequency: .daily,
+                lastBackupAt: nil,
+                lastAutomaticBackupAttemptAt: now.addingTimeInterval(365 * 24 * 60 * 60),
+                lastAutomaticBackupSucceeded: false,
+                now: now
+            ),
+            now
+        )
+    }
+
+    @MainActor
+    func testBackgroundSchedulerReportsArmedAndSubmissionFailureWithoutRawError() {
+        struct SubmissionFailure: Error {}
+        let earliest = Date(timeIntervalSince1970: 1_800_000_000)
+
+        let successfulScheduler = MessageBackupRefreshScheduler()
+        XCTAssertEqual(
+            successfulScheduler.schedule(
+                earliestBeginDate: earliest,
+                submit: { _ in }
+            ),
+            .armed(earliestBeginDate: earliest)
+        )
+
+        let failingScheduler = MessageBackupRefreshScheduler()
+        XCTAssertEqual(
+            failingScheduler.schedule(
+                earliestBeginDate: earliest,
+                submit: { _ in throw SubmissionFailure() }
+            ),
+            .submissionFailed
+        )
+    }
+
+    @MainActor
+    func testBackgroundSchedulerSubmitsOnceAndPreservesAnArmedTaskOnLaterFailure() {
+        struct SubmissionFailure: Error {}
+        let scheduler = MessageBackupRefreshScheduler()
+        let earliest = Date(timeIntervalSince1970: 1_800_000_000)
+        var submissions = 0
+
+        XCTAssertEqual(
+            scheduler.schedule(earliestBeginDate: earliest) { request in
+                submissions += 1
+                XCTAssertTrue(request.requiresNetworkConnectivity)
+                XCTAssertFalse(request.requiresExternalPower)
+            },
+            .armed(earliestBeginDate: earliest)
+        )
+        XCTAssertEqual(
+            scheduler.schedule(earliestBeginDate: earliest.addingTimeInterval(60)) { _ in
+                submissions += 1
+                throw SubmissionFailure()
+            },
+            .armed(earliestBeginDate: earliest)
+        )
+        XCTAssertEqual(submissions, 1)
+
+        XCTAssertEqual(
+            scheduler.schedule(earliestBeginDate: earliest.addingTimeInterval(-60)) { _ in
+                submissions += 1
+                throw SubmissionFailure()
+            },
+            .armed(earliestBeginDate: earliest),
+            "a failed attempt to improve the window must not discard the known-valid task"
+        )
+        XCTAssertEqual(submissions, 2)
     }
 
     // MARK: Multi-device conflict merge
