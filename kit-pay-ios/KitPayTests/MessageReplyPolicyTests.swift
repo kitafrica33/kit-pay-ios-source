@@ -61,6 +61,51 @@ final class MessageReplyPolicyTests: XCTestCase {
 
     // MARK: Gesture geometry
 
+    func testSwipeReplyLocksVerticalScrollingAndNeverChangesItsMind() {
+        let vertical = SwipeToReplyPolicy.lockedAxis(
+            current: .undecided,
+            translation: CGSize(width: 3, height: -24)
+        )
+        XCTAssertEqual(vertical, .vertical)
+        XCTAssertEqual(
+            SwipeToReplyPolicy.lockedAxis(
+                current: vertical,
+                translation: CGSize(width: 90, height: -30)
+            ),
+            .vertical
+        )
+    }
+
+    func testSwipeReplyAdoptsOnlyDecisivelyHorizontalMovement() {
+        XCTAssertEqual(
+            SwipeToReplyPolicy.lockedAxis(
+                current: .undecided,
+                translation: CGSize(width: 24, height: 4)
+            ),
+            .horizontal
+        )
+        XCTAssertEqual(
+            SwipeToReplyPolicy.lockedAxis(
+                current: .undecided,
+                translation: CGSize(width: 24, height: 19)
+            ),
+            .vertical
+        )
+        XCTAssertEqual(
+            SwipeToReplyPolicy.lockedAxis(
+                current: .undecided,
+                translation: CGSize(width: 7, height: 8)
+            ),
+            .undecided
+        )
+    }
+
+    func testSwipeReplyDirectionThresholdLeavesScrollViewFirstRefusal() {
+        XCTAssertGreaterThan(SwipeToReplyPolicy.activationDistance, 10)
+        XCTAssertLessThan(SwipeToReplyPolicy.activationDistance, SwipeToReplyPolicy.replyTrigger)
+        XCTAssertGreaterThan(SwipeToReplyPolicy.horizontalDominance, 1)
+    }
+
     func testTravelFollowsTheFingerOneForOneWithinTheLimit() {
         XCTAssertEqual(SwipeToReplyPolicy.travel(drag: 0), 0, accuracy: 0.001)
         XCTAssertEqual(SwipeToReplyPolicy.travel(drag: 30), 30, accuracy: 0.001)

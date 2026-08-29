@@ -935,11 +935,21 @@ struct GroupMemberPickerView: View {
             }
         } label: {
             HStack(spacing: 12) {
-                RemoteAvatarView(name: contact.name, avatarURL: contact.avatarURL, size: 44)
+                RemoteAvatarView(
+                    name: contact.name,
+                    avatarURL: contact.avatarURL,
+                    size: 44,
+                    verification: contact.verification?.designation
+                )
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(contact.name)
-                        .font(.headline)
-                        .foregroundStyle(KitColor.primaryText)
+                    HStack(spacing: 5) {
+                        Text(contact.name)
+                            .font(.headline)
+                            .foregroundStyle(KitColor.primaryText)
+                        if let verification = contact.verification?.designation {
+                            VerifiedAccountBadge(designation: verification, diameter: 15)
+                        }
+                    }
                     Text(
                         contact.phone.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                             ? "Kit Pay member"

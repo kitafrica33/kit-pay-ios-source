@@ -1651,11 +1651,13 @@ enum ConversationTimelinePolicy {
             for: conversation,
             currentUserID: currentUserID
         )
-        let matchingMessages = messages.filter {
-            if $0.conversationId == conversation.id { return true }
-            guard let conversationID = canonicalUUID(conversation.id) else { return false }
-            return canonicalUUID($0.conversationId) == conversationID
-        }
+        let matchingMessages = GroupPaymentRequestProjectionCoalescingPolicy.coalescedForTimeline(
+            messages.filter {
+                if $0.conversationId == conversation.id { return true }
+                guard let conversationID = canonicalUUID(conversation.id) else { return false }
+                return canonicalUUID($0.conversationId) == conversationID
+            }
+        )
         candidates.reserveCapacity(matchingMessages.count + calls.count)
         // Announcements first: an outcome is only believable in the company of the payment it
         // answers, and the announcement is the only offline record of who sent that payment.

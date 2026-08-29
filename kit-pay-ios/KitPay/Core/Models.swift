@@ -2029,6 +2029,60 @@ struct BiometricKeyStatusDTO: Decodable, Hashable, Sendable {
     }
 }
 
+/// A server-owned public verification designation.
+///
+/// This is intentionally separate from KYC. Passing an identity check may unlock regulated
+/// features, but it never grants a public badge by itself. Only one of these exact values, sent by
+/// the authenticated API, may put a blue verification seal on screen.
+enum AccountVerificationDesignation: String, Codable, Hashable, Sendable {
+    case verified
+    case official
+    case officialSupport = "official_support"
+
+    var accessibilityLabel: String {
+        switch self {
+        case .verified:
+            return "Verified account"
+        case .official:
+            return "Official account"
+        case .officialSupport:
+            return "Official Kit Pay support"
+        }
+    }
+}
+
+/// Verification metadata embedded in profile and contact projections.
+///
+/// Unknown, padded, or differently-cased designations decode without breaking the surrounding
+/// profile, but remain unrecognised and therefore cannot earn a badge. This fail-closed behaviour
+/// also keeps a future server designation safe on older clients.
+struct AccountVerificationDTO: Codable, Hashable, Sendable {
+    let designation: AccountVerificationDesignation?
+    let since: String?
+
+    init(designation: AccountVerificationDesignation?, since: String? = nil) {
+        self.designation = designation
+        self.since = since
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case designation, since
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let rawDesignation = try container.decodeIfPresent(String.self, forKey: .designation)
+        designation = rawDesignation.flatMap(AccountVerificationDesignation.init(rawValue:))
+        since = try container.decodeIfPresent(String.self, forKey: .since)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(designation?.rawValue, forKey: .designation)
+        try container.encodeIfPresent(since, forKey: .since)
+    }
+}
+
 /// A Kit Pay account carries two deliberately separate names.
 ///
 /// `legalName` is read off the identity document during verification and is never replaced by
@@ -2060,6 +2114,8 @@ struct UserProfile: Codable, Hashable, Identifiable, Sendable {
     /// Whether this account still has to choose an `@username` before it can use Kit Pay. Servers
     /// that predate the split omit it; `nil` reads as "required", which is the old behaviour.
     var usernameRequired: Bool? = nil
+    /// Public verification is server-assigned and distinct from identity/KYC completion.
+    var verification: AccountVerificationDTO? = nil
 
     enum CodingKeys: String, CodingKey {
         case id, name, email, phone, tag
@@ -2074,6 +2130,7 @@ struct UserProfile: Codable, Hashable, Identifiable, Sendable {
         case legalName = "legal_name"
         case legalNameVerifiedAt = "legal_name_verified_at"
         case usernameRequired = "username_required"
+        case verification
     }
 
     /// The verified legal name, or nil when identity verification has not produced one.
@@ -2132,6 +2189,9 @@ enum UserProfileMutationMergePolicy {
         merged.legalName = response.legalName ?? current.legalName
         merged.legalNameVerifiedAt = response.legalNameVerifiedAt ?? current.legalNameVerifiedAt
         merged.usernameRequired = response.usernameRequired ?? current.usernameRequired
+        // Profile mutation endpoints can return a focused projection. Do not make a server-owned
+        // public designation disappear merely because an unrelated name/photo response omitted it.
+        merged.verification = response.verification ?? current.verification
         return merged
     }
 }
@@ -2487,6 +2547,7 @@ struct WalletContactDTO: Codable, Hashable, Identifiable, Sendable {
     let tag: String?
     let avatarURL: String?
     let receivingWalletId: String?
+    var verification: AccountVerificationDTO? = nil
 
     enum CodingKeys: String, CodingKey {
         case id, name, phone, favorite, status, tag
@@ -2494,6 +2555,7 @@ struct WalletContactDTO: Codable, Hashable, Identifiable, Sendable {
         case isKitUser = "is_kit_user"
         case avatarURL = "avatar_url"
         case receivingWalletId = "receiving_wallet_id"
+        case verification
     }
 }
 

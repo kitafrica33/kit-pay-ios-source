@@ -49,6 +49,7 @@ struct ProfileView: View {
                 }
                 .padding(18)
             }
+            .refreshable { await model.refresh(userInitiated: true) }
             .rootTabBarScrollClearance()
             .background(KitColor.canvas)
             .navigationTitle("Profile")
@@ -99,12 +100,18 @@ struct ProfileView: View {
             RemoteAvatarView(
                 name: model.profile?.identityDisplayName ?? "Kit Pay",
                 avatarURL: model.profile?.avatarURL,
-                size: 82
+                size: 82,
+                verification: model.profile?.verification?.designation
             )
             VStack(alignment: .leading, spacing: 5) {
-                Text(model.profile?.identityDisplayName ?? "Kit Pay user")
-                    .font(.title2.bold())
-                    .foregroundStyle(KitColor.primaryText)
+                HStack(spacing: 6) {
+                    Text(model.profile?.identityDisplayName ?? "Kit Pay user")
+                        .font(.title2.bold())
+                        .foregroundStyle(KitColor.primaryText)
+                    if let designation = model.profile?.verification?.designation {
+                        VerifiedAccountBadge(designation: designation, diameter: 18)
+                    }
+                }
                 if let legalName = distinctVerifiedLegalName {
                     Label("Legal name: \(legalName)", systemImage: "checkmark.seal.fill")
                         .font(.caption)

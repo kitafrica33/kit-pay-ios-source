@@ -1190,6 +1190,128 @@ final class GroupPaymentTests: XCTestCase {
         XCTAssertEqual(cards.map(\.senderId), [ama, sender])
     }
 
+    func testFinancialGroupRequestProjectionWinsWhenItArrivesAfterQueuedDescriptor() throws {
+        let authoritativeDescriptor = try XCTUnwrap(
+            KitGroupPaymentRequestMessage(requesting: groupRequest())
+        )
+        let conflictingDescriptor = try XCTUnwrap(KitGroupPaymentRequestMessage(
+            action: .requested,
+            requestID: authoritativeDescriptor.requestID,
+            amountMinor: 999_999,
+            currencyCode: "UGX",
+            currencyScale: 0,
+            note: "Untrusted copy"
+        ))
+        let queued = groupRequestDescriptorMessage(
+            conflictingDescriptor,
+            id: KitGroupPaymentRequestMessage.deterministicMessageID(
+                requestID: authoritativeDescriptor.requestID,
+                action: .requested,
+                actorUserID: sender
+            ),
+            state: .queued,
+            authenticated: false
+        )
+        let financial = authoritativeGroupRequestMessage(authoritativeDescriptor)
+        var messages: [LocalMessage] = []
+
+        XCTAssertEqual(
+            GroupPaymentRequestProjectionCoalescingPolicy.reconcile(
+                queued,
+                source: .encryptedDescriptor,
+                into: &messages
+            ),
+            .inserted
+        )
+        XCTAssertEqual(
+            GroupPaymentRequestProjectionCoalescingPolicy.reconcile(
+                financial,
+                source: .authoritativeFinancialEvent,
+                into: &messages
+            ),
+            .coalesced
+        )
+        XCTAssertEqual(messages, [financial])
+    }
+
+    func testRecoveredGroupRequestDescriptorCannotReplaceEarlierFinancialProjection() throws {
+        let authoritativeDescriptor = try XCTUnwrap(
+            KitGroupPaymentRequestMessage(requesting: groupRequest())
+        )
+        let financial = authoritativeGroupRequestMessage(authoritativeDescriptor)
+        let recovered = groupRequestDescriptorMessage(
+            authoritativeDescriptor,
+            id: financial.id,
+            state: .received,
+            authenticated: true
+        )
+        let now = Date(timeIntervalSince1970: 9)
+        let command = OfflineCommand(
+            id: UUID(uuidString: "90000000-0000-4000-8000-000000000001")!,
+            kind: .secureMessage,
+            createdAt: now,
+            nextAttemptAt: now,
+            attemptCount: 0,
+            conversationId: conversationID,
+            messageId: financial.id,
+            recipientUserIds: [ama],
+            recipientName: "Team",
+            video: nil,
+            expiresAt: nil
+        )
+        var state = PersistedState.empty
+        state.messages = [financial]
+        state.outbox = [command]
+
+        SecureMessagingExchangeCoordinator.reconcileRecoveredHistoryMessages(
+            [recovered],
+            currentDeviceID: "92000000-0000-4000-8000-000000000001",
+            into: &state
+        )
+
+        XCTAssertEqual(state.messages, [financial])
+        XCTAssertTrue(state.outbox.isEmpty)
+    }
+
+    func testTimelineCoalescesConflictingRequestCopiesInEitherArrivalOrder() throws {
+        let authoritativeDescriptor = try XCTUnwrap(
+            KitGroupPaymentRequestMessage(requesting: groupRequest())
+        )
+        let conflictingDescriptor = try XCTUnwrap(KitGroupPaymentRequestMessage(
+            action: .requested,
+            requestID: authoritativeDescriptor.requestID,
+            amountMinor: 50,
+            currencyCode: "UGX",
+            currencyScale: 0,
+            note: "Peer-authored contradiction"
+        ))
+        let financial = authoritativeGroupRequestMessage(authoritativeDescriptor)
+        let authenticated = groupRequestDescriptorMessage(
+            conflictingDescriptor,
+            id: UUID(uuidString: "90000000-0000-4000-8000-000000000002")!,
+            state: .received,
+            authenticated: true
+        )
+        let malformed = message(
+            sender,
+            "KITGREQ1:v=1&a=requested&id=not-a-request&amt=50&cur=UGX&sc=0"
+        )
+
+        for source in [[authenticated, financial, malformed], [financial, authenticated, malformed]] {
+            let rows = timeline(source).compactMap { item
+                -> (LocalMessage, KitGroupPaymentRequestMessage)? in
+                guard case .groupPaymentRequest(let message, let descriptor) = item else {
+                    return nil
+                }
+                return (message, descriptor)
+            }
+            XCTAssertEqual(rows.count, 1)
+            let row = try XCTUnwrap(rows.first)
+            XCTAssertEqual(row.0, financial)
+            XCTAssertEqual(row.1, authoritativeDescriptor)
+        }
+    }
+
     func testGroupRequestProgressCopyIsExactAndDropsTrailingZeroes() {
         XCTAssertEqual(GroupPaymentRequestCopy.progressPercent(0), "0%")
         XCTAssertEqual(GroupPaymentRequestCopy.progressPercent(1_250), "12.5%")
@@ -1563,6 +1685,62 @@ final class GroupPaymentTests: XCTestCase {
             failureReason: nil,
             isOutgoing: outgoing
         )
+    }
+
+    private func authoritativeGroupRequestMessage(
+        _ descriptor: KitGroupPaymentRequestMessage
+    ) -> LocalMessage {
+        LocalMessage(
+            id: KitGroupPaymentRequestMessage.deterministicMessageID(
+                requestID: descriptor.requestID,
+                action: descriptor.action,
+                contributionID: descriptor.contributionID,
+                actorUserID: sender
+            ),
+            conversationId: conversationID,
+            senderId: sender,
+            body: descriptor.encoded,
+            createdAt: Date(timeIntervalSince1970: 10),
+            sentAt: Date(timeIntervalSince1970: 10),
+            state: .received,
+            failureReason: nil,
+            isOutgoing: false
+        )
+    }
+
+    private func groupRequestDescriptorMessage(
+        _ descriptor: KitGroupPaymentRequestMessage,
+        id: UUID,
+        state: MessageDeliveryState,
+        authenticated: Bool
+    ) -> LocalMessage {
+        var result = LocalMessage(
+            id: id,
+            serverMessageId: authenticated
+                ? "91000000-0000-4000-8000-000000000001"
+                : nil,
+            conversationId: conversationID,
+            senderId: sender,
+            body: descriptor.encoded,
+            createdAt: Date(timeIntervalSince1970: 9),
+            sentAt: authenticated ? Date(timeIntervalSince1970: 9) : nil,
+            state: state,
+            failureReason: nil,
+            isOutgoing: !authenticated
+        )
+        if authenticated {
+            result.secureMessagingHistory = SecureMessagingRetainedMessageMetadata(
+                clientMessageID: id.uuidString.lowercased(),
+                senderUserID: sender,
+                senderDeviceID: "92000000-0000-4000-8000-000000000001",
+                senderEnrollmentEpoch: 1,
+                senderSignalDeviceID: 1,
+                rosterRevision: "v1:sha256:" + String(repeating: "a", count: 64),
+                kind: .encrypted,
+                replyToMessageID: nil
+            )
+        }
+        return result
     }
 
     private func timeline(_ messages: [LocalMessage]) -> [ConversationTimelineItem] {

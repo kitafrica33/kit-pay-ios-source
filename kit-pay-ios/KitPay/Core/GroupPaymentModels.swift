@@ -2197,6 +2197,153 @@ struct KitGroupPaymentRequestMessage: Equatable, Sendable {
     }
 }
 
+enum GroupPaymentRequestProjectionSource: Sendable {
+    case encryptedDescriptor
+    case authoritativeFinancialEvent
+}
+
+enum GroupPaymentRequestProjectionDisposition: Equatable, Sendable {
+    case notAGroupPaymentRequest
+    case inserted
+    case coalesced
+}
+
+/// Gives the optional encrypted `KITGREQ1` hint and the authoritative financial sync row one
+/// durable identity. A financial projection always wins when the bodies disagree; this prevents
+/// arrival order, history restoration, or a peer-authored contradictory hint from changing the
+/// payment card that survives locally.
+enum GroupPaymentRequestProjectionCoalescingPolicy {
+    private struct Identity: Hashable {
+        let conversationID: String
+        let actorUserID: String
+        let requestID: String
+        let action: String
+        let contributionID: String?
+    }
+
+    static func sameEvent(_ lhs: LocalMessage, _ rhs: LocalMessage) -> Bool {
+        guard let left = identity(for: lhs), let right = identity(for: rhs) else { return false }
+        return left == right
+    }
+
+    static func isAuthoritativeFinancialProjection(_ message: LocalMessage) -> Bool {
+        guard let descriptor = KitGroupPaymentRequestMessage.parse(message.body),
+              let actorUserID = GroupPaymentRequestValidation.canonicalUUID(message.senderId),
+              message.id == KitGroupPaymentRequestMessage.deterministicMessageID(
+                  requestID: descriptor.requestID,
+                  action: descriptor.action,
+                  contributionID: descriptor.contributionID,
+                  actorUserID: actorUserID
+              ),
+              message.serverMessageId == nil,
+              message.secureMessagingHistory == nil,
+              message.failureReason == nil,
+              message.pendingAttachment == nil,
+              message.pendingMediaBatch == nil,
+              message.attachmentData == nil,
+              message.replyToServerMessageID == nil,
+              message.scheduledAt == nil
+        else { return false }
+        return message.state == .sent || message.state == .received
+    }
+
+    @discardableResult
+    static func reconcile(
+        _ candidate: LocalMessage,
+        source: GroupPaymentRequestProjectionSource,
+        into messages: inout [LocalMessage]
+    ) -> GroupPaymentRequestProjectionDisposition {
+        guard let candidateIdentity = identity(for: candidate) else {
+            return .notAGroupPaymentRequest
+        }
+        let matchingIndices = messages.indices.filter {
+            identity(for: messages[$0]) == candidateIdentity
+        }
+        guard let insertionIndex = matchingIndices.first else {
+            messages.append(candidate)
+            return .inserted
+        }
+
+        let winner: LocalMessage
+        switch source {
+        case .authoritativeFinancialEvent:
+            winner = candidate
+        case .encryptedDescriptor:
+            if let authoritative = matchingIndices
+                .map({ messages[$0] })
+                .first(where: isAuthoritativeFinancialProjection) {
+                winner = authoritative
+            } else {
+                winner = (matchingIndices.map({ messages[$0] }) + [candidate])
+                    .sorted(by: descriptorComesBefore)
+                    .first ?? candidate
+            }
+        }
+
+        messages[insertionIndex] = winner
+        for index in matchingIndices.dropFirst().reversed() {
+            messages.remove(at: index)
+        }
+        return .coalesced
+    }
+
+    static func coalescedForTimeline(_ messages: [LocalMessage]) -> [LocalMessage] {
+        var result: [LocalMessage] = []
+        result.reserveCapacity(messages.count)
+        for message in messages {
+            guard identity(for: message) != nil else {
+                result.append(message)
+                continue
+            }
+            let source: GroupPaymentRequestProjectionSource =
+                isAuthoritativeFinancialProjection(message)
+                    ? .authoritativeFinancialEvent
+                    : .encryptedDescriptor
+            _ = reconcile(message, source: source, into: &result)
+        }
+        return result
+    }
+
+    private static func identity(for message: LocalMessage) -> Identity? {
+        guard let conversationID = GroupPaymentRequestValidation.canonicalUUID(
+            message.conversationId
+        ),
+              let actorUserID = GroupPaymentRequestValidation.canonicalUUID(message.senderId),
+              let descriptor = KitGroupPaymentRequestMessage.parse(message.body)
+        else { return nil }
+        return Identity(
+            conversationID: conversationID,
+            actorUserID: actorUserID,
+            requestID: descriptor.requestID,
+            action: descriptor.action.rawValue,
+            contributionID: descriptor.contributionID
+        )
+    }
+
+    private static func descriptorComesBefore(_ lhs: LocalMessage, _ rhs: LocalMessage) -> Bool {
+        let left = descriptorOrderKey(lhs)
+        let right = descriptorOrderKey(rhs)
+        if left.authenticated != right.authenticated {
+            return left.authenticated && !right.authenticated
+        }
+        if left.serverID != right.serverID { return left.serverID < right.serverID }
+        if left.body != right.body { return left.body < right.body }
+        return left.localID < right.localID
+    }
+
+    private static func descriptorOrderKey(
+        _ message: LocalMessage
+    ) -> (authenticated: Bool, serverID: String, body: String, localID: String) {
+        (
+            authenticated: message.serverMessageId != nil
+                && message.secureMessagingHistory != nil,
+            serverID: message.serverMessageId ?? "~",
+            body: message.body,
+            localID: message.id.uuidString.lowercased()
+        )
+    }
+}
+
 enum GroupPaymentRequestDraftPolicy {
     enum Outcome: Equatable {
         case ready(CreateGroupPaymentRequestBody)

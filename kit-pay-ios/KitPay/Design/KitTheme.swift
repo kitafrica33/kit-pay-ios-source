@@ -20,18 +20,16 @@ enum KitColor {
     static let primaryText = Color(uiColor: .label)
     static let secondaryText = Color(uiColor: .secondaryLabel)
 
-    /// Verified OFFICIAL Kit Pay identity in support surfaces wears blue, deliberately distinct
-    /// from the green of KYC/personal verification: a chat sender showing the mark a customer
-    /// knows from their own verified profile would lend it borrowed credibility. Blue appears
-    /// only where `isVerifiedOfficialSupport` holds; green stays personal.
+    /// Public account verification wears blue, deliberately distinct from green KYC status.
+    /// The blue seal is driven only by a validated server designation; completing KYC alone must
+    /// never manufacture one locally.
     static let verifiedBlue = Color(uiColor: UIColor { traits in
         traits.userInterfaceStyle == .dark
             ? UIColor(red: 96 / 255, green: 168 / 255, blue: 238 / 255, alpha: 1)
             : UIColor(red: 16 / 255, green: 94 / 255, blue: 176 / 255, alpha: 1)
     })
 
-    /// Surface tint behind official-support avatars and chips, the blue counterpart of
-    /// `paleGreen` — pale enough to carry `verifiedBlue` glyphs in both appearances.
+    /// Surface tint behind verified identity artwork, the blue counterpart of `paleGreen`.
     static let paleBlue = Color(uiColor: UIColor { traits in
         traits.userInterfaceStyle == .dark
             ? UIColor(red: 20 / 255, green: 50 / 255, blue: 82 / 255, alpha: 1)
@@ -753,17 +751,25 @@ struct RemoteAvatarView: View {
     let name: String
     let avatarURL: String?
     var size: CGFloat = 52
+    var verification: AccountVerificationDesignation? = nil
     /// Opacity of the hairline ring, or `nil` where the avatar already sits inside a glass lens
     /// and a second outline would only muddy the edge.
     var ringOpacity: Double? = 0.65
 
     @State private var image: UIImage?
 
-    init(name: String, avatarURL: String?, size: CGFloat = 52, ringOpacity: Double? = 0.65) {
+    init(
+        name: String,
+        avatarURL: String?,
+        size: CGFloat = 52,
+        ringOpacity: Double? = 0.65,
+        verification: AccountVerificationDesignation? = nil
+    ) {
         self.name = name
         self.avatarURL = avatarURL
         self.size = size
         self.ringOpacity = ringOpacity
+        self.verification = verification
         // Seeded synchronously so a row scrolling back into view draws its photo in the first
         // frame rather than flashing initials for one hop.
         _image = State(initialValue: ProfileAvatarCache.cachedImage(for: avatarURL))
@@ -788,6 +794,17 @@ struct RemoteAvatarView: View {
                     .allowsHitTesting(false)
             }
         }
+        .overlay(alignment: .topTrailing) {
+            if let verification {
+                VerifiedAccountBadge(
+                    designation: verification,
+                    diameter: max(15, size * 0.30),
+                    hasContrastBorder: true
+                )
+                .offset(x: size * 0.04, y: -size * 0.04)
+                .accessibilityHidden(true)
+            }
+        }
         .animation(.easeOut(duration: 0.18), value: image == nil)
         .task(id: avatarURL) { await load() }
         .accessibilityLabel("Profile photo for \(name)")
@@ -805,6 +822,31 @@ struct RemoteAvatarView: View {
         let loaded = await ProfileAvatarCache.shared.image(for: avatarURL)
         guard !Task.isCancelled else { return }
         image = loaded
+    }
+}
+
+/// Compact public-verification seal used beside account names and on profile photos.
+/// Callers can only construct it with an allowlisted designation decoded from the server.
+struct VerifiedAccountBadge: View {
+    let designation: AccountVerificationDesignation
+    var diameter: CGFloat = 16
+    var hasContrastBorder = false
+
+    var body: some View {
+        ZStack {
+            Circle().fill(KitColor.verifiedBlue)
+            Image(systemName: "checkmark")
+                .font(.system(size: diameter * 0.52, weight: .black))
+                .foregroundStyle(.white)
+        }
+        .frame(width: diameter, height: diameter)
+        .overlay {
+            if hasContrastBorder {
+                Circle().stroke(.white, lineWidth: max(1, diameter * 0.08))
+            }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(designation.accessibilityLabel)
     }
 }
 

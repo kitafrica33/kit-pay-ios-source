@@ -600,7 +600,10 @@ enum ContactRecipientDirectory {
             status: base.status ?? supplement.status,
             tag: base.tag ?? supplement.tag,
             avatarURL: base.avatarURL ?? supplement.avatarURL,
-            receivingWalletId: base.receivingWalletId ?? supplement.receivingWalletId
+            receivingWalletId: base.receivingWalletId ?? supplement.receivingWalletId,
+            verification: base.verification?.designation != nil
+                ? base.verification
+                : supplement.verification
         )
     }
 

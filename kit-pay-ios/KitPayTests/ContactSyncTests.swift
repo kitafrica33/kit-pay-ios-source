@@ -526,6 +526,40 @@ final class ContactSyncTests: XCTestCase {
         XCTAssertEqual(profile.countryCode, "UG")
     }
 
+    func testWalletContactDecodesServerOwnedPublicVerification() throws {
+        let data = try XCTUnwrap(#"""
+        {
+          "id": "11111111-1111-4111-8111-111111111111",
+          "contact_id": "22222222-2222-4222-8222-222222222222",
+          "name": "Namisi Arnold Paul",
+          "phone": "+256759948200",
+          "is_kit_user": true,
+          "verification": {
+            "designation": "official",
+            "since": "2026-08-29T08:00:00Z"
+          }
+        }
+        """#.data(using: .utf8))
+
+        let contact = try JSONDecoder().decode(WalletContactDTO.self, from: data)
+        XCTAssertEqual(contact.verification?.designation, .official)
+        XCTAssertEqual(contact.verification?.since, "2026-08-29T08:00:00Z")
+    }
+
+    func testWalletContactFailsClosedForUnknownPublicVerification() throws {
+        let data = try XCTUnwrap(#"""
+        {
+          "id": "11111111-1111-4111-8111-111111111111",
+          "name": "Example",
+          "phone": "+256700000001",
+          "verification": {"designation": "verified_partner"}
+        }
+        """#.data(using: .utf8))
+
+        let contact = try JSONDecoder().decode(WalletContactDTO.self, from: data)
+        XCTAssertNil(contact.verification?.designation)
+    }
+
     func testPhoneIdentityRejectsAmbiguousOrInvalidSyntax() {
         XCTAssertNil(PhoneIdentityNormalizer.normalizedE164("*165#"))
         XCTAssertNil(PhoneIdentityNormalizer.normalizedE164("+256772123456 ext 4"))
@@ -596,7 +630,13 @@ final class ContactSyncTests: XCTestCase {
         let kitB = "550e8400-e29b-41d4-a716-446655440002"
         let contacts = [
             contact(id: "invite-z", name: "Zara Invite", phone: "0701 000 003", kitUser: false, favorite: true),
-            contact(id: kitB, name: "Brian", phone: "+256 701 000 002", kitUser: true),
+            contact(
+                id: kitB,
+                name: "Brian",
+                phone: "+256 701 000 002",
+                kitUser: true,
+                verification: AccountVerificationDTO(designation: .verified)
+            ),
             contact(id: "invite-duplicate", name: "Address-book Brian", phone: "0701 000 002", kitUser: false, favorite: true),
             contact(id: "invite-a", name: "Amina Invite", phone: "+256701000004", kitUser: false),
             contact(id: kitA, name: "Aisha", phone: "256 701 000 001", kitUser: true, favorite: true),
@@ -612,6 +652,7 @@ final class ContactSyncTests: XCTestCase {
         XCTAssertTrue(brian.isKitUser == true)
         XCTAssertTrue(brian.favorite == true)
         XCTAssertEqual(brian.phone, "+256701000002")
+        XCTAssertEqual(brian.verification?.designation, .verified)
     }
 
     func testPartialServerUnionIsRestrictedToThisDevicesSnapshot() {
@@ -1035,7 +1076,8 @@ private func contact(
     phone: String,
     kitUser: Bool,
     favorite: Bool = false,
-    tag: String? = nil
+    tag: String? = nil,
+    verification: AccountVerificationDTO? = nil
 ) -> WalletContactDTO {
     WalletContactDTO(
         id: id,
@@ -1047,7 +1089,8 @@ private func contact(
         status: nil,
         tag: tag,
         avatarURL: nil,
-        receivingWalletId: nil
+        receivingWalletId: nil,
+        verification: verification
     )
 }
 

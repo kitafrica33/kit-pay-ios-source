@@ -5574,6 +5574,41 @@ actor SecureMessagingExchangeCoordinator {
             guard let historyMetadata = message.secureMessagingHistory,
                   historyMetadata.senderUserID == message.senderId
             else { continue }
+            let matchingGroupRequestIDs = Set(state.messages.lazy.filter {
+                GroupPaymentRequestProjectionCoalescingPolicy.sameEvent($0, message)
+            }.map(\.id))
+            if !matchingGroupRequestIDs.isEmpty {
+                let matchingGroupRequestClientIDs = Set(matchingGroupRequestIDs.map {
+                    $0.uuidString.lowercased()
+                })
+                _ = GroupPaymentRequestProjectionCoalescingPolicy.reconcile(
+                    message,
+                    source: .encryptedDescriptor,
+                    into: &state.messages
+                )
+                // A restored authenticated copy proves that this optional descriptor already
+                // reached the server. Retire any semantically duplicate local command so a
+                // relaunch cannot transmit the hint again under an older client identifier.
+                state.outbox.removeAll { command in
+                    guard command.kind == .secureMessage,
+                          command.conversationId == message.conversationId
+                    else { return false }
+                    return (command.messageId.map(matchingGroupRequestIDs.contains) ?? false)
+                        || (command.secureMessageFanout.map {
+                            matchingGroupRequestClientIDs.contains($0.clientMessageID)
+                        } ?? false)
+                }
+                if !historyMetadata.kind.isTimelineMetadata,
+                   let index = state.conversations.firstIndex(where: {
+                       $0.id == message.conversationId
+                   }) {
+                    state.conversations[index].updatedAt = max(
+                        state.conversations[index].updatedAt,
+                        message.createdAt
+                    )
+                }
+                continue
+            }
             let serverMatches = state.messages.indices.filter {
                 state.messages[$0].serverMessageId == message.serverMessageId
             }
@@ -5650,7 +5685,21 @@ actor SecureMessagingExchangeCoordinator {
             }
 
             guard clientMatches.isEmpty else { continue }
-            state.messages.append(message)
+            let groupRequestDisposition = GroupPaymentRequestProjectionCoalescingPolicy.reconcile(
+                message,
+                source: .encryptedDescriptor,
+                into: &state.messages
+            )
+            switch groupRequestDisposition {
+            case .notAGroupPaymentRequest:
+                state.messages.append(message)
+            case .inserted:
+                break
+            case .coalesced:
+                // A recovered optional descriptor must never add a second row beside the
+                // authoritative financial projection (or another authenticated copy).
+                continue
+            }
             if !historyMetadata.kind.isTimelineMetadata,
                let index = state.conversations.firstIndex(where: {
                    $0.id == message.conversationId
@@ -6376,20 +6425,26 @@ actor SecureMessagingExchangeCoordinator {
                             $0.secureMessageFanout?.clientMessageID == echo.clientMessageID
                         }
                     }
-                    for message in incomingMessages where !state.messages.contains(where: {
-                        $0.serverMessageId == message.serverMessageId
-                    }) {
-                        if let syntheticIndex = state.messages.firstIndex(where: {
-                            $0.serverMessageId == nil
-                                && Self.sameGroupPaymentRequestEvent($0, message)
-                        }) {
-                            // The financial sync row can beat its optional encrypted descriptor.
-                            // Replace that local projection with the authenticated E2EE message
-                            // without counting the same event as unread twice.
-                            state.messages[syntheticIndex] = message
+                    for message in incomingMessages {
+                        guard !state.messages.contains(where: {
+                            $0.serverMessageId == message.serverMessageId
+                        }) else { continue }
+                        let groupRequestDisposition =
+                            GroupPaymentRequestProjectionCoalescingPolicy.reconcile(
+                                message,
+                                source: .encryptedDescriptor,
+                                into: &state.messages
+                            )
+                        switch groupRequestDisposition {
+                        case .notAGroupPaymentRequest:
+                            state.messages.append(message)
+                        case .inserted:
+                            break
+                        case .coalesced:
+                            // The event was already projected. In particular, an optional E2EE
+                            // hint may never replace an authoritative financial sync result.
                             continue
                         }
-                        state.messages.append(message)
                         if let index = state.conversations.firstIndex(where: {
                             $0.id == message.conversationId
                         }) {
@@ -6488,10 +6543,39 @@ actor SecureMessagingExchangeCoordinator {
                     }
                     for transition in groupPaymentRequestTransitions {
                         let message = transition.message
-                        guard !state.messages.contains(where: {
-                            $0.id == message.id || Self.sameGroupPaymentRequestEvent($0, message)
-                        }) else { continue }
-                        state.messages.append(message)
+                        let supersededDescriptorIDs = Set(state.messages.lazy.filter {
+                            GroupPaymentRequestProjectionCoalescingPolicy.sameEvent($0, message)
+                                && !GroupPaymentRequestProjectionCoalescingPolicy
+                                    .isAuthoritativeFinancialProjection($0)
+                        }.map(\.id))
+                        let supersededClientIDs = Set(supersededDescriptorIDs.map {
+                            $0.uuidString.lowercased()
+                        })
+                        let disposition = GroupPaymentRequestProjectionCoalescingPolicy.reconcile(
+                            message,
+                            source: .authoritativeFinancialEvent,
+                            into: &state.messages
+                        )
+                        guard disposition != .notAGroupPaymentRequest else {
+                            throw SecureMessagingExchangeError.invalidServerResponse
+                        }
+                        if !supersededDescriptorIDs.isEmpty {
+                            // Once the authenticated financial event exists, an optional chat
+                            // hint for that same event must not leave the device later and recreate
+                            // a duplicate on peers. Remove only commands bound to the rows replaced
+                            // above; unrelated messages in the same conversation remain queued.
+                            state.outbox.removeAll { command in
+                                guard command.kind == .secureMessage,
+                                      command.conversationId == transition.conversationID
+                                else { return false }
+                                return (command.messageId.map(
+                                    supersededDescriptorIDs.contains
+                                ) ?? false)
+                                    || (command.secureMessageFanout.map {
+                                        supersededClientIDs.contains($0.clientMessageID)
+                                    } ?? false)
+                            }
+                        }
                         if let index = state.conversations.firstIndex(where: {
                             $0.id == transition.conversationID
                         }) {
@@ -6499,7 +6583,7 @@ actor SecureMessagingExchangeCoordinator {
                                 state.conversations[index].updatedAt,
                                 message.createdAt
                             )
-                            if !message.isOutgoing {
+                            if disposition == .inserted, !message.isOutgoing {
                                 state.conversations[index].unreadCount += 1
                             }
                         }
@@ -7256,20 +7340,6 @@ actor SecureMessagingExchangeCoordinator {
             conversationID: envelope.conversationID,
             message: message
         )
-    }
-
-    private nonisolated static func sameGroupPaymentRequestEvent(
-        _ lhs: LocalMessage,
-        _ rhs: LocalMessage
-    ) -> Bool {
-        guard lhs.conversationId == rhs.conversationId,
-              lhs.senderId == rhs.senderId,
-              let left = KitGroupPaymentRequestMessage.parse(lhs.body),
-              let right = KitGroupPaymentRequestMessage.parse(rhs.body)
-        else { return false }
-        return left.action == right.action
-            && left.requestID == right.requestID
-            && left.contributionID == right.contributionID
     }
 
     /// Validates a group membership lifecycle event and pre-builds its thread-documenting system

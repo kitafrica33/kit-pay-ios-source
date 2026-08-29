@@ -6,7 +6,7 @@ import XCTest
 
 final class AccountSetupPolicyTests: XCTestCase {
     func testProfileMutationMergePreservesOmittedFieldsAndAppliesRequestedIdentity() throws {
-        let current = UserProfile(
+        var current = UserProfile(
             id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
             name: "Old Name",
             email: "verified@example.test",
@@ -20,6 +20,10 @@ final class AccountSetupPolicyTests: XCTestCase {
             emailVerified: true,
             phoneVerified: true,
             profileSetupRequired: true
+        )
+        current.verification = AccountVerificationDTO(
+            designation: .verified,
+            since: "2026-08-29T08:00:00Z"
         )
         let focused = UserProfile(
             id: current.id,
@@ -50,6 +54,7 @@ final class AccountSetupPolicyTests: XCTestCase {
         XCTAssertEqual(merged.emailVerified, true)
         XCTAssertEqual(merged.phoneVerified, true)
         XCTAssertEqual(merged.profileSetupRequired, false)
+        XCTAssertEqual(merged.verification, current.verification)
     }
 
     func testProfileMutationMergeRejectsAResponseForAnotherAccount() {
@@ -132,6 +137,34 @@ final class AccountSetupPolicyTests: XCTestCase {
             "https://pay.kit.africa/profiles/11111111-1111-4111-8111-111111111111/avatar/22222222-2222-4222-8222-222222222222"
         )
         XCTAssertNil(legacy.avatarURL)
+    }
+
+    func testProfileProjectionAcceptsOnlyExactPublicVerificationDesignations() throws {
+        let verified = try JSONDecoder().decode(UserProfile.self, from: Data(#"""
+        {
+          "id": "11111111-1111-4111-8111-111111111111",
+          "name": "Namisi Arnold Paul",
+          "verification": {
+            "designation": "verified",
+            "since": "2026-08-29T08:00:00Z"
+          }
+        }
+        """#.utf8))
+
+        XCTAssertEqual(verified.verification?.designation, .verified)
+        XCTAssertEqual(verified.verification?.since, "2026-08-29T08:00:00Z")
+
+        for untrusted in ["VERIFIED", " verified ", "partner", "", "blue_tick"] {
+            let payload = #"{"id":"user-1","verification":{"designation":"\#(untrusted)"}}"#
+            let profile = try JSONDecoder().decode(UserProfile.self, from: Data(payload.utf8))
+            XCTAssertNil(profile.verification?.designation, untrusted)
+        }
+
+        let legacy = try JSONDecoder().decode(
+            UserProfile.self,
+            from: Data(#"{"id":"user-1"}"#.utf8)
+        )
+        XCTAssertNil(legacy.verification)
     }
 
     func testProfileAvatarPreparationIsSquareStripsSensitiveMetadataAndIsSmall() throws {

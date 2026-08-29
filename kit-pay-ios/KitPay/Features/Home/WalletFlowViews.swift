@@ -638,9 +638,19 @@ struct SendMoneyView: View {
             step = .amount
         } label: {
             HStack(spacing: 14) {
-                RemoteAvatarView(name: contact.name, avatarURL: contact.avatarURL, size: 46)
+                RemoteAvatarView(
+                    name: contact.name,
+                    avatarURL: contact.avatarURL,
+                    size: 46,
+                    verification: contact.verification?.designation
+                )
                 VStack(alignment: .leading, spacing: 3) {
-                    MarqueeText(text: contact.name, font: .headline)
+                    HStack(spacing: 5) {
+                        MarqueeText(text: contact.name, font: .headline)
+                        if let verification = contact.verification?.designation {
+                            VerifiedAccountBadge(designation: verification, diameter: 15)
+                        }
+                    }
                     Text(contact.tag?.nilIfEmpty ?? contact.phone)
                         .font(.subheadline)
                         .foregroundStyle(KitColor.secondaryText)

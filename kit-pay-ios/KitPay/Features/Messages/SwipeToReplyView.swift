@@ -2,7 +2,8 @@ import SwiftUI
 
 /// Wraps one message row so dragging it either way composes an answer to it. The distances and
 /// the damping come from `SwipeToReplyPolicy`, so the gesture arms at the same point in the drag
-/// here as it does on Android.
+/// here as it does on Android. Direction arbitration remains iOS-specific because it must yield
+/// promptly to SwiftUI's vertical `ScrollView` recognizer.
 ///
 /// The drag runs alongside the conversation's own scrolling rather than instead of it: a drag is
 /// only adopted once it is clearly sideways, so flicking through history still scrolls normally.
@@ -12,8 +13,9 @@ struct SwipeToReplyContainer<Content: View>: View {
     @ViewBuilder var content: () -> Content
 
     @State private var travel: CGFloat = 0
-    @State private var isTracking = false
+    @State private var dragAxis: SwipeToReplyPolicy.DragAxis = .undecided
     @State private var hasArmed = false
+    @GestureState private var gestureIsActive = false
 
     private var progress: CGFloat { SwipeToReplyPolicy.progress(travel: travel) }
 
@@ -23,7 +25,15 @@ struct SwipeToReplyContainer<Content: View>: View {
             content()
                 .offset(x: travel)
         }
+        .contentShape(Rectangle())
+        // Preserve taps, media controls, reaction chips, selection and context menus in the row's
+        // subviews. Scroll arbitration is handled by the higher threshold and sticky axis below.
         .simultaneousGesture(dragGesture, including: isEnabled ? .all : .subviews)
+        .onChange(of: gestureIsActive) { wasActive, isActive in
+            // GestureState also resets when UIKit cancels this recognizer in favour of the scroll
+            // view. Clear the direction lock on that path as well as the ordinary onEnded path.
+            if wasActive, !isActive { resetGesture(animated: travel != 0) }
+        }
     }
 
     private var indicator: some View {
@@ -39,15 +49,24 @@ struct SwipeToReplyContainer<Content: View>: View {
     }
 
     private var dragGesture: some Gesture {
-        DragGesture(minimumDistance: 12, coordinateSpace: .local)
+        DragGesture(
+            minimumDistance: SwipeToReplyPolicy.activationDistance,
+            coordinateSpace: .local
+        )
+            .updating($gestureIsActive) { _, isActive, _ in isActive = true }
             .onChanged { value in
                 guard isEnabled else { return }
-                if !isTracking {
-                    // Adopt the drag only once it is decisively sideways. Anything else belongs
-                    // to the conversation's scroll, which is still receiving it too.
-                    guard abs(value.translation.width)
-                        > abs(value.translation.height) * 1.5 else { return }
-                    isTracking = true
+                let lockedAxis = SwipeToReplyPolicy.lockedAxis(
+                    current: dragAxis,
+                    translation: value.translation
+                )
+                dragAxis = lockedAxis
+                guard lockedAxis == .horizontal else {
+                    // Once vertical wins, keep the bubble perfectly still for the rest of this
+                    // touch. The surrounding ScrollView remains the sole visible interaction.
+                    travel = 0
+                    hasArmed = false
+                    return
                 }
                 travel = SwipeToReplyPolicy.travel(drag: value.translation.width)
                 let armed = SwipeToReplyPolicy.shouldReply(travel: travel)
@@ -59,14 +78,22 @@ struct SwipeToReplyContainer<Content: View>: View {
                 if !armed { hasArmed = false } else { hasArmed = true }
             }
             .onEnded { _ in
-                let fires = isTracking && isEnabled && SwipeToReplyPolicy.shouldReply(travel: travel)
-                isTracking = false
-                hasArmed = false
-                withAnimation(.spring(response: 0.28, dampingFraction: 0.75)) {
-                    travel = 0
-                }
+                let fires = dragAxis == .horizontal
+                    && isEnabled
+                    && SwipeToReplyPolicy.shouldReply(travel: travel)
+                resetGesture(animated: true)
                 if fires { onReply() }
             }
+    }
+
+    private func resetGesture(animated: Bool) {
+        dragAxis = .undecided
+        hasArmed = false
+        if animated {
+            withAnimation(.spring(response: 0.28, dampingFraction: 0.75)) { travel = 0 }
+        } else {
+            travel = 0
+        }
     }
 }
 
