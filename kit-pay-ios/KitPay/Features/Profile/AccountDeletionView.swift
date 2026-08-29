@@ -14,6 +14,7 @@ struct AccountDeletionView: View {
     @State private var submissionOutcomeUncertain = false
     @State private var loadError: String?
     @State private var submissionError: String?
+    @State private var showSupport = false
 
     @MainActor
     init(submissionGate: AccountDeletionSubmissionGate? = nil) {
@@ -28,7 +29,7 @@ struct AccountDeletionView: View {
                     protectedFlow
                 } else {
                     publicFallbackCard(
-                        explanation: "Use Kit Pay's support-assisted account deletion page to review and submit your request."
+                        explanation: "Protected in-app deletion isn't available right now. You can still review and continue your deletion request below."
                     )
                 }
             }
@@ -46,12 +47,22 @@ struct AccountDeletionView: View {
         .onDisappear {
             paymentPIN = ""
         }
+        .sheet(isPresented: $showSupport) {
+            SupportSheetView(
+                preferredCategoryKeys: SupportContract.accountDeletionCategoryHints
+            )
+            .environmentObject(model)
+        }
     }
 
     private var protectedFlowAvailable: Bool {
         AccountDeletionContract.protectedFlowAvailable(
             features: model.capabilities?.features
         )
+    }
+
+    private var deletionAssistancePath: SupportAssistancePath {
+        SupportContract.deletionAssistancePath(capabilities: model.capabilities)
     }
 
     private var warningCard: some View {
@@ -219,11 +230,14 @@ struct AccountDeletionView: View {
             }
 
             if submissionOutcomeUncertain {
-                if let fallbackURL = AccountDeletionContract.trustedFallbackURL {
-                    Link(destination: fallbackURL) {
+                switch deletionAssistancePath {
+                case .inAppSupport:
+                    Button {
+                        showSupport = true
+                    } label: {
                         Label(
-                            "Continue with account deletion support",
-                            systemImage: "arrow.up.right.square"
+                            "Ask Kit Pay support about this request",
+                            systemImage: "bubble.left.and.text.bubble.right"
                         )
                         .font(.headline)
                         .frame(maxWidth: .infinity)
@@ -232,6 +246,29 @@ struct AccountDeletionView: View {
                     .buttonStyle(.borderedProminent)
                     .buttonBorderShape(.roundedRectangle(radius: 17))
                     .tint(KitColor.navy)
+                case .legalDeletionPage:
+                    if let deletionURL = AccountDeletionContract.trustedFallbackURL {
+                        Link(destination: deletionURL) {
+                            Label(
+                                "Review your deletion request",
+                                systemImage: "arrow.up.right.square"
+                            )
+                            .font(.headline)
+                            .frame(maxWidth: .infinity)
+                            .frame(minHeight: 48)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .buttonBorderShape(.roundedRectangle(radius: 17))
+                        .tint(KitColor.navy)
+
+                        Text(
+                            "This opens Kit Pay's official account deletion page, used only to "
+                                + "review or continue a deletion request. It is not a support "
+                                + "channel."
+                        )
+                        .font(.caption)
+                        .foregroundStyle(KitColor.secondaryText)
+                    }
                 }
             }
 
@@ -258,7 +295,7 @@ struct AccountDeletionView: View {
 
     private func publicFallbackCard(explanation: String) -> some View {
         VStack(alignment: .leading, spacing: 14) {
-            Label("Account deletion support", systemImage: "safari.fill")
+            Label("Continue account deletion", systemImage: "person.crop.circle.badge.xmark")
                 .font(.headline)
                 .foregroundStyle(KitColor.primaryText)
 
@@ -275,16 +312,52 @@ struct AccountDeletionView: View {
                 .disabled(isLoading || model.isSubmittingAccountDeletion)
             }
 
-            if let fallbackURL = AccountDeletionContract.trustedFallbackURL {
-                Link(destination: fallbackURL) {
-                    Label("Continue on the Kit Pay website", systemImage: "arrow.up.right.square")
-                        .font(.headline)
-                        .frame(maxWidth: .infinity)
-                        .frame(minHeight: 48)
+            switch deletionAssistancePath {
+            case .inAppSupport:
+                Button {
+                    showSupport = true
+                } label: {
+                    Label(
+                        "Ask Kit Pay support",
+                        systemImage: "bubble.left.and.text.bubble.right"
+                    )
+                    .font(.headline)
+                    .frame(maxWidth: .infinity)
+                    .frame(minHeight: 48)
                 }
                 .buttonStyle(.borderedProminent)
                 .buttonBorderShape(.roundedRectangle(radius: 17))
                 .tint(KitColor.navy)
+
+                Text(
+                    "Kit Pay support can help with your deletion request without leaving "
+                        + "the app."
+                )
+                .font(.caption)
+                .foregroundStyle(KitColor.secondaryText)
+            case .legalDeletionPage:
+                if let deletionURL = AccountDeletionContract.trustedFallbackURL {
+                    Link(destination: deletionURL) {
+                        Label(
+                            "Continue on the Kit Pay account deletion page",
+                            systemImage: "arrow.up.right.square"
+                        )
+                        .font(.headline)
+                        .frame(maxWidth: .infinity)
+                        .frame(minHeight: 48)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .buttonBorderShape(.roundedRectangle(radius: 17))
+                    .tint(KitColor.navy)
+
+                    Text(
+                        "This opens Kit Pay's official account deletion page, used only to "
+                            + "review or continue a deletion request. It is not a support "
+                            + "channel."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(KitColor.secondaryText)
+                }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)

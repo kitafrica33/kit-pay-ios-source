@@ -873,6 +873,33 @@ actor APIClient {
         boundSessionID: String? = nil,
         includeBodyForDelete: Bool = false
     ) async throws -> Response {
+        try await sendWithMeta(
+            path: path,
+            method: method,
+            body: body,
+            authentication: authentication,
+            allowRefresh: allowRefresh,
+            headers: headers,
+            queryItems: queryItems,
+            boundSessionID: boundSessionID,
+            includeBodyForDelete: includeBodyForDelete
+        ).0
+    }
+
+    /// `send` plus the envelope's `meta` block, for endpoints whose contract lives partly in
+    /// response metadata (cursor pagination, idempotent-replay flags). Same transport behavior in
+    /// every respect; the 401-refresh retry threads the tuple through.
+    func sendWithMeta<Response: Decodable, Body: Encodable>(
+        path: String,
+        method: String,
+        body: Body,
+        authentication: APIRequestAuthentication = .required,
+        allowRefresh: Bool = true,
+        headers: [String: String] = [:],
+        queryItems: [URLQueryItem] = [],
+        boundSessionID: String? = nil,
+        includeBodyForDelete: Bool = false
+    ) async throws -> (Response, APIMeta?) {
         let inheritedSessionID = APIClientSessionBinding.sessionID
         if let boundSessionID,
            let inheritedSessionID,
@@ -926,7 +953,7 @@ actor APIClient {
            currentSession != nil,
            allowRefresh {
             try await refreshSession(afterRejectedSession: currentSession)
-            return try await send(
+            return try await sendWithMeta(
                 path: path,
                 method: method,
                 body: body,
@@ -963,7 +990,7 @@ actor APIClient {
                 retryAfter: HTTPRetryAfterParser.delay(from: http)
             )
         }
-        return value
+        return (value, envelope.meta)
     }
 
     private func uploadProfileAvatarBytes(

@@ -252,16 +252,16 @@ private struct UnresolvedAccountDeletionAttemptView: View {
                     .foregroundStyle(KitColor.primaryText)
 
                 Text(
-                    "Kit Pay will keep this account's local data hidden until support confirms "
+                    "Kit Pay will keep this account's local data hidden until Kit Pay confirms "
                         + "whether the interrupted deletion request was accepted. Do not submit it again."
                 )
                 .font(.subheadline)
                 .foregroundStyle(KitColor.secondaryText)
                 .multilineTextAlignment(.center)
 
-                if let supportURL = AccountDeletionContract.trustedFallbackURL {
-                    Link(destination: supportURL) {
-                        Label("Account deletion support", systemImage: "arrow.up.right.square")
+                if let deletionURL = AccountDeletionContract.trustedFallbackURL {
+                    Link(destination: deletionURL) {
+                        Label("Continue your deletion request", systemImage: "arrow.up.right.square")
                             .font(.headline)
                             .frame(maxWidth: .infinity)
                             .frame(minHeight: 48)
@@ -269,6 +269,14 @@ private struct UnresolvedAccountDeletionAttemptView: View {
                     .buttonStyle(.borderedProminent)
                     .buttonBorderShape(.roundedRectangle(radius: 17))
                     .tint(KitColor.green)
+
+                    Text(
+                        "This opens Kit Pay's official account deletion page, used only to review "
+                            + "or continue a deletion request. It is not a support channel."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(KitColor.secondaryText)
+                    .multilineTextAlignment(.center)
                 }
             }
             .padding(24)
@@ -302,7 +310,7 @@ private struct ProtectedLocalStateRecoveryView: View {
                 Text(
                     model.protectedLocalStateRecoveryRequiresSupport
                         ? "Kit Pay could not safely read this device's protected account data. "
-                            + "It remains hidden; contact support before signing in again."
+                            + "It remains hidden and signing in here stays paused."
                         : "Unlock this device and try again. Kit Pay will not show or change local "
                             + "account data until its protected storage is available."
                 )
@@ -310,17 +318,24 @@ private struct ProtectedLocalStateRecoveryView: View {
                 .foregroundStyle(KitColor.secondaryText)
                 .multilineTextAlignment(.center)
 
-                if model.protectedLocalStateRecoveryRequiresSupport,
-                   let supportURL = URL(string: "mailto:info@kit.africa") {
-                    Link(destination: supportURL) {
-                        Label("Contact support", systemImage: "arrow.up.right.square")
-                            .font(.headline)
-                            .frame(maxWidth: .infinity)
-                            .frame(minHeight: 48)
+                if model.protectedLocalStateRecoveryRequiresSupport {
+                    Label {
+                        Text(
+                            "To get help, open Kit Pay on a device where you are signed in and "
+                                + "go to Profile → Help & support. Kit Pay support works only "
+                                + "inside the app, so this signed-out screen can't start a "
+                                + "support request."
+                        )
+                        .font(.footnote)
+                        .foregroundStyle(KitColor.secondaryText)
+                        .multilineTextAlignment(.leading)
+                    } icon: {
+                        Image(systemName: "iphone.gen3")
+                            .foregroundStyle(KitColor.green)
                     }
-                    .buttonStyle(.borderedProminent)
-                    .buttonBorderShape(.roundedRectangle(radius: 17))
-                    .tint(KitColor.green)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(14)
+                    .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16))
                 } else {
                     Button {
                         Task {
@@ -396,17 +411,6 @@ private struct AcceptedAccountDeletionRecoveryView: View {
                 .buttonBorderShape(.roundedRectangle(radius: 17))
                 .tint(KitColor.green)
                 .disabled(isRetrying)
-
-                if let supportURL = AccountDeletionContract.trustedFallbackURL {
-                    Link(destination: supportURL) {
-                        Label("Account deletion support", systemImage: "arrow.up.right.square")
-                            .font(.headline)
-                            .frame(maxWidth: .infinity)
-                            .frame(minHeight: 48)
-                    }
-                    .buttonStyle(.bordered)
-                    .buttonBorderShape(.roundedRectangle(radius: 17))
-                }
             }
             .padding(24)
             .kitGlass(cornerRadius: 30)

@@ -317,7 +317,7 @@ enum AccountDeletionSubmissionError: LocalizedError, Equatable {
         case .accountChanged:
             "The signed-in account changed before deletion could be submitted."
         case .completionUncertain:
-            "Kit Pay could not confirm whether the request was accepted. Do not submit it again. Use account deletion support to resolve this safely."
+            "Kit Pay could not confirm whether the request was accepted. Do not submit it again. Use the option below to resolve this safely."
         case .acceptedForPreviousSession:
             "The deletion request was accepted for the previous signed-in session."
         case .acceptedButLocalCleanupFailed:

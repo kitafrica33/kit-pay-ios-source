@@ -107,10 +107,20 @@ struct APIErrorPayload: Decodable, Error {
 struct APIMeta: Decodable {
     let requestId: String?
     let serverTime: String?
+    /// Cursor-pagination and idempotency metadata (`ApiResponse::success(..., meta:)`). Strictly
+    /// optional: an absent key or JSON null decodes as nil, but a present key of the wrong type
+    /// fails the whole envelope decode — endpoints that require these fields must fail closed on
+    /// a malformed advertisement, never guess.
+    let nextCursor: String?
+    let hasMore: Bool?
+    let idempotentReplay: Bool?
 
     enum CodingKeys: String, CodingKey {
         case requestId = "request_id"
         case serverTime = "server_time"
+        case nextCursor = "next_cursor"
+        case hasMore = "has_more"
+        case idempotentReplay = "idempotent_replay"
     }
 }
 
@@ -505,17 +515,24 @@ struct CapabilityProtocolsDTO: Decodable {
     /// Realtime is an additive transport hint. A malformed advertisement must disable only the
     /// socket path rather than making the entire capabilities response unusable.
     var realtime: RealtimeProtocolCapabilityDTO? = nil
+    /// Typed support contract advertisement. Lenient at this layer for the same reason as
+    /// `realtime` (a malformed block must not make the whole capabilities response unusable);
+    /// `SupportProtocolDTO` itself decodes strictly, so any missing, malformed, unknown, or
+    /// extra value yields `nil` here and `SupportGate` fails closed on it.
+    var support: SupportProtocolDTO? = nil
 
     private enum CodingKeys: String, CodingKey {
-        case messaging, realtime
+        case messaging, realtime, support
     }
 
     init(
         messaging: MessagingProtocolCapabilityDTO?,
-        realtime: RealtimeProtocolCapabilityDTO? = nil
+        realtime: RealtimeProtocolCapabilityDTO? = nil,
+        support: SupportProtocolDTO? = nil
     ) {
         self.messaging = messaging
         self.realtime = realtime
+        self.support = support
     }
 
     init(from decoder: Decoder) throws {
@@ -527,6 +544,10 @@ struct CapabilityProtocolsDTO: Decodable {
         realtime = try? values.decodeIfPresent(
             RealtimeProtocolCapabilityDTO.self,
             forKey: .realtime
+        )
+        support = try? values.decodeIfPresent(
+            SupportProtocolDTO.self,
+            forKey: .support
         )
     }
 }

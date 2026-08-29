@@ -1647,7 +1647,7 @@ final class AppModel: ObservableObject {
                 await concealUnresolvedAcceptedAccountDeletionProjection()
                 lastError =
                     "This device could not finish removing data for an accepted account deletion. "
-                    + "Use account deletion support before signing in again."
+                    + "Retry secure account-deletion cleanup before signing in again."
             } else {
                 await blockProtectedLocalStateRecovery()
             }
@@ -1664,7 +1664,7 @@ final class AppModel: ObservableObject {
                 await concealUnresolvedAcceptedAccountDeletionProjection()
                 lastError =
                     "This device could not safely schedule accepted account-deletion cleanup. "
-                    + "Use account deletion support before signing in again."
+                    + "Retry secure account-deletion cleanup before signing in again."
                 return false
             }
         }
@@ -1690,7 +1690,7 @@ final class AppModel: ObservableObject {
                 await concealUnresolvedAcceptedAccountDeletionProjection()
                 lastError =
                     "This device could not read protected data required to finish account deletion. "
-                    + "Use account deletion support before signing in again."
+                    + "Retry secure account-deletion cleanup before signing in again."
             } else if deletionAttempt != nil {
                 await blockUnresolvedAccountDeletionAttempt()
             } else {
@@ -1723,7 +1723,7 @@ final class AppModel: ObservableObject {
                     await concealUnresolvedAcceptedAccountDeletionProjection()
                     lastError =
                         "This device could not finish removing data for an accepted account deletion. "
-                        + "Use account deletion support before signing in again."
+                        + "Retry secure account-deletion cleanup before signing in again."
                     return false
                 }
             }
@@ -2207,6 +2207,8 @@ final class AppModel: ObservableObject {
             try await SecureMediaFileCache.shared.purge(forUserID: pending.accountID)
             try await ProfileAvatarCache.shared.purge(forUserID: pending.accountID)
             try MessageBackupKeyStore.removeKey(forUserID: pending.accountID)
+            try SupportDraftStore.shared.purgeAccount(accountID: pending.accountID)
+            try SupportPaymentStore.shared.purgeAccount(accountID: pending.accountID)
         } catch {
             await concealUnresolvedAcceptedAccountDeletionProjection()
             return false

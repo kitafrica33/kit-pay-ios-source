@@ -20,6 +20,24 @@ enum KitColor {
     static let primaryText = Color(uiColor: .label)
     static let secondaryText = Color(uiColor: .secondaryLabel)
 
+    /// Verified OFFICIAL Kit Pay identity in support surfaces wears blue, deliberately distinct
+    /// from the green of KYC/personal verification: a chat sender showing the mark a customer
+    /// knows from their own verified profile would lend it borrowed credibility. Blue appears
+    /// only where `isVerifiedOfficialSupport` holds; green stays personal.
+    static let verifiedBlue = Color(uiColor: UIColor { traits in
+        traits.userInterfaceStyle == .dark
+            ? UIColor(red: 96 / 255, green: 168 / 255, blue: 238 / 255, alpha: 1)
+            : UIColor(red: 16 / 255, green: 94 / 255, blue: 176 / 255, alpha: 1)
+    })
+
+    /// Surface tint behind official-support avatars and chips, the blue counterpart of
+    /// `paleGreen` — pale enough to carry `verifiedBlue` glyphs in both appearances.
+    static let paleBlue = Color(uiColor: UIColor { traits in
+        traits.userInterfaceStyle == .dark
+            ? UIColor(red: 20 / 255, green: 50 / 255, blue: 82 / 255, alpha: 1)
+            : UIColor(red: 214 / 255, green: 232 / 255, blue: 250 / 255, alpha: 1)
+    })
+
     /// Money shared out in a group wears gold, so it is never mistaken for an ordinary message or
     /// for the green of a one-to-one payment at a glance.
     ///

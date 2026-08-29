@@ -1564,17 +1564,17 @@ class AppStoreProfileGeneratorTests(unittest.TestCase):
 
 
 class SigningConfigurationTests(unittest.TestCase):
-    def test_build_37_release_identity_is_consistent(self) -> None:
+    def test_build_38_release_identity_is_consistent(self) -> None:
         workflow = (ROOT / ".github/workflows/ios-app-store-archive.yml").read_text()
         project = (ROOT / "KitPay.xcodeproj/project.pbxproj").read_text()
 
         self.assertIn("default: 1.0.16", workflow)
-        self.assertIn('default: "37"', workflow)
-        self.assertIn("v1.0.16-build37", workflow)
+        self.assertIn('default: "38"', workflow)
+        self.assertIn("v1.0.16-build38", workflow)
         # Four each: Debug and Release of the app and of the share extension. iOS refuses to
         # install an app whose extension carries a different version, so they move together.
         self.assertEqual(project.count("MARKETING_VERSION = 1.0.16;"), 4)
-        self.assertEqual(project.count("CURRENT_PROJECT_VERSION = 37;"), 4)
+        self.assertEqual(project.count("CURRENT_PROJECT_VERSION = 38;"), 4)
         self.assertNotIn("MARKETING_VERSION = 1.0.1;", project)
 
     def test_archive_unit_tests_are_ad_hoc_signed_for_keychain_entitlements(self) -> None:

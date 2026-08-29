@@ -10,6 +10,8 @@ enum ProfileDetailDestination: Hashable {
     case identityVerification
     case security
     case chatBackup
+    case inviteFriends
+    case helpSupport
     case legalPrivacy
     case accountDeletion
 }
@@ -85,6 +87,8 @@ struct ProfileView: View {
         case .identityVerification: KYCView()
         case .security: SecurityView()
         case .chatBackup: ChatBackupSettingsView()
+        case .inviteFriends: ReferralView()
+        case .helpSupport: SupportView()
         case .legalPrivacy: LegalPrivacyView()
         case .accountDeletion: AccountDeletionView()
         }
@@ -168,6 +172,14 @@ struct ProfileView: View {
             NavigationLink(value: ProfileDetailDestination.security) { settingsRow(row) }
         case .chatBackup:
             NavigationLink(value: ProfileDetailDestination.chatBackup) { settingsRow(row) }
+        case .referrals:
+            // The row itself only exists while the capability is advertised (see
+            // `secondaryRows`), so this is plain navigation; the screen re-checks the gate too.
+            NavigationLink(value: ProfileDetailDestination.inviteFriends) { settingsRow(row) }
+        case .helpSupport where supportAvailable:
+            NavigationLink(value: ProfileDetailDestination.helpSupport) { settingsRow(row) }
+        case .helpSupport:
+            settingsRow(row, showsDisclosure: false)
         case .legalPrivacy:
             NavigationLink(value: ProfileDetailDestination.legalPrivacy) { settingsRow(row) }
         case .accountDeletion:
@@ -241,6 +253,22 @@ struct ProfileView: View {
         model.capabilities?.supportsFeature("kyc") == true
     }
 
+    private var supportAvailable: Bool {
+        // The full typed gate, not the bare feature flag: the row appears only when the server
+        // advertises the exact support contract this client implements.
+        SupportGate.state(for: model.capabilities).isAvailable
+    }
+
+    private var referralsAvailable: Bool {
+        ReferralGate.state(for: model.capabilities).isAvailable
+    }
+
+    private var helpSupportSubtitle: String {
+        supportAvailable
+            ? "Message Kit Pay support in the app"
+            : "In-app support is not available yet"
+    }
+
     private var identityVerificationTitle: String {
         guard kycAvailable else { return "Verify your identity with Didit" }
         if kycVerified { return "Identity verified with Didit" }
@@ -267,7 +295,7 @@ struct ProfileView: View {
         ) {
             return "Request protected deletion of your account and eligible data"
         }
-        return "Open the support-assisted account deletion request"
+        return "Review or continue your account deletion request"
     }
 
     private var primaryRows: [ProfileRow] {
@@ -312,7 +340,26 @@ struct ProfileView: View {
     }
 
     private var secondaryRows: [ProfileRow] {
-        [
+        var rows: [ProfileRow] = []
+        // Server-advertised capability, default off: while `referrals` isn't exactly true the
+        // row does not exist at all — no disabled teaser, no dark-launch hint.
+        if referralsAvailable {
+            rows.append(
+                .init(
+                    title: "Invite friends",
+                    subtitle: "Share your Kit Pay invite link and track rewards",
+                    icon: "gift",
+                    destination: .referrals
+                )
+            )
+        }
+        rows.append(contentsOf: [
+            .init(
+                title: "Help & support",
+                subtitle: helpSupportSubtitle,
+                icon: "questionmark.circle",
+                destination: .helpSupport
+            ),
             .init(
                 title: "Legal & privacy",
                 subtitle: "Privacy policy, licences and software notices",
@@ -325,7 +372,8 @@ struct ProfileView: View {
                 icon: "person.crop.circle.badge.xmark",
                 destination: .accountDeletion
             )
-        ]
+        ])
+        return rows
     }
 
     private var profileEmailPresentation: ProfileEmailPresentation {
@@ -684,6 +732,8 @@ private enum ProfileRowDestination {
     case identityVerification
     case security
     case chatBackup
+    case referrals
+    case helpSupport
     case legalPrivacy
     case accountDeletion
 }
