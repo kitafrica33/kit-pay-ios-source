@@ -747,11 +747,13 @@ struct GroupAvatarView: View {
 /// with no network, and the bytes sit encrypted on disk instead of in the clear in `URLCache`.
 /// Loading is lazy by construction: the fetch starts in `.task`, so a row that never scrolls into
 /// view never downloads anything.
+///
+/// Verification is intentionally absent here. The authoritative seal belongs immediately after
+/// a displayed account name, never on the profile-photo circle or its accessibility label.
 struct RemoteAvatarView: View {
     let name: String
     let avatarURL: String?
     var size: CGFloat = 52
-    var verification: AccountVerificationDesignation? = nil
     /// Opacity of the hairline ring, or `nil` where the avatar already sits inside a glass lens
     /// and a second outline would only muddy the edge.
     var ringOpacity: Double? = 0.65
@@ -762,14 +764,12 @@ struct RemoteAvatarView: View {
         name: String,
         avatarURL: String?,
         size: CGFloat = 52,
-        ringOpacity: Double? = 0.65,
-        verification: AccountVerificationDesignation? = nil
+        ringOpacity: Double? = 0.65
     ) {
         self.name = name
         self.avatarURL = avatarURL
         self.size = size
         self.ringOpacity = ringOpacity
-        self.verification = verification
         // Seeded synchronously so a row scrolling back into view draws its photo in the first
         // frame rather than flashing initials for one hop.
         _image = State(initialValue: ProfileAvatarCache.cachedImage(for: avatarURL))
@@ -794,23 +794,9 @@ struct RemoteAvatarView: View {
                     .allowsHitTesting(false)
             }
         }
-        .overlay(alignment: .topTrailing) {
-            if let verification {
-                VerifiedAccountBadge(
-                    designation: verification,
-                    diameter: max(15, size * 0.30),
-                    hasContrastBorder: true
-                )
-                .offset(x: size * 0.04, y: -size * 0.04)
-                .accessibilityHidden(true)
-            }
-        }
         .animation(.easeOut(duration: 0.18), value: image == nil)
         .task(id: avatarURL) { await load() }
-        .accessibilityLabel(
-            verification.map { "Profile photo for \(name), \($0.accessibilityLabel)" }
-                ?? "Profile photo for \(name)"
-        )
+        .accessibilityLabel("Profile photo for \(name)")
     }
 
     private func load() async {
@@ -828,12 +814,42 @@ struct RemoteAvatarView: View {
     }
 }
 
-/// Compact public-verification seal used beside account names and on profile photos.
-/// Callers can only construct it with an allowlisted designation decoded from the server.
-struct VerifiedAccountBadge: View {
+/// Keeps an authoritative public-verification seal immediately after the displayed account name.
+/// Profile photos deliberately carry no verification decoration; the name is the sole placement.
+struct VerifiedAccountNameLabel<NameContent: View>: View {
+    let designation: AccountVerificationDesignation?
+    var spacing: CGFloat = 5
+    var badgeDiameter: CGFloat = 15
+    private let nameContent: NameContent
+
+    init(
+        designation: AccountVerificationDesignation?,
+        spacing: CGFloat = 5,
+        badgeDiameter: CGFloat = 15,
+        @ViewBuilder nameContent: () -> NameContent
+    ) {
+        self.designation = designation
+        self.spacing = spacing
+        self.badgeDiameter = badgeDiameter
+        self.nameContent = nameContent()
+    }
+
+    var body: some View {
+        HStack(spacing: spacing) {
+            nameContent
+            if let designation {
+                VerifiedAccountBadge(designation: designation, diameter: badgeDiameter)
+            }
+        }
+        .accessibilityElement(children: .combine)
+    }
+}
+
+/// Compact public-verification seal. Construction is private so it can only appear through the
+/// name-label component above, never as an avatar overlay or free-floating decoration.
+private struct VerifiedAccountBadge: View {
     let designation: AccountVerificationDesignation
     var diameter: CGFloat = 16
-    var hasContrastBorder = false
 
     var body: some View {
         Image(systemName: "checkmark.seal.fill")
@@ -841,13 +857,8 @@ struct VerifiedAccountBadge: View {
         .foregroundStyle(.white, KitColor.verifiedBlue)
         .font(.system(size: diameter, weight: .semibold))
         .frame(width: diameter, height: diameter)
-        .background {
-            if hasContrastBorder {
-                Circle()
-                    .fill(.white)
-                    .padding(-max(1, diameter * 0.06))
-            }
-        }
+        .fixedSize()
+        .layoutPriority(1)
         .shadow(color: KitColor.verifiedBlue.opacity(0.22), radius: 2, y: 1)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(designation.accessibilityLabel)

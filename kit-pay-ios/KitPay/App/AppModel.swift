@@ -1747,9 +1747,13 @@ final class AppModel: ObservableObject {
         for participantUserIds: [String]?,
         identities: [String: AccountIdentityProjection]? = nil
     ) -> AccountVerificationDesignation? {
-        guard let remoteUserId = participantUserIds?.first(where: {
+        let remoteUserIds = participantUserIds?.filter {
             $0.caseInsensitiveCompare(profile?.id ?? "") != .orderedSame
-        }) else { return nil }
+        } ?? []
+        // A call-level name can claim one person's designation only when the authenticated roster
+        // has one remote account. Multi-person calls keep per-participant badges on their named
+        // tiles; borrowing the first member's badge for a group title would be misleading.
+        guard remoteUserIds.count == 1, let remoteUserId = remoteUserIds.first else { return nil }
         if let identity = identities?[remoteUserId.lowercased()],
            identity.isValid,
            let verification = identity.verification?.designation {

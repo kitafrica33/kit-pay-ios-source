@@ -207,13 +207,14 @@ struct ForwardMessagesView: View {
                 RemoteAvatarView(
                     name: row.displayName,
                     avatarURL: row.avatarURL,
-                    size: 44,
-                    verification: row.verification
+                    size: 44
                 )
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(row.displayName)
-                        .font(.headline)
-                        .foregroundStyle(KitColor.primaryText)
+                    VerifiedAccountNameLabel(designation: row.verification) {
+                        Text(row.displayName)
+                            .font(.headline)
+                            .foregroundStyle(KitColor.primaryText)
+                    }
                     Text(row.subtitle)
                         .font(.caption)
                         .foregroundStyle(KitColor.secondaryText)
@@ -459,7 +460,7 @@ struct ForwardMessagesView: View {
                     displayName: presentation.displayName,
                     subtitle: presentation.contact?.phone.forwardingNilIfBlank ?? "Chat on Kit Pay",
                     avatarURL: presentation.avatarURL,
-                    verification: presentation.contact?.verification?.designation,
+                    verification: presentation.verification,
                     recipientUserID: recipientUserID
                 )
             )

@@ -108,13 +108,16 @@ struct CallsView: View {
             RemoteAvatarView(
                 name: call.name,
                 avatarURL: model.callParticipantAvatarURL(for: call),
-                size: 56,
-                verification: model.callParticipantVerification(for: call)
+                size: 56
             )
             VStack(alignment: .leading, spacing: 5) {
-                Text(call.name)
-                    .font(.headline)
-                    .foregroundStyle(presentation.isMissed ? .red : KitColor.primaryText)
+                VerifiedAccountNameLabel(
+                    designation: model.callParticipantVerification(for: call)
+                ) {
+                    Text(call.name)
+                        .font(.headline)
+                        .foregroundStyle(presentation.isMissed ? .red : KitColor.primaryText)
+                }
                 HStack(spacing: 5) {
                     Image(systemName: presentation.isOutgoing ? "arrow.up.right" : "arrow.down.left")
                     Text(
@@ -284,11 +287,14 @@ private struct NewCallSheet: View {
             RemoteAvatarView(
                 name: contact.name,
                 avatarURL: contact.source?.avatarURL,
-                size: 42,
-                verification: contact.source?.verification?.designation
+                size: 42
             )
             VStack(alignment: .leading, spacing: 3) {
-                Text(contact.name).font(.headline)
+                VerifiedAccountNameLabel(
+                    designation: contact.source?.verification?.designation
+                ) {
+                    Text(contact.name).font(.headline)
+                }
                 Text(contact.subtitle)
                     .font(.caption)
                     .foregroundStyle(KitColor.secondaryText)

@@ -2507,7 +2507,7 @@ private struct SupportSenderAvatarView: View {
         switch avatar {
         case .officialMark:
             disc {
-                Image(systemName: "checkmark.seal.fill")
+                Image(systemName: "lifepreserver.fill")
                     .font(.system(size: 13, weight: .semibold))
             }
             .accessibilityLabel("Kit Pay official")

@@ -639,18 +639,21 @@ struct ActiveCallView: View {
                             CallParticipantAvatarView(
                                 name: call.participantName,
                                 avatarURL: call.participantAvatarURL,
-                                size: avatarSize,
-                                verification: call.participantVerification
+                                size: avatarSize
                             )
                         }
                         if !compactLandscape {
-                            Text(call.participantName)
-                                .font(.title2.bold())
-                                .foregroundStyle(callForeground)
-                                .multilineTextAlignment(.center)
-                                .lineLimit(2)
-                                .minimumScaleFactor(0.76)
-                                .padding(.horizontal, 28)
+                            VerifiedAccountNameLabel(
+                                designation: call.participantVerification
+                            ) {
+                                Text(call.participantName)
+                                    .font(.title2.bold())
+                                    .foregroundStyle(callForeground)
+                                    .multilineTextAlignment(.center)
+                                    .lineLimit(2)
+                                    .minimumScaleFactor(0.76)
+                            }
+                            .padding(.horizontal, 28)
                         }
                     }
                     .shadow(color: .black.opacity(0.34), radius: 28, y: 14)
@@ -891,13 +894,15 @@ struct ActiveCallView: View {
         compactLandscape: Bool
     ) -> some View {
         VStack(spacing: compactLandscape ? 1 : 3) {
-            Text(call.participantName)
-                .font(compactLandscape ? .headline.bold() : .title2.bold())
-                .foregroundStyle(callForeground)
-                .lineLimit(compactLandscape ? 1 : 2)
-                .minimumScaleFactor(0.72)
-                .multilineTextAlignment(.center)
-                .accessibilityAddTraits(.isHeader)
+            VerifiedAccountNameLabel(designation: call.participantVerification) {
+                Text(call.participantName)
+                    .font(compactLandscape ? .headline.bold() : .title2.bold())
+                    .foregroundStyle(callForeground)
+                    .lineLimit(compactLandscape ? 1 : 2)
+                    .minimumScaleFactor(0.72)
+                    .multilineTextAlignment(.center)
+                    .accessibilityAddTraits(.isHeader)
+            }
 
             TimelineView(.periodic(from: .now, by: 1)) { timeline in
                 let status = callStatus(at: timeline.date)
@@ -1560,8 +1565,7 @@ private struct GroupCallParticipantTile: View {
                     CallParticipantAvatarView(
                         name: participant.name,
                         avatarURL: participant.avatarURL,
-                        size: avatarSize,
-                        verification: participant.verification
+                        size: avatarSize
                     )
                 }
             }
@@ -1574,10 +1578,15 @@ private struct GroupCallParticipantTile: View {
                             .font(.caption2.weight(.semibold))
                             .accessibilityHidden(true)
                     }
-                    Text(participant.name)
-                        .font(.caption.weight(.semibold))
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.75)
+                    VerifiedAccountNameLabel(
+                        designation: participant.verification,
+                        badgeDiameter: 12
+                    ) {
+                        Text(participant.name)
+                            .font(.caption.weight(.semibold))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.75)
+                    }
                 }
                 .foregroundStyle(.white)
                 .padding(.horizontal, 9)
@@ -1717,13 +1726,16 @@ private struct ActiveCallParticipantSheet: View {
                                     RemoteAvatarView(
                                         name: contact.name,
                                         avatarURL: contact.source?.avatarURL,
-                                        size: 42,
-                                        verification: contact.source?.verification?.designation
+                                        size: 42
                                     )
                                     VStack(alignment: .leading, spacing: 3) {
-                                        Text(contact.name)
-                                            .font(.headline)
-                                            .foregroundStyle(KitColor.primaryText)
+                                        VerifiedAccountNameLabel(
+                                            designation: contact.source?.verification?.designation
+                                        ) {
+                                            Text(contact.name)
+                                                .font(.headline)
+                                                .foregroundStyle(KitColor.primaryText)
+                                        }
                                         Text(contact.subtitle)
                                             .font(.caption)
                                             .foregroundStyle(KitColor.secondaryText)
@@ -2085,14 +2097,18 @@ struct MinimizedCallView: View {
                     CallParticipantAvatarView(
                         name: call.participantName,
                         avatarURL: call.participantAvatarURL,
-                        size: 38,
-                        verification: call.participantVerification
+                        size: 38
                     )
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(call.participantName)
-                            .font(.subheadline.bold())
-                            .foregroundStyle(.primary)
-                            .lineLimit(1)
+                        VerifiedAccountNameLabel(
+                            designation: call.participantVerification,
+                            badgeDiameter: 13
+                        ) {
+                            Text(call.participantName)
+                                .font(.subheadline.bold())
+                                .foregroundStyle(.primary)
+                                .lineLimit(1)
+                        }
                         HStack(spacing: 5) {
                             Circle()
                                 .fill(KitColor.green)
@@ -2325,10 +2341,15 @@ struct MinimizedCallView: View {
                     )
 
                     VStack(alignment: .leading, spacing: 4) {
-                        Text(call.participantName)
-                            .font(.caption.bold())
-                            .foregroundStyle(.white)
-                            .lineLimit(1)
+                        VerifiedAccountNameLabel(
+                            designation: call.participantVerification,
+                            badgeDiameter: 12
+                        ) {
+                            Text(call.participantName)
+                                .font(.caption.bold())
+                                .foregroundStyle(.white)
+                                .lineLimit(1)
+                        }
                         HStack(spacing: 5) {
                             Circle()
                                 .fill(KitColor.green)
@@ -2413,8 +2434,7 @@ struct MinimizedCallView: View {
                     CallParticipantAvatarView(
                         name: call.participantName,
                         avatarURL: call.participantAvatarURL,
-                        size: min(size.width * 0.58, 82),
-                        verification: call.participantVerification
+                        size: min(size.width * 0.58, 82)
                     )
                 }
             }
@@ -2867,15 +2887,13 @@ private struct CallParticipantAvatarView: View {
     let name: String
     let avatarURL: String?
     let size: CGFloat
-    var verification: AccountVerificationDesignation? = nil
 
     var body: some View {
         RemoteAvatarView(
             name: name,
             avatarURL: avatarURL,
             size: size,
-            ringOpacity: 0.22,
-            verification: verification
+            ringOpacity: 0.22
         )
     }
 }

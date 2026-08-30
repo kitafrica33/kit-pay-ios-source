@@ -641,19 +641,17 @@ struct MessagesView: View {
                 RemoteAvatarView(
                     name: context.displayName,
                     avatarURL: context.avatarURL,
-                    size: 52,
-                    verification: context.verification
+                    size: 52
                 )
             }
 
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 5) {
-                    Text(context.displayName)
-                        .font(.body.weight(.semibold))
-                        .foregroundStyle(KitColor.navy)
-                        .lineLimit(1)
-                    if let verification = context.verification {
-                        VerifiedAccountBadge(designation: verification, diameter: 15)
+                    VerifiedAccountNameLabel(designation: context.verification) {
+                        Text(context.displayName)
+                            .font(.body.weight(.semibold))
+                            .foregroundStyle(KitColor.navy)
+                            .lineLimit(1)
                     }
                     if model.isReadOnlyAppReviewDemoConversation(conversation.id) {
                         Image(systemName: "eye.fill")
@@ -1228,18 +1226,16 @@ private struct MessageGlobalSearchView: View {
             RemoteAvatarView(
                 name: contact.name,
                 avatarURL: contact.avatarURL,
-                size: 48,
-                verification: contact.verification?.designation
+                size: 48
             )
             VStack(alignment: .leading, spacing: 3) {
-                HStack(spacing: 5) {
+                VerifiedAccountNameLabel(
+                    designation: contact.verification?.designation
+                ) {
                     Text(contact.name)
                         .font(.body.weight(.semibold))
                         .foregroundStyle(.primary)
                         .lineLimit(1)
-                    if let verification = contact.verification?.designation {
-                        VerifiedAccountBadge(designation: verification, diameter: 15)
-                    }
                 }
                 Text(contactTag.map { "@\($0)" } ?? contact.phone)
                     .font(.caption)
@@ -1258,18 +1254,14 @@ private struct MessageGlobalSearchView: View {
             RemoteAvatarView(
                 name: hit.displayName,
                 avatarURL: hit.avatarURL,
-                size: 52,
-                verification: hit.verification
+                size: 52
             )
             VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 5) {
+                VerifiedAccountNameLabel(designation: hit.verification) {
                     Text(hit.displayName)
                         .font(.body.weight(.semibold))
                         .foregroundStyle(.primary)
                         .lineLimit(1)
-                    if let verification = hit.verification {
-                        VerifiedAccountBadge(designation: verification, diameter: 15)
-                    }
                 }
                 Text(
                     hit.lastMessage.map {
@@ -1296,17 +1288,15 @@ private struct MessageGlobalSearchView: View {
             RemoteAvatarView(
                 name: hit.displayName,
                 avatarURL: hit.avatarURL,
-                size: 48,
-                verification: hit.verification
+                size: 48
             )
             VStack(alignment: .leading, spacing: 4) {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text(hit.displayName)
-                        .font(.body.weight(.semibold))
-                        .foregroundStyle(.primary)
-                        .lineLimit(1)
-                    if let verification = hit.verification {
-                        VerifiedAccountBadge(designation: verification, diameter: 15)
+                    VerifiedAccountNameLabel(designation: hit.verification) {
+                        Text(hit.displayName)
+                            .font(.body.weight(.semibold))
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
                     }
                     Spacer(minLength: 4)
                     Text(AppPresentationClock.abbreviatedDate(hit.message.createdAt))
@@ -3925,8 +3915,7 @@ struct ConversationView: View {
                         name: recipientDisplayName,
                         avatarURL: recipientPresentation.avatarURL,
                         size: ConversationHeaderLayoutPolicy.avatarImageDiameter,
-                        isGroup: isGroupConversation,
-                        verification: recipientContact?.verification?.designation
+                        isGroup: isGroupConversation
                     )
                     .kitBarControlGlass(
                         diameter: ConversationHeaderLayoutPolicy.avatarControlDiameter
@@ -3954,15 +3943,14 @@ struct ConversationView: View {
             ToolbarItem(placement: .principal) {
                 Button { openConversationProfile() } label: {
                     VStack(alignment: .leading, spacing: 1) {
-                        HStack(spacing: 5) {
+                        VerifiedAccountNameLabel(
+                            designation: recipientPresentation.verification
+                        ) {
                             Text(recipientDisplayName)
                                 .font(.headline)
                                 .foregroundStyle(.primary)
                                 .lineLimit(ConversationHeaderLayoutPolicy.nameLineLimit)
                                 .truncationMode(.tail)
-                            if let verification = recipientContact?.verification?.designation {
-                                VerifiedAccountBadge(designation: verification, diameter: 15)
-                            }
                         }
                         if let presenceSubtitle {
                             Text(presenceSubtitle)
@@ -8017,19 +8005,19 @@ private struct ConversationContactProfileView: View {
                         RemoteAvatarView(
                             name: displayName,
                             avatarURL: avatarURL ?? contact?.avatarURL,
-                            size: 96,
-                            verification: verification ?? contact?.verification?.designation
+                            size: 96
                         )
                             .kitCircularGlass(diameter: 116, interactive: false)
 
-                        HStack(spacing: 7) {
+                        VerifiedAccountNameLabel(
+                            designation: verification ?? contact?.verification?.designation,
+                            spacing: 7,
+                            badgeDiameter: 22
+                        ) {
                             Text(displayName)
                                 .font(.largeTitle.bold())
                                 .foregroundStyle(.primary)
                                 .multilineTextAlignment(.center)
-                            if let verification = contact?.verification?.designation {
-                                VerifiedAccountBadge(designation: verification, diameter: 22)
-                            }
                         }
 
                         if let subtitle {
@@ -8407,7 +8395,6 @@ private struct ConversationAvatarView: View {
     let avatarURL: String?
     let size: CGFloat
     var isGroup = false
-    var verification: AccountVerificationDesignation? = nil
 
     var body: some View {
         if isGroup {
@@ -8417,8 +8404,7 @@ private struct ConversationAvatarView: View {
                 name: name,
                 avatarURL: avatarURL,
                 size: size,
-                ringOpacity: nil,
-                verification: verification
+                ringOpacity: nil
             )
         }
     }
@@ -8849,17 +8835,15 @@ private struct NewMessageSheet: View {
             RemoteAvatarView(
                 name: contact.name,
                 avatarURL: contact.avatarURL,
-                size: 44,
-                verification: contact.verification?.designation
+                size: 44
             )
             VStack(alignment: .leading, spacing: 3) {
-                HStack(spacing: 5) {
+                VerifiedAccountNameLabel(
+                    designation: contact.verification?.designation
+                ) {
                     Text(contact.name)
                         .font(.headline)
                         .foregroundStyle(KitColor.primaryText)
-                    if let verification = contact.verification?.designation {
-                        VerifiedAccountBadge(designation: verification, diameter: 15)
-                    }
                 }
                 Text(contact.phone.nilIfBlank ?? "Kit Pay member")
                     .font(.caption)

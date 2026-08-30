@@ -133,13 +133,16 @@ struct MessageInfoView: View {
                     RemoteAvatarView(
                         name: name,
                         avatarURL: avatarURLForUserID(recipient.userID),
-                        size: 40,
-                        verification: verificationForUserID(recipient.userID)
+                        size: 40
                     )
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(name)
-                            .font(.body)
-                            .foregroundStyle(.primary)
+                        VerifiedAccountNameLabel(
+                            designation: verificationForUserID(recipient.userID)
+                        ) {
+                            Text(name)
+                                .font(.body)
+                                .foregroundStyle(.primary)
+                        }
                         Text(summary(for: recipient))
                             .font(.caption)
                             .foregroundStyle(.secondary)

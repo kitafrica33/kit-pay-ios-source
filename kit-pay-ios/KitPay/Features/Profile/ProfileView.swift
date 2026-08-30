@@ -103,13 +103,14 @@ struct ProfileView: View {
                 size: 82
             )
             VStack(alignment: .leading, spacing: 5) {
-                HStack(spacing: 6) {
+                VerifiedAccountNameLabel(
+                    designation: model.profile?.verification?.designation,
+                    spacing: 6,
+                    badgeDiameter: 18
+                ) {
                     Text(model.profile?.identityDisplayName ?? "Kit Pay user")
                         .font(.title2.bold())
                         .foregroundStyle(KitColor.primaryText)
-                    if let designation = model.profile?.verification?.designation {
-                        VerifiedAccountBadge(designation: designation, diameter: 18)
-                    }
                 }
                 if let legalName = distinctVerifiedLegalName {
                     Text("Legal name: \(legalName)")

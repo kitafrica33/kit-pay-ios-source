@@ -643,15 +643,13 @@ struct SendMoneyView: View {
                 RemoteAvatarView(
                     name: contact.name,
                     avatarURL: contact.avatarURL,
-                    size: 46,
-                    verification: contact.verification?.designation
+                    size: 46
                 )
                 VStack(alignment: .leading, spacing: 3) {
-                    HStack(spacing: 5) {
+                    VerifiedAccountNameLabel(
+                        designation: contact.verification?.designation
+                    ) {
                         MarqueeText(text: contact.name, font: .headline)
-                        if let verification = contact.verification?.designation {
-                            VerifiedAccountBadge(designation: verification, diameter: 15)
-                        }
                     }
                     Text(contact.tag?.nilIfEmpty ?? contact.phone)
                         .font(.subheadline)
@@ -675,11 +673,14 @@ struct SendMoneyView: View {
                         RemoteAvatarView(
                             name: selectedContact.name,
                             avatarURL: selectedContact.avatarURL,
-                            size: 38,
-                            verification: selectedContact.verification?.designation
+                            size: 38
                         )
                         VStack(alignment: .leading) {
-                            Text(selectedContact.name).font(.headline)
+                            VerifiedAccountNameLabel(
+                                designation: selectedContact.verification?.designation
+                            ) {
+                                Text(selectedContact.name).font(.headline)
+                            }
                             Text(selectedContact.phone).font(.caption).foregroundStyle(KitColor.secondaryText)
                         }
                     }
@@ -781,10 +782,13 @@ struct SendMoneyView: View {
                     RemoteAvatarView(
                         name: selectedContact.name,
                         avatarURL: selectedContact.avatarURL,
-                        size: 70,
-                        verification: selectedContact.verification?.designation
+                        size: 70
                     )
-                    Text(selectedContact.name).font(.title2.bold())
+                    VerifiedAccountNameLabel(
+                        designation: selectedContact.verification?.designation
+                    ) {
+                        Text(selectedContact.name).font(.title2.bold())
+                    }
                     Text(displayedAmount)
                         .font(.system(size: 38, weight: .heavy, design: .rounded))
                 }
@@ -1143,17 +1147,20 @@ struct RequestMoneyView: View {
                                         RemoteAvatarView(
                                             name: contact.name,
                                             avatarURL: contact.avatarURL,
-                                            size: 50,
-                                            verification: contact.verification?.designation
+                                            size: 50
                                         )
                                         // A tile this narrow cannot show most full names, and a
                                         // first name alone is ambiguous between contacts. Long
                                         // names scroll past instead of being cut short.
-                                        MarqueeText(
-                                            text: contact.name,
-                                            font: .caption.bold(),
-                                            color: KitColor.primaryText
-                                        )
+                                        VerifiedAccountNameLabel(
+                                            designation: contact.verification?.designation
+                                        ) {
+                                            MarqueeText(
+                                                text: contact.name,
+                                                font: .caption.bold(),
+                                                color: KitColor.primaryText
+                                            )
+                                        }
                                     }
                                     .frame(width: 82)
                                     .padding(.vertical, 12)
@@ -1687,12 +1694,17 @@ struct TransactionDetailView: View {
                 RemoteAvatarView(
                     name: transaction.counterparty?.name ?? "Kit Pay",
                     avatarURL: model.contactAvatarURL(forUserID: transaction.counterparty?.id),
-                    size: 68,
-                    verification: model.contactVerification(forUserID: transaction.counterparty?.id)
+                    size: 68
                 )
-                Text(transaction.counterparty?.name ?? transaction.type.displayLabel)
-                    .font(.title2.bold())
-                    .foregroundStyle(KitColor.primaryText)
+                VerifiedAccountNameLabel(
+                    designation: model.contactVerification(
+                        forUserID: transaction.counterparty?.id
+                    )
+                ) {
+                    Text(transaction.counterparty?.name ?? transaction.type.displayLabel)
+                        .font(.title2.bold())
+                        .foregroundStyle(KitColor.primaryText)
+                }
                 Text(transaction.signedDisplayAmount)
                     .font(.system(size: 38, weight: .heavy, design: .rounded))
                     .foregroundStyle(transaction.direction == "credit" ? KitColor.green : KitColor.primaryText)

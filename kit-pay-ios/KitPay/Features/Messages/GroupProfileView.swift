@@ -444,14 +444,15 @@ struct GroupProfileView: View {
             RemoteAvatarView(
                 name: member.displayName,
                 avatarURL: member.avatarURL,
-                size: 44,
-                verification: member.verification
+                size: 44
             )
             HStack(spacing: 8) {
-                Text(member.displayName)
-                    .font(.headline)
-                    .foregroundStyle(KitColor.primaryText)
-                    .lineLimit(1)
+                VerifiedAccountNameLabel(designation: member.verification) {
+                    Text(member.displayName)
+                        .font(.headline)
+                        .foregroundStyle(KitColor.primaryText)
+                        .lineLimit(1)
+                }
                 if member.isCurrentUser {
                     Text("You")
                         .font(.caption.weight(.semibold))
@@ -945,17 +946,15 @@ struct GroupMemberPickerView: View {
                 RemoteAvatarView(
                     name: contact.name,
                     avatarURL: contact.avatarURL,
-                    size: 44,
-                    verification: contact.verification?.designation
+                    size: 44
                 )
                 VStack(alignment: .leading, spacing: 3) {
-                    HStack(spacing: 5) {
+                    VerifiedAccountNameLabel(
+                        designation: contact.verification?.designation
+                    ) {
                         Text(contact.name)
                             .font(.headline)
                             .foregroundStyle(KitColor.primaryText)
-                        if let verification = contact.verification?.designation {
-                            VerifiedAccountBadge(designation: verification, diameter: 15)
-                        }
                     }
                     Text(
                         contact.phone.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty

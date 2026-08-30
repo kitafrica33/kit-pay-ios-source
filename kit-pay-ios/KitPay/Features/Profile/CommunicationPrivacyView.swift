@@ -248,14 +248,15 @@ struct CommunicationPrivacyView: View {
             RemoteAvatarView(
                 name: person.displayName,
                 avatarURL: person.avatarURL,
-                size: 46,
-                verification: person.verification
+                size: 46
             )
             VStack(alignment: .leading, spacing: 3) {
-                Text(person.displayName)
-                    .font(.body.weight(.semibold))
-                    .foregroundStyle(KitColor.primaryText)
-                    .lineLimit(1)
+                VerifiedAccountNameLabel(designation: person.verification) {
+                    Text(person.displayName)
+                        .font(.body.weight(.semibold))
+                        .foregroundStyle(KitColor.primaryText)
+                        .lineLimit(1)
+                }
                 if let detail = person.detail {
                     Text(detail)
                         .font(.caption)
@@ -398,14 +399,17 @@ private struct CommunicationBlockPickerView: View {
                                 RemoteAvatarView(
                                     name: candidate.displayName,
                                     avatarURL: candidate.avatarURL,
-                                    size: 46,
-                                    verification: candidate.verification
+                                    size: 46
                                 )
                                 VStack(alignment: .leading, spacing: 3) {
-                                    Text(candidate.displayName)
-                                        .font(.body.weight(.semibold))
-                                        .foregroundStyle(KitColor.primaryText)
-                                        .lineLimit(1)
+                                    VerifiedAccountNameLabel(
+                                        designation: candidate.verification
+                                    ) {
+                                        Text(candidate.displayName)
+                                            .font(.body.weight(.semibold))
+                                            .foregroundStyle(KitColor.primaryText)
+                                            .lineLimit(1)
+                                    }
                                     if let detail = candidate.detail {
                                         Text(detail)
                                             .font(.caption)

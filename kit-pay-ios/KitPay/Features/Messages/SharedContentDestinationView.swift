@@ -199,15 +199,16 @@ struct SharedContentDestinationView: View {
                     RemoteAvatarView(
                         name: destination.displayName,
                         avatarURL: destination.avatarURL,
-                        size: 44,
-                        verification: destination.verification
+                        size: 44
                     )
                 }
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(destination.displayName)
-                        .font(.headline)
-                        .foregroundStyle(KitColor.primaryText)
-                        .lineLimit(1)
+                    VerifiedAccountNameLabel(designation: destination.verification) {
+                        Text(destination.displayName)
+                            .font(.headline)
+                            .foregroundStyle(KitColor.primaryText)
+                            .lineLimit(1)
+                    }
                     Text(destination.subtitle)
                         .font(.caption)
                         .foregroundStyle(KitColor.secondaryText)
