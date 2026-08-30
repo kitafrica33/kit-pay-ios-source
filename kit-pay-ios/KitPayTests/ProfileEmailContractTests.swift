@@ -267,7 +267,11 @@ final class ProfileEmailContractTests: XCTestCase {
             attachmentAvailable: true
         )
         XCTAssertFalse(verified.canAttach)
-        XCTAssertTrue(verified.subtitle.contains("Verified"))
+        XCTAssertEqual(
+            verified.subtitle,
+            "amina@example.test · Email changes are not yet supported"
+        )
+        XCTAssertFalse(verified.subtitle.contains("Verified"))
 
         let unavailable = ProfileEmailPresentationPolicy.presentation(
             profile: profile(email: nil, emailVerified: nil),

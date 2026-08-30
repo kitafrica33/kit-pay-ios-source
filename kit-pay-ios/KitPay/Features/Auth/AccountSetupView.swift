@@ -55,7 +55,7 @@ private struct ProfileSetupView: View {
     private var subtitle: String {
         verifiedLegalName == nil
             ? "Choose the display name and unique @username people will see when they pay or message you."
-            : "Your identity is verified. Everything below is optional — it only changes how other people see you."
+            : "Your legal name is already on file. Everything below is optional — it only changes how other people see you."
     }
 
     var body: some View {
@@ -139,14 +139,14 @@ private struct ProfileSetupView: View {
 
     private func verifiedIdentityCard(_ legalName: String) -> some View {
         HStack(alignment: .top, spacing: 13) {
-            Image(systemName: "checkmark.seal.fill")
+            Image(systemName: "person.text.rectangle")
                 .font(.title3.weight(.semibold))
-                .foregroundStyle(KitColor.green)
+                .foregroundStyle(KitColor.secondaryText)
                 .frame(width: 42, height: 42)
-                .background(KitColor.paleGreen.opacity(0.3), in: Circle())
+                .background(.thinMaterial, in: Circle())
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 4) {
-                Text("Verified legal name")
+                Text("Legal name")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(KitColor.secondaryText)
                     .textCase(.uppercase)
@@ -160,9 +160,9 @@ private struct ProfileSetupView: View {
             Spacer(minLength: 0)
         }
         .padding(17)
-        .kitGlass(cornerRadius: 24, tint: KitColor.paleGreen, shadow: false)
+        .kitGlass(cornerRadius: 24, shadow: false)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("Verified legal name, \(legalName)")
+        .accessibilityLabel("Legal name, \(legalName)")
     }
 
     private var photoCard: some View {
@@ -185,24 +185,12 @@ private struct ProfileSetupView: View {
                     RemoteAvatarView(
                         name: displayNamePreview,
                         avatarURL: model.profile?.avatarURL,
-                        size: 96,
-                        verification: model.profile?.verification?.designation
+                        size: 96
                     )
                 }
                 if isPreparingPhoto {
                     Circle().fill(.black.opacity(0.32)).frame(width: 96, height: 96)
                     ProgressView().tint(.white)
-                }
-            }
-            .overlay(alignment: .topTrailing) {
-                if preparedAvatarPreview != nil,
-                   let verification = model.profile?.verification?.designation {
-                    VerifiedAccountBadge(
-                        designation: verification,
-                        diameter: 29,
-                        hasContrastBorder: true
-                    )
-                    .offset(x: 4, y: -4)
                 }
             }
             .accessibilityElement(children: .ignore)

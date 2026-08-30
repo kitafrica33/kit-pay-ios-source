@@ -37,26 +37,7 @@ enum AccountSetupPolicy {
         with user: UserProfile,
         assurance: SessionAssuranceDTO?
     ) -> AccountSetupStep? {
-        let next = requiredStep(user: user, assurance: assurance)
-
-        // Profile PATCH responses from older servers can omit payment_pin_set. Do not lose a
-        // PIN-setup requirement already carried by this authenticated flow.
-        let carriedPaymentPin = switch current {
-        case .profile(let pending), .deviceVerification(let pending): pending
-        case .paymentPin: true
-        case .loginUnlock, nil: false
-        }
-        guard carriedPaymentPin, user.paymentPinSet != true else { return next }
-        switch next {
-        case .profile:
-            return .profile(needsPaymentPin: true)
-        case .deviceVerification:
-            return .deviceVerification(needsPaymentPin: true)
-        case .loginUnlock, nil:
-            return .paymentPin
-        case .paymentPin:
-            return .paymentPin
-        }
+        requiredStep(user: user, assurance: assurance)
     }
 
     static func reconcile(_ current: AccountSetupStep?, with user: UserProfile) -> AccountSetupStep? {
@@ -65,13 +46,9 @@ enum AccountSetupPolicy {
 
     static func nextStep(afterCompleting current: AccountSetupStep) -> AccountSetupStep? {
         switch current {
-        case .profile(let needsPaymentPin):
-            .deviceVerification(needsPaymentPin: needsPaymentPin)
-        case .deviceVerification(needsPaymentPin: true):
-            .paymentPin
-        case .deviceVerification(needsPaymentPin: false):
+        case .profile:
             .loginUnlock
-        case .paymentPin, .loginUnlock:
+        case .deviceVerification, .paymentPin, .loginUnlock:
             nil
         }
     }
@@ -91,22 +68,22 @@ enum AccountSetupPolicy {
         user: UserProfile?,
         assurance: SessionAssuranceDTO?
     ) -> AccountSetupStep? {
-        let needsPaymentPin = user?.paymentPinSet != true
         if requiresProfileSetup(user) {
-            return .profile(needsPaymentPin: needsPaymentPin)
+            // Wallet-PIN and KYC setup belong to the money flow, not app admission. Carrying
+            // `false` prevents legacy setup state from manufacturing a payment-PIN step.
+            return .profile(needsPaymentPin: false)
         }
-        guard assurance?.deviceIdentity.isVerified == true else {
-            return .deviceVerification(needsPaymentPin: needsPaymentPin)
-        }
-        if needsPaymentPin {
-            return .paymentPin
-        }
-        guard assurance?.loginUnlock.isUnlocked == true,
-              assurance?.grantsFullAccess == true
-        else {
+        guard let user, let assurance else { return .loginUnlock }
+        switch assurance.communicationRequirement(accountKYCStatus: user.kycStatus) {
+        case .allowed:
+            return nil
+        case .verifyDeviceIdentity:
+            return .deviceVerification(needsPaymentPin: false)
+        case .unlockSession:
+            return user.paymentPinSet == true ? .loginUnlock : .paymentPin
+        case .unavailable:
             return .loginUnlock
         }
-        return nil
     }
 }
 

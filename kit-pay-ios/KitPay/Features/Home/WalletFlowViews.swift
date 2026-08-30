@@ -328,17 +328,19 @@ struct WalletFlowContainer: View {
 
     var body: some View {
         NavigationStack {
-            switch destination {
-            case .send:
-                SendMoneyView(flow: flow)
-            case .receive:
-                ReceiveMoneyView(flow: flow)
-            case .request:
-                PaymentRequestsView()
-            case .transactions:
-                TransactionsView()
-            case let .transaction(transaction):
-                TransactionDetailView(transaction: transaction)
+            MoneyAccessBoundary {
+                switch destination {
+                case .send:
+                    SendMoneyView(flow: flow)
+                case .receive:
+                    ReceiveMoneyView(flow: flow)
+                case .request:
+                    PaymentRequestsView()
+                case .transactions:
+                    TransactionsView()
+                case let .transaction(transaction):
+                    TransactionDetailView(transaction: transaction)
+                }
             }
         }
         .presentationBackground(.ultraThinMaterial)

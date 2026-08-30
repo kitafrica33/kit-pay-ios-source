@@ -29,6 +29,35 @@ enum AppReviewDemoAccessPolicy {
         return profileID
     }
 
+    /// The authenticated scoped-access contract independently identifies the review cohort.
+    /// Accept it only as a coherent pair bound to the same account/session as the feature route.
+    static func scopedOwnerID(
+        communicationAccess: SessionCommunicationAccessDTO?,
+        financialAccess: SessionFinancialAccessDTO?,
+        authority: AppReviewDemoCapabilityAuthority,
+        isSignedIn: Bool,
+        profileID: String?,
+        sessionID: String?,
+        sessionAccountID: String?
+    ) -> String? {
+        guard authority == .authenticatedSession,
+              isSignedIn,
+              let communicationAccess,
+              let financialAccess,
+              SessionScopedAccessPolicy.isCoherent(
+                communication: communicationAccess,
+                financial: financialAccess
+              ),
+              communicationAccess.basis == SessionScopedAccessPolicy.appReview,
+              financialAccess.readOnly,
+              let profileID = canonicalUUID(profileID),
+              let sessionAccountID = canonicalUUID(sessionAccountID),
+              profileID == sessionAccountID,
+              sessionID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        else { return nil }
+        return profileID
+    }
+
     private static func canonicalUUID(_ rawValue: String?) -> String? {
         guard let rawValue,
               rawValue == rawValue.trimmingCharacters(in: .whitespacesAndNewlines),

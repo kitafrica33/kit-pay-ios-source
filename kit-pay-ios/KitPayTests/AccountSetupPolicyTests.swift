@@ -547,7 +547,7 @@ final class AccountSetupPolicyTests: XCTestCase {
         XCTAssertNil(APIClientSessionBinding.sessionID)
     }
 
-    func testNewAccountRoutesProfileThenDeviceVerificationThenPin() {
+    func testNewAccountRoutesOnlyThroughRequiredProfileSetup() {
         let user = profile(
             name: "Kit Pay User",
             tag: "kit_a1b2c3d4e5",
@@ -557,27 +557,21 @@ final class AccountSetupPolicyTests: XCTestCase {
 
         let first = AccountSetupPolicy.initialStep(afterAuthentication: user)
 
-        XCTAssertEqual(first, .profile(needsPaymentPin: true))
+        XCTAssertEqual(first, .profile(needsPaymentPin: false))
         XCTAssertEqual(
             AccountSetupPolicy.nextStep(afterCompleting: first!),
-            .deviceVerification(needsPaymentPin: true)
-        )
-        XCTAssertEqual(
-            AccountSetupPolicy.nextStep(
-                afterCompleting: .deviceVerification(needsPaymentPin: true)
-            ),
-            .paymentPin
+            .loginUnlock
         )
     }
 
     func testMissingAuthenticatedUserFailsClosed() {
         XCTAssertEqual(
             AccountSetupPolicy.initialStep(afterAuthentication: nil),
-            .profile(needsPaymentPin: true)
+            .profile(needsPaymentPin: false)
         )
         XCTAssertEqual(
             AccountSetupPolicy.restoredStep(user: nil),
-            .profile(needsPaymentPin: true)
+            .profile(needsPaymentPin: false)
         )
     }
 
@@ -596,7 +590,7 @@ final class AccountSetupPolicyTests: XCTestCase {
         )))
     }
 
-    func testMissingAssuranceFailsClosedAtDeviceVerification() {
+    func testMissingAssuranceFailsClosedAtLoginUnlock() {
         XCTAssertEqual(
             AccountSetupPolicy.initialStep(afterAuthentication: profile(
                 name: "Amina Yusuf",
@@ -604,72 +598,100 @@ final class AccountSetupPolicyTests: XCTestCase {
                 paymentPinSet: nil,
                 profileSetupRequired: nil
             )),
-            .deviceVerification(needsPaymentPin: true)
+            .loginUnlock
         )
     }
 
-    func testVerifiedDeviceRoutesNewAccountToPinSetup() {
-        XCTAssertEqual(
-            AccountSetupPolicy.initialStep(
-                afterAuthentication: profile(
-                    name: "Amina Yusuf",
-                    tag: "amina_01",
-                    paymentPinSet: false,
-                    profileSetupRequired: false
-                ),
-                assurance: assurance(deviceStatus: "verified", unlockStatus: "locked")
+    func testUnverifiedNewAccountWithoutPinCanUseRestrictedCommunicationSession() {
+        let user = profile(
+            name: "Amina Yusuf",
+            tag: "amina_01",
+            paymentPinSet: false,
+            profileSetupRequired: false,
+            kycStatus: "not_started"
+        )
+        let restricted = assurance(
+            deviceStatus: "required",
+            unlockStatus: "locked",
+            access: "restricted",
+            communicationAccess: .init(
+                allowed: true,
+                basis: "account_onboarding",
+                requiredAction: nil
             ),
-            .paymentPin
+            financialAccess: .init(
+                allowed: false,
+                basis: "account_onboarding",
+                requiredAction: "identity_verification_required",
+                readOnly: false
+            )
         )
+
+        XCTAssertTrue(restricted.grantsCommunicationAccess(accountKYCStatus: user.kycStatus))
+        XCTAssertNil(AccountSetupPolicy.initialStep(afterAuthentication: user, assurance: restricted))
     }
 
-    func testOptionalDeviceVerificationStillRequiresReturningLoginUnlock() {
+    func testUnverifiedExistingPinAccountDoesNotDeadlockOnUnavailableUnlock() {
         let returning = profile(
             name: "Amina Yusuf",
             tag: "amina_01",
             paymentPinSet: true,
-            profileSetupRequired: false
+            profileSetupRequired: false,
+            kycStatus: "pending"
+        )
+        let restricted = assurance(
+            deviceStatus: "required",
+            unlockStatus: "locked",
+            access: "restricted",
+            communicationAccess: .init(
+                allowed: true,
+                basis: "account_onboarding",
+                requiredAction: nil
+            ),
+            financialAccess: .init(
+                allowed: false,
+                basis: "account_onboarding",
+                requiredAction: "identity_verification_required",
+                readOnly: false
+            )
         )
 
+        XCTAssertTrue(restricted.grantsCommunicationAccess(accountKYCStatus: returning.kycStatus))
+        XCTAssertNil(AccountSetupPolicy.initialStep(afterAuthentication: returning, assurance: restricted))
+    }
+
+    func testVerifiedAccountWithRestrictedDeviceRemainsBlocked() {
+        let returning = profile(
+            name: "Amina Yusuf",
+            tag: "amina_01",
+            paymentPinSet: true,
+            profileSetupRequired: false,
+            kycStatus: "verified"
+        )
+        let restricted = assurance(
+            deviceStatus: "required",
+            unlockStatus: "locked",
+            access: "restricted",
+            communicationAccess: .init(
+                allowed: false,
+                basis: "full_assurance",
+                requiredAction: "verify_device_identity"
+            ),
+            financialAccess: .init(
+                allowed: false,
+                basis: "full_assurance",
+                requiredAction: "verify_device_identity",
+                readOnly: false
+            )
+        )
+
+        XCTAssertFalse(restricted.grantsCommunicationAccess(accountKYCStatus: returning.kycStatus))
         XCTAssertEqual(
             AccountSetupPolicy.initialStep(
                 afterAuthentication: returning,
-                assurance: assurance(
-                    deviceStatus: "not_required",
-                    unlockStatus: "locked",
-                    deviceRequired: false
-                )
+                assurance: restricted
             ),
-            .loginUnlock
-        )
-        XCTAssertNil(AccountSetupPolicy.initialStep(
-            afterAuthentication: returning,
-            assurance: assurance(
-                deviceStatus: "not_required",
-                unlockStatus: "unlocked",
-                deviceRequired: false
-            )
-        ))
-    }
-
-    func testOptionalDeviceVerificationStillRequiresFirstPaymentPinSetup() {
-        let newAccount = profile(
-            name: "Amina Yusuf",
-            tag: "amina_01",
-            paymentPinSet: false,
-            profileSetupRequired: false
-        )
-
-        XCTAssertEqual(
-            AccountSetupPolicy.initialStep(
-                afterAuthentication: newAccount,
-                assurance: assurance(
-                    deviceStatus: "not_required",
-                    unlockStatus: "locked",
-                    deviceRequired: false
-                )
-            ),
-            .paymentPin
+            .deviceVerification(needsPaymentPin: false)
         )
     }
 
@@ -678,7 +700,8 @@ final class AccountSetupPolicyTests: XCTestCase {
             name: "Amina Yusuf",
             tag: "amina_01",
             paymentPinSet: true,
-            profileSetupRequired: false
+            profileSetupRequired: false,
+            kycStatus: "verified"
         )
 
         XCTAssertEqual(
@@ -690,28 +713,485 @@ final class AccountSetupPolicyTests: XCTestCase {
         )
     }
 
-    func testReturningLoginRequiresUnlockAfterFreshDeviceVerification() {
+    func testVerifiedAccountRequiresUnlockThenAdmitsCommunication() {
         let returning = profile(
             name: "Amina Yusuf",
             tag: "amina_01",
             paymentPinSet: true,
-            profileSetupRequired: false
+            profileSetupRequired: false,
+            kycStatus: "approved"
+        )
+        let locked = assurance(
+            deviceStatus: "verified",
+            unlockStatus: "locked",
+            access: "restricted",
+            communicationAccess: .init(
+                allowed: false,
+                basis: "full_assurance",
+                requiredAction: "unlock_session"
+            ),
+            financialAccess: .init(
+                allowed: false,
+                basis: "full_assurance",
+                requiredAction: "unlock_session",
+                readOnly: false
+            )
+        )
+        let unlocked = assurance(
+            deviceStatus: "verified",
+            unlockStatus: "unlocked",
+            access: "full",
+            communicationAccess: .init(
+                allowed: true,
+                basis: "full_assurance",
+                requiredAction: nil
+            ),
+            financialAccess: .init(
+                allowed: true,
+                basis: "full_assurance",
+                requiredAction: nil,
+                readOnly: false
+            )
         )
 
+        XCTAssertFalse(locked.grantsCommunicationAccess(accountKYCStatus: returning.kycStatus))
         XCTAssertEqual(
             AccountSetupPolicy.initialStep(
                 afterAuthentication: returning,
-                assurance: assurance(deviceStatus: "verified", unlockStatus: "locked")
+                assurance: locked
             ),
             .loginUnlock
         )
+        XCTAssertTrue(unlocked.grantsCommunicationAccess(accountKYCStatus: returning.kycStatus))
         XCTAssertNil(AccountSetupPolicy.initialStep(
             afterAuthentication: returning,
-            assurance: assurance(deviceStatus: "verified", unlockStatus: "unlocked")
+            assurance: unlocked
         ))
     }
 
-    func testReconciliationRetainsCarriedPinRequirement() {
+    func testRestrictedCommunicationFailsClosedForUnknownAccountKYC() {
+        let restricted = assurance(
+            deviceStatus: "required",
+            unlockStatus: "locked",
+            access: "restricted"
+        )
+
+        XCTAssertFalse(restricted.grantsCommunicationAccess(accountKYCStatus: nil))
+        for status in ["", "unknown", "VERIFIED", "active"] {
+            XCTAssertFalse(
+                restricted.grantsCommunicationAccess(accountKYCStatus: status),
+                status
+            )
+        }
+    }
+
+    func testLegacyUnverifiedStatusAdmitsCommunicationBeforeScopedRefresh() {
+        let user = profile(
+            name: "Amina Yusuf",
+            tag: "amina_01",
+            paymentPinSet: false,
+            profileSetupRequired: false,
+            kycStatus: "unverified"
+        )
+        let legacyRestricted = assurance(
+            deviceStatus: "required",
+            unlockStatus: "locked",
+            access: "restricted"
+        )
+
+        XCTAssertTrue(legacyRestricted.grantsCommunicationAccess(accountKYCStatus: "unverified"))
+        XCTAssertNil(AccountSetupPolicy.initialStep(
+            afterAuthentication: user,
+            assurance: legacyRestricted
+        ))
+    }
+
+    func testMoneyActionsRequireKYCAndFullSessionIndependently() {
+        XCTAssertEqual(
+            MoneyActionAccessPolicy.requirement(
+                identityVerified: false,
+                sessionGrantsFullAccess: false
+            ),
+            .verifyIdentity
+        )
+        XCTAssertEqual(
+            MoneyActionAccessPolicy.requirement(
+                identityVerified: false,
+                sessionGrantsFullAccess: true
+            ),
+            .verifyIdentity
+        )
+        XCTAssertEqual(
+            MoneyActionAccessPolicy.requirement(
+                identityVerified: true,
+                sessionGrantsFullAccess: false
+            ),
+            .unlockSession
+        )
+        XCTAssertEqual(
+            MoneyActionAccessPolicy.requirement(
+                identityVerified: true,
+                sessionGrantsFullAccess: true
+            ),
+            .allowed
+        )
+    }
+
+    func testScopedAdmissionMatrixRoutesCommunicationAndMoneyIndependently() {
+        struct Row {
+            let name: String
+            let profileKYC: String
+            let paymentPinSet: Bool
+            let assurance: SessionAssuranceDTO
+            let expectedSetup: AccountSetupStep?
+            let expectedMoney: MoneyActionAccessRequirement
+        }
+
+        let rows = [
+            Row(
+                name: "pre-KYC onboarding",
+                profileKYC: "not_started",
+                paymentPinSet: false,
+                assurance: scopedAssurance(
+                    basis: "account_onboarding",
+                    communicationAllowed: true,
+                    financialAllowed: false,
+                    financialAction: "identity_verification_required",
+                    deviceStatus: "required",
+                    unlockStatus: "locked"
+                ),
+                expectedSetup: nil,
+                expectedMoney: .verifyIdentity
+            ),
+            Row(
+                name: "verified new device",
+                profileKYC: "verified",
+                paymentPinSet: false,
+                assurance: scopedAssurance(
+                    basis: "full_assurance",
+                    communicationAllowed: false,
+                    communicationAction: "verify_device_identity",
+                    financialAllowed: false,
+                    financialAction: "verify_device_identity",
+                    deviceStatus: "required",
+                    unlockStatus: "locked"
+                ),
+                expectedSetup: .deviceVerification(needsPaymentPin: false),
+                expectedMoney: .verifyDeviceIdentity
+            ),
+            Row(
+                name: "newly verified account creates its first PIN before unlock",
+                profileKYC: "verified",
+                paymentPinSet: false,
+                assurance: scopedAssurance(
+                    basis: "full_assurance",
+                    communicationAllowed: false,
+                    communicationAction: "unlock_session",
+                    financialAllowed: false,
+                    financialAction: "unlock_session",
+                    deviceStatus: "verified",
+                    unlockStatus: "locked"
+                ),
+                expectedSetup: .paymentPin,
+                expectedMoney: .unlockSession
+            ),
+            Row(
+                name: "verified locked login",
+                profileKYC: "verified",
+                paymentPinSet: true,
+                assurance: scopedAssurance(
+                    basis: "full_assurance",
+                    communicationAllowed: false,
+                    communicationAction: "unlock_session",
+                    financialAllowed: false,
+                    financialAction: "unlock_session",
+                    deviceStatus: "verified",
+                    unlockStatus: "locked"
+                ),
+                expectedSetup: .loginUnlock,
+                expectedMoney: .unlockSession
+            ),
+            Row(
+                name: "verified full assurance",
+                profileKYC: "verified",
+                paymentPinSet: true,
+                assurance: scopedAssurance(
+                    basis: "full_assurance",
+                    communicationAllowed: true,
+                    financialAllowed: true,
+                    deviceStatus: "verified",
+                    unlockStatus: "unlocked"
+                ),
+                expectedSetup: nil,
+                expectedMoney: .allowed
+            ),
+            Row(
+                name: "App Review",
+                profileKYC: "verified",
+                paymentPinSet: true,
+                assurance: scopedAssurance(
+                    basis: "app_review",
+                    communicationAllowed: true,
+                    financialAllowed: true,
+                    financialReadOnly: true,
+                    deviceStatus: "verified",
+                    unlockStatus: "unlocked"
+                ),
+                expectedSetup: nil,
+                expectedMoney: .readOnly
+            ),
+        ]
+
+        for row in rows {
+            let user = profile(
+                name: "Amina Yusuf",
+                tag: "amina_01",
+                paymentPinSet: row.paymentPinSet,
+                profileSetupRequired: false,
+                kycStatus: row.profileKYC
+            )
+            XCTAssertEqual(
+                AccountSetupPolicy.initialStep(
+                    afterAuthentication: user,
+                    assurance: row.assurance
+                ),
+                row.expectedSetup,
+                row.name
+            )
+            XCTAssertEqual(
+                MoneyActionAccessPolicy.requirement(
+                    identityVerified: row.profileKYC == "verified",
+                    sessionGrantsFullAccess: row.assurance.grantsFullAccess,
+                    scopedCommunication: row.assurance.communicationAccess,
+                    scopedFinancial: row.assurance.financialAccess
+                ),
+                row.expectedMoney,
+                row.name
+            )
+        }
+    }
+
+    func testFinancialEntryRoutesRemainVisibleButNeverMutateWithoutAuthority() {
+        XCTAssertEqual(
+            FinancialEntryRoutePolicy.route(
+                requirement: .verifyIdentity,
+                kind: .readOnlySurface
+            ),
+            .verifyIdentity
+        )
+        XCTAssertEqual(
+            FinancialEntryRoutePolicy.route(
+                requirement: .verifyIdentity,
+                kind: .moneyMovement
+            ),
+            .verifyIdentity
+        )
+        XCTAssertEqual(
+            FinancialEntryRoutePolicy.route(
+                requirement: .readOnly,
+                kind: .readOnlySurface
+            ),
+            .open
+        )
+        XCTAssertEqual(
+            FinancialEntryRoutePolicy.route(
+                requirement: .readOnly,
+                kind: .moneyMovement
+            ),
+            .readOnly
+        )
+    }
+
+    func testScopedFinancialGrantCannotBypassLegacySessionAssurance() {
+        let inconsistent = scopedAssurance(
+            basis: "full_assurance",
+            communicationAllowed: true,
+            financialAllowed: true,
+            deviceStatus: "required",
+            unlockStatus: "locked"
+        )
+
+        XCTAssertEqual(
+            inconsistent.communicationRequirement(accountKYCStatus: "verified"),
+            .unavailable
+        )
+        XCTAssertEqual(
+            MoneyActionAccessPolicy.requirement(
+                identityVerified: true,
+                sessionGrantsFullAccess: inconsistent.grantsFullAccess,
+                scopedCommunication: inconsistent.communicationAccess,
+                scopedFinancial: inconsistent.financialAccess
+            ),
+            .unavailable
+        )
+    }
+
+    func testScopedAccessWireContractDecodesAtCapabilitiesAndBootstrapTopLevel() throws {
+        let capabilities = try JSONDecoder().decode(
+            CapabilitiesDTO.self,
+            from: Data(#"""
+            {
+              "currency":{"code":"UGX","scale":"0"},
+              "communication_access":{"allowed":true,"basis":"account_onboarding","required_action":null},
+              "financial_access":{"allowed":false,"basis":"account_onboarding","required_action":"identity_verification_required","read_only":false}
+            }
+            """#.utf8)
+        )
+        XCTAssertEqual(capabilities.communicationAccess?.allowed, true)
+        XCTAssertEqual(capabilities.financialAccess?.requiredAction, "identity_verification_required")
+        XCTAssertEqual(capabilities.financialAccess?.readOnly, false)
+
+        let bootstrap = try JSONDecoder().decode(
+            BootstrapDTO.self,
+            from: Data(#"""
+            {
+              "user":{"id":"11111111-1111-4111-8111-111111111111","kyc_status":"not_started"},
+              "wallets":[],
+              "devices":[],
+              "selected_wallet_id":null,
+              "session_assurance":{
+                "device_identity":{"status":"required","required":true,"epoch":1,"verified_at":null},
+                "login_unlock":{"status":"locked","required":true,"method":null,"methods":[],"unlocked_at":null},
+                "access":"restricted",
+                "communication_access":{"allowed":true,"basis":"account_onboarding","required_action":null},
+                "financial_access":{"allowed":false,"basis":"account_onboarding","required_action":"identity_verification_required","read_only":false}
+              },
+              "communication_access":{"allowed":true,"basis":"account_onboarding","required_action":null},
+              "financial_access":{"allowed":false,"basis":"account_onboarding","required_action":"identity_verification_required","read_only":false}
+            }
+            """#.utf8)
+        )
+        let resolved = try XCTUnwrap(bootstrap.resolvedSessionAssurance)
+        XCTAssertEqual(resolved.communicationRequirement(accountKYCStatus: nil), .allowed)
+        XCTAssertEqual(
+            MoneyActionAccessPolicy.requirement(
+                identityVerified: false,
+                sessionGrantsFullAccess: resolved.grantsFullAccess,
+                scopedCommunication: resolved.communicationAccess,
+                scopedFinancial: resolved.financialAccess
+            ),
+            .verifyIdentity
+        )
+    }
+
+    func testTopLevelScopedAccessAtomicallyOverridesConflictingNestedAccess() {
+        let nested = scopedAssurance(
+            basis: "full_assurance",
+            communicationAllowed: true,
+            financialAllowed: true,
+            deviceStatus: "verified",
+            unlockStatus: "unlocked"
+        )
+        let resolved = nested.applyingTopLevelAccess(
+            communication: .init(
+                allowed: true,
+                basis: "account_onboarding",
+                requiredAction: nil
+            ),
+            financial: .init(
+                allowed: false,
+                basis: "account_onboarding",
+                requiredAction: "identity_verification_required",
+                readOnly: false
+            )
+        )
+
+        XCTAssertEqual(resolved.communicationAccess?.basis, "account_onboarding")
+        XCTAssertEqual(resolved.financialAccess?.allowed, false)
+        XCTAssertEqual(resolved.communicationRequirement(accountKYCStatus: "unverified"), .allowed)
+        XCTAssertEqual(
+            MoneyActionAccessPolicy.requirement(
+                identityVerified: false,
+                sessionGrantsFullAccess: resolved.grantsFullAccess,
+                scopedCommunication: resolved.communicationAccess,
+                scopedFinancial: resolved.financialAccess
+            ),
+            .verifyIdentity
+        )
+    }
+
+    func testPartialTopLevelScopedAccessReplacesTheNestedPairAndFailsClosed() {
+        let nested = scopedAssurance(
+            basis: "full_assurance",
+            communicationAllowed: true,
+            financialAllowed: true,
+            deviceStatus: "verified",
+            unlockStatus: "unlocked"
+        )
+        let resolved = nested.applyingTopLevelAccess(
+            communication: .init(
+                allowed: true,
+                basis: "account_onboarding",
+                requiredAction: nil
+            ),
+            financial: nil
+        )
+
+        XCTAssertEqual(resolved.communicationAccess?.basis, "account_onboarding")
+        XCTAssertNil(resolved.financialAccess)
+        XCTAssertEqual(
+            resolved.communicationRequirement(accountKYCStatus: "unverified"),
+            .unavailable
+        )
+        XCTAssertEqual(
+            MoneyActionAccessPolicy.requirement(
+                identityVerified: false,
+                sessionGrantsFullAccess: resolved.grantsFullAccess,
+                scopedCommunication: resolved.communicationAccess,
+                scopedFinancial: resolved.financialAccess
+            ),
+            .unavailable
+        )
+    }
+
+    func testMalformedOrPartialScopedAccessFailsClosed() throws {
+        let partial = assurance(
+            deviceStatus: "verified",
+            unlockStatus: "unlocked",
+            access: "full",
+            communicationAccess: .init(
+                allowed: true,
+                basis: "full_assurance",
+                requiredAction: nil
+            )
+        )
+        XCTAssertEqual(partial.communicationRequirement(accountKYCStatus: "verified"), .unavailable)
+        XCTAssertEqual(
+            MoneyActionAccessPolicy.requirement(
+                identityVerified: true,
+                sessionGrantsFullAccess: true,
+                scopedCommunication: partial.communicationAccess,
+                scopedFinancial: partial.financialAccess
+            ),
+            .unavailable
+        )
+
+        XCTAssertThrowsError(try JSONDecoder().decode(
+            SessionFinancialAccessDTO.self,
+            from: Data(#"{"allowed":true,"basis":"app_review","required_action":null}"#.utf8)
+        ))
+    }
+
+    func testKYCNeverManufacturesPublicVerificationDesignation() throws {
+        let kycOnly = try JSONDecoder().decode(UserProfile.self, from: Data(#"""
+        {
+          "id": "11111111-1111-4111-8111-111111111111",
+          "name": "Amina Yusuf",
+          "kyc_status": "verified",
+          "email_verified": true,
+          "legal_name": "Amina Yusuf",
+          "legal_name_verified_at": "2026-08-29T08:00:00Z"
+        }
+        """#.utf8))
+
+        XCTAssertTrue(MoneyIdentityAccessPolicy.isVerified(
+            liveAccountStatus: nil,
+            cachedProfileStatus: kycOnly.kycStatus
+        ))
+        XCTAssertNil(kycOnly.verification)
+    }
+
+    func testReconciliationDoesNotCarryFinancialSetupIntoCommunicationAdmission() {
         let complete = profile(
             name: "Amina Yusuf",
             tag: "amina_01",
@@ -719,22 +1199,16 @@ final class AccountSetupPolicyTests: XCTestCase {
             profileSetupRequired: false
         )
 
-        XCTAssertEqual(
-            AccountSetupPolicy.reconcile(
-                .deviceVerification(needsPaymentPin: true),
-                with: complete,
-                assurance: assurance(deviceStatus: "verified", unlockStatus: "locked")
-            ),
-            .paymentPin
-        )
-        XCTAssertEqual(
-            AccountSetupPolicy.reconcile(
-                .profile(needsPaymentPin: false),
-                with: complete,
-                assurance: assurance(deviceStatus: "required", unlockStatus: "locked")
-            ),
-            .deviceVerification(needsPaymentPin: true)
-        )
+        XCTAssertNil(AccountSetupPolicy.reconcile(
+            .deviceVerification(needsPaymentPin: true),
+            with: complete,
+            assurance: assurance(deviceStatus: "verified", unlockStatus: "locked")
+        ))
+        XCTAssertNil(AccountSetupPolicy.reconcile(
+            .profile(needsPaymentPin: false),
+            with: complete,
+            assurance: assurance(deviceStatus: "required", unlockStatus: "locked")
+        ))
 
         let returning = profile(
             name: "Amina Yusuf",
@@ -742,14 +1216,11 @@ final class AccountSetupPolicyTests: XCTestCase {
             paymentPinSet: true,
             profileSetupRequired: false
         )
-        XCTAssertEqual(
-            AccountSetupPolicy.reconcile(
-                .deviceVerification(needsPaymentPin: false),
-                with: returning,
-                assurance: assurance(deviceStatus: "verified", unlockStatus: "locked")
-            ),
-            .loginUnlock
-        )
+        XCTAssertNil(AccountSetupPolicy.reconcile(
+            .deviceVerification(needsPaymentPin: false),
+            with: returning,
+            assurance: assurance(deviceStatus: "verified", unlockStatus: "locked")
+        ))
 
         let incomplete = profile(
             name: "Kit Pay User",
@@ -763,16 +1234,17 @@ final class AccountSetupPolicyTests: XCTestCase {
                 with: incomplete,
                 assurance: assurance(deviceStatus: "verified", unlockStatus: "locked")
             ),
-            .profile(needsPaymentPin: true)
+            .profile(needsPaymentPin: false)
         )
     }
 
-    func testBootstrapAccessFlagAlsoFailsClosed() {
+    func testVerifiedBootstrapRestrictedAccessFailsClosed() {
         let returning = profile(
             name: "Amina Yusuf",
             tag: "amina_01",
             paymentPinSet: true,
-            profileSetupRequired: false
+            profileSetupRequired: false,
+            kycStatus: "verified"
         )
 
         XCTAssertEqual(
@@ -788,7 +1260,7 @@ final class AccountSetupPolicyTests: XCTestCase {
         )
     }
 
-    func testNullablePinFlagStillRequiresPinAfterDeviceVerification() {
+    func testNullablePinFlagDoesNotForceFinancialSetupBeforeCommunication() {
         let user = profile(
             name: "Amina Yusuf",
             tag: "amina_01",
@@ -801,7 +1273,7 @@ final class AccountSetupPolicyTests: XCTestCase {
                 user: user,
                 assurance: assurance(deviceStatus: "verified", unlockStatus: "unlocked")
             ),
-            .paymentPin
+            nil
         )
     }
 
@@ -1244,7 +1716,8 @@ final class AccountSetupPolicyTests: XCTestCase {
         name: String?,
         tag: String?,
         paymentPinSet: Bool?,
-        profileSetupRequired: Bool?
+        profileSetupRequired: Bool?,
+        kycStatus: String = "not_started"
     ) -> UserProfile {
         UserProfile(
             id: "user-1",
@@ -1252,7 +1725,7 @@ final class AccountSetupPolicyTests: XCTestCase {
             email: nil,
             phone: "+256700000200",
             tag: tag,
-            kycStatus: "not_started",
+            kycStatus: kycStatus,
             paymentPinSet: paymentPinSet,
             mfaEnabled: nil,
             profileSetupRequired: profileSetupRequired
@@ -1291,7 +1764,9 @@ final class AccountSetupPolicyTests: XCTestCase {
         deviceStatus: String,
         unlockStatus: String,
         access: String? = nil,
-        deviceRequired: Bool = true
+        deviceRequired: Bool = true,
+        communicationAccess: SessionCommunicationAccessDTO? = nil,
+        financialAccess: SessionFinancialAccessDTO? = nil
     ) -> SessionAssuranceDTO {
         let device = DeviceIdentityAssuranceDTO(
             status: deviceStatus,
@@ -1311,6 +1786,38 @@ final class AccountSetupPolicyTests: XCTestCase {
             loginUnlock: unlock,
             access: access ?? (
                 device.isVerified && unlock.isUnlocked ? "full" : "restricted"
+            ),
+            communicationAccess: communicationAccess,
+            financialAccess: financialAccess
+        )
+    }
+
+    private func scopedAssurance(
+        basis: String,
+        communicationAllowed: Bool,
+        communicationAction: String? = nil,
+        financialAllowed: Bool,
+        financialAction: String? = nil,
+        financialReadOnly: Bool = false,
+        deviceStatus: String,
+        unlockStatus: String
+    ) -> SessionAssuranceDTO {
+        assurance(
+            deviceStatus: deviceStatus,
+            unlockStatus: unlockStatus,
+            access: deviceStatus == "verified" && unlockStatus == "unlocked"
+                ? "full"
+                : "restricted",
+            communicationAccess: .init(
+                allowed: communicationAllowed,
+                basis: basis,
+                requiredAction: communicationAction
+            ),
+            financialAccess: .init(
+                allowed: financialAllowed,
+                basis: basis,
+                requiredAction: financialAction,
+                readOnly: financialReadOnly
             )
         )
     }

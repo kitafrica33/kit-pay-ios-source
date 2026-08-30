@@ -316,6 +316,47 @@ final class AppReviewDemoContentTests: XCTestCase {
         XCTAssertFalse(withdrawn.keepsTransportFenceAfterProjection)
     }
 
+    func testScopedReadOnlyAccessAlsoAuthenticatesTheReviewFence() {
+        let communication = SessionCommunicationAccessDTO(
+            allowed: true,
+            basis: "app_review",
+            requiredAction: nil
+        )
+        let financial = SessionFinancialAccessDTO(
+            allowed: true,
+            basis: "app_review",
+            requiredAction: nil,
+            readOnly: true
+        )
+
+        XCTAssertEqual(
+            AppReviewDemoAccessPolicy.scopedOwnerID(
+                communicationAccess: communication,
+                financialAccess: financial,
+                authority: .authenticatedSession,
+                isSignedIn: true,
+                profileID: ownerID,
+                sessionID: sessionID,
+                sessionAccountID: ownerID
+            ),
+            ownerID
+        )
+        XCTAssertNil(AppReviewDemoAccessPolicy.scopedOwnerID(
+            communicationAccess: communication,
+            financialAccess: SessionFinancialAccessDTO(
+                allowed: true,
+                basis: "app_review",
+                requiredAction: nil,
+                readOnly: false
+            ),
+            authority: .authenticatedSession,
+            isSignedIn: true,
+            profileID: ownerID,
+            sessionID: sessionID,
+            sessionAccountID: ownerID
+        ))
+    }
+
     func testTransportFenceRemainsBoundAcrossRefreshForSameSessionID() async {
         let api = APIClient(sessionStore: SessionStore())
         await api.setAppReviewDemoReadOnly(true, sessionID: sessionID.uppercased())

@@ -78,12 +78,22 @@ struct HomeView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .kitGlass(cornerRadius: 20, shadow: false)
                     }
-                    balanceCard
+                    if model.financialDataAccessGranted {
+                        balanceCard
+                    } else {
+                        identityRequiredCard
+                    }
+                    // Financial actions stay discoverable before KYC. Their shared route guard
+                    // opens identity verification instead of silently removing the product.
                     quickServices
                     if let checklist = starterChecklist {
                         starterChecklistSection(checklist)
                     }
-                    recentActivity
+                    if model.financialDataAccessGranted {
+                        recentActivity
+                    } else {
+                        lockedRecentActivity
+                    }
                 }
                 .padding(.horizontal, 18)
                 // No extra bottom padding: the floating menu already reserves its own scroll
@@ -142,12 +152,16 @@ struct HomeView: View {
         .onChange(of: model.homeAccessGranted) { _, granted in
             if granted { applyWalletClaimNavigation() }
         }
+        .onChange(of: model.financialDataAccessGranted) { _, granted in
+            if granted { applyWalletClaimNavigation() }
+        }
     }
 
     private func applyWalletClaimNavigation() {
         guard model.homeAccessGranted,
               let request = model.walletClaimNavigationRequest
         else { return }
+        guard routeFinancialAccess(requiresMutation: false) else { return }
         modal = .wallet(.transactions)
         model.consumeWalletClaimNavigationRequest(request.id)
     }
@@ -157,8 +171,7 @@ struct HomeView: View {
             RemoteAvatarView(
                 name: model.profile?.name ?? "Kit Pay",
                 avatarURL: model.profile?.avatarURL,
-                size: 54,
-                verification: model.profile?.verification?.designation
+                size: 54
             )
             VStack(alignment: .leading, spacing: 2) {
                 Text(greeting)
@@ -222,6 +235,52 @@ struct HomeView: View {
         .shadow(color: KitColor.navy.opacity(0.18), radius: 20, y: 10)
     }
 
+    private var identityRequiredCard: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Button {
+                _ = routeFinancialAccess(requiresMutation: false)
+            } label: {
+                HStack(spacing: 16) {
+                    Image(systemName: "person.text.rectangle")
+                        .font(.system(size: 25, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .frame(width: 52, height: 52)
+                        .background(.white.opacity(0.14), in: Circle())
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Set up wallet access")
+                            .font(.headline)
+                        Text("Verify your identity before viewing balances or using payments.")
+                            .font(.subheadline)
+                            .foregroundStyle(.white.opacity(0.78))
+                            .multilineTextAlignment(.leading)
+                    }
+                    Spacer(minLength: 8)
+                    Image(systemName: "chevron.right")
+                        .font(.subheadline.bold())
+                        .foregroundStyle(.white.opacity(0.8))
+                }
+                .foregroundStyle(.white)
+            }
+            .buttonStyle(.plain)
+            .accessibilityHint("Opens identity verification")
+
+            HStack(spacing: 10) {
+                walletAction("Send", icon: "arrow.up.right", primary: true, destination: .send, available: canSend, needsInternet: true)
+                walletAction("Receive", icon: "arrow.down.left", primary: false, destination: .receive, available: canReceive)
+                walletAction("Request", icon: "doc.text", primary: false, destination: .request, available: canRequest, needsInternet: true)
+            }
+        }
+        .padding(20)
+        .background(
+            LinearGradient(
+                colors: [KitColor.deepNavy, KitColor.navy],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            ),
+            in: RoundedRectangle(cornerRadius: 28, style: .continuous)
+        )
+    }
+
     private func walletAction(
         _ title: String,
         icon: String,
@@ -244,10 +303,14 @@ struct HomeView: View {
         .buttonStyle(.plain)
         .disabled(
             !available
+                || (model.moneyActionAccessRequirement == .readOnly
+                    && destination.isAppReviewDemoMutation)
                 || (!model.appReviewDemoMutationsAllowed && destination.isAppReviewDemoMutation)
         )
         .opacity(
             !available
+                || (model.moneyActionAccessRequirement == .readOnly
+                    && destination.isAppReviewDemoMutation)
                 || (!model.appReviewDemoMutationsAllowed && destination.isAppReviewDemoMutation)
                 ? 0.55 : 1
         )
@@ -301,8 +364,17 @@ struct HomeView: View {
             .kitGlass(cornerRadius: 22)
         }
         .buttonStyle(.plain)
-        .disabled(!available || !model.appReviewDemoMutationsAllowed)
-        .opacity(!available || !model.appReviewDemoMutationsAllowed ? 0.55 : 1)
+        .disabled(
+            !available
+                || model.moneyActionAccessRequirement == .readOnly
+                || !model.appReviewDemoMutationsAllowed
+        )
+        .opacity(
+            !available
+                || model.moneyActionAccessRequirement == .readOnly
+                || !model.appReviewDemoMutationsAllowed
+                ? 0.55 : 1
+        )
     }
 
     /// Derived entirely from state already in memory: nothing here waits on the network, so
@@ -403,7 +475,7 @@ struct HomeView: View {
 
     private func starterIcon(_ step: HomeStarterStep) -> String {
         switch step {
-        case .verifyIdentity: "checkmark.seal"
+        case .verifyIdentity: "person.text.rectangle"
         case .sendFirstMessage: "bubble.left.and.text.bubble.right"
         case .makeFirstTransaction: "arrow.up.right.circle"
         }
@@ -481,6 +553,36 @@ struct HomeView: View {
                     .buttonStyle(.plain)
                 }
             }
+        }
+    }
+
+    private var lockedRecentActivity: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Recent activity")
+                    .font(.title2.bold())
+                    .foregroundStyle(KitColor.primaryText)
+                Spacer()
+                Button("See all") {
+                    open(
+                        .transactions,
+                        title: "Transactions",
+                        available: canViewWallet,
+                        needsInternet: false
+                    )
+                }
+                .font(.subheadline.bold())
+                .foregroundStyle(KitColor.green)
+            }
+            Label(
+                "Verify your identity to view wallet activity.",
+                systemImage: "lock.shield"
+            )
+            .font(.subheadline)
+            .foregroundStyle(KitColor.secondaryText)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(18)
+            .kitGlass(cornerRadius: 20, shadow: false)
         }
     }
 
@@ -574,10 +676,8 @@ struct HomeView: View {
         available: Bool,
         needsInternet: Bool
     ) {
-        guard model.appReviewDemoMutationsAllowed || !destination.isAppReviewDemoMutation else {
-            model.lastError = AppReviewDemoMutationPolicy.readOnlyMessage
-            return
-        }
+        guard routeFinancialAccess(requiresMutation: destination.isAppReviewDemoMutation)
+        else { return }
         guard available else {
             model.lastError = "\(title) is not enabled for this Kit Pay account."
             return
@@ -594,10 +694,7 @@ struct HomeView: View {
         title: String,
         available: Bool
     ) {
-        guard model.appReviewDemoMutationsAllowed else {
-            model.lastError = AppReviewDemoMutationPolicy.readOnlyMessage
-            return
-        }
+        guard routeFinancialAccess(requiresMutation: true) else { return }
         guard available else {
             model.lastError = "\(title) is not enabled for this Kit Pay account."
             return
@@ -614,10 +711,7 @@ struct HomeView: View {
         title: String,
         available: Bool
     ) {
-        guard model.appReviewDemoMutationsAllowed else {
-            model.lastError = AppReviewDemoMutationPolicy.readOnlyMessage
-            return
-        }
+        guard routeFinancialAccess(requiresMutation: true) else { return }
         guard available else {
             model.lastError = "\(title) is not enabled for this Kit Pay account."
             return
@@ -631,6 +725,29 @@ struct HomeView: View {
         case .bankTransfer: cover = .bankTransfer
         case .scanQR: modal = .scanQR
         }
+    }
+
+    @discardableResult
+    private func routeFinancialAccess(requiresMutation: Bool) -> Bool {
+        let route = FinancialEntryRoutePolicy.route(
+            requirement: model.moneyActionAccessRequirement,
+            kind: requiresMutation ? .moneyMovement : .readOnlySurface
+        )
+        switch route {
+        case .open:
+            return true
+        case .readOnly:
+            model.lastError = AppReviewDemoMutationPolicy.readOnlyMessage
+        case .verifyIdentity:
+            cover = .identityVerification
+        case .verifyDeviceIdentity:
+            model.lastError = "Verify this iPhone before using wallet or payment actions."
+        case .unlockSession:
+            model.lastError = "Unlock this iPhone before using wallet or payment actions."
+        case .unavailable:
+            model.lastError = "Wallet access is temporarily unavailable. Refresh and try again."
+        }
+        return false
     }
 }
 

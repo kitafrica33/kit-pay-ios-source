@@ -135,10 +135,15 @@ struct CapabilitiesDTO: Decodable {
     let features: [String: Bool?]?
     let authentication: [String: Bool?]?
     var protocols: CapabilityProtocolsDTO? = nil
+    /// Omitted on the public/anonymous response and present for an authenticated session.
+    var communicationAccess: SessionCommunicationAccessDTO? = nil
+    var financialAccess: SessionFinancialAccessDTO? = nil
 
     enum CodingKeys: String, CodingKey {
         case apiVersion = "api_version"
         case currency, features, authentication, protocols
+        case communicationAccess = "communication_access"
+        case financialAccess = "financial_access"
     }
 
     /// Authentication and account-access capabilities fail closed when the server omits a key,
@@ -1961,21 +1966,118 @@ struct LoginUnlockAssuranceDTO: Codable, Hashable, Sendable {
     }
 }
 
+/// The backend's scoped admission decision for authenticated, non-financial product areas.
+///
+/// The wire values remain strings so a future server value does not make the surrounding login
+/// or bootstrap response undecodable. The policy below accepts only the exact reviewed values;
+/// anything new therefore fails closed until this client understands it.
+struct SessionCommunicationAccessDTO: Codable, Hashable, Sendable {
+    let allowed: Bool
+    let basis: String
+    let requiredAction: String?
+
+    enum CodingKeys: String, CodingKey {
+        case allowed, basis
+        case requiredAction = "required_action"
+    }
+
+    init(allowed: Bool, basis: String, requiredAction: String?) {
+        self.allowed = allowed
+        self.basis = basis
+        self.requiredAction = requiredAction
+    }
+}
+
+/// The backend's independent wallet/payment decision. `readOnly` is deliberately required when
+/// the object is present: silently defaulting a malformed authenticated projection to writable
+/// would turn a server contract error into money-moving authority.
+struct SessionFinancialAccessDTO: Codable, Hashable, Sendable {
+    let allowed: Bool
+    let basis: String
+    let requiredAction: String?
+    let readOnly: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case allowed, basis
+        case requiredAction = "required_action"
+        case readOnly = "read_only"
+    }
+
+    init(allowed: Bool, basis: String, requiredAction: String?, readOnly: Bool) {
+        self.allowed = allowed
+        self.basis = basis
+        self.requiredAction = requiredAction
+        self.readOnly = readOnly
+    }
+}
+
 struct SessionAssuranceDTO: Codable, Hashable, Sendable {
     let deviceIdentity: DeviceIdentityAssuranceDTO
     let loginUnlock: LoginUnlockAssuranceDTO
     let access: String
+    /// Scoped decisions are optional only for encrypted state and servers from before this
+    /// contract. When either appears, both must appear before policy grants anything.
+    let communicationAccess: SessionCommunicationAccessDTO?
+    let financialAccess: SessionFinancialAccessDTO?
 
     enum CodingKeys: String, CodingKey {
         case deviceIdentity = "device_identity"
         case loginUnlock = "login_unlock"
         case access
+        case communicationAccess = "communication_access"
+        case financialAccess = "financial_access"
+    }
+
+    init(
+        deviceIdentity: DeviceIdentityAssuranceDTO,
+        loginUnlock: LoginUnlockAssuranceDTO,
+        access: String,
+        communicationAccess: SessionCommunicationAccessDTO? = nil,
+        financialAccess: SessionFinancialAccessDTO? = nil
+    ) {
+        self.deviceIdentity = deviceIdentity
+        self.loginUnlock = loginUnlock
+        self.access = access
+        self.communicationAccess = communicationAccess
+        self.financialAccess = financialAccess
     }
 
     var grantsFullAccess: Bool {
         access.caseInsensitiveCompare("full") == .orderedSame
             && deviceIdentity.isVerified
             && loginUnlock.isUnlocked
+    }
+
+    func communicationRequirement(accountKYCStatus: String?) -> CommunicationAccessRequirement {
+        SessionCommunicationAccessPolicy.requirement(
+            scopedCommunication: communicationAccess,
+            scopedFinancial: financialAccess,
+            legacyAccountKYCStatus: accountKYCStatus,
+            sessionGrantsFullAccess: grantsFullAccess,
+            deviceIdentityVerified: deviceIdentity.isVerified
+        )
+    }
+
+    func grantsCommunicationAccess(accountKYCStatus: String?) -> Bool {
+        communicationRequirement(accountKYCStatus: accountKYCStatus) == .allowed
+    }
+
+    /// Bootstrap and authenticated capabilities repeat the scoped objects at their top level.
+    /// A present top-level pair is newer authority and replaces the nested pair atomically. A
+    /// partial pair is deliberately preserved as partial so policy fails closed instead of
+    /// borrowing one half from a stale response.
+    func applyingTopLevelAccess(
+        communication: SessionCommunicationAccessDTO?,
+        financial: SessionFinancialAccessDTO?
+    ) -> SessionAssuranceDTO {
+        guard communication != nil || financial != nil else { return self }
+        return SessionAssuranceDTO(
+            deviceIdentity: deviceIdentity,
+            loginUnlock: loginUnlock,
+            access: access,
+            communicationAccess: communication,
+            financialAccess: financial
+        )
     }
 }
 
@@ -2295,11 +2397,22 @@ struct BootstrapDTO: Decodable {
     let devices: [DeviceDTO]
     let selectedWalletId: String?
     let sessionAssurance: SessionAssuranceDTO?
+    let communicationAccess: SessionCommunicationAccessDTO?
+    let financialAccess: SessionFinancialAccessDTO?
 
     enum CodingKeys: String, CodingKey {
         case user, wallets, devices
         case selectedWalletId = "selected_wallet_id"
         case sessionAssurance = "session_assurance"
+        case communicationAccess = "communication_access"
+        case financialAccess = "financial_access"
+    }
+
+    var resolvedSessionAssurance: SessionAssuranceDTO? {
+        sessionAssurance?.applyingTopLevelAccess(
+            communication: communicationAccess,
+            financial: financialAccess
+        )
     }
 }
 
@@ -2713,6 +2826,320 @@ enum HomeStarterStep: String, CaseIterable, Hashable {
     case makeFirstTransaction
 }
 
+/// The sole client-side KYC admission rule for wallet and payment surfaces.
+///
+/// Public blue verification is deliberately absent here: it is a separate, rare designation
+/// assigned by the server and never grants financial access. The live account-wide KYC value
+/// wins over the cached profile; the blended per-device `KYCStatus.status` must not be used.
+enum MoneyIdentityAccessPolicy {
+    static let approvedStatuses: Set<String> = ["verified", "approved"]
+    /// Known account states that have not yet unlocked money. Unknown/missing values are excluded
+    /// so they can never turn a generic restricted session into authenticated communication.
+    static let explicitlyUnverifiedStatuses: Set<String> = [
+        "unverified", "not_started", "pending", "in_review", "review", "reviewing", "submitted",
+        "processing", "rejected", "declined", "failed",
+    ]
+
+    static func isVerified(
+        liveAccountStatus: String?,
+        cachedProfileStatus: String?
+    ) -> Bool {
+        normalizedStatus(liveAccountStatus ?? cachedProfileStatus)
+            .map(approvedStatuses.contains) == true
+    }
+
+    static func isExplicitlyUnverified(
+        liveAccountStatus: String?,
+        cachedProfileStatus: String?
+    ) -> Bool {
+        normalizedStatus(liveAccountStatus ?? cachedProfileStatus)
+            .map(explicitlyUnverifiedStatuses.contains) == true
+    }
+
+    private static func normalizedStatus(_ status: String?) -> String? {
+        guard let status else { return nil }
+        let normalized = status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return normalized.isEmpty ? nil : normalized
+    }
+}
+
+enum CommunicationAccessRequirement: Equatable {
+    case allowed
+    case verifyDeviceIdentity
+    case unlockSession
+    case unavailable
+}
+
+enum SessionScopedAccessPolicy {
+    static let accountOnboarding = "account_onboarding"
+    static let fullAssurance = "full_assurance"
+    static let appReview = "app_review"
+    static let identityVerificationRequired = "identity_verification_required"
+    static let verifyDeviceIdentity = "verify_device_identity"
+    static let unlockSession = "unlock_session"
+
+    /// The two objects describe one admission state and must move together. This prevents a
+    /// partial, stale, or internally contradictory projection from granting either surface.
+    static func isCoherent(
+        communication: SessionCommunicationAccessDTO,
+        financial: SessionFinancialAccessDTO
+    ) -> Bool {
+        guard communication.basis == communication.basis.trimmingCharacters(
+                  in: .whitespacesAndNewlines
+              ),
+              financial.basis == financial.basis.trimmingCharacters(in: .whitespacesAndNewlines),
+              communication.requiredAction == communication.requiredAction?.trimmingCharacters(
+                in: .whitespacesAndNewlines
+              ),
+              financial.requiredAction == financial.requiredAction?.trimmingCharacters(
+                in: .whitespacesAndNewlines
+              ),
+              communication.basis == financial.basis
+        else { return false }
+
+        switch communication.basis {
+        case Self.accountOnboarding:
+            return communication.allowed
+                && communication.requiredAction == nil
+                && !financial.allowed
+                && !financial.readOnly
+                && financial.requiredAction == identityVerificationRequired
+        case Self.fullAssurance:
+            if communication.allowed || financial.allowed {
+                return communication.allowed
+                    && financial.allowed
+                    && !financial.readOnly
+                    && communication.requiredAction == nil
+                    && financial.requiredAction == nil
+            }
+            guard let requiredAction = communication.requiredAction else { return false }
+            return !financial.readOnly
+                && [verifyDeviceIdentity, unlockSession].contains(requiredAction)
+                && communication.requiredAction == financial.requiredAction
+        case Self.appReview:
+            if communication.allowed || financial.allowed {
+                return communication.allowed
+                    && financial.allowed
+                    && financial.readOnly
+                    && communication.requiredAction == nil
+                    && financial.requiredAction == nil
+            }
+            guard let requiredAction = communication.requiredAction else { return false }
+            return financial.readOnly
+                && [verifyDeviceIdentity, unlockSession].contains(requiredAction)
+                && communication.requiredAction == financial.requiredAction
+        default:
+            return false
+        }
+    }
+}
+
+/// Validates the scoped communication projection as a coherent server decision. The legacy
+/// fallback exists only for saved state and servers predating the scoped contract; once either
+/// scoped object appears, a missing peer object or unknown value fails closed.
+enum SessionCommunicationAccessPolicy {
+    static func requirement(
+        scopedCommunication: SessionCommunicationAccessDTO?,
+        scopedFinancial: SessionFinancialAccessDTO?,
+        legacyAccountKYCStatus: String?,
+        sessionGrantsFullAccess: Bool,
+        deviceIdentityVerified: Bool
+    ) -> CommunicationAccessRequirement {
+        if scopedCommunication != nil || scopedFinancial != nil {
+            guard let scopedCommunication,
+                  let scopedFinancial,
+                  SessionScopedAccessPolicy.isCoherent(
+                    communication: scopedCommunication,
+                    financial: scopedFinancial
+                  )
+            else { return .unavailable }
+            return scopedRequirement(
+                scopedCommunication,
+                sessionGrantsFullAccess: sessionGrantsFullAccess
+            )
+        }
+
+        // Compatibility for a last confirmed encrypted projection from before this contract.
+        if sessionGrantsFullAccess { return .allowed }
+        if MoneyIdentityAccessPolicy.isExplicitlyUnverified(
+            liveAccountStatus: legacyAccountKYCStatus,
+            cachedProfileStatus: nil
+        ) {
+            return .allowed
+        }
+        return deviceIdentityVerified ? .unlockSession : .verifyDeviceIdentity
+    }
+
+    private static func scopedRequirement(
+        _ access: SessionCommunicationAccessDTO,
+        sessionGrantsFullAccess: Bool
+    ) -> CommunicationAccessRequirement {
+        guard access.basis == access.basis.trimmingCharacters(in: .whitespacesAndNewlines),
+              access.requiredAction == access.requiredAction?.trimmingCharacters(
+                in: .whitespacesAndNewlines
+              )
+        else { return .unavailable }
+
+        if access.allowed {
+            guard access.requiredAction == nil else { return .unavailable }
+            switch access.basis {
+            case SessionScopedAccessPolicy.accountOnboarding:
+                return .allowed
+            case SessionScopedAccessPolicy.fullAssurance, SessionScopedAccessPolicy.appReview:
+                return sessionGrantsFullAccess ? .allowed : .unavailable
+            default:
+                return .unavailable
+            }
+        }
+
+        guard [SessionScopedAccessPolicy.fullAssurance, SessionScopedAccessPolicy.appReview]
+            .contains(access.basis)
+        else { return .unavailable }
+        switch access.requiredAction {
+        case SessionScopedAccessPolicy.verifyDeviceIdentity: return .verifyDeviceIdentity
+        case SessionScopedAccessPolicy.unlockSession: return .unlockSession
+        default: return .unavailable
+        }
+    }
+}
+
+enum MoneyActionAccessRequirement: Equatable {
+    case allowed
+    case readOnly
+    case verifyIdentity
+    case verifyDeviceIdentity
+    case unlockSession
+    case unavailable
+}
+
+enum FinancialEntryKind: Equatable {
+    case readOnlySurface
+    case moneyMovement
+}
+
+/// Testable navigation decision shared by Home, chat and support payment entry points. Keeping
+/// visibility separate from mutation authority lets pre-KYC users see the complete product and
+/// routes their tap to KYC, while App Review can inspect financial screens without moving money.
+enum FinancialEntryRoute: Equatable {
+    case open
+    case verifyIdentity
+    case verifyDeviceIdentity
+    case unlockSession
+    case readOnly
+    case unavailable
+}
+
+enum FinancialEntryRoutePolicy {
+    static func route(
+        requirement: MoneyActionAccessRequirement,
+        kind: FinancialEntryKind
+    ) -> FinancialEntryRoute {
+        switch (requirement, kind) {
+        case (.allowed, _), (.readOnly, .readOnlySurface):
+            return .open
+        case (.readOnly, .moneyMovement):
+            return .readOnly
+        case (.verifyIdentity, _):
+            return .verifyIdentity
+        case (.verifyDeviceIdentity, _):
+            return .verifyDeviceIdentity
+        case (.unlockSession, _):
+            return .unlockSession
+        case (.unavailable, _):
+            return .unavailable
+        }
+    }
+}
+
+/// One decision shared by every wallet/payment entry point. Identity is checked first so a
+/// pre-KYC communication session is routed to the KYC flow; an already verified account with a
+/// stepped-down device/session must restore its stronger assurance instead.
+enum MoneyActionAccessPolicy {
+    static func requirement(
+        identityVerified: Bool,
+        sessionGrantsFullAccess: Bool,
+        scopedCommunication: SessionCommunicationAccessDTO? = nil,
+        scopedFinancial: SessionFinancialAccessDTO? = nil
+    ) -> MoneyActionAccessRequirement {
+        if scopedCommunication != nil || scopedFinancial != nil {
+            guard let scopedCommunication,
+                  let scopedFinancial,
+                  SessionScopedAccessPolicy.isCoherent(
+                    communication: scopedCommunication,
+                    financial: scopedFinancial
+                  )
+            else { return .unavailable }
+            return scopedRequirement(
+                scopedFinancial,
+                sessionGrantsFullAccess: sessionGrantsFullAccess
+            )
+        }
+
+        // Compatibility for a last confirmed encrypted projection from before this contract.
+        guard identityVerified else { return .verifyIdentity }
+        guard sessionGrantsFullAccess else { return .unlockSession }
+        return .allowed
+    }
+
+    static func permitsFinancialData(
+        identityVerified: Bool,
+        sessionGrantsFullAccess: Bool,
+        scopedCommunication: SessionCommunicationAccessDTO?,
+        scopedFinancial: SessionFinancialAccessDTO?
+    ) -> Bool {
+        switch requirement(
+            identityVerified: identityVerified,
+            sessionGrantsFullAccess: sessionGrantsFullAccess,
+            scopedCommunication: scopedCommunication,
+            scopedFinancial: scopedFinancial
+        ) {
+        case .allowed, .readOnly:
+            return true
+        case .verifyIdentity, .verifyDeviceIdentity, .unlockSession, .unavailable:
+            return false
+        }
+    }
+
+    private static func scopedRequirement(
+        _ access: SessionFinancialAccessDTO,
+        sessionGrantsFullAccess: Bool
+    ) -> MoneyActionAccessRequirement {
+        guard access.basis == access.basis.trimmingCharacters(in: .whitespacesAndNewlines),
+              access.requiredAction == access.requiredAction?.trimmingCharacters(
+                in: .whitespacesAndNewlines
+              )
+        else { return .unavailable }
+
+        if access.allowed {
+            guard sessionGrantsFullAccess, access.requiredAction == nil else {
+                return .unavailable
+            }
+            switch (access.basis, access.readOnly) {
+            case (SessionScopedAccessPolicy.fullAssurance, false): return .allowed
+            case (SessionScopedAccessPolicy.appReview, true): return .readOnly
+            default: return .unavailable
+            }
+        }
+
+        if access.basis == SessionScopedAccessPolicy.accountOnboarding,
+           access.requiredAction == SessionScopedAccessPolicy.identityVerificationRequired,
+           !access.readOnly {
+            return .verifyIdentity
+        }
+        if access.requiredAction == SessionScopedAccessPolicy.verifyDeviceIdentity,
+           ((access.basis == SessionScopedAccessPolicy.fullAssurance && !access.readOnly)
+               || (access.basis == SessionScopedAccessPolicy.appReview && access.readOnly)) {
+            return .verifyDeviceIdentity
+        }
+        if access.requiredAction == SessionScopedAccessPolicy.unlockSession,
+           ((access.basis == SessionScopedAccessPolicy.fullAssurance && !access.readOnly)
+               || (access.basis == SessionScopedAccessPolicy.appReview && access.readOnly)) {
+            return .unlockSession
+        }
+        return .unavailable
+    }
+}
+
 struct HomeStarterChecklist: Equatable {
     struct Entry: Equatable {
         let step: HomeStarterStep
@@ -2732,9 +3159,6 @@ struct HomeStarterChecklist: Equatable {
 /// because the checklist is withheld for the demo account entirely. The checklist disappears
 /// once all three steps are genuinely complete.
 enum HomeStarterChecklistPolicy {
-    /// The app's authoritative "identity verified" KYC states (see KYCView/ProfileView).
-    static let verifiedKYCStatuses: Set<String> = ["verified", "approved"]
-
     /// Wallet statuses that mean money actually moved and stayed moved. An allowlist on
     /// purpose: pending, failed, reversed, and anything unrecognized all fail closed.
     static let settledTransactionStatuses: Set<String> = [
@@ -2742,9 +3166,9 @@ enum HomeStarterChecklistPolicy {
     ]
 
     static func identityVerified(kycStatus: String?) -> Bool {
-        guard let kycStatus else { return false }
-        return verifiedKYCStatuses.contains(
-            kycStatus.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        MoneyIdentityAccessPolicy.isVerified(
+            liveAccountStatus: kycStatus,
+            cachedProfileStatus: nil
         )
     }
 

@@ -384,21 +384,23 @@ struct ProviderFlowContainer: View {
 
     var body: some View {
         NavigationStack {
-            Group {
-                if !permitted {
-                    ProviderUnavailableView(
-                        title: entry == .bills ? "Bill payments unavailable" : "Airtime unavailable",
-                        message: "This service is not enabled for your Kit Pay account."
-                    )
-                } else if !app.isOnline {
-                    ProviderUnavailableView(
-                        title: "Internet connection required",
-                        message: "Provider payments are submitted online and cannot be queued offline."
-                    )
-                } else if entry == .bills {
-                    BillsCatalogView(flow: flow)
-                } else {
-                    AirtimePurchaseView(flow: flow)
+            MoneyAccessBoundary {
+                Group {
+                    if !permitted {
+                        ProviderUnavailableView(
+                            title: entry == .bills ? "Bill payments unavailable" : "Airtime unavailable",
+                            message: "This service is not enabled for your Kit Pay account."
+                        )
+                    } else if !app.isOnline {
+                        ProviderUnavailableView(
+                            title: "Internet connection required",
+                            message: "Provider payments are submitted online and cannot be queued offline."
+                        )
+                    } else if entry == .bills {
+                        BillsCatalogView(flow: flow)
+                    } else {
+                        AirtimePurchaseView(flow: flow)
+                    }
                 }
             }
             .background(KitColor.canvas.ignoresSafeArea())
@@ -411,7 +413,8 @@ struct ProviderFlowContainer: View {
         }
         .presentationBackground(.ultraThinMaterial)
         .interactiveDismissDisabled(flow.isSubmitting)
-        .task(id: "\(entry.id)-\(permitted)-\(app.isOnline)") {
+        .task(id: "\(entry.id)-\(permitted)-\(app.isOnline)-\(app.financialDataAccessGranted)") {
+            guard app.financialDataAccessGranted else { return }
             await flow.loadCatalog(permitted: permitted, online: app.isOnline)
         }
     }

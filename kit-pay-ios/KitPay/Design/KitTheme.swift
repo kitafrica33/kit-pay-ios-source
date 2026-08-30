@@ -836,18 +836,19 @@ struct VerifiedAccountBadge: View {
     var hasContrastBorder = false
 
     var body: some View {
-        ZStack {
-            Circle().fill(KitColor.verifiedBlue)
-            Image(systemName: "checkmark")
-                .font(.system(size: diameter * 0.52, weight: .black))
-                .foregroundStyle(.white)
-        }
+        Image(systemName: "checkmark.seal.fill")
+        .symbolRenderingMode(.palette)
+        .foregroundStyle(.white, KitColor.verifiedBlue)
+        .font(.system(size: diameter, weight: .semibold))
         .frame(width: diameter, height: diameter)
-        .overlay {
+        .background {
             if hasContrastBorder {
-                Circle().stroke(.white, lineWidth: max(1, diameter * 0.08))
+                Circle()
+                    .fill(.white)
+                    .padding(-max(1, diameter * 0.06))
             }
         }
+        .shadow(color: KitColor.verifiedBlue.opacity(0.22), radius: 2, y: 1)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(designation.accessibilityLabel)
     }

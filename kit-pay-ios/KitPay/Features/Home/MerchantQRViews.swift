@@ -210,48 +210,50 @@ struct MerchantQRPaymentView: View {
 
     var body: some View {
         NavigationStack {
-            Group {
-                if let paid = model.paidIntent {
-                    successView(paid)
-                } else {
-                    ScrollView {
-                        VStack(spacing: 18) {
-                            if let code = model.resolvedCode {
-                                paymentForm(code)
-                            } else {
-                                scanner
-                                manualEntry
+            MoneyAccessBoundary {
+                Group {
+                    if let paid = model.paidIntent {
+                        successView(paid)
+                    } else {
+                        ScrollView {
+                            VStack(spacing: 18) {
+                                if let code = model.resolvedCode {
+                                    paymentForm(code)
+                                } else {
+                                    scanner
+                                    manualEntry
+                                }
+                                if let error = model.errorMessage ?? cameraError {
+                                    Text(error)
+                                        .font(.footnote)
+                                        .foregroundStyle(.red)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .padding(14)
+                                        .background(.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 16))
+                                }
                             }
-                            if let error = model.errorMessage ?? cameraError {
-                                Text(error)
-                                    .font(.footnote)
-                                    .foregroundStyle(.red)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .padding(14)
-                                    .background(.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 16))
-                            }
+                            .padding(20)
+                            .padding(.bottom, 24)
                         }
-                        .padding(20)
-                        .padding(.bottom, 24)
                     }
                 }
-            }
-            .background(KitColor.canvas.ignoresSafeArea())
-            .navigationTitle("Scan to pay")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button("Close") { dismiss() }.disabled(model.isPaying)
-                }
-                if model.resolvedCode != nil, model.paidIntent == nil {
-                    ToolbarItem(placement: .topBarTrailing) {
-                        Button("Scan again") {
-                            model.reset()
-                            pin = ""
-                            amount = ""
-                            scannerGeneration = UUID()
+                .background(KitColor.canvas.ignoresSafeArea())
+                .navigationTitle("Scan to pay")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button("Close") { dismiss() }.disabled(model.isPaying)
+                    }
+                    if model.resolvedCode != nil, model.paidIntent == nil {
+                        ToolbarItem(placement: .topBarTrailing) {
+                            Button("Scan again") {
+                                model.reset()
+                                pin = ""
+                                amount = ""
+                                scannerGeneration = UUID()
+                            }
+                            .disabled(model.isPaying)
                         }
-                        .disabled(model.isPaying)
                     }
                 }
             }

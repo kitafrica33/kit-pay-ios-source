@@ -1159,6 +1159,7 @@ private struct SupportTicketThreadSheet: View {
     /// retryable notice and informs the close prompt.
     @State private var paymentStoreBlocked = false
     @State private var paymentSheet: SupportPaymentSheetPresentation?
+    @State private var showMoneyIdentityVerification = false
 
     init(ticket: SupportTicketDTO, onTicketUpdated: @escaping (SupportTicketDTO) -> Void) {
         _ticket = State(initialValue: ticket)
@@ -1280,10 +1281,11 @@ private struct SupportTicketThreadSheet: View {
                             if paymentsGate.isAvailable,
                                pendingPayment == nil,
                                !paymentStoreBlocked,
-                               flow != nil,
+                               (flow != nil
+                                   || model.moneyActionAccessRequirement == .verifyIdentity),
                                threadDraftKey != nil {
                                 Button {
-                                    paymentSheet = SupportPaymentSheetPresentation(envelope: nil)
+                                    openSupportPayment(nil)
                                 } label: {
                                     Label("Send money to Kit Pay", systemImage: "banknote")
                                 }
@@ -1335,6 +1337,22 @@ private struct SupportTicketThreadSheet: View {
                     )
                     .environmentObject(model)
                 }
+            }
+            .fullScreenCover(isPresented: $showMoneyIdentityVerification) {
+                NavigationStack {
+                    KYCView()
+                        .toolbar {
+                            ToolbarItem(placement: .topBarLeading) {
+                                Button {
+                                    showMoneyIdentityVerification = false
+                                } label: {
+                                    Label("Close", systemImage: "xmark")
+                                }
+                                .accessibilityLabel("Close identity verification")
+                            }
+                        }
+                }
+                .environmentObject(model)
             }
             .task {
                 // Restoration FIRST: the composer's persisted envelope must be bound before any
@@ -1519,9 +1537,9 @@ private struct SupportTicketThreadSheet: View {
                 .font(.footnote)
                 .foregroundStyle(KitColor.secondaryText)
                 .fixedSize(horizontal: false, vertical: true)
-                if flow != nil {
+                if flow != nil || model.moneyActionAccessRequirement == .verifyIdentity {
                     Button("Review payment") {
-                        paymentSheet = SupportPaymentSheetPresentation(envelope: pendingPayment)
+                        openSupportPayment(pendingPayment)
                     }
                     .font(.footnote.weight(.semibold))
                     .disabled(busy)
@@ -2208,14 +2226,34 @@ private struct SupportTicketThreadSheet: View {
                 Task { await discardDraftThenClose() }
             }
         case .pendingPayment:
-            if let pendingPayment, flow != nil {
+            if let pendingPayment,
+               flow != nil || model.moneyActionAccessRequirement == .verifyIdentity {
                 Button("Review payment") {
-                    paymentSheet = SupportPaymentSheetPresentation(envelope: pendingPayment)
+                    openSupportPayment(pendingPayment)
                 }
             }
             Button("Close request anyway", role: .destructive) {
                 Task { await performClose(acknowledgedPendingPayment: true) }
             }
+        }
+    }
+
+    private func openSupportPayment(_ envelope: SupportPaymentEnvelope?) {
+        switch model.moneyActionAccessRequirement {
+        case .allowed:
+            guard flow != nil else {
+                model.lastError = "Wallet access is temporarily unavailable. Refresh and try again."
+                return
+            }
+            paymentSheet = SupportPaymentSheetPresentation(envelope: envelope)
+        case .readOnly:
+            model.lastError = "This App Review preview is read-only."
+        case .verifyIdentity:
+            showMoneyIdentityVerification = true
+        case .verifyDeviceIdentity:
+            model.lastError = "Verify this iPhone before sending money."
+        case .unlockSession, .unavailable:
+            model.lastError = "Unlock this iPhone before sending money."
         }
     }
 

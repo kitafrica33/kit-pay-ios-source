@@ -82,7 +82,7 @@ struct RootView: View {
             guard !Task.isCancelled else { return }
             guard model.isSignedIn,
                   model.accountSetupStep == nil,
-                  model.sessionAssurance?.grantsFullAccess == true,
+                  model.communicationAccessGranted,
                   !model.requiresBiometricSignIn,
                   let configuration = model.messagingRealtimeConfiguration,
                   let userID = model.profile?.id,
@@ -151,7 +151,7 @@ struct RootView: View {
             model.profile?.id ?? "none",
             String(model.isSignedIn),
             String(model.accountSetupStep == nil),
-            String(model.sessionAssurance?.grantsFullAccess == true),
+            String(model.communicationAccessGranted),
             String(model.isOnline),
         ].joined(separator: ":")
     }
@@ -190,8 +190,7 @@ struct RootView: View {
                     unreadMessageCount: model.state.conversations.reduce(0) { $0 + $1.unreadCount },
                     queuedCount: model.queuedCount,
                     profileName: model.profile?.identityDisplayName ?? "Kit Pay",
-                    profileAvatarURL: model.profile?.avatarURL,
-                    profileVerification: model.profile?.verification?.designation
+                    profileAvatarURL: model.profile?.avatarURL
                 )
                 .background {
                     GeometryReader { proxy in
@@ -660,7 +659,6 @@ private struct FloatingTabBar: View {
     /// The signed-in customer, for the Profile tab's own photo.
     let profileName: String
     let profileAvatarURL: String?
-    let profileVerification: AccountVerificationDesignation?
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
@@ -892,8 +890,7 @@ private struct FloatingTabBar: View {
                 name: profileName,
                 avatarURL: profileAvatarURL,
                 size: tabIconSize + 4,
-                ringOpacity: nil,
-                verification: profileVerification
+                ringOpacity: nil
             )
             .overlay {
                 Circle()

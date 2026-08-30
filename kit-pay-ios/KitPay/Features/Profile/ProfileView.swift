@@ -100,8 +100,7 @@ struct ProfileView: View {
             RemoteAvatarView(
                 name: model.profile?.identityDisplayName ?? "Kit Pay",
                 avatarURL: model.profile?.avatarURL,
-                size: 82,
-                verification: model.profile?.verification?.designation
+                size: 82
             )
             VStack(alignment: .leading, spacing: 5) {
                 HStack(spacing: 6) {
@@ -113,7 +112,7 @@ struct ProfileView: View {
                     }
                 }
                 if let legalName = distinctVerifiedLegalName {
-                    Label("Legal name: \(legalName)", systemImage: "checkmark.seal.fill")
+                    Text("Legal name: \(legalName)")
                         .font(.caption)
                         .foregroundStyle(KitColor.secondaryText)
                 }
@@ -121,14 +120,6 @@ struct ProfileView: View {
                     Text(profileSubtitle)
                         .font(.subheadline)
                         .foregroundStyle(KitColor.secondaryText)
-                }
-                if kycAvailable {
-                    Label(
-                        kycLabel,
-                        systemImage: kycVerified ? "checkmark.seal.fill" : "hourglass"
-                    )
-                    .font(.caption.bold())
-                    .foregroundStyle(kycVerified ? KitColor.green : .orange)
                 }
             }
             Spacer()
@@ -208,12 +199,7 @@ struct ProfileView: View {
                     .lineLimit(1)
             }
             Spacer()
-            if row.destination == .profileEmail, model.profile?.emailVerified == true {
-                Image(systemName: "checkmark.seal.fill")
-                    .font(.body.weight(.semibold))
-                    .foregroundStyle(KitColor.green)
-                    .accessibilityLabel("Verified")
-            } else if showsDisclosure {
+            if showsDisclosure {
                 Image(systemName: "chevron.right")
                     .font(.caption.bold())
                     .foregroundStyle(.tertiary)
@@ -239,19 +225,11 @@ struct ProfileView: View {
     }
 
     private var kycVerified: Bool {
-        ["verified", "approved"].contains(normalizedKYCStatus)
-    }
-
-    private var kycLabel: String {
-        if kycVerified { return "Identity verified with Didit" }
-        if ["pending", "in_review", "review"].contains(normalizedKYCStatus) {
-            return "Didit verification in review"
-        }
-        return "Identity not verified"
+        model.hasVerifiedIdentityForMoney
     }
 
     private var normalizedKYCStatus: String {
-        (model.kycStatus?.status ?? model.profile?.kycStatus ?? "")
+        (model.kycStatus?.accountStatus ?? model.profile?.kycStatus ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
     }
@@ -277,23 +255,18 @@ struct ProfileView: View {
     }
 
     private var identityVerificationTitle: String {
-        guard kycAvailable else { return "Verify your identity with Didit" }
-        if kycVerified { return "Identity verified with Didit" }
-        if ["pending", "in_review", "review"].contains(normalizedKYCStatus) {
-            return "Didit verification in review"
-        }
-        return "Verify your identity with Didit"
+        "Identity verification"
     }
 
     private var identityVerificationSubtitle: String {
         guard kycAvailable else {
-            return "Didit verification is temporarily unavailable"
+            return "Identity checks are temporarily unavailable"
         }
-        if kycVerified { return "Your identity checks are complete" }
+        if kycVerified { return "Wallet and payments are unlocked" }
         if ["pending", "in_review", "review"].contains(normalizedKYCStatus) {
-            return "Tap to refresh your verification status"
+            return "Your identity check is under review"
         }
-        return "Tap to start the secure identity check"
+        return "Required before using wallet and payments"
     }
 
     private var accountDeletionSubtitle: String {
@@ -446,8 +419,7 @@ private struct ProfileEditorView: View {
                                         ? (model.profile?.identityDisplayName ?? "Kit Pay")
                                         : name,
                                     avatarURL: model.profile?.avatarURL,
-                                    size: 112,
-                                    verification: model.profile?.verification?.designation
+                                    size: 112
                                 )
                             }
 
@@ -457,17 +429,6 @@ private struct ProfileEditorView: View {
                                     .frame(width: 112, height: 112)
                                 ProgressView()
                                     .tint(.white)
-                            }
-                        }
-                        .overlay(alignment: .topTrailing) {
-                            if preparedAvatarPreview != nil,
-                               let verification = model.profile?.verification?.designation {
-                                VerifiedAccountBadge(
-                                    designation: verification,
-                                    diameter: 34,
-                                    hasContrastBorder: true
-                                )
-                                .offset(x: 5, y: -5)
                             }
                         }
                         .frame(maxWidth: .infinity)
@@ -497,10 +458,10 @@ private struct ProfileEditorView: View {
                                     fromByteCount: Int64(preparedAvatarJPEG.count),
                                     countStyle: .file
                                 ),
-                                systemImage: "checkmark.circle.fill"
+                                systemImage: "photo.fill"
                             )
                             .font(.caption)
-                            .foregroundStyle(KitColor.green)
+                            .foregroundStyle(KitColor.secondaryText)
                         }
                     }
                     .padding(.vertical, 8)
@@ -522,8 +483,7 @@ private struct ProfileEditorView: View {
                                 .foregroundStyle(KitColor.primaryText)
                         }
                     } header: {
-                        Label("Verified legal name", systemImage: "checkmark.seal.fill")
-                            .foregroundStyle(KitColor.green)
+                        Text("Legal name")
                     } footer: {
                         Text("Taken from your verified ID. Kit Pay uses it for payments and security checks. To change it, verify your identity again with an updated document.")
                     }

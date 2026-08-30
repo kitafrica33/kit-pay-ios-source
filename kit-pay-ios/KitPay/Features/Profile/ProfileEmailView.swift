@@ -16,7 +16,7 @@ enum ProfileEmailPresentationPolicy {
         if profile?.emailVerified == true, let email, !email.isEmpty {
             return ProfileEmailPresentation(
                 title: "Email address",
-                subtitle: "\(email) · Verified · Email changes are not yet supported",
+                subtitle: "\(email) · Email changes are not yet supported",
                 canAttach: false
             )
         }

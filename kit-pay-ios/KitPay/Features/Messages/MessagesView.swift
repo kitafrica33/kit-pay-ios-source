@@ -1475,6 +1475,7 @@ struct ConversationView: View {
     @State private var immediateDraftPersistenceTask: Task<Void, Never>?
     @State private var showPaymentRequest = false
     @State private var showSendMoney = false
+    @State private var showMoneyIdentityVerification = false
     @State private var showContactProfile = false
     @State private var showGroupProfile = false
     @State private var showGroupMemberPicker = false
@@ -1654,7 +1655,7 @@ struct ConversationView: View {
 
     private var scheduledPaymentLoadID: String {
         let terminal = terminalScheduledPaymentIDs.sorted().joined(separator: ",")
-        return "\(model.isOnline):\(scheduledPaymentsEnabled):\(conversation.id.lowercased()):\(terminal)"
+        return "\(model.isOnline):\(model.financialAccessGranted):\(scheduledPaymentsEnabled):\(conversation.id.lowercased()):\(terminal)"
     }
 
     private var timelineItems: [ConversationTimelineItem] {
@@ -1800,7 +1801,7 @@ struct ConversationView: View {
         let descriptorMessageIDs = paymentRequestEvents.map {
             $0.message.id.uuidString.lowercased()
         }
-        return "\(model.isOnline):\(descriptorMessageIDs.joined(separator: ","))"
+        return "\(model.isOnline):\(model.financialAccessGranted):\(descriptorMessageIDs.joined(separator: ","))"
     }
 
     /// The signed-in user and this conversation's peer — the only accounts a transfer event in
@@ -1827,7 +1828,7 @@ struct ConversationView: View {
             else { return nil }
             return message.id.uuidString.lowercased()
         }
-        return "\(model.isOnline):\(transferAcceptanceEnabled):\(transferMessageIDs.joined(separator: ","))"
+        return "\(model.isOnline):\(model.financialAccessGranted):\(transferAcceptanceEnabled):\(transferMessageIDs.joined(separator: ","))"
     }
 
     private var conversationHasTransferEvents: Bool {
@@ -1871,7 +1872,7 @@ struct ConversationView: View {
                 return nil
             }
         }
-        return "\(model.isOnline):\(groupPaymentsEnabled):\(eventIDs.joined(separator: ","))"
+        return "\(model.isOnline):\(model.financialAccessGranted):\(groupPaymentsEnabled):\(eventIDs.joined(separator: ","))"
     }
 
     private var groupPaymentRequestsEnabled: Bool {
@@ -1897,7 +1898,7 @@ struct ConversationView: View {
                 return nil
             }
         }.joined(separator: ",")
-        return "\(model.isOnline):\(scheduledGroupPaymentsEnabled):\(conversation.id.lowercased()):\(known):\(terminal)"
+        return "\(model.isOnline):\(model.financialAccessGranted):\(scheduledGroupPaymentsEnabled):\(conversation.id.lowercased()):\(known):\(terminal)"
     }
 
     private var conversationGroupPaymentRequestIDs: [String] {
@@ -1937,7 +1938,7 @@ struct ConversationView: View {
                 return nil
             }
         }
-        return "\(model.isOnline):\(groupPaymentRequestsEnabled):\(eventIDs.joined(separator: ","))"
+        return "\(model.isOnline):\(model.financialAccessGranted):\(groupPaymentRequestsEnabled):\(eventIDs.joined(separator: ","))"
     }
 
     /// Members of this group who could be paid: everyone but the account holder.
@@ -2687,9 +2688,15 @@ struct ConversationView: View {
                                 isOnline: model.isOnline,
                                 failureReason: { model.scheduledItemFailureReason($0) },
                                 onSendNow: { item in
+                                    guard !item.isPaymentRequest || requireMoneyAccess() else {
+                                        return
+                                    }
                                     Task { await model.sendScheduledItemNow(item.id) }
                                 },
                                 onEditSchedule: { item in
+                                    guard !item.isPaymentRequest || requireMoneyAccess() else {
+                                        return
+                                    }
                                     scheduleRequest = ChatScheduleRequest(
                                         id: item.id,
                                         existingItem: item,
@@ -2697,6 +2704,9 @@ struct ConversationView: View {
                                     )
                                 },
                                 onCancel: { item in
+                                    guard !item.isPaymentRequest || requireMoneyAccess() else {
+                                        return
+                                    }
                                     Task { await cancelScheduledItem(item) }
                                 }
                             )
@@ -2709,6 +2719,7 @@ struct ConversationView: View {
                                 cancellingID: chatScheduledPayments.cancellingID,
                                 errorMessage: chatScheduledPayments.errorMessage,
                                 onCancel: { payment in
+                                    guard requireMoneyAccess() else { return }
                                     Task {
                                         await chatScheduledPayments.cancel(
                                             payment,
@@ -2726,6 +2737,7 @@ struct ConversationView: View {
                                 actionID: chatScheduledGroupPayments.actionID,
                                 errorMessage: chatScheduledGroupPayments.errorMessage,
                                 onCancel: { schedule in
+                                    guard requireMoneyAccess() else { return }
                                     Task {
                                         await chatScheduledGroupPayments.cancel(
                                             schedule,
@@ -2992,6 +3004,22 @@ struct ConversationView: View {
 
     private var conversationSheets: some View {
         conversationMediaPickers
+        .fullScreenCover(isPresented: $showMoneyIdentityVerification) {
+            NavigationStack {
+                KYCView()
+                    .toolbar {
+                        ToolbarItem(placement: .topBarLeading) {
+                            Button {
+                                showMoneyIdentityVerification = false
+                            } label: {
+                                Label("Close", systemImage: "xmark")
+                            }
+                            .accessibilityLabel("Close identity verification")
+                        }
+                    }
+            }
+            .environmentObject(model)
+        }
         .sheet(isPresented: $showPaymentRequest) {
             NavigationStack {
                 RequestMoneyView(
@@ -3301,7 +3329,7 @@ struct ConversationView: View {
                 isSubmitting: chatTransfers.actionTransferId != nil,
                 errorMessage: chatTransfers.errorMessage
             ) { reason, pin in
-                guard transferAcceptanceEnabled else { return false }
+                guard requireMoneyAccess(), transferAcceptanceEnabled else { return false }
                 let reversed = await chatTransfers.reverse(
                     target.descriptor,
                     binding: transferPartyBinding,
@@ -3329,7 +3357,7 @@ struct ConversationView: View {
                 isSubmitting: chatTransfers.actionTransferId != nil,
                 errorMessage: chatTransfers.errorMessage
             ) { reason in
-                guard transferAcceptanceEnabled else { return false }
+                guard requireMoneyAccess(), transferAcceptanceEnabled else { return false }
                 let rejected = await chatTransfers.reject(
                     target.descriptor,
                     binding: transferPartyBinding,
@@ -3354,7 +3382,9 @@ struct ConversationView: View {
                 isSubmitting: chatPaymentRequests.actionRequestId == approval.request.id,
                 errorMessage: chatPaymentRequests.errorMessage
             ) { pin in
-                guard let wallet = model.selectedWallet else { return false }
+                guard requireMoneyAccess(),
+                      let wallet = model.selectedWallet
+                else { return false }
                 let paid = await chatPaymentRequests.pay(
                     approval.request,
                     from: wallet,
@@ -3386,6 +3416,7 @@ struct ConversationView: View {
                 isSubmitting: chatGroupPayments.actionPaymentId != nil,
                 errorMessage: chatGroupPayments.errorMessage
             ) { reason in
+                guard requireMoneyAccess() else { return false }
                 let declined = await chatGroupPayments.rejectShare(
                     target.descriptor,
                     conversationID: conversation.id,
@@ -3407,6 +3438,7 @@ struct ConversationView: View {
                 isSubmitting: chatGroupPayments.actionPaymentId != nil,
                 errorMessage: chatGroupPayments.errorMessage
             ) { reason, pin in
+                guard requireMoneyAccess() else { return false }
                 let returned = await chatGroupPayments.reverseUnclaimed(
                     target.descriptor,
                     conversationID: conversation.id,
@@ -3437,40 +3469,43 @@ struct ConversationView: View {
                     errorMessage: chatGroupPayments.errorMessage
                         ?? chatScheduledGroupPayments.errorMessage,
                     submit: { body, pin in
-                    let payment = await chatGroupPayments.send(
-                        conversationId: conversation.id,
-                        body: body,
-                        idempotencyKey: composer.id,
-                        groupPaymentsEnabled: groupPaymentsEnabled,
-                        pin: pin,
-                        isOnline: model.isOnline,
-                        authorize: model.authorizeFinancialStepUp
-                    )
-                    guard let payment else { return nil }
-                    // The money movement is already confirmed. Hand success back immediately so
-                    // the composer closes once; posting its idempotent chat card and refreshing
-                    // the wallet continue without leaving a live Send button over the thread.
-                    Task { @MainActor in
-                        var announced = await announceGroupPayment(payment)
-                        // A refresh can repair a transient roster/session race. The deterministic
-                        // client message id makes this one retry safe if the first queue actually
-                        // committed before reporting failure.
-                        await model.refresh()
-                        if !announced {
-                            announced = await announceGroupPayment(payment)
+                        guard requireMoneyAccess() else { return nil }
+                        let payment = await chatGroupPayments.send(
+                            conversationId: conversation.id,
+                            body: body,
+                            idempotencyKey: composer.id,
+                            groupPaymentsEnabled: groupPaymentsEnabled,
+                            pin: pin,
+                            isOnline: model.isOnline,
+                            authorize: model.authorizeFinancialStepUp
+                        )
+                        guard let payment else { return nil }
+                        // The money movement is already confirmed. Hand success back immediately
+                        // so the composer closes once; posting its idempotent chat card and
+                        // refreshing the wallet continue without leaving a live Send button over
+                        // the thread.
+                        Task { @MainActor in
+                            var announced = await announceGroupPayment(payment)
+                            // A refresh can repair a transient roster/session race. The
+                            // deterministic client message id makes this one retry safe if the
+                            // first queue actually committed before reporting failure.
+                            await model.refresh()
+                            if !announced {
+                                announced = await announceGroupPayment(payment)
+                            }
+                            if !announced {
+                                let message = "The payment was sent, but its chat card could not be "
+                                    + "added after retrying. Do not send it again; check Wallet "
+                                    + "activity and contact Kit Pay support with reference \(payment.id)."
+                                chatGroupPayments.errorMessage = message
+                                model.lastError = message
+                            }
                         }
-                        if !announced {
-                            let message = "The payment was sent, but its chat card could not be "
-                                + "added after retrying. Do not send it again; check Wallet "
-                                + "activity and contact Kit Pay support with reference \(payment.id)."
-                            chatGroupPayments.errorMessage = message
-                            model.lastError = message
-                        }
-                    }
-                    return payment
+                        return payment
                     },
                     schedulePayment: scheduledGroupPaymentsEnabled ? { body, date, pin in
-                        await chatScheduledGroupPayments.schedule(
+                        guard requireMoneyAccess() else { return nil }
+                        return await chatScheduledGroupPayments.schedule(
                             conversationID: conversation.id,
                             draft: body,
                             wallet: wallet,
@@ -3495,6 +3530,7 @@ struct ConversationView: View {
                     isSubmitting: chatGroupPaymentRequests.actionRequestID != nil,
                     errorMessage: chatGroupPaymentRequests.errorMessage
                 ) { body in
+                    guard requireMoneyAccess() else { return nil }
                     guard let requesterUserID = model.profile?.id else { return nil }
                     let request = await chatGroupPaymentRequests.create(
                         conversationID: conversation.id,
@@ -3527,6 +3563,7 @@ struct ConversationView: View {
                     isSubmitting: chatGroupPaymentRequests.actionRequestID != nil,
                     errorMessage: chatGroupPaymentRequests.errorMessage
                 ) { amount, pin in
+                    guard requireMoneyAccess() else { return nil }
                     guard let currentUserID = model.profile?.id else { return nil }
                     let result = await chatGroupPaymentRequests.contribute(
                         descriptor: target.descriptor,
@@ -3557,6 +3594,7 @@ struct ConversationView: View {
                 message: Text("Contributions already received stay settled. No new contributions will be accepted."),
                 primaryButton: .destructive(Text("Close request")) {
                     Task { @MainActor in
+                        guard requireMoneyAccess() else { return }
                         guard let request = await chatGroupPaymentRequests.cancel(
                             descriptor: target.descriptor,
                             conversationID: conversation.id,
@@ -3630,6 +3668,7 @@ struct ConversationView: View {
         }
         .task(id: incomingPaymentRequestLoadID) {
             guard !isReadOnlyAppReviewPreview,
+                  model.financialAccessGranted,
                   paymentRecipientUserID != nil,
                   model.isOnline,
                   !paymentRequestEvents.isEmpty
@@ -3639,6 +3678,7 @@ struct ConversationView: View {
         }
         .task(id: transferEventLoadID) {
             guard !isReadOnlyAppReviewPreview,
+                  model.financialAccessGranted,
                   paymentRecipientUserID != nil,
                   model.isOnline,
                   conversationHasTransferEvents,
@@ -3652,6 +3692,7 @@ struct ConversationView: View {
         }
         .task(id: groupPaymentLoadID) {
             guard !isReadOnlyAppReviewPreview,
+                  model.financialAccessGranted,
                   model.isOnline,
                   groupPaymentsEnabled,
                   !conversationGroupPaymentIDs.isEmpty
@@ -3663,6 +3704,7 @@ struct ConversationView: View {
         }
         .task(id: groupPaymentRequestLoadID) {
             guard !isReadOnlyAppReviewPreview,
+                  model.financialAccessGranted,
                   model.isOnline,
                   groupPaymentRequestsEnabled,
                   !conversationGroupPaymentRequestIDs.isEmpty
@@ -3675,6 +3717,7 @@ struct ConversationView: View {
             )
         }
         .task(id: scheduledGroupPaymentLoadID) {
+            guard model.financialAccessGranted else { return }
             await chatScheduledGroupPayments.load(
                 conversationID: conversation.id,
                 enabled: scheduledGroupPaymentsEnabled,
@@ -3682,6 +3725,7 @@ struct ConversationView: View {
             )
         }
         .task(id: scheduledPaymentLoadID) {
+            guard model.financialAccessGranted else { return }
             await chatScheduledPayments.load(
                 conversationID: conversation.id,
                 enabled: scheduledPaymentsEnabled,
@@ -5297,12 +5341,14 @@ struct ConversationView: View {
                     displayName: { participantDisplayName(for: $0) },
                     isBusy: chatGroupPayments.actionPaymentId != nil,
                     accept: {
+                        guard requireMoneyAccess() else { return }
                         acceptGroupPaymentShare(
                             descriptor,
                             announcementSenderID: message.senderId
                         )
                     },
                     decline: {
+                        guard requireMoneyAccess() else { return }
                         groupPaymentDeclineTarget = GroupPaymentDeclineTarget(
                             descriptor: descriptor,
                             announcementSenderID: message.senderId,
@@ -5310,6 +5356,7 @@ struct ConversationView: View {
                         )
                     },
                     returnUnclaimed: {
+                        guard requireMoneyAccess() else { return }
                         groupPaymentReturnTarget = GroupPaymentReturnTarget(
                             descriptor: descriptor,
                             announcementSenderID: message.senderId,
@@ -5405,6 +5452,7 @@ struct ConversationView: View {
                         )
                     },
                     cancel: {
+                        guard requireMoneyAccess() else { return }
                         groupPaymentRequestCancellation = GroupPaymentRequestCancellationTarget(
                             descriptor: descriptor,
                             announcementSenderID: message.senderId
@@ -5438,6 +5486,7 @@ struct ConversationView: View {
         announcementSenderID: String,
         payRemaining: Bool
     ) {
+        guard requireMoneyAccess() else { return }
         guard groupPaymentRequestsEnabled,
               model.isOnline,
               model.selectedWallet != nil,
@@ -5543,6 +5592,7 @@ struct ConversationView: View {
         _ descriptor: KitGroupPaymentMessage,
         announcementSenderID: String
     ) {
+        guard requireMoneyAccess() else { return }
         Task { @MainActor in
             let accepted = await chatGroupPayments.acceptShare(
                 descriptor,
@@ -5771,6 +5821,7 @@ struct ConversationView: View {
                     }
                     if presentation.showsReject {
                         Button {
+                            guard requireMoneyAccess() else { return }
                             transferRejectTarget = ChatTransferRejectTarget(
                                 descriptor: descriptor
                             )
@@ -5785,6 +5836,7 @@ struct ConversationView: View {
             }
             if !isGroupConversation && presentation.showsReverse {
                 Button {
+                    guard requireMoneyAccess() else { return }
                     transferReverseTarget = ChatTransferReverseTarget(descriptor: descriptor)
                 } label: {
                     if isActing {
@@ -5828,7 +5880,7 @@ struct ConversationView: View {
 
     /// Recipient accepts a pending transfer, then tells the sender inside the conversation.
     private func acceptTransfer(_ descriptor: KitPaymentMessage) async {
-        guard transferAcceptanceEnabled else { return }
+        guard requireMoneyAccess(), transferAcceptanceEnabled else { return }
         let accepted = await chatTransfers.accept(
             descriptor,
             binding: transferPartyBinding,
@@ -6059,6 +6111,7 @@ struct ConversationView: View {
 
     @MainActor
     private func prepareChatPayment(_ descriptor: KitPaymentMessage) async {
+        guard requireMoneyAccess() else { return }
         guard paymentRecipientUserID != nil,
               descriptor.isRequest,
               resolvingPaymentRequestID == nil
@@ -6086,7 +6139,8 @@ struct ConversationView: View {
     }
 
     private func declineChatPaymentRequest(_ descriptor: KitPaymentMessage) async {
-        guard descriptor.isRequest,
+        guard requireMoneyAccess(),
+              descriptor.isRequest,
               let paymentRecipientUserID,
               let declined = descriptor.changingAction(to: .declined)
         else { return }
@@ -6099,7 +6153,8 @@ struct ConversationView: View {
     }
 
     private func cancelChatPaymentRequest(_ descriptor: KitPaymentMessage) async {
-        guard descriptor.isRequest,
+        guard requireMoneyAccess(),
+              descriptor.isRequest,
               let paymentRecipientUserID,
               let request = authoritativeRequest(for: descriptor),
               paymentRequestPolicy.canCancel(request)
@@ -6628,6 +6683,7 @@ struct ConversationView: View {
             model.lastError = "This App Review preview is read-only."
             return
         }
+        guard requireMoneyAccess() else { return }
         guard !isGroupConversation else {
             model.lastError = "Payment requests are available only in one-to-one Kit Pay chats."
             return
@@ -6665,6 +6721,7 @@ struct ConversationView: View {
             model.lastError = "This App Review preview is read-only."
             return
         }
+        guard requireMoneyAccess() else { return }
         guard !isGroupConversation else {
             model.lastError = "Sending money is available only in one-to-one Kit Pay chats."
             return
@@ -6703,16 +6760,19 @@ struct ConversationView: View {
         groupPaymentsEnabled
             && conversationMessagingAvailable
             && !groupPaymentMembers.isEmpty
-            && model.selectedWallet != nil
+            && (model.selectedWallet != nil
+                || model.moneyActionAccessRequirement == .verifyIdentity)
     }
 
     private var canCreateGroupPaymentRequest: Bool {
         groupPaymentRequestsEnabled
             && conversationMessagingAvailable
-            && model.selectedWallet?.status == "active"
+            && (model.selectedWallet?.status == "active"
+                || model.moneyActionAccessRequirement == .verifyIdentity)
     }
 
     private func openGroupPayment() {
+        guard requireMoneyAccess() else { return }
         guard canSendGroupPayment else {
             model.lastError = "Group payments are not available in this chat."
             return
@@ -6727,6 +6787,7 @@ struct ConversationView: View {
     }
 
     private func openGroupPaymentRequest() {
+        guard requireMoneyAccess() else { return }
         guard canCreateGroupPaymentRequest else {
             model.lastError = "Group payment requests are not available in this chat."
             return
@@ -6738,6 +6799,30 @@ struct ConversationView: View {
         isComposerFocused = false
         chatGroupPaymentRequests.errorMessage = nil
         groupPaymentRequestComposer = GroupPaymentRequestComposerTarget()
+    }
+
+    /// Keeps communication available before KYC while every chat money affordance fails closed.
+    /// Missing KYC opens the full identity flow; a verified but stepped-down session is an
+    /// anti-takeover boundary and must be unlocked rather than silently treated as pre-KYC.
+    @discardableResult
+    private func requireMoneyAccess() -> Bool {
+        switch model.moneyActionAccessRequirement {
+        case .allowed:
+            return true
+        case .readOnly:
+            model.lastError = "This App Review preview is read-only."
+            return false
+        case .verifyIdentity:
+            isComposerFocused = false
+            showMoneyIdentityVerification = true
+            return false
+        case .verifyDeviceIdentity:
+            model.lastError = "Verify this iPhone before using wallet or payment actions."
+            return false
+        case .unlockSession, .unavailable:
+            model.lastError = "Unlock this iPhone before using wallet or payment actions."
+            return false
+        }
     }
 
     // MARK: Attachment staging

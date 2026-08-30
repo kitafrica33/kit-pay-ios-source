@@ -1044,7 +1044,7 @@ final class AppModel: ObservableObject {
                     self.scheduleEphemeralCallCancellationDrain()
                     if self.isSignedIn,
                        self.accountSetupStep == nil,
-                       self.sessionAssurance?.grantsFullAccess == true {
+                       self.communicationAccessGranted {
                         await self.refresh()
                         if self.appReviewDemoMutationsAllowed,
                            self.capabilities != nil {
@@ -1336,6 +1336,45 @@ final class AppModel: ObservableObject {
             biometricsEnabled: biometricUnlockEnabled
         ) == .biometricSignature
     }
+    /// Authenticated communication is intentionally available before account KYC. A restricted
+    /// session may chat, call and manage its account; it still cannot cross a financial guard.
+    var communicationAccessGranted: Bool {
+        guard let profile else { return false }
+        return sessionAssurance?.grantsCommunicationAccess(
+            accountKYCStatus: kycStatus?.accountStatus ?? profile.kycStatus
+        ) == true
+    }
+    /// Account-wide KYC unlocks money. Public verification (`profile.verification`) is a separate
+    /// server designation and must never influence this decision.
+    var hasVerifiedIdentityForMoney: Bool {
+        MoneyIdentityAccessPolicy.isVerified(
+            liveAccountStatus: kycStatus?.accountStatus,
+            cachedProfileStatus: profile?.kycStatus
+        )
+    }
+    /// Money movement needs both account-wide KYC and the existing device/login assurance.
+    /// Public verification is intentionally unrelated to this authorization boundary.
+    var financialAccessGranted: Bool {
+        moneyActionAccessRequirement == .allowed
+    }
+    var moneyActionAccessRequirement: MoneyActionAccessRequirement {
+        MoneyActionAccessPolicy.requirement(
+            identityVerified: hasVerifiedIdentityForMoney,
+            sessionGrantsFullAccess: sessionAssurance?.grantsFullAccess == true,
+            scopedCommunication: sessionAssurance?.communicationAccess,
+            scopedFinancial: sessionAssurance?.financialAccess
+        )
+    }
+    /// Read-only App Review sessions may inspect the server-approved financial projection while
+    /// every money-moving action remains denied.
+    var financialDataAccessGranted: Bool {
+        MoneyActionAccessPolicy.permitsFinancialData(
+            identityVerified: hasVerifiedIdentityForMoney,
+            sessionGrantsFullAccess: sessionAssurance?.grantsFullAccess == true,
+            scopedCommunication: sessionAssurance?.communicationAccess,
+            scopedFinancial: sessionAssurance?.financialAccess
+        )
+    }
     var requiresBiometricSignIn: Bool {
         isSignedIn
             && accountSetupStep == nil
@@ -1402,7 +1441,7 @@ final class AppModel: ObservableObject {
             messagingRealtimeConfiguration?.lifecycleIdentity ?? "polling",
             String(isSignedIn),
             String(accountSetupStep == nil),
-            String(sessionAssurance?.grantsFullAccess == true),
+            String(communicationAccessGranted),
             String(requiresBiometricSignIn),
             String(communicationPreferences?.messagingPresenceVisible ?? false),
         ].joined(separator: ":")
@@ -2493,7 +2532,7 @@ final class AppModel: ObservableObject {
                         expectedOwnerID: expectedOwnerID
                     ) else { throw StoreError.accountChanged }
                     persisted.bindAuthenticatedProfile(bootstrap.user)
-                    persisted.sessionAssurance = bootstrap.sessionAssurance
+                    persisted.sessionAssurance = bootstrap.resolvedSessionAssurance
                     persisted.wallets = bootstrap.wallets
                     persisted.selectedWalletId = selectedID
                 }
@@ -2560,7 +2599,7 @@ final class AppModel: ObservableObject {
                         expectedOwnerID: expectedOwnerID
                     ) else { throw StoreError.accountChanged }
                     persisted.bindAuthenticatedProfile(bootstrap.user)
-                    persisted.sessionAssurance = bootstrap.sessionAssurance
+                    persisted.sessionAssurance = bootstrap.resolvedSessionAssurance
                     persisted.wallets = bootstrap.wallets
                     persisted.selectedWalletId = selectedID
                 }
@@ -2701,7 +2740,7 @@ final class AppModel: ObservableObject {
                     user: state.profile,
                     assurance: sessionAssurance
                 )
-                if sessionAssurance?.grantsFullAccess != true {
+                if !communicationAccessGranted {
                     lastError = error.localizedDescription
                     isLoading = false
                     return
@@ -5421,7 +5460,7 @@ final class AppModel: ObservableObject {
             let sessionIsEligible = !isSigningOut
                 && isSignedIn
                 && accountSetupStep == nil
-                && sessionAssurance?.grantsFullAccess == true
+                && communicationAccessGranted
                 && !requiresBiometricSignIn
                 && !acceptedAccountDeletionCleanupBlocked
                 && !protectedLocalStateRecoveryBlocked
@@ -5494,6 +5533,7 @@ final class AppModel: ObservableObject {
     func authorizePaymentRequestSubmission() async -> Bool {
         guard appReviewDemoMutationsAllowed,
               isSignedIn,
+              financialAccessGranted,
               !requiresBiometricSignIn
         else { return false }
         guard biometricUnlockEnabled else { return true }
@@ -5517,7 +5557,7 @@ final class AppModel: ObservableObject {
               isOnline,
               accountSetupStep == nil,
               !requiresBiometricSignIn,
-              sessionAssurance?.grantsFullAccess == true,
+              financialAccessGranted,
               let expectedWallet = state.wallets.first(where: { $0.id == destinationWalletID }),
               let expectedUserID = profile?.id,
               let expectedSessionID = await sessions.current()?.sessionId,
@@ -5584,7 +5624,7 @@ final class AppModel: ObservableObject {
               isOnline,
               accountSetupStep == nil,
               !requiresBiometricSignIn,
-              sessionAssurance?.grantsFullAccess == true,
+              financialAccessGranted,
               let expectedUserID = profile?.id
         else { throw APIClientError.signedOut }
 
@@ -5963,7 +6003,7 @@ final class AppModel: ObservableObject {
               !protectedLocalStateRecoveryBlocked,
               !unresolvedAccountDeletionAttemptBlocked,
               accountSetupStep == nil,
-              sessionAssurance?.grantsFullAccess == true,
+              communicationAccessGranted,
               !requiresBiometricSignIn,
               let expectedUserID = profile?.id
         else {
@@ -6102,7 +6142,7 @@ final class AppModel: ObservableObject {
             isSignedIn: isSignedIn,
             isSigningOut: isSigningOut,
             accountSetupComplete: accountSetupStep == nil,
-            sessionGrantsFullAccess: sessionAssurance?.grantsFullAccess == true,
+            sessionGrantsFullAccess: communicationAccessGranted,
             hasAuthenticatedCapabilities: capabilities != nil,
             accountMutationsAllowed: appReviewDemoMutationsAllowed,
             callsFeatureEnabled: callsFeatureEnabled,
@@ -6164,7 +6204,7 @@ final class AppModel: ObservableObject {
               isSignedIn,
               isOnline,
               accountSetupStep == nil,
-              sessionAssurance?.grantsFullAccess == true
+              communicationAccessGranted
         else { return }
         guard let expectedSessionID = await sessions.current()?.sessionId,
               let expectedUserID = profile?.id
@@ -6249,7 +6289,7 @@ final class AppModel: ObservableObject {
                 guard persisted.profile?.id.caseInsensitiveCompare(expectedUserID) == .orderedSame
                 else { throw AccountSetupError.accountChanged }
                 persisted.bindAuthenticatedProfile(bootstrap.user)
-                persisted.sessionAssurance = bootstrap.sessionAssurance
+                persisted.sessionAssurance = bootstrap.resolvedSessionAssurance
                 persisted.replaceAuthoritativeWalletProjection(
                     bootstrap.wallets,
                     selectedWalletID: selectedId
@@ -6267,7 +6307,7 @@ final class AppModel: ObservableObject {
                 userID: expectedUserID
             ) else { return }
             await publishLatestState()
-            sessionAssurance = bootstrap.sessionAssurance
+            sessionAssurance = bootstrap.resolvedSessionAssurance
             foregroundAuthoritativeRefreshGate.authoritativeRefreshDidCommit(
                 upTo: foregroundGenerationAtStart
             )
@@ -6444,7 +6484,7 @@ final class AppModel: ObservableObject {
         guard isSignedIn,
               !isSigningOut,
               accountSetupStep == nil,
-              sessionAssurance?.grantsFullAccess == true,
+              communicationAccessGranted,
               !requiresBiometricSignIn,
               messagingRealtimeConfiguration != nil,
               profile?.id.caseInsensitiveCompare(userID) == .orderedSame,
@@ -6538,7 +6578,7 @@ final class AppModel: ObservableObject {
               isSignedIn,
               isOnline,
               accountSetupStep == nil,
-              sessionAssurance?.grantsFullAccess == true,
+              communicationAccessGranted,
               let userID = profile?.id
         else { return .noData }
         let syncAttempt = secureMessagingSyncError.begin()
@@ -7140,7 +7180,7 @@ final class AppModel: ObservableObject {
               !unresolvedAccountDeletionAttemptBlocked,
               isSignedIn,
               accountSetupStep == nil,
-              sessionAssurance?.grantsFullAccess == true,
+              communicationAccessGranted,
               let currentUserID = profile?.id,
               MessageNotificationContract.canonicalUUID(state.communicationOwnerUserID)
                 == MessageNotificationContract.canonicalUUID(currentUserID),
@@ -7225,7 +7265,9 @@ final class AppModel: ObservableObject {
                   == action.accountFingerprint,
               MessageNotificationContract.canonicalUUID(snapshot.communicationOwnerUserID)
                   == MessageNotificationContract.canonicalUUID(currentUserID),
-              snapshot.sessionAssurance?.grantsFullAccess == true,
+              snapshot.sessionAssurance?.grantsCommunicationAccess(
+                accountKYCStatus: snapshot.profile?.kycStatus
+              ) == true,
               AccountSetupPolicy.restoredStep(
                   user: snapshot.profile,
                   assurance: snapshot.sessionAssurance
@@ -7352,7 +7394,7 @@ final class AppModel: ObservableObject {
               isOnline,
               callsFeatureEnabled,
               accountSetupStep == nil,
-              sessionAssurance?.grantsFullAccess == true,
+              communicationAccessGranted,
               let expectedUserID = profile?.id,
               let expectedSessionID = await sessions.current()?.sessionId
         else { return }
@@ -7422,7 +7464,7 @@ final class AppModel: ObservableObject {
               isOnline,
               callsFeatureEnabled,
               accountSetupStep == nil,
-              sessionAssurance?.grantsFullAccess == true,
+              communicationAccessGranted,
               let expectedUserID = profile?.id,
               let expectedSessionID = await sessions.current()?.sessionId
         else { return false }
@@ -7808,7 +7850,7 @@ final class AppModel: ObservableObject {
               isSignedIn,
               !isUpdatingProfile,
               accountSetupStep == nil,
-              sessionAssurance?.grantsFullAccess == true,
+              communicationAccessGranted,
               let profile,
               profile.emailVerified != true,
               let session = await sessions.current(),
@@ -8063,7 +8105,7 @@ final class AppModel: ObservableObject {
               isSignedIn,
               isOnline,
               accountSetupStep == nil,
-              sessionAssurance?.grantsFullAccess == true,
+              communicationAccessGranted,
               capabilities?.enablesProfileAvatars == true,
               let expectedUserID = profile?.id,
               let pendingAttachment = state.pendingProfileAvatarAttachment
@@ -8404,8 +8446,7 @@ final class AppModel: ObservableObject {
                       cancelled: false
                   )
             else { return false }
-            let demoFence = AppReviewDemoCapabilityFenceDecision.resolved(
-                ownerID: AppReviewDemoAccessPolicy.ownerID(
+            let featureDemoOwnerID = AppReviewDemoAccessPolicy.ownerID(
                     features: discovered.features,
                     authority: .authenticatedSession,
                     isSignedIn: isSignedIn,
@@ -8413,6 +8454,17 @@ final class AppModel: ObservableObject {
                     sessionID: expectedSession?.sessionId,
                     sessionAccountID: expectedSession?.accountId
                 )
+            let scopedDemoOwnerID = AppReviewDemoAccessPolicy.scopedOwnerID(
+                communicationAccess: discovered.communicationAccess,
+                financialAccess: discovered.financialAccess,
+                authority: .authenticatedSession,
+                isSignedIn: isSignedIn,
+                profileID: profile?.id,
+                sessionID: expectedSession?.sessionId,
+                sessionAccountID: expectedSession?.accountId
+            )
+            let demoFence = AppReviewDemoCapabilityFenceDecision.resolved(
+                ownerID: scopedDemoOwnerID ?? featureDemoOwnerID
             )
             // Arm the transport fence before exposing demo content. When the capability is
             // authoritatively withdrawn, keep the fence through projection replacement so stale
@@ -8424,6 +8476,19 @@ final class AppModel: ObservableObject {
                 communicationReplayTask?.cancel()
                 communicationReplayTask = nil
                 CommunicationBackgroundReplayScheduler.shared.cancel()
+            }
+            if isSignedIn, let currentAssurance = sessionAssurance {
+                sessionAssurance = currentAssurance.applyingTopLevelAccess(
+                    communication: discovered.communicationAccess,
+                    financial: discovered.financialAccess
+                )
+                if let profile {
+                    accountSetupStep = AccountSetupPolicy.reconcile(
+                        accountSetupStep,
+                        with: profile,
+                        assurance: sessionAssurance
+                    )
+                }
             }
             authenticatedAppReviewDemoOwnerID = demoFence.projectedOwnerID
             capabilities = discovered
@@ -8682,7 +8747,7 @@ final class AppModel: ObservableObject {
               isSignedIn,
               isOnline,
               accountSetupStep == nil,
-              sessionAssurance?.grantsFullAccess == true
+              communicationAccessGranted
         else { return }
         isApplyingAccountDiscoveryChoice = true
         defer { isApplyingAccountDiscoveryChoice = false }
@@ -8899,7 +8964,7 @@ final class AppModel: ObservableObject {
         guard !isSigningOut,
               isSignedIn,
               accountSetupStep == nil,
-              sessionAssurance?.grantsFullAccess == true,
+              communicationAccessGranted,
               let userID = CommunicationPrivacyIdentifier.canonicalUUID(profile?.id)
         else { return nil }
         let expectedAccountEpoch = accountEpoch
@@ -8907,7 +8972,7 @@ final class AppModel: ObservableObject {
               !isSigningOut,
               isSignedIn,
               accountSetupStep == nil,
-              sessionAssurance?.grantsFullAccess == true,
+              communicationAccessGranted,
               accountEpoch == expectedAccountEpoch,
               CommunicationPrivacyIdentifier.canonicalUUID(profile?.id) == userID
         else { return nil }
@@ -8925,7 +8990,7 @@ final class AppModel: ObservableObject {
               !isSigningOut,
               isSignedIn,
               accountSetupStep == nil,
-              sessionAssurance?.grantsFullAccess == true,
+              communicationAccessGranted,
               accountEpoch == context.accountEpoch,
               CommunicationPrivacyIdentifier.canonicalUUID(profile?.id) == context.userID
         else { return false }
@@ -12032,7 +12097,7 @@ final class AppModel: ObservableObject {
         guard isSignedIn,
               isOnline,
               accountSetupStep == nil,
-              sessionAssurance?.grantsFullAccess == true,
+              communicationAccessGranted,
               callsFeatureEnabled,
               let lease = callMediaAccountLease,
               lease.accountEpoch == accountEpoch,
@@ -12626,7 +12691,7 @@ final class AppModel: ObservableObject {
               !isSigningOut,
               isSignedIn,
               accountSetupStep == nil,
-              sessionAssurance?.grantsFullAccess == true,
+              communicationAccessGranted,
               callsFeatureEnabled,
               UIApplication.shared.applicationState == .active,
               callMediaAccountLease == attempt.lease,
@@ -12787,7 +12852,7 @@ final class AppModel: ObservableObject {
                   !isSigningOut,
                   isSignedIn,
                   accountSetupStep == nil,
-                  sessionAssurance?.grantsFullAccess == true,
+                  communicationAccessGranted,
                   callsFeatureEnabled,
                   UIApplication.shared.applicationState == .active,
                   callMediaAccountLease == attempt.lease,
@@ -13432,7 +13497,7 @@ final class AppModel: ObservableObject {
         }
         guard accountSetupStep == nil,
               !requiresBiometricSignIn,
-              sessionAssurance?.grantsFullAccess == true,
+              financialAccessGranted,
               state.wallets.contains(where: { $0.id == payload.destinationWalletID })
         else {
             state = (try? await commitOutboxMutation(
@@ -13791,7 +13856,7 @@ final class AppModel: ObservableObject {
         guard appReviewDemoMutationsAllowed,
               isSignedIn,
               accountSetupStep == nil,
-              sessionAssurance?.grantsFullAccess == true,
+              communicationAccessGranted,
               callsFeatureEnabled,
               UIApplication.shared.applicationState == .active,
               ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil
@@ -13873,7 +13938,7 @@ final class AppModel: ObservableObject {
                   self.isOnline,
                   self.isSignedIn,
                   self.accountSetupStep == nil,
-                  self.sessionAssurance?.grantsFullAccess == true
+                  self.communicationAccessGranted
             else { return false }
             await self.refresh()
             await self.drainReadyOutbox()
@@ -13943,7 +14008,7 @@ final class AppModel: ObservableObject {
               isSignedIn,
               isOnline,
               accountSetupStep == nil,
-              sessionAssurance?.grantsFullAccess == true,
+              communicationAccessGranted,
               contactDiscoveryEnabled
         else { return nil }
         guard [.allowed, .limited].contains(contactSource.accessState()) else { return nil }
@@ -13997,7 +14062,7 @@ final class AppModel: ObservableObject {
         guard appReviewDemoMutationsAllowed,
               isSignedIn, isOnline,
               accountSetupStep == nil,
-              sessionAssurance?.grantsFullAccess == true,
+              communicationAccessGranted,
               accountEpoch == expectedAccountEpoch,
               contactSyncGeneration == expectedSyncGeneration,
               let expectedSessionID = await sessions.current()?.sessionId
@@ -14848,7 +14913,7 @@ final class AppModel: ObservableObject {
               !isSigningOut,
               isSignedIn,
               accountSetupStep == nil,
-              sessionAssurance?.grantsFullAccess == true,
+              communicationAccessGranted,
               let accountID = profile?.id
         else { return }
         let expectedAccountEpoch = accountEpoch
@@ -14907,20 +14972,20 @@ final class AppModel: ObservableObject {
                 sessionID: expectedSessionID
             ) else { return }
             kycStatus = status
-            if case .deviceVerification = accountSetupStep {
-                let assurance = try await api.sessionAssurance()
-                guard await kycRequestIsCurrent(
-                    generation: expectedGeneration,
-                    sessionID: expectedSessionID
-                ) else { return }
-                sessionAssurance = assurance
-                if let currentProfile = profile {
-                    accountSetupStep = AccountSetupPolicy.reconcile(
-                        accountSetupStep,
-                        with: currentProfile,
-                        assurance: assurance
-                    )
-                }
+            // KYC can change financial_access without changing the legacy assurance fields.
+            // Re-read the scoped decision before enabling any wallet action.
+            let assurance = try await api.sessionAssurance()
+            guard await kycRequestIsCurrent(
+                generation: expectedGeneration,
+                sessionID: expectedSessionID
+            ) else { return }
+            sessionAssurance = assurance
+            if let currentProfile = profile {
+                accountSetupStep = AccountSetupPolicy.reconcile(
+                    accountSetupStep,
+                    with: currentProfile,
+                    assurance: assurance
+                )
             }
         } catch {
             guard await kycRequestIsCurrent(

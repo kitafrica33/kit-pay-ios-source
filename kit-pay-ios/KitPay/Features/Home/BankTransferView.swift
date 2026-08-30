@@ -1015,132 +1015,136 @@ struct BankTransferView: View {
     private var loadTrigger: String {
         let transfers = transferPermission.map { $0 ? "enabled" : "disabled" } ?? "unknown"
         let deposits = depositPermission.map { $0 ? "enabled" : "disabled" } ?? "unknown"
-        return "\(country)-\(transfers)-\(deposits)-\(app.selectedWallet?.id ?? "none")-\(app.isOnline)"
+        return "\(country)-\(transfers)-\(deposits)-\(app.selectedWallet?.id ?? "none")-\(app.isOnline)-\(app.financialDataAccessGranted)"
     }
 
     var body: some View {
         NavigationStack {
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 18) {
-                    intro
-                    if depositsPermitted {
-                        depositSection
-                        depositsSection
-                    }
-                    if transfersPermitted {
-                        beneficiariesSection
-                        transfersSection
-                    }
-                }
-                .padding(20)
-                .padding(.bottom, 24)
-            }
-            .background(KitColor.canvas.ignoresSafeArea())
-            .navigationTitle("Bank")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button("Close") { dismiss() }
-                }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        Task {
-                            async let transfers: Void = model.load(
-                                country: country,
-                                permitted: transferPermission,
-                                online: app.isOnline
-                            )
-                            async let deposits: Void = depositModel.load(
-                                wallet: app.selectedWallet,
-                                permitted: depositPermission,
-                                online: app.isOnline
-                            )
-                            _ = await (transfers, deposits)
+            MoneyAccessBoundary {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 18) {
+                        intro
+                        if depositsPermitted {
+                            depositSection
+                            depositsSection
                         }
-                    } label: {
-                        Image(systemName: "arrow.clockwise")
+                        if transfersPermitted {
+                            beneficiariesSection
+                            transfersSection
+                        }
                     }
-                    .disabled(
-                        model.isLoading || model.isSubmitting
-                            || depositModel.isLoading || depositModel.isSubmitting
-                    )
-                    .accessibilityLabel("Refresh bank activity")
+                    .padding(20)
+                    .padding(.bottom, 24)
                 }
-            }
-            .task(id: loadTrigger) {
-                async let transfers: Void = model.load(
-                    country: country,
-                    permitted: transferPermission,
-                    online: app.isOnline
-                )
-                async let deposits: Void = depositModel.load(
-                    wallet: app.selectedWallet,
-                    permitted: depositPermission,
-                    online: app.isOnline
-                )
-                _ = await (transfers, deposits)
-            }
-            .onAppear { rebuildContactIndex(app.contactDirectory) }
-            .onChange(of: app.contactDirectory) { _, contacts in
-                rebuildContactIndex(contacts)
-            }
-            .refreshable {
-                async let transfers: Void = model.load(
-                    country: country,
-                    permitted: transferPermission,
-                    online: app.isOnline
-                )
-                async let deposits: Void = depositModel.load(
-                    wallet: app.selectedWallet,
-                    permitted: depositPermission,
-                    online: app.isOnline
-                )
-                _ = await (transfers, deposits)
-            }
-            .sheet(item: $modal) { presented in
-                Group {
-                    switch presented {
-                    case .addBeneficiary:
-                        AddBankBeneficiaryView(
-                            model: model,
-                            permitted: transfersPermitted,
-                            online: app.isOnline
+                .background(KitColor.canvas.ignoresSafeArea())
+                .navigationTitle("Bank")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button("Close") { dismiss() }
+                    }
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button {
+                            Task {
+                                async let transfers: Void = model.load(
+                                    country: country,
+                                    permitted: transferPermission,
+                                    online: app.isOnline
+                                )
+                                async let deposits: Void = depositModel.load(
+                                    wallet: app.selectedWallet,
+                                    permitted: depositPermission,
+                                    online: app.isOnline
+                                )
+                                _ = await (transfers, deposits)
+                            }
+                        } label: {
+                            Image(systemName: "arrow.clockwise")
+                        }
+                        .disabled(
+                            model.isLoading || model.isSubmitting
+                                || depositModel.isLoading || depositModel.isSubmitting
                         )
-                    case .send(let beneficiary):
-                        BankTransferPaymentView(
-                            model: model,
-                            beneficiary: beneficiary,
-                            permitted: transfersPermitted,
+                        .accessibilityLabel("Refresh bank activity")
+                    }
+                }
+                .task(id: loadTrigger) {
+                    guard app.financialDataAccessGranted else { return }
+                    async let transfers: Void = model.load(
+                        country: country,
+                        permitted: transferPermission,
+                        online: app.isOnline
+                    )
+                    async let deposits: Void = depositModel.load(
+                        wallet: app.selectedWallet,
+                        permitted: depositPermission,
+                        online: app.isOnline
+                    )
+                    _ = await (transfers, deposits)
+                }
+                .onAppear { rebuildContactIndex(app.contactDirectory) }
+                .onChange(of: app.contactDirectory) { _, contacts in
+                    rebuildContactIndex(contacts)
+                }
+                .refreshable {
+                    guard app.financialDataAccessGranted else { return }
+                    async let transfers: Void = model.load(
+                        country: country,
+                        permitted: transferPermission,
+                        online: app.isOnline
+                    )
+                    async let deposits: Void = depositModel.load(
+                        wallet: app.selectedWallet,
+                        permitted: depositPermission,
+                        online: app.isOnline
+                    )
+                    _ = await (transfers, deposits)
+                }
+                .sheet(item: $modal) { presented in
+                    Group {
+                        switch presented {
+                        case .addBeneficiary:
+                            AddBankBeneficiaryView(
+                                model: model,
+                                permitted: transfersPermitted,
+                                online: app.isOnline
+                            )
+                        case .send(let beneficiary):
+                            BankTransferPaymentView(
+                                model: model,
+                                beneficiary: beneficiary,
+                                permitted: transfersPermitted,
+                                online: app.isOnline
+                            )
+                            .environmentObject(app)
+                        case .transferReceipt(let operation):
+                            BankTransferHistoryReceiptView(
+                                model: model,
+                                initialOperation: operation
+                            )
+                        }
+                    }
+                    .presentationBackground(.ultraThinMaterial)
+                }
+                .navigationDestination(item: $depositDestination) { destination in
+                    switch destination {
+                    case .create:
+                        BankDepositFlowView(
+                            model: depositModel,
+                            initialDeposit: nil,
+                            permitted: depositsPermitted,
                             online: app.isOnline
                         )
                         .environmentObject(app)
-                    case .transferReceipt(let operation):
-                        BankTransferHistoryReceiptView(
-                            model: model,
-                            initialOperation: operation
+                    case .receipt(let deposit):
+                        BankDepositFlowView(
+                            model: depositModel,
+                            initialDeposit: deposit,
+                            permitted: depositsPermitted,
+                            online: app.isOnline
                         )
+                        .environmentObject(app)
                     }
-                }
-                .presentationBackground(.ultraThinMaterial)
-            }
-            .navigationDestination(item: $depositDestination) { destination in
-                switch destination {
-                case .create:
-                    BankDepositFlowView(
-                        model: depositModel,
-                        initialDeposit: nil,
-                        permitted: depositsPermitted,
-                        online: app.isOnline
-                    )
-                    .environmentObject(app)
-                case .receipt(let deposit):
-                    BankDepositFlowView(
-                        model: depositModel,
-                        initialDeposit: deposit,
-                        permitted: depositsPermitted,
-                        online: app.isOnline
-                    )
-                    .environmentObject(app)
                 }
             }
         }

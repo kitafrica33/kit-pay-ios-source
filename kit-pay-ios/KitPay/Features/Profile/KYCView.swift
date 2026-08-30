@@ -253,7 +253,7 @@ struct KYCView: View {
 
     private func statusIcon(_ status: String) -> String {
         switch status.lowercased() {
-        case "verified", "approved": "checkmark.seal.fill"
+        case "verified", "approved": "checkmark.circle.fill"
         case "pending", "in_review", "review": "hourglass.circle.fill"
         case "rejected", "declined", "failed": "exclamationmark.triangle.fill"
         default: "person.badge.shield.checkmark"
@@ -265,6 +265,35 @@ struct KYCView: View {
         case "verified", "approved": KitColor.green
         case "rejected", "declined", "failed": .red
         default: .orange
+        }
+    }
+}
+
+/// Defense-in-depth for wallet and payment destinations that may be reached from more than one
+/// navigation path. Entry-point buttons still route explicitly, but a deep link or stale sheet
+/// can never render balances or financial controls without both KYC and full session assurance.
+struct MoneyAccessBoundary<Content: View>: View {
+    @EnvironmentObject private var model: AppModel
+    private let content: Content
+
+    init(@ViewBuilder content: () -> Content) {
+        self.content = content()
+    }
+
+    var body: some View {
+        switch model.moneyActionAccessRequirement {
+        case .allowed, .readOnly:
+            content
+        case .verifyIdentity:
+            KYCView()
+        case .verifyDeviceIdentity, .unlockSession, .unavailable:
+            ContentUnavailableView(
+                "Wallet locked",
+                systemImage: "lock.shield",
+                description: Text("Complete this iPhone's secure sign-in before using wallet or payment actions.")
+            )
+            .navigationTitle("Wallet locked")
+            .navigationBarTitleDisplayMode(.inline)
         }
     }
 }

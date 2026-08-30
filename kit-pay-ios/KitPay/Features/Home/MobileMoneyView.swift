@@ -962,61 +962,67 @@ struct MobileMoneyView: View {
 
     var body: some View {
         NavigationStack {
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 18) {
-                    intro
-                    actions
-                    accountsSection
-                    operationsSection
+            MoneyAccessBoundary {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 18) {
+                        intro
+                        actions
+                        accountsSection
+                        operationsSection
+                    }
+                    .padding(20)
+                    .padding(.bottom, 24)
                 }
-                .padding(20)
-                .padding(.bottom, 24)
-            }
-            .background(KitColor.canvas.ignoresSafeArea())
-            .navigationTitle("Mobile money")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) { Button("Close") { dismiss() } }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        Task { await model.load(permitted: permitted, online: app.isOnline) }
-                    } label: { Image(systemName: "arrow.clockwise") }
-                    .disabled(model.isLoading || model.isSubmitting)
+                .background(KitColor.canvas.ignoresSafeArea())
+                .navigationTitle("Mobile money")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .topBarLeading) { Button("Close") { dismiss() } }
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button {
+                            Task { await model.load(permitted: permitted, online: app.isOnline) }
+                        } label: { Image(systemName: "arrow.clockwise") }
+                        .disabled(model.isLoading || model.isSubmitting)
+                    }
                 }
-            }
-            .task(id: "\(permitted)-\(app.isOnline)") {
-                await model.load(permitted: permitted, online: app.isOnline)
-            }
-            .onAppear { contactIndex = BeneficiaryContactIndex(contacts: app.contactDirectory) }
-            .onChange(of: app.contactDirectory) { _, contacts in
-                contactIndex = BeneficiaryContactIndex(contacts: contacts)
-            }
-            .refreshable { await model.load(permitted: permitted, online: app.isOnline) }
-            .sheet(isPresented: $addingAccount) {
-                AddMobileMoneyAccountView(
-                    model: model,
-                    permitted: permitted,
-                    online: app.isOnline
-                )
-                .presentationBackground(.ultraThinMaterial)
-            }
-            .sheet(item: $flow) { flow in
-                MobileMoneyOperationView(
-                    model: model,
-                    flow: flow,
-                    wallet: app.selectedWallet,
-                    permitted: permitted,
-                    online: app.isOnline
-                ) {
-                    await app.refresh()
+                .task(id: "\(permitted)-\(app.isOnline)-\(app.financialDataAccessGranted)") {
+                    guard app.financialDataAccessGranted else { return }
+                    await model.load(permitted: permitted, online: app.isOnline)
                 }
-                .environmentObject(app)
-                .presentationBackground(.ultraThinMaterial)
-            }
-            .sheet(item: $selectedTransaction) { transaction in
-                WalletFlowContainer(destination: .transaction(transaction))
+                .onAppear { contactIndex = BeneficiaryContactIndex(contacts: app.contactDirectory) }
+                .onChange(of: app.contactDirectory) { _, contacts in
+                    contactIndex = BeneficiaryContactIndex(contacts: contacts)
+                }
+                .refreshable {
+                    guard app.financialDataAccessGranted else { return }
+                    await model.load(permitted: permitted, online: app.isOnline)
+                }
+                .sheet(isPresented: $addingAccount) {
+                    AddMobileMoneyAccountView(
+                        model: model,
+                        permitted: permitted,
+                        online: app.isOnline
+                    )
+                    .presentationBackground(.ultraThinMaterial)
+                }
+                .sheet(item: $flow) { flow in
+                    MobileMoneyOperationView(
+                        model: model,
+                        flow: flow,
+                        wallet: app.selectedWallet,
+                        permitted: permitted,
+                        online: app.isOnline
+                    ) {
+                        await app.refresh()
+                    }
                     .environmentObject(app)
                     .presentationBackground(.ultraThinMaterial)
+                }
+                .sheet(item: $selectedTransaction) { transaction in
+                    WalletFlowContainer(destination: .transaction(transaction))
+                        .environmentObject(app)
+                        .presentationBackground(.ultraThinMaterial)
+                }
             }
         }
     }
