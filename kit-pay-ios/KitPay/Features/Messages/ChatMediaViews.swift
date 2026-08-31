@@ -8,14 +8,27 @@ import UIKit
 
 /// A file the user picked and can still review/remove before sending.
 struct ChatStagedAttachment: Identifiable {
-    let id = UUID()
+    let id: UUID
     let kind: KitChatMediaKind
-    let data: Data
+    /// Small media can stay in memory. Large video/document originals are file-backed so the
+    /// composer and player never require a 200 MB allocation merely to remain local-first.
+    let data: Data?
+    let localFileURL: URL?
+    let byteCount: Int
     let mediaType: String
+    /// MIME type of the capture/provider original when `mediaType` describes a later optimized
+    /// representation. Kept separate so a HEIC/PNG source is never relabeled as JPEG on disk.
+    let originalMediaType: String?
+    /// Stable destination reserved for a durable preprocessing job.
+    let preprocessingOutputStorageKey: String?
     /// Shown in the staging chip; for a lone document it also becomes the caption when no
     /// typed text rides along, so the filename survives the v1 wire format.
     let displayName: String
     let previewImage: UIImage?
+    let duration: TimeInterval?
+    /// When the app accepted the picker/camera/recorder output, before local persistence or any
+    /// send-time work. Performance milestones use this instead of starting after processing.
+    let acceptedAt: Date
     /// Shared-in rows carry their source item UUID so the composer can recognize and detach
     /// exactly the rows a handoff introduced. It is only a fallback send identity: while a
     /// shared delivery is applied, the whole send queues under the delivery's batch UUID.
@@ -24,22 +37,124 @@ struct ChatStagedAttachment: Identifiable {
     let clientMessageID: UUID?
 
     init(
+        id: UUID = UUID(),
         kind: KitChatMediaKind,
         data: Data,
         mediaType: String,
         displayName: String,
         previewImage: UIImage?,
-        clientMessageID: UUID? = nil
+        duration: TimeInterval? = nil,
+        acceptedAt: Date = Date(),
+        clientMessageID: UUID? = nil,
+        originalMediaType: String? = nil,
+        preprocessingOutputStorageKey: String? = nil
     ) {
+        self.id = id
         self.kind = kind
         self.data = data
+        self.localFileURL = nil
+        self.byteCount = data.count
         self.mediaType = mediaType
+        self.originalMediaType = originalMediaType
+        self.preprocessingOutputStorageKey = preprocessingOutputStorageKey
         self.displayName = displayName
         self.previewImage = previewImage
+        self.duration = duration
+        self.acceptedAt = acceptedAt
         self.clientMessageID = clientMessageID
     }
 
-    var byteLabel: String { ChatMediaBytes.label(data.count) }
+    /// A camera image can render from its in-memory UIKit object while its protected JPEG is
+    /// encoded and persisted off the main actor. Sending remains disabled during that short
+    /// transition; this initializer must never cross into the durable queue unchanged.
+    init(
+        preparingImage id: UUID,
+        previewImage: UIImage,
+        displayName: String,
+        acceptedAt: Date
+    ) {
+        self.id = id
+        self.kind = .image
+        self.data = nil
+        self.localFileURL = nil
+        self.byteCount = 0
+        self.mediaType = "image/jpeg"
+        self.originalMediaType = nil
+        self.preprocessingOutputStorageKey = nil
+        self.displayName = displayName
+        self.previewImage = previewImage
+        self.duration = nil
+        self.acceptedAt = acceptedAt
+        self.clientMessageID = nil
+    }
+
+    init(
+        id: UUID = UUID(),
+        kind: KitChatMediaKind,
+        localFileURL: URL,
+        byteCount: Int,
+        mediaType: String,
+        displayName: String,
+        previewImage: UIImage?,
+        duration: TimeInterval? = nil,
+        acceptedAt: Date = Date(),
+        clientMessageID: UUID? = nil,
+        originalMediaType: String? = nil,
+        preprocessingOutputStorageKey: String? = nil
+    ) {
+        self.id = id
+        self.kind = kind
+        self.data = nil
+        self.localFileURL = localFileURL
+        self.byteCount = byteCount
+        self.mediaType = mediaType
+        self.originalMediaType = originalMediaType
+        self.preprocessingOutputStorageKey = preprocessingOutputStorageKey
+        self.displayName = displayName
+        self.previewImage = previewImage
+        self.duration = duration
+        self.acceptedAt = acceptedAt
+        self.clientMessageID = clientMessageID
+    }
+
+    var isFileBacked: Bool { localFileURL != nil && data == nil }
+    var byteLabel: String { ChatMediaBytes.label(byteCount) }
+
+    func replacingDuration(_ duration: TimeInterval) -> ChatStagedAttachment {
+        guard duration.isFinite, duration > 0 else { return self }
+        if let localFileURL {
+            return ChatStagedAttachment(
+                id: id,
+                kind: kind,
+                localFileURL: localFileURL,
+                byteCount: byteCount,
+                mediaType: mediaType,
+                displayName: displayName,
+                previewImage: previewImage,
+                duration: duration,
+                acceptedAt: acceptedAt,
+                clientMessageID: clientMessageID,
+                originalMediaType: originalMediaType,
+                preprocessingOutputStorageKey: preprocessingOutputStorageKey
+            )
+        }
+        if let data {
+            return ChatStagedAttachment(
+                id: id,
+                kind: kind,
+                data: data,
+                mediaType: mediaType,
+                displayName: displayName,
+                previewImage: previewImage,
+                duration: duration,
+                acceptedAt: acceptedAt,
+                clientMessageID: clientMessageID,
+                originalMediaType: originalMediaType,
+                preprocessingOutputStorageKey: preprocessingOutputStorageKey
+            )
+        }
+        return self
+    }
 }
 
 enum ChatMediaBytes {
@@ -117,6 +232,34 @@ enum ChatMediaTempFiles {
         return url
     }
 
+    /// File-to-file export for a protected local original. This preserves bounded memory while
+    /// giving share/save consumers an independently owned, correctly extended temporary path.
+    static func copyTemporaryFile(
+        from sourceURL: URL,
+        mediaType: String,
+        suggestedName: String? = nil
+    ) throws -> URL {
+        let base = suggestedName?
+            .components(separatedBy: CharacterSet(charactersIn: "/\\:"))
+            .joined(separator: "-")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let stem = base?.isEmpty == false ? base! : "kit-media-\(UUID().uuidString)"
+        let ext = fileExtension(forMediaType: mediaType)
+        let named = stem.lowercased().hasSuffix(".\(ext)") ? stem : "\(stem).\(ext)"
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "kit-preview-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        let destination = directory.appendingPathComponent(named, isDirectory: false)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: sourceURL, to: destination)
+        try FileManager.default.setAttributes(
+            [.protectionKey: FileProtectionType.completeUnlessOpen],
+            ofItemAtPath: destination.path
+        )
+        return destination
+    }
+
     static func removeTemporaryFile(_ url: URL?) {
         guard let url else { return }
         try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
@@ -136,6 +279,7 @@ private final class SecureMediaLoader: ObservableObject {
     @Published var errorMessage: String?
 
     var data: Data? { loaded?.data }
+    var hasLoaded: Bool { loaded != nil }
 
     /// Identity only: the model re-resolves the current persisted row and re-parses its
     /// descriptor before any cache probe, so a bubble's captured snapshot can never feed the
@@ -218,8 +362,12 @@ struct SecureMediaMessageView: View {
                 descriptor: descriptor,
                 openGallery: openGallery
             )
-        case .voice:
-            VoiceNoteBubbleView(message: message, descriptor: descriptor)
+        case .voice, .audio:
+            VoiceNoteBubbleView(
+                message: message,
+                descriptor: descriptor,
+                displayKind: KitChatMediaKind(mediaType: descriptor.mediaType)
+            )
         case .video:
             VideoMessageBubbleView(
                 message: message,
@@ -234,21 +382,39 @@ struct SecureMediaMessageView: View {
 
 /// Renders media that is durably queued locally but does not have an uploaded descriptor yet.
 /// Pending rows must use the attachment MIME type rather than assuming every queued blob is a photo.
+private struct PendingMediaPresentation: Identifiable {
+    let id = UUID()
+    let kind: KitChatMediaKind
+    let image: UIImage?
+    let fileURL: URL?
+    let displayName: String
+    let mediaType: String
+    let byteCount: Int
+    let ownsTemporaryFile: Bool
+    /// Retains receiver-cache ownership until the presented video/document is dismissed.
+    let protectedOriginalLease: SecureMediaOriginalAccessLease?
+}
+
 struct PendingSecureMediaMessageView: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.voiceNoteChatContext) private var chatContext
+    @ObservedObject private var player = VoiceNotePlayer.shared
     let message: LocalMessage
     let attachment: LocalPendingAttachment
     /// Bytes plus the MIME facts of the same authoritative identity resolution. Loaded by
     /// message identity — never from this view's captured row snapshot — so the preview and
     /// the facts shown with it can only ever be the current persisted pending attachment's.
     @State private var loaded: SecureMediaLoadPolicy.LoadedItem?
+    @State private var isLoading = false
+    @State private var errorMessage: String?
+    @State private var presentedMedia: PendingMediaPresentation?
 
     private var kind: KitChatMediaKind {
         KitChatMediaKind(mediaType: attachment.mediaType)
     }
 
     private var sizeLabel: String? {
-        if let byteCount = loaded?.data.count ?? attachment.byteCount {
+        if let byteCount = loaded?.byteCount ?? attachment.byteCount {
             return ChatMediaBytes.label(byteCount)
         }
         return nil
@@ -261,14 +427,65 @@ struct PendingSecureMediaMessageView: View {
         return "\(kind.previewLabel) queued"
     }
 
+    private var mediaID: UUID {
+        let matching = (message.localMediaRecords ?? []).filter { record in
+            record.messageID == message.id
+                && record.conversationID == message.conversationId
+                && record.mediaType == attachment.mediaType
+                && (attachment.byteCount.map { record.fileSize == $0 } ?? true)
+        }
+        return matching.count == 1
+            ? UUID(uuidString: matching[0].id) ?? message.id
+            : message.id
+    }
+
     var body: some View {
         pendingContent
             .task(id: message.id) {
                 guard loaded == nil, kind == .image else { return }
-                loaded = await model.loadPendingMedia(
-                    messageID: message.id,
-                    conversationId: message.conversationId
-                )
+                await loadLocalOriginal(markPlayableWhenLoaded: true)
+            }
+            .onAppear {
+                LocalMediaPerformanceMonitor.shared.markVisible(mediaID: mediaID)
+                if kind == .voice || kind == .audio {
+                    player.noteSourceVisibility(true, for: mediaID)
+                }
+            }
+            .onDisappear {
+                if kind == .voice || kind == .audio {
+                    player.noteSourceVisibility(false, for: mediaID)
+                }
+            }
+            .fullScreenCover(item: $presentedMedia) { presentation in
+                Group {
+                    switch presentation.kind {
+                    case .image:
+                        if let image = presentation.image {
+                            MediaImageViewer(image: image)
+                        }
+                    case .video:
+                        if let fileURL = presentation.fileURL {
+                            MediaVideoPlayerView(fileURL: fileURL) { closePresentation() }
+                        }
+                    case .document:
+                        if let fileURL = presentation.fileURL {
+                            KitDocumentViewerView(
+                                fileURL: fileURL,
+                                displayName: presentation.displayName,
+                                mediaType: presentation.mediaType,
+                                byteCount: presentation.byteCount,
+                                onClose: { closePresentation() }
+                            )
+                        }
+                    case .voice, .audio:
+                        EmptyView()
+                    }
+                }
+                .onDisappear {
+                    if presentation.ownsTemporaryFile {
+                        ChatMediaTempFiles.removeTemporaryFile(presentation.fileURL)
+                    }
+                }
             }
     }
 
@@ -276,18 +493,45 @@ struct PendingSecureMediaMessageView: View {
     private var pendingContent: some View {
         if let loaded,
            KitChatMediaKind(mediaType: loaded.mediaType) == .image,
-           let image = UIImage(data: loaded.data) {
-            Image(uiImage: image)
-                .resizable()
-                .scaledToFill()
-                .frame(width: 224, height: 168)
-                .clipShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
-                .accessibilityLabel("End-to-end encrypted photo queued to send")
+           let image = ChatMediaImageDecoder.downsample(
+               data: loaded.data,
+               maximumPixelSize: 2_048
+           ) {
+            Button {
+                LocalMediaPerformanceMonitor.shared.markPlayable(mediaID: mediaID)
+                presentedMedia = PendingMediaPresentation(
+                    kind: .image,
+                    image: image,
+                    fileURL: nil,
+                    displayName: title,
+                    mediaType: loaded.mediaType,
+                    byteCount: loaded.data.count,
+                    ownsTemporaryFile: false,
+                    protectedOriginalLease: nil
+                )
+            } label: {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: 224, height: 168)
+                    .clipShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("End-to-end encrypted photo queued to send")
         } else {
-            HStack(spacing: 11) {
-                Image(systemName: kind.symbolName)
-                    .font(.system(size: 19, weight: .semibold))
-                    .foregroundStyle(message.isOutgoing ? .white : KitColor.green)
+            Button {
+                Task { await openLocalOriginal() }
+            } label: {
+                HStack(spacing: 11) {
+                    ZStack {
+                        Image(systemName: pendingSymbol)
+                            .font(.system(size: 19, weight: .semibold))
+                            .foregroundStyle(message.isOutgoing ? .white : KitColor.green)
+                        if isLoading {
+                            ProgressView()
+                                .tint(message.isOutgoing ? .white : KitColor.green)
+                        }
+                    }
                     .frame(width: 38, height: 38)
                     .background(
                         message.isOutgoing
@@ -295,13 +539,12 @@ struct PendingSecureMediaMessageView: View {
                             : KitColor.paleGreen.opacity(0.55),
                         in: RoundedRectangle(cornerRadius: 10, style: .continuous)
                     )
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(title)
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(message.isOutgoing ? .white : KitColor.navy)
-                        .lineLimit(2)
-                    if let sizeLabel {
-                        Text(sizeLabel)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(title)
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(message.isOutgoing ? .white : KitColor.navy)
+                            .lineLimit(2)
+                        Text(errorMessage ?? pendingSubtitle)
                             .font(.caption)
                             .foregroundStyle(
                                 message.isOutgoing
@@ -311,9 +554,178 @@ struct PendingSecureMediaMessageView: View {
                     }
                 }
             }
+            .buttonStyle(.plain)
+            .disabled(isLoading)
             .accessibilityElement(children: .combine)
-            .accessibilityLabel("End-to-end encrypted \(kind.previewLabel.lowercased()) queued to send")
+            .accessibilityLabel(
+                "End-to-end encrypted \(kind.previewLabel.lowercased()) queued to send"
+            )
         }
+    }
+
+    private var pendingSymbol: String {
+        guard kind == .voice || kind == .audio,
+              player.playingID == mediaID,
+              !player.isPaused
+        else { return (kind == .voice || kind == .audio) ? "play.fill" : kind.symbolName }
+        return "pause.fill"
+    }
+
+    private var pendingSubtitle: String {
+        let size = sizeLabel ?? "Saved locally"
+        if kind == .voice || kind == .audio,
+           let duration = message.localMediaRecords?.first(where: { $0.id == mediaID.uuidString.lowercased() })?.duration {
+            let seconds = Int(duration.rounded())
+            return "Queued · \(seconds / 60):\(String(format: "%02d", seconds % 60)) · \(size)"
+        }
+        return "Queued · \(size)"
+    }
+
+    private func loadLocalOriginal(markPlayableWhenLoaded: Bool = false) async {
+        guard !isLoading else { return }
+        isLoading = true
+        errorMessage = nil
+        defer { isLoading = false }
+        guard let fresh = await model.loadPendingMedia(
+            messageID: message.id,
+            conversationId: message.conversationId
+        ) else {
+            loaded = nil
+            errorMessage = "Local copy unavailable"
+            return
+        }
+        loaded = fresh
+        if markPlayableWhenLoaded,
+           KitChatMediaKind(mediaType: fresh.mediaType) == .image,
+           ChatMediaImageDecoder.downsample(
+               data: fresh.data,
+               maximumPixelSize: 256
+           ) != nil {
+            LocalMediaPerformanceMonitor.shared.markPlayable(mediaID: mediaID)
+        }
+    }
+
+    private func openLocalOriginal() async {
+        if kind == .voice || kind == .audio,
+           let playback = await model.loadPendingVoicePlayback(
+               messageID: message.id,
+               conversationId: message.conversationId
+           ) {
+            player.toggle(
+                fileURLs: playback.fileURLs,
+                segmentDurations: playback.segmentDurations,
+                id: mediaID,
+                context: chatContext.playbackContext(senderUserID: message.senderId)
+            )
+            guard player.playingID == mediaID else {
+                errorMessage = "Voice note unavailable"
+                return
+            }
+            LocalMediaPerformanceMonitor.shared.markPlayable(mediaID: mediaID)
+            return
+        }
+        if kind == .video || kind == .document || kind == .voice || kind == .audio,
+           let localFile = await model.loadProtectedLocalMediaFile(
+               messageID: message.id,
+               conversationId: message.conversationId,
+               itemIndex: nil
+           ) {
+            if kind == .voice || kind == .audio {
+                player.toggle(
+                    fileURL: localFile.url,
+                    id: mediaID,
+                    context: chatContext.playbackContext(senderUserID: message.senderId),
+                    protectedOriginalLease: localFile.accessLease
+                )
+                guard player.playingID == mediaID else {
+                    errorMessage = "Voice note unavailable"
+                    return
+                }
+            } else {
+                presentedMedia = PendingMediaPresentation(
+                    kind: kind,
+                    image: nil,
+                    fileURL: localFile.url,
+                    displayName: localFile.caption ?? title,
+                    mediaType: localFile.mediaType,
+                    byteCount: localFile.byteCount,
+                    ownsTemporaryFile: false,
+                    protectedOriginalLease: localFile.accessLease
+                )
+            }
+            LocalMediaPerformanceMonitor.shared.markPlayable(mediaID: mediaID)
+            return
+        }
+        await loadLocalOriginal()
+        guard let loaded else { return }
+        switch KitChatMediaKind(mediaType: loaded.mediaType) {
+        case .image:
+            guard let image = ChatMediaImageDecoder.downsample(
+                data: loaded.data,
+                maximumPixelSize: 4_096
+            ) else {
+                errorMessage = "Local copy unavailable"
+                return
+            }
+            presentedMedia = PendingMediaPresentation(
+                kind: .image,
+                image: image,
+                fileURL: nil,
+                displayName: title,
+                mediaType: loaded.mediaType,
+                byteCount: loaded.data.count,
+                ownsTemporaryFile: false,
+                protectedOriginalLease: nil
+            )
+        case .voice, .audio:
+            if let fileURL = loaded.localFileURL {
+                player.toggle(
+                    fileURL: fileURL,
+                    id: mediaID,
+                    context: chatContext.playbackContext(senderUserID: message.senderId),
+                    protectedOriginalLease: loaded.localFileLease
+                )
+            } else {
+                player.toggle(
+                    data: loaded.data,
+                    id: mediaID,
+                    context: chatContext.playbackContext(senderUserID: message.senderId)
+                )
+            }
+            guard player.playingID == mediaID else {
+                errorMessage = "Voice note unavailable"
+                return
+            }
+        case .video, .document:
+            let ownsTemporaryFile = loaded.localFileURL == nil
+            let url = loaded.localFileURL ?? (try? ChatMediaTempFiles.writeTemporaryFile(
+                data: loaded.data,
+                mediaType: loaded.mediaType,
+                suggestedName: kind == .document ? attachment.caption : nil
+            ))
+            guard let url else {
+                errorMessage = "Local copy unavailable"
+                return
+            }
+            presentedMedia = PendingMediaPresentation(
+                kind: kind,
+                image: nil,
+                fileURL: url,
+                displayName: attachment.caption ?? title,
+                mediaType: loaded.mediaType,
+                byteCount: loaded.byteCount,
+                ownsTemporaryFile: ownsTemporaryFile,
+                protectedOriginalLease: loaded.localFileLease
+            )
+        }
+        LocalMediaPerformanceMonitor.shared.markPlayable(mediaID: mediaID)
+    }
+
+    private func closePresentation() {
+        if presentedMedia?.ownsTemporaryFile == true {
+            ChatMediaTempFiles.removeTemporaryFile(presentedMedia?.fileURL)
+        }
+        presentedMedia = nil
     }
 }
 
@@ -397,6 +809,8 @@ struct SecureMediaBatchItemView: View {
     @State private var showsImageViewer = false
     @State private var playbackURL: URL?
     @State private var documentURL: URL?
+    @State private var localPresentation: SecureMediaLoadPolicy.LocalFileItem?
+    @State private var ownsPresentationURL = false
 
     private var kind: KitChatMediaKind { KitChatMediaKind(mediaType: mediaType) }
 
@@ -404,11 +818,11 @@ struct SecureMediaBatchItemView: View {
         UUID(uuidString: attachmentID) ?? message.id
     }
 
-    /// Photos fetch themselves the way v1 photos do; other kinds wait for a tap, because a
-    /// batch can carry up to eight items of up to 200 MB each. Pending items always load —
-    /// for them "loading" is a local cache read, never network.
+    /// Photos fetch themselves for immediate visual rendering. Audio, video and documents wait
+    /// for a tap even while pending: their read is local, but eagerly decrypting as many as eight
+    /// 200 MB originals merely to draw a bubble would defeat the background-throughput goal.
     private var loadsAutomatically: Bool {
-        isPending || kind == .image
+        kind == .image
     }
 
     private var accessibilityPosition: String {
@@ -417,6 +831,11 @@ struct SecureMediaBatchItemView: View {
 
     var body: some View {
         itemContent
+            .onAppear {
+                if let id = UUID(uuidString: attachmentID) {
+                    LocalMediaPerformanceMonitor.shared.markVisible(mediaID: id)
+                }
+            }
             .task(
                 id: "\(message.id):\(itemIndex):\(model.isOnline):\(retryGeneration)"
             ) {
@@ -427,6 +846,16 @@ struct SecureMediaBatchItemView: View {
                     conversationId: message.conversationId,
                     itemIndex: itemIndex
                 )
+                if kind == .image,
+                   loader.data.flatMap({
+                       ChatMediaImageDecoder.downsample(
+                           data: $0,
+                           maximumPixelSize: 256
+                       )
+                   }) != nil,
+                   let id = UUID(uuidString: attachmentID) {
+                    LocalMediaPerformanceMonitor.shared.markPlayable(mediaID: id)
+                }
             }
     }
 
@@ -435,7 +864,7 @@ struct SecureMediaBatchItemView: View {
         switch kind {
         case .image:
             imageCell
-        case .voice:
+        case .voice, .audio:
             voiceRow
         case .video, .document:
             fileRow
@@ -444,7 +873,9 @@ struct SecureMediaBatchItemView: View {
 
     @ViewBuilder
     private var imageCell: some View {
-        if let image = loader.data.flatMap(UIImage.init(data:)) {
+        if let image = loader.data.flatMap({
+            ChatMediaImageDecoder.downsample(data: $0, maximumPixelSize: 1_024)
+        }) {
             Image(uiImage: image)
                 .resizable()
                 .scaledToFill()
@@ -461,7 +892,10 @@ struct SecureMediaBatchItemView: View {
                                   messageID: message.id,
                                   conversationId: message.conversationId,
                                   itemIndex: itemIndex
-                              ), UIImage(data: fresh.data) != nil else { return }
+                              ), ChatMediaImageDecoder.downsample(
+                                  data: fresh.data,
+                                  maximumPixelSize: 256
+                              ) != nil else { return }
                         showsImageViewer = true
                     }
                 }
@@ -499,14 +933,14 @@ struct SecureMediaBatchItemView: View {
         } label: {
             row(
                 systemImage: isPlaying ? "pause.fill" : "play.fill",
-                title: "Voice note",
+                title: kind.previewLabel,
                 subtitle: subtitleLabel
             )
         }
         .buttonStyle(.plain)
         .disabled(loader.isLoading)
         .accessibilityLabel(
-            "End-to-end encrypted voice note, \(accessibilityPosition)"
+            "End-to-end encrypted \(kind.previewLabel.lowercased()), \(accessibilityPosition)"
         )
     }
 
@@ -533,16 +967,20 @@ struct SecureMediaBatchItemView: View {
         ) {
             if let playbackURL {
                 MediaVideoPlayerView(fileURL: playbackURL) { closePresentation() }
-            } else if let documentURL, let loaded = loader.loaded {
+            } else if let documentURL {
+                let mediaType = localPresentation?.mediaType ?? loader.loaded?.mediaType
+                let byteCount = localPresentation?.byteCount ?? loader.loaded?.byteCount
                 // Viewer facts from the same fresh resolution that produced the temp file —
                 // never the item fields this bubble captured at render time.
-                KitDocumentViewerView(
-                    fileURL: documentURL,
-                    displayName: presentedDisplayName(mediaType: loaded.mediaType),
-                    mediaType: loaded.mediaType,
-                    byteCount: loaded.data.count,
-                    onClose: { closePresentation() }
-                )
+                if let mediaType, let byteCount {
+                    KitDocumentViewerView(
+                        fileURL: documentURL,
+                        displayName: presentedDisplayName(mediaType: mediaType),
+                        mediaType: mediaType,
+                        byteCount: byteCount,
+                        onClose: { closePresentation() }
+                    )
+                }
             }
         }
     }
@@ -589,7 +1027,7 @@ struct SecureMediaBatchItemView: View {
         if let errorMessage = loader.errorMessage { return errorMessage }
         if loader.isLoading { return "Decrypting…" }
         // Once loaded, the size fact tracks the resolved bytes, not the captured item field.
-        let bytes = loader.loaded?.data.count ?? plaintextByteSize
+        let bytes = localPresentation?.byteCount ?? loader.loaded?.byteCount ?? plaintextByteSize
         if isPending { return "Queued · \(ChatMediaBytes.label(bytes))" }
         return ChatMediaBytes.label(bytes)
     }
@@ -600,6 +1038,22 @@ struct SecureMediaBatchItemView: View {
     /// still playing under this identity is stopped rather than left presenting stale audio.
     private func refreshThenPlay() async {
         guard !loader.isLoading else { return }
+        if let localFile = await model.loadProtectedLocalMediaFile(
+            messageID: message.id,
+            conversationId: message.conversationId,
+            itemIndex: itemIndex
+        ) {
+            player.toggle(
+                fileURL: localFile.url,
+                id: voiceNoteID,
+                context: chatContext.playbackContext(senderUserID: message.senderId),
+                protectedOriginalLease: localFile.accessLease
+            )
+            if player.playingID == voiceNoteID {
+                LocalMediaPerformanceMonitor.shared.markPlayable(mediaID: voiceNoteID)
+            }
+            return
+        }
         guard let fresh = await loader.refreshForPresentation(
             model: model,
             messageID: message.id,
@@ -609,15 +1063,44 @@ struct SecureMediaBatchItemView: View {
             if player.playingID == voiceNoteID { player.stop() }
             return
         }
-        player.toggle(
-            data: fresh.data,
-            id: voiceNoteID,
-            context: chatContext.playbackContext(senderUserID: message.senderId)
-        )
+        if let fileURL = fresh.localFileURL {
+            player.toggle(
+                fileURL: fileURL,
+                id: voiceNoteID,
+                context: chatContext.playbackContext(senderUserID: message.senderId),
+                protectedOriginalLease: fresh.localFileLease
+            )
+        } else {
+            player.toggle(
+                data: fresh.data,
+                id: voiceNoteID,
+                context: chatContext.playbackContext(senderUserID: message.senderId)
+            )
+        }
+        if player.playingID == voiceNoteID {
+            LocalMediaPerformanceMonitor.shared.markPlayable(mediaID: voiceNoteID)
+        }
     }
 
     private func refreshThenPresent() async {
         guard !loader.isLoading else { return }
+        if let localFile = await model.loadProtectedLocalMediaFile(
+            messageID: message.id,
+            conversationId: message.conversationId,
+            itemIndex: itemIndex
+        ) {
+            localPresentation = localFile
+            if kind == .video {
+                playbackURL = localFile.url
+            } else {
+                documentURL = localFile.url
+            }
+            ownsPresentationURL = false
+            if let id = UUID(uuidString: localFile.attachmentID) {
+                LocalMediaPerformanceMonitor.shared.markPlayable(mediaID: id)
+            }
+            return
+        }
         guard let fresh = await loader.refreshForPresentation(
             model: model,
             messageID: message.id,
@@ -632,24 +1115,32 @@ struct SecureMediaBatchItemView: View {
     private func present(_ item: SecureMediaLoadPolicy.LoadedItem) {
         guard playbackURL == nil, documentURL == nil else { return }
         let presentedKind = KitChatMediaKind(mediaType: item.mediaType)
-        let url = try? ChatMediaTempFiles.writeTemporaryFile(
+        let url = item.localFileURL ?? (try? ChatMediaTempFiles.writeTemporaryFile(
             data: item.data,
             mediaType: item.mediaType,
             suggestedName: presentedKind == .document
                 ? presentedDisplayName(mediaType: item.mediaType)
                 : nil
-        )
+        ))
         if presentedKind == .video {
             playbackURL = url
         } else {
             documentURL = url
         }
+        ownsPresentationURL = url != nil && item.localFileURL == nil
+        if url != nil, let id = UUID(uuidString: attachmentID) {
+            LocalMediaPerformanceMonitor.shared.markPlayable(mediaID: id)
+        }
     }
 
     private func closePresentation() {
-        ChatMediaTempFiles.removeTemporaryFile(playbackURL ?? documentURL)
+        if ownsPresentationURL {
+            ChatMediaTempFiles.removeTemporaryFile(playbackURL ?? documentURL)
+        }
         playbackURL = nil
         documentURL = nil
+        localPresentation = nil
+        ownsPresentationURL = false
     }
 }
 
@@ -667,7 +1158,13 @@ struct SecureImageMessageView: View {
     private var image: UIImage? {
         // Identity-resolved bytes only: the captured row's inline slot is a snapshot, and the
         // loader serves the same inline bytes through the current-row resolution instead.
-        loader.data.flatMap(UIImage.init(data:))
+        loader.data.flatMap {
+            ChatMediaThumbnailStore.shared.thumbnail(
+                forKey: descriptor.storageKey,
+                maxPixel: 1_024,
+                from: $0
+            )
+        }
     }
 
     var body: some View {
@@ -693,7 +1190,10 @@ struct SecureImageMessageView: View {
                                           messageID: message.id,
                                           conversationId: message.conversationId,
                                           itemIndex: nil
-                                      ), UIImage(data: fresh.data) != nil else { return }
+                                      ), ChatMediaImageDecoder.downsample(
+                                          data: fresh.data,
+                                          maximumPixelSize: 256
+                                      ) != nil else { return }
                                 showsViewer = true
                             }
                         }
@@ -714,6 +1214,11 @@ struct SecureImageMessageView: View {
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel("End-to-end encrypted photo")
+        .onAppear {
+            if let id = UUID(uuidString: descriptor.attachmentID) {
+                LocalMediaPerformanceMonitor.shared.markVisible(mediaID: id)
+            }
+        }
         .task(id: "\(descriptor.storageKey):\(model.isOnline):\(retryGeneration)") {
             guard image == nil else { return }
             await loader.load(
@@ -722,6 +1227,9 @@ struct SecureImageMessageView: View {
                 conversationId: message.conversationId,
                 itemIndex: nil
             )
+            if image != nil, let id = UUID(uuidString: descriptor.attachmentID) {
+                LocalMediaPerformanceMonitor.shared.markPlayable(mediaID: id)
+            }
         }
         .fullScreenCover(isPresented: $showsViewer) {
             if let image {
@@ -783,6 +1291,7 @@ struct VoiceNoteBubbleView: View {
     @ObservedObject private var player = VoiceNotePlayer.shared
     let message: LocalMessage
     let descriptor: KitMediaMessageDescriptor
+    let displayKind: KitChatMediaKind
     @StateObject private var loader = SecureMediaLoader()
     /// Fraction playback was at when the current slide began, so a slide moves the note relative
     /// to where the finger went down instead of jumping to it.
@@ -817,7 +1326,11 @@ struct VoiceNoteBubbleView: View {
                 .background(accent, in: Circle())
             }
             .buttonStyle(.plain)
-            .accessibilityLabel(isPlaying ? "Pause voice note" : "Play voice note")
+            .accessibilityLabel(
+                isPlaying
+                    ? "Pause \(displayKind.previewLabel.lowercased())"
+                    : "Play \(displayKind.previewLabel.lowercased())"
+            )
 
             VStack(alignment: .leading, spacing: 5) {
                 VoiceNoteWaveform(
@@ -831,7 +1344,7 @@ struct VoiceNoteBubbleView: View {
                 // drag that starts on the waveform is someone scrolling past, and is left alone.
                 .simultaneousGesture(seekGesture)
                 .accessibilityElement()
-                .accessibilityLabel("Voice note position")
+                .accessibilityLabel("\(displayKind.previewLabel) position")
                 .accessibilityValue(
                     isCurrent ? "\(Int((player.progress * 100).rounded())) percent" : "Not playing"
                 )
@@ -852,9 +1365,9 @@ struct VoiceNoteBubbleView: View {
         }
         .padding(.vertical, 3)
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("End-to-end encrypted voice note")
+        .accessibilityLabel("End-to-end encrypted \(displayKind.previewLabel.lowercased())")
         .task(id: "\(descriptor.storageKey):\(model.isOnline)") {
-            guard data == nil else { return }
+            guard !loader.hasLoaded else { return }
             await loader.load(
                 model: model,
                 messageID: message.id,
@@ -922,6 +1435,23 @@ struct VoiceNoteBubbleView: View {
     /// still playing under this identity is stopped rather than left presenting stale audio.
     private func refreshThenToggle() async {
         guard !loader.isLoading else { return }
+        if let localFile = await model.loadProtectedLocalMediaFile(
+            messageID: message.id,
+            conversationId: message.conversationId,
+            itemIndex: nil
+        ) {
+            player.toggle(
+                fileURL: localFile.url,
+                id: message.id,
+                context: playbackContext,
+                protectedOriginalLease: localFile.accessLease
+            )
+            if player.playingID == message.id,
+               let id = UUID(uuidString: localFile.attachmentID) {
+                LocalMediaPerformanceMonitor.shared.markPlayable(mediaID: id)
+            }
+            return
+        }
         guard let fresh = await loader.refreshForPresentation(
             model: model,
             messageID: message.id,
@@ -931,7 +1461,20 @@ struct VoiceNoteBubbleView: View {
             if isCurrent { player.stop() }
             return
         }
-        player.toggle(data: fresh.data, id: message.id, context: playbackContext)
+        if let fileURL = fresh.localFileURL {
+            player.toggle(
+                fileURL: fileURL,
+                id: message.id,
+                context: playbackContext,
+                protectedOriginalLease: fresh.localFileLease
+            )
+        } else {
+            player.toggle(data: fresh.data, id: message.id, context: playbackContext)
+        }
+        if player.playingID == message.id,
+           let id = UUID(uuidString: descriptor.attachmentID) {
+            LocalMediaPerformanceMonitor.shared.markPlayable(mediaID: id)
+        }
     }
 
     private var subtitle: String {
@@ -940,7 +1483,7 @@ struct VoiceNoteBubbleView: View {
             return durationLabel(remaining)
         }
         if let errorMessage = loader.errorMessage { return errorMessage }
-        if data == nil { return ChatMediaBytes.label(descriptor.plaintextByteSize) }
+        if !loader.hasLoaded { return ChatMediaBytes.label(descriptor.plaintextByteSize) }
         return "Voice note"
     }
 
@@ -993,6 +1536,8 @@ struct VideoMessageBubbleView: View {
     @StateObject private var loader = SecureMediaLoader()
     @State private var poster: UIImage?
     @State private var playbackURL: URL?
+    @State private var ownsPlaybackURL = false
+    @State private var protectedOriginalLease: SecureMediaOriginalAccessLease?
 
     var body: some View {
         Button {
@@ -1050,6 +1595,14 @@ struct VideoMessageBubbleView: View {
             // Poster only from bytes that are already local, but still through identity
             // resolution — never the captured row snapshot. `allowsDownload: false` keeps
             // scrolling a conversation from silently downloading large videos.
+            if let localFile = await model.loadProtectedLocalMediaFile(
+                messageID: message.id,
+                conversationId: message.conversationId,
+                itemIndex: nil
+            ) {
+                await makePoster(fileURL: localFile.url)
+                return
+            }
             await loader.load(
                 model: model,
                 messageID: message.id,
@@ -1076,7 +1629,7 @@ struct VideoMessageBubbleView: View {
     private var subtitle: String {
         if let errorMessage = loader.errorMessage { return errorMessage }
         if loader.isLoading { return "Decrypting…" }
-        if loader.data == nil {
+        if !loader.hasLoaded {
             return ChatMediaBytes.label(descriptor.plaintextByteSize)
         }
         return "Play"
@@ -1087,6 +1640,20 @@ struct VideoMessageBubbleView: View {
     /// UI state never services it.
     private func refreshThenPresent() async {
         guard !loader.isLoading else { return }
+        if let localFile = await model.loadProtectedLocalMediaFile(
+            messageID: message.id,
+            conversationId: message.conversationId,
+            itemIndex: nil
+        ) {
+            await makePoster(fileURL: localFile.url)
+            protectedOriginalLease = localFile.accessLease
+            playbackURL = localFile.url
+            ownsPlaybackURL = false
+            if let id = UUID(uuidString: localFile.attachmentID) {
+                LocalMediaPerformanceMonitor.shared.markPlayable(mediaID: id)
+            }
+            return
+        }
         guard let fresh = await loader.refreshForPresentation(
             model: model,
             messageID: message.id,
@@ -1101,31 +1668,45 @@ struct VideoMessageBubbleView: View {
     // bytes it holds, not from the descriptor the bubble captured at render time.
     private func present(_ item: SecureMediaLoadPolicy.LoadedItem) {
         guard playbackURL == nil else { return }
-        playbackURL = try? ChatMediaTempFiles.writeTemporaryFile(
+        playbackURL = item.localFileURL ?? (try? ChatMediaTempFiles.writeTemporaryFile(
             data: item.data,
+            mediaType: item.mediaType
+        ))
+        protectedOriginalLease = item.localFileLease
+        ownsPlaybackURL = playbackURL != nil && item.localFileURL == nil
+        if playbackURL != nil, let id = UUID(uuidString: descriptor.attachmentID) {
+            LocalMediaPerformanceMonitor.shared.markPlayable(mediaID: id)
+        }
+    }
+
+    private func closePlayer() {
+        if ownsPlaybackURL { ChatMediaTempFiles.removeTemporaryFile(playbackURL) }
+        playbackURL = nil
+        ownsPlaybackURL = false
+        protectedOriginalLease = nil
+    }
+
+    private func makePoster(from item: SecureMediaLoadPolicy.LoadedItem) async {
+        guard poster == nil else { return }
+        if let localFileURL = item.localFileURL {
+            await makePoster(fileURL: localFileURL)
+            return
+        }
+        poster = await ChatMediaThumbnailStore.shared.videoThumbnail(
+            forKey: descriptor.storageKey,
+            maxPixel: 248,
+            from: item.data,
             mediaType: item.mediaType
         )
     }
 
-    private func closePlayer() {
-        ChatMediaTempFiles.removeTemporaryFile(playbackURL)
-        playbackURL = nil
-    }
-
-    private func makePoster(from item: SecureMediaLoadPolicy.LoadedItem) async {
-        guard poster == nil,
-              let url = try? ChatMediaTempFiles.writeTemporaryFile(
-                  data: item.data,
-                  mediaType: item.mediaType
-              )
-        else { return }
-        defer { ChatMediaTempFiles.removeTemporaryFile(url) }
-        let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
-        generator.appliesPreferredTrackTransform = true
-        generator.maximumSize = CGSize(width: 600, height: 600)
-        if let cgImage = try? await generator.image(at: .init(seconds: 0.1, preferredTimescale: 600)).image {
-            poster = UIImage(cgImage: cgImage)
-        }
+    private func makePoster(fileURL: URL) async {
+        guard poster == nil else { return }
+        poster = await ChatMediaThumbnailStore.shared.videoThumbnail(
+            forKey: descriptor.storageKey,
+            maxPixel: 248,
+            fromFileURL: fileURL
+        )
     }
 }
 
@@ -1376,10 +1957,18 @@ struct DocumentMessageBubbleView: View {
     let descriptor: KitMediaMessageDescriptor
     @StateObject private var loader = SecureMediaLoader()
     @State private var previewURL: URL?
+    @State private var localPresentation: SecureMediaLoadPolicy.LocalFileItem?
+    @State private var ownsPreviewURL = false
 
     /// Before bytes exist the row label comes from the parse-gated bubble descriptor; once a
     /// fresh resolution has loaded, every fact tracks that result instead.
     private var fileName: String {
+        if let localPresentation {
+            return Self.fileName(
+                caption: localPresentation.caption,
+                mediaType: localPresentation.mediaType
+            )
+        }
         if let loaded = loader.loaded {
             return Self.fileName(caption: loaded.caption, mediaType: loaded.mediaType)
         }
@@ -1438,19 +2027,21 @@ struct DocumentMessageBubbleView: View {
                 set: { if !$0 { closePreview() } }
             )
         ) {
-            if let previewURL, let loaded = loader.loaded {
+            if let previewURL {
+                let mediaType = localPresentation?.mediaType ?? loader.loaded?.mediaType
+                let caption = localPresentation?.caption ?? loader.loaded?.caption
+                let byteCount = localPresentation?.byteCount ?? loader.loaded?.byteCount
                 // Viewer facts from the same fresh resolution that produced the temp file —
                 // never the descriptor this bubble captured at render time.
-                KitDocumentViewerView(
-                    fileURL: previewURL,
-                    displayName: Self.fileName(
-                        caption: loaded.caption,
-                        mediaType: loaded.mediaType
-                    ),
-                    mediaType: loaded.mediaType,
-                    byteCount: loaded.data.count,
-                    onClose: { closePreview() }
-                )
+                if let mediaType, let byteCount {
+                    KitDocumentViewerView(
+                        fileURL: previewURL,
+                        displayName: Self.fileName(caption: caption, mediaType: mediaType),
+                        mediaType: mediaType,
+                        byteCount: byteCount,
+                        onClose: { closePreview() }
+                    )
+                }
             }
         }
     }
@@ -1459,7 +2050,11 @@ struct DocumentMessageBubbleView: View {
         if let errorMessage = loader.errorMessage { return errorMessage }
         if loader.isLoading { return "Decrypting…" }
         // Once loaded, the size fact tracks the resolved bytes, not the captured descriptor.
-        return ChatMediaBytes.label(loader.loaded?.data.count ?? descriptor.plaintextByteSize)
+        return ChatMediaBytes.label(
+            localPresentation?.byteCount
+                ?? loader.loaded?.byteCount
+                ?? descriptor.plaintextByteSize
+        )
     }
 
     /// A tap presents the preview: re-prove the row — account, current persisted row, full
@@ -1467,6 +2062,19 @@ struct DocumentMessageBubbleView: View {
     /// UI state never services it.
     private func refreshThenPresent() async {
         guard !loader.isLoading else { return }
+        if let localFile = await model.loadProtectedLocalMediaFile(
+            messageID: message.id,
+            conversationId: message.conversationId,
+            itemIndex: nil
+        ) {
+            localPresentation = localFile
+            previewURL = localFile.url
+            ownsPreviewURL = false
+            if let id = UUID(uuidString: localFile.attachmentID) {
+                LocalMediaPerformanceMonitor.shared.markPlayable(mediaID: id)
+            }
+            return
+        }
         guard let fresh = await loader.refreshForPresentation(
             model: model,
             messageID: message.id,
@@ -1480,16 +2088,22 @@ struct DocumentMessageBubbleView: View {
     // never from the descriptor the bubble captured at render time.
     private func present(_ item: SecureMediaLoadPolicy.LoadedItem) {
         guard previewURL == nil else { return }
-        previewURL = try? ChatMediaTempFiles.writeTemporaryFile(
+        previewURL = item.localFileURL ?? (try? ChatMediaTempFiles.writeTemporaryFile(
             data: item.data,
             mediaType: item.mediaType,
             suggestedName: Self.fileName(caption: item.caption, mediaType: item.mediaType)
-        )
+        ))
+        ownsPreviewURL = previewURL != nil && item.localFileURL == nil
+        if previewURL != nil, let id = UUID(uuidString: descriptor.attachmentID) {
+            LocalMediaPerformanceMonitor.shared.markPlayable(mediaID: id)
+        }
     }
 
     private func closePreview() {
-        ChatMediaTempFiles.removeTemporaryFile(previewURL)
+        if ownsPreviewURL { ChatMediaTempFiles.removeTemporaryFile(previewURL) }
         previewURL = nil
+        localPresentation = nil
+        ownsPreviewURL = false
     }
 }
 

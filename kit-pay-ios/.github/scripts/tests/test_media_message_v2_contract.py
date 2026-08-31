@@ -19,6 +19,11 @@ ROOT = pathlib.Path(__file__).resolve().parents[3]
 V2_MODELS = ROOT / "KitPay/Core/MediaMessageV2Models.swift"
 V1_MODELS = ROOT / "KitPay/Core/MessagingAPIModels.swift"
 MODELS = ROOT / "KitPay/Core/Models.swift"
+BACKGROUND_UPLOAD = ROOT / "KitPay/Core/MessagingBackgroundUpload.swift"
+API_CLIENT = ROOT / "KitPay/Core/APIClient.swift"
+MESSAGING_API = ROOT / "KitPay/Core/APIClient+Messaging.swift"
+COORDINATOR = ROOT / "KitPay/Core/SecureMessagingCoordinator.swift"
+APP_DELEGATE = ROOT / "KitPay/App/NotificationCoordinator.swift"
 V2_TESTS = ROOT / "KitPayTests/MediaMessageV2ContractTests.swift"
 WIRE_GLUE_TESTS = ROOT / "KitPayTests/MediaMessageV2WireGlueTests.swift"
 PBXPROJ = ROOT / "KitPay.xcodeproj/project.pbxproj"
@@ -63,18 +68,16 @@ class MediaMessageV2SourceContract(unittest.TestCase):
         self.v1 = V1_MODELS.read_text(encoding="utf-8")
         self.models = MODELS.read_text(encoding="utf-8")
 
-    def test_media_loader_cache_writes_are_owned_inserts(self) -> None:
-        """The identity-addressed loader must park downloaded plaintext with the atomic
-        non-overwriting insert and, on a failed post-write revalidation, remove the entry only
-        when its own insert created it (`.stored`) — a plain `store` would clobber a concurrent
-        owner's copy, and an unconditional remove would unwind an entry it never created.
-        Behavior of the primitive itself is pinned by SecureMediaFileCacheTests."""
+    def test_media_loader_delegates_downloads_to_verified_file_hydration(self) -> None:
+        """The identity-addressed loader must route remote media through the streaming,
+        authenticated file hydrator. It must not reintroduce the old whole-Data cache-write path
+        (which could both block rendering and clobber another loader's local representation)."""
         app_model = (ROOT / "KitPay/App/AppModel.swift").read_text(encoding="utf-8")
         start = app_model.index("func loadSecureMediaItem(")
         end = app_model.index("func queueDirectMessage(", start)
         loader = app_model[start:end]
-        self.assertEqual(loader.count("insertIfAbsent("), 2)
-        self.assertEqual(loader.count("if insertion == .stored {"), 2)
+        self.assertEqual(loader.count("loadProtectedLocalMediaFile("), 2)
+        self.assertNotIn("insertIfAbsent(", loader)
         self.assertNotIn("SecureMediaFileCache.shared.store(", loader)
 
     def test_percent_encode_bodies_are_identical(self) -> None:
@@ -136,6 +139,135 @@ class MediaMessageV2SourceContract(unittest.TestCase):
         self.assertEqual(text.count("B42000000000000000000001"), 3)
         self.assertEqual(text.count("A42000000000000000000002"), 2)
         self.assertEqual(text.count("B42000000000000000000002"), 3)
+
+    def test_resumable_chunks_use_a_relaunchable_file_backed_background_session(self) -> None:
+        """A durable spool/offset alone cannot keep an in-flight request alive after process
+        termination. Production PATCHes must use the dedicated background session, while the
+        coordinator keeps the protocol's authoritative-offset validation and checkpointing."""
+        background = BACKGROUND_UPLOAD.read_text(encoding="utf-8")
+        api = API_CLIENT.read_text(encoding="utf-8")
+        messaging_api = MESSAGING_API.read_text(encoding="utf-8")
+        coordinator = COORDINATOR.read_text(encoding="utf-8")
+        app_delegate = APP_DELEGATE.read_text(encoding="utf-8")
+        project = PBXPROJ.read_text(encoding="utf-8")
+
+        self.assertIn("URLSessionConfiguration.background(", background)
+        self.assertIn("sessionSendsLaunchEvents = true", background)
+        self.assertIn("uploadTask(with: request, fromFile: chunkURL)", background)
+        self.assertIn("task.taskDescription = description", background)
+        self.assertIn("accountFingerprint", background)
+        self.assertIn("sessionFingerprint", background)
+        self.assertIn("accessTokenFingerprint", background)
+        self.assertIn("persistDurableResult(result)", background)
+        self.assertIn("sendBackgroundAttachmentChunk", api)
+        self.assertIn("uploadMessagingAttachmentChunkInBackground", messaging_api)
+        self.assertIn(".uploadMessagingAttachmentChunkInBackground(", coordinator)
+        self.assertIn("handleEventsForBackgroundURLSession", app_delegate)
+        self.assertEqual(project.count("A43000000000000000000001"), 2)
+        self.assertEqual(project.count("B43000000000000000000001"), 3)
+
+    def test_shared_inbox_and_voice_adoption_do_not_scale_with_file_bytes(self) -> None:
+        """Shared files are already local and protected, so the containing app may do metadata
+        work but must not synchronously duplicate every byte before the composer appears. Voice
+        segments are app-owned scratch files and must use same-volume moves before queueing."""
+        cache = (ROOT / "KitPay/Core/SecureMediaFileCache.swift").read_text(encoding="utf-8")
+        messages = (ROOT / "KitPay/Features/Messages/MessagesView.swift").read_text(
+            encoding="utf-8"
+        )
+        shared_start = messages.index("private func stageSharedInbox(")
+        shared_end = messages.index("private func preparedSharedItem(", shared_start)
+        shared = messages[shared_start:shared_end]
+        voice_start = messages.index("private func sendVoiceNote()")
+        voice_end = messages.index("private func recoverUnqueuedVoiceNote(", voice_start)
+        voice = messages[voice_start:voice_end]
+
+        self.assertIn("clonefile(sourcePath, destinationPath, 0)", cache)
+        self.assertIn("requiresConstantTimeClone: true", shared)
+        self.assertNotIn("Data(contentsOf:", shared)
+        self.assertIn("moveSource: true", voice)
+        self.assertLess(voice.index("persistStagedMediaOriginal("), voice.index("queueMediaMessage("))
+
+    def test_video_original_is_published_before_optional_trim(self) -> None:
+        """Camera/library video must become an app-owned playable draft before the editor runs.
+        Reopening trim over a staged file must read the permanent source directly rather than
+        making another whole-file copy on the capture-to-visible path."""
+        messages = (ROOT / "KitPay/Features/Messages/MessagesView.swift").read_text(
+            encoding="utf-8"
+        )
+        camera_stage = "\n".join(function_body(messages, "private func stageCapturedVideo("))
+        library_stage = "\n".join(
+            function_body(messages, "private func openLibraryVideoInEditor(")
+        )
+        trim = "\n".join(
+            function_body(messages, "private func beginTrimmingStagedVideo(")
+        )
+
+        for staging_path in (camera_stage, library_stage):
+            self.assertLess(
+                staging_path.index("persistStagedMediaOriginal("),
+                staging_path.index("stageAttachment("),
+            )
+            self.assertLess(
+                staging_path.index("stageAttachment("),
+                staging_path.index("beginTrimmingStagedVideo("),
+            )
+        self.assertIn("url = sourceURL", trim)
+        self.assertIn("ownsInputFile = false", trim)
+        self.assertNotIn("copyItem(", trim)
+
+    def test_passive_media_rendering_uses_bounded_decoding(self) -> None:
+        """Conversation bubbles and the gallery page must not inflate arbitrary source pixels.
+        Explicit share/save actions may still request a full representation after a user tap."""
+        views = (ROOT / "KitPay/Features/Messages/ChatMediaViews.swift").read_text(
+            encoding="utf-8"
+        )
+        gallery = (ROOT / "KitPay/Features/Messages/KitMediaGalleryView.swift").read_text(
+            encoding="utf-8"
+        )
+        page_start = gallery.index("private struct GalleryImagePage")
+        page = gallery[page_start:]
+        view_code = "\n".join(
+            line for line in views.splitlines() if not line.lstrip().startswith("//")
+        )
+        page_code = "\n".join(
+            line for line in page.splitlines() if not line.lstrip().startswith("//")
+        )
+
+        self.assertNotIn("UIImage(data:", view_code)
+        self.assertNotIn("UIImage.init(data:", view_code)
+        self.assertIn("ChatMediaImageDecoder.downsample", view_code)
+        self.assertIn("maximumPixelSize: 4_096", page_code)
+        self.assertNotIn("UIImage(data:", page_code)
+
+    def test_ready_leases_are_replayed_at_the_sealing_boundary(self) -> None:
+        """Resumable ciphertext must stay retained until an exact READY replay immediately
+        before sealing; a swept batch item reopens without changing local identity/key material."""
+        coordinator = COORDINATOR.read_text(encoding="utf-8")
+        batch_start = coordinator.index("batchUploadAndRenewal: while true")
+        batch_end = coordinator.index("mediaMessageV2Items = draftItems", batch_start)
+        batch = coordinator[batch_start:batch_end]
+        upload_start = coordinator.index("private func uploadDeferredMediaDescriptor(")
+        upload_end = coordinator.index("static func validatedResumableCheckpoint(", upload_start)
+        single = coordinator[upload_start:upload_end]
+
+        for path in (batch, single):
+            self.assertIn("beginMessagingAttachmentUpload(", path)
+            self.assertIn("validatedResumableLeasePreflight(", path)
+        self.assertIn("reopeningUpload()", batch)
+        self.assertLess(
+            batch.index("validatedResumableLeasePreflight("),
+            batch.index("removeCiphertextSpool"),
+        )
+
+    def test_fanout_promotion_retains_sender_local_media_records(self) -> None:
+        """Replacing a sealed pending row with its Signal fanout must retain the sender's
+        permanent local-media references; the remote descriptor can never become its sole key."""
+        coordinator = COORDINATOR.read_text(encoding="utf-8")
+        queue_text = "\n".join(function_body(coordinator, "private func queueText("))
+        self.assertIn(
+            "localMediaRecords: existingMessage?.localMediaRecords",
+            queue_text,
+        )
 
     def test_content_binding_intercepts_the_v2_prefix(self) -> None:
         """The kind() dispatcher must strict-parse v2-prefixed bodies BEFORE the plain-text

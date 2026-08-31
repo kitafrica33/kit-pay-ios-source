@@ -154,6 +154,13 @@ actor SessionStore {
     func clear() throws {
         // Clear in-memory authority first even if either Keychain deletion
         // later fails; callers must never keep using credentials after logout.
+        if let revoked = cached,
+           let accountID = revoked.accountId {
+            MessagingBackgroundAttachmentUploader.shared.cancelTransfers(
+                accountID: accountID,
+                sessionID: revoked.sessionId
+            )
+        }
         cached = nil
         refreshAttempt = nil
         var firstError: Error?

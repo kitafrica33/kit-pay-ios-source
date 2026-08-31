@@ -28,6 +28,10 @@ struct MessagingAPIEndpoint {
         path: "messaging/attachments",
         method: "POST"
     )
+    static let attachmentUploads = MessagingAPIEndpoint(
+        path: "messaging/attachment-uploads",
+        method: "POST"
+    )
 
     init(path: String, method: String, queryItems: [URLQueryItem] = []) {
         self.path = path
@@ -197,6 +201,25 @@ struct MessagingAPIEndpoint {
         return MessagingAPIEndpoint(
             path: "messaging/attachments/\(storageKey)",
             method: "GET"
+        )
+    }
+
+    static func attachmentUpload(
+        _ uploadID: String,
+        method: String = "GET"
+    ) throws -> MessagingAPIEndpoint {
+        try requireUUID(uploadID, field: "attachment upload ID")
+        return MessagingAPIEndpoint(
+            path: "messaging/attachment-uploads/\(uploadID)",
+            method: method
+        )
+    }
+
+    static func completeAttachmentUpload(_ uploadID: String) throws -> MessagingAPIEndpoint {
+        try requireUUID(uploadID, field: "attachment upload ID")
+        return MessagingAPIEndpoint(
+            path: "messaging/attachment-uploads/\(uploadID)/complete",
+            method: "POST"
         )
     }
 
@@ -463,6 +486,157 @@ extension APIClient {
         )
     }
 
+    func uploadMessagingAttachment(
+        mediaType: String,
+        ciphertextFileURL: URL,
+        ciphertextByteSize: Int64,
+        clientMediaID: String,
+        ciphertextSHA256: String
+    ) async throws -> MessagingAttachmentUploadDTO {
+        guard SecureMessagingWire.allowedAttachmentMediaTypes.contains(mediaType),
+              ciphertextByteSize >= SecureMessagingWire.minimumAttachmentCiphertextBytes,
+              ciphertextByteSize <= SecureMessagingWire.maximumAttachmentCiphertextBytes,
+              UUID(uuidString: clientMediaID)?.uuidString.lowercased() == clientMediaID,
+              SecureMessagingWirePolicy.isLowercaseSHA256(ciphertextSHA256),
+              (try FileManager.default.attributesOfItem(atPath: ciphertextFileURL.path)[.size]
+                  as? NSNumber)?.int64Value == ciphertextByteSize
+        else { throw SecureMessagingContractError.invalid("attachment upload") }
+        let endpoint = MessagingAPIEndpoint.attachments
+        return try await sendMultipartFile(
+            path: endpoint.path,
+            fields: [
+                "media_type": mediaType,
+                "client_media_id": clientMediaID,
+                "ciphertext_sha256": ciphertextSHA256,
+            ],
+            fileField: "ciphertext",
+            fileName: "encrypted-attachment.bin",
+            fileContentType: "application/octet-stream",
+            fileURL: ciphertextFileURL,
+            expectedFileByteCount: ciphertextByteSize
+        )
+    }
+
+    func beginMessagingAttachmentUpload(
+        _ request: BeginMessagingAttachmentUploadRequest
+    ) async throws -> MessagingAttachmentUploadSessionDTO {
+        guard SecureMessagingWirePolicy.isCanonicalUUID(request.clientMediaId),
+              SecureMessagingWire.allowedAttachmentMediaTypes.contains(request.mediaType),
+              request.byteSize >= SecureMessagingWire.minimumAttachmentCiphertextBytes,
+              request.byteSize <= SecureMessagingWire.maximumAttachmentCiphertextBytes,
+              SecureMessagingWirePolicy.isLowercaseSHA256(request.ciphertextSha256)
+        else { throw SecureMessagingContractError.invalid("attachment upload session") }
+        let endpoint = MessagingAPIEndpoint.attachmentUploads
+        return try await send(path: endpoint.path, method: endpoint.method, body: request)
+    }
+
+    func messagingAttachmentUpload(
+        id uploadID: String
+    ) async throws -> MessagingAttachmentUploadSessionDTO {
+        let endpoint = try MessagingAPIEndpoint.attachmentUpload(uploadID)
+        return try await send(
+            path: endpoint.path,
+            method: endpoint.method,
+            body: MessagingEmptyBody()
+        )
+    }
+
+    func uploadMessagingAttachmentChunk(
+        id uploadID: String,
+        offset: Int64,
+        chunk: Data,
+        chunkSHA256: String
+    ) async throws -> MessagingAttachmentUploadChunkResultDTO {
+        guard offset >= 0,
+              !chunk.isEmpty,
+              chunk.count <= MessagingResumableAttachmentPolicy.maximumChunkBytes,
+              SecureMessagingWirePolicy.isLowercaseSHA256(chunkSHA256),
+              SecureMessagingValidation.sha256Hex(chunk) == chunkSHA256
+        else { throw SecureMessagingContractError.invalid("attachment upload chunk") }
+        let endpoint = try MessagingAPIEndpoint.attachmentUpload(uploadID, method: "PATCH")
+        return try await sendRaw(
+            path: endpoint.path,
+            method: endpoint.method,
+            body: chunk,
+            contentType: "application/offset+octet-stream",
+            headers: [
+                "Upload-Offset": String(offset),
+                "Upload-Chunk-SHA256": chunkSHA256,
+            ]
+        )
+    }
+
+    func uploadMessagingAttachmentChunkInBackground(
+        id uploadID: String,
+        offset: Int64,
+        chunk: Data,
+        chunkSHA256: String
+    ) async throws -> MessagingAttachmentUploadChunkResultDTO {
+        guard offset >= 0,
+              !chunk.isEmpty,
+              chunk.count <= MessagingResumableAttachmentPolicy.maximumChunkBytes,
+              SecureMessagingWirePolicy.isLowercaseSHA256(chunkSHA256),
+              SecureMessagingValidation.sha256Hex(chunk) == chunkSHA256
+        else { throw SecureMessagingContractError.invalid("attachment upload chunk") }
+        let endpoint = try MessagingAPIEndpoint.attachmentUpload(uploadID, method: "PATCH")
+        return try await sendBackgroundAttachmentChunk(
+            path: endpoint.path,
+            method: endpoint.method,
+            body: chunk,
+            contentType: "application/offset+octet-stream",
+            headers: [
+                "Upload-Offset": String(offset),
+                "Upload-Chunk-SHA256": chunkSHA256,
+            ],
+            uploadID: uploadID,
+            byteOffset: offset,
+            chunkSHA256: chunkSHA256
+        )
+    }
+
+    func completeMessagingAttachmentUpload(
+        id uploadID: String
+    ) async throws -> MessagingAttachmentUploadSessionDTO {
+        let endpoint = try MessagingAPIEndpoint.completeAttachmentUpload(uploadID)
+        return try await sendRaw(
+            path: endpoint.path,
+            method: endpoint.method,
+            body: Data(),
+            contentType: "application/json"
+        )
+    }
+
+    /// Idempotent local-first upload. The permanent client media id is bound to the exact
+    /// ciphertext digest, so replay after a timeout/crash returns the original object instead of
+    /// creating a duplicate; reuse of the id with different encrypted bytes fails server-side.
+    func uploadMessagingAttachment(
+        mediaType: String,
+        ciphertext: Data,
+        clientMediaID: String,
+        ciphertextSHA256: String
+    ) async throws -> MessagingAttachmentUploadDTO {
+        guard SecureMessagingWire.allowedAttachmentMediaTypes.contains(mediaType),
+              ciphertext.count >= Int(SecureMessagingWire.minimumAttachmentCiphertextBytes),
+              ciphertext.count <= Int(SecureMessagingWire.maximumAttachmentCiphertextBytes),
+              UUID(uuidString: clientMediaID)?.uuidString.lowercased() == clientMediaID,
+              SecureMessagingWirePolicy.isLowercaseSHA256(ciphertextSHA256),
+              SecureMessagingValidation.sha256Hex(ciphertext) == ciphertextSHA256
+        else { throw SecureMessagingContractError.invalid("attachment upload") }
+        let endpoint = MessagingAPIEndpoint.attachments
+        return try await sendMultipart(
+            path: endpoint.path,
+            fields: [
+                "media_type": mediaType,
+                "client_media_id": clientMediaID,
+                "ciphertext_sha256": ciphertextSHA256,
+            ],
+            fileField: "ciphertext",
+            fileName: "encrypted-attachment.bin",
+            fileContentType: "application/octet-stream",
+            fileData: ciphertext
+        )
+    }
+
     func downloadMessagingAttachment(
         storageKey: String,
         expectedByteSize: Int64
@@ -479,6 +653,17 @@ extension APIClient {
             throw SecureMediaAttachmentError.serverMetadataMismatch
         }
         return data
+    }
+
+    func downloadMessagingAttachmentFile(
+        storageKey: String,
+        expectedByteSize: Int64
+    ) async throws -> URL {
+        let endpoint = try MessagingAPIEndpoint.attachment(storageKey)
+        return try await downloadAuthenticatedFile(
+            path: endpoint.path,
+            expectedByteCount: expectedByteSize
+        )
     }
 }
 

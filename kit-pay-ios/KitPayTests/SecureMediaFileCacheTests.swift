@@ -105,4 +105,321 @@ final class SecureMediaFileCacheTests: XCTestCase {
         )
         XCTAssertEqual(badAccount, .rejected)
     }
+
+    func testDuplicateSupportsEncryptedBlobAndProtectedFileRepresentations() async throws {
+        let sealedSource = UUID().uuidString.lowercased()
+        let sealedDestination = UUID().uuidString.lowercased()
+        let sealedBytes = Data("small encrypted-state cache item".utf8)
+        let sealedInsertion = await cache.insertIfAbsent(
+            sealedBytes,
+            forStorageKey: sealedSource,
+            userID: userID
+        )
+        XCTAssertEqual(sealedInsertion, .stored)
+        let sealedDuplication = await cache.duplicate(
+            fromStorageKey: sealedSource,
+            toStorageKey: sealedDestination,
+            userID: userID
+        )
+        XCTAssertEqual(sealedDuplication, .stored)
+        let duplicatedSealed = await cache.data(
+            forStorageKey: sealedDestination,
+            userID: userID
+        )
+        XCTAssertEqual(duplicatedSealed, sealedBytes)
+
+        let fileSource = UUID().uuidString.lowercased()
+        let fileDestination = UUID().uuidString.lowercased()
+        let fileBytes = Data(repeating: 0x7a, count: 4_096)
+        let sourceURL = temporaryDirectory.appendingPathComponent("protected-source.bin")
+        try fileBytes.write(to: sourceURL, options: .atomic)
+        _ = try await cache.importProtectedOriginal(
+            from: sourceURL,
+            forStorageKey: fileSource,
+            userID: userID,
+            mediaType: "application/octet-stream",
+            expectedByteCount: fileBytes.count,
+            moveSource: false
+        )
+        let fileDuplication = await cache.duplicate(
+            fromStorageKey: fileSource,
+            toStorageKey: fileDestination,
+            userID: userID
+        )
+        XCTAssertEqual(fileDuplication, .stored)
+        let duplicatedFileURL = await cache.protectedOriginalURL(
+            forStorageKey: fileDestination,
+            userID: userID,
+            expectedByteCount: fileBytes.count
+        )
+        XCTAssertNotNil(duplicatedFileURL)
+        let duplicatedFileBytes = try duplicatedFileURL.map { try Data(contentsOf: $0) }
+        XCTAssertEqual(duplicatedFileBytes, fileBytes)
+    }
+
+    func testSharedInboxStyleImportRequiresIndependentCopyOnWriteClone() async throws {
+        let storageKey = UUID().uuidString.lowercased()
+        let sourceURL = temporaryDirectory.appendingPathComponent("shared-inbox-source.bin")
+        let bytes = Data(repeating: 0x6b, count: 4 * 1_024 * 1_024)
+        try bytes.write(to: sourceURL, options: .atomic)
+
+        let importedURL = try await cache.importProtectedOriginal(
+            from: sourceURL,
+            forStorageKey: storageKey,
+            userID: userID,
+            mediaType: "application/octet-stream",
+            expectedByteCount: bytes.count,
+            moveSource: false,
+            requiresConstantTimeClone: true
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: sourceURL.path))
+        try FileManager.default.removeItem(at: sourceURL)
+        XCTAssertEqual(try Data(contentsOf: importedURL), bytes)
+    }
+
+    func testOrphanSweepKeepsReferencedAndRecentMedia() async throws {
+        let retainedKey = UUID().uuidString.lowercased()
+        let orphanKey = UUID().uuidString.lowercased()
+        let recentKey = UUID().uuidString.lowercased()
+        for key in [retainedKey, orphanKey, recentKey] {
+            let insertion = await cache.insertIfAbsent(
+                Data("bytes-\(key)".utf8),
+                forStorageKey: key,
+                userID: userID
+            )
+            XCTAssertEqual(insertion, .stored)
+        }
+        let accountID = UUID(uuidString: userID)!.uuidString.lowercased()
+        let oldDate = Date(timeIntervalSinceNow: -48 * 60 * 60)
+        for key in [retainedKey, orphanKey] {
+            let url = temporaryDirectory
+                .appendingPathComponent(accountID, isDirectory: true)
+                .appendingPathComponent("\(key).sealed")
+            try FileManager.default.setAttributes(
+                [.modificationDate: oldDate],
+                ofItemAtPath: url.path
+            )
+        }
+
+        let removed = await cache.removeUnreferenced(
+            retainingStorageKeys: [retainedKey],
+            forUserID: userID,
+            modifiedBefore: Date(timeIntervalSinceNow: -24 * 60 * 60),
+            maximumRemovals: 64
+        )
+
+        XCTAssertEqual(removed, 1)
+        let retained = await cache.data(forStorageKey: retainedKey, userID: userID)
+        let orphan = await cache.data(forStorageKey: orphanKey, userID: userID)
+        let recent = await cache.data(forStorageKey: recentKey, userID: userID)
+        XCTAssertNotNil(retained)
+        XCTAssertNil(orphan)
+        XCTAssertNotNil(recent)
+    }
+
+    func testRestartVerifiesCiphertextSpoolOnceThenReusesFingerprintLease() async throws {
+        let mediaID = UUID().uuidString.lowercased()
+        let source = temporaryDirectory.appendingPathComponent("source.bin")
+        let plaintext = Data(repeating: 0x5a, count: 2 * 1_024 * 1_024)
+        try plaintext.write(to: source, options: .atomic)
+        _ = try await cache.importProtectedOriginal(
+            from: source,
+            forStorageKey: mediaID,
+            userID: userID,
+            mediaType: "application/octet-stream",
+            expectedByteCount: plaintext.count,
+            moveSource: false
+        )
+        let keyMaterial = Data(repeating: 0x33, count: SecureMediaAttachmentCipher.keyMaterialBytes)
+        let created = try await cache.prepareCiphertextSpool(
+            forStorageKey: mediaID,
+            userID: userID,
+            expectedPlaintextByteCount: plaintext.count,
+            keyMaterial: keyMaterial,
+            attachmentID: mediaID
+        )
+        let spool = try XCTUnwrap(created)
+
+        // A fresh actor simulates process restart: the first open hashes the complete spool,
+        // while repeated transport retries validate only its cheap path/size/mtime fingerprint.
+        let restarted = SecureMediaFileCache(
+            directoryURL: temporaryDirectory,
+            keyAccount: "kit-pay-media-cache-key-tests-restarted-\(UUID().uuidString)"
+        )
+        let first = await restarted.ciphertextSpool(
+            forStorageKey: mediaID,
+            userID: userID,
+            expectedByteCount: spool.byteSize,
+            expectedSHA256: spool.sha256Hex
+        )
+        let second = await restarted.ciphertextSpool(
+            forStorageKey: mediaID,
+            userID: userID,
+            expectedByteCount: spool.byteSize,
+            expectedSHA256: spool.sha256Hex
+        )
+
+        XCTAssertNotNil(first)
+        XCTAssertEqual(first, second)
+        let verificationCount = await restarted.ciphertextSpoolDigestVerificationCount(
+            forStorageKey: mediaID,
+            userID: userID
+        )
+        XCTAssertEqual(verificationCount, 1)
+    }
+
+    func testReceivedCacheEvictsLRUWithoutEverSelectingSenderOriginals() async throws {
+        let senderKey = UUID().uuidString.lowercased()
+        let oldestReceivedKey = UUID().uuidString.lowercased()
+        let newestReceivedKey = UUID().uuidString.lowercased()
+        let bytes = 40
+        try await importOriginal(key: senderKey, byte: 0x11, count: bytes)
+        try await importOriginal(key: oldestReceivedKey, byte: 0x22, count: bytes)
+        try await importOriginal(key: newestReceivedKey, byte: 0x33, count: bytes)
+
+        let old = Date(timeIntervalSince1970: 1_700_000_000)
+        let newer = old.addingTimeInterval(60)
+        try setOriginalModificationDate(old, storageKey: senderKey)
+        try setOriginalModificationDate(old, storageKey: oldestReceivedKey)
+        try setOriginalModificationDate(newer, storageKey: newestReceivedKey)
+        let messageID = UUID()
+        let conversationID = UUID().uuidString.lowercased()
+        func candidate(
+            _ key: String,
+            ownership: SecureMediaCacheOwnership,
+            accessed: Date
+        ) -> SecureMediaCacheEvictionCandidate {
+            SecureMediaCacheEvictionCandidate(
+                messageID: messageID,
+                conversationID: conversationID,
+                attachmentID: key,
+                storageKey: key,
+                expectedPlaintextByteCount: bytes,
+                storageKind: .protectedFile,
+                ownership: ownership,
+                lastAccessedAt: accessed
+            )
+        }
+
+        let proposed = await cache.reserveReceivedCacheEviction(
+            candidates: [
+                candidate(senderKey, ownership: .senderOriginal, accessed: old),
+                candidate(oldestReceivedKey, ownership: .receivedCache, accessed: old),
+                candidate(newestReceivedKey, ownership: .receivedCache, accessed: newer),
+            ],
+            forUserID: userID,
+            maximumBytes: 60,
+            targetBytes: 40,
+            recentAccessProtection: 0,
+            now: newer.addingTimeInterval(60)
+        )
+        let reservation = try XCTUnwrap(proposed)
+
+        XCTAssertEqual(reservation.candidates.map(\.storageKey), [oldestReceivedKey])
+        let removed = await cache.commitEviction(reservation, forUserID: userID)
+        XCTAssertEqual(removed, Set([oldestReceivedKey]))
+        let evictedURL = await cache.protectedOriginalURL(
+            forStorageKey: oldestReceivedKey,
+            userID: userID,
+            expectedByteCount: bytes
+        )
+        let senderURL = await cache.protectedOriginalURL(
+            forStorageKey: senderKey,
+            userID: userID,
+            expectedByteCount: bytes
+        )
+        let newestURL = await cache.protectedOriginalURL(
+            forStorageKey: newestReceivedKey,
+            userID: userID,
+            expectedByteCount: bytes
+        )
+        XCTAssertNil(evictedURL)
+        XCTAssertNotNil(senderURL)
+        XCTAssertNotNil(newestURL)
+    }
+
+    func testActiveReceivedFileLeaseDefersEvictionUntilReleased() async throws {
+        let oldestKey = UUID().uuidString.lowercased()
+        let fallbackKey = UUID().uuidString.lowercased()
+        let bytes = 40
+        try await importOriginal(key: oldestKey, byte: 0x44, count: bytes)
+        try await importOriginal(key: fallbackKey, byte: 0x55, count: bytes)
+        let old = Date(timeIntervalSince1970: 1_700_000_000)
+        try setOriginalModificationDate(old, storageKey: oldestKey)
+        try setOriginalModificationDate(old.addingTimeInterval(60), storageKey: fallbackKey)
+        let leaseNow = old.addingTimeInterval(120)
+        let proposedLease = await cache.protectedOriginalLease(
+            forStorageKey: oldestKey,
+            userID: userID,
+            expectedByteCount: bytes,
+            now: leaseNow
+        )
+        let lease = try XCTUnwrap(proposedLease)
+        let messageID = UUID()
+        let conversationID = UUID().uuidString.lowercased()
+        let candidates = [oldestKey, fallbackKey].enumerated().map { index, key in
+            SecureMediaCacheEvictionCandidate(
+                messageID: messageID,
+                conversationID: conversationID,
+                attachmentID: key,
+                storageKey: key,
+                expectedPlaintextByteCount: bytes,
+                storageKind: .protectedFile,
+                ownership: .receivedCache,
+                lastAccessedAt: old.addingTimeInterval(Double(index * 60))
+            )
+        }
+        let proposedFirst = await cache.reserveReceivedCacheEviction(
+            candidates: candidates,
+            forUserID: userID,
+            maximumBytes: 60,
+            targetBytes: 40,
+            recentAccessProtection: 0,
+            now: leaseNow.addingTimeInterval(1)
+        )
+        let first = try XCTUnwrap(proposedFirst)
+        XCTAssertEqual(first.candidates.map(\.storageKey), [fallbackKey])
+        _ = await cache.commitEviction(first, forUserID: userID)
+        let protectedURL = await cache.protectedOriginalURL(
+            forStorageKey: oldestKey,
+            userID: userID,
+            expectedByteCount: bytes
+        )
+        XCTAssertNotNil(protectedURL)
+
+        await cache.releaseProtectedOriginalLease(lease)
+        let proposedSecond = await cache.reserveReceivedCacheEviction(
+            candidates: [candidates[0]],
+            forUserID: userID,
+            maximumBytes: 20,
+            targetBytes: 0,
+            recentAccessProtection: 0,
+            now: Date().addingTimeInterval(1)
+        )
+        let second = try XCTUnwrap(proposedSecond)
+        XCTAssertEqual(second.candidates.map(\.storageKey), [oldestKey])
+        let removed = await cache.commitEviction(second, forUserID: userID)
+        XCTAssertEqual(removed, Set([oldestKey]))
+    }
+
+    private func importOriginal(key: String, byte: UInt8, count: Int) async throws {
+        let source = temporaryDirectory.appendingPathComponent("source-\(key).bin")
+        try Data(repeating: byte, count: count).write(to: source, options: .atomic)
+        _ = try await cache.importProtectedOriginal(
+            from: source,
+            forStorageKey: key,
+            userID: userID,
+            mediaType: "application/octet-stream",
+            expectedByteCount: count,
+            moveSource: false
+        )
+    }
+
+    private func setOriginalModificationDate(_ date: Date, storageKey: String) throws {
+        let accountID = UUID(uuidString: userID)!.uuidString.lowercased()
+        let url = temporaryDirectory
+            .appendingPathComponent(accountID, isDirectory: true)
+            .appendingPathComponent("\(storageKey).original.bin", isDirectory: false)
+        try FileManager.default.setAttributes([.modificationDate: date], ofItemAtPath: url.path)
+    }
 }

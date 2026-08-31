@@ -1,4 +1,168 @@
 import Foundation
+import OSLog
+
+struct LocalMediaLatencyMeasurement: Equatable, Sendable {
+    let captureToVisibleMilliseconds: Double?
+    let captureToPlayableMilliseconds: Double?
+    let captureToEncryptedMilliseconds: Double?
+    let captureToServerAcceptedMilliseconds: Double?
+    let recipientDescriptorToLocalMilliseconds: Double?
+
+    init(
+        captureToVisibleMilliseconds: Double? = nil,
+        captureToPlayableMilliseconds: Double? = nil,
+        captureToEncryptedMilliseconds: Double? = nil,
+        captureToServerAcceptedMilliseconds: Double? = nil,
+        recipientDescriptorToLocalMilliseconds: Double? = nil
+    ) {
+        self.captureToVisibleMilliseconds = captureToVisibleMilliseconds
+        self.captureToPlayableMilliseconds = captureToPlayableMilliseconds
+        self.captureToEncryptedMilliseconds = captureToEncryptedMilliseconds
+        self.captureToServerAcceptedMilliseconds = captureToServerAcceptedMilliseconds
+        self.recipientDescriptorToLocalMilliseconds = recipientDescriptorToLocalMilliseconds
+    }
+
+    static func milliseconds(from start: Date, to end: Date) -> Double {
+        max(0, end.timeIntervalSince(start) * 1_000)
+    }
+}
+
+/// Lightweight, privacy-safe timing for local availability and the independent background
+/// encryption/upload/recipient-hydration milestones. IDs index in-memory state only; logs carry
+/// durations and never a filename, media id, MIME payload, contact or content.
+@MainActor
+final class LocalMediaPerformanceMonitor {
+    static let shared = LocalMediaPerformanceMonitor()
+    private static let maximumTrackedItems = 256
+
+    private struct Milestones {
+        let capturedAt: Date
+        var visibleAt: Date? = nil
+        var playableAt: Date? = nil
+        var encryptedAt: Date? = nil
+        var serverAcceptedAt: Date? = nil
+    }
+
+    private let logger = Logger(subsystem: "africa.kit.pay.ios", category: "LocalFirstMedia")
+    private var milestones: [UUID: Milestones] = [:]
+    private var recipientDescriptorDates: [UUID: Date] = [:]
+
+    func begin(mediaID: UUID, at date: Date = Date()) {
+        guard milestones[mediaID] == nil else { return }
+        if milestones.count >= Self.maximumTrackedItems,
+           let oldest = milestones.min(by: {
+               $0.value.capturedAt < $1.value.capturedAt
+           })?.key {
+            milestones.removeValue(forKey: oldest)
+        }
+        milestones[mediaID] = Milestones(capturedAt: date)
+    }
+
+    @discardableResult
+    func markVisible(mediaID: UUID, at date: Date = Date()) -> LocalMediaLatencyMeasurement? {
+        guard var value = milestones[mediaID] else { return nil }
+        guard value.visibleAt == nil else { return measurement(value) }
+        value.visibleAt = date
+        milestones[mediaID] = value
+        let result = measurement(value)
+        if let milliseconds = result.captureToVisibleMilliseconds {
+            logger.info("capture_to_visible_ms=\(milliseconds, privacy: .public)")
+        }
+        return result
+    }
+
+    @discardableResult
+    func markPlayable(mediaID: UUID, at date: Date = Date()) -> LocalMediaLatencyMeasurement? {
+        guard var value = milestones[mediaID] else { return nil }
+        guard value.playableAt == nil else { return measurement(value) }
+        value.playableAt = date
+        milestones[mediaID] = value
+        let result = measurement(value)
+        if let milliseconds = result.captureToPlayableMilliseconds {
+            logger.info("capture_to_playable_ms=\(milliseconds, privacy: .public)")
+        }
+        return result
+    }
+
+    @discardableResult
+    func markEncrypted(mediaID: UUID, at date: Date = Date()) -> LocalMediaLatencyMeasurement? {
+        guard var value = milestones[mediaID] else { return nil }
+        if value.encryptedAt == nil {
+            value.encryptedAt = date
+            milestones[mediaID] = value
+        }
+        let result = measurement(value)
+        if let milliseconds = result.captureToEncryptedMilliseconds {
+            logger.info("capture_to_encrypted_ms=\(milliseconds, privacy: .public)")
+        }
+        return result
+    }
+
+    @discardableResult
+    func markServerAccepted(
+        mediaID: UUID,
+        at date: Date = Date()
+    ) -> LocalMediaLatencyMeasurement? {
+        guard var value = milestones[mediaID] else { return nil }
+        if value.serverAcceptedAt == nil {
+            value.serverAcceptedAt = date
+            milestones[mediaID] = value
+        }
+        let result = measurement(value)
+        if let milliseconds = result.captureToServerAcceptedMilliseconds {
+            logger.info("capture_to_server_accepted_ms=\(milliseconds, privacy: .public)")
+        }
+        milestones.removeValue(forKey: mediaID)
+        return result
+    }
+
+    func beginRecipientHydration(mediaID: UUID, descriptorObservedAt: Date = Date()) {
+        recipientDescriptorDates[mediaID] = min(
+            recipientDescriptorDates[mediaID] ?? descriptorObservedAt,
+            descriptorObservedAt
+        )
+        if recipientDescriptorDates.count > Self.maximumTrackedItems,
+           let oldest = recipientDescriptorDates.min(by: { $0.value < $1.value })?.key {
+            recipientDescriptorDates.removeValue(forKey: oldest)
+        }
+    }
+
+    @discardableResult
+    func markRecipientHydrated(
+        mediaID: UUID,
+        at date: Date = Date()
+    ) -> LocalMediaLatencyMeasurement? {
+        guard let observedAt = recipientDescriptorDates.removeValue(forKey: mediaID) else {
+            return nil
+        }
+        let milliseconds = LocalMediaLatencyMeasurement.milliseconds(
+            from: observedAt,
+            to: date
+        )
+        logger.info("recipient_descriptor_to_local_ms=\(milliseconds, privacy: .public)")
+        return LocalMediaLatencyMeasurement(
+            recipientDescriptorToLocalMilliseconds: milliseconds
+        )
+    }
+
+    private func measurement(_ value: Milestones) -> LocalMediaLatencyMeasurement {
+        LocalMediaLatencyMeasurement(
+            captureToVisibleMilliseconds: value.visibleAt.map {
+                LocalMediaLatencyMeasurement.milliseconds(from: value.capturedAt, to: $0)
+            },
+            captureToPlayableMilliseconds: value.playableAt.map {
+                LocalMediaLatencyMeasurement.milliseconds(from: value.capturedAt, to: $0)
+            },
+            captureToEncryptedMilliseconds: value.encryptedAt.map {
+                LocalMediaLatencyMeasurement.milliseconds(from: value.capturedAt, to: $0)
+            },
+            captureToServerAcceptedMilliseconds: value.serverAcceptedAt.map {
+                LocalMediaLatencyMeasurement.milliseconds(from: value.capturedAt, to: $0)
+            },
+            recipientDescriptorToLocalMilliseconds: nil
+        )
+    }
+}
 
 /// Classifies an end-to-end encrypted attachment by its wire MIME type.
 ///
@@ -7,6 +171,7 @@ import Foundation
 enum KitChatMediaKind: String, Codable, CaseIterable, Sendable {
     case image
     case voice
+    case audio
     case video
     case document
 
@@ -14,8 +179,12 @@ enum KitChatMediaKind: String, Codable, CaseIterable, Sendable {
         let normalized = mediaType.lowercased()
         if normalized.hasPrefix("image/") {
             self = .image
-        } else if normalized.hasPrefix("audio/") {
+        } else if normalized == "audio/mp4" {
+            // Kit voice notes are recorded and assembled as canonical M4A. Other supported audio
+            // MIME types are imported files and must not be presented as microphone recordings.
             self = .voice
+        } else if normalized.hasPrefix("audio/") {
+            self = .audio
         } else if normalized.hasPrefix("video/") {
             self = .video
         } else {
@@ -27,6 +196,7 @@ enum KitChatMediaKind: String, Codable, CaseIterable, Sendable {
         switch self {
         case .image: "photo.fill"
         case .voice: "mic.fill"
+        case .audio: "music.note"
         case .video: "video.fill"
         case .document: "doc.fill"
         }
@@ -36,6 +206,7 @@ enum KitChatMediaKind: String, Codable, CaseIterable, Sendable {
         switch self {
         case .image: "Photo"
         case .voice: "Voice note"
+        case .audio: "Audio"
         case .video: "Video"
         case .document: "Document"
         }
@@ -59,8 +230,20 @@ enum KitChatMediaLimits {
 
     static let maximumTransferLabel = "200 MB"
 
+    /// A local video may temporarily exceed the wire ceiling while the user trims it. Keeping
+    /// that source app-owned and protected preserves local-first editing; only the resulting clip
+    /// may enter a message/outbox record and it must still satisfy `maximumTransferBytes`.
+    static let maximumEditableLocalVideoBytes = 1_073_741_824
+
     static func fits(_ byteCount: Int, kind _: KitChatMediaKind) -> Bool {
         byteCount > 0 && byteCount <= maximumTransferBytes
+    }
+
+    static func fitsLocalOriginal(byteCount: Int, mediaType: String) -> Bool {
+        if mediaType.lowercased().hasPrefix("video/") {
+            return byteCount > 0 && byteCount <= maximumEditableLocalVideoBytes
+        }
+        return fits(byteCount, kind: KitChatMediaKind(mediaType: mediaType))
     }
 
     static func shouldCacheInline(byteCount: Int) -> Bool {

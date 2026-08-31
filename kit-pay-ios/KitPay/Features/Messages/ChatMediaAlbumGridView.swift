@@ -198,6 +198,7 @@ private struct ChatMediaAlbumGridCell: View {
     /// content-bound storage key, and it is only consulted after that row re-resolves.
     @State private var loaded: SecureMediaLoadPolicy.LoadedItem?
     @State private var videoPoster: UIImage?
+    @State private var fileImageThumbnail: UIImage?
 
     private var kind: KitChatMediaKind {
         KitChatMediaKind(mediaType: loaded?.mediaType ?? item.mediaType)
@@ -215,12 +216,20 @@ private struct ChatMediaAlbumGridCell: View {
                 forKey: item.thumbnailKey,
                 maxPixel: maxPixel
             ) ?? videoPoster
-        default:
+        case .image:
+            if loaded.localFileURL != nil {
+                return ChatMediaThumbnailStore.shared.cachedThumbnail(
+                    forKey: item.thumbnailKey,
+                    maxPixel: maxPixel
+                ) ?? fileImageThumbnail
+            }
             return ChatMediaThumbnailStore.shared.thumbnail(
                 forKey: item.thumbnailKey,
                 maxPixel: maxPixel,
                 from: loaded.data
             )
+        default:
+            return nil
         }
     }
 
@@ -253,27 +262,53 @@ private struct ChatMediaAlbumGridCell: View {
             // Fresh local-only identity resolution per (message, sealed-descriptor) key; a
             // replaced row changes the key and re-fires this. Failure clears any previously
             // shown pixels instead of serving stale state.
-            loaded = try? await model.loadSecureMediaItem(
+            if let localFile = await model.loadProtectedLocalMediaFile(
                 messageID: item.messageID,
                 conversationId: item.conversationID,
-                itemIndex: nil,
-                allowsDownload: false
-            )
+                itemIndex: nil
+            ) {
+                loaded = SecureMediaLoadPolicy.LoadedItem(localFile: localFile)
+            } else {
+                loaded = try? await model.loadSecureMediaItem(
+                    messageID: item.messageID,
+                    conversationId: item.conversationID,
+                    itemIndex: nil,
+                    allowsDownload: false
+                )
+            }
             guard let loaded else { return }
             switch KitChatMediaKind(mediaType: loaded.mediaType) {
             case .video:
-                videoPoster = await ChatMediaThumbnailStore.shared.videoThumbnail(
-                    forKey: item.thumbnailKey,
-                    maxPixel: maxPixel,
-                    from: loaded.data,
-                    mediaType: loaded.mediaType
-                )
+                if let localFileURL = loaded.localFileURL {
+                    videoPoster = await ChatMediaThumbnailStore.shared.videoThumbnail(
+                        forKey: item.thumbnailKey,
+                        maxPixel: maxPixel,
+                        fromFileURL: localFileURL
+                    )
+                } else {
+                    videoPoster = await ChatMediaThumbnailStore.shared.videoThumbnail(
+                        forKey: item.thumbnailKey,
+                        maxPixel: maxPixel,
+                        from: loaded.data,
+                        mediaType: loaded.mediaType
+                    )
+                }
             case .image:
-                let thumb = ChatMediaThumbnailStore.shared.thumbnail(
-                    forKey: item.thumbnailKey,
-                    maxPixel: maxPixel,
-                    from: loaded.data
-                )
+                let thumb: UIImage?
+                if let localFileURL = loaded.localFileURL {
+                    thumb = ChatMediaThumbnailStore.shared.thumbnail(
+                        forKey: item.thumbnailKey,
+                        maxPixel: maxPixel,
+                        fromFileURL: localFileURL
+                    )
+                    fileImageThumbnail = thumb
+                } else {
+                    thumb = ChatMediaThumbnailStore.shared.thumbnail(
+                        forKey: item.thumbnailKey,
+                        maxPixel: maxPixel,
+                        from: loaded.data
+                    )
+                }
                 if let thumb, thumb.size.height > 0 {
                     onImageAspectRatio?(thumb.size.width / thumb.size.height)
                 }

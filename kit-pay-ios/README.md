@@ -75,11 +75,11 @@ and Apple Liquid Glass.
   The capability handshake pins the advertised byte bounds exactly, so the backend must declare
   `maximum_plaintext_bytes` 209715200 and `maximum_ciphertext_bytes` 209715264. Devices without
   the baseline capability remain image-only, while a roster missing the 200 MiB attestation is
-  capped at 10 MiB; unknown types fail closed. Caveat: the attachment cipher and the
-  multipart transport currently materialize their buffers in memory, so a transfer near the cap
-  briefly costs a low multiple of its size in RAM — acceptable on recent iPhones, but streaming
-  encrypt/upload/download is the follow-up required before the cap can be considered robust on
-  older, memory-constrained devices.
+  capped at 10 MiB; unknown types fail closed. Large transfers use bounded streaming encryption,
+  file-backed upload/download, resumable ciphertext checkpoints, and a relaunchable background
+  `URLSession` for bounded upload chunks. `BGProcessingTask` remains an opportunistic extra wake;
+  broader rollout is blocked on the physical-device termination/relaunch matrix documented in
+  [LOCAL_FIRST_MEDIA.md](LOCAL_FIRST_MEDIA.md).
 - Kit Pay → Kit Pay transfers post a canonical encrypted `KITPAY1` event into the 1:1 chat. The
   cross-platform action set is `request|paid|declined|cancelled|transfer|sent|accepted|rejected|
   reversed|expired`; optional `note` precedes optional `rsn`, and older clients show a redacted

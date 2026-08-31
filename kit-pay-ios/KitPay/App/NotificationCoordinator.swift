@@ -3487,8 +3487,23 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         ContactBackgroundRefreshScheduler.shared.register()
         CommunicationBackgroundReplayScheduler.shared.register()
         MessageBackupRefreshScheduler.shared.register()
+        MessagingBackgroundAttachmentUploader.shared.prepareForApplicationLaunch()
         NotificationCoordinator.shared.prepareForProtectedStateRestore()
         return true
+    }
+
+    func application(
+        _ application: UIApplication,
+        handleEventsForBackgroundURLSession identifier: String,
+        completionHandler: @escaping () -> Void
+    ) {
+        guard MessagingBackgroundAttachmentUploader.handlesSession(identifier: identifier) else {
+            completionHandler()
+            return
+        }
+        MessagingBackgroundAttachmentUploader.shared.setBackgroundEventsCompletionHandler(
+            completionHandler
+        )
     }
 
     func application(_ application: UIApplication, didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) {

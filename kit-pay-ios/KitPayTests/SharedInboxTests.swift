@@ -680,6 +680,38 @@ final class SharedInboxTests: XCTestCase {
         XCTAssertEqual(try store.data(for: item, in: batchID), Data("hello".utf8))
     }
 
+    func testValidatedFileURLRemainsOwnedByInboxUntilExplicitRemoval() throws {
+        let store = SharedInboxStore(containerURL: try makeContainer())
+        let batchID = UUID()
+        let bytes = Data("local-first shared document".utf8)
+        let item = try store.stage(
+            data: bytes,
+            suggestedName: "document.txt",
+            mediaType: "text/plain",
+            batchID: batchID
+        )
+        try store.finishBatch(
+            id: batchID,
+            items: [item],
+            text: nil,
+            ownerAccountID: accountID,
+            receivedAt: Date()
+        )
+
+        let fileURL = try store.fileURL(for: item, in: batchID)
+        XCTAssertEqual(try Data(contentsOf: fileURL), bytes)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fileURL.path))
+
+        // Resolving the file is non-consuming. The composer copies it into permanent protected
+        // media storage, and the inbox remains the recovery owner until the outbox commit wins.
+        _ = try store.fileURL(for: item, in: batchID)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fileURL.path))
+
+        store.remove(batchID: batchID)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fileURL.path))
+        XCTAssertThrowsError(try store.fileURL(for: item, in: batchID))
+    }
+
     func testManifestItemMetadataMustRemainCanonical() {
         let id = UUID()
         XCTAssertTrue(SharedInboxPolicy.isValidItemMetadata(SharedInboxItem(

@@ -449,11 +449,19 @@ struct KitMediaGalleryView: View {
         }
         switch KitChatMediaKind(mediaType: fresh.mediaType) {
         case .video:
-            shareURL = try? ChatMediaTempFiles.writeTemporaryFile(
-                data: fresh.data,
-                mediaType: fresh.mediaType,
-                suggestedName: "Kit video"
-            )
+            if let localFileURL = fresh.localFileURL {
+                shareURL = try? ChatMediaTempFiles.copyTemporaryFile(
+                    from: localFileURL,
+                    mediaType: fresh.mediaType,
+                    suggestedName: "Kit video"
+                )
+            } else {
+                shareURL = try? ChatMediaTempFiles.writeTemporaryFile(
+                    data: fresh.data,
+                    mediaType: fresh.mediaType,
+                    suggestedName: "Kit video"
+                )
+            }
         default:
             guard let image = UIImage(data: fresh.data),
                   let jpeg = image.jpegData(compressionQuality: 0.9)
@@ -486,7 +494,15 @@ struct KitMediaGalleryView: View {
         }
         switch KitChatMediaKind(mediaType: fresh.mediaType) {
         case .video:
-            saveVideo(data: fresh.data, mediaType: fresh.mediaType)
+            if let localFileURL = fresh.localFileURL {
+                saveVideo(
+                    fileURL: localFileURL,
+                    removeAfterSave: false,
+                    protectedOriginalLease: fresh.localFileLease
+                )
+            } else {
+                saveVideo(data: fresh.data, mediaType: fresh.mediaType)
+            }
         default:
             saveImage(data: fresh.data)
         }
@@ -517,8 +533,23 @@ struct KitMediaGalleryView: View {
             showToast("Could not save video")
             return
         }
-        let completion = MediaSaveCompletion { error in
-            ChatMediaTempFiles.removeTemporaryFile(url)
+        saveVideo(
+            fileURL: url,
+            removeAfterSave: true,
+            protectedOriginalLease: nil
+        )
+    }
+
+    private func saveVideo(
+        fileURL url: URL,
+        removeAfterSave: Bool,
+        protectedOriginalLease: SecureMediaOriginalAccessLease?
+    ) {
+        let completion = MediaSaveCompletion { [protectedOriginalLease] error in
+            // UISaveVideoAtPathToSavedPhotosAlbum reads asynchronously after this method returns.
+            // Keep a received-cache lease alive until UIKit reports that it has finished.
+            _ = protectedOriginalLease
+            if removeAfterSave { ChatMediaTempFiles.removeTemporaryFile(url) }
             showToast(error == nil ? "Saved to Photos" : "Could not save video")
         }
         MediaSaveCompletion.retain(completion)
@@ -672,7 +703,10 @@ private struct GalleryImagePage: View {
         .task(id: data) {
             let bytes = data
             let image = await Task.detached(priority: .userInitiated) {
-                UIImage(data: bytes)
+                ChatMediaImageDecoder.downsample(
+                    data: bytes,
+                    maximumPixelSize: 4_096
+                )
             }.value
             decodedImage = image
             decodeFinished = true
@@ -858,23 +892,42 @@ private struct GalleryVideoPage: View {
         .contentShape(Rectangle())
         .onTapGesture { onToggleChrome() }
         .task(id: item.id) {
-            poster = await ChatMediaThumbnailStore.shared.videoThumbnail(
-                forKey: item.thumbnailKey,
-                maxPixel: 400,
-                from: loaded.data,
-                mediaType: loaded.mediaType
-            )
+            if let localFileURL = loaded.localFileURL {
+                poster = await ChatMediaThumbnailStore.shared.videoThumbnail(
+                    forKey: item.thumbnailKey,
+                    maxPixel: 400,
+                    fromFileURL: localFileURL
+                )
+            } else {
+                poster = await ChatMediaThumbnailStore.shared.videoThumbnail(
+                    forKey: item.thumbnailKey,
+                    maxPixel: 400,
+                    from: loaded.data,
+                    mediaType: loaded.mediaType
+                )
+            }
             // Picture in Picture restores at exact gallery identity: item 3 of a
             // multi-attachment message reopens on item 3, still within its one bubble.
-            controller.prepare(
-                data: loaded.data,
-                mediaType: loaded.mediaType,
-                galleryIdentity: ChatVideoGalleryIdentity(
-                    messageID: item.messageID,
-                    itemIndex: item.itemIndex
-                ),
-                restoreFromPictureInPicture: restoreFromPictureInPicture
+            let identity = ChatVideoGalleryIdentity(
+                messageID: item.messageID,
+                itemIndex: item.itemIndex
             )
+            if let localFileURL = loaded.localFileURL {
+                controller.prepare(
+                    fileURL: localFileURL,
+                    ownsFile: false,
+                    protectedOriginalLease: loaded.localFileLease,
+                    galleryIdentity: identity,
+                    restoreFromPictureInPicture: restoreFromPictureInPicture
+                )
+            } else {
+                controller.prepare(
+                    data: loaded.data,
+                    mediaType: loaded.mediaType,
+                    galleryIdentity: identity,
+                    restoreFromPictureInPicture: restoreFromPictureInPicture
+                )
+            }
         }
         .onChange(of: isActive) { _, nowActive in
             if !nowActive { controller.pause() }
@@ -966,6 +1019,11 @@ private final class GalleryVideoController: ObservableObject {
 
     private var isScrubbing = false
     private var fileURL: URL?
+    private var ownsFileURL = false
+    /// Retained by the controller, rather than the SwiftUI page value, so a Picture in Picture
+    /// handoff continues to exclude this received-cache file from eviction after the gallery is
+    /// dismissed. `releaseResources` drops it only when playback ownership truly ends.
+    private var protectedOriginalLease: SecureMediaOriginalAccessLease?
     /// Keeping the protected file open is what makes `.completeFileProtectionUnlessOpen` useful:
     /// AVFoundation can continue reading after a lock/background transition, but a new process
     /// still cannot open the plaintext while protected data is unavailable.
@@ -998,11 +1056,35 @@ private final class GalleryVideoController: ObservableObject {
             data: data,
             mediaType: mediaType
         ) else { return }
+        prepare(
+            fileURL: url,
+            ownsFile: true,
+            protectedOriginalLease: nil,
+            galleryIdentity: galleryIdentity,
+            restoreFromPictureInPicture: restoreFromPictureInPicture
+        )
+    }
+
+    func prepare(
+        fileURL url: URL,
+        ownsFile: Bool,
+        protectedOriginalLease: SecureMediaOriginalAccessLease?,
+        galleryIdentity: ChatVideoGalleryIdentity,
+        restoreFromPictureInPicture: @escaping (ChatVideoGalleryIdentity) -> Void
+    ) {
+        self.galleryIdentity = galleryIdentity
+        self.restoreFromPictureInPicture = restoreFromPictureInPicture
+        guard player == nil else {
+            if ownsFile { ChatMediaTempFiles.removeTemporaryFile(url) }
+            return
+        }
         guard let fileHandle = try? FileHandle(forReadingFrom: url) else {
-            ChatMediaTempFiles.removeTemporaryFile(url)
+            if ownsFile { ChatMediaTempFiles.removeTemporaryFile(url) }
             return
         }
         fileURL = url
+        ownsFileURL = ownsFile
+        self.protectedOriginalLease = protectedOriginalLease
         playbackFileHandle = fileHandle
         let asset = AVURLAsset(url: url)
         let item = AVPlayerItem(asset: asset)
@@ -1068,8 +1150,10 @@ private final class GalleryVideoController: ObservableObject {
             try? playbackFileHandle.close()
         }
         playbackFileHandle = nil
-        ChatMediaTempFiles.removeTemporaryFile(fileURL)
+        if ownsFileURL { ChatMediaTempFiles.removeTemporaryFile(fileURL) }
         fileURL = nil
+        ownsFileURL = false
+        protectedOriginalLease = nil
         galleryIdentity = nil
         restoreFromPictureInPicture = nil
     }

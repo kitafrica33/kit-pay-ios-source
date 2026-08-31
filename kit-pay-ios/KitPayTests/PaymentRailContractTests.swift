@@ -1441,6 +1441,155 @@ final class PaymentRailContractTests: XCTestCase {
         XCTAssertNil(operation.outboundPricing)
     }
 
+    func testMobileMoneyOperationRefreshPolicyPollsPendingRowsWithBoundedBackoff() {
+        let pending = mobileMoneyOperation(
+            status: "pending",
+            type: "collection",
+            failureCode: ""
+        )
+        let succeeded = mobileMoneyOperation(
+            status: "succeeded",
+            type: "collection",
+            failureCode: ""
+        )
+
+        XCTAssertTrue(MobileMoneyOperationRefreshPolicy.shouldPoll(
+            pending,
+            isActive: true,
+            isOnline: true
+        ))
+        XCTAssertFalse(MobileMoneyOperationRefreshPolicy.shouldPoll(
+            pending,
+            isActive: false,
+            isOnline: true
+        ))
+        XCTAssertFalse(MobileMoneyOperationRefreshPolicy.shouldPoll(
+            pending,
+            isActive: true,
+            isOnline: false
+        ))
+        XCTAssertFalse(MobileMoneyOperationRefreshPolicy.shouldPoll(
+            succeeded,
+            isActive: true,
+            isOnline: true
+        ))
+
+        XCTAssertEqual(MobileMoneyOperationRefreshPolicy.interval(attempt: -1), 1.5)
+        var previous = MobileMoneyOperationRefreshPolicy.interval(attempt: 0)
+        for attempt in 1...30 {
+            let interval = MobileMoneyOperationRefreshPolicy.interval(attempt: attempt)
+            XCTAssertGreaterThanOrEqual(interval, previous)
+            XCTAssertLessThanOrEqual(
+                interval,
+                MobileMoneyOperationRefreshPolicy.maximumInterval
+            )
+            previous = interval
+        }
+        XCTAssertEqual(
+            MobileMoneyOperationRefreshPolicy.interval(attempt: 30),
+            MobileMoneyOperationRefreshPolicy.maximumInterval
+        )
+        XCTAssertEqual(
+            MobileMoneyOperationRefreshPolicy.nextAttempt(after: Int.max),
+            MobileMoneyOperationRefreshPolicy.maximumBackoffAttempt
+        )
+    }
+
+    func testMobileMoneyOperationRefreshAcceptsOnlyTheSameImmutablePayment() {
+        let pending = mobileMoneyOperation(
+            status: "pending",
+            type: "payout",
+            failureCode: ""
+        )
+        let settled = mobileMoneyOperation(
+            status: "succeeded",
+            type: "payout",
+            failureCode: ""
+        )
+        let differentOperation = mobileMoneyOperation(
+            id: "99999999-9999-4999-8999-999999999999",
+            status: "succeeded",
+            type: "payout",
+            failureCode: ""
+        )
+        let differentWallet = mobileMoneyOperation(
+            walletId: "88888888-8888-4888-8888-888888888888",
+            status: "succeeded",
+            type: "payout",
+            failureCode: ""
+        )
+        let differentBeneficiary = mobileMoneyOperation(
+            status: "succeeded",
+            type: "payout",
+            failureCode: "",
+            beneficiaryId: "77777777-7777-4777-8777-777777777777"
+        )
+
+        XCTAssertTrue(MobileMoneyOperationRefreshPolicy.hasSameImmutableIdentity(
+            settled,
+            as: pending
+        ))
+        XCTAssertFalse(MobileMoneyOperationRefreshPolicy.hasSameImmutableIdentity(
+            differentOperation,
+            as: pending
+        ))
+        XCTAssertFalse(MobileMoneyOperationRefreshPolicy.hasSameImmutableIdentity(
+            differentWallet,
+            as: pending
+        ))
+        XCTAssertFalse(MobileMoneyOperationRefreshPolicy.hasSameImmutableIdentity(
+            differentBeneficiary,
+            as: pending
+        ))
+    }
+
+    func testMobileMoneyCustomerStatusCopyDistinguishesPaidPayouts() {
+        func status(_ state: String, type: String) -> String {
+            MobileMoneyOperationStatusPresentation.customerText(for: mobileMoneyOperation(
+                status: state,
+                type: type,
+                failureCode: ""
+            ))
+        }
+
+        XCTAssertEqual(status("succeeded", type: "payout"), "Paid")
+        XCTAssertEqual(status("completed", type: "collection"), "Completed")
+        XCTAssertEqual(status("failed", type: "payout"), "Failed")
+        XCTAssertEqual(status("reversed", type: "collection"), "Reversed")
+        XCTAssertEqual(status("canceled", type: "payout"), "Cancelled")
+        XCTAssertEqual(status("processing", type: "payout"), "Processing")
+    }
+
+    func testMobileMoneyRemoteWakeRefreshesOnlyForTypedTerminalEvents() {
+        let terminalTypes = [
+            "mobile_money.collection.succeeded",
+            "mobile_money.collection.failed",
+            "mobile_money.collection.reversed",
+            "mobile_money.payout.succeeded",
+            "mobile_money.payout.failed",
+            "mobile_money.payout.reversed",
+        ]
+        for eventType in terminalTypes {
+            XCTAssertTrue(MobileMoneyRemoteWakePolicy.shouldRefreshOperations(
+                for: ["type": eventType]
+            ), eventType)
+        }
+
+        let unrelatedObjects: [Any?] = [
+            ["type": "mobile_money.collection.processing"],
+            ["type": "message.created"],
+            ["type": "mobile_money.collection.succeeded "],
+            ["type": "MOBILE_MONEY.PAYOUT.SUCCEEDED"],
+            ["event_type": "mobile_money.payout.succeeded"],
+            ["type": 1],
+            "mobile_money.payout.succeeded",
+            nil,
+        ]
+        for object in unrelatedObjects {
+            XCTAssertFalse(MobileMoneyRemoteWakePolicy.shouldRefreshOperations(for: object))
+        }
+    }
+
     func testConfirmedCollectionFailureCopyRequiresAFailedCollection() {
         let expected = CustomerFacingPaymentCopy.confirmedMobileMoneyCollectionFailure
         let failedCollection = mobileMoneyOperation(
@@ -1600,6 +1749,8 @@ final class PaymentRailContractTests: XCTestCase {
     }
 
     private func mobileMoneyOperation(
+        id: String = "11111111-1111-1111-1111-111111111111",
+        walletId: String = "33333333-3333-3333-3333-333333333333",
         status: String,
         type: String,
         failureCode: String,
@@ -1609,7 +1760,7 @@ final class PaymentRailContractTests: XCTestCase {
         netAmount: String? = nil
     ) -> MobileMoneyOperationDTO {
         MobileMoneyOperationDTO(
-            id: "11111111-1111-1111-1111-111111111111",
+            id: id,
             reference: "MM-FAILURE",
             type: type == MobileMoneyAction.collection.rawValue ? "deposit" : "withdrawal",
             direction: type == MobileMoneyAction.collection.rawValue ? "credit" : "outbound",
@@ -1617,7 +1768,7 @@ final class PaymentRailContractTests: XCTestCase {
             submissionStage: status == "failed" ? "terminal" : "awaiting_provider",
             bankId: "22222222-2222-2222-2222-222222222222",
             beneficiaryId: beneficiaryId,
-            walletId: "33333333-3333-3333-3333-333333333333",
+            walletId: walletId,
             amount: "500.00",
             currency: CurrencyDTO(code: "UGX", scale: "2"),
             providerReference: nil,

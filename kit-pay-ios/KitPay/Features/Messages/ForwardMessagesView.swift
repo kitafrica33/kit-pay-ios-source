@@ -672,13 +672,31 @@ struct ForwardMessagesView: View {
                             conversationId: sourceConversationID,
                             itemIndex: nil
                         )
+                        let forwardedMediaID = loadedMedia.localFileURL.map { _ in UUID() }
+                        var forwardedFileURL: URL?
+                        if let sourceURL = loadedMedia.localFileURL,
+                           let forwardedMediaID {
+                            forwardedFileURL = await model.persistStagedMediaOriginal(
+                                mediaID: forwardedMediaID,
+                                sourceURL: sourceURL,
+                                mediaType: loadedMedia.mediaType,
+                                byteCount: loadedMedia.byteCount,
+                                moveSource: false
+                            )
+                            guard forwardedFileURL != nil else {
+                                throw SecureMediaAttachmentError.invalidMedia
+                            }
+                        }
                         let queued = await model.queueMediaMessage(
                             conversationId: conversationID,
                             title: title,
                             recipientId: recipientUserID,
-                            mediaData: loadedMedia.data,
+                            mediaData: loadedMedia.localFileURL == nil ? loadedMedia.data : nil,
                             mediaType: loadedMedia.mediaType,
                             caption: loadedMedia.caption,
+                            localMediaID: forwardedMediaID,
+                            plaintextByteSize: loadedMedia.byteCount,
+                            localStorageKind: forwardedFileURL == nil ? nil : .protectedFile,
                             submittedDraftBody: nil,
                             draftClearVersion: nil
                         )
@@ -686,6 +704,9 @@ struct ForwardMessagesView: View {
                             sentForTarget += 1
                             totalSent += 1
                         } else {
+                            if let forwardedMediaID {
+                                await model.discardStagedMediaOriginal(mediaID: forwardedMediaID)
+                            }
                             let kind = KitChatMediaKind(mediaType: loadedMedia.mediaType)
                             itemFailureReasons.append(
                                 model.lastError

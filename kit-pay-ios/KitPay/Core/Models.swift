@@ -717,12 +717,16 @@ struct MessagingProtocolCapabilityDTO: Decodable {
     /// Media-message v2 is an additive block. A malformed advertisement must disable only the
     /// multi-attachment path — never the messaging protocol block it rides in.
     var mediaMessage: MessagingMediaMessageProtocolCapabilityDTO? = nil
+    /// Chunked attachment transport is additive. Its decoder is intentionally isolated so a
+    /// malformed rollout block disables resume without taking ordinary encrypted messaging down.
+    var resumableAttachments: MessagingResumableAttachmentsCapabilityDTO? = nil
 
     enum CodingKeys: String, CodingKey {
         case ready, version, suite
         case postQuantum = "post_quantum"
         case richMedia = "rich_media"
         case mediaMessage = "media_message"
+        case resumableAttachments = "resumable_attachments"
     }
 
     init(
@@ -731,7 +735,8 @@ struct MessagingProtocolCapabilityDTO: Decodable {
         suite: String?,
         postQuantum: Bool?,
         richMedia: MessagingRichMediaProtocolCapabilityDTO? = nil,
-        mediaMessage: MessagingMediaMessageProtocolCapabilityDTO? = nil
+        mediaMessage: MessagingMediaMessageProtocolCapabilityDTO? = nil,
+        resumableAttachments: MessagingResumableAttachmentsCapabilityDTO? = nil
     ) {
         self.ready = ready
         self.version = version
@@ -739,6 +744,7 @@ struct MessagingProtocolCapabilityDTO: Decodable {
         self.postQuantum = postQuantum
         self.richMedia = richMedia
         self.mediaMessage = mediaMessage
+        self.resumableAttachments = resumableAttachments
     }
 
     init(from decoder: Decoder) throws {
@@ -755,6 +761,10 @@ struct MessagingProtocolCapabilityDTO: Decodable {
             MessagingMediaMessageProtocolCapabilityDTO.self,
             forKey: .mediaMessage
         )
+        resumableAttachments = try? values.decodeIfPresent(
+            MessagingResumableAttachmentsCapabilityDTO.self,
+            forKey: .resumableAttachments
+        )
     }
 
     var supportsReviewedV2: Bool {
@@ -762,6 +772,37 @@ struct MessagingProtocolCapabilityDTO: Decodable {
             && version == SecureMessagingWire.protocolVersion
             && suite == SecureMessagingWire.protocolSuite
             && postQuantum == true
+    }
+}
+
+/// Fail-closed advertisement for the ciphertext-offset upload protocol. The fixed chunk ceiling
+/// is part of the reviewed wire contract, not a server tuning hint: accepting a larger value
+/// could defeat the client's bounded-memory guarantee.
+struct MessagingResumableAttachmentsCapabilityDTO: Decodable, Equatable, Sendable {
+    let ready: Bool?
+    let profile: String?
+    let maxChunkBytes: Int?
+    let offsetUnit: String?
+    let chunkDigest: String?
+    let fullDigest: String?
+
+    enum CodingKeys: String, CodingKey {
+        case ready, profile
+        case maxChunkBytes = "max_chunk_bytes"
+        case offsetUnit = "offset_unit"
+        case chunkDigest = "chunk_digest"
+        case fullDigest = "full_digest"
+    }
+
+    var validatedMaximumChunkBytes: Int? {
+        guard ready == true,
+              profile == MessagingResumableAttachmentPolicy.profile,
+              maxChunkBytes == MessagingResumableAttachmentPolicy.maximumChunkBytes,
+              offsetUnit == "ciphertext_byte",
+              chunkDigest == "sha256",
+              fullDigest == "sha256"
+        else { return nil }
+        return maxChunkBytes
     }
 }
 
@@ -3427,6 +3468,267 @@ struct SecureMessagingRetainedMessageMetadata: Codable, Hashable, Sendable {
     let replyToMessageID: String?
 }
 
+/// Device-local ownership of one media item. The media id is minted before upload and never
+/// changes when a server storage key appears, which keeps rendering, retry and cleanup rooted in
+/// local identity rather than a CDN/object URL. This metadata lives inside the account-bound
+/// encrypted state file; `localStorageKey` addresses either the encrypted blob cache or the
+/// message's encrypted inline slot and never exposes a filesystem path to the UI.
+/// One immutable sender-side source retained independently of any optimized upload
+/// representation. A voice note can have several finalized AAC segments; an image has one
+/// camera/library original. These references remain part of the message's ownership graph after
+/// preprocessing succeeds, so cleanup can never orphan (or prematurely delete) the original.
+struct LocalMediaOriginalSource: Codable, Hashable, Sendable {
+    let storageKey: String
+    let mediaType: String
+    let fileSize: Int
+    let duration: TimeInterval?
+
+    var isStructurallyValid: Bool {
+        guard UUID(uuidString: storageKey)?.uuidString.lowercased() == storageKey,
+              !mediaType.isEmpty,
+              mediaType == mediaType.lowercased(),
+              mediaType.utf8.count <= 127,
+              mediaType.unicodeScalars.allSatisfy({ scalar in
+                  scalar.value >= 0x21 && scalar.value <= 0x7e
+              }),
+              (1 ... SecureMediaAttachmentCipher.maximumPlaintextBytes).contains(fileSize),
+              duration.map({ $0.isFinite && $0 > 0 }) ?? true
+        else { return false }
+        return true
+    }
+}
+
+/// Durable work that must finish before ciphertext/upload may start. The visible message and its
+/// protected originals are committed first; the outbox command is explicitly parked while this
+/// value exists. Relaunch simply resumes the same job and publishes to the same output key.
+struct LocalMediaPreprocessingJob: Codable, Hashable, Sendable {
+    enum Kind: String, Codable, Hashable, Sendable {
+        case imageJPEG
+        case voiceAssembly
+    }
+
+    let kind: Kind
+    let sources: [LocalMediaOriginalSource]
+    let outputStorageKey: String
+    let outputMediaType: String
+
+    var isStructurallyValid: Bool {
+        guard !sources.isEmpty,
+              sources.count <= 256,
+              sources.allSatisfy(\.isStructurallyValid),
+              Set(sources.map(\.storageKey)).count == sources.count,
+              UUID(uuidString: outputStorageKey)?.uuidString.lowercased() == outputStorageKey,
+              !Set(sources.map(\.storageKey)).contains(outputStorageKey),
+              SecureMessagingWire.allowedAttachmentMediaTypes.contains(outputMediaType)
+        else { return false }
+        var aggregate = 0
+        for source in sources {
+            let (next, overflow) = aggregate.addingReportingOverflow(source.fileSize)
+            guard !overflow,
+                  next <= SecureMediaAttachmentCipher.maximumPlaintextBytes
+            else { return false }
+            aggregate = next
+        }
+        switch kind {
+        case .imageJPEG:
+            return sources.count == 1
+                && sources[0].mediaType.hasPrefix("image/")
+                && outputMediaType == "image/jpeg"
+        case .voiceAssembly:
+            return sources.allSatisfy { $0.mediaType == "audio/mp4" }
+                && outputMediaType == "audio/mp4"
+        }
+    }
+}
+
+struct LocalMediaRecord: Codable, Hashable, Identifiable, Sendable {
+    enum Direction: String, Codable, Hashable, Sendable {
+        case sent
+        case received
+    }
+
+    enum LocalStorageKind: String, Codable, Hashable, Sendable {
+        case encryptedState
+        case encryptedBlob
+        /// A sender-owned original kept as a file so video/document playback never requires a
+        /// whole-file decrypt/copy. The file is account-scoped, backup-excluded and protected by
+        /// iOS Data Protection; transmission still uses the attachment E2EE cipher.
+        case protectedFile
+        case none
+    }
+
+    enum ProcessingState: String, Codable, Hashable, Sendable {
+        case ready
+        case processing
+        case failed
+    }
+
+    enum UploadState: String, Codable, Hashable, Sendable {
+        case notRequired
+        case pending
+        case uploading
+        case uploaded
+        case failed
+    }
+
+    enum DownloadState: String, Codable, Hashable, Sendable {
+        case notRequired
+        case pending
+        case downloading
+        case downloaded
+        case failed
+    }
+
+    enum EncryptionState: String, Codable, Hashable, Sendable {
+        case pending
+        case encrypting
+        case encrypted
+        case decrypted
+        case failed
+    }
+
+    enum AvailabilityState: String, Codable, Hashable, Sendable {
+        case localOriginal
+        case localCached
+        case remoteOnly
+        case unavailable
+    }
+
+    let id: String
+    let messageID: UUID
+    let conversationID: String
+    let direction: Direction
+    var mediaType: String
+    var fileSize: Int
+    var duration: TimeInterval?
+    /// Sender-only E2EE attachment key material, protected by SecureLocalStore. Persisting it
+    /// before upload lets retries reproduce the same ciphertext for the permanent media id.
+    var outboundKeyMaterialBase64: String?
+    var localStorageKind: LocalStorageKind
+    var localStorageKey: String?
+    var remoteEncryptedObjectID: String?
+    var processingState: ProcessingState
+    var uploadState: UploadState
+    var downloadState: DownloadState
+    var encryptionState: EncryptionState
+    var availabilityState: AvailabilityState
+    /// Capture/selection inputs retained even after `localStorageKey` switches to the processed
+    /// representation. Optional keeps every pre-local-first state file backward-decodable.
+    var originalSources: [LocalMediaOriginalSource]? = nil
+    /// Non-nil only while durable preprocessing is pending or retryable after a failure.
+    var preprocessingJob: LocalMediaPreprocessingJob? = nil
+    /// Durable facts for the deterministic encrypted spool. Optional fields keep protected
+    /// state written by build 44 and earlier readable without a migration rewrite.
+    var ciphertextSpoolByteSize: Int64? = nil
+    var ciphertextSpoolSHA256: String? = nil
+    /// Authoritative server offset/session checkpoint. Once present it is drained even if the
+    /// capability is later withdrawn; starting a new session still requires the live capability.
+    var resumableUpload: LocalMediaResumableUpload? = nil
+    /// A receiver-cache eviction remains remote and fetchable, but is not immediately prefetched
+    /// again by the background hydrator. An explicit open clears this marker before downloading.
+    var cacheEvictedAt: Date? = nil
+    let createdAt: Date
+    var updatedAt: Date
+
+    var isStructurallyValid: Bool {
+        guard UUID(uuidString: id)?.uuidString.lowercased() == id,
+              OutboxPolicy.canonicalConversationID(conversationID) == conversationID,
+              SecureMessagingWire.allowedAttachmentMediaTypes.contains(mediaType),
+              KitChatMediaLimits.fits(fileSize, kind: KitChatMediaKind(mediaType: mediaType)),
+              duration.map({ $0.isFinite && $0 >= 0 }) ?? true,
+              outboundKeyMaterialBase64.map({ encoded in
+                  guard let decoded = Data(base64Encoded: encoded) else { return false }
+                  return decoded.count == SecureMediaAttachmentCipher.keyMaterialBytes
+                      && decoded.base64EncodedString() == encoded
+              }) ?? true,
+              localStorageKey.map({ UUID(uuidString: $0)?.uuidString.lowercased() == $0 }) ?? true,
+              remoteEncryptedObjectID.map({
+                  UUID(uuidString: $0)?.uuidString.lowercased() == $0
+              }) ?? true,
+              ciphertextSpoolByteSize.map({
+                  $0 >= SecureMessagingWire.minimumAttachmentCiphertextBytes
+                      && $0 <= SecureMessagingWire.maximumAttachmentCiphertextBytes
+              }) ?? true,
+              ciphertextSpoolSHA256.map(SecureMessagingWirePolicy.isLowercaseSHA256) ?? true,
+              (ciphertextSpoolByteSize == nil) == (ciphertextSpoolSHA256 == nil),
+              resumableUpload?.isStructurallyValid ?? true,
+              resumableUpload.map({ checkpoint in
+                  checkpoint.uploadID == id
+                      && checkpoint.storageKey != nil
+                      && ciphertextSpoolByteSize.map({ checkpoint.nextOffset <= $0 }) == true
+              }) ?? true,
+              originalSources.map({ sources in
+                  !sources.isEmpty
+                      && sources.count <= 256
+                      && sources.allSatisfy(\.isStructurallyValid)
+                      && Set(sources.map(\.storageKey)).count == sources.count
+              }) ?? true,
+              preprocessingJob?.isStructurallyValid ?? true,
+              cacheEvictedAt.map({ _ in
+                  direction == .received
+                      && localStorageKind == .none
+                      && localStorageKey == nil
+                      && remoteEncryptedObjectID != nil
+                      && downloadState == .pending
+                      && encryptionState == .encrypted
+                      && availabilityState == .remoteOnly
+              }) ?? true,
+              preprocessingJob.map({ job in
+                  direction == .sent
+                      && originalSources == job.sources
+                      && localStorageKind == .protectedFile
+                      && localStorageKey == job.sources.first?.storageKey
+                      && mediaType == job.outputMediaType
+                      && fileSize == job.sources.first?.fileSize
+                      && remoteEncryptedObjectID == nil
+                      && uploadState == .pending
+                      && encryptionState == .pending
+                      && [.processing, .failed].contains(processingState)
+              }) ?? true
+        else { return false }
+
+        switch localStorageKind {
+        case .encryptedState:
+            guard localStorageKey == nil else { return false }
+        case .encryptedBlob, .protectedFile:
+            guard localStorageKey != nil else { return false }
+        case .none:
+            guard localStorageKey == nil else { return false }
+        }
+        switch availabilityState {
+        case .localOriginal, .localCached:
+            guard localStorageKind != .none else { return false }
+        case .remoteOnly:
+            guard localStorageKind == .none, remoteEncryptedObjectID != nil else { return false }
+        case .unavailable:
+            break
+        }
+        if direction == .received, uploadState != .notRequired { return false }
+        if direction == .received, outboundKeyMaterialBase64 != nil { return false }
+        if direction == .sent, downloadState != .notRequired { return false }
+        return true
+    }
+}
+
+struct LocalMediaResumableUpload: Codable, Hashable, Sendable {
+    let uploadID: String
+    /// Server object allocated at start. Optional solely for decoding never-shipped interim
+    /// state; every live response must supply and pin a canonical value before upload proceeds.
+    var storageKey: String? = nil
+    var nextOffset: Int64
+    let maxChunkBytes: Int
+    let expiresAt: String?
+
+    var isStructurallyValid: Bool {
+        SecureMessagingWirePolicy.isCanonicalUUID(uploadID)
+            && (storageKey.map(SecureMessagingWirePolicy.isCanonicalUUID) ?? true)
+            && nextOffset >= 0
+            && maxChunkBytes > 0
+            && maxChunkBytes <= MessagingResumableAttachmentPolicy.maximumChunkBytes
+            && expiresAt.map({ !$0.isEmpty && $0.utf8.count <= 128 }) ?? true
+    }
+}
+
 struct LocalMessage: Codable, Hashable, Identifiable {
     let id: UUID
     /// The server message UUID is distinct from the client-generated idempotency UUID for sends.
@@ -3454,6 +3756,10 @@ struct LocalMessage: Codable, Hashable, Identifiable {
     /// point resumes the same one-message identity instead of re-queueing or splitting.
     /// Optional keeps state written by earlier builds decodable.
     var pendingMediaBatch: KitMediaMessageV2OutboundBatch? = nil
+    /// Stable local-first records for every attachment in this message. Optional keeps protected
+    /// state written before the media-library layer backward-decodable; restore backfills safe
+    /// descriptor metadata without guessing that a local blob exists.
+    var localMediaRecords: [LocalMediaRecord]? = nil
     /// Exact authenticated metadata needed to donate this plaintext through the history-backfill
     /// protocol. A missing value is fail-closed: the message remains visible locally but is never
     /// offered as a trusted history source to another enrollment.
@@ -3476,7 +3782,7 @@ struct LocalMessage: Codable, Hashable, Identifiable {
 }
 
 struct LocalPendingAttachment: Codable, Hashable, Sendable {
-    let mediaType: String
+    var mediaType: String
     let caption: String?
     /// Locally minted storage key of a large plaintext parked in the encrypted media file cache
     /// while the message waits offline for upload. Inline attachments leave this nil. Optional
@@ -3484,6 +3790,848 @@ struct LocalPendingAttachment: Codable, Hashable, Sendable {
     var localStorageKey: String? = nil
     /// Plaintext size for pending bubbles that carry no inline data. Optional for old state.
     var byteCount: Int? = nil
+}
+
+/// One composer-owned input crossing into the durable batch queue. Large sources carry only the
+/// permanent protected-file key and byte count; small sources may carry in-memory bytes. This
+/// type never holds a filesystem path, so the model/coordinator always re-resolve storage inside
+/// the active account boundary.
+struct LocalMediaQueueAttachment: Sendable {
+    let mediaID: UUID
+    let mediaData: Data?
+    let mediaType: String
+    let byteCount: Int
+    let localStorageKind: LocalMediaRecord.LocalStorageKind
+    /// Optional durable transform that owns this attachment's source/output keys. Batch items
+    /// carry this independently so a mixed album can preprocess one HEIC while an adjacent
+    /// video/document remains immediately ready.
+    let preprocessingJob: LocalMediaPreprocessingJob?
+
+    init(
+        mediaID: UUID,
+        mediaData: Data?,
+        mediaType: String,
+        byteCount: Int,
+        localStorageKind: LocalMediaRecord.LocalStorageKind,
+        preprocessingJob: LocalMediaPreprocessingJob? = nil
+    ) {
+        self.mediaID = mediaID
+        self.mediaData = mediaData
+        self.mediaType = mediaType
+        self.byteCount = byteCount
+        self.localStorageKind = localStorageKind
+        self.preprocessingJob = preprocessingJob
+    }
+}
+
+/// Pure state transitions for the local media library. File I/O remains in
+/// `SecureMediaFileCache`; these helpers keep its stable identity and lifecycle metadata in the
+/// same atomic state mutation as the message/outbox projection.
+enum LocalMediaRecordPolicy {
+    static func queuedOutgoing(
+        id: String,
+        messageID: UUID,
+        conversationID: String,
+        mediaType: String,
+        fileSize: Int,
+        duration: TimeInterval? = nil,
+        localStorageKey: String?,
+        storesInline: Bool,
+        now: Date,
+        outboundKeyMaterial: Data? = nil,
+        localStorageKind suppliedStorageKind: LocalMediaRecord.LocalStorageKind? = nil,
+        originalSources: [LocalMediaOriginalSource]? = nil,
+        preprocessingJob: LocalMediaPreprocessingJob? = nil
+    ) -> LocalMediaRecord? {
+        guard let mediaID = canonicalUUID(id),
+              let conversationID = canonicalUUID(conversationID)
+        else { return nil }
+        let record = LocalMediaRecord(
+            id: mediaID,
+            messageID: messageID,
+            conversationID: conversationID,
+            direction: .sent,
+            mediaType: mediaType,
+            fileSize: fileSize,
+            duration: duration,
+            outboundKeyMaterialBase64: outboundKeyMaterial?.base64EncodedString(),
+            localStorageKind: storesInline
+                ? .encryptedState
+                : suppliedStorageKind ?? .encryptedBlob,
+            localStorageKey: storesInline ? nil : canonicalUUID(localStorageKey),
+            remoteEncryptedObjectID: nil,
+            processingState: preprocessingJob == nil ? .ready : .processing,
+            uploadState: .pending,
+            downloadState: .notRequired,
+            encryptionState: .pending,
+            availabilityState: .localOriginal,
+            originalSources: originalSources,
+            preprocessingJob: preprocessingJob,
+            createdAt: now,
+            updatedAt: now
+        )
+        return record.isStructurallyValid ? record : nil
+    }
+
+    static func queuedOutgoing(
+        batch: KitMediaMessageV2OutboundBatch,
+        messageID: UUID,
+        conversationID: String,
+        now: Date,
+        localStorageKinds: [LocalMediaRecord.LocalStorageKind]? = nil,
+        preprocessingJobs: [LocalMediaPreprocessingJob?]? = nil
+    ) -> [LocalMediaRecord]? {
+        guard batch.isStructurallyValid,
+              localStorageKinds.map({ $0.count == batch.items.count }) ?? true,
+              preprocessingJobs.map({ $0.count == batch.items.count }) ?? true
+        else { return nil }
+        let records = batch.items.enumerated().compactMap { index, item in
+            let job = preprocessingJobs?[index]
+            return queuedOutgoing(
+                id: item.attachmentID,
+                messageID: messageID,
+                conversationID: conversationID,
+                mediaType: item.mediaType,
+                fileSize: item.plaintextByteSize,
+                localStorageKey: item.localStorageKey,
+                storesInline: false,
+                now: now,
+                outboundKeyMaterial: Data(base64Encoded: item.keyMaterialBase64),
+                localStorageKind: localStorageKinds?[index],
+                originalSources: job?.sources,
+                preprocessingJob: job
+            )
+        }
+        return records.count == batch.items.count ? records : nil
+    }
+
+    /// Creates remote-only records for an authenticated media projection. Merely receiving
+    /// metadata never claims plaintext is local; the verifying download path promotes a record
+    /// to `localCached` only after its protected cache write succeeds.
+    static func remoteRecords(for message: LocalMessage, now: Date? = nil) -> [LocalMediaRecord]? {
+        let direction: LocalMediaRecord.Direction = message.isOutgoing ? .sent : .received
+        let timestamp = now ?? message.sentAt ?? message.createdAt
+        let items: [(String, String, Int, String)]
+        if let descriptor = KitMediaMessageDescriptor.parse(message.body) {
+            items = [(
+                descriptor.attachmentID,
+                descriptor.mediaType,
+                descriptor.plaintextByteSize,
+                descriptor.storageKey
+            )]
+        } else if let descriptor = KitMediaMessageV2Descriptor.parse(message.body) {
+            items = descriptor.items.map {
+                ($0.attachmentID, $0.mediaType, $0.plaintextByteSize, $0.storageKey)
+            }
+        } else {
+            return nil
+        }
+        let records = items.map { mediaID, mediaType, size, storageKey in
+            LocalMediaRecord(
+                id: mediaID,
+                messageID: message.id,
+                conversationID: message.conversationId,
+                direction: direction,
+                mediaType: mediaType,
+                fileSize: size,
+                duration: nil,
+                outboundKeyMaterialBase64: nil,
+                localStorageKind: .none,
+                localStorageKey: nil,
+                remoteEncryptedObjectID: storageKey,
+                processingState: .ready,
+                uploadState: direction == .sent ? .uploaded : .notRequired,
+                downloadState: direction == .received ? .pending : .notRequired,
+                encryptionState: .encrypted,
+                availabilityState: .remoteOnly,
+                createdAt: timestamp,
+                updatedAt: timestamp
+            )
+        }
+        return records.allSatisfy(\.isStructurallyValid) ? records : nil
+    }
+
+    /// Backfills old protected rows and resets process-only in-flight states after a relaunch.
+    /// It never guesses that a descriptor-backed blob exists: old sealed rows begin remote-only
+    /// unless their plaintext is visibly inline, and a successful local read promotes them.
+    @discardableResult
+    static func migrateAndRecover(_ message: inout LocalMessage, now: Date = Date()) -> Bool {
+        let before = message.localMediaRecords
+        if message.localMediaRecords == nil {
+            if let pending = message.pendingAttachment {
+                let mediaID = message.id.uuidString.lowercased()
+                message.localMediaRecords = queuedOutgoing(
+                    id: mediaID,
+                    messageID: message.id,
+                    conversationID: message.conversationId,
+                    mediaType: pending.mediaType,
+                    fileSize: pending.byteCount ?? message.attachmentData?.count ?? 0,
+                    localStorageKey: pending.localStorageKey,
+                    storesInline: message.attachmentData != nil,
+                    now: message.createdAt
+                ).map { [$0] }
+            } else if let batch = message.pendingMediaBatch {
+                message.localMediaRecords = queuedOutgoing(
+                    batch: batch,
+                    messageID: message.id,
+                    conversationID: message.conversationId,
+                    now: message.createdAt
+                )
+                if var records = message.localMediaRecords {
+                    for index in records.indices where batch.items[index].isUploaded {
+                        let item = batch.items[index]
+                        records[index].remoteEncryptedObjectID = item.storageKey
+                        records[index].uploadState = .uploaded
+                        records[index].encryptionState = .encrypted
+                        records[index].updatedAt = now
+                    }
+                    message.localMediaRecords = records
+                }
+            } else if let remote = remoteRecords(for: message) {
+                if message.attachmentData != nil, remote.count == 1 {
+                    var local = remote[0]
+                    local.localStorageKind = .encryptedState
+                    local.availabilityState = message.isOutgoing ? .localOriginal : .localCached
+                    local.downloadState = message.isOutgoing ? .notRequired : .downloaded
+                    local.encryptionState = message.isOutgoing ? .encrypted : .decrypted
+                    message.localMediaRecords = [local]
+                } else {
+                    message.localMediaRecords = remote
+                }
+            }
+        }
+        if var records = message.localMediaRecords {
+            for index in records.indices {
+                var recovered = false
+                if let upload = records[index].resumableUpload,
+                   upload.storageKey == nil || upload.uploadID != records[index].id {
+                    records[index].resumableUpload = nil
+                    records[index].uploadState = .pending
+                    recovered = true
+                }
+                switch records[index].processingState {
+                case .processing where records[index].preprocessingJob == nil:
+                    records[index].processingState = .ready
+                    recovered = true
+                case .ready, .failed, .processing:
+                    break
+                }
+                if records[index].uploadState == .uploading {
+                    records[index].uploadState = .pending
+                    recovered = true
+                }
+                if records[index].downloadState == .downloading {
+                    records[index].downloadState = .pending
+                    recovered = true
+                }
+                if records[index].direction == .received,
+                   records[index].downloadState == .failed {
+                    records[index].downloadState = .pending
+                    records[index].processingState = .ready
+                    recovered = true
+                }
+                if records[index].encryptionState == .encrypting {
+                    records[index].encryptionState = records[index].uploadState == .uploaded
+                        ? .encrypted
+                        : .pending
+                    recovered = true
+                }
+                if recovered { records[index].updatedAt = max(records[index].updatedAt, now) }
+            }
+            message.localMediaRecords = records
+        }
+        return before != message.localMediaRecords
+    }
+
+    static func record(
+        messageID: UUID,
+        conversationID: String,
+        attachmentID: String,
+        mediaType: String,
+        fileSize: Int,
+        remoteStorageKey: String?,
+        in messages: [LocalMessage]
+    ) -> LocalMediaRecord? {
+        let rows = messages.filter {
+            $0.id == messageID && $0.conversationId == conversationID
+        }
+        guard rows.count == 1, let message = rows.first else { return nil }
+        let matches = (message.localMediaRecords ?? []).filter { record in
+            record.id == attachmentID
+                && record.messageID == messageID
+                && record.conversationID == conversationID
+                && record.direction == (message.isOutgoing ? .sent : .received)
+                && record.mediaType == mediaType
+                && record.fileSize == fileSize
+                && record.remoteEncryptedObjectID == remoteStorageKey
+                && record.isStructurallyValid
+        }
+        guard matches.count == 1 else { return nil }
+        return matches[0]
+    }
+
+    static func markUploading(_ message: inout LocalMessage, attachmentID: String, now: Date = Date()) -> Bool {
+        mutate(&message, attachmentID: attachmentID) { record in
+            guard record.direction == .sent,
+                  record.preprocessingJob == nil,
+                  record.uploadState == .pending || record.uploadState == .failed
+            else { return false }
+            record.processingState = .processing
+            record.uploadState = .uploading
+            record.encryptionState = record.ciphertextSpoolByteSize == nil
+                ? .encrypting
+                : .encrypted
+            record.updatedAt = now
+            return true
+        }
+    }
+
+    static func setCiphertextSpool(
+        _ message: inout LocalMessage,
+        attachmentID: String,
+        byteSize: Int64,
+        sha256: String,
+        now: Date = Date()
+    ) -> Bool {
+        guard byteSize >= SecureMessagingWire.minimumAttachmentCiphertextBytes,
+              byteSize <= SecureMessagingWire.maximumAttachmentCiphertextBytes,
+              SecureMessagingWirePolicy.isLowercaseSHA256(sha256)
+        else { return false }
+        return mutate(&message, attachmentID: attachmentID) { record in
+            guard record.direction == .sent,
+                  record.ciphertextSpoolByteSize.map({ $0 == byteSize }) ?? true,
+                  record.ciphertextSpoolSHA256.map({ $0 == sha256 }) ?? true
+            else { return false }
+            record.ciphertextSpoolByteSize = byteSize
+            record.ciphertextSpoolSHA256 = sha256
+            record.encryptionState = .encrypted
+            record.processingState = .processing
+            record.updatedAt = now
+            return true
+        }
+    }
+
+    static func setResumableUpload(
+        _ message: inout LocalMessage,
+        attachmentID: String,
+        checkpoint: LocalMediaResumableUpload,
+        now: Date = Date()
+    ) -> Bool {
+        guard checkpoint.isStructurallyValid else { return false }
+        return mutate(&message, attachmentID: attachmentID) { record in
+            guard record.direction == .sent,
+                  record.uploadState == .uploading,
+                  let spoolSize = record.ciphertextSpoolByteSize,
+                  checkpoint.nextOffset <= spoolSize,
+                  checkpoint.storageKey != nil,
+                  checkpoint.uploadID == record.id,
+                  record.resumableUpload.map({ $0.uploadID == checkpoint.uploadID }) ?? true
+            else { return false }
+            record.resumableUpload = checkpoint
+            record.updatedAt = now
+            return true
+        }
+    }
+
+    /// Drops only the server lease after it expires or disappears. The permanent media id,
+    /// outbound key and deterministic ciphertext-spool facts remain pinned, so restarting the
+    /// lease cannot create a duplicate attachment or re-encrypt different bytes.
+    static func clearResumableUpload(
+        _ message: inout LocalMessage,
+        attachmentID: String,
+        now: Date = Date()
+    ) -> Bool {
+        mutate(&message, attachmentID: attachmentID) { record in
+            guard record.direction == .sent,
+                  record.uploadState == .uploading,
+                  record.resumableUpload != nil,
+                  record.ciphertextSpoolByteSize != nil,
+                  record.ciphertextSpoolSHA256 != nil
+            else { return false }
+            record.resumableUpload = nil
+            record.updatedAt = now
+            return true
+        }
+    }
+
+    static func setOutboundKeyMaterial(
+        _ message: inout LocalMessage,
+        attachmentID: String,
+        keyMaterial: Data,
+        now: Date = Date()
+    ) -> Bool {
+        guard keyMaterial.count == SecureMediaAttachmentCipher.keyMaterialBytes else { return false }
+        let encoded = keyMaterial.base64EncodedString()
+        return mutate(&message, attachmentID: attachmentID) { record in
+            guard record.direction == .sent,
+                  record.outboundKeyMaterialBase64 == nil
+                    || record.outboundKeyMaterialBase64 == encoded
+            else { return false }
+            record.outboundKeyMaterialBase64 = encoded
+            record.updatedAt = now
+            return true
+        }
+    }
+
+    /// Persists locally-derived audiovisual duration without changing upload identity or any
+    /// remote/E2EE state. Metadata extraction is intentionally asynchronous and may finish after
+    /// the message has already entered the outbox. Do not rewrite an actively uploading record:
+    /// deferred transfer commits compare-and-swap the complete message projection, so an
+    /// otherwise harmless `updatedAt` change there would cancel a valid resumable upload pass.
+    static func setDuration(
+        _ message: inout LocalMessage,
+        attachmentID: String,
+        duration: TimeInterval,
+        now: Date = Date()
+    ) -> Bool {
+        guard duration.isFinite, duration > 0 else { return false }
+        return mutate(&message, attachmentID: attachmentID) { record in
+            guard record.fileSize > 0,
+                  record.uploadState != .uploading,
+                  record.duration != duration
+            else { return false }
+            record.duration = duration
+            record.updatedAt = now
+            return true
+        }
+    }
+
+    static func markUploaded(
+        _ message: inout LocalMessage,
+        attachmentID: String,
+        remoteStorageKey: String,
+        now: Date = Date()
+    ) -> Bool {
+        guard let remoteStorageKey = canonicalUUID(remoteStorageKey) else { return false }
+        return mutate(&message, attachmentID: attachmentID) { record in
+            guard record.direction == .sent else { return false }
+            record.remoteEncryptedObjectID = remoteStorageKey
+            record.processingState = .ready
+            record.uploadState = .uploaded
+            record.encryptionState = .encrypted
+            record.availabilityState = .localOriginal
+            record.ciphertextSpoolByteSize = nil
+            record.ciphertextSpoolSHA256 = nil
+            record.resumableUpload = nil
+            record.updatedAt = now
+            return true
+        }
+    }
+
+    /// Reopens a sealed single attachment whose server object expired before message acceptance.
+    /// Identity, local original and E2EE key stay pinned; only remote/upload-derived facts reset.
+    static func reopenExpiredSingleUpload(
+        _ message: inout LocalMessage,
+        descriptor: KitMediaMessageDescriptor,
+        now: Date = Date()
+    ) -> Bool {
+        guard message.pendingAttachment == nil,
+              message.pendingMediaBatch == nil,
+              message.body == descriptor.encoded,
+              var records = message.localMediaRecords
+        else { return false }
+        let indices = records.indices.filter { records[$0].id == descriptor.attachmentID }
+        guard indices.count == 1, let index = indices.first else { return false }
+        var record = records[index]
+        guard record.direction == .sent,
+              record.messageID == message.id,
+              record.conversationID == message.conversationId,
+              record.mediaType == descriptor.mediaType,
+              record.fileSize == descriptor.plaintextByteSize,
+              record.outboundKeyMaterialBase64 == descriptor.keyMaterialBase64,
+              record.remoteEncryptedObjectID == descriptor.storageKey,
+              record.localStorageKind != .none,
+              record.availabilityState == .localOriginal,
+              record.isStructurallyValid
+        else { return false }
+
+        message.body = descriptor.caption
+            ?? KitChatMediaKind(mediaType: descriptor.mediaType).previewLabel
+        message.pendingAttachment = LocalPendingAttachment(
+            mediaType: descriptor.mediaType,
+            caption: descriptor.caption,
+            localStorageKey: record.localStorageKind == .encryptedState
+                ? nil
+                : record.localStorageKey,
+            byteCount: descriptor.plaintextByteSize
+        )
+        record.remoteEncryptedObjectID = nil
+        record.processingState = .ready
+        record.uploadState = .pending
+        record.encryptionState = .pending
+        record.ciphertextSpoolByteSize = nil
+        record.ciphertextSpoolSHA256 = nil
+        record.resumableUpload = nil
+        record.updatedAt = now
+        guard record.isStructurallyValid else { return false }
+        records[index] = record
+        message.localMediaRecords = records
+        return true
+    }
+
+    /// Batch form of expiry recovery. The sealed descriptor authenticates immutable wire facts;
+    /// each matching record supplies the independently retained local source to re-upload.
+    static func reopenExpiredBatchUploads(
+        _ message: inout LocalMessage,
+        descriptor: KitMediaMessageV2Descriptor,
+        now: Date = Date()
+    ) -> Bool {
+        guard message.pendingAttachment == nil,
+              message.pendingMediaBatch == nil,
+              message.attachmentData == nil,
+              message.body == descriptor.encoded,
+              var records = message.localMediaRecords,
+              records.count == descriptor.items.count
+        else { return false }
+        var reopened = KitMediaMessageV2OutboundBatch.reopened(from: descriptor)
+        for itemIndex in descriptor.items.indices {
+            let item = descriptor.items[itemIndex]
+            let recordIndices = records.indices.filter { records[$0].id == item.attachmentID }
+            guard recordIndices.count == 1, let recordIndex = recordIndices.first else {
+                return false
+            }
+            var record = records[recordIndex]
+            guard record.direction == .sent,
+                  record.messageID == message.id,
+                  record.conversationID == message.conversationId,
+                  record.mediaType == item.mediaType,
+                  record.fileSize == item.plaintextByteSize,
+                  record.outboundKeyMaterialBase64 == item.keyMaterialBase64,
+                  record.remoteEncryptedObjectID == item.storageKey,
+                  [.protectedFile, .encryptedBlob].contains(record.localStorageKind),
+                  let localStorageKey = record.localStorageKey,
+                  record.availabilityState == .localOriginal,
+                  record.isStructurallyValid
+            else { return false }
+            reopened.items[itemIndex].localStorageKey = localStorageKey
+            record.remoteEncryptedObjectID = nil
+            record.processingState = .ready
+            record.uploadState = .pending
+            record.encryptionState = .pending
+            record.ciphertextSpoolByteSize = nil
+            record.ciphertextSpoolSHA256 = nil
+            record.resumableUpload = nil
+            record.updatedAt = now
+            guard record.isStructurallyValid else { return false }
+            records[recordIndex] = record
+        }
+        guard reopened.isStructurallyValid else { return false }
+        message.body = reopened.caption
+            ?? SecureMessagingExchangeCoordinator.mediaBatchPlaceholderBody(
+                itemCount: reopened.items.count
+            )
+        message.pendingMediaBatch = reopened
+        message.localMediaRecords = records
+        return true
+    }
+
+    static func markDownloaded(
+        _ message: inout LocalMessage,
+        attachmentID: String,
+        storageKey: String,
+        now: Date = Date()
+    ) -> Bool {
+        guard let storageKey = canonicalUUID(storageKey) else { return false }
+        return mutate(&message, attachmentID: attachmentID) { record in
+            guard record.remoteEncryptedObjectID == storageKey else { return false }
+            record.localStorageKind = .encryptedBlob
+            record.localStorageKey = storageKey
+            record.processingState = .ready
+            record.downloadState = record.direction == .received ? .downloaded : .notRequired
+            record.encryptionState = .decrypted
+            record.availabilityState = .localCached
+            record.cacheEvictedAt = nil
+            record.updatedAt = now
+            return true
+        }
+    }
+
+    static func markDownloadedProtectedFile(
+        _ message: inout LocalMessage,
+        attachmentID: String,
+        remoteStorageKey: String,
+        localStorageKey: String,
+        now: Date = Date()
+    ) -> Bool {
+        guard let remoteStorageKey = canonicalUUID(remoteStorageKey),
+              let localStorageKey = canonicalUUID(localStorageKey)
+        else { return false }
+        return mutate(&message, attachmentID: attachmentID) { record in
+            guard record.direction == .received,
+                  record.remoteEncryptedObjectID == remoteStorageKey
+            else { return false }
+            record.localStorageKind = .protectedFile
+            record.localStorageKey = localStorageKey
+            record.processingState = .ready
+            record.downloadState = .downloaded
+            record.encryptionState = .decrypted
+            record.availabilityState = .localCached
+            record.cacheEvictedAt = nil
+            record.updatedAt = now
+            return true
+        }
+    }
+
+    /// A verified small receive may live in the account-bound encrypted state row instead of
+    /// the file cache. Keep that storage fact explicit so a relaunch does not pretend the
+    /// server object is the only available representation.
+    static func markDownloadedInline(
+        _ message: inout LocalMessage,
+        attachmentID: String,
+        storageKey: String,
+        now: Date = Date()
+    ) -> Bool {
+        guard let storageKey = canonicalUUID(storageKey) else { return false }
+        return mutate(&message, attachmentID: attachmentID) { record in
+            guard record.remoteEncryptedObjectID == storageKey else { return false }
+            record.localStorageKind = .encryptedState
+            record.localStorageKey = nil
+            record.processingState = .ready
+            record.downloadState = record.direction == .received ? .downloaded : .notRequired
+            record.encryptionState = .decrypted
+            record.availabilityState = .localCached
+            record.cacheEvictedAt = nil
+            record.updatedAt = now
+            return true
+        }
+    }
+
+    static func markDownloading(
+        _ message: inout LocalMessage,
+        attachmentID: String,
+        now: Date = Date()
+    ) -> Bool {
+        mutate(&message, attachmentID: attachmentID) { record in
+            guard record.direction == .received,
+                  record.downloadState == .pending || record.downloadState == .failed
+            else { return false }
+            record.processingState = .processing
+            record.downloadState = .downloading
+            record.cacheEvictedAt = nil
+            record.updatedAt = now
+            return true
+        }
+    }
+
+    static func markDownloadFailed(
+        _ message: inout LocalMessage,
+        attachmentID: String,
+        now: Date = Date()
+    ) -> Bool {
+        mutate(&message, attachmentID: attachmentID) { record in
+            guard record.direction == .received, record.downloadState != .downloaded
+            else { return false }
+            record.processingState = .failed
+            record.downloadState = .failed
+            record.updatedAt = now
+            return true
+        }
+    }
+
+    /// State half of receiver-cache eviction. The caller reserves the exact file first, performs
+    /// this transition in the protected-state transaction, and only then commits deletion. Sender
+    /// originals and inline received bytes are never accepted by this transition.
+    static func markReceivedCacheEvicted(
+        _ message: inout LocalMessage,
+        attachmentID: String,
+        expectedLocalStorageKey: String,
+        expectedUpdatedAt: Date,
+        now: Date = Date()
+    ) -> Bool {
+        guard let expectedLocalStorageKey = canonicalUUID(expectedLocalStorageKey) else {
+            return false
+        }
+        return mutate(&message, attachmentID: attachmentID) { record in
+            guard record.direction == .received,
+                  record.availabilityState == .localCached,
+                  record.downloadState == .downloaded,
+                  record.remoteEncryptedObjectID != nil,
+                  [.protectedFile, .encryptedBlob].contains(record.localStorageKind),
+                  record.localStorageKey == expectedLocalStorageKey,
+                  record.updatedAt == expectedUpdatedAt
+            else { return false }
+            record.localStorageKind = .none
+            record.localStorageKey = nil
+            record.processingState = .ready
+            record.downloadState = .pending
+            record.encryptionState = .encrypted
+            record.availabilityState = .remoteOnly
+            record.cacheEvictedAt = now
+            record.updatedAt = now
+            return true
+        }
+    }
+
+    static func markRetryPending(_ message: inout LocalMessage, now: Date = Date()) {
+        guard var records = message.localMediaRecords else { return }
+        for index in records.indices where records[index].direction == .sent {
+            if records[index].uploadState == .uploading
+                || records[index].uploadState == .failed {
+                records[index].uploadState = .pending
+            }
+            if records[index].encryptionState == .encrypting
+                || records[index].encryptionState == .failed {
+                records[index].encryptionState = .pending
+            }
+            if records[index].preprocessingJob == nil,
+               (records[index].processingState == .processing
+                   || records[index].processingState == .failed) {
+                records[index].processingState = .ready
+            }
+            records[index].updatedAt = now
+        }
+        message.localMediaRecords = records
+    }
+
+    /// Atomically switches a preprocessing message from its immediately playable source to the
+    /// finished local representation. The outbox command is released by the same store mutation
+    /// at the call site, so encryption can never race an incompletely published output.
+    static func completePreprocessing(
+        _ message: inout LocalMessage,
+        attachmentID: String,
+        expectedJob: LocalMediaPreprocessingJob,
+        outputByteCount: Int,
+        now: Date = Date()
+    ) -> Bool {
+        guard expectedJob.isStructurallyValid,
+              KitChatMediaLimits.fits(
+                  outputByteCount,
+                  kind: KitChatMediaKind(mediaType: expectedJob.outputMediaType)
+              ),
+              var records = message.localMediaRecords
+        else { return false }
+        let indices = records.indices.filter { records[$0].id == attachmentID }
+        guard indices.count == 1, let index = indices.first else { return false }
+        var record = records[index]
+        guard record.messageID == message.id,
+              record.conversationID == message.conversationId,
+              record.isStructurallyValid,
+              record.preprocessingJob == expectedJob,
+              record.originalSources == expectedJob.sources
+        else { return false }
+
+        var nextPendingAttachment = message.pendingAttachment
+        var nextPendingBatch = message.pendingMediaBatch
+        if var pending = nextPendingAttachment {
+            guard nextPendingBatch == nil,
+                  pending.localStorageKey == record.localStorageKey,
+                  pending.mediaType == expectedJob.outputMediaType,
+                  pending.byteCount == record.fileSize
+            else { return false }
+            pending.mediaType = expectedJob.outputMediaType
+            pending.localStorageKey = expectedJob.outputStorageKey
+            pending.byteCount = outputByteCount
+            nextPendingAttachment = pending
+        } else if var batch = nextPendingBatch {
+            let itemIndices = batch.items.indices.filter {
+                batch.items[$0].attachmentID == attachmentID
+            }
+            guard itemIndices.count == 1, let itemIndex = itemIndices.first else { return false }
+            let item = batch.items[itemIndex]
+            guard item.localStorageKey == record.localStorageKey,
+                  item.mediaType == expectedJob.outputMediaType,
+                  item.plaintextByteSize == record.fileSize,
+                  let processed = item.preprocessed(
+                      storageKey: expectedJob.outputStorageKey,
+                      mediaType: expectedJob.outputMediaType,
+                      plaintextByteSize: outputByteCount
+                  )
+            else { return false }
+            batch.items[itemIndex] = processed
+            guard batch.isStructurallyValid else { return false }
+            nextPendingBatch = batch
+        } else {
+            return false
+        }
+
+        record.localStorageKind = .protectedFile
+        record.localStorageKey = expectedJob.outputStorageKey
+        record.mediaType = expectedJob.outputMediaType
+        record.fileSize = outputByteCount
+        record.preprocessingJob = nil
+        record.processingState = .ready
+        record.uploadState = .pending
+        record.encryptionState = .pending
+        record.availabilityState = .localOriginal
+        record.updatedAt = now
+        guard record.isStructurallyValid else { return false }
+        records[index] = record
+        message.localMediaRecords = records
+        message.pendingAttachment = nextPendingAttachment
+        message.pendingMediaBatch = nextPendingBatch
+        return true
+    }
+
+    static func markPreprocessingStarted(
+        _ message: inout LocalMessage,
+        attachmentID: String,
+        expectedJob: LocalMediaPreprocessingJob,
+        now: Date = Date()
+    ) -> Bool {
+        mutate(&message, attachmentID: attachmentID) { record in
+            guard record.preprocessingJob == expectedJob,
+                  record.uploadState == .pending,
+                  record.encryptionState == .pending
+            else { return false }
+            record.processingState = .processing
+            record.updatedAt = now
+            return true
+        }
+    }
+
+    static func markPreprocessingFailed(
+        _ message: inout LocalMessage,
+        attachmentID: String,
+        expectedJob: LocalMediaPreprocessingJob,
+        now: Date = Date()
+    ) -> Bool {
+        mutate(&message, attachmentID: attachmentID) { record in
+            guard record.preprocessingJob == expectedJob else { return false }
+            record.processingState = .failed
+            record.updatedAt = now
+            return true
+        }
+    }
+
+    static func markUploadFailed(_ message: inout LocalMessage, now: Date = Date()) {
+        guard var records = message.localMediaRecords else { return }
+        for index in records.indices where records[index].direction == .sent {
+            guard records[index].uploadState != .uploaded else { continue }
+            records[index].processingState = .failed
+            records[index].uploadState = .failed
+            records[index].encryptionState = records[index].ciphertextSpoolByteSize == nil
+                ? .failed
+                : .encrypted
+            records[index].updatedAt = now
+        }
+        message.localMediaRecords = records
+    }
+
+    private static func mutate(
+        _ message: inout LocalMessage,
+        attachmentID: String,
+        mutation: (inout LocalMediaRecord) -> Bool
+    ) -> Bool {
+        guard var records = message.localMediaRecords else { return false }
+        let indices = records.indices.filter { records[$0].id == attachmentID }
+        guard indices.count == 1, let index = indices.first,
+              records[index].messageID == message.id,
+              records[index].conversationID == message.conversationId,
+              records[index].isStructurallyValid
+        else { return false }
+        var record = records[index]
+        guard mutation(&record), record.isStructurallyValid else { return false }
+        records[index] = record
+        message.localMediaRecords = records
+        return true
+    }
+
+    private static func canonicalUUID(_ raw: String?) -> String? {
+        guard let raw,
+              let uuid = UUID(uuidString: raw.trimmingCharacters(in: .whitespacesAndNewlines))
+        else { return nil }
+        return uuid.uuidString.lowercased()
+    }
 }
 
 extension LocalMessage {
@@ -3494,6 +4642,15 @@ extension LocalMessage {
     /// this set — enumerating any less leaves recoverable media behind after a local delete.
     var localMediaStorageKeys: [String] {
         var keys: [String] = []
+        keys.append(contentsOf: (localMediaRecords ?? []).compactMap { record in
+            record.isStructurallyValid ? record.localStorageKey : nil
+        })
+        keys.append(contentsOf: (localMediaRecords ?? []).flatMap { record in
+            guard record.isStructurallyValid else { return [String]() }
+            var owned = record.originalSources?.map(\.storageKey) ?? []
+            if let output = record.preprocessingJob?.outputStorageKey { owned.append(output) }
+            return owned
+        })
         if let parked = pendingAttachment?.localStorageKey { keys.append(parked) }
         // Structural gate before trusting any batch key field: a corrupt batch's keys are
         // arbitrary persisted bytes that can name blobs owned by *other* messages even while
@@ -3527,6 +4684,10 @@ extension LocalMessage {
 /// fail closed, surface nothing.
 enum SecureMediaLoadPolicy {
     enum Resolved: Equatable {
+        /// One legacy-format attachment still queued locally. It is intentionally part of the
+        /// common identity resolver so media-library and presentation surfaces do not need a
+        /// network-only special case while upload is pending.
+        case pendingSingle(ResolvedPendingSingle)
         /// A sealed single-attachment (KITMEDIA1) message. `descriptorText` is the current
         /// persisted body re-read here — the one string the legacy open path may see — and
         /// `inlineData` is the v1 inline plaintext slot, when the row still carries it.
@@ -3603,6 +4764,13 @@ enum SecureMediaLoadPolicy {
                 itemIndex: itemIndex
             )
         }
+        if let pending = resolvePendingSingle(
+            messageID: messageID,
+            conversationId: conversationId,
+            in: messages
+        ) {
+            return .pendingSingle(pending)
+        }
         guard row.pendingAttachment == nil,
               row.pendingMediaBatch == nil,
               let descriptor = KitMediaMessageDescriptor.parse(row.body)
@@ -3625,10 +4793,76 @@ enum SecureMediaLoadPolicy {
     /// never from a row snapshot captured earlier, where only the bytes would be current.
     struct LoadedItem {
         let data: Data
+        /// Non-nil only for a sender-owned protected original. `data` is empty in that case so
+        /// large local video/document presentation remains bounded-memory.
+        let localFileURL: URL?
+        /// Retains receiver-cache ownership while a file-backed presentation keeps this value.
+        /// Sender originals are never eviction candidates, but use the same shape for callers.
+        let localFileLease: SecureMediaOriginalAccessLease?
+        let byteCount: Int
         let mediaType: String
         /// The v1 message caption. nil for batch items: a batch caption belongs to the whole
         /// message, and forwarding one item must never smuggle the message's text with it.
         let caption: String?
+
+        init(data: Data, mediaType: String, caption: String?) {
+            self.data = data
+            localFileURL = nil
+            localFileLease = nil
+            byteCount = data.count
+            self.mediaType = mediaType
+            self.caption = caption
+        }
+
+        init(localFile: LocalFileItem) {
+            data = Data()
+            localFileURL = localFile.url
+            localFileLease = localFile.accessLease
+            byteCount = localFile.byteCount
+            mediaType = localFile.mediaType
+            caption = localFile.caption
+        }
+    }
+
+    /// A direct lease on a sender-owned protected original. Large video/document UI uses this
+    /// instead of materializing `LoadedItem.data`; identity is resolved and revalidated by the
+    /// model before the URL is returned.
+    struct LocalFileItem {
+        let url: URL
+        let mediaType: String
+        let caption: String?
+        let byteCount: Int
+        let attachmentID: String
+        let accessLease: SecureMediaOriginalAccessLease?
+
+        init(
+            url: URL,
+            mediaType: String,
+            caption: String?,
+            byteCount: Int,
+            attachmentID: String,
+            accessLease: SecureMediaOriginalAccessLease? = nil
+        ) {
+            self.url = url
+            self.mediaType = mediaType
+            self.caption = caption
+            self.byteCount = byteCount
+            self.attachmentID = attachmentID
+            self.accessLease = accessLease
+        }
+    }
+
+    struct LocalVoicePlayback: Sendable {
+        let fileURLs: [URL]
+        let segmentDurations: [TimeInterval]
+        let attachmentID: String
+
+        var isStructurallyValid: Bool {
+            !fileURLs.isEmpty
+                && fileURLs.count == segmentDurations.count
+                && segmentDurations.allSatisfy { $0.isFinite && $0 > 0 }
+                && UUID(uuidString: attachmentID)?.uuidString.lowercased() == attachmentID
+        }
     }
 
     /// A single-attachment (KITMEDIA1) message still waiting for upload. Exactly one storage
@@ -3643,6 +4877,7 @@ enum SecureMediaLoadPolicy {
     /// reuses the storage form while changing the MIME type, caption, or bound body. Display
     /// facts shown with the loaded bytes must come from this same value.
     struct ResolvedPendingSingle: Equatable {
+        let attachmentID: String
         let inlineData: Data?
         let localStorageKey: String?
         let expectedByteCount: Int?
@@ -3685,12 +4920,23 @@ enum SecureMediaLoadPolicy {
            !KitChatMediaLimits.fits(declared, kind: kind) {
             return nil
         }
+        let records = (row.localMediaRecords ?? []).filter { record in
+            record.messageID == row.id
+                && record.conversationID == row.conversationId
+                && record.direction == .sent
+                && record.mediaType == pending.mediaType
+                && (pending.byteCount.map { $0 == record.fileSize } ?? true)
+                && record.isStructurallyValid
+        }
+        guard records.count <= 1 else { return nil }
+        let attachmentID = records.first?.id ?? row.id.uuidString.lowercased()
         switch (row.attachmentData, pending.localStorageKey) {
         case (let inline?, nil):
             guard KitChatMediaLimits.shouldCacheInline(byteCount: inline.count),
                   pending.byteCount.map({ $0 == inline.count }) ?? true
             else { return nil }
             return ResolvedPendingSingle(
+                attachmentID: attachmentID,
                 inlineData: inline,
                 localStorageKey: nil,
                 expectedByteCount: pending.byteCount,
@@ -3706,6 +4952,7 @@ enum SecureMediaLoadPolicy {
                   let declared = pending.byteCount
             else { return nil }
             return ResolvedPendingSingle(
+                attachmentID: attachmentID,
                 inlineData: nil,
                 localStorageKey: key,
                 expectedByteCount: declared,
@@ -4098,6 +5345,10 @@ struct OfflineCommand: Codable, Hashable, Identifiable {
     /// `nextAttemptAt`, kept separately because `nextAttemptAt` moves with every backoff and the
     /// promise shown in the conversation must not move with it.
     var scheduledAt: Date? = nil
+    /// A visible, durable local-first message can exist before image optimization or voice
+    /// assembly finishes. Such a command is deliberately excluded from FIFO head selection, so
+    /// later text/media in the same conversation remains sendable while local CPU work proceeds.
+    var awaitingMediaPreprocessing: Bool? = nil
     /// Present only on `.scheduledPaymentRequest`.
     var scheduledPaymentRequest: ScheduledPaymentRequestPayload? = nil
 

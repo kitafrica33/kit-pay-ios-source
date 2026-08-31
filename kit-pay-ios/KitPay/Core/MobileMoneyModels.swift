@@ -428,6 +428,137 @@ struct MobileMoneyOperationDTO: Decodable, Hashable, Identifiable {
     }
 }
 
+/// How a mobile-money operation is refreshed while its screen is visible.
+///
+/// Provider settlement is asynchronous and can take longer than any fixed client-side window.
+/// Polling therefore continues until the server returns a terminal operation, while the bounded
+/// interval keeps a long-running provider request from becoming a tight network loop.
+enum MobileMoneyOperationRefreshPolicy {
+    static let firstInterval: TimeInterval = 1.5
+    static let maximumInterval: TimeInterval = 10
+    static let maximumBackoffAttempt = 5
+
+    static func interval(attempt: Int) -> TimeInterval {
+        let boundedAttempt = min(max(attempt, 0), maximumBackoffAttempt)
+        guard boundedAttempt > 0 else { return firstInterval }
+        let grown = firstInterval * pow(1.5, Double(boundedAttempt))
+        return min(maximumInterval, grown)
+    }
+
+    static func nextAttempt(after attempt: Int) -> Int {
+        guard attempt < maximumBackoffAttempt else { return maximumBackoffAttempt }
+        return max(attempt, 0) + 1
+    }
+
+    static func shouldPoll(
+        _ operation: MobileMoneyOperationDTO,
+        isActive: Bool,
+        isOnline: Bool
+    ) -> Bool {
+        isActive && isOnline && !operation.isTerminal
+    }
+
+    /// A detail response may advance settlement fields, but it must not replace the operation
+    /// with a different payment. These fields are fixed when the operation is created.
+    static func hasSameImmutableIdentity(
+        _ candidate: MobileMoneyOperationDTO,
+        as expected: MobileMoneyOperationDTO
+    ) -> Bool {
+        guard sameCanonicalID(candidate.id, expected.id),
+              sameCanonicalID(candidate.bankId, expected.bankId),
+              sameCanonicalID(candidate.walletId, expected.walletId),
+              sameCanonicalID(candidate.network.id, expected.network.id),
+              sameOptionalCanonicalID(candidate.beneficiaryId, expected.beneficiaryId),
+              sameOptionalCanonicalID(candidate.outboundQuoteId, expected.outboundQuoteId),
+              sameOptionalCanonicalID(candidate.feeQuoteId, expected.feeQuoteId)
+        else { return false }
+        return candidate.reference == expected.reference
+            && candidate.type.caseInsensitiveCompare(expected.type) == .orderedSame
+            && candidate.direction.caseInsensitiveCompare(expected.direction) == .orderedSame
+            && candidate.mobileMoneyType.caseInsensitiveCompare(expected.mobileMoneyType)
+                == .orderedSame
+            && candidate.network.code.caseInsensitiveCompare(expected.network.code) == .orderedSame
+            && candidate.currency == expected.currency
+            && MobileMoneyAmount.amountsMatch(candidate.amount, expected.amount)
+            && candidate.feeMode == expected.feeMode
+            && sameOptionalAmount(candidate.requestedAmount, expected.requestedAmount)
+    }
+
+    private static func sameCanonicalID(_ candidate: String, _ expected: String) -> Bool {
+        guard let candidateID = UUID(uuidString: candidate),
+              let expectedID = UUID(uuidString: expected)
+        else { return false }
+        return candidateID == expectedID
+    }
+
+    private static func sameOptionalCanonicalID(
+        _ candidate: String?,
+        _ expected: String?
+    ) -> Bool {
+        switch (candidate, expected) {
+        case (nil, nil):
+            return true
+        case (.some(let candidate), .some(let expected)):
+            return sameCanonicalID(candidate, expected)
+        default:
+            return false
+        }
+    }
+
+    private static func sameOptionalAmount(_ candidate: String?, _ expected: String?) -> Bool {
+        switch (candidate, expected) {
+        case (nil, nil):
+            return true
+        case (.some(let candidate), .some(let expected)):
+            return MobileMoneyAmount.amountsMatch(candidate, expected)
+        default:
+            return false
+        }
+    }
+}
+
+/// Customer-facing operation state shared by every mobile-money activity surface.
+enum MobileMoneyOperationStatusPresentation {
+    static func customerText(for operation: MobileMoneyOperationDTO) -> String {
+        if operation.isSuccessful {
+            return operation.mobileMoneyType.caseInsensitiveCompare(
+                MobileMoneyAction.payout.rawValue
+            ) == .orderedSame ? "Paid" : "Completed"
+        }
+        switch operation.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "failed":
+            return "Failed"
+        case "reversed":
+            return "Reversed"
+        case "cancelled", "canceled":
+            return "Cancelled"
+        default:
+            return "Processing"
+        }
+    }
+}
+
+/// Only terminal mobile-money push events are settlement refresh hints. The shared remote-wake
+/// notification also carries messaging, support, and call payloads, which must not trigger a
+/// financial-history request merely because the mobile-money screen is open.
+enum MobileMoneyRemoteWakePolicy {
+    private static let terminalEventTypes: Set<String> = [
+        "mobile_money.collection.succeeded",
+        "mobile_money.collection.failed",
+        "mobile_money.collection.reversed",
+        "mobile_money.payout.succeeded",
+        "mobile_money.payout.failed",
+        "mobile_money.payout.reversed",
+    ]
+
+    static func shouldRefreshOperations(for object: Any?) -> Bool {
+        guard let payload = object as? [AnyHashable: Any],
+              let eventType = payload["type"] as? String
+        else { return false }
+        return terminalEventTypes.contains(eventType)
+    }
+}
+
 enum MobileMoneySavedAccountActivity {
     /// The server binds both collections and payouts to the saved account through
     /// `beneficiary_id`. Do not infer ownership from a network, name, or masked phone number:

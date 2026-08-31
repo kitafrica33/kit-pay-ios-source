@@ -44,6 +44,9 @@ final class MobileMoneyViewModel: ObservableObject {
     private let api: APIClient
     private var pendingKeys: [String: String] = [:]
     private var operationPollTasks: [String: Task<Void, Never>] = [:]
+    private var operationPollTokens: [String: UUID] = [:]
+    private var operationPollingIsActive = false
+    private var isRefreshingOperationHistory = false
     private var quoteRequestID: UUID?
     private var payoutQuoteRequestID: UUID?
     private var payoutLookupGeneration = MobileMoneyLookupGeneration()
@@ -93,11 +96,42 @@ final class MobileMoneyViewModel: ObservableObject {
             let operationResponse = try await api.mobileMoneyOperations()
             networks = networkResponse.items ?? []
             accounts = accountResponse.items ?? []
-            operations = (operationResponse.items ?? []).sorted {
-                ($0.createdAt ?? "") > ($1.createdAt ?? "")
-            }
+            replaceOperations(operationResponse.items ?? [])
         } catch {
             errorMessage = message(for: error)
+        }
+    }
+
+    /// The owning view controls this gate from scene/connectivity lifecycle events. Poll tasks are
+    /// not allowed to outlive the foreground surface that needs them.
+    func setOperationPollingActive(_ active: Bool) {
+        guard operationPollingIsActive != active else {
+            if active { reconcileOperationPollers() }
+            return
+        }
+        operationPollingIsActive = active
+        reconcileOperationPollers()
+    }
+
+    /// A remote wake only needs the authoritative operation list; account and network catalogues
+    /// are unchanged. Loaded pending rows are reconciled into the same deduplicated pollers.
+    func refreshOperationHistory(permitted: Bool, online: Bool) async {
+        guard operationPollingIsActive,
+              permitted,
+              online,
+              !isLoading,
+              !isRefreshingOperationHistory
+        else { return }
+        isRefreshingOperationHistory = true
+        defer { isRefreshingOperationHistory = false }
+        do {
+            let response = try await api.mobileMoneyOperations()
+            guard !Task.isCancelled else { return }
+            replaceOperations(response.items ?? [])
+        } catch is CancellationError {
+            return
+        } catch {
+            // A wake is only a hint. The existing rows and their bounded pollers remain usable.
         }
     }
 
@@ -650,7 +684,7 @@ final class MobileMoneyViewModel: ObservableObject {
             upsert(operation)
             pendingKeys[fingerprint] = nil
             clearCollectionQuote()
-            pollOperation(operation.id)
+            pollOperation(operation)
             return true
         } catch {
             errorMessage = message(for: error, confirmedCollectionFailure: true)
@@ -762,7 +796,7 @@ final class MobileMoneyViewModel: ObservableObject {
             upsert(operation)
             pendingKeys[fingerprint] = nil
             clearPayoutQuote()
-            pollOperation(operation.id)
+            pollOperation(operation)
             return true
         } catch {
             if WalletTopUpPolicy.isInsufficientFunds(error) {
@@ -773,28 +807,80 @@ final class MobileMoneyViewModel: ObservableObject {
         }
     }
 
-    private func pollOperation(_ id: String) {
-        operationPollTasks[id]?.cancel()
-        operationPollTasks[id] = Task { [weak self] in
-            guard let self else { return }
-            for _ in 0..<40 {
-                guard !Task.isCancelled else { return }
-                try? await Task.sleep(nanoseconds: 1_500_000_000)
-                guard !Task.isCancelled else { return }
-                guard let operation = try? await api.mobileMoneyOperation(id: id) else { continue }
-                upsert(operation)
-                if operation.isTerminal {
-                    operationPollTasks[id] = nil
+    private func pollOperation(_ operation: MobileMoneyOperationDTO) {
+        let key = operationPollKey(operation.id)
+        guard !key.isEmpty,
+              MobileMoneyOperationRefreshPolicy.shouldPoll(
+                operation,
+                isActive: operationPollingIsActive,
+                isOnline: true
+              ),
+              operationPollTasks[key] == nil
+        else { return }
+
+        let token = UUID()
+        let operationAPI = api
+        operationPollTokens[key] = token
+        operationPollTasks[key] = Task { [weak self] in
+            defer { self?.finishOperationPoll(key: key, token: token) }
+
+            var attempt = 0
+            while !Task.isCancelled {
+                guard self?.operationPollingIsActive == true,
+                      let beforeSleep = self?.operation(forPollKey: key),
+                      !beforeSleep.isTerminal
+                else {
                     return
                 }
+                let interval = MobileMoneyOperationRefreshPolicy.interval(attempt: attempt)
+                do {
+                    try await Task.sleep(
+                        nanoseconds: UInt64(interval * 1_000_000_000)
+                    )
+                } catch {
+                    return
+                }
+                guard !Task.isCancelled,
+                      self?.operationPollingIsActive == true,
+                      let expected = self?.operation(forPollKey: key),
+                      !expected.isTerminal
+                else { return }
+
+                do {
+                    let refreshed = try await operationAPI.mobileMoneyOperation(id: expected.id)
+                    guard !Task.isCancelled,
+                          let live = self?.operation(forPollKey: key),
+                          !live.isTerminal
+                    else { return }
+                    guard live == expected else {
+                        attempt = MobileMoneyOperationRefreshPolicy.nextAttempt(after: attempt)
+                        continue
+                    }
+                    guard MobileMoneyOperationRefreshPolicy.hasSameImmutableIdentity(
+                        refreshed,
+                        as: expected
+                    ) else {
+                        attempt = MobileMoneyOperationRefreshPolicy.nextAttempt(after: attempt)
+                        continue
+                    }
+                    self?.upsert(refreshed)
+                    if refreshed.isTerminal { return }
+                } catch is CancellationError {
+                    return
+                } catch {
+                    // Keep the last authoritative row and retry at the bounded backoff cadence.
+                }
+                attempt = MobileMoneyOperationRefreshPolicy.nextAttempt(after: attempt)
             }
-            operationPollTasks[id] = nil
         }
     }
 
     private func upsert(_ operation: MobileMoneyOperationDTO) {
-        operations.removeAll { $0.id == operation.id }
-        operations.insert(operation, at: 0)
+        let key = operationPollKey(operation.id)
+        operations.removeAll { operationPollKey($0.id) == key }
+        operations.append(operation)
+        sortOperations()
+        reconcileOperationPollers()
     }
 
     private func upsert(_ account: MobileMoneyAccountDTO) {
@@ -804,10 +890,52 @@ final class MobileMoneyViewModel: ObservableObject {
     }
 
     private func merge(_ recentOperations: [MobileMoneyOperationDTO]) {
-        let incomingIDs = Set(recentOperations.map(\.id))
-        operations.removeAll { incomingIDs.contains($0.id) }
+        let incomingIDs = Set(recentOperations.map { operationPollKey($0.id) })
+        operations.removeAll { incomingIDs.contains(operationPollKey($0.id)) }
         operations.append(contentsOf: recentOperations)
+        sortOperations()
+        reconcileOperationPollers()
+    }
+
+    private func replaceOperations(_ replacements: [MobileMoneyOperationDTO]) {
+        operations = replacements
+        sortOperations()
+        reconcileOperationPollers()
+    }
+
+    private func sortOperations() {
         operations.sort { ($0.createdAt ?? "") > ($1.createdAt ?? "") }
+    }
+
+    private func reconcileOperationPollers() {
+        let pendingKeys = Set(
+            operations.lazy.filter { !$0.isTerminal }.map { self.operationPollKey($0.id) }
+        )
+        for key in Array(operationPollTasks.keys)
+        where !operationPollingIsActive || !pendingKeys.contains(key) {
+            cancelOperationPoll(key: key)
+        }
+        guard operationPollingIsActive else { return }
+        operations.lazy.filter { !$0.isTerminal }.forEach { self.pollOperation($0) }
+    }
+
+    private func cancelOperationPoll(key: String) {
+        operationPollTokens[key] = nil
+        operationPollTasks.removeValue(forKey: key)?.cancel()
+    }
+
+    private func finishOperationPoll(key: String, token: UUID) {
+        guard operationPollTokens[key] == token else { return }
+        operationPollTokens[key] = nil
+        operationPollTasks[key] = nil
+    }
+
+    private func operation(forPollKey key: String) -> MobileMoneyOperationDTO? {
+        operations.first { operationPollKey($0.id) == key }
+    }
+
+    private func operationPollKey(_ id: String) -> String {
+        id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
     private func key(for fingerprint: String, prefix: String) -> String {
@@ -818,6 +946,10 @@ final class MobileMoneyViewModel: ObservableObject {
     }
 
     private func clear() {
+        operationPollingIsActive = false
+        operationPollTokens.removeAll()
+        operationPollTasks.values.forEach { $0.cancel() }
+        operationPollTasks.removeAll()
         networks = []
         accounts = []
         operations = []
@@ -946,6 +1078,7 @@ private enum MobileMoneyFlowError: LocalizedError {
 struct MobileMoneyView: View {
     @EnvironmentObject private var app: AppModel
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var model = MobileMoneyViewModel()
     @State private var addingAccount = false
     @State private var flow: MobileMoneyFlow?
@@ -985,14 +1118,6 @@ struct MobileMoneyView: View {
                         .disabled(model.isLoading || model.isSubmitting)
                     }
                 }
-                .task(id: "\(permitted)-\(app.isOnline)-\(app.financialDataAccessGranted)") {
-                    guard app.financialDataAccessGranted else { return }
-                    await model.load(permitted: permitted, online: app.isOnline)
-                }
-                .onAppear { contactIndex = BeneficiaryContactIndex(contacts: app.contactDirectory) }
-                .onChange(of: app.contactDirectory) { _, contacts in
-                    contactIndex = BeneficiaryContactIndex(contacts: contacts)
-                }
                 .refreshable {
                     guard app.financialDataAccessGranted else { return }
                     await model.load(permitted: permitted, online: app.isOnline)
@@ -1025,6 +1150,51 @@ struct MobileMoneyView: View {
                 }
             }
         }
+        .task(
+            id: "\(permitted)-\(app.isOnline)-\(app.financialDataAccessGranted)-\(scenePhase == .active)"
+        ) {
+            let canRefresh = app.financialDataAccessGranted
+                && permitted
+                && app.isOnline
+                && scenePhase == .active
+            model.setOperationPollingActive(canRefresh)
+            guard app.financialDataAccessGranted, scenePhase == .active else { return }
+            await model.load(permitted: permitted, online: app.isOnline)
+        }
+        .onAppear {
+            contactIndex = BeneficiaryContactIndex(contacts: app.contactDirectory)
+            model.setOperationPollingActive(
+                app.financialDataAccessGranted
+                    && permitted
+                    && app.isOnline
+                    && scenePhase == .active
+            )
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase != .active { model.setOperationPollingActive(false) }
+        }
+        .onChange(of: app.contactDirectory) { _, contacts in
+            contactIndex = BeneficiaryContactIndex(contacts: contacts)
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(for: .kitRemoteWakeReceived)
+        ) { notification in
+            guard scenePhase == .active,
+                  app.financialDataAccessGranted,
+                  permitted,
+                  app.isOnline,
+                  MobileMoneyRemoteWakePolicy.shouldRefreshOperations(
+                    for: notification.object
+                  )
+            else { return }
+            Task {
+                await model.refreshOperationHistory(
+                    permitted: permitted,
+                    online: app.isOnline
+                )
+            }
+        }
+        .onDisappear { model.setOperationPollingActive(false) }
     }
 
     private var intro: some View {
@@ -1124,7 +1294,6 @@ struct MobileMoneyView: View {
                         MobileMoneySavedAccountDetailView(
                             model: model,
                             account: account,
-                            cachedOperations: model.operations,
                             permitted: permitted
                         )
                     } label: {
@@ -1224,7 +1393,9 @@ struct MobileMoneyView: View {
                             Spacer()
                             VStack(alignment: .trailing, spacing: 3) {
                                 Text(KitMoney.formatted(operation.amount, currency: operation.currency)).font(.subheadline.bold())
-                                Text(operation.isSuccessful ? "Completed" : operation.isTerminal ? "Failed" : "Processing")
+                                Text(MobileMoneyOperationStatusPresentation.customerText(
+                                    for: operation
+                                ))
                                     .font(.caption2.bold())
                                     .foregroundStyle(operation.isSuccessful ? KitColor.green : operation.isTerminal ? .red : .orange)
                             }
@@ -1256,7 +1427,6 @@ private struct MobileMoneySavedAccountDetailView: View {
     let permitted: Bool
 
     @State private var account: MobileMoneyAccountDTO
-    @State private var recentOperations: [MobileMoneyOperationDTO]
     @State private var selectedOwnership: MobileMoneySavedAccountOwnership
     @State private var isRefreshing = false
     @State private var hasConfirmedLatestDetails = false
@@ -1272,17 +1442,19 @@ private struct MobileMoneySavedAccountDetailView: View {
     init(
         model: MobileMoneyViewModel,
         account: MobileMoneyAccountDTO,
-        cachedOperations: [MobileMoneyOperationDTO],
         permitted: Bool
     ) {
         self.model = model
         self.permitted = permitted
         _account = State(initialValue: account)
-        _recentOperations = State(initialValue: MobileMoneySavedAccountActivity.recentOperations(
-            for: account.id,
-            from: cachedOperations
-        ))
         _selectedOwnership = State(initialValue: account.ownership ?? .beneficiary)
+    }
+
+    private var recentOperations: [MobileMoneyOperationDTO] {
+        MobileMoneySavedAccountActivity.recentOperations(
+            for: account.id,
+            from: model.operations
+        )
     }
 
     var body: some View {
@@ -1673,7 +1845,6 @@ private struct MobileMoneySavedAccountDetailView: View {
             )
             account = detail.account
             selectedOwnership = detail.account.ownership ?? selectedOwnership
-            recentOperations = detail.recentOperations
             hasConfirmedLatestDetails = true
         } catch is CancellationError {
             return
@@ -1758,10 +1929,7 @@ private struct MobileMoneySavedAccountDetailView: View {
     }
 
     private func activityStatus(_ operation: MobileMoneyOperationDTO) -> String {
-        if operation.isSuccessful { return "Completed" }
-        if operation.isFailed { return "Failed" }
-        if operation.status.caseInsensitiveCompare("reversed") == .orderedSame { return "Reversed" }
-        return "Processing"
+        MobileMoneyOperationStatusPresentation.customerText(for: operation)
     }
 
     private func activityStatusColor(_ operation: MobileMoneyOperationDTO) -> Color {

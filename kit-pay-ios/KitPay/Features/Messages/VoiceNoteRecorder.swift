@@ -16,9 +16,23 @@ import Foundation
 @MainActor
 final class VoiceNoteRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
     struct Recording {
-        let data: Data
+        struct Segment {
+            /// Finalized local MPEG-4 file. Ownership transfers to the caller, which must either
+            /// adopt it into the protected media library or remove it.
+            let fileURL: URL
+            let byteCount: Int
+            let duration: TimeInterval
+        }
+
+        let segments: [Segment]
         let duration: TimeInterval
         static let mediaType = "audio/mp4"
+
+        var byteCount: Int { segments.reduce(0) { $0 + $1.byteCount } }
+
+        func removeFiles() {
+            segments.forEach { try? FileManager.default.removeItem(at: $0.fileURL) }
+        }
     }
 
     static let minimumDuration = VoiceNoteDraftPolicy.minimumDuration
@@ -35,6 +49,7 @@ final class VoiceNoteRecorder: NSObject, ObservableObject, AVAudioRecorderDelega
     private var meterTask: Task<Void, Never>?
     private var fileURL: URL?
     private var segmentURLs: [URL] = []
+    private var segmentDurations: [TimeInterval] = []
     private var finalizedDuration: TimeInterval = 0
     private var previewPlayer: AVQueuePlayer?
     private var previewEndObserver: NSObjectProtocol?
@@ -63,6 +78,7 @@ final class VoiceNoteRecorder: NSObject, ObservableObject, AVAudioRecorderDelega
         }
         elapsed = 0
         finalizedDuration = 0
+        segmentDurations = []
         beginSegment()
     }
 
@@ -122,20 +138,40 @@ final class VoiceNoteRecorder: NSObject, ObservableObject, AVAudioRecorderDelega
         stopPreviewPlayback()
         finalizeActiveSegment()
         let urls = segmentURLs
+        let durations = segmentDurations
         let duration = finalizedDuration
         segmentURLs = []
+        segmentDurations = []
         finalizedDuration = 0
         phase = .idle
-        defer {
+        defer { releaseAudioSession() }
+        guard !urls.isEmpty, urls.count == durations.count,
+              duration >= Self.minimumDuration
+        else {
             urls.forEach { try? FileManager.default.removeItem(at: $0) }
-            releaseAudioSession()
+            return nil
         }
-        guard !urls.isEmpty,
-              duration >= Self.minimumDuration,
-              let data = await VoiceNoteSegmentAssembler.assemble(urls),
-              !data.isEmpty
-        else { return nil }
-        return Recording(data: data, duration: min(duration, Self.maximumDuration))
+        let segments = zip(urls, durations).compactMap { url, segmentDuration -> Recording.Segment? in
+            guard let bytes = try? FileManager.default.attributesOfItem(
+                atPath: url.path
+            )[.size] as? NSNumber,
+                  bytes.intValue > 0,
+                  segmentDuration > 0
+            else { return nil }
+            return Recording.Segment(
+                fileURL: url,
+                byteCount: bytes.intValue,
+                duration: segmentDuration
+            )
+        }
+        guard segments.count == urls.count else {
+            urls.forEach { try? FileManager.default.removeItem(at: $0) }
+            return nil
+        }
+        return Recording(
+            segments: segments,
+            duration: min(duration, Self.maximumDuration)
+        )
     }
 
     /// The explicit discard: everything captured so far is deleted, live or finalized.
@@ -148,6 +184,7 @@ final class VoiceNoteRecorder: NSObject, ObservableObject, AVAudioRecorderDelega
         fileURL = nil
         segmentURLs.forEach { try? FileManager.default.removeItem(at: $0) }
         segmentURLs = []
+        segmentDurations = []
         finalizedDuration = 0
         elapsed = 0
         phase = .idle
@@ -244,6 +281,7 @@ final class VoiceNoteRecorder: NSObject, ObservableObject, AVAudioRecorderDelega
            bytes.intValue > 0,
            segmentDuration > 0 {
             segmentURLs.append(url)
+            segmentDurations.append(segmentDuration)
             finalizedDuration += segmentDuration
         } else if let url {
             try? FileManager.default.removeItem(at: url)
@@ -345,9 +383,29 @@ final class VoiceNoteDraftRegistry {
 /// one segment short-circuits to its own bytes. Any failure returns nil rather than half a
 /// file — a note that cannot be assembled is not sent.
 enum VoiceNoteSegmentAssembler {
-    static func assemble(_ segments: [URL]) async -> Data? {
-        if segments.count == 1 { return try? Data(contentsOf: segments[0]) }
+    static func assembleToFile(_ segments: [URL]) async -> URL? {
         guard !segments.isEmpty else { return nil }
+
+        let joinedURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kit-voice-final-\(UUID().uuidString).m4a", isDirectory: false)
+        var published = false
+        defer {
+            if !published { try? FileManager.default.removeItem(at: joinedURL) }
+        }
+        if segments.count == 1 {
+            do {
+                try FileManager.default.copyItem(at: segments[0], to: joinedURL)
+                try FileManager.default.setAttributes(
+                    [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+                    ofItemAtPath: joinedURL.path
+                )
+                published = true
+                return joinedURL
+            } catch {
+                try? FileManager.default.removeItem(at: joinedURL)
+                return nil
+            }
+        }
 
         let composition = AVMutableComposition()
         guard let track = composition.addMutableTrack(
@@ -369,9 +427,6 @@ enum VoiceNoteSegmentAssembler {
             cursor = CMTimeAdd(cursor, duration)
         }
 
-        let joinedURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("kit-voice-joined-\(UUID().uuidString).m4a", isDirectory: false)
-        defer { try? FileManager.default.removeItem(at: joinedURL) }
         guard let export = AVAssetExportSession(
             asset: composition,
             presetName: AVAssetExportPresetPassthrough
@@ -379,7 +434,21 @@ enum VoiceNoteSegmentAssembler {
         export.outputURL = joinedURL
         export.outputFileType = .m4a
         await export.export()
-        guard export.status == .completed else { return nil }
-        return try? Data(contentsOf: joinedURL)
+        guard export.status == .completed else {
+            return nil
+        }
+        guard let values = try? joinedURL.resourceValues(
+                  forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]
+              ),
+              values.isRegularFile == true,
+              values.isSymbolicLink != true,
+              (values.fileSize ?? 0) > 0
+        else { return nil }
+        try? FileManager.default.setAttributes(
+            [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+            ofItemAtPath: joinedURL.path
+        )
+        published = true
+        return joinedURL
     }
 }

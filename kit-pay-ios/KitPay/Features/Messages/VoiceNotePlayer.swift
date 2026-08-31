@@ -26,6 +26,14 @@ final class VoiceNotePlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     var playingID: UUID? { playing?.id }
 
     private var player: AVAudioPlayer?
+    private var queuePlayer: AVQueuePlayer?
+    private var queueURLs: [URL] = []
+    private var queueDurations: [TimeInterval] = []
+    /// Keeps a receiver-cache file ineligible for eviction for the whole lifetime of playback,
+    /// including while its originating bubble has scrolled away and the floating player owns the
+    /// controls. Sender originals are not evictable, but use the same optional handoff shape.
+    private var protectedOriginalLease: SecureMediaOriginalAccessLease?
+    private var queueEndObserver: NSObjectProtocol?
     private var progressTask: Task<Void, Never>?
     private var interruptionObserver: NSObjectProtocol?
     private var hasRemoteCommands = false
@@ -48,6 +56,70 @@ final class VoiceNotePlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     // MARK: Transport
 
     func toggle(data: Data, id: UUID, context: VoiceNotePlaybackContext) {
+        toggle(id: id, context: context, protectedOriginalLease: nil) {
+            try AVAudioPlayer(data: data)
+        }
+    }
+
+    func toggle(
+        fileURL: URL,
+        id: UUID,
+        context: VoiceNotePlaybackContext,
+        protectedOriginalLease: SecureMediaOriginalAccessLease? = nil
+    ) {
+        toggle(
+            id: id,
+            context: context,
+            protectedOriginalLease: protectedOriginalLease
+        ) {
+            try AVAudioPlayer(contentsOf: fileURL)
+        }
+    }
+
+    /// Plays finalized capture segments directly while their durable background assembly is in
+    /// flight. No upload, remote URL, or re-download is involved.
+    func toggle(
+        fileURLs: [URL],
+        segmentDurations: [TimeInterval],
+        id: UUID,
+        context: VoiceNotePlaybackContext
+    ) {
+        guard !fileURLs.isEmpty,
+              fileURLs.count == segmentDurations.count,
+              segmentDurations.allSatisfy({ $0.isFinite && $0 > 0 })
+        else { return }
+        if playing?.id == id, queuePlayer != nil {
+            if isPaused { resume() } else { pause() }
+            return
+        }
+        stop()
+        guard CallMediaCoordinator.shared.activeCall == nil else { return }
+        do {
+            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .spokenAudio)
+            try AVAudioSession.sharedInstance().setActive(true)
+            queueURLs = fileURLs
+            queueDurations = segmentDurations
+            playing = VoiceNotePlayingNote(id: id, context: context)
+            isPaused = false
+            duration = segmentDurations.reduce(0, +)
+            progress = 0
+            isSourceOnScreen = true
+            rebuildQueue(startingAt: 0, offset: 0, shouldPlay: true)
+            startProgressUpdates()
+            installRemoteCommands()
+            publishNowPlaying()
+            VoiceNoteOverlayWindowController.shared.refresh()
+        } catch {
+            stop()
+        }
+    }
+
+    private func toggle(
+        id: UUID,
+        context: VoiceNotePlaybackContext,
+        protectedOriginalLease: SecureMediaOriginalAccessLease?,
+        makePlayer: () throws -> AVAudioPlayer
+    ) {
         if playing?.id == id, player != nil {
             if isPaused { resume() } else { pause() }
             return
@@ -58,11 +130,12 @@ final class VoiceNotePlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
         do {
             try AVAudioSession.sharedInstance().setCategory(.playback, mode: .spokenAudio)
             try AVAudioSession.sharedInstance().setActive(true)
-            let player = try AVAudioPlayer(data: data)
+            let player = try makePlayer()
             player.delegate = self
             player.prepareToPlay()
             player.play()
             self.player = player
+            self.protectedOriginalLease = protectedOriginalLease
             playing = VoiceNotePlayingNote(id: id, context: context)
             isPaused = false
             duration = player.duration
@@ -79,17 +152,19 @@ final class VoiceNotePlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     func pause() {
-        guard let player, player.isPlaying else { return }
-        player.pause()
+        guard player?.isPlaying == true || (queuePlayer?.rate ?? 0) != 0 else { return }
+        player?.pause()
+        queuePlayer?.pause()
         isPaused = true
         publishNowPlaying()
     }
 
     func resume() {
-        guard let player, playing != nil else { return }
+        guard playing != nil, (player != nil || queuePlayer != nil) else { return }
         // The session may have been deactivated by an interruption or by another note stopping.
         try? AVAudioSession.sharedInstance().setActive(true)
-        player.play()
+        player?.play()
+        queuePlayer?.play()
         isPaused = false
         startProgressUpdates()
         publishNowPlaying()
@@ -103,23 +178,47 @@ final class VoiceNotePlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     /// Positions playback at `fraction` of the note. Used by both a tap inside the waveform and a
     /// slide along it; scrubbing past either end simply rests at that end.
     func seek(toFraction fraction: Double) {
-        guard let player, playing != nil else { return }
+        guard playing != nil else { return }
+        if let player {
+            let target = VoiceNoteSeekPolicy.time(
+                forFraction: fraction,
+                duration: player.duration
+            )
+            player.currentTime = target
+            progress = VoiceNoteSeekPolicy.fraction(forTime: target, duration: player.duration)
+            publishNowPlaying()
+            return
+        }
+        guard queuePlayer != nil, duration > 0 else { return }
         let target = VoiceNoteSeekPolicy.time(
             forFraction: fraction,
-            duration: player.duration
+            duration: duration
         )
-        player.currentTime = target
-        progress = VoiceNoteSeekPolicy.fraction(forTime: target, duration: player.duration)
+        var prefix: TimeInterval = 0
+        var targetIndex = queueDurations.index(before: queueDurations.endIndex)
+        for index in queueDurations.indices {
+            if target <= prefix + queueDurations[index] {
+                targetIndex = index
+                break
+            }
+            prefix += queueDurations[index]
+        }
+        rebuildQueue(
+            startingAt: targetIndex,
+            offset: max(0, target - prefix),
+            shouldPlay: !isPaused
+        )
+        progress = VoiceNoteSeekPolicy.fraction(forTime: target, duration: duration)
         publishNowPlaying()
     }
 
     /// Nudges playback by `delta` seconds, for the lock screen's skip controls.
     func seek(by delta: TimeInterval) {
-        guard let player, playing != nil, player.duration > 0 else { return }
+        guard playing != nil, duration > 0 else { return }
         seek(
             toFraction: VoiceNoteSeekPolicy.fraction(
-                forTime: player.currentTime + delta,
-                duration: player.duration
+                forTime: elapsedPlaybackTime + delta,
+                duration: duration
             )
         )
     }
@@ -129,6 +228,14 @@ final class VoiceNotePlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
         progressTask = nil
         player?.stop()
         player = nil
+        queuePlayer?.pause()
+        queuePlayer?.removeAllItems()
+        queuePlayer = nil
+        queueURLs = []
+        queueDurations = []
+        protectedOriginalLease = nil
+        if let queueEndObserver { NotificationCenter.default.removeObserver(queueEndObserver) }
+        queueEndObserver = nil
         playing = nil
         isPaused = false
         isSourceOnScreen = false
@@ -170,15 +277,18 @@ final class VoiceNotePlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
         progressTask?.cancel()
         progressTask = Task { [weak self] in
             while !Task.isCancelled {
-                guard let self, let player = self.player else { return }
+                guard let self, self.player != nil || self.queuePlayer != nil else { return }
                 // A call that starts mid-note takes the session; end the note rather than let it
                 // fight the call for the route.
                 if CallMediaCoordinator.shared.activeCall != nil {
                     self.stop()
                     return
                 }
-                if player.duration > 0 {
-                    self.progress = player.currentTime / player.duration
+                if self.duration > 0 {
+                    self.progress = VoiceNoteSeekPolicy.fraction(
+                        forTime: self.elapsedPlaybackTime,
+                        duration: self.duration
+                    )
                 }
                 try? await Task.sleep(for: .milliseconds(120))
             }
@@ -247,14 +357,51 @@ final class VoiceNotePlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
     /// The lock screen shows who is speaking and where, never the note's contents.
     private func publishNowPlaying() {
-        guard let player, let playing else { return }
+        guard let playing, (player != nil || queuePlayer != nil) else { return }
         MPNowPlayingInfoCenter.default().nowPlayingInfo = [
             MPMediaItemPropertyTitle: playing.context.title,
             MPMediaItemPropertyArtist: playing.context.subtitle,
-            MPMediaItemPropertyPlaybackDuration: player.duration,
-            MPNowPlayingInfoPropertyElapsedPlaybackTime: player.currentTime,
-            MPNowPlayingInfoPropertyPlaybackRate: player.isPlaying ? 1.0 : 0.0,
+            MPMediaItemPropertyPlaybackDuration: duration,
+            MPNowPlayingInfoPropertyElapsedPlaybackTime: elapsedPlaybackTime,
+            MPNowPlayingInfoPropertyPlaybackRate:
+                (player?.isPlaying == true || (queuePlayer?.rate ?? 0) != 0) ? 1.0 : 0.0,
         ]
+    }
+
+    private var elapsedPlaybackTime: TimeInterval {
+        if let player { return player.currentTime }
+        guard let queuePlayer else { return 0 }
+        let remaining = queuePlayer.items().count
+        let completedCount = max(0, queueDurations.count - remaining)
+        return queueDurations.prefix(completedCount).reduce(0, +)
+            + max(0, queuePlayer.currentTime().seconds.isFinite
+                ? queuePlayer.currentTime().seconds
+                : 0)
+    }
+
+    private func rebuildQueue(
+        startingAt index: Int,
+        offset: TimeInterval,
+        shouldPlay: Bool
+    ) {
+        guard queueURLs.indices.contains(index) else { return }
+        if let queueEndObserver { NotificationCenter.default.removeObserver(queueEndObserver) }
+        queueEndObserver = nil
+        queuePlayer?.pause()
+        queuePlayer?.removeAllItems()
+        let items = queueURLs[index...].map { AVPlayerItem(url: $0) }
+        guard let last = items.last else { return }
+        let queue = AVQueuePlayer(items: items)
+        queueEndObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime,
+            object: last,
+            queue: .main
+        ) { _ in
+            MainActor.assumeIsolated { VoiceNotePlayer.shared.stop() }
+        }
+        queuePlayer = queue
+        queue.seek(to: CMTime(seconds: offset, preferredTimescale: 600))
+        if shouldPlay { queue.play() }
     }
 
     private func clearNowPlaying() {

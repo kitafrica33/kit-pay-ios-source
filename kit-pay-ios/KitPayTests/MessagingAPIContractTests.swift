@@ -8,6 +8,462 @@ final class MessagingAPIContractTests: XCTestCase {
     private let messageId = "33333333-3333-4333-8333-333333333333"
     private let rosterRevision = "v1:sha256:" + String(repeating: "a", count: 64)
 
+    func testBackgroundUploadTaskDescriptionRoundTripsWithoutCredentials() throws {
+        let accountID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        let sessionID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        let accessToken = "secret-access-token"
+        let uploadID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        let digest = String(repeating: "d", count: 64)
+        let context = try XCTUnwrap(MessagingBackgroundUploadContext(
+            accountID: accountID,
+            sessionID: sessionID,
+            accessToken: accessToken,
+            uploadID: uploadID,
+            byteOffset: 5 * 1_024 * 1_024,
+            byteSize: 512,
+            ciphertextSHA256: digest
+        ))
+        let description = try XCTUnwrap(context.taskDescription)
+
+        XCTAssertEqual(
+            MessagingBackgroundUploadContext.decode(taskDescription: description),
+            context
+        )
+        XCTAssertFalse(description.contains(accountID))
+        XCTAssertFalse(description.contains(sessionID))
+        XCTAssertFalse(description.contains(accessToken))
+        XCTAssertTrue(context.isStructurallyValid)
+    }
+
+    func testBackgroundUploadSerializesOneOffsetAcrossTokenRotation() throws {
+        func context(token: String, offset: Int64 = 0) throws -> MessagingBackgroundUploadContext {
+            try XCTUnwrap(MessagingBackgroundUploadContext(
+                accountID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                sessionID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                accessToken: token,
+                uploadID: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                byteOffset: offset,
+                byteSize: 512,
+                ciphertextSHA256: String(repeating: "d", count: 64)
+            ))
+        }
+        let rejectedToken = try context(token: "old-token")
+        let refreshedToken = try context(token: "new-token")
+        let nextChunk = try context(token: "new-token", offset: 512)
+
+        XCTAssertTrue(rejectedToken.describesSameTransfer(as: refreshedToken))
+        XCTAssertEqual(rejectedToken.logicalTransferID, refreshedToken.logicalTransferID)
+        XCTAssertNotEqual(rejectedToken.attemptID, refreshedToken.attemptID)
+        XCTAssertFalse(refreshedToken.describesSameTransfer(as: nextChunk))
+    }
+
+    func testBackgroundUploadResultRequiresBoundedResponseOrTransportError() throws {
+        let context = try XCTUnwrap(MessagingBackgroundUploadContext(
+            accountID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            sessionID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            accessToken: "token",
+            uploadID: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            byteOffset: 0,
+            byteSize: 512,
+            ciphertextSHA256: String(repeating: "d", count: 64)
+        ))
+        XCTAssertTrue(MessagingBackgroundUploadResult(
+            context: context,
+            statusCode: 200,
+            headers: ["Content-Type": "application/json"],
+            body: Data("{}".utf8),
+            errorDomain: nil,
+            errorCode: nil,
+            completedAt: Date()
+        ).isStructurallyValid)
+        XCTAssertFalse(MessagingBackgroundUploadResult(
+            context: context,
+            statusCode: nil,
+            headers: [:],
+            body: Data(),
+            errorDomain: nil,
+            errorCode: nil,
+            completedAt: Date()
+        ).isStructurallyValid)
+        XCTAssertFalse(MessagingBackgroundUploadResult(
+            context: context,
+            statusCode: 200,
+            headers: [:],
+            body: Data(count: MessagingBackgroundUploadResult.maximumResponseBytes + 1),
+            errorDomain: nil,
+            errorCode: nil,
+            completedAt: Date()
+        ).isStructurallyValid)
+    }
+
+    func testAttachmentUploadDTOConditionallyDecodesClientMediaIdentity() throws {
+        let mediaID = "44444444-4444-4444-8444-444444444444"
+        let modern = try JSONDecoder().decode(
+            MessagingAttachmentUploadDTO.self,
+            from: Data(
+                #"{"storage_key":"55555555-5555-4555-8555-555555555555","byte_size":96,"ciphertext_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","client_media_id":"\#(mediaID)"}"#.utf8
+            )
+        )
+        XCTAssertEqual(modern.clientMediaId, mediaID)
+
+        let legacy = try JSONDecoder().decode(
+            MessagingAttachmentUploadDTO.self,
+            from: Data(
+                #"{"storage_key":"55555555-5555-4555-8555-555555555555","byte_size":96,"ciphertext_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#.utf8
+            )
+        )
+        XCTAssertNil(legacy.clientMediaId)
+    }
+
+    func testUploadResponseRequiresExactClientMediaIdentityEcho() {
+        let mediaID = "44444444-4444-4444-8444-444444444444"
+        let storageKey = "55555555-5555-4555-8555-555555555555"
+        let digest = String(repeating: "a", count: 64)
+        let bytes: Int64 = 96
+        let valid = MessagingAttachmentUploadDTO(
+            storageKey: storageKey,
+            byteSize: bytes,
+            ciphertextSha256: digest,
+            clientMediaId: mediaID
+        )
+        XCTAssertEqual(
+            SecureMessagingAttachmentUploadResponsePolicy.validate(
+                valid,
+                attachmentID: mediaID,
+                ciphertextByteSize: bytes,
+                ciphertextSHA256: digest
+            ),
+            ValidatedMessagingAttachmentUpload(
+                storageKey: storageKey,
+                byteSize: bytes,
+                ciphertextSHA256: digest
+            )
+        )
+
+        for rejected in [
+            MessagingAttachmentUploadDTO(
+                storageKey: storageKey,
+                byteSize: bytes,
+                ciphertextSha256: digest,
+                clientMediaId: nil
+            ),
+            MessagingAttachmentUploadDTO(
+                storageKey: storageKey,
+                byteSize: bytes,
+                ciphertextSha256: digest,
+                clientMediaId: "66666666-6666-4666-8666-666666666666"
+            ),
+        ] {
+            XCTAssertNil(SecureMessagingAttachmentUploadResponsePolicy.validate(
+                rejected,
+                attachmentID: mediaID,
+                ciphertextByteSize: bytes,
+                ciphertextSHA256: digest
+            ))
+        }
+    }
+
+    func testResumableChunkRequiresExplicitReplayField() throws {
+        let digest = String(repeating: "b", count: 64)
+        let upload = try JSONDecoder().decode(
+            MessagingAttachmentUploadSessionDTO.self,
+            from: Data(
+                #"{"client_media_id":"44444444-4444-4444-8444-444444444444","storage_key":"55555555-5555-4555-8555-555555555555","media_type":"image/jpeg","byte_size":96,"ciphertext_sha256":"\#(digest)","state":"pending","next_offset":32,"max_chunk_bytes":5242880,"complete":false}"#.utf8
+            )
+        )
+        func response(_ replayJSON: String) throws -> MessagingAttachmentUploadChunkResultDTO {
+            try JSONDecoder().decode(
+                MessagingAttachmentUploadChunkResultDTO.self,
+                from: Data(
+                    #"{"upload":{"client_media_id":"44444444-4444-4444-8444-444444444444","storage_key":"55555555-5555-4555-8555-555555555555","media_type":"image/jpeg","byte_size":96,"ciphertext_sha256":"\#(digest)","state":"pending","next_offset":32,"max_chunk_bytes":5242880,"complete":false},"chunk":{"byte_offset":0,"byte_size":32,"ciphertext_sha256":"\#(digest)"\#(replayJSON)}}"#.utf8
+                )
+            )
+        }
+
+        let missing = try response("")
+        XCTAssertNil(MessagingResumableAttachmentPolicy.validatedChunkUpload(
+            missing,
+            expectedOffset: 0,
+            expectedByteSize: 32,
+            expectedSHA256: digest
+        ))
+        for value in [false, true] {
+            let explicit = try response(",\"replayed\":\(value)")
+            XCTAssertEqual(
+                MessagingResumableAttachmentPolicy.validatedChunkUpload(
+                    explicit,
+                    expectedOffset: 0,
+                    expectedByteSize: 32,
+                    expectedSHA256: digest
+                ),
+                upload
+            )
+        }
+
+        let wrongOffset = try JSONDecoder().decode(
+            MessagingAttachmentUploadChunkResultDTO.self,
+            from: Data(
+                #"{"upload":{"client_media_id":"44444444-4444-4444-8444-444444444444","storage_key":"55555555-5555-4555-8555-555555555555","media_type":"image/jpeg","byte_size":96,"ciphertext_sha256":"\#(digest)","state":"pending","next_offset":32,"max_chunk_bytes":5242880,"complete":false},"chunk":{"byte_offset":1,"byte_size":32,"ciphertext_sha256":"\#(digest)","replayed":true}}"#.utf8
+            )
+        )
+        XCTAssertNil(MessagingResumableAttachmentPolicy.validatedChunkUpload(
+            wrongOffset,
+            expectedOffset: 0,
+            expectedByteSize: 32,
+            expectedSHA256: digest
+        ))
+    }
+
+    func testResumableCheckpointPersistsAuthoritativeRestartOffset() throws {
+        let mediaID = "44444444-4444-4444-8444-444444444444"
+        let storageKey = "55555555-5555-4555-8555-555555555555"
+        let digest = String(repeating: "b", count: 64)
+        let response = try resumableSession(
+            mediaID: mediaID,
+            storageKey: storageKey,
+            digest: digest,
+            state: "pending",
+            nextOffset: 5 * 1_024 * 1_024,
+            complete: false
+        )
+
+        let checkpoint = try SecureMessagingExchangeCoordinator.validatedResumableCheckpoint(
+            response,
+            attachmentID: mediaID,
+            mediaType: "video/mp4",
+            byteSize: 12 * 1_024 * 1_024,
+            digest: digest,
+            advertisedChunkBytes: 5 * 1_024 * 1_024,
+            expectedUploadID: mediaID,
+            expectedStorageKey: storageKey
+        )
+        let restored = try JSONDecoder().decode(
+            LocalMediaResumableUpload.self,
+            from: JSONEncoder().encode(checkpoint)
+        )
+
+        XCTAssertEqual(restored.uploadID, mediaID)
+        XCTAssertEqual(restored.storageKey, storageKey)
+        XCTAssertEqual(restored.nextOffset, 5 * 1_024 * 1_024)
+        XCTAssertEqual(
+            MessagingResumableAttachmentPolicy.chunkLength(
+                remaining: 12 * 1_024 * 1_024 - restored.nextOffset,
+                serverMaximum: restored.maxChunkBytes
+            ),
+            5 * 1_024 * 1_024
+        )
+    }
+
+    func testResumableCompletionRejectsEveryBoundMetadataMismatch() throws {
+        let mediaID = "44444444-4444-4444-8444-444444444444"
+        let storageKey = "55555555-5555-4555-8555-555555555555"
+        let digest = String(repeating: "b", count: 64)
+        let byteSize: Int64 = 96
+
+        let valid = try resumableSession(
+            mediaID: mediaID,
+            storageKey: storageKey,
+            digest: digest,
+            state: "ready",
+            nextOffset: byteSize,
+            complete: true,
+            byteSize: byteSize
+        )
+        XCTAssertNoThrow(try SecureMessagingExchangeCoordinator.validatedResumableCheckpoint(
+            valid,
+            attachmentID: mediaID,
+            mediaType: "video/mp4",
+            byteSize: byteSize,
+            digest: digest,
+            advertisedChunkBytes: 5 * 1_024 * 1_024,
+            expectedUploadID: mediaID,
+            expectedStorageKey: storageKey,
+            requiresComplete: true
+        ))
+
+        let mismatches = [
+            try resumableSession(
+                mediaID: mediaID,
+                storageKey: "66666666-6666-4666-8666-666666666666",
+                digest: digest,
+                state: "ready",
+                nextOffset: byteSize,
+                complete: true,
+                byteSize: byteSize
+            ),
+            try resumableSession(
+                mediaID: mediaID,
+                storageKey: storageKey,
+                digest: digest,
+                state: "ready",
+                nextOffset: byteSize - 1,
+                complete: true,
+                byteSize: byteSize
+            ),
+            try resumableSession(
+                mediaID: mediaID,
+                storageKey: storageKey,
+                digest: String(repeating: "c", count: 64),
+                state: "ready",
+                nextOffset: byteSize,
+                complete: true,
+                byteSize: byteSize
+            ),
+        ]
+        for mismatch in mismatches {
+            XCTAssertThrowsError(try SecureMessagingExchangeCoordinator.validatedResumableCheckpoint(
+                mismatch,
+                attachmentID: mediaID,
+                mediaType: "video/mp4",
+                byteSize: byteSize,
+                digest: digest,
+                advertisedChunkBytes: 5 * 1_024 * 1_024,
+                expectedUploadID: mediaID,
+                expectedStorageKey: storageKey,
+                requiresComplete: true
+            ))
+        }
+    }
+
+    func testResumableLeaseReplacementIsLimitedToMissingOrExpiredLeaseResponses() {
+        XCTAssertTrue(SecureMessagingExchangeCoordinator.resumableLeaseMayRestart(after:
+            APIErrorPayload(
+                code: "ATTACHMENT_UPLOAD_NOT_FOUND",
+                message: "gone",
+                httpStatus: 404
+            )
+        ))
+        XCTAssertTrue(SecureMessagingExchangeCoordinator.resumableLeaseMayRestart(after:
+            APIErrorPayload(
+                code: "ATTACHMENT_UPLOAD_EXPIRED",
+                message: "expired",
+                httpStatus: 410
+            )
+        ))
+        XCTAssertFalse(SecureMessagingExchangeCoordinator.resumableLeaseMayRestart(after:
+            APIErrorPayload(code: "NOT_FOUND", message: "wrong resource", httpStatus: 404)
+        ))
+        XCTAssertFalse(SecureMessagingExchangeCoordinator.resumableLeaseMayRestart(after:
+            APIClientError.httpResponse(status: 401, retryAfter: nil)
+        ))
+    }
+
+    func testReadyLeasePreflightRenewsInPlaceOrAcceptsOnlyFreshEmptyReplacement() throws {
+        let mediaID = "44444444-4444-4444-8444-444444444444"
+        let oldStorageKey = "55555555-5555-4555-8555-555555555555"
+        let replacementStorageKey = "66666666-6666-4666-8666-666666666666"
+        let digest = String(repeating: "b", count: 64)
+        let byteSize: Int64 = 96
+
+        let renewed = try SecureMessagingExchangeCoordinator
+            .validatedResumableLeasePreflight(
+                try resumableSession(
+                    mediaID: mediaID,
+                    storageKey: oldStorageKey,
+                    digest: digest,
+                    state: "ready",
+                    nextOffset: byteSize,
+                    complete: true,
+                    byteSize: byteSize
+                ),
+                attachmentID: mediaID,
+                mediaType: "video/mp4",
+                byteSize: byteSize,
+                digest: digest,
+                advertisedChunkBytes: 5 * 1_024 * 1_024,
+                previousStorageKey: oldStorageKey
+            )
+        XCTAssertEqual(renewed.storageKey, oldStorageKey)
+        XCTAssertEqual(renewed.nextOffset, byteSize)
+
+        let replacement = try SecureMessagingExchangeCoordinator
+            .validatedResumableLeasePreflight(
+                try resumableSession(
+                    mediaID: mediaID,
+                    storageKey: replacementStorageKey,
+                    digest: digest,
+                    state: "pending",
+                    nextOffset: 0,
+                    complete: false,
+                    byteSize: byteSize
+                ),
+                attachmentID: mediaID,
+                mediaType: "video/mp4",
+                byteSize: byteSize,
+                digest: digest,
+                advertisedChunkBytes: 5 * 1_024 * 1_024,
+                previousStorageKey: oldStorageKey
+            )
+        XCTAssertEqual(replacement.storageKey, replacementStorageKey)
+        XCTAssertEqual(replacement.nextOffset, 0)
+
+        for invalid in [
+            try resumableSession(
+                mediaID: mediaID,
+                storageKey: replacementStorageKey,
+                digest: digest,
+                state: "ready",
+                nextOffset: byteSize,
+                complete: true,
+                byteSize: byteSize
+            ),
+            try resumableSession(
+                mediaID: mediaID,
+                storageKey: replacementStorageKey,
+                digest: digest,
+                state: "pending",
+                nextOffset: 1,
+                complete: false,
+                byteSize: byteSize
+            ),
+            try resumableSession(
+                mediaID: mediaID,
+                storageKey: oldStorageKey,
+                digest: digest,
+                state: "pending",
+                nextOffset: 0,
+                complete: false,
+                byteSize: byteSize
+            ),
+        ] {
+            XCTAssertThrowsError(try SecureMessagingExchangeCoordinator
+                .validatedResumableLeasePreflight(
+                    invalid,
+                    attachmentID: mediaID,
+                    mediaType: "video/mp4",
+                    byteSize: byteSize,
+                    digest: digest,
+                    advertisedChunkBytes: 5 * 1_024 * 1_024,
+                    previousStorageKey: oldStorageKey
+                ))
+        }
+    }
+
+    private func resumableSession(
+        mediaID: String,
+        storageKey: String,
+        digest: String,
+        state: String,
+        nextOffset: Int64,
+        complete: Bool,
+        byteSize: Int64 = 12 * 1_024 * 1_024
+    ) throws -> MessagingAttachmentUploadSessionDTO {
+        try JSONDecoder().decode(
+            MessagingAttachmentUploadSessionDTO.self,
+            from: try JSONSerialization.data(withJSONObject: [
+                "client_media_id": mediaID,
+                "storage_key": storageKey,
+                "media_type": "video/mp4",
+                "byte_size": byteSize,
+                "ciphertext_sha256": digest,
+                "state": state,
+                "next_offset": nextOffset,
+                "max_chunk_bytes": 5 * 1_024 * 1_024,
+                "complete": complete,
+            ], options: [.sortedKeys])
+        )
+    }
+
     private struct MapperDeviceFixture {
         let userID: String
         let deviceID: String

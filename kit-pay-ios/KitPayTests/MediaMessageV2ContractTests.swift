@@ -468,6 +468,33 @@ final class MediaMessageV2ContractTests: XCTestCase {
         )
     }
 
+    func testReadyLeaseReplacementReopensOnlyServerDerivedUploadFacts() throws {
+        let original = KitMediaMessageV2OutboundBatch.Item(
+            attachmentID: V1.id0,
+            mediaType: "image/jpeg",
+            plaintextByteSize: 1_024,
+            keyMaterialBase64: Data(repeating: 0x41, count: 64).base64EncodedString(),
+            localStorageKey: "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        )
+        let uploaded = try XCTUnwrap(original.uploaded(
+            storageKey: V1.sk0,
+            ciphertextByteSize: 1_088,
+            ciphertextSHA256: V1.sha0
+        ))
+
+        let reopened = uploaded.reopeningUpload()
+
+        XCTAssertFalse(reopened.isUploaded)
+        XCTAssertNil(reopened.storageKey)
+        XCTAssertNil(reopened.ciphertextByteSize)
+        XCTAssertNil(reopened.ciphertextSHA256)
+        XCTAssertEqual(reopened.attachmentID, original.attachmentID)
+        XCTAssertEqual(reopened.mediaType, original.mediaType)
+        XCTAssertEqual(reopened.plaintextByteSize, original.plaintextByteSize)
+        XCTAssertEqual(reopened.keyMaterialBase64, original.keyMaterialBase64)
+        XCTAssertEqual(reopened.localStorageKey, original.localStorageKey)
+    }
+
     // MARK: - Caption budget (§4 `cap`, client test 8 model layer)
 
     func testCaptionBudget() {
@@ -698,6 +725,8 @@ final class MediaMessageV2ContractTests: XCTestCase {
         ("testMalformedAggregate", testMalformedAggregate),
         ("testOuterRowSetMatch", testOuterRowSetMatch),
         ("testCanonicalOuterOrderPolicy", testCanonicalOuterOrderPolicy),
+        ("testReadyLeaseReplacementReopensOnlyServerDerivedUploadFacts",
+         testReadyLeaseReplacementReopensOnlyServerDerivedUploadFacts),
         ("testCaptionBudget", testCaptionBudget),
         ("testSixCodepointHelpers", testSixCodepointHelpers),
         ("testFamilyInputGuard", testFamilyInputGuard),

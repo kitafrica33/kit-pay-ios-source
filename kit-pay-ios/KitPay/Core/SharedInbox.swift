@@ -1121,6 +1121,12 @@ struct SharedInboxStore {
     }
 
     func data(for item: SharedInboxItem, in batchID: UUID) throws -> Data {
+        try Data(contentsOf: fileURL(for: item, in: batchID))
+    }
+
+    /// Validated file lease for the containing app's file-first adoption path. The inbox keeps
+    /// ownership until the exact outbox commit is acknowledged; callers may copy, never move.
+    func fileURL(for item: SharedInboxItem, in batchID: UUID) throws -> URL {
         guard let rootURL else { throw SharedInboxError.unavailable }
         guard SharedInboxPolicy.isSafeFileName(item.fileName) else {
             throw SharedInboxError.unreadable
@@ -1133,7 +1139,7 @@ struct SharedInboxStore {
             throw SharedInboxError.unreadable
         }
         let url = try verifiedFileURL(for: item, batchURL: batchURL)
-        return try Data(contentsOf: url)
+        return url
     }
 
     func remove(batchID: UUID) {

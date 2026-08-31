@@ -1190,6 +1190,261 @@ actor APIClient {
         return try decodeEnvelope(data, response: http)
     }
 
+    /// File-backed multipart transport for the capability-absent compatibility path. The
+    /// multipart envelope is assembled on disk and uploaded from a file, so a 200 MiB encrypted
+    /// attachment is never mirrored in one or two process-sized `Data` allocations.
+    func sendMultipartFile<Response: Decodable>(
+        path: String,
+        fields: [String: String],
+        fileField: String,
+        fileName: String,
+        fileContentType: String,
+        fileURL: URL,
+        expectedFileByteCount: Int64,
+        allowRefresh: Bool = true,
+        boundSessionID: String? = nil
+    ) async throws -> Response {
+        guard expectedFileByteCount > 0 else { throw APIClientError.invalidResponse }
+        let inheritedSessionID = APIClientSessionBinding.sessionID
+        if let boundSessionID,
+           let inheritedSessionID,
+           !SessionRefreshPolicy.matchesSessionID(boundSessionID, current: inheritedSessionID) {
+            throw APIClientError.signedOut
+        }
+        let requiredSessionID = boundSessionID ?? inheritedSessionID
+        guard let currentSession = await sessionStore.current() else {
+            throw APIClientError.signedOut
+        }
+        if let requiredSessionID,
+           !SessionRefreshPolicy.matchesSessionID(
+               requiredSessionID,
+               current: currentSession.sessionId
+           ) {
+            throw APIClientError.signedOut
+        }
+        try requireAppReviewDemoRequestPermission(
+            path: path,
+            method: "POST",
+            sessionID: currentSession.sessionId
+        )
+
+        let boundary = "KitPay-\(UUID().uuidString.lowercased())"
+        let multipartURL = try MultipartFormDataBody.makeFile(
+            boundary: boundary,
+            fields: fields,
+            fileField: fileField,
+            fileName: fileName,
+            fileContentType: fileContentType,
+            sourceURL: fileURL,
+            expectedSourceByteCount: expectedFileByteCount
+        )
+        defer { try? FileManager.default.removeItem(at: multipartURL) }
+        var request = URLRequest(url: try endpoint(path, queryItems: []))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue(
+            "multipart/form-data; boundary=\(boundary)",
+            forHTTPHeaderField: "Content-Type"
+        )
+        request.setValue(APIClientIdentity.currentHeader, forHTTPHeaderField: "X-Kit-Wallet-Client")
+        request.setValue(UUID().uuidString.lowercased(), forHTTPHeaderField: "X-Request-ID")
+        request.setValue("Bearer \(currentSession.accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue(currentSession.sessionId, forHTTPHeaderField: "X-Kit-Wallet-Session-ID")
+
+        let (data, response) = try await session.upload(for: request, fromFile: multipartURL)
+        guard let http = response as? HTTPURLResponse else { throw APIClientError.invalidResponse }
+        if http.statusCode == 401, allowRefresh {
+            try await refreshSession(afterRejectedSession: currentSession)
+            return try await sendMultipartFile(
+                path: path,
+                fields: fields,
+                fileField: fileField,
+                fileName: fileName,
+                fileContentType: fileContentType,
+                fileURL: fileURL,
+                expectedFileByteCount: expectedFileByteCount,
+                allowRefresh: false,
+                boundSessionID: currentSession.sessionId
+            )
+        }
+        return try decodeEnvelope(data, response: http)
+    }
+
+    /// Bounded raw-body request used by resumable ciphertext chunks. The caller caps every body
+    /// at five MiB; authentication and one-refresh replay retain the same task-local session fence
+    /// as ordinary API calls.
+    func sendRaw<Response: Decodable>(
+        path: String,
+        method: String,
+        body: Data?,
+        contentType: String,
+        headers: [String: String] = [:],
+        allowRefresh: Bool = true,
+        boundSessionID: String? = nil
+    ) async throws -> Response {
+        let inheritedSessionID = APIClientSessionBinding.sessionID
+        if let boundSessionID,
+           let inheritedSessionID,
+           !SessionRefreshPolicy.matchesSessionID(boundSessionID, current: inheritedSessionID) {
+            throw APIClientError.signedOut
+        }
+        let requiredSessionID = boundSessionID ?? inheritedSessionID
+        guard let currentSession = await sessionStore.current() else {
+            throw APIClientError.signedOut
+        }
+        if let requiredSessionID,
+           !SessionRefreshPolicy.matchesSessionID(
+               requiredSessionID,
+               current: currentSession.sessionId
+           ) {
+            throw APIClientError.signedOut
+        }
+        try requireAppReviewDemoRequestPermission(
+            path: path,
+            method: method,
+            sessionID: currentSession.sessionId
+        )
+        var request = URLRequest(url: try endpoint(path, queryItems: []))
+        request.httpMethod = method
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue(contentType, forHTTPHeaderField: "Content-Type")
+        request.setValue(APIClientIdentity.currentHeader, forHTTPHeaderField: "X-Kit-Wallet-Client")
+        request.setValue(UUID().uuidString.lowercased(), forHTTPHeaderField: "X-Request-ID")
+        request.setValue("Bearer \(currentSession.accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue(currentSession.sessionId, forHTTPHeaderField: "X-Kit-Wallet-Session-ID")
+        for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
+        request.httpBody = body
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw APIClientError.invalidResponse }
+        if http.statusCode == 401, allowRefresh {
+            try await refreshSession(afterRejectedSession: currentSession)
+            return try await sendRaw(
+                path: path,
+                method: method,
+                body: body,
+                contentType: contentType,
+                headers: headers,
+                allowRefresh: false,
+                boundSessionID: currentSession.sessionId
+            )
+        }
+        return try decodeEnvelope(data, response: http)
+    }
+
+    /// Termination-surviving counterpart for resumable E2EE attachment PATCHes. The bounded
+    /// ciphertext chunk is staged under Data Protection and handed to a background URLSession as
+    /// a file upload. Its task identity contains only fingerprints and immutable ciphertext facts;
+    /// relaunch reattaches to that task or consumes its durable response before replaying.
+    func sendBackgroundAttachmentChunk<Response: Decodable>(
+        path: String,
+        method: String,
+        body: Data,
+        contentType: String,
+        headers: [String: String],
+        uploadID: String,
+        byteOffset: Int64,
+        chunkSHA256: String,
+        allowRefresh: Bool = true,
+        boundSessionID: String? = nil
+    ) async throws -> Response {
+        guard method.caseInsensitiveCompare("PATCH") == .orderedSame,
+              !body.isEmpty,
+              body.count <= MessagingResumableAttachmentPolicy.maximumChunkBytes,
+              SecureMessagingValidation.sha256Hex(body) == chunkSHA256
+        else { throw APIClientError.invalidResponse }
+        let inheritedSessionID = APIClientSessionBinding.sessionID
+        if let boundSessionID,
+           let inheritedSessionID,
+           !SessionRefreshPolicy.matchesSessionID(boundSessionID, current: inheritedSessionID) {
+            throw APIClientError.signedOut
+        }
+        let requiredSessionID = boundSessionID ?? inheritedSessionID
+        guard let currentSession = await sessionStore.current(),
+              let accountID = currentSession.accountId?.lowercased(),
+              let context = MessagingBackgroundUploadContext(
+                  accountID: accountID,
+                  sessionID: currentSession.sessionId,
+                  accessToken: currentSession.accessToken,
+                  uploadID: uploadID,
+                  byteOffset: byteOffset,
+                  byteSize: body.count,
+                  ciphertextSHA256: chunkSHA256
+              )
+        else { throw APIClientError.signedOut }
+        if let requiredSessionID,
+           !SessionRefreshPolicy.matchesSessionID(
+               requiredSessionID,
+               current: currentSession.sessionId
+           ) {
+            throw APIClientError.signedOut
+        }
+        try requireAppReviewDemoRequestPermission(
+            path: path,
+            method: method,
+            sessionID: currentSession.sessionId
+        )
+        var request = URLRequest(url: try endpoint(path, queryItems: []))
+        request.httpMethod = method
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue(contentType, forHTTPHeaderField: "Content-Type")
+        request.setValue(APIClientIdentity.currentHeader, forHTTPHeaderField: "X-Kit-Wallet-Client")
+        request.setValue(UUID().uuidString.lowercased(), forHTTPHeaderField: "X-Request-ID")
+        request.setValue("Bearer \(currentSession.accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue(currentSession.sessionId, forHTTPHeaderField: "X-Kit-Wallet-Session-ID")
+        request.setValue(String(body.count), forHTTPHeaderField: "Content-Length")
+        for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
+
+        let result = try await MessagingBackgroundAttachmentUploader.shared.upload(
+            request: request,
+            chunk: body,
+            context: context
+        )
+        guard result.context.describesSameTransfer(as: context),
+              result.context.accountFingerprint == context.accountFingerprint,
+              result.context.sessionFingerprint == context.sessionFingerprint,
+              let statusCode = result.statusCode,
+              let response = HTTPURLResponse(
+                  url: request.url!,
+                  statusCode: statusCode,
+                  httpVersion: nil,
+                  headerFields: result.headers
+              )
+        else { throw APIClientError.invalidResponse }
+        if statusCode == 401, allowRefresh {
+            if result.context.accessTokenFingerprint == context.accessTokenFingerprint {
+                try await refreshSession(afterRejectedSession: currentSession)
+                return try await sendBackgroundAttachmentChunk(
+                    path: path,
+                    method: method,
+                    body: body,
+                    contentType: contentType,
+                    headers: headers,
+                    uploadID: uploadID,
+                    byteOffset: byteOffset,
+                    chunkSHA256: chunkSHA256,
+                    allowRefresh: false,
+                    boundSessionID: currentSession.sessionId
+                )
+            }
+            // A task restored from before token rotation may finish after a newer access token is
+            // already installed. Replay with that generation first; if it too receives 401, the
+            // recursive call still owns the single permitted fenced refresh.
+            return try await sendBackgroundAttachmentChunk(
+                path: path,
+                method: method,
+                body: body,
+                contentType: contentType,
+                headers: headers,
+                uploadID: uploadID,
+                byteOffset: byteOffset,
+                chunkSHA256: chunkSHA256,
+                allowRefresh: true,
+                boundSessionID: currentSession.sessionId
+            )
+        }
+        return try decodeEnvelope(result.body, response: response)
+    }
+
     /// Downloads opaque end-to-end encrypted bytes through the authenticated transport. The
     /// caller supplies the exact authenticated byte bound from the Signal descriptor.
     func downloadAuthenticatedData(
@@ -1252,6 +1507,75 @@ actor APIClient {
             throw APIClientError.invalidPayload(status: http.statusCode)
         }
         return data
+    }
+
+    /// URLSession streams the response to its own temporary file. Move it immediately into a
+    /// protected app-owned temporary path so the coordinator can authenticate/decrypt it without
+    /// retaining the ciphertext in memory.
+    func downloadAuthenticatedFile(
+        path: String,
+        expectedByteCount: Int64,
+        allowRefresh: Bool = true,
+        boundSessionID: String? = nil
+    ) async throws -> URL {
+        guard expectedByteCount >= SecureMessagingWire.minimumAttachmentCiphertextBytes,
+              expectedByteCount <= SecureMessagingWire.maximumAttachmentCiphertextBytes
+        else { throw APIClientError.invalidResponse }
+        let inheritedSessionID = APIClientSessionBinding.sessionID
+        if let boundSessionID,
+           let inheritedSessionID,
+           !SessionRefreshPolicy.matchesSessionID(boundSessionID, current: inheritedSessionID) {
+            throw APIClientError.signedOut
+        }
+        let requiredSessionID = boundSessionID ?? inheritedSessionID
+        guard let currentSession = await sessionStore.current() else {
+            throw APIClientError.signedOut
+        }
+        if let requiredSessionID,
+           !SessionRefreshPolicy.matchesSessionID(
+               requiredSessionID,
+               current: currentSession.sessionId
+           ) {
+            throw APIClientError.signedOut
+        }
+        var request = URLRequest(url: try endpoint(path, queryItems: []))
+        request.httpMethod = "GET"
+        request.setValue("application/octet-stream", forHTTPHeaderField: "Accept")
+        request.setValue(APIClientIdentity.currentHeader, forHTTPHeaderField: "X-Kit-Wallet-Client")
+        request.setValue(UUID().uuidString.lowercased(), forHTTPHeaderField: "X-Request-ID")
+        request.setValue("Bearer \(currentSession.accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue(currentSession.sessionId, forHTTPHeaderField: "X-Kit-Wallet-Session-ID")
+
+        let (downloadURL, response) = try await session.download(for: request)
+        guard let http = response as? HTTPURLResponse else { throw APIClientError.invalidResponse }
+        if http.statusCode == 401, allowRefresh {
+            try await refreshSession(afterRejectedSession: currentSession)
+            return try await downloadAuthenticatedFile(
+                path: path,
+                expectedByteCount: expectedByteCount,
+                allowRefresh: false,
+                boundSessionID: currentSession.sessionId
+            )
+        }
+        guard (200 ... 299).contains(http.statusCode) else {
+            let errorData = (try? Data(contentsOf: downloadURL)) ?? Data()
+            throw decodeAPIError(errorData, response: http)
+        }
+        let actual = (try FileManager.default.attributesOfItem(atPath: downloadURL.path)[.size]
+            as? NSNumber)?.int64Value
+        guard actual == expectedByteCount else {
+            throw APIClientError.invalidPayload(status: http.statusCode)
+        }
+        let retainedURL = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "kit-media-download-\(UUID().uuidString.lowercased()).ciphertext",
+            isDirectory: false
+        )
+        try FileManager.default.moveItem(at: downloadURL, to: retainedURL)
+        try? FileManager.default.setAttributes(
+            [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+            ofItemAtPath: retainedURL.path
+        )
+        return retainedURL
     }
 
     private func decodeEnvelope<Response: Decodable>(
@@ -1710,6 +2034,75 @@ private enum MultipartFormDataBody {
         body.append(fileData)
         try append("\r\n--\(boundary)--\r\n", to: &body)
         return body
+    }
+
+    static func makeFile(
+        boundary: String,
+        fields: [String: String],
+        fileField: String,
+        fileName: String,
+        fileContentType: String,
+        sourceURL: URL,
+        expectedSourceByteCount: Int64,
+        chunkBytes: Int = 256 * 1_024
+    ) throws -> URL {
+        guard isSafeToken(boundary),
+              isSafeToken(fileField),
+              isSafeToken(fileName),
+              isSafeToken(fileContentType),
+              fields.keys.allSatisfy(isSafeToken),
+              fields.values.allSatisfy({ !$0.contains("\r") && !$0.contains("\n") }),
+              expectedSourceByteCount > 0,
+              chunkBytes > 0,
+              (try FileManager.default.attributesOfItem(atPath: sourceURL.path)[.size]
+                  as? NSNumber)?.int64Value == expectedSourceByteCount
+        else { throw APIClientError.invalidResponse }
+        let destination = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "kit-multipart-\(UUID().uuidString.lowercased()).body",
+            isDirectory: false
+        )
+        _ = FileManager.default.createFile(atPath: destination.path, contents: nil)
+        do {
+            let output = try FileHandle(forWritingTo: destination)
+            defer { try? output.close() }
+            func write(_ string: String) throws {
+                guard let data = string.data(using: .utf8) else {
+                    throw APIClientError.invalidResponse
+                }
+                try output.write(contentsOf: data)
+            }
+            for (name, value) in fields.sorted(by: { $0.key < $1.key }) {
+                try write(
+                    "--\(boundary)\r\nContent-Disposition: form-data; name=\"\(name)\"\r\n\r\n\(value)\r\n"
+                )
+            }
+            try write(
+                "--\(boundary)\r\nContent-Disposition: form-data; name=\"\(fileField)\"; filename=\"\(fileName)\"\r\nContent-Type: \(fileContentType)\r\n\r\n"
+            )
+            let input = try FileHandle(forReadingFrom: sourceURL)
+            defer { try? input.close() }
+            var copied: Int64 = 0
+            while let data = try input.read(upToCount: chunkBytes), !data.isEmpty {
+                copied += Int64(data.count)
+                guard copied <= expectedSourceByteCount else {
+                    throw APIClientError.invalidResponse
+                }
+                try output.write(contentsOf: data)
+            }
+            guard copied == expectedSourceByteCount else {
+                throw APIClientError.invalidResponse
+            }
+            try write("\r\n--\(boundary)--\r\n")
+            try output.synchronize()
+            try? FileManager.default.setAttributes(
+                [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+                ofItemAtPath: destination.path
+            )
+            return destination
+        } catch {
+            try? FileManager.default.removeItem(at: destination)
+            throw error
+        }
     }
 
     private static func append(_ value: String, to data: inout Data) throws {

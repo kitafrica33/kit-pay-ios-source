@@ -527,13 +527,16 @@ struct KitMediaMessageV2OutboundBatch: Codable, Hashable, Sendable {
     struct Item: Codable, Hashable, Sendable {
         /// Fresh random canonical UUID minted at queue time. Also the §5 outer-row sort key.
         let attachmentID: String
-        let mediaType: String
-        let plaintextByteSize: Int
+        /// These three local-representation fields may change exactly once when a durable
+        /// preprocessing job publishes its output. Identity and key material never change.
+        var mediaType: String
+        var plaintextByteSize: Int
         /// The 64-byte AES+HMAC key material, minted at queue time and kept across a blob-expiry
-        /// re-upload (the ciphertext IV is fresh per encryption; the descriptor width is not).
+        /// re-upload. Idempotent uploads derive their IV from this key and the permanent media id,
+        /// reproducing the same ciphertext without persisting a second whole-file artifact.
         let keyMaterialBase64: String
-        /// Where the plaintext lives in the local encrypted blob cache right now: the park key
-        /// minted at queue time, or the previous server storage key after a blob-expiry reopen.
+        /// Where the plaintext lives in protected local storage right now: the permanent media
+        /// key minted at capture/selection time, or a durable preprocessing output key.
         var localStorageKey: String
         // UPLOADED fields — nil until the item's upload checkpoint persists all three at once.
         var storageKey: String? = nil
@@ -542,6 +545,30 @@ struct KitMediaMessageV2OutboundBatch: Codable, Hashable, Sendable {
 
         var isUploaded: Bool {
             storageKey != nil && ciphertextByteSize != nil && ciphertextSHA256 != nil
+        }
+
+        /// Rebinds a not-yet-uploaded item to an atomically published local transform output.
+        /// The containing batch is validated again by the state transition before commit.
+        func preprocessed(
+            storageKey: String,
+            mediaType: String,
+            plaintextByteSize: Int
+        ) -> Item? {
+            guard !isUploaded,
+                  self.storageKey == nil,
+                  ciphertextByteSize == nil,
+                  ciphertextSHA256 == nil,
+                  KitMediaMessageV2Descriptor.isCanonicalUUID(storageKey),
+                  storageKey != localStorageKey,
+                  KitMediaMessageV2Descriptor.allowedAttachmentMediaTypes.contains(mediaType),
+                  (1 ... KitMediaMessageV2Descriptor.maximumPlaintextBytes)
+                    .contains(plaintextByteSize)
+            else { return nil }
+            var staged = self
+            staged.localStorageKey = storageKey
+            staged.mediaType = mediaType
+            staged.plaintextByteSize = plaintextByteSize
+            return staged
         }
 
         /// The item with its server-verified upload result staged for the durable checkpoint;
@@ -565,6 +592,17 @@ struct KitMediaMessageV2OutboundBatch: Codable, Hashable, Sendable {
             staged.storageKey = storageKey
             staged.ciphertextByteSize = ciphertextByteSize
             staged.ciphertextSHA256 = ciphertextSHA256
+            return staged
+        }
+
+        /// Returns the same immutable local item with only server-derived upload facts cleared.
+        /// Used before KITMEDIA2 sealing when an exact READY replay reveals that retention swept
+        /// the old unclaimed object and allocated a fresh empty resumable session.
+        func reopeningUpload() -> Item {
+            var staged = self
+            staged.storageKey = nil
+            staged.ciphertextByteSize = nil
+            staged.ciphertextSHA256 = nil
             return staged
         }
 
@@ -596,12 +634,21 @@ struct KitMediaMessageV2OutboundBatch: Codable, Hashable, Sendable {
 
     /// What the composer hands over per attachment, in display order.
     struct DraftAttachment: Equatable, Sendable {
+        /// Stable client media identity. Composer-owned attachments provide this before any
+        /// background work starts; older/internal callers may omit it and receive a fresh id.
+        let attachmentID: String?
         let mediaType: String
         let plaintextByteSize: Int
         /// Queue-time park key in the local encrypted blob cache; canonical lowercase UUID.
         let localStorageKey: String
 
-        init(mediaType: String, plaintextByteSize: Int, localStorageKey: String) {
+        init(
+            attachmentID: String? = nil,
+            mediaType: String,
+            plaintextByteSize: Int,
+            localStorageKey: String
+        ) {
+            self.attachmentID = attachmentID
             self.mediaType = mediaType
             self.plaintextByteSize = plaintextByteSize
             self.localStorageKey = localStorageKey
@@ -639,8 +686,16 @@ struct KitMediaMessageV2OutboundBatch: Codable, Hashable, Sendable {
             .contains(attachments.count)
         else { throw QueueValidationError.invalidItems }
         let items = try attachments.map { attachment in
-            Item(
-                attachmentID: UUID().uuidString.lowercased(),
+            let mediaID: String
+            if let supplied = attachment.attachmentID {
+                guard UUID(uuidString: supplied)?.uuidString.lowercased() == supplied
+                else { throw QueueValidationError.invalidItems }
+                mediaID = supplied
+            } else {
+                mediaID = UUID().uuidString.lowercased()
+            }
+            return Item(
+                attachmentID: mediaID,
                 mediaType: attachment.mediaType,
                 plaintextByteSize: attachment.plaintextByteSize,
                 keyMaterialBase64: try keyMaterialFactory().base64EncodedString(),
@@ -667,10 +722,10 @@ struct KitMediaMessageV2OutboundBatch: Codable, Hashable, Sendable {
         return batch
     }
 
-    /// §7 blob-expiry recovery: the sealed descriptor alone reopens the batch. Ids, media
-    /// types, sizes, key material, caption, and display order are all preserved; each item's
-    /// previous storage key becomes its local plaintext pointer and the upload fields clear so
-    /// every item re-uploads under a fresh storage key with the same client message id.
+    /// §7 blob-expiry recovery skeleton. Ids, media types, sizes, key material, caption, and
+    /// display order come from the sealed descriptor. The state transition must replace each
+    /// temporary remote-key placeholder with its independently retained local original before
+    /// accepting this batch for re-upload.
     static func reopened(
         from descriptor: KitMediaMessageV2Descriptor
     ) -> KitMediaMessageV2OutboundBatch {

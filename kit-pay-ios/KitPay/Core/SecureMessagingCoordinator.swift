@@ -430,10 +430,48 @@ protocol SecureMessagingExchangeTransport: SecureMessagingActivationTransport {
         mediaType: String,
         ciphertext: Data
     ) async throws -> MessagingAttachmentUploadDTO
+    func uploadMessagingAttachment(
+        mediaType: String,
+        ciphertext: Data,
+        clientMediaID: String,
+        ciphertextSHA256: String
+    ) async throws -> MessagingAttachmentUploadDTO
+    func uploadMessagingAttachment(
+        mediaType: String,
+        ciphertextFileURL: URL,
+        ciphertextByteSize: Int64,
+        clientMediaID: String,
+        ciphertextSHA256: String
+    ) async throws -> MessagingAttachmentUploadDTO
+    func beginMessagingAttachmentUpload(
+        _ request: BeginMessagingAttachmentUploadRequest
+    ) async throws -> MessagingAttachmentUploadSessionDTO
+    func messagingAttachmentUpload(
+        id uploadID: String
+    ) async throws -> MessagingAttachmentUploadSessionDTO
+    func uploadMessagingAttachmentChunk(
+        id uploadID: String,
+        offset: Int64,
+        chunk: Data,
+        chunkSHA256: String
+    ) async throws -> MessagingAttachmentUploadChunkResultDTO
+    func uploadMessagingAttachmentChunkInBackground(
+        id uploadID: String,
+        offset: Int64,
+        chunk: Data,
+        chunkSHA256: String
+    ) async throws -> MessagingAttachmentUploadChunkResultDTO
+    func completeMessagingAttachmentUpload(
+        id uploadID: String
+    ) async throws -> MessagingAttachmentUploadSessionDTO
     func downloadMessagingAttachment(
         storageKey: String,
         expectedByteSize: Int64
     ) async throws -> Data
+    func downloadMessagingAttachmentFile(
+        storageKey: String,
+        expectedByteSize: Int64
+    ) async throws -> URL
     func syncEncryptedMessages(cursor: String?, limit: Int) async throws -> MessagingSyncDTO
     func acknowledgeMessageDelivery(
         _ request: AcknowledgeMessageDeliveryRequest
@@ -468,6 +506,97 @@ protocol SecureMessagingExchangeTransport: SecureMessagingActivationTransport {
 }
 
 extension SecureMessagingExchangeTransport {
+    /// Compatibility bridge for test transports and staged backend rollouts. Production
+    /// `APIClient` implements the keyed overload and sends both idempotency fields; older test
+    /// doubles still exercise the exact same coordinator validation through the legacy method.
+    func uploadMessagingAttachment(
+        mediaType: String,
+        ciphertext: Data,
+        clientMediaID _: String,
+        ciphertextSHA256 _: String
+    ) async throws -> MessagingAttachmentUploadDTO {
+        try await uploadMessagingAttachment(mediaType: mediaType, ciphertext: ciphertext)
+    }
+
+    func uploadMessagingAttachment(
+        mediaType: String,
+        ciphertextFileURL: URL,
+        ciphertextByteSize: Int64,
+        clientMediaID: String,
+        ciphertextSHA256: String
+    ) async throws -> MessagingAttachmentUploadDTO {
+        let data = try Data(contentsOf: ciphertextFileURL)
+        guard Int64(data.count) == ciphertextByteSize else {
+            throw SecureMediaAttachmentError.invalidCiphertext
+        }
+        return try await uploadMessagingAttachment(
+            mediaType: mediaType,
+            ciphertext: data,
+            clientMediaID: clientMediaID,
+            ciphertextSHA256: ciphertextSHA256
+        )
+    }
+
+    func beginMessagingAttachmentUpload(
+        _ request: BeginMessagingAttachmentUploadRequest
+    ) async throws -> MessagingAttachmentUploadSessionDTO {
+        throw SecureMessagingExchangeError.invalidServerResponse
+    }
+
+    func messagingAttachmentUpload(
+        id uploadID: String
+    ) async throws -> MessagingAttachmentUploadSessionDTO {
+        throw SecureMessagingExchangeError.invalidServerResponse
+    }
+
+    func uploadMessagingAttachmentChunk(
+        id uploadID: String,
+        offset: Int64,
+        chunk: Data,
+        chunkSHA256: String
+    ) async throws -> MessagingAttachmentUploadChunkResultDTO {
+        throw SecureMessagingExchangeError.invalidServerResponse
+    }
+
+    /// Test transports keep their deterministic in-memory PATCH implementation. Production
+    /// APIClient supplies the background-file witness used by the coordinator through this
+    /// protocol requirement.
+    func uploadMessagingAttachmentChunkInBackground(
+        id uploadID: String,
+        offset: Int64,
+        chunk: Data,
+        chunkSHA256: String
+    ) async throws -> MessagingAttachmentUploadChunkResultDTO {
+        try await uploadMessagingAttachmentChunk(
+            id: uploadID,
+            offset: offset,
+            chunk: chunk,
+            chunkSHA256: chunkSHA256
+        )
+    }
+
+    func completeMessagingAttachmentUpload(
+        id uploadID: String
+    ) async throws -> MessagingAttachmentUploadSessionDTO {
+        throw SecureMessagingExchangeError.invalidServerResponse
+    }
+
+    func downloadMessagingAttachmentFile(
+        storageKey: String,
+        expectedByteSize: Int64
+    ) async throws -> URL {
+        let data = try await downloadMessagingAttachment(
+            storageKey: storageKey,
+            expectedByteSize: expectedByteSize
+        )
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "kit-media-transport-\(UUID().uuidString.lowercased()).ciphertext",
+            isDirectory: false
+        )
+        try data.write(to: url, options: [.atomic, .completeFileProtectionUnlessOpen])
+        return url
+    }
+
     /// Delivery details fail closed on transports (and test doubles) that predate them, so a
     /// screen asking an older transport is told it cannot know rather than shown nothing at all.
     func messagingMessageInfo(
@@ -712,6 +841,12 @@ enum SecureMessagingHistoryContinuationPolicy {
 /// deferred pipeline against in-memory blobs.
 struct SecureMediaBlobStoreAccess {
     var read: @Sendable (_ storageKey: String, _ userID: String) async -> Data?
+    /// Metadata-only local-original validation for the immediate queue path.
+    var byteCount: @Sendable (_ storageKey: String, _ userID: String) async -> Int?
+    /// Direct file lease for sender playback. nil for legacy encrypted blobs/test stores.
+    var protectedOriginalURL: @Sendable (
+        _ storageKey: String, _ userID: String, _ expectedByteCount: Int
+    ) async -> URL?
     /// Non-overwriting duplication performed atomically inside the cache actor: existence
     /// check, byte comparison, write, and verification as one uninterrupted step. There is
     /// deliberately no overwriting copy primitive at this boundary.
@@ -724,10 +859,115 @@ struct SecureMediaBlobStoreAccess {
         _ key: String, _ keeping: String, _ userID: String
     ) async -> Bool
     var remove: @Sendable (_ storageKey: String, _ userID: String) async -> Void
+    var prepareCiphertextSpool: (@Sendable (
+        _ storageKey: String,
+        _ userID: String,
+        _ expectedPlaintextByteCount: Int,
+        _ keyMaterial: Data,
+        _ attachmentID: String
+    ) async throws -> SecureMediaCiphertextSpool?)?
+    var ciphertextSpool: (@Sendable (
+        _ storageKey: String,
+        _ userID: String,
+        _ expectedByteCount: Int64,
+        _ expectedSHA256: String
+    ) async -> SecureMediaCiphertextSpool?)?
+    var ciphertextChunk: (@Sendable (
+        _ storageKey: String,
+        _ userID: String,
+        _ expectedByteCount: Int64,
+        _ expectedSHA256: String,
+        _ offset: Int64,
+        _ maximumBytes: Int
+    ) async throws -> Data?)?
+    var removeCiphertextSpool: (@Sendable (
+        _ storageKey: String, _ userID: String
+    ) async -> Void)?
+    var storeVerifiedReceivedOriginal: (@Sendable (
+        _ ciphertextURL: URL,
+        _ storageKey: String,
+        _ userID: String,
+        _ mediaType: String,
+        _ ciphertextByteCount: Int64,
+        _ ciphertextSHA256: String,
+        _ plaintextByteCount: Int,
+        _ keyMaterial: Data
+    ) async throws -> SecureMediaProtectedFile)?
+
+    init(
+        read: @escaping @Sendable (_ storageKey: String, _ userID: String) async -> Data?,
+        byteCount: @escaping @Sendable (_ storageKey: String, _ userID: String) async -> Int?,
+        protectedOriginalURL: @escaping @Sendable (
+            _ storageKey: String, _ userID: String, _ expectedByteCount: Int
+        ) async -> URL?,
+        duplicateIfAbsent: @escaping @Sendable (
+            _ fromKey: String, _ toKey: String, _ userID: String
+        ) async -> SecureMediaDuplicateOutcome,
+        removeDuplicate: @escaping @Sendable (
+            _ key: String, _ keeping: String, _ userID: String
+        ) async -> Bool,
+        remove: @escaping @Sendable (_ storageKey: String, _ userID: String) async -> Void,
+        prepareCiphertextSpool: (@Sendable (
+            _ storageKey: String,
+            _ userID: String,
+            _ expectedPlaintextByteCount: Int,
+            _ keyMaterial: Data,
+            _ attachmentID: String
+        ) async throws -> SecureMediaCiphertextSpool?)? = nil,
+        ciphertextSpool: (@Sendable (
+            _ storageKey: String,
+            _ userID: String,
+            _ expectedByteCount: Int64,
+            _ expectedSHA256: String
+        ) async -> SecureMediaCiphertextSpool?)? = nil,
+        ciphertextChunk: (@Sendable (
+            _ storageKey: String,
+            _ userID: String,
+            _ expectedByteCount: Int64,
+            _ expectedSHA256: String,
+            _ offset: Int64,
+            _ maximumBytes: Int
+        ) async throws -> Data?)? = nil,
+        removeCiphertextSpool: (@Sendable (
+            _ storageKey: String, _ userID: String
+        ) async -> Void)? = nil,
+        storeVerifiedReceivedOriginal: (@Sendable (
+            _ ciphertextURL: URL,
+            _ storageKey: String,
+            _ userID: String,
+            _ mediaType: String,
+            _ ciphertextByteCount: Int64,
+            _ ciphertextSHA256: String,
+            _ plaintextByteCount: Int,
+            _ keyMaterial: Data
+        ) async throws -> SecureMediaProtectedFile)? = nil
+    ) {
+        self.read = read
+        self.byteCount = byteCount
+        self.protectedOriginalURL = protectedOriginalURL
+        self.duplicateIfAbsent = duplicateIfAbsent
+        self.removeDuplicate = removeDuplicate
+        self.remove = remove
+        self.prepareCiphertextSpool = prepareCiphertextSpool
+        self.ciphertextSpool = ciphertextSpool
+        self.ciphertextChunk = ciphertextChunk
+        self.removeCiphertextSpool = removeCiphertextSpool
+        self.storeVerifiedReceivedOriginal = storeVerifiedReceivedOriginal
+    }
 
     static let fileCache = SecureMediaBlobStoreAccess(
         read: { key, userID in
             await SecureMediaFileCache.shared.data(forStorageKey: key, userID: userID)
+        },
+        byteCount: { key, userID in
+            await SecureMediaFileCache.shared.byteCount(forStorageKey: key, userID: userID)
+        },
+        protectedOriginalURL: { key, userID, expectedByteCount in
+            await SecureMediaFileCache.shared.protectedOriginalURL(
+                forStorageKey: key,
+                userID: userID,
+                expectedByteCount: expectedByteCount
+            )
         },
         duplicateIfAbsent: { fromKey, toKey, userID in
             await SecureMediaFileCache.shared.duplicate(
@@ -745,9 +985,100 @@ struct SecureMediaBlobStoreAccess {
         },
         remove: { key, userID in
             await SecureMediaFileCache.shared.remove(forStorageKey: key, userID: userID)
+        },
+        prepareCiphertextSpool: { key, userID, expectedSize, keyMaterial, attachmentID in
+            try await SecureMediaFileCache.shared.prepareCiphertextSpool(
+                forStorageKey: key,
+                userID: userID,
+                expectedPlaintextByteCount: expectedSize,
+                keyMaterial: keyMaterial,
+                attachmentID: attachmentID
+            )
+        },
+        ciphertextSpool: { key, userID, expectedSize, expectedDigest in
+            await SecureMediaFileCache.shared.ciphertextSpool(
+                forStorageKey: key,
+                userID: userID,
+                expectedByteCount: expectedSize,
+                expectedSHA256: expectedDigest
+            )
+        },
+        ciphertextChunk: { key, userID, expectedSize, expectedDigest, offset, maximumBytes in
+            try await SecureMediaFileCache.shared.ciphertextChunk(
+                forStorageKey: key,
+                userID: userID,
+                expectedByteCount: expectedSize,
+                expectedSHA256: expectedDigest,
+                offset: offset,
+                maximumBytes: maximumBytes
+            )
+        },
+        removeCiphertextSpool: { key, userID in
+            await SecureMediaFileCache.shared.removeCiphertextSpool(
+                forStorageKey: key,
+                userID: userID
+            )
+        },
+        storeVerifiedReceivedOriginal: {
+            ciphertextURL, key, userID, mediaType, ciphertextSize, digest, plaintextSize, keyMaterial in
+            try await SecureMediaFileCache.shared.storeVerifiedReceivedOriginal(
+                ciphertextURL: ciphertextURL,
+                forStorageKey: key,
+                userID: userID,
+                mediaType: mediaType,
+                ciphertextByteCount: ciphertextSize,
+                ciphertextSHA256: digest,
+                plaintextByteCount: plaintextSize,
+                keyMaterial: keyMaterial
+            )
         }
     )
 }
+
+struct ValidatedMessagingAttachmentUpload: Equatable, Sendable {
+    let storageKey: String
+    let byteSize: Int64
+    let ciphertextSHA256: String
+}
+
+enum SecureMessagingAttachmentUploadResponsePolicy {
+    /// Both upload request shapes send a permanent client media id. Its response echo is
+    /// mandatory: accepting an omitted legacy echo would make timeout reconciliation unable to
+    /// prove that the returned object belongs to the queued local media record.
+    static func validate(
+        _ upload: MessagingAttachmentUploadDTO,
+        attachmentID: String,
+        ciphertextByteSize: Int64,
+        ciphertextSHA256: String
+    ) -> ValidatedMessagingAttachmentUpload? {
+        guard SecureMessagingWirePolicy.isCanonicalUUID(attachmentID),
+              let echoedClientMediaID = upload.clientMediaId,
+              echoedClientMediaID == attachmentID,
+              SecureMessagingWirePolicy.isCanonicalUUID(echoedClientMediaID),
+              let storageKey = upload.storageKey?.lowercased(),
+              SecureMessagingWirePolicy.isCanonicalUUID(storageKey),
+              let byteSize = upload.byteSize,
+              byteSize == ciphertextByteSize,
+              let digest = upload.ciphertextSha256?.lowercased(),
+              digest == ciphertextSHA256
+        else { return nil }
+        return ValidatedMessagingAttachmentUpload(
+            storageKey: storageKey,
+            byteSize: byteSize,
+            ciphertextSHA256: digest
+        )
+    }
+}
+
+struct SecureMediaHydratedFile: Equatable, Sendable {
+    let fileURL: URL
+    let storageKey: String
+    let mediaType: String
+    let plaintextByteSize: Int
+    let attachmentID: String
+}
+
+private struct ResumableAttachmentLeaseExpired: Error {}
 
 actor SecureMessagingExchangeCoordinator {
     static let shared = SecureMessagingExchangeCoordinator(
@@ -2072,6 +2403,7 @@ actor SecureMessagingExchangeCoordinator {
             // the fresh command deliberately carries no schedule, so the projection must not
             // keep claiming one.
             state.messages[messageIndex].scheduledAt = nil
+            LocalMediaRecordPolicy.markRetryPending(&state.messages[messageIndex])
             state.outbox.append(command)
         }
         if let commitAdmission {
@@ -2161,10 +2493,15 @@ actor SecureMessagingExchangeCoordinator {
         conversationID: String,
         expectedRecipientUserID: String?,
         title: String,
-        mediaData: Data,
+        mediaData: Data?,
         mediaType: String,
         caption: String?,
         localStorageKey: String? = nil,
+        localMediaID: UUID? = nil,
+        plaintextByteSize: Int? = nil,
+        localStorageKind: LocalMediaRecord.LocalStorageKind? = nil,
+        duration: TimeInterval? = nil,
+        preprocessingJob: LocalMediaPreprocessingJob? = nil,
         clientMessageID: UUID? = nil,
         submittedDraftBody: String? = nil,
         draftClearVersion: ConversationDraftWriteVersion? = nil,
@@ -2185,19 +2522,54 @@ actor SecureMessagingExchangeCoordinator {
         let trimmedCaption = caption?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let normalizedCaption = trimmedCaption?.isEmpty == false ? trimmedCaption : nil
+        let mediaByteCount = mediaData?.count ?? plaintextByteSize ?? 0
         guard SecureMessagingWire.allowedAttachmentMediaTypes.contains(mediaType),
-              !mediaData.isEmpty,
-              mediaData.count <= SecureMediaAttachmentCipher.maximumPlaintextBytes,
+              mediaByteCount > 0,
+              mediaByteCount <= SecureMediaAttachmentCipher.maximumPlaintextBytes,
+              mediaData.map({ !$0.isEmpty && $0.count == mediaByteCount }) ?? true,
               KitMediaMessageDescriptor.canEncodeCaption(normalizedCaption)
         else { throw SecureMediaAttachmentError.invalidMedia }
+        if let preprocessingJob {
+            guard mediaData == nil,
+                  preprocessingJob.isStructurallyValid,
+                  preprocessingJob.outputMediaType == mediaType,
+                  preprocessingJob.sources.first?.storageKey == localStorageKey,
+                  preprocessingJob.sources.first?.fileSize == mediaByteCount,
+                  localStorageKind == .protectedFile
+            else { throw SecureMediaAttachmentError.invalidMedia }
+        }
         // Large plaintext never rides inside the encrypted state file — the caller parks it in
         // the media file cache under a locally minted key before queueing.
-        let storesInline = mediaData.count <= KitChatMediaLimits.maximumInlineCacheBytes
+        let storesInline = mediaData != nil
+            && mediaByteCount <= KitChatMediaLimits.maximumInlineCacheBytes
         let canonicalLocalStorageKey = localStorageKey
             .flatMap { UUID(uuidString: $0)?.uuidString.lowercased() }
         if !storesInline {
             guard canonicalLocalStorageKey != nil else {
                 throw SecureMediaAttachmentError.invalidMedia
+            }
+        }
+        if mediaData == nil {
+            guard (clientMessageID == nil || preprocessingJob != nil),
+                  localMediaID?.uuidString.lowercased() == canonicalLocalStorageKey,
+                  let canonicalLocalStorageKey,
+                  await mediaBlobs.byteCount(canonicalLocalStorageKey, local) == mediaByteCount,
+                  await mediaBlobs.protectedOriginalURL(
+                      canonicalLocalStorageKey,
+                      local,
+                      mediaByteCount
+                  ) != nil
+            else { throw SecureMediaAttachmentError.invalidMedia }
+            if let preprocessingJob {
+                for source in preprocessingJob.sources {
+                    guard await mediaBlobs.byteCount(source.storageKey, local) == source.fileSize,
+                          await mediaBlobs.protectedOriginalURL(
+                              source.storageKey,
+                              local,
+                              source.fileSize
+                          ) != nil
+                    else { throw SecureMediaAttachmentError.invalidMedia }
+                }
             }
         }
         let snapshot = await store.snapshot()
@@ -2229,7 +2601,7 @@ actor SecureMessagingExchangeCoordinator {
         // No network at queue time: the offline path must succeed in airplane mode. The rich-media
         // recipient-capability gate still runs authoritatively at flush (prepareDeferredMessage)
         // and again per-encrypt in queueText before any bytes leave the device.
-        if let clientMessageID,
+        if let clientMessageID, let mediaData,
            let existing = try await existingDeferredMediaResult(
                in: snapshot,
                clientMessageID: clientMessageID,
@@ -2255,6 +2627,25 @@ actor SecureMessagingExchangeCoordinator {
         let messageID = clientMessageID ?? UUID()
         let commandID = UUID()
         let createdAt = Date()
+        let stableMediaID = localMediaID?.uuidString.lowercased()
+            ?? canonicalLocalStorageKey
+            ?? UUID().uuidString.lowercased()
+        let outboundKeyMaterial = try SecureMediaAttachmentCipher.randomKeyMaterial()
+        guard let localMediaRecord = LocalMediaRecordPolicy.queuedOutgoing(
+            id: stableMediaID,
+            messageID: messageID,
+            conversationID: conversationID,
+            mediaType: mediaType,
+            fileSize: mediaByteCount,
+            duration: duration,
+            localStorageKey: canonicalLocalStorageKey,
+            storesInline: storesInline && canonicalLocalStorageKey == nil,
+            now: createdAt,
+            outboundKeyMaterial: outboundKeyMaterial,
+            localStorageKind: localStorageKind,
+            originalSources: preprocessingJob?.sources,
+            preprocessingJob: preprocessingJob
+        ) else { throw SecureMediaAttachmentError.invalidMedia }
         // The photo is already parked in the account-bound encrypted cache; scheduling only moves
         // the upload-and-send attempt to a later minute. A fresh stale/invalid date fails closed;
         // it is never interpreted as permission to send immediately.
@@ -2264,6 +2655,11 @@ actor SecureMessagingExchangeCoordinator {
             return normalized
         }
         let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        var proposedStorageKeys = Set([canonicalLocalStorageKey].compactMap { $0 })
+        if let preprocessingJob {
+            proposedStorageKeys.formUnion(preprocessingJob.sources.map(\.storageKey))
+            proposedStorageKeys.insert(preprocessingJob.outputStorageKey)
+        }
         let localMessage = LocalMessage(
             id: messageID,
             conversationId: conversationID,
@@ -2279,8 +2675,9 @@ actor SecureMessagingExchangeCoordinator {
                 mediaType: mediaType,
                 caption: normalizedCaption,
                 localStorageKey: storesInline ? nil : canonicalLocalStorageKey,
-                byteCount: mediaData.count
+                byteCount: mediaByteCount
             ),
+            localMediaRecords: [localMediaRecord],
             replyToServerMessageID: replyTarget,
             scheduledAt: scheduledAt
         )
@@ -2297,7 +2694,8 @@ actor SecureMessagingExchangeCoordinator {
             video: nil,
             expiresAt: nil,
             secureMessageFanout: nil,
-            scheduledAt: scheduledAt
+            scheduledAt: scheduledAt,
+            awaitingMediaPreprocessing: preprocessingJob == nil ? nil : true
         )
         var updatedConversation = conversation
         if scheduledAt == nil {
@@ -2307,7 +2705,14 @@ actor SecureMessagingExchangeCoordinator {
         try await store.update { state in
             guard Self.permitsLocalQueueState(state, userID: local),
                   !state.messages.contains(where: { $0.id == messageID }),
-                  !state.outbox.contains(where: { $0.id == commandID })
+                  !state.outbox.contains(where: { $0.id == commandID }),
+                  state.messages.allSatisfy({ existing in
+                      !(existing.localMediaRecords ?? []).contains(where: {
+                          $0.id == stableMediaID
+                      })
+                          && Set(existing.localMediaStorageKeys)
+                              .isDisjoint(with: proposedStorageKeys)
+                  })
             else { throw StoreError.accountChanged }
             Self.upsert(conversation: queuedConversation, in: &state)
             state.messages.append(localMessage)
@@ -2470,6 +2875,8 @@ actor SecureMessagingExchangeCoordinator {
         expectedRecipientUserID: String?,
         title: String,
         batch: KitMediaMessageV2OutboundBatch,
+        localStorageKinds: [LocalMediaRecord.LocalStorageKind]? = nil,
+        preprocessingJobs: [LocalMediaPreprocessingJob?]? = nil,
         clientMessageID: UUID? = nil,
         submittedDraftBody: String? = nil,
         draftClearVersion: ConversationDraftWriteVersion? = nil,
@@ -2490,8 +2897,30 @@ actor SecureMessagingExchangeCoordinator {
         // The batch arrives fully minted (fresh ids, key material, parked plaintext keys) and
         // not yet uploaded anywhere; a torn or replayed value must never become durable state.
         guard batch.isStructurallyValid,
-              batch.items.allSatisfy({ !$0.isUploaded })
+              batch.items.allSatisfy({ !$0.isUploaded }),
+              localStorageKinds.map({ kinds in
+                  kinds.count == batch.items.count
+                      && kinds.allSatisfy { $0 == .encryptedBlob || $0 == .protectedFile }
+              }) ?? true,
+              preprocessingJobs.map({ $0.count == batch.items.count }) ?? true
         else { throw SecureMediaAttachmentError.invalidMedia }
+        if let preprocessingJobs {
+            for index in batch.items.indices {
+                guard let job = preprocessingJobs[index] else { continue }
+                let item = batch.items[index]
+                guard job.isStructurallyValid,
+                      job.outputMediaType == item.mediaType,
+                      job.sources.first?.storageKey == item.localStorageKey,
+                      job.sources.first?.fileSize == item.plaintextByteSize,
+                      localStorageKinds?[index] == .protectedFile
+                else { throw SecureMediaAttachmentError.invalidMedia }
+            }
+            let sourceKeys = Set(batch.items.map(\.localStorageKey))
+            let outputKeys = preprocessingJobs.compactMap { $0?.outputStorageKey }
+            guard Set(outputKeys).count == outputKeys.count,
+                  sourceKeys.isDisjoint(with: outputKeys)
+            else { throw SecureMediaAttachmentError.invalidMedia }
+        }
         let snapshot = await store.snapshot()
         guard Self.permitsLocalQueueState(snapshot, userID: local),
               let conversation = snapshot.conversations.first(where: {
@@ -2522,9 +2951,20 @@ actor SecureMessagingExchangeCoordinator {
         // commit: a torn share hand-off surfaces here, while the draft is still recoverable,
         // instead of as a visible retire at flush time.
         for item in batch.items {
-            guard let parked = await mediaBlobs.read(item.localStorageKey, local),
-                  parked.count == item.plaintextByteSize
+            guard await mediaBlobs.byteCount(item.localStorageKey, local)
+                    == item.plaintextByteSize
             else { throw SecureMediaAttachmentError.invalidMedia }
+        }
+        for job in preprocessingJobs?.compactMap({ $0 }) ?? [] {
+            for source in job.sources {
+                guard await mediaBlobs.byteCount(source.storageKey, local) == source.fileSize,
+                      await mediaBlobs.protectedOriginalURL(
+                          source.storageKey,
+                          local,
+                          source.fileSize
+                      ) != nil
+                else { throw SecureMediaAttachmentError.invalidMedia }
+            }
         }
 
         let createdAt = Date()
@@ -2533,6 +2973,12 @@ actor SecureMessagingExchangeCoordinator {
         // may since have passed while the retry is still the same send.
         let requestedMinute = deliverAt.map { ScheduledSendPolicy.canonicalMinute($0) }
         let offeredParkKeys = Set(batch.items.map(\.localStorageKey))
+        var offeredStorageKeys = offeredParkKeys
+        for job in preprocessingJobs?.compactMap({ $0 }) ?? [] {
+            offeredStorageKeys.formUnion(job.sources.map(\.storageKey))
+            offeredStorageKeys.insert(job.outputStorageKey)
+        }
+        let offeredMediaIDs = Set(batch.items.map(\.attachmentID))
 
         if let clientMessageID,
            let match = try await existingDeferredMediaBatchResult(
@@ -2557,8 +3003,12 @@ actor SecureMessagingExchangeCoordinator {
                           == (match.command.map { [$0] } ?? []),
                       state.messages.allSatisfy({
                           $0.id == clientMessageID
-                              || Set($0.localMediaStorageKeys)
-                                  .isDisjoint(with: offeredParkKeys)
+                              || (
+                                  Set($0.localMediaStorageKeys)
+                                      .isDisjoint(with: offeredStorageKeys)
+                                      && Set(($0.localMediaRecords ?? []).map(\.id))
+                                          .isDisjoint(with: offeredMediaIDs)
+                              )
                       })
                 else { throw StoreError.accountChanged }
                 if let submittedDraftBody, let draftClearVersion {
@@ -2600,6 +3050,14 @@ actor SecureMessagingExchangeCoordinator {
         let messageID = clientMessageID ?? UUID()
         let commandID = UUID()
         let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let localMediaRecords = LocalMediaRecordPolicy.queuedOutgoing(
+            batch: batch,
+            messageID: messageID,
+            conversationID: conversationID,
+            now: createdAt,
+            localStorageKinds: localStorageKinds,
+            preprocessingJobs: preprocessingJobs
+        ) else { throw SecureMediaAttachmentError.invalidMedia }
         let localMessage = LocalMessage(
             id: messageID,
             conversationId: conversationID,
@@ -2614,6 +3072,7 @@ actor SecureMessagingExchangeCoordinator {
             attachmentData: nil,
             pendingAttachment: nil,
             pendingMediaBatch: batch,
+            localMediaRecords: localMediaRecords,
             replyToServerMessageID: replyTarget,
             scheduledAt: scheduledAt
         )
@@ -2630,7 +3089,10 @@ actor SecureMessagingExchangeCoordinator {
             video: nil,
             expiresAt: nil,
             secureMessageFanout: nil,
-            scheduledAt: scheduledAt
+            scheduledAt: scheduledAt,
+            awaitingMediaPreprocessing: preprocessingJobs?.contains(where: { $0 != nil }) == true
+                ? true
+                : nil
         )
         // The blob reads above suspended the actor N times, so the opening snapshot is stale
         // by commit time. The mutation re-proves everything it makes durable against live
@@ -2645,7 +3107,9 @@ actor SecureMessagingExchangeCoordinator {
                   // stable client message id must block the append, not silently coexist.
                   !state.outbox.contains(where: { $0.messageId == messageID }),
                   state.messages.allSatisfy({
-                      Set($0.localMediaStorageKeys).isDisjoint(with: offeredParkKeys)
+                      Set($0.localMediaStorageKeys).isDisjoint(with: offeredStorageKeys)
+                          && Set(($0.localMediaRecords ?? []).map(\.id))
+                              .isDisjoint(with: offeredMediaIDs)
                   }),
                   let liveConversation = state.conversations.first(where: {
                       $0.id == conversationID
@@ -2882,6 +3346,7 @@ actor SecureMessagingExchangeCoordinator {
                   $0.id == commandID
                       && $0.kind == .secureMessage
                       && $0.secureMessageFanout == nil
+                      && $0.awaitingMediaPreprocessing != true
               }),
               let messageID = command.messageId,
               let message = snapshot.messages.first(where: { $0.id == messageID }),
@@ -2955,19 +3420,33 @@ actor SecureMessagingExchangeCoordinator {
             }
             var mediaMessageV2Items: [MessagingMediaMessageV2CapabilityPolicy.DraftItem]? = nil
             if let pending = message.pendingAttachment {
-                // Plaintext lives inline for small attachments; large deferred media was parked
-                // in the encrypted media file cache under a locally minted key at queue time.
-                let mediaData: Data
+                // New video/document/voice sends resolve only protected-file metadata here. Old
+                // inline/encrypted-blob rows retain their small compatibility representation.
+                let mediaData: Data?
+                let mediaByteCount: Int
+                var inferredStorageKind: LocalMediaRecord.LocalStorageKind? = nil
                 if let inline = message.attachmentData, !inline.isEmpty {
                     mediaData = inline
+                    mediaByteCount = inline.count
                 } else if let localKey = pending.localStorageKey,
-                          let parked = await mediaBlobs.read(localKey, local),
-                          !parked.isEmpty {
+                          let expected = pending.byteCount,
+                          expected > 0,
+                          await mediaBlobs.protectedOriginalURL(
+                              localKey,
+                              local,
+                              expected
+                          ) != nil {
+                    mediaData = nil
+                    mediaByteCount = expected
+                    inferredStorageKind = .protectedFile
+                } else if let localKey = pending.localStorageKey,
+                          let parked = await mediaBlobs.read(localKey, local), !parked.isEmpty {
                     mediaData = parked
+                    mediaByteCount = parked.count
                 } else {
                     throw SecureMediaAttachmentError.invalidMedia
                 }
-                guard mediaData.count <= SecureMediaAttachmentCipher.maximumPlaintextBytes
+                guard mediaByteCount <= SecureMediaAttachmentCipher.maximumPlaintextBytes
                 else { throw SecureMediaAttachmentError.invalidMedia }
                 // Queueing is deliberately allowed before this installation has a Signal
                 // enrollment. Activate first at flush time, then use that exact returned
@@ -2979,7 +3458,7 @@ actor SecureMessagingExchangeCoordinator {
                     throw SecureMessagingExchangeError.invalidAccount
                 }
                 if KitChatMediaKind(mediaType: pending.mediaType) != .image
-                    || mediaData.count
+                    || mediaByteCount
                         > MessagingRichMediaCapabilityPolicy
                             .broadlyCompatibleMaximumPlaintextBytes {
                     let roster = try await transport.messagingDeviceRoster(
@@ -2997,20 +3476,101 @@ actor SecureMessagingExchangeCoordinator {
                         )
                     }
                     try Self.requireLargeMediaRecipientSupport(
-                        plaintextByteSize: mediaData.count,
+                        plaintextByteSize: mediaByteCount,
                         roster: roster,
                         conversationID: conversationID,
                         currentDeviceID: enrollment.serverDeviceID,
                         memberUserIDs: conversation.memberUserIDs
                     )
                 }
-                let descriptor = try await uploadMediaDescriptor(
-                    mediaData: mediaData,
-                    mediaType: pending.mediaType,
-                    caption: pending.caption
+                guard pending.byteCount.map({ $0 == mediaByteCount }) ?? true else {
+                    throw SecureMediaAttachmentError.invalidMedia
+                }
+                var pendingMessage = message
+                var needsMediaCheckpoint = false
+                // State written before LocalMediaRecord existed is upgraded here as well as at
+                // app restore. Flush may be invoked directly during recovery/tests, and it must
+                // still persist identity plus key material before the first upload byte leaves.
+                if pendingMessage.localMediaRecords == nil {
+                    guard let recoveredRecord = LocalMediaRecordPolicy.queuedOutgoing(
+                        id: message.id.uuidString.lowercased(),
+                        messageID: message.id,
+                        conversationID: message.conversationId,
+                        mediaType: pending.mediaType,
+                        fileSize: mediaByteCount,
+                        localStorageKey: pending.localStorageKey,
+                        storesInline: message.attachmentData != nil,
+                        now: message.createdAt,
+                        localStorageKind: inferredStorageKind
+                    ) else { throw SecureMediaAttachmentError.invalidMedia }
+                    pendingMessage.localMediaRecords = [recoveredRecord]
+                    needsMediaCheckpoint = true
+                }
+                var mediaRecords = pendingMessage.localMediaRecords ?? []
+                if mediaRecords.count == 1,
+                   mediaRecords[0].outboundKeyMaterialBase64 == nil {
+                    let recoveredKeyMaterial = try SecureMediaAttachmentCipher.randomKeyMaterial()
+                    guard LocalMediaRecordPolicy.setOutboundKeyMaterial(
+                        &pendingMessage,
+                        attachmentID: mediaRecords[0].id,
+                        keyMaterial: recoveredKeyMaterial
+                    ) else { throw SecureMediaAttachmentError.invalidMedia }
+                    needsMediaCheckpoint = true
+                    mediaRecords = pendingMessage.localMediaRecords ?? []
+                }
+                if needsMediaCheckpoint {
+                    pendingMessage = try await replaceDeferredMessageProjection(
+                        pendingMessage,
+                        command: command,
+                        message: message,
+                        forUserID: local
+                    )
+                    ownedMessage = pendingMessage
+                    mediaRecords = pendingMessage.localMediaRecords ?? []
+                }
+                guard mediaRecords.count == 1,
+                      let mediaID = mediaRecords.first?.id,
+                      let keyMaterialBase64 = mediaRecords.first?.outboundKeyMaterialBase64,
+                      let keyMaterial = Data(base64Encoded: keyMaterialBase64),
+                      keyMaterial.count == SecureMediaAttachmentCipher.keyMaterialBytes,
+                      mediaRecords[0].messageID == message.id,
+                      mediaRecords[0].conversationID == message.conversationId,
+                      mediaRecords[0].mediaType == pending.mediaType,
+                      mediaRecords[0].fileSize == mediaByteCount,
+                      mediaRecords[0].isStructurallyValid
+                else { throw SecureMediaAttachmentError.invalidMedia }
+                let sourceStorageKey = mediaRecords[0].localStorageKey ?? mediaID
+                var uploadingMessage = pendingMessage
+                guard LocalMediaRecordPolicy.markUploading(
+                    &uploadingMessage,
+                    attachmentID: mediaID
+                ) else { throw SecureMediaAttachmentError.invalidMedia }
+                uploadingMessage = try await replaceDeferredMessageProjection(
+                    uploadingMessage,
+                    command: command,
+                    message: pendingMessage,
+                    forUserID: local
                 )
-                if let localKey = pending.localStorageKey {
-                    // Duplicate-then-checkpoint-then-remove: the cache actor's non-overwriting
+                ownedMessage = uploadingMessage
+                let uploaded = try await uploadDeferredMediaDescriptor(
+                    sourceStorageKey: sourceStorageKey,
+                    fallbackPlaintext: mediaData,
+                    userID: local,
+                    mediaType: pending.mediaType,
+                    plaintextByteSize: mediaByteCount,
+                    caption: pending.caption,
+                    attachmentID: mediaID,
+                    keyMaterial: keyMaterial,
+                    capabilities: nil,
+                    command: command,
+                    message: uploadingMessage
+                )
+                uploadingMessage = uploaded.message
+                ownedMessage = uploadingMessage
+                let descriptor = uploaded.descriptor
+                let shouldDuplicateLegacyBlob = mediaRecords[0].localStorageKind == .encryptedBlob
+                if shouldDuplicateLegacyBlob, let localKey = mediaRecords[0].localStorageKey {
+                    // Duplicate-then-checkpoint-and-retain: the cache actor's non-overwriting
                     // duplicate is the only write primitive here. A fresh server-issued key
                     // must land on an ABSENT destination — even byte-identical content means
                     // the key is not exclusively ours (two sends of the same bytes can collide
@@ -3032,11 +3592,12 @@ actor SecureMessagingExchangeCoordinator {
                     preparedMessage = try await checkpointDeferredImageDescriptor(
                         descriptor,
                         command: command,
-                        message: message,
+                        message: uploadingMessage,
                         forUserID: local
                     )
                 } catch {
-                    if let localKey = pending.localStorageKey {
+                    if shouldDuplicateLegacyBlob,
+                       let localKey = mediaRecords[0].localStorageKey {
                         _ = await mediaBlobs.removeDuplicate(
                             descriptor.storageKey,
                             localKey,
@@ -3045,13 +3606,12 @@ actor SecureMessagingExchangeCoordinator {
                     }
                     throw error
                 }
-                if let localKey = pending.localStorageKey {
-                    _ = await mediaBlobs.removeDuplicate(
-                        localKey,
-                        descriptor.storageKey,
-                        local
-                    )
+                if let removeSpool = mediaBlobs.removeCiphertextSpool {
+                    await removeSpool(mediaID, local)
                 }
+                // The server-keyed cache copy accelerates legacy/open paths, but the stable
+                // client-keyed original remains the sender's source of truth until explicit
+                // local deletion. Upload completion must never take local playback away.
                 ownedMessage = preparedMessage
             } else if message.pendingMediaBatch != nil {
                 guard var batch = message.pendingMediaBatch,
@@ -3093,102 +3653,232 @@ actor SecureMessagingExchangeCoordinator {
                 // §5/§7: ciphertext leaves the device in ascending fresh-random attachment-id
                 // order — never display order — and each uploaded item becomes durable in its
                 // own checkpoint so a crash resumes exactly where the last checkpoint stopped.
-                for index in batch.pendingUploadIndicesInUploadOrder {
-                    let item = batch.items[index]
-                    guard let keyMaterial = Data(base64Encoded: item.keyMaterialBase64),
-                          keyMaterial.count == SecureMediaAttachmentCipher.keyMaterialBytes,
-                          let plaintext = await mediaBlobs.read(item.localStorageKey, local),
-                          plaintext.count == item.plaintextByteSize
-                    else { throw SecureMediaAttachmentError.invalidMedia }
-                    let encrypted = try await Task.detached(priority: .userInitiated) {
-                        try SecureMediaAttachmentCipher.encrypt(
-                            plaintext,
-                            keyMaterial: keyMaterial
+                var preflightReplacementIDs = Set<String>()
+                batchUploadAndRenewal: while true {
+                    for index in batch.pendingUploadIndicesInUploadOrder {
+                        let item = batch.items[index]
+                        guard let keyMaterial = Data(base64Encoded: item.keyMaterialBase64),
+                              keyMaterial.count == SecureMediaAttachmentCipher.keyMaterialBytes,
+                              let mediaRecord = (currentMessage.localMediaRecords ?? [])
+                                .first(where: { $0.id == item.attachmentID }),
+                              mediaRecord.localStorageKey == item.localStorageKey,
+                              await mediaBlobs.byteCount(item.localStorageKey, local)
+                                  == item.plaintextByteSize
+                        else { throw SecureMediaAttachmentError.invalidMedia }
+                        let plaintext: Data?
+                        if mediaRecord.localStorageKind == .protectedFile {
+                            guard await mediaBlobs.protectedOriginalURL(
+                                item.localStorageKey,
+                                local,
+                                item.plaintextByteSize
+                            ) != nil else { throw SecureMediaAttachmentError.invalidMedia }
+                            plaintext = nil
+                        } else {
+                            plaintext = await mediaBlobs.read(item.localStorageKey, local)
+                            guard plaintext?.count == item.plaintextByteSize else {
+                                throw SecureMediaAttachmentError.invalidMedia
+                            }
+                        }
+                        // A swept READY lease reopens this item without changing its durable
+                        // record from `.uploading`. Likewise, a process can terminate after the
+                        // uploading checkpoint but before the batch checkpoint. Both resume from
+                        // the retained deterministic spool instead of trying an invalid second
+                        // `.pending` -> `.uploading` transition.
+                        if mediaRecord.uploadState != .uploading {
+                            var uploadingMessage = currentMessage
+                            guard LocalMediaRecordPolicy.markUploading(
+                                &uploadingMessage,
+                                attachmentID: item.attachmentID
+                            ) else { throw SecureMediaAttachmentError.invalidMedia }
+                            currentMessage = try await replaceDeferredMessageProjection(
+                                uploadingMessage,
+                                command: command,
+                                message: currentMessage,
+                                forUserID: local
+                            )
+                            ownedMessage = currentMessage
+                        }
+                        let uploaded = try await uploadDeferredMediaDescriptor(
+                            sourceStorageKey: item.localStorageKey,
+                            fallbackPlaintext: plaintext,
+                            userID: local,
+                            mediaType: item.mediaType,
+                            plaintextByteSize: item.plaintextByteSize,
+                            caption: nil,
+                            attachmentID: item.attachmentID,
+                            keyMaterial: keyMaterial,
+                            capabilities: capabilities,
+                            command: command,
+                            message: currentMessage
                         )
-                    }.value
-                    let upload = try await transport.uploadMessagingAttachment(
-                        mediaType: item.mediaType,
-                        ciphertext: encrypted.ciphertext
-                    )
-                    guard let storageKey = upload.storageKey?.lowercased(),
-                          let byteSize = upload.byteSize,
-                          let digest = upload.ciphertextSha256?.lowercased(),
-                          SecureMessagingWirePolicy.isCanonicalUUID(storageKey),
-                          byteSize == Int64(encrypted.ciphertext.count),
-                          digest == encrypted.sha256Hex,
-                          let uploadedItem = item.uploaded(
-                              storageKey: storageKey,
-                              ciphertextByteSize: byteSize,
-                              ciphertextSHA256: digest
-                          )
-                    else { throw SecureMediaAttachmentError.serverMetadataMismatch }
-                    // Stage the checkpoint candidate and prove global key distinctness BEFORE
-                    // copying: a colliding server-issued storage key must never overwrite
-                    // another item's parked plaintext or retained copy.
-                    var stagedBatch = batch
-                    stagedBatch.items[index] = uploadedItem
-                    guard stagedBatch.isStructurallyValid else {
-                        throw SecureMediaAttachmentError.serverMetadataMismatch
+                        currentMessage = uploaded.message
+                        ownedMessage = currentMessage
+                        let descriptor = uploaded.descriptor
+                        let storageKey = descriptor.storageKey
+                        let byteSize = descriptor.ciphertextByteSize
+                        let digest = descriptor.ciphertextSHA256
+                        guard
+                              let uploadedItem = item.uploaded(
+                                  storageKey: storageKey,
+                                  ciphertextByteSize: byteSize,
+                                  ciphertextSHA256: digest
+                              )
+                        else { throw SecureMediaAttachmentError.serverMetadataMismatch }
+                        // Stage the checkpoint candidate and prove global key distinctness BEFORE
+                        // copying: a colliding server-issued storage key must never overwrite
+                        // another item's parked plaintext or retained copy.
+                        var stagedBatch = batch
+                        stagedBatch.items[index] = uploadedItem
+                        guard stagedBatch.isStructurallyValid else {
+                            throw SecureMediaAttachmentError.serverMetadataMismatch
+                        }
+                        // A server-issued key that aliases ANY other live message's blob must
+                        // still fail here — the non-overwriting duplicate protects the bytes, but
+                        // only this state-level proof keeps a foreign message's key out of our
+                        // durable projection; the checkpoint mutation below re-proves the same
+                        // distinctness after this read suspends the actor.
+                        let liveState = await store.snapshot()
+                        guard liveState.profile?.id == local,
+                              liveState.messages.allSatisfy({
+                                  $0.id == messageID
+                                      || !$0.localMediaStorageKeys.contains(storageKey)
+                              })
+                        else { throw SecureMediaAttachmentError.serverMetadataMismatch }
+                        // Duplicate-then-checkpoint-and-retain, exactly like single-attachment
+                        // media. A fresh, not-yet-checkpointed key must land on an ABSENT
+                        // destination: two messages can carry byte-identical plaintext, so
+                        // `.alreadyIdentical` here could be the OTHER message's checkpointed blob
+                        // — accepting it would let this message's failed-checkpoint unwind delete
+                        // that live blob. Only `.stored` proves exclusive ownership, which is what
+                        // licenses the unwind. The permanent client-keyed original remains after a
+                        // successful checkpoint and is removed only by explicit local deletion.
+                        let shouldDuplicateLegacyBlob = mediaRecord.localStorageKind
+                            == .encryptedBlob
+                        if shouldDuplicateLegacyBlob {
+                            switch await mediaBlobs.duplicateIfAbsent(
+                                item.localStorageKey,
+                                storageKey,
+                                local
+                            ) {
+                            case .stored:
+                                break
+                            case .alreadyIdentical, .conflict, .sourceMissing:
+                                throw SecureMediaAttachmentError.serverMetadataMismatch
+                            }
+                        }
+                        var checkpointed = currentMessage
+                        checkpointed.pendingMediaBatch = stagedBatch
+                        do {
+                            currentMessage = try await replaceDeferredMessageProjection(
+                                checkpointed,
+                                command: command,
+                                message: currentMessage,
+                                forUserID: local,
+                                requiringDistinctCacheKeys: [storageKey]
+                            )
+                        } catch {
+                            if shouldDuplicateLegacyBlob {
+                                _ = await mediaBlobs.removeDuplicate(
+                                    storageKey,
+                                    item.localStorageKey,
+                                    local
+                                )
+                            }
+                            throw error
+                        }
+                        batch = stagedBatch
+                        ownedMessage = currentMessage
                     }
-                    // A server-issued key that aliases ANY other live message's blob must
-                    // still fail here — the non-overwriting duplicate protects the bytes, but
-                    // only this state-level proof keeps a foreign message's key out of our
-                    // durable projection; the checkpoint mutation below re-proves the same
-                    // distinctness after this read suspends the actor.
-                    let liveState = await store.snapshot()
-                    guard liveState.profile?.id == local,
-                          liveState.messages.allSatisfy({
-                              $0.id == messageID
-                                  || !$0.localMediaStorageKeys.contains(storageKey)
-                          })
-                    else { throw SecureMediaAttachmentError.serverMetadataMismatch }
-                    // Duplicate-then-checkpoint-then-remove, exactly like single-attachment
-                    // media. A fresh, not-yet-checkpointed key must land on an ABSENT
-                    // destination: two messages can carry byte-identical plaintext, so
-                    // `.alreadyIdentical` here could be the OTHER message's checkpointed blob
-                    // — accepting it would let this message's failed-checkpoint unwind delete
-                    // that live blob. Only `.stored` proves exclusive ownership, which is what
-                    // licenses the unwind; the park delete afterwards is licensed separately
-                    // by byte-identical survival under the checkpointed key.
-                    switch await mediaBlobs.duplicateIfAbsent(
-                        item.localStorageKey,
-                        storageKey,
-                        local
-                    ) {
-                    case .stored:
-                        break
-                    case .alreadyIdentical, .conflict, .sourceMissing:
-                        throw SecureMediaAttachmentError.serverMetadataMismatch
-                    }
-                    var checkpointed = currentMessage
-                    checkpointed.pendingMediaBatch = stagedBatch
-                    do {
+
+                    // An early item can sit READY while later large items upload. Replay every
+                    // exact resumable declaration only after the whole batch is ready and
+                    // immediately before sealing. A live lease renews in place. If retention
+                    // swept one, persist the fresh empty session, clear only that item's
+                    // server-derived batch fields, and refill it from retained ciphertext without
+                    // changing media/message identity or key material.
+                    var shouldRestartUploadPass = false
+                    let advertisedChunkBytes = capabilities.protocols?.messaging?
+                        .resumableAttachments?.validatedMaximumChunkBytes
+                    for index in batch.items.indices {
+                        let item = batch.items[index]
+                        guard item.isUploaded,
+                              let storageKey = item.storageKey,
+                              let ciphertextByteSize = item.ciphertextByteSize,
+                              let ciphertextSHA256 = item.ciphertextSHA256,
+                              let record = (currentMessage.localMediaRecords ?? []).first(where: {
+                                  $0.id == item.attachmentID
+                              }),
+                              record.resumableUpload != nil
+                        else { continue }
+                        let preflight = try await transport.beginMessagingAttachmentUpload(
+                            BeginMessagingAttachmentUploadRequest(
+                                clientMediaId: item.attachmentID,
+                                mediaType: item.mediaType,
+                                byteSize: ciphertextByteSize,
+                                ciphertextSha256: ciphertextSHA256
+                            )
+                        )
+                        let renewed = try Self.validatedResumableLeasePreflight(
+                            preflight,
+                            attachmentID: item.attachmentID,
+                            mediaType: item.mediaType,
+                            byteSize: ciphertextByteSize,
+                            digest: ciphertextSHA256,
+                            advertisedChunkBytes: advertisedChunkBytes,
+                            previousStorageKey: storageKey
+                        )
+                        var renewedMessage = currentMessage
+                        guard LocalMediaRecordPolicy.setResumableUpload(
+                            &renewedMessage,
+                            attachmentID: item.attachmentID,
+                            checkpoint: renewed
+                        ) else { throw SecureMediaAttachmentError.serverMetadataMismatch }
+                        if renewed.nextOffset < ciphertextByteSize {
+                            guard preflightReplacementIDs.insert(item.attachmentID).inserted else {
+                                throw ResumableAttachmentLeaseExpired()
+                            }
+                            var reopenedBatch = batch
+                            reopenedBatch.items[index] = item.reopeningUpload()
+                            guard reopenedBatch.isStructurallyValid else {
+                                throw SecureMediaAttachmentError.serverMetadataMismatch
+                            }
+                            renewedMessage.pendingMediaBatch = reopenedBatch
+                            currentMessage = try await replaceDeferredMessageProjection(
+                                renewedMessage,
+                                command: command,
+                                message: currentMessage,
+                                forUserID: local,
+                                requiringDistinctCacheKeys: reopenedBatch.items
+                                    .compactMap(\.storageKey)
+                            )
+                            if record.localStorageKind == .encryptedBlob {
+                                _ = await mediaBlobs.removeDuplicate(
+                                    storageKey,
+                                    item.localStorageKey,
+                                    local
+                                )
+                            }
+                            batch = reopenedBatch
+                            ownedMessage = currentMessage
+                            shouldRestartUploadPass = true
+                            break
+                        }
                         currentMessage = try await replaceDeferredMessageProjection(
-                            checkpointed,
+                            renewedMessage,
                             command: command,
                             message: currentMessage,
                             forUserID: local,
-                            requiringDistinctCacheKeys: [storageKey]
+                            requiringDistinctCacheKeys: batch.items.compactMap(\.storageKey)
                         )
-                    } catch {
-                        _ = await mediaBlobs.removeDuplicate(
-                            storageKey,
-                            item.localStorageKey,
-                            local
-                        )
-                        throw error
+                        ownedMessage = currentMessage
                     }
-                    batch = stagedBatch
-                    ownedMessage = currentMessage
-                    _ = await mediaBlobs.removeDuplicate(
-                        item.localStorageKey,
-                        storageKey,
-                        local
-                    )
+                    if shouldRestartUploadPass { continue batchUploadAndRenewal }
+
+                    break batchUploadAndRenewal
                 }
                 // The awaits since the last checkpoint suspended the actor; re-prove the exact
                 // projection and account-wide key ownership once more immediately before the
-                // destructive reconcile pass below and the seal after it.
+                // cache reconcile pass below and the seal after it.
                 currentMessage = try await replaceDeferredMessageProjection(
                     currentMessage,
                     command: command,
@@ -3196,18 +3886,17 @@ actor SecureMessagingExchangeCoordinator {
                     forUserID: local,
                     requiringDistinctCacheKeys: batch.items.compactMap(\.storageKey)
                 )
-                // Crash-resume reconciliation: an item checkpointed by an earlier pass may
-                // have died before its park blob was removed. Sealing clears the batch, so
-                // stale park keys must go now or they orphan in the encrypted cache forever.
-                // Every write here is the cache actor's non-overwriting duplicate and every
-                // delete is its byte-identical-survivor license, so nothing in this pass can
-                // destroy information whatever raced in between; byte-different content under
-                // a checkpointed key fails the whole prepare closed instead of being
-                // overwritten. When the park is already gone there is nothing to license: the
-                // retained copy was written by this pipeline from queue-verified bytes, the
-                // frozen descriptor carries no plaintext digest to re-prove it against, and
-                // no destructive action rides on trusting it.
+                // Crash-resume reconciliation: ensure each checkpointed item also has its
+                // server-keyed cache copy before sealing, while retaining the permanent
+                // client-keyed original. Every write is non-overwriting; byte-different content
+                // under a checkpointed key fails closed instead of being replaced. If the
+                // original is absent there is no safe source for repair, so sealing relies on the
+                // already-checkpointed descriptor rather than making a destructive guess.
                 for item in batch.items where item.isUploaded {
+                    let localKind = (currentMessage.localMediaRecords ?? []).first(where: {
+                        $0.id == item.attachmentID
+                    })?.localStorageKind
+                    guard localKind == .encryptedBlob else { continue }
                     guard let storageKey = item.storageKey,
                           storageKey != item.localStorageKey,
                           let parked = await mediaBlobs.read(item.localStorageKey, local),
@@ -3248,11 +3937,9 @@ actor SecureMessagingExchangeCoordinator {
                     case .conflict, .sourceMissing:
                         throw SecureMediaAttachmentError.serverMetadataMismatch
                     }
-                    _ = await mediaBlobs.removeDuplicate(
-                        item.localStorageKey,
-                        storageKey,
-                        local
-                    )
+                    // Keep the stable client-keyed original alongside the server-keyed copy.
+                    // It is the sender's independent local source for playback and a future
+                    // re-upload; deletion removes both through `localMediaStorageKeys`.
                 }
                 // SEALED (§7): the canonical descriptor becomes the durable body before any
                 // Signal encryption; from here retries re-derive everything from the body.
@@ -3262,6 +3949,18 @@ actor SecureMessagingExchangeCoordinator {
                 var sealedMessage = currentMessage
                 sealedMessage.body = sealed.encoded
                 sealedMessage.pendingMediaBatch = nil
+                // Seal the descriptor and mark every record uploaded in one durable projection.
+                // Until this CAS succeeds, resumable checkpoints and ciphertext-spool facts stay
+                // available for another final lease preflight after interruption.
+                for item in batch.items {
+                    guard let storageKey = item.storageKey,
+                          LocalMediaRecordPolicy.markUploaded(
+                              &sealedMessage,
+                              attachmentID: item.attachmentID,
+                              remoteStorageKey: storageKey
+                          )
+                    else { throw SecureMediaAttachmentError.invalidMedia }
+                }
                 preparedMessage = try await replaceDeferredMessageProjection(
                     sealedMessage,
                     command: command,
@@ -3270,6 +3969,9 @@ actor SecureMessagingExchangeCoordinator {
                     requiringDistinctCacheKeys: batch.items.compactMap(\.storageKey)
                 )
                 ownedMessage = preparedMessage
+                if let removeSpool = mediaBlobs.removeCiphertextSpool {
+                    for item in batch.items { await removeSpool(item.attachmentID, local) }
+                }
                 mediaMessageV2Items = draftItems
             } else if let sealed = KitMediaMessageV2Descriptor.parse(message.body) {
                 // A sealed v2 message resuming after a crash or a blob-expiry reopen that
@@ -3443,37 +4145,571 @@ actor SecureMessagingExchangeCoordinator {
     private func uploadMediaDescriptor(
         mediaData: Data,
         mediaType: String,
-        caption: String?
+        caption: String?,
+        attachmentID: String? = nil,
+        keyMaterial suppliedKeyMaterial: Data? = nil
     ) async throws -> KitMediaMessageDescriptor {
         guard SecureMessagingWire.allowedAttachmentMediaTypes.contains(mediaType),
               !mediaData.isEmpty,
               mediaData.count <= SecureMediaAttachmentCipher.maximumPlaintextBytes,
               KitMediaMessageDescriptor.canEncodeCaption(caption)
         else { throw SecureMediaAttachmentError.invalidMedia }
+        let attachmentID = attachmentID.flatMap {
+            UUID(uuidString: $0)?.uuidString.lowercased()
+        } ?? UUID().uuidString.lowercased()
+        let keyMaterial = try suppliedKeyMaterial
+            ?? SecureMediaAttachmentCipher.randomKeyMaterial()
         let encrypted = try await Task.detached(priority: .userInitiated) {
-            try SecureMediaAttachmentCipher.encrypt(mediaData)
+            try SecureMediaAttachmentCipher.encrypt(
+                mediaData,
+                keyMaterial: keyMaterial,
+                attachmentID: attachmentID
+            )
         }.value
         let upload = try await transport.uploadMessagingAttachment(
             mediaType: mediaType,
-            ciphertext: encrypted.ciphertext
+            ciphertext: encrypted.ciphertext,
+            clientMediaID: attachmentID,
+            ciphertextSHA256: encrypted.sha256Hex
         )
-        guard let storageKey = upload.storageKey?.lowercased(),
-              let byteSize = upload.byteSize,
-              let digest = upload.ciphertextSha256?.lowercased(),
-              SecureMessagingWirePolicy.isCanonicalUUID(storageKey),
-              byteSize == Int64(encrypted.ciphertext.count),
-              digest == encrypted.sha256Hex
+        guard let validated = SecureMessagingAttachmentUploadResponsePolicy.validate(
+            upload,
+            attachmentID: attachmentID,
+            ciphertextByteSize: Int64(encrypted.ciphertext.count),
+            ciphertextSHA256: encrypted.sha256Hex
+        )
         else { throw SecureMediaAttachmentError.serverMetadataMismatch }
         return try KitMediaMessageDescriptor(
-            attachmentID: UUID().uuidString.lowercased(),
-            storageKey: storageKey,
+            attachmentID: attachmentID,
+            storageKey: validated.storageKey,
             mediaType: mediaType,
-            ciphertextByteSize: byteSize,
-            ciphertextSHA256: digest,
+            ciphertextByteSize: validated.byteSize,
+            ciphertextSHA256: validated.ciphertextSHA256,
             keyMaterial: encrypted.keyMaterial,
             plaintextByteSize: encrypted.plaintextByteSize,
             caption: caption
         )
+    }
+
+    /// File-first counterpart used by every durable outbox attachment. A deterministic encrypted
+    /// spool is checkpointed before any upload byte leaves; resumable sessions then checkpoint
+    /// each authoritative ciphertext offset. Test/legacy stores without file support retain the
+    /// bounded compatibility path for their small in-memory fixtures.
+    private func uploadDeferredMediaDescriptor(
+        sourceStorageKey: String,
+        fallbackPlaintext: Data?,
+        userID: String,
+        mediaType: String,
+        plaintextByteSize: Int,
+        caption: String?,
+        attachmentID: String,
+        keyMaterial: Data,
+        capabilities suppliedCapabilities: CapabilitiesDTO?,
+        command: OfflineCommand,
+        message: LocalMessage
+    ) async throws -> (descriptor: KitMediaMessageDescriptor, message: LocalMessage) {
+        guard SecureMessagingWirePolicy.isCanonicalUUID(sourceStorageKey),
+              SecureMessagingWirePolicy.isCanonicalUUID(attachmentID),
+              SecureMessagingWire.allowedAttachmentMediaTypes.contains(mediaType),
+              (1 ... SecureMediaAttachmentCipher.maximumPlaintextBytes)
+                  .contains(plaintextByteSize),
+              keyMaterial.count == SecureMediaAttachmentCipher.keyMaterialBytes,
+              KitMediaMessageDescriptor.canEncodeCaption(caption)
+        else { throw SecureMediaAttachmentError.invalidMedia }
+
+        var currentMessage = message
+        let existingRecord = (currentMessage.localMediaRecords ?? []).first {
+            $0.id == attachmentID
+        }
+        guard existingRecord?.messageID == message.id,
+              existingRecord?.conversationID == message.conversationId,
+              existingRecord?.mediaType == mediaType,
+              existingRecord?.fileSize == plaintextByteSize
+        else { throw SecureMediaAttachmentError.invalidMedia }
+
+        // Capability discovery and local encryption are independent. Start the network read as
+        // soon as a file-backed item is known to use the spool path; no upload is selected or
+        // attempted until the authenticated document is awaited and validated below.
+        let capabilityTask: Task<CapabilitiesDTO, Error>? = {
+            guard suppliedCapabilities == nil,
+                  existingRecord?.localStorageKind == .protectedFile,
+                  mediaBlobs.prepareCiphertextSpool != nil
+            else { return nil }
+            let transport = self.transport
+            return Task.detached(priority: .utility) {
+                try await transport.capabilities()
+            }
+        }()
+        defer { capabilityTask?.cancel() }
+
+        var spool: SecureMediaCiphertextSpool?
+        if let byteSize = existingRecord?.ciphertextSpoolByteSize,
+           let digest = existingRecord?.ciphertextSpoolSHA256,
+           let loadSpool = mediaBlobs.ciphertextSpool {
+            spool = await loadSpool(attachmentID, userID, byteSize, digest)
+        }
+        if spool == nil, let prepareSpool = mediaBlobs.prepareCiphertextSpool {
+            spool = try await prepareSpool(
+                sourceStorageKey,
+                userID,
+                plaintextByteSize,
+                keyMaterial,
+                attachmentID
+            )
+            if let spool {
+                var checkpointed = currentMessage
+                guard spool.plaintextByteSize == plaintextByteSize,
+                      LocalMediaRecordPolicy.setCiphertextSpool(
+                          &checkpointed,
+                          attachmentID: attachmentID,
+                          byteSize: spool.byteSize,
+                          sha256: spool.sha256Hex
+                      )
+                else { throw SecureMediaAttachmentError.invalidMedia }
+                currentMessage = try await replaceDeferredMessageProjection(
+                    checkpointed,
+                    command: command,
+                    message: currentMessage,
+                    forUserID: userID
+                )
+                if let mediaID = UUID(uuidString: attachmentID) {
+                    await LocalMediaPerformanceMonitor.shared.markEncrypted(mediaID: mediaID)
+                }
+            }
+        }
+
+        let upload: MessagingAttachmentUploadDTO
+        let ciphertextByteSize: Int64
+        let ciphertextSHA256: String
+        if let spool {
+            ciphertextByteSize = spool.byteSize
+            ciphertextSHA256 = spool.sha256Hex
+            let capabilities: CapabilitiesDTO
+            if let suppliedCapabilities {
+                capabilities = suppliedCapabilities
+            } else if let capabilityTask {
+                capabilities = try await capabilityTask.value
+            } else {
+                capabilities = try await transport.capabilities()
+            }
+            let advertisedChunkBytes = capabilities.protocols?.messaging?
+                .resumableAttachments?.validatedMaximumChunkBytes
+            let record = (currentMessage.localMediaRecords ?? []).first {
+                $0.id == attachmentID
+            }
+            if record?.resumableUpload != nil || advertisedChunkBytes != nil {
+                guard let readChunk = mediaBlobs.ciphertextChunk else {
+                    throw SecureMediaAttachmentError.invalidMedia
+                }
+                var resolvedUpload: MessagingAttachmentUploadDTO?
+                var mayRestartExpiredLease = true
+                var expectedUploadID = record?.resumableUpload?.uploadID
+                var expectedStorageKey = record?.resumableUpload?.storageKey
+                leaseLoop: while resolvedUpload == nil {
+                    do {
+                        let session: MessagingAttachmentUploadSessionDTO
+                        if let expectedUploadID {
+                            session = try await transport.messagingAttachmentUpload(
+                                id: expectedUploadID
+                            )
+                        } else {
+                            session = try await transport.beginMessagingAttachmentUpload(
+                                BeginMessagingAttachmentUploadRequest(
+                                    clientMediaId: attachmentID,
+                                    mediaType: mediaType,
+                                    byteSize: spool.byteSize,
+                                    ciphertextSha256: spool.sha256Hex
+                                )
+                            )
+                        }
+                        if session.state == "expired" {
+                            guard expiredResumableSessionMatches(
+                                session,
+                                attachmentID: attachmentID,
+                                mediaType: mediaType,
+                                byteSize: spool.byteSize,
+                                digest: spool.sha256Hex,
+                                expectedUploadID: expectedUploadID,
+                                expectedStorageKey: expectedStorageKey
+                            ) else {
+                                throw SecureMediaAttachmentError.serverMetadataMismatch
+                            }
+                            throw ResumableAttachmentLeaseExpired()
+                        }
+                        var checkpoint = try Self.validatedResumableCheckpoint(
+                            session,
+                            attachmentID: attachmentID,
+                            mediaType: mediaType,
+                            byteSize: spool.byteSize,
+                            digest: spool.sha256Hex,
+                            advertisedChunkBytes: advertisedChunkBytes,
+                            expectedUploadID: expectedUploadID,
+                            expectedStorageKey: expectedStorageKey
+                        )
+                        var checkpointed = currentMessage
+                        guard LocalMediaRecordPolicy.setResumableUpload(
+                            &checkpointed,
+                            attachmentID: attachmentID,
+                            checkpoint: checkpoint
+                        ) else { throw SecureMediaAttachmentError.serverMetadataMismatch }
+                        currentMessage = try await replaceDeferredMessageProjection(
+                            checkpointed,
+                            command: command,
+                            message: currentMessage,
+                            forUserID: userID
+                        )
+
+                        while checkpoint.nextOffset < spool.byteSize {
+                            try Task.checkCancellation()
+                            guard let chunkLength = MessagingResumableAttachmentPolicy.chunkLength(
+                                remaining: spool.byteSize - checkpoint.nextOffset,
+                                serverMaximum: checkpoint.maxChunkBytes
+                            ), let chunk = try await readChunk(
+                                attachmentID,
+                                userID,
+                                spool.byteSize,
+                                spool.sha256Hex,
+                                checkpoint.nextOffset,
+                                chunkLength
+                            ), chunk.count == chunkLength
+                            else { throw SecureMediaAttachmentError.invalidCiphertext }
+                            let offsetBeforeChunk = checkpoint.nextOffset
+                            let response = try await transport
+                                .uploadMessagingAttachmentChunkInBackground(
+                                id: checkpoint.uploadID,
+                                offset: offsetBeforeChunk,
+                                chunk: chunk,
+                                chunkSHA256: SecureMessagingValidation.sha256Hex(chunk)
+                            )
+                            guard let responseUpload = MessagingResumableAttachmentPolicy
+                                .validatedChunkUpload(
+                                    response,
+                                    expectedOffset: offsetBeforeChunk,
+                                    expectedByteSize: chunk.count,
+                                    expectedSHA256: SecureMessagingValidation.sha256Hex(chunk)
+                                )
+                            else { throw SecureMediaAttachmentError.serverMetadataMismatch }
+                            checkpoint = try Self.validatedResumableCheckpoint(
+                                responseUpload,
+                                attachmentID: attachmentID,
+                                mediaType: mediaType,
+                                byteSize: spool.byteSize,
+                                digest: spool.sha256Hex,
+                                advertisedChunkBytes: advertisedChunkBytes,
+                                expectedUploadID: checkpoint.uploadID,
+                                expectedStorageKey: checkpoint.storageKey
+                            )
+                            guard checkpoint.nextOffset
+                                    == offsetBeforeChunk + Int64(chunk.count)
+                            else { throw SecureMediaAttachmentError.serverMetadataMismatch }
+                            var offsetCheckpoint = currentMessage
+                            guard LocalMediaRecordPolicy.setResumableUpload(
+                                &offsetCheckpoint,
+                                attachmentID: attachmentID,
+                                checkpoint: checkpoint
+                            ) else { throw SecureMediaAttachmentError.serverMetadataMismatch }
+                            currentMessage = try await replaceDeferredMessageProjection(
+                                offsetCheckpoint,
+                                command: command,
+                                message: currentMessage,
+                                forUserID: userID
+                            )
+                        }
+                        let completed = try await transport.completeMessagingAttachmentUpload(
+                            id: checkpoint.uploadID
+                        )
+                        let completedCheckpoint = try Self.validatedResumableCheckpoint(
+                            completed,
+                            attachmentID: attachmentID,
+                            mediaType: mediaType,
+                            byteSize: spool.byteSize,
+                            digest: spool.sha256Hex,
+                            advertisedChunkBytes: advertisedChunkBytes,
+                            expectedUploadID: checkpoint.uploadID,
+                            expectedStorageKey: checkpoint.storageKey,
+                            requiresComplete: true
+                        )
+                        guard completedCheckpoint.nextOffset == spool.byteSize,
+                              let completedStorageKey = completedCheckpoint.storageKey
+                        else { throw SecureMediaAttachmentError.serverMetadataMismatch }
+
+                        // GET and /complete prove byte receipt but do not renew an unclaimed
+                        // READY lease. Replay the exact immutable declaration immediately before
+                        // returning a descriptor for Signal sealing. The backend renews an exact
+                        // READY replay in place; if retention swept the row between completion
+                        // and this preflight it returns a fresh empty session, which we checkpoint
+                        // and refill from the retained deterministic ciphertext spool.
+                        let preflight = try await transport.beginMessagingAttachmentUpload(
+                            BeginMessagingAttachmentUploadRequest(
+                                clientMediaId: attachmentID,
+                                mediaType: mediaType,
+                                byteSize: spool.byteSize,
+                                ciphertextSha256: spool.sha256Hex
+                            )
+                        )
+                        checkpoint = try Self.validatedResumableLeasePreflight(
+                            preflight,
+                            attachmentID: attachmentID,
+                            mediaType: mediaType,
+                            byteSize: spool.byteSize,
+                            digest: spool.sha256Hex,
+                            advertisedChunkBytes: advertisedChunkBytes,
+                            previousStorageKey: completedStorageKey
+                        )
+                        var renewedCheckpoint = currentMessage
+                        guard LocalMediaRecordPolicy.setResumableUpload(
+                            &renewedCheckpoint,
+                            attachmentID: attachmentID,
+                            checkpoint: checkpoint
+                        ) else { throw SecureMediaAttachmentError.serverMetadataMismatch }
+                        currentMessage = try await replaceDeferredMessageProjection(
+                            renewedCheckpoint,
+                            command: command,
+                            message: currentMessage,
+                            forUserID: userID
+                        )
+                        if checkpoint.nextOffset < spool.byteSize {
+                            expectedUploadID = checkpoint.uploadID
+                            expectedStorageKey = checkpoint.storageKey
+                            continue leaseLoop
+                        }
+                        guard let storageKey = preflight.storageKey else {
+                            throw SecureMediaAttachmentError.serverMetadataMismatch
+                        }
+                        resolvedUpload = MessagingAttachmentUploadDTO(
+                            storageKey: storageKey,
+                            byteSize: preflight.byteSize,
+                            ciphertextSha256: preflight.ciphertextSha256,
+                            clientMediaId: preflight.clientMediaId
+                        )
+                    } catch {
+                        guard mayRestartExpiredLease,
+                              Self.resumableLeaseMayRestart(after: error),
+                              (currentMessage.localMediaRecords ?? []).contains(where: {
+                                  $0.id == attachmentID && $0.resumableUpload != nil
+                              })
+                        else { throw error }
+                        mayRestartExpiredLease = false
+                        var cleared = currentMessage
+                        guard LocalMediaRecordPolicy.clearResumableUpload(
+                            &cleared,
+                            attachmentID: attachmentID
+                        ) else { throw error }
+                        currentMessage = try await replaceDeferredMessageProjection(
+                            cleared,
+                            command: command,
+                            message: currentMessage,
+                            forUserID: userID
+                        )
+                        expectedUploadID = nil
+                        // The old lease owned its object key. A replacement POST is expected to
+                        // allocate a different object, which becomes pinned only after its own
+                        // response passes the full media/digest/size binding below.
+                        expectedStorageKey = nil
+                    }
+                }
+                guard let resolvedUpload else {
+                    throw SecureMediaAttachmentError.serverMetadataMismatch
+                }
+                upload = resolvedUpload
+            } else {
+                upload = try await transport.uploadMessagingAttachment(
+                    mediaType: mediaType,
+                    ciphertextFileURL: spool.fileURL,
+                    ciphertextByteSize: spool.byteSize,
+                    clientMediaID: attachmentID,
+                    ciphertextSHA256: spool.sha256Hex
+                )
+            }
+        } else {
+            let plaintext: Data?
+            if let fallbackPlaintext {
+                plaintext = fallbackPlaintext
+            } else {
+                plaintext = await mediaBlobs.read(sourceStorageKey, userID)
+            }
+            guard let plaintext, plaintext.count == plaintextByteSize
+            else { throw SecureMediaAttachmentError.invalidMedia }
+            let encrypted = try await Task.detached(priority: .userInitiated) {
+                try SecureMediaAttachmentCipher.encrypt(
+                    plaintext,
+                    keyMaterial: keyMaterial,
+                    attachmentID: attachmentID
+                )
+            }.value
+            if let mediaID = UUID(uuidString: attachmentID) {
+                await LocalMediaPerformanceMonitor.shared.markEncrypted(mediaID: mediaID)
+            }
+            ciphertextByteSize = Int64(encrypted.ciphertext.count)
+            ciphertextSHA256 = encrypted.sha256Hex
+            upload = try await transport.uploadMessagingAttachment(
+                mediaType: mediaType,
+                ciphertext: encrypted.ciphertext,
+                clientMediaID: attachmentID,
+                ciphertextSHA256: encrypted.sha256Hex
+            )
+        }
+        guard let validated = SecureMessagingAttachmentUploadResponsePolicy.validate(
+            upload,
+            attachmentID: attachmentID,
+            ciphertextByteSize: ciphertextByteSize,
+            ciphertextSHA256: ciphertextSHA256
+        )
+        else { throw SecureMediaAttachmentError.serverMetadataMismatch }
+        if let mediaID = UUID(uuidString: attachmentID) {
+            await LocalMediaPerformanceMonitor.shared.markServerAccepted(mediaID: mediaID)
+        }
+        return (
+            try KitMediaMessageDescriptor(
+                attachmentID: attachmentID,
+                storageKey: validated.storageKey,
+                mediaType: mediaType,
+                ciphertextByteSize: validated.byteSize,
+                ciphertextSHA256: validated.ciphertextSHA256,
+                keyMaterial: keyMaterial,
+                plaintextByteSize: plaintextByteSize,
+                caption: caption
+            ),
+            currentMessage
+        )
+    }
+
+    /// Pure protocol validator kept internal so focused tests can pin restart and completion
+    /// semantics without standing up an actor, filesystem, or HTTP stack.
+    static func validatedResumableCheckpoint(
+        _ dto: MessagingAttachmentUploadSessionDTO,
+        attachmentID: String,
+        mediaType: String,
+        byteSize: Int64,
+        digest: String,
+        advertisedChunkBytes: Int?,
+        expectedUploadID: String?,
+        expectedStorageKey: String?,
+        requiresComplete: Bool = false
+    ) throws -> LocalMediaResumableUpload {
+        guard let uploadID = dto.clientMediaId?.lowercased(),
+              SecureMessagingWirePolicy.isCanonicalUUID(uploadID),
+              expectedUploadID.map({ $0 == uploadID }) ?? true,
+              let storageKey = dto.storageKey?.lowercased(),
+              SecureMessagingWirePolicy.isCanonicalUUID(storageKey),
+              expectedStorageKey.map({ $0 == storageKey }) ?? true,
+              dto.clientMediaId == attachmentID,
+              dto.mediaType == mediaType,
+              dto.byteSize == byteSize,
+              dto.ciphertextSha256?.lowercased() == digest,
+              let nextOffset = dto.nextOffset,
+              (0 ... byteSize).contains(nextOffset),
+              let maximumChunkBytes = dto.maxChunkBytes,
+              maximumChunkBytes > 0,
+              maximumChunkBytes <= MessagingResumableAttachmentPolicy.maximumChunkBytes,
+              advertisedChunkBytes.map({ maximumChunkBytes <= $0 }) ?? true,
+              let state = dto.state,
+              ["pending", "assembling", "ready", "claimed"].contains(state),
+              let complete = dto.complete,
+              (["ready", "claimed"].contains(state)
+                  ? complete && nextOffset == byteSize
+                  : !complete),
+              !requiresComplete || (complete
+                  && ["ready", "claimed"].contains(state)
+                  && nextOffset == byteSize)
+        else { throw SecureMediaAttachmentError.serverMetadataMismatch }
+        let checkpoint = LocalMediaResumableUpload(
+            uploadID: uploadID,
+            storageKey: storageKey,
+            nextOffset: nextOffset,
+            maxChunkBytes: maximumChunkBytes,
+            expiresAt: dto.expiresAt
+        )
+        guard checkpoint.isStructurallyValid else {
+            throw SecureMediaAttachmentError.serverMetadataMismatch
+        }
+        return checkpoint
+    }
+
+    /// Validates the exact-declaration replay used at the sealing boundary. A live READY or
+    /// CLAIMED row must retain its storage key. The only accepted key replacement is a fresh,
+    /// empty PENDING/ASSEMBLING session: that is the backend's contract when retention swept the
+    /// old unclaimed row, and it requires refilling the same deterministic ciphertext before a
+    /// descriptor can be sealed.
+    static func validatedResumableLeasePreflight(
+        _ dto: MessagingAttachmentUploadSessionDTO,
+        attachmentID: String,
+        mediaType: String,
+        byteSize: Int64,
+        digest: String,
+        advertisedChunkBytes: Int?,
+        previousStorageKey: String
+    ) throws -> LocalMediaResumableUpload {
+        let replacement = dto.storageKey != previousStorageKey
+        if replacement {
+            guard ["pending", "assembling"].contains(dto.state),
+                  dto.complete == false,
+                  dto.nextOffset == 0
+            else { throw SecureMediaAttachmentError.serverMetadataMismatch }
+        }
+        let checkpoint = try validatedResumableCheckpoint(
+            dto,
+            attachmentID: attachmentID,
+            mediaType: mediaType,
+            byteSize: byteSize,
+            digest: digest,
+            advertisedChunkBytes: advertisedChunkBytes,
+            expectedUploadID: attachmentID,
+            expectedStorageKey: replacement ? nil : previousStorageKey
+        )
+        guard checkpoint.storageKey != nil,
+              replacement || checkpoint.nextOffset == byteSize
+        else { throw SecureMediaAttachmentError.serverMetadataMismatch }
+        return checkpoint
+    }
+
+    private func expiredResumableSessionMatches(
+        _ dto: MessagingAttachmentUploadSessionDTO,
+        attachmentID: String,
+        mediaType: String,
+        byteSize: Int64,
+        digest: String,
+        expectedUploadID: String?,
+        expectedStorageKey: String?
+    ) -> Bool {
+        guard dto.state == "expired",
+              dto.complete == false,
+              let uploadID = dto.clientMediaId?.lowercased(),
+              uploadID == attachmentID,
+              SecureMessagingWirePolicy.isCanonicalUUID(uploadID),
+              expectedUploadID.map({ $0 == uploadID }) ?? true,
+              let storageKey = dto.storageKey?.lowercased(),
+              SecureMessagingWirePolicy.isCanonicalUUID(storageKey),
+              expectedStorageKey.map({ $0 == storageKey }) ?? true,
+              dto.mediaType == mediaType,
+              dto.byteSize == byteSize,
+              dto.ciphertextSha256?.lowercased() == digest,
+              let nextOffset = dto.nextOffset,
+              (0 ... byteSize).contains(nextOffset)
+        else { return false }
+        return true
+    }
+
+    /// Only a missing/expired upload lease may allocate a replacement server object. Authentication,
+    /// transport, and malformed-response failures retain the current checkpoint and retry it.
+    static func resumableLeaseMayRestart(after error: Error) -> Bool {
+        if error is ResumableAttachmentLeaseExpired { return true }
+        if let payload = error as? APIErrorPayload {
+            let code = payload.code.uppercased()
+            return (payload.httpStatus == 404 && code == "ATTACHMENT_UPLOAD_NOT_FOUND")
+                || (payload.httpStatus == 410 && code == "ATTACHMENT_UPLOAD_EXPIRED")
+        }
+        if let clientError = error as? APIClientError {
+            switch clientError {
+            case .invalidPayload(let status), .httpStatus(let status):
+                return status == 404 || status == 410
+            case .httpResponse(let status, _):
+                return status == 404 || status == 410
+            case .signedOut, .invalidResponse, .invalidURL:
+                return false
+            }
+        }
+        return false
     }
 
     private func checkpointDeferredImageDescriptor(
@@ -3485,6 +4721,11 @@ actor SecureMessagingExchangeCoordinator {
         var finalized = message
         finalized.body = descriptor.encoded
         finalized.pendingAttachment = nil
+        guard LocalMediaRecordPolicy.markUploaded(
+            &finalized,
+            attachmentID: descriptor.attachmentID,
+            remoteStorageKey: descriptor.storageKey
+        ) else { throw SecureMediaAttachmentError.invalidMedia }
         try await store.update { state in
             guard state.profile?.id == userID,
                   let indices = Self.exactPendingProjectionIndices(
@@ -3613,6 +4854,132 @@ actor SecureMessagingExchangeCoordinator {
             throw SecureMediaAttachmentError.invalidCiphertext
         }
         return plaintext
+    }
+
+    /// File-streamed receive path for every non-inline attachment. URLSession downloads opaque
+    /// ciphertext to disk; the cache verifies full SHA-256 and HMAC before streaming decryption
+    /// into an unpublished protected staging file, then atomically publishes the plaintext.
+    func hydrateMediaFile(
+        forUserID userID: String,
+        conversationID: String,
+        messageID: UUID,
+        itemIndex: Int?
+    ) async throws -> SecureMediaHydratedFile {
+        let local = try canonicalUUID(userID, error: .invalidAccount)
+        let conversationID = try canonicalUUID(conversationID, error: .invalidConversation)
+        let snapshot = await store.snapshot()
+        guard snapshot.profile?.id == local,
+              let resolved = SecureMediaLoadPolicy.resolve(
+                  messageID: messageID,
+                  conversationId: conversationID,
+                  itemIndex: itemIndex,
+                  in: snapshot.messages
+              )
+        else { throw SecureMediaAttachmentError.invalidDescriptor }
+        let identity: (
+            id: String,
+            storageKey: String,
+            mediaType: String,
+            ciphertextByteSize: Int64,
+            ciphertextSHA256: String,
+            plaintextByteSize: Int,
+            keyMaterial: Data
+        )
+        switch resolved {
+        case .single(let descriptor, _, _):
+            guard let keyMaterial = descriptor.keyMaterial else {
+                throw SecureMediaAttachmentError.invalidDescriptor
+            }
+            identity = (
+                descriptor.attachmentID,
+                descriptor.storageKey,
+                descriptor.mediaType,
+                descriptor.ciphertextByteSize,
+                descriptor.ciphertextSHA256,
+                descriptor.plaintextByteSize,
+                keyMaterial
+            )
+        case .sealedBatchItem(let descriptor, _, let index):
+            let item = descriptor.items[index]
+            guard let keyMaterial = item.keyMaterial else {
+                throw SecureMediaAttachmentError.invalidDescriptor
+            }
+            identity = (
+                item.attachmentID,
+                item.storageKey,
+                item.mediaType,
+                item.ciphertextByteSize,
+                item.ciphertextSHA256,
+                item.plaintextByteSize,
+                keyMaterial
+            )
+        case .pendingSingle, .pendingBatchItem:
+            throw SecureMediaAttachmentError.invalidDescriptor
+        }
+        guard let record = LocalMediaRecordPolicy.record(
+            messageID: messageID,
+            conversationID: conversationID,
+            attachmentID: identity.id,
+            mediaType: identity.mediaType,
+            fileSize: identity.plaintextByteSize,
+            remoteStorageKey: identity.storageKey,
+            in: snapshot.messages
+        ), record.direction == .received,
+           let storeReceived = mediaBlobs.storeVerifiedReceivedOriginal
+        else { throw SecureMediaAttachmentError.invalidDescriptor }
+
+        let ciphertextURL = try await transport.downloadMessagingAttachmentFile(
+            storageKey: identity.storageKey,
+            expectedByteSize: identity.ciphertextByteSize
+        )
+        defer { try? FileManager.default.removeItem(at: ciphertextURL) }
+        // A same-size corrupt cache entry is repairable, but only while the exact received row
+        // that authorized this download still owns the media id. Re-prove ownership immediately
+        // before the cache actor is allowed to replace any existing plaintext.
+        let beforePublication = await store.snapshot()
+        guard beforePublication.profile?.id == local,
+              SecureMediaLoadPolicy.resolve(
+                  messageID: messageID,
+                  conversationId: conversationID,
+                  itemIndex: itemIndex,
+                  in: beforePublication.messages
+              ) == resolved,
+              LocalMediaRecordPolicy.record(
+                  messageID: messageID,
+                  conversationID: conversationID,
+                  attachmentID: identity.id,
+                  mediaType: identity.mediaType,
+                  fileSize: identity.plaintextByteSize,
+                  remoteStorageKey: identity.storageKey,
+                  in: beforePublication.messages
+              ) == record
+        else { throw CancellationError() }
+        let protected = try await storeReceived(
+            ciphertextURL,
+            identity.id,
+            local,
+            identity.mediaType,
+            identity.ciphertextByteSize,
+            identity.ciphertextSHA256,
+            identity.plaintextByteSize,
+            identity.keyMaterial
+        )
+        let current = await store.snapshot()
+        guard current.profile?.id == local,
+              SecureMediaLoadPolicy.resolve(
+                  messageID: messageID,
+                  conversationId: conversationID,
+                  itemIndex: itemIndex,
+                  in: current.messages
+              ) == resolved
+        else { throw CancellationError() }
+        return SecureMediaHydratedFile(
+            fileURL: protected.fileURL,
+            storageKey: identity.storageKey,
+            mediaType: identity.mediaType,
+            plaintextByteSize: identity.plaintextByteSize,
+            attachmentID: identity.id
+        )
     }
 
     private func queueText(
@@ -3912,6 +5279,10 @@ actor SecureMessagingExchangeCoordinator {
                 failureReason: nil,
                 isOutgoing: true,
                 attachmentData: attachmentData,
+                // Fanout preparation replaces the pending message projection. Keep the stable
+                // sender-side media rows so the protected original remains addressable by its
+                // permanent media id after upload and Signal encryption have completed.
+                localMediaRecords: existingMessage?.localMediaRecords,
                 replyToServerMessageID: replyTarget,
                 // Sealing and fanout replace the pending projection wholesale; the scheduled
                 // instant the user chose must survive both replacements.
@@ -4041,22 +5412,29 @@ actor SecureMessagingExchangeCoordinator {
             return response
         } catch let error as APIErrorPayload
             where error.code == "ATTACHMENT_REFERENCE_INVALID"
-            && KitMediaMessageV2Descriptor.parse(localMessage.body) != nil {
+            && (KitMediaMessageV2Descriptor.parse(localMessage.body) != nil
+                || KitMediaMessageDescriptor.parse(localMessage.body) != nil) {
             // Only the contract's expiry code takes this recovery: ATTACHMENT_ALREADY_ATTACHED
             // signals an attachment-identity conflict — the server already holds one of these
             // uploads bound to a message — and reopening would mint a whole new upload set
             // under the same client message id against blobs the server just said it has. That
             // conflict takes the ordinary visible failure path instead.
-            // §7 blob expiry: the sealed descriptor's uploads lapsed server-side. Reopen the
-            // batch from the descriptor — same client message id, same key material, retained
-            // plaintext as source — and clear the now-unusable fanout so flush re-uploads,
-            // re-seals, and re-encrypts. The command survives: this is a transport lapse, not
-            // a user-confirmation event, and the message is never split or abandoned.
-            try await reopenExpiredMediaBatch(
-                command,
-                message: localMessage,
-                userID: userID
-            )
+            // Blob expiry reopens either descriptor generation under the same message/media ids,
+            // E2EE key material and retained local original. Only the lapsed remote reference and
+            // old fanout are discarded; the next flush uploads again without duplicating a send.
+            if KitMediaMessageV2Descriptor.parse(localMessage.body) != nil {
+                try await reopenExpiredMediaBatch(
+                    command,
+                    message: localMessage,
+                    userID: userID
+                )
+            } else {
+                try await reopenExpiredSingleMedia(
+                    command,
+                    message: localMessage,
+                    userID: userID
+                )
+            }
             throw SecureMessagingExchangeError.mediaMessageBlobExpired
         } catch let error as APIErrorPayload where [
             "MESSAGING_ROSTER_CHANGED",
@@ -4284,8 +5662,8 @@ actor SecureMessagingExchangeCoordinator {
 
     /// §7 blob expiry: rebuild the pending batch from the sealed descriptor under the SAME
     /// client message id — identical ids, key material, media types, sizes, caption, and
-    /// display order; each item's lapsed storage key becomes its plaintext pointer so every
-    /// item re-uploads fresh. The body returns to its canonical pending form (caption, or the
+    /// display order; each item is rebound to its retained local original so every item
+    /// re-uploads fresh. The body returns to its canonical pending form (caption, or the
     /// placeholder when captionless): the deferred pipeline replays this exactly like a first
     /// send, the raw descriptor stops being display text, and message id, command id,
     /// schedule, and reply target all survive untouched. Only the fanout clears.
@@ -4294,15 +5672,96 @@ actor SecureMessagingExchangeCoordinator {
         message: LocalMessage,
         userID: String
     ) async throws {
-        guard let descriptor = KitMediaMessageV2Descriptor.parse(message.body) else {
+        guard let descriptor = KitMediaMessageV2Descriptor.parse(message.body),
+              message.pendingAttachment == nil,
+              message.pendingMediaBatch == nil,
+              message.attachmentData == nil
+        else {
             throw SecureMessagingExchangeError.messageNotRetryable
         }
-        let reopened = KitMediaMessageV2OutboundBatch.reopened(from: descriptor)
-        guard reopened.isStructurallyValid else {
+        let records = message.localMediaRecords ?? []
+        for item in descriptor.items {
+            let matches = records.filter { record in
+                record.id == item.attachmentID
+                    && record.mediaType == item.mediaType
+                    && record.fileSize == item.plaintextByteSize
+                    && record.remoteEncryptedObjectID == item.storageKey
+                    && record.outboundKeyMaterialBase64 == item.keyMaterialBase64
+            }
+            guard matches.count == 1,
+                  let record = matches.first,
+                  let localStorageKey = record.localStorageKey,
+                  await mediaBlobs.byteCount(localStorageKey, userID)
+                      == item.plaintextByteSize
+            else { throw SecureMessagingExchangeError.messageNotRetryable }
+        }
+        var reopenedMessage = message
+        guard LocalMediaRecordPolicy.reopenExpiredBatchUploads(
+            &reopenedMessage,
+            descriptor: descriptor
+        ) else { throw SecureMessagingExchangeError.messageNotRetryable }
+        try await store.update { state in
+            guard state.profile?.id == userID,
+                  let indices = Self.exactPendingProjectionIndices(
+                      in: state,
+                      command: command,
+                      message: message
+            )
+            else { throw CancellationError() }
+            state.messages[indices.message] = reopenedMessage
+            state.outbox[indices.command].secureMessageFanout = nil
+        }
+        for item in descriptor.items {
+            guard let record = records.first(where: { $0.id == item.attachmentID }),
+                  record.localStorageKind == .encryptedBlob,
+                  let localStorageKey = record.localStorageKey,
+                  localStorageKey != item.storageKey
+            else { continue }
+            _ = await mediaBlobs.removeDuplicate(item.storageKey, localStorageKey, userID)
+        }
+    }
+
+    /// KITMEDIA1 counterpart of batch expiry recovery. A successful upload followed by delayed
+    /// message delivery may outlive server retention just as a batch item can. Rebuild the pending
+    /// projection from the sealed descriptor only while its retained original is still readable;
+    /// never mint a replacement media id or key, and never fall back to insecure transmission.
+    private func reopenExpiredSingleMedia(
+        _ command: OfflineCommand,
+        message: LocalMessage,
+        userID: String
+    ) async throws {
+        let records = message.localMediaRecords ?? []
+        guard let descriptor = KitMediaMessageDescriptor.parse(message.body),
+              message.pendingAttachment == nil,
+              message.pendingMediaBatch == nil,
+              records.count == 1,
+              let record = records.first,
+              record.id == descriptor.attachmentID,
+              record.mediaType == descriptor.mediaType,
+              record.fileSize == descriptor.plaintextByteSize,
+              record.remoteEncryptedObjectID == descriptor.storageKey,
+              record.outboundKeyMaterialBase64 == descriptor.keyMaterialBase64
+        else { throw SecureMessagingExchangeError.messageNotRetryable }
+
+        switch record.localStorageKind {
+        case .encryptedState:
+            guard message.attachmentData?.count == descriptor.plaintextByteSize else {
+                throw SecureMessagingExchangeError.messageNotRetryable
+            }
+        case .encryptedBlob, .protectedFile:
+            guard let localStorageKey = record.localStorageKey,
+                  await mediaBlobs.byteCount(localStorageKey, userID)
+                      == descriptor.plaintextByteSize
+            else { throw SecureMessagingExchangeError.messageNotRetryable }
+        case .none:
             throw SecureMessagingExchangeError.messageNotRetryable
         }
-        let pendingBody = reopened.caption
-            ?? Self.mediaBatchPlaceholderBody(itemCount: reopened.items.count)
+
+        var reopened = message
+        guard LocalMediaRecordPolicy.reopenExpiredSingleUpload(
+            &reopened,
+            descriptor: descriptor
+        ) else { throw SecureMessagingExchangeError.messageNotRetryable }
         try await store.update { state in
             guard state.profile?.id == userID,
                   let indices = Self.exactPendingProjectionIndices(
@@ -4311,9 +5770,20 @@ actor SecureMessagingExchangeCoordinator {
                       message: message
                   )
             else { throw CancellationError() }
-            state.messages[indices.message].body = pendingBody
-            state.messages[indices.message].pendingMediaBatch = reopened
+            state.messages[indices.message] = reopened
             state.outbox[indices.command].secureMessageFanout = nil
+        }
+
+        // Older encrypted-blob sends may retain a second plaintext copy under the expired remote
+        // key. Remove only when the cache proves it byte-identical to the permanent local source.
+        if record.localStorageKind == .encryptedBlob,
+           let localStorageKey = record.localStorageKey,
+           localStorageKey != descriptor.storageKey {
+            _ = await mediaBlobs.removeDuplicate(
+                descriptor.storageKey,
+                localStorageKey,
+                userID
+            )
         }
     }
 
@@ -5553,7 +7023,7 @@ actor SecureMessagingExchangeCoordinator {
         else { return nil }
 
         let authoredOnCurrentAccount = envelope.sender.address.userID == currentUserID
-        return LocalMessage(
+        var projected = LocalMessage(
             id: messageID,
             serverMessageId: envelope.messageID,
             conversationId: envelope.conversationID,
@@ -5581,6 +7051,14 @@ actor SecureMessagingExchangeCoordinator {
                 ? nil
                 : envelope.replyToMessageID?.lowercased()
         )
+        // `createdAt` on received media records is the local descriptor-observation milestone,
+        // not the sender's clock. It survives offline/background delay so hydration latency can
+        // be measured independently from send latency.
+        projected.localMediaRecords = LocalMediaRecordPolicy.remoteRecords(
+            for: projected,
+            now: Date()
+        )
+        return projected
     }
 
     nonisolated static func reconcileRecoveredHistoryMessages(
@@ -5962,7 +7440,7 @@ actor SecureMessagingExchangeCoordinator {
                         guard let messageUUID = UUID(uuidString: localID) else {
                             throw SecureMessagingCryptoError.invalidContent
                         }
-                        recoveredHistoryMessages.append(LocalMessage(
+                        var recoveredMessage = LocalMessage(
                             id: messageUUID,
                             serverMessageId: original.messageID,
                             conversationId: conversation.id,
@@ -5974,7 +7452,11 @@ actor SecureMessagingExchangeCoordinator {
                             failureReason: nil,
                             isOutgoing: outgoing,
                             secureMessagingHistory: original.retainedMetadata
-                        ))
+                        )
+                        recoveredMessage.localMediaRecords = LocalMediaRecordPolicy.remoteRecords(
+                            for: recoveredMessage
+                        )
+                        recoveredHistoryMessages.append(recoveredMessage)
                         acknowledgementIDs.append(original.messageID)
                     } else if dto.senderDeviceId == enrollment.serverDeviceID {
                         let clientID = dto.clientMessageId

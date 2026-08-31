@@ -59,6 +59,10 @@ enum OutboxPolicy {
             // are process-memory-only and legacy rows must never reach timers or background work.
             .filter { $0.failureDisposition == nil && $0.kind != .callAttempt }
             .filter { !$0.isAwaitingScheduledTime(at: now) }
+            // Local preprocessing is not a network ordering barrier. The source message is
+            // already durable and visible, but allowing it to claim the stream head would make
+            // an image encode or voice assembly freeze every later message in this conversation.
+            .filter { $0.awaitingMediaPreprocessing != true }
             .sorted {
             if $0.createdAt != $1.createdAt { return $0.createdAt < $1.createdAt }
             return $0.id.uuidString < $1.id.uuidString
@@ -236,6 +240,13 @@ enum OutboxPolicy {
             state.outbox[index].failureDisposition = nil
             state.outbox[index].lastFailureReason = nil
             state.outbox[index].nextAttemptAt = now
+            if let messageID = state.outbox[index].messageId,
+               let messageIndex = state.messages.firstIndex(where: { $0.id == messageID }) {
+                LocalMediaRecordPolicy.markRetryPending(
+                    &state.messages[messageIndex],
+                    now: now
+                )
+            }
             resumed += 1
         }
         return resumed
@@ -260,6 +271,7 @@ enum OutboxPolicy {
         if let messageIndex = state.messages.firstIndex(where: { $0.id == messageID }) {
             state.messages[messageIndex].state = .queued
             state.messages[messageIndex].failureReason = nil
+            LocalMediaRecordPolicy.markRetryPending(&state.messages[messageIndex], now: now)
         }
         return true
     }

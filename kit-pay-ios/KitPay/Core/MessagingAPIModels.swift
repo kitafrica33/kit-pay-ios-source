@@ -274,6 +274,36 @@ enum SecureMediaAttachmentCipher {
         )
     }
 
+    /// Reproducible framing for an immutable client media id. The key material is random and
+    /// unique per attachment; an HMAC-derived, domain-separated IV is therefore unpredictable to
+    /// anyone without that key while remaining byte-identical across crash/retry. Callers must
+    /// bind one id to one immutable local original — the cache and queue admission enforce that.
+    static func encrypt(
+        _ plaintext: Data,
+        keyMaterial: Data,
+        attachmentID: String
+    ) throws -> Encrypted {
+        guard UUID(uuidString: attachmentID)?.uuidString.lowercased() == attachmentID,
+              keyMaterial.count == keyMaterialBytes
+        else { throw SecureMediaAttachmentError.cryptographyFailed }
+        let domain = Data("KITMEDIA-IV1\u{0}\(attachmentID)".utf8)
+        let derived = HMAC<SHA256>.authenticationCode(
+            for: domain,
+            using: SymmetricKey(data: keyMaterial.suffixData(macKeyBytes))
+        )
+        let iv = Data(derived.prefix(ivBytes))
+        return try encrypt(
+            plaintext,
+            keyMaterial: keyMaterial,
+            randomBytes: { requested in
+                guard requested == ivBytes else {
+                    throw SecureMediaAttachmentError.cryptographyFailed
+                }
+                return iv
+            }
+        )
+    }
+
     static func decrypt(
         _ ciphertext: Data,
         keyMaterial: Data,
@@ -367,6 +397,296 @@ enum SecureMediaAttachmentCipher {
     private static func timingSafeEqual(_ lhs: Data, _ rhs: Data) -> Bool {
         guard lhs.count == rhs.count else { return false }
         return zip(lhs, rhs).reduce(UInt8(0)) { $0 | ($1.0 ^ $1.1) } == 0
+    }
+
+    struct EncryptedFile: Equatable, Sendable {
+        let ciphertextByteSize: Int64
+        let ciphertextSHA256: String
+        let plaintextByteSize: Int
+    }
+
+    /// Keeps large attachment encryption bounded independently of the source size. The caller
+    /// owns both URLs and publishes the output only after this returns successfully.
+    static func encryptFile(
+        plaintextURL: URL,
+        ciphertextURL: URL,
+        expectedPlaintextByteSize: Int,
+        keyMaterial: Data,
+        attachmentID: String,
+        chunkBytes: Int = 256 * 1_024
+    ) throws -> EncryptedFile {
+        guard (1 ... maximumPlaintextBytes).contains(expectedPlaintextByteSize),
+              chunkBytes > 0,
+              chunkBytes <= MessagingResumableAttachmentPolicy.maximumChunkBytes,
+              UUID(uuidString: attachmentID)?.uuidString.lowercased() == attachmentID,
+              keyMaterial.count == keyMaterialBytes
+        else { throw SecureMediaAttachmentError.invalidMedia }
+
+        let attributes = try FileManager.default.attributesOfItem(atPath: plaintextURL.path)
+        guard (attributes[.type] as? FileAttributeType) == .typeRegular,
+              (attributes[.size] as? NSNumber)?.intValue == expectedPlaintextByteSize
+        else { throw SecureMediaAttachmentError.invalidMedia }
+
+        let domain = Data("KITMEDIA-IV1\u{0}\(attachmentID)".utf8)
+        let iv = Data(HMAC<SHA256>.authenticationCode(
+            for: domain,
+            using: SymmetricKey(data: keyMaterial.suffixData(macKeyBytes))
+        ).prefix(ivBytes))
+        var cryptor: CCCryptorRef?
+        let createStatus = keyMaterial.prefixData(aesKeyBytes).withUnsafeBytes { keyBytes in
+            iv.withUnsafeBytes { ivBuffer in
+                CCCryptorCreate(
+                    CCOperation(kCCEncrypt),
+                    CCAlgorithm(kCCAlgorithmAES),
+                    CCOptions(kCCOptionPKCS7Padding),
+                    keyBytes.baseAddress,
+                    aesKeyBytes,
+                    ivBuffer.baseAddress,
+                    &cryptor
+                )
+            }
+        }
+        guard createStatus == kCCSuccess, let cryptor else {
+            throw SecureMediaAttachmentError.cryptographyFailed
+        }
+        defer { CCCryptorRelease(cryptor) }
+
+        _ = FileManager.default.createFile(atPath: ciphertextURL.path, contents: nil)
+        let input = try FileHandle(forReadingFrom: plaintextURL)
+        let output = try FileHandle(forWritingTo: ciphertextURL)
+        defer {
+            try? input.close()
+            try? output.close()
+        }
+        var hmac = HMAC<SHA256>(key: SymmetricKey(data: keyMaterial.suffixData(macKeyBytes)))
+        var digest = SHA256()
+        try output.write(contentsOf: iv)
+        hmac.update(data: iv)
+        digest.update(data: iv)
+        var plaintextBytes = 0
+
+        while let chunk = try input.read(upToCount: chunkBytes), !chunk.isEmpty {
+            plaintextBytes += chunk.count
+            guard plaintextBytes <= expectedPlaintextByteSize else {
+                throw SecureMediaAttachmentError.invalidMedia
+            }
+            var encryptedChunk = Data(count: chunk.count + kCCBlockSizeAES128)
+            var moved = 0
+            let encryptedCapacity = encryptedChunk.count
+            let status = encryptedChunk.withUnsafeMutableBytes { outputBuffer in
+                chunk.withUnsafeBytes { inputBuffer in
+                    CCCryptorUpdate(
+                        cryptor,
+                        inputBuffer.baseAddress,
+                        chunk.count,
+                        outputBuffer.baseAddress,
+                        encryptedCapacity,
+                        &moved
+                    )
+                }
+            }
+            guard status == kCCSuccess, moved <= encryptedChunk.count else {
+                throw SecureMediaAttachmentError.cryptographyFailed
+            }
+            encryptedChunk.removeSubrange(moved..<encryptedChunk.count)
+            if !encryptedChunk.isEmpty {
+                try output.write(contentsOf: encryptedChunk)
+                hmac.update(data: encryptedChunk)
+                digest.update(data: encryptedChunk)
+            }
+        }
+        guard plaintextBytes == expectedPlaintextByteSize else {
+            throw SecureMediaAttachmentError.invalidMedia
+        }
+
+        var finalBlock = Data(count: kCCBlockSizeAES128)
+        var finalMoved = 0
+        let finalCapacity = finalBlock.count
+        let finalStatus = finalBlock.withUnsafeMutableBytes { buffer in
+            CCCryptorFinal(cryptor, buffer.baseAddress, finalCapacity, &finalMoved)
+        }
+        guard finalStatus == kCCSuccess, finalMoved <= finalBlock.count else {
+            throw SecureMediaAttachmentError.cryptographyFailed
+        }
+        finalBlock.removeSubrange(finalMoved..<finalBlock.count)
+        try output.write(contentsOf: finalBlock)
+        hmac.update(data: finalBlock)
+        digest.update(data: finalBlock)
+        let mac = Data(hmac.finalize())
+        try output.write(contentsOf: mac)
+        digest.update(data: mac)
+        try output.synchronize()
+
+        let ciphertextByteSize = Int64(iv.count + plaintextBytes
+            + (kCCBlockSizeAES128 - plaintextBytes % kCCBlockSizeAES128) + mac.count)
+        guard ciphertextByteSize >= SecureMessagingWire.minimumAttachmentCiphertextBytes,
+              ciphertextByteSize <= SecureMessagingWire.maximumAttachmentCiphertextBytes,
+              (try FileManager.default.attributesOfItem(atPath: ciphertextURL.path)[.size]
+                  as? NSNumber)?.int64Value == ciphertextByteSize
+        else { throw SecureMediaAttachmentError.cryptographyFailed }
+        return EncryptedFile(
+            ciphertextByteSize: ciphertextByteSize,
+            ciphertextSHA256: digest.finalize().hexString,
+            plaintextByteSize: plaintextBytes
+        )
+    }
+
+    /// Streams ciphertext once while decrypting into an unpublished staging file and computing
+    /// the full SHA-256/HMAC. The staging file is deleted unless tag, digest, padding and exact
+    /// plaintext size all verify, so no unauthenticated plaintext is ever published to a caller.
+    static func decryptFile(
+        ciphertextURL: URL,
+        plaintextURL: URL,
+        expectedCiphertextByteSize: Int64,
+        expectedCiphertextSHA256: String,
+        expectedPlaintextByteSize: Int,
+        keyMaterial: Data,
+        chunkBytes: Int = 256 * 1_024
+    ) throws {
+        guard expectedCiphertextByteSize >= SecureMessagingWire.minimumAttachmentCiphertextBytes,
+              expectedCiphertextByteSize <= SecureMessagingWire.maximumAttachmentCiphertextBytes,
+              (1 ... maximumPlaintextBytes).contains(expectedPlaintextByteSize),
+              SecureMessagingWirePolicy.isLowercaseSHA256(expectedCiphertextSHA256),
+              keyMaterial.count == keyMaterialBytes,
+              chunkBytes > 0,
+              chunkBytes <= MessagingResumableAttachmentPolicy.maximumChunkBytes,
+              (try FileManager.default.attributesOfItem(atPath: ciphertextURL.path)[.size]
+                  as? NSNumber)?.int64Value == expectedCiphertextByteSize
+        else { throw SecureMediaAttachmentError.invalidCiphertext }
+
+        let authenticatedByteSize = expectedCiphertextByteSize - Int64(macBytes)
+        guard authenticatedByteSize > Int64(ivBytes) else {
+            throw SecureMediaAttachmentError.invalidCiphertext
+        }
+        let input = try FileHandle(forReadingFrom: ciphertextURL)
+        defer { try? input.close() }
+        guard !FileManager.default.fileExists(atPath: plaintextURL.path) else {
+            throw SecureMediaAttachmentError.invalidCiphertext
+        }
+        _ = FileManager.default.createFile(atPath: plaintextURL.path, contents: nil)
+        var succeeded = false
+        defer {
+            if !succeeded { try? FileManager.default.removeItem(at: plaintextURL) }
+        }
+        let output = try FileHandle(forWritingTo: plaintextURL)
+        defer { try? output.close() }
+
+        guard let iv = try input.read(upToCount: ivBytes), iv.count == ivBytes else {
+            throw SecureMediaAttachmentError.invalidCiphertext
+        }
+        var digest = SHA256()
+        var hmac = HMAC<SHA256>(key: SymmetricKey(data: keyMaterial.suffixData(macKeyBytes)))
+        digest.update(data: iv)
+        hmac.update(data: iv)
+        var cryptor: CCCryptorRef?
+        let createStatus = keyMaterial.prefixData(aesKeyBytes).withUnsafeBytes { keyBytes in
+            iv.withUnsafeBytes { ivBuffer in
+                CCCryptorCreate(
+                    CCOperation(kCCDecrypt),
+                    CCAlgorithm(kCCAlgorithmAES),
+                    CCOptions(kCCOptionPKCS7Padding),
+                    keyBytes.baseAddress,
+                    aesKeyBytes,
+                    ivBuffer.baseAddress,
+                    &cryptor
+                )
+            }
+        }
+        guard createStatus == kCCSuccess, let cryptor else {
+            throw SecureMediaAttachmentError.invalidCiphertext
+        }
+        defer { CCCryptorRelease(cryptor) }
+
+        var encryptedBodyRemaining = authenticatedByteSize - Int64(ivBytes)
+        var plaintextBytes = 0
+        while encryptedBodyRemaining > 0 {
+            let requested = min(Int64(chunkBytes), encryptedBodyRemaining)
+            guard let chunk = try input.read(upToCount: Int(requested)),
+                  chunk.count == Int(requested)
+            else { throw SecureMediaAttachmentError.invalidCiphertext }
+            encryptedBodyRemaining -= Int64(chunk.count)
+            digest.update(data: chunk)
+            hmac.update(data: chunk)
+            var plaintextChunk = Data(count: chunk.count + kCCBlockSizeAES128)
+            var moved = 0
+            let plaintextCapacity = plaintextChunk.count
+            let status = plaintextChunk.withUnsafeMutableBytes { outputBuffer in
+                chunk.withUnsafeBytes { inputBuffer in
+                    CCCryptorUpdate(
+                        cryptor,
+                        inputBuffer.baseAddress,
+                        chunk.count,
+                        outputBuffer.baseAddress,
+                        plaintextCapacity,
+                        &moved
+                    )
+                }
+            }
+            guard status == kCCSuccess, moved <= plaintextChunk.count else {
+                throw SecureMediaAttachmentError.invalidCiphertext
+            }
+            plaintextChunk.removeSubrange(moved..<plaintextChunk.count)
+            plaintextBytes += plaintextChunk.count
+            guard plaintextBytes <= expectedPlaintextByteSize else {
+                throw SecureMediaAttachmentError.invalidCiphertext
+            }
+            try output.write(contentsOf: plaintextChunk)
+        }
+        guard let suppliedMAC = try input.read(upToCount: macBytes),
+              suppliedMAC.count == macBytes,
+              (try input.read(upToCount: 1))?.isEmpty != false
+        else { throw SecureMediaAttachmentError.invalidCiphertext }
+        digest.update(data: suppliedMAC)
+        var finalBlock = Data(count: kCCBlockSizeAES128)
+        var finalMoved = 0
+        let finalCapacity = finalBlock.count
+        let finalStatus = finalBlock.withUnsafeMutableBytes { buffer in
+            CCCryptorFinal(cryptor, buffer.baseAddress, finalCapacity, &finalMoved)
+        }
+        guard finalStatus == kCCSuccess, finalMoved <= finalBlock.count else {
+            throw SecureMediaAttachmentError.invalidCiphertext
+        }
+        finalBlock.removeSubrange(finalMoved..<finalBlock.count)
+        plaintextBytes += finalBlock.count
+        guard plaintextBytes == expectedPlaintextByteSize else {
+            throw SecureMediaAttachmentError.invalidCiphertext
+        }
+        try output.write(contentsOf: finalBlock)
+        try output.synchronize()
+        guard digest.finalize().hexString == expectedCiphertextSHA256,
+              timingSafeEqual(suppliedMAC, Data(hmac.finalize()))
+        else { throw SecureMediaAttachmentError.invalidCiphertext }
+        succeeded = true
+    }
+}
+
+enum MessagingResumableAttachmentPolicy {
+    static let profile = "kit-attachment-upload-v1"
+    static let maximumChunkBytes = 5 * 1_024 * 1_024
+
+    static func chunkLength(remaining: Int64, serverMaximum: Int) -> Int? {
+        guard remaining > 0,
+              serverMaximum > 0,
+              serverMaximum <= maximumChunkBytes
+        else { return nil }
+        return Int(min(remaining, Int64(serverMaximum)))
+    }
+
+    static func validatedChunkUpload(
+        _ response: MessagingAttachmentUploadChunkResultDTO,
+        expectedOffset: Int64,
+        expectedByteSize: Int,
+        expectedSHA256: String
+    ) -> MessagingAttachmentUploadSessionDTO? {
+        guard let chunk = response.chunk,
+              // Presence is part of the contract even though either boolean value is valid.
+              chunk.replayed != nil,
+              chunk.byteOffset == expectedOffset,
+              chunk.byteSize == expectedByteSize,
+              chunk.ciphertextSha256?.lowercased() == expectedSHA256,
+              let upload = response.upload
+        else { return nil }
+        return upload
     }
 }
 
@@ -2494,10 +2814,84 @@ struct MessagingAttachmentUploadDTO: Decodable, Equatable, Sendable {
     let storageKey: String?
     let byteSize: Int64?
     let ciphertextSha256: String?
+    let clientMediaId: String?
+
+    init(
+        storageKey: String?,
+        byteSize: Int64?,
+        ciphertextSha256: String?,
+        clientMediaId: String? = nil
+    ) {
+        self.storageKey = storageKey
+        self.byteSize = byteSize
+        self.ciphertextSha256 = ciphertextSha256
+        self.clientMediaId = clientMediaId
+    }
 
     enum CodingKeys: String, CodingKey {
         case storageKey = "storage_key"
         case byteSize = "byte_size"
         case ciphertextSha256 = "ciphertext_sha256"
+        case clientMediaId = "client_media_id"
     }
+}
+
+struct BeginMessagingAttachmentUploadRequest: Encodable, Equatable, Sendable {
+    let clientMediaId: String
+    let mediaType: String
+    let byteSize: Int64
+    let ciphertextSha256: String
+
+    enum CodingKeys: String, CodingKey {
+        case clientMediaId = "client_media_id"
+        case mediaType = "media_type"
+        case byteSize = "byte_size"
+        case ciphertextSha256 = "ciphertext_sha256"
+    }
+}
+
+/// One authoritative resumable-upload projection. Every response is validated against the
+/// immutable client media identity and ciphertext facts before its offset is checkpointed.
+struct MessagingAttachmentUploadSessionDTO: Decodable, Equatable, Sendable {
+    let clientMediaId: String?
+    let storageKey: String?
+    let mediaType: String?
+    let byteSize: Int64?
+    let ciphertextSha256: String?
+    let state: String?
+    let nextOffset: Int64?
+    let maxChunkBytes: Int?
+    let complete: Bool?
+    let expiresAt: String?
+
+    enum CodingKeys: String, CodingKey {
+        case state, complete
+        case clientMediaId = "client_media_id"
+        case storageKey = "storage_key"
+        case mediaType = "media_type"
+        case byteSize = "byte_size"
+        case ciphertextSha256 = "ciphertext_sha256"
+        case nextOffset = "next_offset"
+        case maxChunkBytes = "max_chunk_bytes"
+        case expiresAt = "expires_at"
+    }
+}
+
+struct MessagingAttachmentUploadChunkResultDTO: Decodable, Equatable, Sendable {
+    struct Chunk: Decodable, Equatable, Sendable {
+        let byteOffset: Int64?
+        let byteSize: Int?
+        let ciphertextSha256: String?
+        let replayed: Bool?
+
+        enum CodingKeys: String, CodingKey {
+            case replayed
+            case byteOffset = "byte_offset"
+            case byteSize = "byte_size"
+            case ciphertextSha256 = "ciphertext_sha256"
+        }
+    }
+
+    let upload: MessagingAttachmentUploadSessionDTO?
+    let chunk: Chunk?
 }

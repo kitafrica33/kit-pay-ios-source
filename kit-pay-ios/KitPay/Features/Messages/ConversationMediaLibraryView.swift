@@ -15,6 +15,7 @@ private struct ConversationMediaItem: Identifiable {
     let messageID: UUID
     let conversationID: String
     let senderID: String
+    let direction: LocalMediaRecord.Direction
     let createdAt: Date
     /// Display-order index within a multi-attachment message; nil for a KITMEDIA1 message.
     let itemIndex: Int?
@@ -58,12 +59,21 @@ private enum MediaLibraryCategory: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
-    var kind: KitChatMediaKind {
+    var symbolName: String {
         switch self {
-        case .photos: .image
-        case .videos: .video
-        case .audio: .voice
-        case .documents: .document
+        case .photos: KitChatMediaKind.image.symbolName
+        case .videos: KitChatMediaKind.video.symbolName
+        case .audio: KitChatMediaKind.audio.symbolName
+        case .documents: KitChatMediaKind.document.symbolName
+        }
+    }
+
+    func includes(_ kind: KitChatMediaKind) -> Bool {
+        switch self {
+        case .photos: kind == .image
+        case .videos: kind == .video
+        case .audio: kind == .voice || kind == .audio
+        case .documents: kind == .document
         }
     }
 
@@ -82,6 +92,22 @@ private enum MediaLibraryCategory: String, CaseIterable, Identifiable {
         case .videos: "Videos shared in this chat will appear here."
         case .audio: "Voice notes and audio shared in this chat will appear here."
         case .documents: "Documents shared in this chat will appear here."
+        }
+    }
+}
+
+private enum MediaLibraryDirectionFilter: String, CaseIterable, Identifiable {
+    case all = "All"
+    case sent = "Sent"
+    case received = "Received"
+
+    var id: String { rawValue }
+
+    func includes(_ direction: LocalMediaRecord.Direction) -> Bool {
+        switch self {
+        case .all: true
+        case .sent: direction == .sent
+        case .received: direction == .received
         }
     }
 }
@@ -151,6 +177,16 @@ private enum ConversationMediaThumbnailFactory {
         ).image else { return nil }
         return UIImage(cgImage: cgImage)
     }
+
+    static func videoThumbnail(fileURL: URL, maxPixel: CGFloat) async -> UIImage? {
+        let generator = AVAssetImageGenerator(asset: AVURLAsset(url: fileURL))
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = CGSize(width: maxPixel, height: maxPixel)
+        guard let cgImage = try? await generator.image(
+            at: .init(seconds: 0.1, preferredTimescale: 600)
+        ).image else { return nil }
+        return UIImage(cgImage: cgImage)
+    }
 }
 
 // MARK: - Media library
@@ -166,6 +202,7 @@ struct ConversationMediaLibraryView: View {
 
     @EnvironmentObject private var model: AppModel
     @State private var selectedCategory: MediaLibraryCategory = .photos
+    @State private var selectedDirection: MediaLibraryDirectionFilter = .all
 
     private static let gridSpacing: CGFloat = 2
     private static let horizontalPadding: CGFloat = 16
@@ -176,6 +213,7 @@ struct ConversationMediaLibraryView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 14, pinnedViews: [.sectionHeaders]) {
                     summaryHeader
+                    directionPicker
                     categoryChips
                     categoryContent(cellEdge: cellEdge)
                 }
@@ -206,21 +244,67 @@ struct ConversationMediaLibraryView: View {
     /// All browsable media items of this conversation, newest message first. A KITMEDIA1
     /// message contributes one item; a sealed KITMEDIA2 message contributes one per attachment
     /// in display order — still one logical chat message, indexed per item only here (§8).
-    /// Pending sends stay in the chat until sealed, and a family body that fails its strict
-    /// parse indexes nothing: nothing here ever reads or exposes raw descriptor text.
+    /// Pending sends index their permanent client ids immediately, so Sent Media is useful while
+    /// offline and before upload. A family body that fails strict parsing indexes nothing:
+    /// nothing here ever reads or exposes raw descriptor text.
     private var mediaItems: [ConversationMediaItem] {
         let target = Self.canonicalConversationID(conversationID)
         return model.state.messages
             .flatMap { message -> [ConversationMediaItem] in
-                guard Self.canonicalConversationID(message.conversationId) == target,
-                      message.pendingAttachment == nil,
-                      message.pendingMediaBatch == nil
-                else { return [] }
+                guard Self.canonicalConversationID(message.conversationId) == target else {
+                    return []
+                }
+                let direction: LocalMediaRecord.Direction = message.isOutgoing ? .sent : .received
+                if let pending = message.pendingAttachment {
+                    guard message.isOutgoing,
+                          let size = pending.byteCount ?? message.attachmentData?.count,
+                          let record = message.localMediaRecords?.first(where: {
+                              $0.direction == .sent
+                                  && $0.mediaType == pending.mediaType
+                                  && $0.fileSize == size
+                                  && $0.isStructurallyValid
+                          })
+                    else { return [] }
+                    return [ConversationMediaItem(
+                        messageID: message.id,
+                        conversationID: message.conversationId,
+                        senderID: message.senderId,
+                        direction: .sent,
+                        createdAt: message.createdAt,
+                        itemIndex: nil,
+                        kind: KitChatMediaKind(mediaType: pending.mediaType),
+                        mediaType: pending.mediaType,
+                        plaintextByteSize: size,
+                        caption: pending.caption,
+                        storageKey: record.id,
+                        playbackID: UUID(uuidString: record.id) ?? message.id
+                    )]
+                }
+                if let batch = message.pendingMediaBatch {
+                    guard message.isOutgoing, batch.isStructurallyValid else { return [] }
+                    return batch.items.enumerated().map { index, item in
+                        ConversationMediaItem(
+                            messageID: message.id,
+                            conversationID: message.conversationId,
+                            senderID: message.senderId,
+                            direction: .sent,
+                            createdAt: message.createdAt,
+                            itemIndex: index,
+                            kind: KitChatMediaKind(mediaType: item.mediaType),
+                            mediaType: item.mediaType,
+                            plaintextByteSize: item.plaintextByteSize,
+                            caption: nil,
+                            storageKey: item.attachmentID,
+                            playbackID: UUID(uuidString: item.attachmentID) ?? message.id
+                        )
+                    }
+                }
                 if let descriptor = KitMediaMessageDescriptor.parse(message.body) {
                     return [ConversationMediaItem(
                         messageID: message.id,
                         conversationID: message.conversationId,
                         senderID: message.senderId,
+                        direction: direction,
                         createdAt: message.createdAt,
                         itemIndex: nil,
                         kind: KitChatMediaKind(mediaType: descriptor.mediaType),
@@ -237,6 +321,7 @@ struct ConversationMediaLibraryView: View {
                             messageID: message.id,
                             conversationID: message.conversationId,
                             senderID: message.senderId,
+                            direction: direction,
                             createdAt: message.createdAt,
                             itemIndex: index,
                             kind: KitChatMediaKind(mediaType: item.mediaType),
@@ -264,7 +349,9 @@ struct ConversationMediaLibraryView: View {
     }
 
     private func items(for category: MediaLibraryCategory) -> [ConversationMediaItem] {
-        mediaItems.filter { $0.kind == category.kind }
+        mediaItems.filter {
+            category.includes($0.kind) && selectedDirection.includes($0.direction)
+        }
     }
 
     // MARK: Summary
@@ -283,19 +370,29 @@ struct ConversationMediaLibraryView: View {
     }
 
     private var summaryLine: String {
-        let all = mediaItems
-        func count(_ kind: KitChatMediaKind) -> Int {
-            all.lazy.filter { $0.kind == kind }.count
-        }
+        let all = mediaItems.filter { selectedDirection.includes($0.direction) }
         func label(_ count: Int, _ singular: String, _ plural: String) -> String {
             "\(count) \(count == 1 ? singular : plural)"
         }
+        let photoCount = all.lazy.filter { $0.kind == .image }.count
+        let videoCount = all.lazy.filter { $0.kind == .video }.count
+        let audioCount = all.lazy.filter { $0.kind == .voice || $0.kind == .audio }.count
+        let documentCount = all.lazy.filter { $0.kind == .document }.count
         return [
-            label(count(.image), "photo", "photos"),
-            label(count(.video), "video", "videos"),
-            label(count(.voice), "voice note", "voice notes"),
-            label(count(.document), "document", "documents"),
+            label(photoCount, "photo", "photos"),
+            label(videoCount, "video", "videos"),
+            label(audioCount, "audio item", "audio items"),
+            label(documentCount, "document", "documents"),
         ].joined(separator: " · ")
+    }
+
+    private var directionPicker: some View {
+        Picker("Media direction", selection: $selectedDirection) {
+            ForEach(MediaLibraryDirectionFilter.allCases) { direction in
+                Text(direction.rawValue).tag(direction)
+            }
+        }
+        .pickerStyle(.segmented)
     }
 
     // MARK: Category chips (match the chats-list filter chips)
@@ -367,7 +464,7 @@ struct ConversationMediaLibraryView: View {
     private func emptyState(for category: MediaLibraryCategory) -> some View {
         ContentUnavailableView(
             category.emptyTitle,
-            systemImage: category.kind.symbolName,
+            systemImage: category.symbolName,
             description: Text(category.emptyDescription)
         )
         .frame(maxWidth: .infinity)
@@ -545,6 +642,25 @@ private struct MediaLibraryGridCell: View {
     /// Never downloads; a v2 item or large v1 media without local bytes stays a placeholder.
     private func prepareThumbnail() async {
         guard thumbnail == nil else { return }
+        if isVideo,
+           let localFile = await model.loadProtectedLocalMediaFile(
+               messageID: item.messageID,
+               conversationId: item.conversationID,
+               itemIndex: item.itemIndex
+           ) {
+            if let cached = ConversationMediaThumbnailCache.shared.image(forKey: cacheKey) {
+                thumbnail = cached
+                return
+            }
+            if let image = await ConversationMediaThumbnailFactory.videoThumbnail(
+                fileURL: localFile.url,
+                maxPixel: maxPixel
+            ) {
+                ConversationMediaThumbnailCache.shared.insert(image, forKey: cacheKey)
+                thumbnail = image
+            }
+            return
+        }
         guard let loaded = try? await model.loadSecureMediaItem(
             messageID: item.messageID,
             conversationId: item.conversationID,
@@ -579,15 +695,22 @@ private struct MediaLibraryGridCell: View {
 
     private func decodeThumbnail(from loaded: SecureMediaLoadPolicy.LoadedItem) async {
         let pixel = maxPixel
-        let data = loaded.data
         let image: UIImage?
         if KitChatMediaKind(mediaType: loaded.mediaType) == .video {
-            image = await ConversationMediaThumbnailFactory.videoThumbnail(
-                data: data,
-                mediaType: loaded.mediaType,
-                maxPixel: pixel
-            )
+            if let localFileURL = loaded.localFileURL {
+                image = await ConversationMediaThumbnailFactory.videoThumbnail(
+                    fileURL: localFileURL,
+                    maxPixel: pixel
+                )
+            } else {
+                image = await ConversationMediaThumbnailFactory.videoThumbnail(
+                    data: loaded.data,
+                    mediaType: loaded.mediaType,
+                    maxPixel: pixel
+                )
+            }
         } else {
+            let data = loaded.data
             image = await Task.detached(priority: .utility) {
                 ConversationMediaThumbnailFactory.imageThumbnail(data: data, maxPixel: pixel)
             }.value
@@ -702,17 +825,54 @@ private struct MediaLibraryAudioRow: View {
         errorMessage = nil
         defer { isLoading = false }
         do {
+            if item.itemIndex == nil,
+               let playback = await model.loadPendingVoicePlayback(
+                   messageID: item.messageID,
+                   conversationId: item.conversationID
+               ) {
+                player.toggle(
+                    fileURLs: playback.fileURLs,
+                    segmentDurations: playback.segmentDurations,
+                    id: item.playbackID,
+                    context: chatContext.playbackContext(senderUserID: item.senderID)
+                )
+                return
+            }
+            if let localFile = await model.loadProtectedLocalMediaFile(
+                messageID: item.messageID,
+                conversationId: item.conversationID,
+                itemIndex: item.itemIndex
+            ) {
+                let fresh = SecureMediaLoadPolicy.LoadedItem(localFile: localFile)
+                loaded = fresh
+                player.toggle(
+                    fileURL: localFile.url,
+                    id: item.playbackID,
+                    context: chatContext.playbackContext(senderUserID: item.senderID),
+                    protectedOriginalLease: localFile.accessLease
+                )
+                return
+            }
             let fresh = try await model.loadSecureMediaItem(
                 messageID: item.messageID,
                 conversationId: item.conversationID,
                 itemIndex: item.itemIndex
             )
             loaded = fresh
-            player.toggle(
-                data: fresh.data,
-                id: item.playbackID,
-                context: chatContext.playbackContext(senderUserID: item.senderID)
-            )
+            if let fileURL = fresh.localFileURL {
+                player.toggle(
+                    fileURL: fileURL,
+                    id: item.playbackID,
+                    context: chatContext.playbackContext(senderUserID: item.senderID),
+                    protectedOriginalLease: fresh.localFileLease
+                )
+            } else {
+                player.toggle(
+                    data: fresh.data,
+                    id: item.playbackID,
+                    context: chatContext.playbackContext(senderUserID: item.senderID)
+                )
+            }
         } catch {
             loaded = nil
             if player.playingID == item.playbackID { player.stop() }
@@ -729,6 +889,7 @@ private struct PresentedDocumentFile: Identifiable {
     /// The same fresh resolution that produced the file: the viewer's display facts must come
     /// from it, never from fields captured when the list was built.
     let loaded: SecureMediaLoadPolicy.LoadedItem
+    let ownsTemporaryFile: Bool
 }
 
 private struct MediaLibraryDocumentRow: View {
@@ -812,7 +973,7 @@ private struct MediaLibraryDocumentRow: View {
                 fileURL: file.url,
                 displayName: Self.presentedFileName(itemIndex: item.itemIndex, loaded: file.loaded),
                 mediaType: file.loaded.mediaType,
-                byteCount: file.loaded.data.count,
+                byteCount: file.loaded.byteCount,
                 onClose: { close() }
             )
         }
@@ -831,6 +992,14 @@ private struct MediaLibraryDocumentRow: View {
         errorMessage = nil
         defer { isLoading = false }
         do {
+            if let localFile = await model.loadProtectedLocalMediaFile(
+                messageID: item.messageID,
+                conversationId: item.conversationID,
+                itemIndex: item.itemIndex
+            ) {
+                present(SecureMediaLoadPolicy.LoadedItem(localFile: localFile))
+                return
+            }
             let fresh = try await model.loadSecureMediaItem(
                 messageID: item.messageID,
                 conversationId: item.conversationID,
@@ -845,19 +1014,33 @@ private struct MediaLibraryDocumentRow: View {
     private func present(_ fresh: SecureMediaLoadPolicy.LoadedItem) {
         guard presented == nil else { return }
         do {
-            let url = try ChatMediaTempFiles.writeTemporaryFile(
-                data: fresh.data,
-                mediaType: fresh.mediaType,
-                suggestedName: Self.presentedFileName(itemIndex: item.itemIndex, loaded: fresh)
-            )
-            presented = PresentedDocumentFile(url: url, loaded: fresh)
+            if let localFileURL = fresh.localFileURL {
+                presented = PresentedDocumentFile(
+                    url: localFileURL,
+                    loaded: fresh,
+                    ownsTemporaryFile: false
+                )
+            } else {
+                let url = try ChatMediaTempFiles.writeTemporaryFile(
+                    data: fresh.data,
+                    mediaType: fresh.mediaType,
+                    suggestedName: Self.presentedFileName(itemIndex: item.itemIndex, loaded: fresh)
+                )
+                presented = PresentedDocumentFile(
+                    url: url,
+                    loaded: fresh,
+                    ownsTemporaryFile: true
+                )
+            }
         } catch {
             errorMessage = "Couldn't open. Tap to retry."
         }
     }
 
     private func close() {
-        ChatMediaTempFiles.removeTemporaryFile(presented?.url)
+        if presented?.ownsTemporaryFile == true {
+            ChatMediaTempFiles.removeTemporaryFile(presented?.url)
+        }
         presented = nil
     }
 }

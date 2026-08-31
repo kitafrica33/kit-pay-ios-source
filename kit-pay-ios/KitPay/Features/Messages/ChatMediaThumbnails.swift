@@ -2,6 +2,54 @@ import AVFoundation
 import ImageIO
 import UIKit
 
+/// Bounded ImageIO decode shared by bubbles and the full-screen gallery. Compressed attachment
+/// bytes may be close to the wire ceiling; `UIImage(data:)` can inflate an adversarially large
+/// pixel surface even when the compressed file itself is modest. Every passive render therefore
+/// asks ImageIO for an explicit pixel ceiling.
+enum ChatMediaImageDecoder {
+    static func downsample(data: Data, maximumPixelSize: Int) -> UIImage? {
+        guard maximumPixelSize > 0 else { return nil }
+        let sourceOptions: [CFString: Any] = [kCGImageSourceShouldCache: false]
+        guard let source = CGImageSourceCreateWithData(
+            data as CFData,
+            sourceOptions as CFDictionary
+        ) else { return nil }
+        let thumbnailOptions: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: maximumPixelSize,
+        ]
+        guard let image = CGImageSourceCreateThumbnailAtIndex(
+            source,
+            0,
+            thumbnailOptions as CFDictionary
+        ) else { return nil }
+        return UIImage(cgImage: image)
+    }
+
+    static func downsample(fileURL: URL, maximumPixelSize: Int) -> UIImage? {
+        guard maximumPixelSize > 0 else { return nil }
+        let sourceOptions: [CFString: Any] = [kCGImageSourceShouldCache: false]
+        guard let source = CGImageSourceCreateWithURL(
+            fileURL as CFURL,
+            sourceOptions as CFDictionary
+        ) else { return nil }
+        let thumbnailOptions: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: maximumPixelSize,
+        ]
+        guard let image = CGImageSourceCreateThumbnailAtIndex(
+            source,
+            0,
+            thumbnailOptions as CFDictionary
+        ) else { return nil }
+        return UIImage(cgImage: image)
+    }
+}
+
 /// In-memory, size-capped thumbnail cache for chat media. Keyed by descriptor storage key +
 /// pixel bucket. Never persists thumbnails to disk (plaintext stays in the encrypted caches).
 @MainActor
@@ -49,8 +97,32 @@ final class ChatMediaThumbnailStore: ObservableObject {
             return cached
         }
         guard let bytes = data(),
-              let image = Self.decodeImageThumbnail(data: bytes, maxPixel: maxPixel)
+              let image = ChatMediaImageDecoder.downsample(
+                  data: bytes,
+                  maximumPixelSize: Int(Self.pixelSize(forMaxPixel: maxPixel))
+              )
         else { return nil }
+        store(image, forKey: key, maxPixel: maxPixel)
+        return image
+    }
+
+    /// File-backed counterpart for a sender original or persisted receiver cache. ImageIO reads
+    /// and downsamples from the URL directly, so an album cell never materializes the complete
+    /// compressed photo merely to draw a thumbnail.
+    func thumbnail(
+        forKey key: String,
+        maxPixel: CGFloat,
+        fromFileURL url: URL
+    ) -> UIImage? {
+        if let cached = cachedThumbnail(forKey: key, maxPixel: maxPixel) {
+            return cached
+        }
+        guard let image = ChatMediaImageDecoder.downsample(
+            fileURL: url,
+            maximumPixelSize: Int(Self.pixelSize(forMaxPixel: maxPixel))
+        ) else {
+            return nil
+        }
         store(image, forKey: key, maxPixel: maxPixel)
         return image
     }
@@ -89,6 +161,28 @@ final class ChatMediaThumbnailStore: ObservableObject {
         return image
     }
 
+    /// File-backed sender-original variant. AVFoundation reads the protected original directly;
+    /// no duplicate temp file or whole-file `Data` is created.
+    func videoThumbnail(
+        forKey key: String,
+        maxPixel: CGFloat,
+        fromFileURL url: URL
+    ) async -> UIImage? {
+        if let cached = cachedThumbnail(forKey: key, maxPixel: maxPixel) {
+            return cached
+        }
+        let pixelEdge = Self.pixelSize(forMaxPixel: maxPixel)
+        let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = CGSize(width: pixelEdge, height: pixelEdge)
+        guard let cgImage = try? await generator.image(
+            at: CMTime(seconds: 0.1, preferredTimescale: 600)
+        ).image else { return nil }
+        let image = UIImage(cgImage: cgImage)
+        store(image, forKey: key, maxPixel: maxPixel)
+        return image
+    }
+
     // MARK: Internals
 
     private static func cacheKey(_ key: String, maxPixel: CGFloat) -> NSString {
@@ -106,23 +200,4 @@ final class ChatMediaThumbnailStore: ObservableObject {
         return (maxPixel * scale).rounded(.up)
     }
 
-    private static func decodeImageThumbnail(data: Data, maxPixel: CGFloat) -> UIImage? {
-        let sourceOptions: [CFString: Any] = [kCGImageSourceShouldCache: false]
-        guard let source = CGImageSourceCreateWithData(
-            data as CFData,
-            sourceOptions as CFDictionary
-        ) else { return nil }
-        let thumbnailOptions: [CFString: Any] = [
-            kCGImageSourceCreateThumbnailFromImageAlways: true,
-            kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceShouldCacheImmediately: true,
-            kCGImageSourceThumbnailMaxPixelSize: Int(pixelSize(forMaxPixel: maxPixel)),
-        ]
-        guard let cgImage = CGImageSourceCreateThumbnailAtIndex(
-            source,
-            0,
-            thumbnailOptions as CFDictionary
-        ) else { return nil }
-        return UIImage(cgImage: cgImage)
-    }
 }
