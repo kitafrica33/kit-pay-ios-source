@@ -578,6 +578,25 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
         XCTAssertTrue(SecureMessagingReleaseGate.enabled)
     }
 
+    func testLocalQueueReleaseGateAllowsDiscoveryGapButHonorsAuthoritativeWithdrawal() {
+        XCTAssertTrue(SecureMessagingLocalQueueReleasePolicy.permits(
+            buildEnabled: true,
+            serverAdvertisesReviewedMessaging: nil
+        ))
+        XCTAssertTrue(SecureMessagingLocalQueueReleasePolicy.permits(
+            buildEnabled: true,
+            serverAdvertisesReviewedMessaging: true
+        ))
+        XCTAssertFalse(SecureMessagingLocalQueueReleasePolicy.permits(
+            buildEnabled: true,
+            serverAdvertisesReviewedMessaging: false
+        ))
+        XCTAssertFalse(SecureMessagingLocalQueueReleasePolicy.permits(
+            buildEnabled: false,
+            serverAdvertisesReviewedMessaging: nil
+        ))
+    }
+
     func testSuccessfulSyncClearsOnlyItsOwnVisibleError() {
         var ownership = SecureMessagingSyncErrorOwnership()
         let attempt = ownership.begin()
@@ -1691,6 +1710,106 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
             abs(restoredConversation.updatedAt.timeIntervalSince(conversation.updatedAt)),
             1
         )
+    }
+
+    func testTextAndMediaEnterEncryptedOutboxBeforeE2EEEnrollmentWithoutNetwork() async throws {
+        let localUserID = "10000000-0000-4000-8000-000000000015"
+        let recipientUserID = "10000000-0000-4000-8000-000000000016"
+        let conversationID = "30000000-0000-4000-8000-000000000015"
+        let store = try await makeStore(userID: localUserID)
+        try await store.update { state in
+            state.communicationOwnerUserID = localUserID
+            state.secureMessaging = nil
+            state.conversations = [Conversation(
+                id: conversationID,
+                title: "ExampleContact",
+                participantUserIds: [localUserID, recipientUserID],
+                unreadCount: 0,
+                updatedAt: Date(timeIntervalSince1970: 1_700_000_000)
+            )]
+        }
+        let transport = OfflineExchangeTransport()
+        let coordinator = SecureMessagingExchangeCoordinator(
+            transport: transport,
+            store: store,
+            engine: SecureMessagingCryptoEngine(),
+            provisioningPreKeyCount: 1
+        )
+
+        let text = try await coordinator.queueDeferredText(
+            forUserID: localUserID,
+            conversationID: conversationID,
+            expectedRecipientUserID: recipientUserID,
+            title: "ExampleContact",
+            text: "held until keys recover"
+        )
+        let mediaBytes = Data(repeating: 0x7a, count: 32_000)
+        let media = try await coordinator.queueDeferredImage(
+            forUserID: localUserID,
+            conversationID: conversationID,
+            expectedRecipientUserID: recipientUserID,
+            title: "ExampleContact",
+            mediaData: mediaBytes,
+            mediaType: "audio/mp4",
+            caption: nil
+        )
+
+        let queueNetworkCallCount = await transport.networkCallCount()
+        XCTAssertEqual(queueNetworkCallCount, 0)
+        let snapshot = await store.snapshot()
+        XCTAssertNil(snapshot.secureMessaging?.enrollment)
+        XCTAssertEqual(snapshot.messages.map(\.id), [text.clientMessageID, media.clientMessageID])
+        XCTAssertTrue(snapshot.messages.allSatisfy { $0.state == .queued })
+        XCTAssertEqual(snapshot.outbox.count, 2)
+        XCTAssertTrue(snapshot.outbox.allSatisfy { $0.secureMessageFanout == nil })
+        XCTAssertEqual(
+            snapshot.messages.first(where: { $0.id == media.clientMessageID })?.attachmentData,
+            mediaBytes
+        )
+    }
+
+    func testPreEnrollmentQueueRejectsContradictoryCommunicationOwner() async throws {
+        let localUserID = "10000000-0000-4000-8000-000000000017"
+        let otherUserID = "10000000-0000-4000-8000-000000000018"
+        let recipientUserID = "10000000-0000-4000-8000-000000000019"
+        let conversationID = "30000000-0000-4000-8000-000000000017"
+        let store = try await makeStore(userID: localUserID)
+        try await store.update { state in
+            state.communicationOwnerUserID = otherUserID
+            state.conversations = [Conversation(
+                id: conversationID,
+                title: "ExampleContact",
+                participantUserIds: [localUserID, recipientUserID],
+                unreadCount: 0,
+                updatedAt: Date(timeIntervalSince1970: 1_700_000_000)
+            )]
+        }
+        let transport = OfflineExchangeTransport()
+        let coordinator = SecureMessagingExchangeCoordinator(
+            transport: transport,
+            store: store,
+            engine: SecureMessagingCryptoEngine(),
+            provisioningPreKeyCount: 1
+        )
+
+        do {
+            _ = try await coordinator.queueDeferredText(
+                forUserID: localUserID,
+                conversationID: conversationID,
+                expectedRecipientUserID: recipientUserID,
+                title: "ExampleContact",
+                text: "must not cross accounts"
+            )
+            XCTFail("A contradictory local communication owner must fail closed")
+        } catch let error as SecureMessagingExchangeError {
+            XCTAssertEqual(error, .invalidConversation)
+        }
+
+        let rejectedQueueNetworkCallCount = await transport.networkCallCount()
+        XCTAssertEqual(rejectedQueueNetworkCallCount, 0)
+        let snapshot = await store.snapshot()
+        XCTAssertTrue(snapshot.messages.isEmpty)
+        XCTAssertTrue(snapshot.outbox.isEmpty)
     }
 
     func testScheduledTextSurvivesRelaunchLocallyEncryptedAndUnsealedUntilDue() async throws {

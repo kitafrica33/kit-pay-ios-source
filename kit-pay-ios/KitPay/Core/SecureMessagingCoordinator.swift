@@ -1560,8 +1560,7 @@ actor SecureMessagingExchangeCoordinator {
         else { throw SecureMessagingCryptoError.invalidContent }
         let replyTarget = replyToServerMessageID?.lowercased()
         let snapshot = await store.snapshot()
-        guard snapshot.profile?.id == local,
-              snapshot.secureMessaging?.enrollment?.userID == local,
+        guard Self.permitsLocalQueueState(snapshot, userID: local),
               let conversation = snapshot.conversations.first(where: {
                   $0.id == conversationID
               }),
@@ -1677,8 +1676,7 @@ actor SecureMessagingExchangeCoordinator {
         }
         let queuedConversation = updatedConversation
         let commitMutation: (inout PersistedState) throws -> Void = { state in
-                guard state.profile?.id == local,
-                      state.secureMessaging?.enrollment?.userID == local,
+                guard Self.permitsLocalQueueState(state, userID: local),
                       !state.messages.contains(where: { $0.id == messageID }),
                       !state.outbox.contains(where: { $0.id == commandID })
                 else { throw StoreError.accountChanged }
@@ -1707,8 +1705,7 @@ actor SecureMessagingExchangeCoordinator {
             // idempotency receipt; any non-identical collision still fails closed.
             if let clientMessageID {
                 let raced = await store.snapshot()
-                guard raced.profile?.id == local,
-                      raced.secureMessaging?.enrollment?.userID == local,
+                guard Self.permitsLocalQueueState(raced, userID: local),
                       let racedConversation = raced.conversations.first(where: {
                           $0.id == conversationID
                       }),
@@ -1769,6 +1766,20 @@ actor SecureMessagingExchangeCoordinator {
             && Set(conversation.participantUserIds).count
                 == conversation.participantUserIds.count
             && conversation.participantUserIds.contains(localUserID)
+    }
+
+    /// A protected local queue belongs to the authenticated profile even before Signal
+    /// enrollment exists. A contradictory communication owner still fails closed; nil is the
+    /// legacy/pre-migration shape and is accepted only while the profile itself matches.
+    private static func permitsLocalQueueState(
+        _ state: PersistedState,
+        userID: String
+    ) -> Bool {
+        guard state.profile?.id.caseInsensitiveCompare(userID) == .orderedSame else {
+            return false
+        }
+        guard let owner = state.communicationOwnerUserID else { return true }
+        return owner.caseInsensitiveCompare(userID) == .orderedSame
     }
 
     /// Rich media requires EVERY receiving member's devices to be attested — one stale member
@@ -2190,9 +2201,7 @@ actor SecureMessagingExchangeCoordinator {
             }
         }
         let snapshot = await store.snapshot()
-        guard snapshot.profile?.id == local,
-              let enrollment = snapshot.secureMessaging?.enrollment,
-              enrollment.userID == local,
+        guard Self.permitsLocalQueueState(snapshot, userID: local),
               let conversation = snapshot.conversations.first(where: {
                   $0.id == conversationID
               }),
@@ -2220,8 +2229,6 @@ actor SecureMessagingExchangeCoordinator {
         // No network at queue time: the offline path must succeed in airplane mode. The rich-media
         // recipient-capability gate still runs authoritatively at flush (prepareDeferredMessage)
         // and again per-encrypt in queueText before any bytes leave the device.
-        _ = enrollment
-
         if let clientMessageID,
            let existing = try await existingDeferredMediaResult(
                in: snapshot,
@@ -2298,8 +2305,7 @@ actor SecureMessagingExchangeCoordinator {
         }
         let queuedConversation = updatedConversation
         try await store.update { state in
-            guard state.profile?.id == local,
-                  state.secureMessaging?.enrollment?.userID == local,
+            guard Self.permitsLocalQueueState(state, userID: local),
                   !state.messages.contains(where: { $0.id == messageID }),
                   !state.outbox.contains(where: { $0.id == commandID })
             else { throw StoreError.accountChanged }
@@ -2423,8 +2429,7 @@ actor SecureMessagingExchangeCoordinator {
     ) async throws {
         guard let submittedDraftBody, let draftClearVersion else { return }
         let mutation: (inout PersistedState) throws -> Void = { state in
-            guard state.profile?.id == localUserID,
-                  state.secureMessaging?.enrollment?.userID == localUserID,
+            guard Self.permitsLocalQueueState(state, userID: localUserID),
                   state.messages.contains(where: {
                       $0.id == clientMessageID
                           && $0.conversationId == conversationID
@@ -2488,9 +2493,7 @@ actor SecureMessagingExchangeCoordinator {
               batch.items.allSatisfy({ !$0.isUploaded })
         else { throw SecureMediaAttachmentError.invalidMedia }
         let snapshot = await store.snapshot()
-        guard snapshot.profile?.id == local,
-              let enrollment = snapshot.secureMessaging?.enrollment,
-              enrollment.userID == local,
+        guard Self.permitsLocalQueueState(snapshot, userID: local),
               let conversation = snapshot.conversations.first(where: {
                   $0.id == conversationID
               }),
@@ -2515,8 +2518,6 @@ actor SecureMessagingExchangeCoordinator {
         // No network at queue time: the offline path must succeed in airplane mode. The v2
         // capability admission gate runs authoritatively at flush (prepareDeferredMessage) and
         // again per-encrypt in queueText before any bytes leave the device.
-        _ = enrollment
-
         // Every parked plaintext must exist with its declared byte count before any durable
         // commit: a torn share hand-off surfaces here, while the draft is still recoverable,
         // instead of as a visible retire at flush time.
@@ -2549,8 +2550,7 @@ actor SecureMessagingExchangeCoordinator {
             // values — with offered park keys disjoint from every other message's media keys,
             // and the requested draft clear rides inside the same mutation.
             try await store.update { state in
-                guard state.profile?.id == local,
-                      state.secureMessaging?.enrollment?.userID == local,
+                guard Self.permitsLocalQueueState(state, userID: local),
                       state.messages.filter({ $0.id == clientMessageID })
                           == [match.message],
                       state.outbox.filter({ $0.messageId == clientMessageID })
@@ -2579,8 +2579,7 @@ actor SecureMessagingExchangeCoordinator {
             // account — on a switch the scratch parks are left behind, because an orphaned
             // scratch blob is recoverable and a deleted parked plaintext is not.
             let latest = await store.snapshot()
-            guard latest.profile?.id == local,
-                  latest.secureMessaging?.enrollment?.userID == local
+            guard Self.permitsLocalQueueState(latest, userID: local)
             else { return match.result }
             let liveKeys = Set(match.message.localMediaStorageKeys)
                 .union(latest.messages.flatMap(\.localMediaStorageKeys))
@@ -2639,8 +2638,7 @@ actor SecureMessagingExchangeCoordinator {
         // target, and park keys unclaimed by any other message — and never upserts the
         // snapshot's conversation back over a newer one.
         try await store.update { state in
-            guard state.profile?.id == local,
-                  state.secureMessaging?.enrollment?.userID == local,
+            guard Self.permitsLocalQueueState(state, userID: local),
                   !state.messages.contains(where: { $0.id == messageID }),
                   !state.outbox.contains(where: { $0.id == commandID }),
                   // One message, one command: a torn or orphaned command already claiming this
@@ -2971,13 +2969,19 @@ actor SecureMessagingExchangeCoordinator {
                 }
                 guard mediaData.count <= SecureMediaAttachmentCipher.maximumPlaintextBytes
                 else { throw SecureMediaAttachmentError.invalidMedia }
+                // Queueing is deliberately allowed before this installation has a Signal
+                // enrollment. Activate first at flush time, then use that exact returned
+                // binding for every device-capability decision below. Reading the opening
+                // snapshot's enrollment here used to strand voice/video/document commands
+                // forever when the composer queued them during key recovery.
+                let activated = try await activation.activate(forUserID: local)
+                guard let enrollment = activated.enrollment, enrollment.userID == local else {
+                    throw SecureMessagingExchangeError.invalidAccount
+                }
                 if KitChatMediaKind(mediaType: pending.mediaType) != .image
                     || mediaData.count
                         > MessagingRichMediaCapabilityPolicy
                             .broadlyCompatibleMaximumPlaintextBytes {
-                    guard let enrollment = snapshot.secureMessaging?.enrollment else {
-                        throw SecureMessagingExchangeError.invalidAccount
-                    }
                     let roster = try await transport.messagingDeviceRoster(
                         conversationId: conversationID
                     )
@@ -3000,7 +3004,6 @@ actor SecureMessagingExchangeCoordinator {
                         memberUserIDs: conversation.memberUserIDs
                     )
                 }
-                _ = try await activation.activate(forUserID: local)
                 let descriptor = try await uploadMediaDescriptor(
                     mediaData: mediaData,
                     mediaType: pending.mediaType,

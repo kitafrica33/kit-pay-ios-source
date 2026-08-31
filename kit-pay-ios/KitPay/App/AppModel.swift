@@ -1402,6 +1402,25 @@ final class AppModel: ObservableObject {
         secureMessagingReleasePermitted
             && state.secureMessaging?.enrollment?.userID == profile?.id
     }
+    /// Local composition does not require a live Signal enrollment. The protected outbox is the
+    /// first destination for a send, and `flushOutbox` activates/repairs E2EE before it can create
+    /// a fanout or touch the message transport. Keeping this separate from
+    /// `secureMessagingAvailable` prevents a missing/rotating enrollment from disabling the
+    /// composer while retaining the no-plaintext-network invariant.
+    var secureMessagingLocalQueueAvailable: Bool {
+        SecureMessagingLocalQueueReleasePolicy.permits(
+            buildEnabled: SecureMessagingReleaseGate.enabled,
+            serverAdvertisesReviewedMessaging: capabilities.map {
+                $0.supportsFeature("messaging")
+                    && $0.protocols?.messaging?.supportsReviewedV2 == true
+            }
+        )
+            && isSignedIn
+            && !isSigningOut
+            && accountSetupStep == nil
+            && communicationAccessGranted
+            && !communicationSurfacesConcealed
+    }
     private var secureMessagingReleasePermitted: Bool {
         guard SecureMessagingReleaseGate.enabled else { return false }
         if let capabilities {
@@ -1416,19 +1435,20 @@ final class AppModel: ObservableObject {
         // every time discovery restarts.
         return state.secureMessaging?.enrollment?.userID == profile?.id
     }
-    /// Group chats stay fail-closed until the server advertises them AND this device owns the
-    /// active enrollment. Unlike composing into an existing thread, group creation is never
-    /// permitted through a capability-discovery gap.
+    /// Group mutations stay fail-closed until the server advertises the reviewed protocol and
+    /// group feature. Enrollment is recovered later by the same secure flush boundary as direct
+    /// messages; unlike composing into an existing thread, group creation is never permitted
+    /// through a capability-discovery gap.
     var messagingGroupsEnabled: Bool {
-        secureMessagingAvailable
+        secureMessagingReleasePermitted
             && capabilities?.supportsFeature(MessagingGroupCapabilityPolicy.featureKey) == true
     }
     var messagingReactionsEnabled: Bool {
-        secureMessagingAvailable
+        secureMessagingReleasePermitted
             && MessagingReactionCapabilityPolicy.isEnabled(features: capabilities?.features)
     }
     var messagingMessageEditsEnabled: Bool {
-        secureMessagingAvailable
+        secureMessagingReleasePermitted
             && MessagingMessageEditCapabilityPolicy.isEnabled(features: capabilities?.features)
     }
     var messagingRealtimeConfiguration: KitRealtimeConfiguration? {
@@ -8593,6 +8613,19 @@ final class AppModel: ObservableObject {
         ) == .allowed
     }
 
+    /// Queueing into the encrypted local store is safe while the authoritative privacy projection
+    /// is still loading. Transport remains blocked in `flushOutbox` until that projection is
+    /// complete and explicitly allows every recipient. A known block still prevents composition.
+    func communicationPrivacyAllowsLocalQueue(to rawUserID: String?) -> Bool {
+        guard isSignedIn, !appReviewDemoIsActive else { return false }
+        return CommunicationPrivacyAccessPolicy.decision(
+            ownerUserID: profile?.id,
+            recipientUserID: rawUserID,
+            hasLoadedCompleteProjection: hasUsableCommunicationPrivacyProjection,
+            blocks: communicationBlocks
+        ) != .blocked
+    }
+
     func isCommunicationBlocked(userID rawUserID: String?) -> Bool {
         guard let userID = CommunicationPrivacyIdentifier.canonicalUUID(rawUserID) else {
             return false
@@ -9452,7 +9485,7 @@ final class AppModel: ObservableObject {
             lastError = "This conversation is no longer available. Your message was not sent."
             return false
         }
-        guard secureMessagingAvailable else {
+        guard secureMessagingLocalQueueAvailable else {
             lastError = messagingSendFailureMessage
             return false
         }
@@ -9520,11 +9553,8 @@ final class AppModel: ObservableObject {
             sessionID: expectedSessionID
         ) else { return false }
         if let recipientUserID,
-           let denial = communicationPrivacyDenialMessage(
-               for: recipientUserID,
-               blockedMessage: "Unblock this account before sending a message."
-           ) {
-            lastError = denial
+           !communicationPrivacyAllowsLocalQueue(to: recipientUserID) {
+            lastError = "Unblock this account before sending a message."
             return false
         }
         guard MessagingGroupCapabilityPolicy.allowsConversationMutation(
@@ -10069,7 +10099,7 @@ final class AppModel: ObservableObject {
             lastError = "\(kind.previewLabel)s can be up to \(KitChatMediaLimits.maximumTransferLabel)."
             return false
         }
-        guard secureMessagingAvailable else {
+        guard secureMessagingLocalQueueAvailable else {
             lastError = messagingSendFailureMessage
             return false
         }
@@ -10102,11 +10132,8 @@ final class AppModel: ObservableObject {
             sessionID: expectedSessionID
         ) else { return false }
         if let recipientUserID,
-           let denial = communicationPrivacyDenialMessage(
-               for: recipientUserID,
-               blockedMessage: "Unblock this account before sending this attachment."
-           ) {
-            lastError = denial
+           !communicationPrivacyAllowsLocalQueue(to: recipientUserID) {
+            lastError = "Unblock this account before sending this attachment."
             return false
         }
         // Offline-first for every kind: the message commits locally (instant bubble) and the
@@ -10289,7 +10316,7 @@ final class AppModel: ObservableObject {
                 return false
             }
         }
-        guard secureMessagingAvailable else {
+        guard secureMessagingLocalQueueAvailable else {
             lastError = messagingSendFailureMessage
             return false
         }
@@ -10322,11 +10349,8 @@ final class AppModel: ObservableObject {
             sessionID: expectedSessionID
         ) else { return false }
         if let recipientUserID,
-           let denial = communicationPrivacyDenialMessage(
-               for: recipientUserID,
-               blockedMessage: "Unblock this account before sending these attachments."
-           ) {
-            lastError = denial
+           !communicationPrivacyAllowsLocalQueue(to: recipientUserID) {
+            lastError = "Unblock this account before sending these attachments."
             return false
         }
         // Offline-first: every plaintext parks in the encrypted media file cache under a fresh
@@ -13206,7 +13230,7 @@ final class AppModel: ObservableObject {
                     }
                     continue
                 }
-                guard secureMessagingAvailable else {
+                guard secureMessagingReleasePermitted else {
                     // A capability gap here is almost always a discovery flap (nil or briefly
                     // missing "messaging" while reloading). Hard-failing every queued message
                     // turned a transient blip into red bubbles; leave them queued. The defer
@@ -15509,7 +15533,7 @@ final class AppModel: ObservableObject {
             return true
         }
 
-        guard secureMessagingAvailable else { return false }
+        guard secureMessagingLocalQueueAvailable else { return false }
         // A failed KITMEDIA2 send — pending batch or sealed descriptor — retries only through
         // the media path, which restores the whole batch under the same client message ID.
         // The text path would send the caption alone and split the message; its own validator
@@ -15589,7 +15613,7 @@ final class AppModel: ObservableObject {
                     else { throw CancellationError() }
                 }
             } else {
-                guard secureMessagingAvailable else { return }
+                guard secureMessagingLocalQueueAvailable else { return }
                 // Same dispatch as `canRetryMessage`: a v2 projection may only ride the media
                 // retry, which re-queues the entire batch — never its caption as text.
                 let failed = state.messages.first(where: { $0.id == messageID })
@@ -15962,6 +15986,19 @@ private enum MainTabIndex {
 /// encrypted path for TestFlight validation; server flags still cannot enable an unreviewed wire.
 enum SecureMessagingReleaseGate {
     static let enabled = true
+}
+
+/// Local queueing tolerates an absent capability document (startup, failed refresh, offline),
+/// because transport revalidates it before encryption/fanout. Once an authenticated server
+/// document is present, however, an explicit feature/protocol withdrawal is authoritative and
+/// composition remains fail-closed.
+enum SecureMessagingLocalQueueReleasePolicy {
+    static func permits(
+        buildEnabled: Bool,
+        serverAdvertisesReviewedMessaging: Bool?
+    ) -> Bool {
+        buildEnabled && serverAdvertisesReviewedMessaging != false
+    }
 }
 
 struct SecureMessagingRemoteWake: Sendable {

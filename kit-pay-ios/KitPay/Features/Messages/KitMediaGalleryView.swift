@@ -966,8 +966,16 @@ private final class GalleryVideoController: ObservableObject {
 
     private var isScrubbing = false
     private var fileURL: URL?
+    /// Keeping the protected file open is what makes `.completeFileProtectionUnlessOpen` useful:
+    /// AVFoundation can continue reading after a lock/background transition, but a new process
+    /// still cannot open the plaintext while protected data is unavailable.
+    private var playbackFileHandle: FileHandle?
     private var timeObserver: Any?
     private var endObserver: NSObjectProtocol?
+    private var stallObserver: NSObjectProtocol?
+    private var failureObserver: NSObjectProtocol?
+    private var recoveryTask: Task<Void, Never>?
+    private var automaticRecoveryAttempts = 0
     /// The layer this page is drawing into, reported by `PlayerLayerView`. Picture in Picture
     /// hands off a *layer*, so the window can only be armed once one exists.
     private weak var playerLayer: AVPlayerLayer?
@@ -990,10 +998,16 @@ private final class GalleryVideoController: ObservableObject {
             data: data,
             mediaType: mediaType
         ) else { return }
+        guard let fileHandle = try? FileHandle(forReadingFrom: url) else {
+            ChatMediaTempFiles.removeTemporaryFile(url)
+            return
+        }
         fileURL = url
+        playbackFileHandle = fileHandle
         let asset = AVURLAsset(url: url)
         let item = AVPlayerItem(asset: asset)
         let player = AVPlayer(playerItem: item)
+        player.automaticallyWaitsToMinimizeStalling = true
         self.player = player
 
         timeObserver = player.addPeriodicTimeObserver(
@@ -1007,17 +1021,11 @@ private final class GalleryVideoController: ObservableObject {
             }
         }
 
-        endObserver = NotificationCenter.default.addObserver(
-            forName: .AVPlayerItemDidPlayToEndTime,
-            object: item,
-            queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor in self?.handlePlaybackEnded() }
-        }
+        observePlaybackItem(item)
 
         Task { [weak self] in
             let loaded = try? await asset.load(.duration)
-            guard let self else { return }
+            guard let self, self.fileURL == url else { return }
             if let seconds = loaded?.seconds, seconds.isFinite {
                 self.duration = seconds
             }
@@ -1042,16 +1050,24 @@ private final class GalleryVideoController: ObservableObject {
     }
 
     private func releaseResources() {
+        recoveryTask?.cancel()
+        recoveryTask = nil
         if let timeObserver { player?.removeTimeObserver(timeObserver) }
         timeObserver = nil
-        if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
-        endObserver = nil
+        removePlaybackItemObservers()
         player?.pause()
+        player?.replaceCurrentItem(with: nil)
         player = nil
         playerLayer = nil
         isPlaying = false
         hasStartedPlayback = false
         currentTime = 0
+        duration = 0
+        automaticRecoveryAttempts = 0
+        if let playbackFileHandle {
+            try? playbackFileHandle.close()
+        }
+        playbackFileHandle = nil
         ChatMediaTempFiles.removeTemporaryFile(fileURL)
         fileURL = nil
         galleryIdentity = nil
@@ -1061,9 +1077,11 @@ private final class GalleryVideoController: ObservableObject {
     func togglePlayback() {
         guard let player else { return }
         if isPlaying {
+            recoveryTask?.cancel()
             player.pause()
             isPlaying = false
         } else {
+            automaticRecoveryAttempts = 0
             player.play()
             isPlaying = true
             hasStartedPlayback = true
@@ -1072,6 +1090,7 @@ private final class GalleryVideoController: ObservableObject {
     }
 
     func pause() {
+        recoveryTask?.cancel()
         player?.pause()
         isPlaying = false
     }
@@ -1115,9 +1134,116 @@ private final class GalleryVideoController: ObservableObject {
         }
     }
 
+    private func observePlaybackItem(_ item: AVPlayerItem) {
+        removePlaybackItemObservers()
+        endObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime,
+            object: item,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.handlePlaybackEnded() }
+        }
+        stallObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemPlaybackStalled,
+            object: item,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                // AVPlayer often clears a transient wait itself. Give that path a brief chance,
+                // then rebuild only if this complete local file is still not advancing.
+                self?.requestAutomaticRecovery(
+                    afterNanoseconds: 400_000_000,
+                    onlyIfStillWaiting: true
+                )
+            }
+        }
+        failureObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemFailedToPlayToEndTime,
+            object: item,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.requestAutomaticRecovery(
+                    afterNanoseconds: 0,
+                    onlyIfStillWaiting: false
+                )
+            }
+        }
+    }
+
+    private func removePlaybackItemObservers() {
+        if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
+        if let stallObserver { NotificationCenter.default.removeObserver(stallObserver) }
+        if let failureObserver { NotificationCenter.default.removeObserver(failureObserver) }
+        endObserver = nil
+        stallObserver = nil
+        failureObserver = nil
+    }
+
+    private func requestAutomaticRecovery(
+        afterNanoseconds delay: UInt64,
+        onlyIfStillWaiting: Bool
+    ) {
+        guard isPlaying,
+              automaticRecoveryAttempts
+                  < ChatVideoPlaybackRecoveryPolicy.maximumAutomaticAttempts,
+              let fileURL
+        else { return }
+        recoveryTask?.cancel()
+        recoveryTask = Task { @MainActor [weak self] in
+            if delay > 0 {
+                try? await Task.sleep(nanoseconds: delay)
+            }
+            guard !Task.isCancelled,
+                  let self,
+                  self.isPlaying,
+                  let player = self.player
+            else { return }
+            if onlyIfStillWaiting, player.timeControlStatus == .playing { return }
+
+            // Re-open the already verified local asset; there is no network fallback here.
+            // Its held read handle keeps the file available through protected-data transitions.
+            let replacementAsset = AVURLAsset(url: fileURL)
+            let loadedDuration = try? await replacementAsset.load(.duration)
+            guard !Task.isCancelled, self.isPlaying else { return }
+            let liveTime = player.currentTime().seconds
+            let resumeTime = liveTime.isFinite ? liveTime : self.currentTime
+            let measuredDuration = loadedDuration?.seconds
+            let provenDuration = if let measuredDuration, measuredDuration.isFinite {
+                measuredDuration
+            } else {
+                self.duration
+            }
+            guard ChatVideoPlaybackRecoveryPolicy.shouldRecover(
+                currentTime: resumeTime,
+                duration: provenDuration,
+                intendsToPlay: self.isPlaying,
+                attemptCount: self.automaticRecoveryAttempts
+            ) else { return }
+
+            self.duration = provenDuration
+            self.automaticRecoveryAttempts += 1
+            let replacementItem = AVPlayerItem(asset: replacementAsset)
+            self.observePlaybackItem(replacementItem)
+            player.replaceCurrentItem(with: replacementItem)
+            player.seek(
+                to: CMTime(seconds: resumeTime, preferredTimescale: 600),
+                toleranceBefore: .zero,
+                toleranceAfter: .zero
+            ) { [weak self, weak player] finished in
+                Task { @MainActor in
+                    guard finished, self?.isPlaying == true else { return }
+                    player?.play()
+                }
+            }
+        }
+    }
+
     private func handlePlaybackEnded() {
+        recoveryTask?.cancel()
         isPlaying = false
         currentTime = 0
+        automaticRecoveryAttempts = 0
         player?.seek(to: .zero)
         // Nothing left to watch: the floating window closes itself rather than sitting on the
         // user's screen showing a frozen last frame.

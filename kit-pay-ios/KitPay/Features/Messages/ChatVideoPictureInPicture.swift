@@ -15,6 +15,64 @@ struct ChatVideoGalleryIdentity: Equatable {
     let itemIndex: Int?
 }
 
+/// A local AVPlayer may report a stall/failure while it is still well short of the duration that
+/// AVFoundation read from the complete, integrity-verified file. Only that provable early stop is
+/// eligible for automatic recovery; an unknown duration or a stop at the natural tail is never
+/// replayed. The cap also prevents a malformed-but-parseable file from entering a retry loop.
+enum ChatVideoPlaybackRecoveryPolicy {
+    static let maximumAutomaticAttempts = 2
+    static let recentPlaybackEvidenceWindow: TimeInterval = 3
+
+    static func shouldRecover(
+        currentTime: Double,
+        duration: Double,
+        intendsToPlay: Bool,
+        attemptCount: Int
+    ) -> Bool {
+        guard intendsToPlay,
+              attemptCount < maximumAutomaticAttempts,
+              currentTime.isFinite,
+              duration.isFinite,
+              currentTime >= 0,
+              duration > 0,
+              currentTime < duration
+        else { return false }
+
+        // Treat the final sliver as a genuine end. The relative component scales for long clips,
+        // while the floor keeps timestamp rounding from restarting very short videos.
+        let endTolerance = max(0.25, min(1, duration * 0.02))
+        return duration - currentTime > endTolerance
+    }
+
+    enum Interruption {
+        case stalled
+        case failed
+    }
+
+    /// SwiftUI's native `VideoPlayer` controls do not expose a play/pause callback. Its recovery
+    /// path therefore requires AVPlayer-owned evidence: an active wait for a stall, or a failed
+    /// item immediately after observed playback progress. An ordinary pause has neither and can
+    /// never be mistaken for a request to resume.
+    static func permitsNativeControlsRecovery(
+        interruption: Interruption,
+        playerIsWaitingToPlay: Bool,
+        itemIsFailed: Bool,
+        secondsSinceLastProgress: TimeInterval?
+    ) -> Bool {
+        switch interruption {
+        case .stalled:
+            return playerIsWaitingToPlay
+        case .failed:
+            guard itemIsFailed,
+                  let secondsSinceLastProgress,
+                  secondsSinceLastProgress.isFinite,
+                  secondsSinceLastProgress >= 0
+            else { return false }
+            return secondsSinceLastProgress <= recentPlaybackEvidenceWindow
+        }
+    }
+}
+
 enum ChatVideoPictureInPictureHandoffPolicy {
     static func shouldRetainTeardown(
         ownerMatches: Bool,

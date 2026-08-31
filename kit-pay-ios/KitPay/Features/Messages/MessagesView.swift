@@ -258,8 +258,12 @@ struct MessagesView: View {
                 }
                 ContentUnavailableView {
                     Label(
-                        model.secureMessagingAvailable ? "No chats yet" : "Messages temporarily unavailable",
-                        systemImage: model.secureMessagingAvailable ? "message" : "lock.fill"
+                        model.secureMessagingLocalQueueAvailable
+                            ? "No chats yet"
+                            : "Messages temporarily unavailable",
+                        systemImage: model.secureMessagingLocalQueueAvailable
+                            ? "message"
+                            : "lock.fill"
                     )
                 } description: {
                     Text("Messages are end-to-end encrypted.")
@@ -1714,6 +1718,13 @@ struct ConversationView: View {
         return model.communicationPrivacyAllowsOutbound(to: recipientUserID)
     }
 
+    /// A privacy refresh may delay transport, but it must not delay an encrypted local queue.
+    /// Known blocks still stop composition; unknown authority is re-checked before flush.
+    private var recipientMessageQueueAllowed: Bool {
+        if isGroupConversation { return true }
+        return model.communicationPrivacyAllowsLocalQueue(to: recipientUserID)
+    }
+
     /// Existing group history remains readable when the rollout gate is absent or withdrawn,
     /// but every local mutation stays disabled until the server advertises the protocol again.
     private var conversationMessagingAvailable: Bool {
@@ -1746,9 +1757,9 @@ struct ConversationView: View {
     private var canSendMessage: Bool {
         let hasAttachment = !stagedAttachments.isEmpty
         return !isReadOnlyAppReviewPreview
-            && model.secureMessagingAvailable
+            && model.secureMessagingLocalQueueAvailable
             && conversationMessagingAvailable
-            && recipientCommunicationAllowed
+            && recipientMessageQueueAllowed
             && !isSending
             && !isLoadingAttachment
             && (hasAttachment || !trimmedDraft.isEmpty)
@@ -2168,7 +2179,7 @@ struct ConversationView: View {
         !isReadOnlyAppReviewPreview
             && !isSelectingMessages
             && conversationMessagingAvailable
-            && model.secureMessagingAvailable
+            && model.secureMessagingLocalQueueAvailable
             && MessageReplyQuotePolicy.canReply(to: message)
     }
 
@@ -4194,7 +4205,7 @@ struct ConversationView: View {
 
             HStack(alignment: .bottom, spacing: 4) {
                 TextField(
-                    model.secureMessagingAvailable && conversationMessagingAvailable
+                    model.secureMessagingLocalQueueAvailable && conversationMessagingAvailable
                         ? "Message"
                         : "Messages temporarily unavailable",
                     text: $draft,
@@ -4202,7 +4213,11 @@ struct ConversationView: View {
                 )
                 .lineLimit(1...5)
                 .focused($isComposerFocused)
-                .disabled(!model.secureMessagingAvailable || !conversationMessagingAvailable || isSending)
+                .disabled(
+                    !model.secureMessagingLocalQueueAvailable
+                        || !conversationMessagingAvailable
+                        || isSending
+                )
                 .padding(.leading, 14)
                 .padding(.vertical, 10)
 
@@ -4218,8 +4233,14 @@ struct ConversationView: View {
                     }
                     .buttonStyle(.plain)
                     .foregroundStyle(KitColor.green)
-                    .disabled(!model.secureMessagingAvailable || !conversationMessagingAvailable)
-                    .opacity(model.secureMessagingAvailable && conversationMessagingAvailable ? 1 : 0.5)
+                    .disabled(
+                        !model.secureMessagingLocalQueueAvailable
+                            || !conversationMessagingAvailable
+                    )
+                    .opacity(
+                        model.secureMessagingLocalQueueAvailable
+                            && conversationMessagingAvailable ? 1 : 0.5
+                    )
                     .accessibilityLabel("Record a voice note")
                     .transition(.opacity.combined(with: .scale(scale: 0.82)))
                 }

@@ -72,6 +72,33 @@ final class ChatMediaPolicyTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: unrelated.path))
     }
 
+    func testPreviewFileUsesProtectionThatRemainsReadableOnlyWhileAlreadyOpen() throws {
+        XCTAssertEqual(
+            ChatMediaTempFiles.previewFileWritingOptions,
+            [.atomic, .completeFileProtectionUnlessOpen]
+        )
+
+        let url = try ChatMediaTempFiles.writeTemporaryFile(
+            data: Data([1, 2, 3]),
+            mediaType: "video/mp4"
+        )
+        defer { ChatMediaTempFiles.removeTemporaryFile(url) }
+
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+#if targetEnvironment(simulator)
+        // Simulator files live on the host filesystem, which may omit NSFileProtectionKey.
+        // If the runtime does expose it, it must still agree with the production policy above.
+        if let protection = attributes[.protectionKey] as? FileProtectionType {
+            XCTAssertEqual(protection, .completeUnlessOpen)
+        }
+#else
+        XCTAssertEqual(
+            attributes[.protectionKey] as? FileProtectionType,
+            .completeUnlessOpen
+        )
+#endif
+    }
+
     func testTransferLimitIsTwoHundredMebibytes() {
         XCTAssertEqual(SecureMediaAttachmentCipher.maximumPlaintextBytes, 200 * 1_024 * 1_024)
         XCTAssertEqual(

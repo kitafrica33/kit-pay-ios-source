@@ -1,12 +1,12 @@
-# Kit Pay iOS 1.0.16 (43) corresponding source
+# Kit Pay iOS 1.0.16 (44) corresponding source
 
 This archive is the complete corresponding source offered for the Kit Pay iOS binary with:
 
 - bundle identifier: `africa.kit.pay.ios`
 - marketing version: `1.0.16`
-- build number: `43`
-- Kit Pay source commit: `92620cb859e7ddaa7af5d71142adbffe2f5746c0`
-- Kit Pay source tree: `be461dc984b8c4a99e4de48e7b88d93c7a3c338c`
+- build number: `44`
+- Kit Pay source commit: `d06eedd24c272b504723bb6d5e7e0479143de12f`
+- Kit Pay source tree: `09d1678cabc564ff9a471ef14901dc5416cda5d6`
 - LibSignal source commit: `b5121d07c72f9e631f178d907ca892587f64f9e2`
 - LibSignal source tree: `4ce005a0bf17a445ab14052f8e0c414aa3ddccb9`
 
