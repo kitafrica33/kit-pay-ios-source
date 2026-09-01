@@ -707,7 +707,13 @@ final class MerchantReceiveQRViewModel: ObservableObject {
                         prefix: "ios-merchant-intent"
                     )
                 )
-                guard intent?.amount == amount, intent?.currency == wallet.currency else {
+                guard let intent,
+                      MerchantReceiveIntentPolicy.confirmsCreatedIntent(
+                          intent,
+                          requestedAmount: amount,
+                          settlementWallet: wallet
+                      )
+                else {
                     throw MerchantReceiveQRFlowError.unconfirmedIntent
                 }
             } else {

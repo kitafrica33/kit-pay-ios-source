@@ -1,4 +1,6 @@
 import XCTest
+import AVFoundation
+import UIKit
 @testable import KitPay
 
 final class ChatMediaPolicyTests: XCTestCase {
@@ -570,6 +572,278 @@ final class ChatMediaPolicyTests: XCTestCase {
         )
     }
 
+    @MainActor
+    func testLocalMediaMonitorRecordsIndependentMilestonesAndKeepsFirstObservation() throws {
+        let monitor = LocalMediaPerformanceMonitor()
+        let mediaID = UUID()
+        let captured = Date(timeIntervalSince1970: 100)
+        monitor.begin(mediaID: mediaID, at: captured)
+
+        let visible = try XCTUnwrap(
+            monitor.markVisible(mediaID: mediaID, at: captured.addingTimeInterval(0.010))
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(visible.captureToVisibleMilliseconds),
+            10,
+            accuracy: 0.001
+        )
+        XCTAssertNil(visible.captureToPlayableMilliseconds)
+
+        let playable = try XCTUnwrap(
+            monitor.markPlayable(mediaID: mediaID, at: captured.addingTimeInterval(0.014))
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(playable.captureToVisibleMilliseconds),
+            10,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(playable.captureToPlayableMilliseconds),
+            14,
+            accuracy: 0.001
+        )
+
+        // A later view/tap cannot inflate the local-availability measurement.
+        let repeated = try XCTUnwrap(
+            monitor.markPlayable(mediaID: mediaID, at: captured.addingTimeInterval(5))
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(repeated.captureToPlayableMilliseconds),
+            14,
+            accuracy: 0.001
+        )
+
+        let encrypted = try XCTUnwrap(
+            monitor.markEncrypted(mediaID: mediaID, at: captured.addingTimeInterval(1))
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(encrypted.captureToEncryptedMilliseconds),
+            1_000,
+            accuracy: 0.001
+        )
+        let accepted = try XCTUnwrap(
+            monitor.markServerAccepted(mediaID: mediaID, at: captured.addingTimeInterval(2))
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(accepted.captureToServerAcceptedMilliseconds),
+            2_000,
+            accuracy: 0.001
+        )
+        XCTAssertNil(monitor.markVisible(mediaID: mediaID, at: captured.addingTimeInterval(3)))
+    }
+
+    @MainActor
+    func testRecipientHydrationMonitorUsesEarliestDescriptorObservation() throws {
+        let monitor = LocalMediaPerformanceMonitor()
+        let mediaID = UUID()
+        let first = Date(timeIntervalSince1970: 200)
+        monitor.beginRecipientHydration(mediaID: mediaID, descriptorObservedAt: first)
+        monitor.beginRecipientHydration(
+            mediaID: mediaID,
+            descriptorObservedAt: first.addingTimeInterval(1)
+        )
+        let hydrated = try XCTUnwrap(
+            monitor.markRecipientHydrated(mediaID: mediaID, at: first.addingTimeInterval(2.5))
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(hydrated.recipientDescriptorToLocalMilliseconds),
+            2_500,
+            accuracy: 0.001
+        )
+        XCTAssertNil(monitor.markRecipientHydrated(mediaID: mediaID))
+    }
+
+    @MainActor
+    func testFastServerAcceptanceDoesNotEraseLaterLocalAvailabilityMetrics() throws {
+        let monitor = LocalMediaPerformanceMonitor()
+        let mediaID = UUID()
+        let captured = Date(timeIntervalSince1970: 300)
+        monitor.begin(mediaID: mediaID, at: captured)
+
+        let accepted = try XCTUnwrap(
+            monitor.markServerAccepted(mediaID: mediaID, at: captured.addingTimeInterval(0.004))
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(accepted.captureToServerAcceptedMilliseconds),
+            4,
+            accuracy: 0.001
+        )
+        let visible = try XCTUnwrap(
+            monitor.markVisible(mediaID: mediaID, at: captured.addingTimeInterval(0.009))
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(visible.captureToVisibleMilliseconds),
+            9,
+            accuracy: 0.001
+        )
+        let playable = try XCTUnwrap(
+            monitor.markPlayable(mediaID: mediaID, at: captured.addingTimeInterval(0.011))
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(playable.captureToPlayableMilliseconds),
+            11,
+            accuracy: 0.001
+        )
+        XCTAssertNil(monitor.markVisible(mediaID: mediaID, at: captured.addingTimeInterval(1)))
+    }
+
+    func testHydrationPassAdmitsCompleteEightItemMessagesWithBoundedConcurrency() {
+        XCTAssertGreaterThanOrEqual(MediaHydrationPolicy.maximumItemsPerPass, 8)
+        XCTAssertGreaterThan(MediaHydrationPolicy.maximumConcurrentDownloads, 1)
+        XCTAssertLessThanOrEqual(
+            MediaHydrationPolicy.maximumConcurrentDownloads,
+            MediaHydrationPolicy.maximumItemsPerPass
+        )
+    }
+
+    func testPreprocessingOverlapsIndependentMessagesWithinABoundedBudget() {
+        XCTAssertGreaterThan(MediaPreprocessingPolicy.maximumItemsPerPass, 1)
+        XCTAssertGreaterThan(MediaPreprocessingPolicy.maximumConcurrentJobs, 1)
+        XCTAssertLessThanOrEqual(
+            MediaPreprocessingPolicy.maximumConcurrentJobs,
+            MediaPreprocessingPolicy.maximumItemsPerPass
+        )
+    }
+
+    func testCrashPublishedJPEGRequiresJPEGSignatureAndImageIODecode() async throws {
+        let rendered = UIGraphicsImageRenderer(size: CGSize(width: 16, height: 16)).image {
+            $0.cgContext.setFillColor(UIColor.systemBlue.cgColor)
+            $0.cgContext.fill(CGRect(x: 0, y: 0, width: 16, height: 16))
+        }
+        let jpeg = try XCTUnwrap(rendered.jpegData(compressionQuality: 0.9))
+        let png = try XCTUnwrap(rendered.pngData())
+        let validURL = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "kit-valid-crash-output-\(UUID().uuidString).jpg"
+        )
+        let wrongFormatURL = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "kit-wrong-crash-output-\(UUID().uuidString).jpg"
+        )
+        let corruptURL = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "kit-corrupt-crash-output-\(UUID().uuidString).jpg"
+        )
+        try jpeg.write(to: validURL, options: .atomic)
+        try png.write(to: wrongFormatURL, options: .atomic)
+        try Data([0xff, 0xd8, 0xff, 0x00, 0x01]).write(to: corruptURL, options: .atomic)
+        defer {
+            try? FileManager.default.removeItem(at: validURL)
+            try? FileManager.default.removeItem(at: wrongFormatURL)
+            try? FileManager.default.removeItem(at: corruptURL)
+        }
+        let sourceKey = UUID().uuidString.lowercased()
+        let job = LocalMediaPreprocessingJob(
+            kind: .imageJPEG,
+            sources: [LocalMediaOriginalSource(
+                storageKey: sourceKey,
+                mediaType: "image/heic",
+                fileSize: 1_024,
+                duration: nil
+            )],
+            outputStorageKey: UUID().uuidString.lowercased(),
+            outputMediaType: "image/jpeg"
+        )
+
+        let acceptsJPEG = await MediaPreprocessingPolicy.isValidPublishedOutput(
+            at: validURL,
+            for: job
+        )
+        let acceptsPNG = await MediaPreprocessingPolicy.isValidPublishedOutput(
+            at: wrongFormatURL,
+            for: job
+        )
+        let acceptsCorruptJPEG = await MediaPreprocessingPolicy.isValidPublishedOutput(
+            at: corruptURL,
+            for: job
+        )
+        XCTAssertTrue(acceptsJPEG)
+        XCTAssertFalse(acceptsPNG, "a decodable non-JPEG must not satisfy an imageJPEG job")
+        XCTAssertFalse(acceptsCorruptJPEG, "signature bytes alone are not a decoded image")
+    }
+
+    func testCrashPublishedVoiceRequiresMPEG4AudioTrackAndPositiveDuration() async throws {
+        let sourceURL = try XCTUnwrap(
+            Bundle.main.url(forResource: "knock_brush", withExtension: "caf")
+        )
+        let outputURL = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "kit-valid-crash-voice-\(UUID().uuidString).m4a"
+        )
+        let imageURL = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "kit-wrong-crash-voice-\(UUID().uuidString).m4a"
+        )
+        defer {
+            try? FileManager.default.removeItem(at: outputURL)
+            try? FileManager.default.removeItem(at: imageURL)
+        }
+        let sourceAsset = AVURLAsset(url: sourceURL)
+        let exporter = try XCTUnwrap(AVAssetExportSession(
+            asset: sourceAsset,
+            presetName: AVAssetExportPresetAppleM4A
+        ))
+        exporter.outputURL = outputURL
+        exporter.outputFileType = .m4a
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            exporter.exportAsynchronously {
+                continuation.resume()
+            }
+        }
+        XCTAssertEqual(exporter.status, .completed)
+
+        let image = UIGraphicsImageRenderer(size: CGSize(width: 8, height: 8)).image {
+            $0.cgContext.setFillColor(UIColor.systemRed.cgColor)
+            $0.cgContext.fill(CGRect(x: 0, y: 0, width: 8, height: 8))
+        }
+        try XCTUnwrap(image.jpegData(compressionQuality: 0.8)).write(
+            to: imageURL,
+            options: .atomic
+        )
+        let sourceKey = UUID().uuidString.lowercased()
+        let job = LocalMediaPreprocessingJob(
+            kind: .voiceAssembly,
+            sources: [LocalMediaOriginalSource(
+                storageKey: sourceKey,
+                mediaType: "audio/mp4",
+                fileSize: 1_024,
+                duration: 1
+            )],
+            outputStorageKey: UUID().uuidString.lowercased(),
+            outputMediaType: "audio/mp4"
+        )
+
+        let acceptsAudio = await MediaPreprocessingPolicy.isValidPublishedOutput(
+            at: outputURL,
+            for: job
+        )
+        let acceptsImage = await MediaPreprocessingPolicy.isValidPublishedOutput(
+            at: imageURL,
+            for: job
+        )
+        XCTAssertTrue(acceptsAudio)
+        XCTAssertFalse(acceptsImage)
+    }
+
+    func testProtectedImageLoadedItemDownsamplesFromFileWithoutWholeFileData() throws {
+        let image = UIGraphicsImageRenderer(size: CGSize(width: 32, height: 24)).image { context in
+            context.cgContext.setFillColor(UIColor.systemGreen.cgColor)
+            context.cgContext.fill(CGRect(x: 0, y: 0, width: 32, height: 24))
+        }
+        let bytes = try XCTUnwrap(image.pngData())
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "kit-file-backed-image-\(UUID().uuidString).png"
+        )
+        try bytes.write(to: url, options: .atomic)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let item = SecureMediaLoadPolicy.LoadedItem(localFile: .init(
+            url: url,
+            mediaType: "image/png",
+            caption: nil,
+            byteCount: bytes.count,
+            attachmentID: UUID().uuidString.lowercased()
+        ))
+        XCTAssertTrue(item.data.isEmpty)
+        let thumbnail = try XCTUnwrap(item.downsampledImage(maximumPixelSize: 16))
+        XCTAssertLessThanOrEqual(max(thumbnail.size.width, thumbnail.size.height), 16)
+    }
+
     func testMediaBatchUsesComposerMintedPermanentIDsInDisplayOrder() throws {
         let firstID = UUID().uuidString.lowercased()
         let secondID = UUID().uuidString.lowercased()
@@ -677,6 +951,688 @@ final class ChatMediaPolicyTests: XCTestCase {
         XCTAssertEqual(imageRecord.originalSources, job.sources)
         XCTAssertTrue(message.localMediaStorageKeys.contains(imageID))
         XCTAssertTrue(message.localMediaStorageKeys.contains(outputKey))
+    }
+
+    func testPreprocessingOutputReplacementRequiresOneExactRecordAndNoDraftOwner() throws {
+        let messageID = UUID()
+        let conversationID = UUID().uuidString.lowercased()
+        let targetSource = UUID().uuidString.lowercased()
+        let siblingSource = UUID().uuidString.lowercased()
+        let outputKey = UUID().uuidString.lowercased()
+        func job(source: String) -> LocalMediaPreprocessingJob {
+            LocalMediaPreprocessingJob(
+                kind: .imageJPEG,
+                sources: [LocalMediaOriginalSource(
+                    storageKey: source,
+                    mediaType: "image/heic",
+                    fileSize: 2_048,
+                    duration: nil
+                )],
+                outputStorageKey: outputKey,
+                outputMediaType: "image/jpeg"
+            )
+        }
+        func record(
+            source: String,
+            preprocessingJob: LocalMediaPreprocessingJob
+        ) throws -> LocalMediaRecord {
+            try XCTUnwrap(LocalMediaRecordPolicy.queuedOutgoing(
+                id: source,
+                messageID: messageID,
+                conversationID: conversationID,
+                mediaType: "image/jpeg",
+                fileSize: 2_048,
+                localStorageKey: source,
+                storesInline: false,
+                now: Date(timeIntervalSince1970: 1_700_000_000),
+                localStorageKind: .protectedFile,
+                originalSources: preprocessingJob.sources,
+                preprocessingJob: preprocessingJob
+            ))
+        }
+        let targetJob = job(source: targetSource)
+        let targetRecord = try record(source: targetSource, preprocessingJob: targetJob)
+        let siblingRecord = try record(
+            source: siblingSource,
+            preprocessingJob: job(source: siblingSource)
+        )
+        var message = LocalMessage(
+            id: messageID,
+            conversationId: conversationID,
+            senderId: UUID().uuidString.lowercased(),
+            body: "Photo",
+            createdAt: Date(timeIntervalSince1970: 1_700_000_000),
+            sentAt: nil,
+            state: .queued,
+            failureReason: nil,
+            isOutgoing: true,
+            localMediaRecords: [targetRecord, siblingRecord]
+        )
+        var state = PersistedState.empty
+        state.messages = [message]
+
+        XCTAssertFalse(MediaPreprocessingPolicy.canReplaceOutput(
+            storageKey: outputKey,
+            ownedBy: messageID,
+            attachmentID: targetSource,
+            expectedJob: targetJob,
+            in: state
+        ), "a sibling record in the same message is an independent owner")
+
+        message.localMediaRecords = [targetRecord]
+        state.messages = [message]
+        XCTAssertTrue(MediaPreprocessingPolicy.canReplaceOutput(
+            storageKey: outputKey,
+            ownedBy: messageID,
+            attachmentID: targetSource,
+            expectedJob: targetJob,
+            in: state
+        ))
+
+        state.conversationDrafts = [
+            UUID().uuidString.lowercased(): ConversationDraft(
+                body: "",
+                updatedAt: Date(),
+                mediaAttachments: [ConversationDraftMediaAttachment(
+                    id: UUID(),
+                    storageKind: .protectedFile,
+                    mediaType: "image/jpeg",
+                    originalMediaType: "image/heic",
+                    byteCount: 2_048,
+                    displayName: "Draft photo",
+                    duration: nil,
+                    acceptedAt: Date(),
+                    clientMessageID: nil,
+                    preprocessingOutputStorageKey: outputKey
+                )]
+            ),
+        ]
+        XCTAssertFalse(MediaPreprocessingPolicy.canReplaceOutput(
+            storageKey: outputKey,
+            ownedBy: messageID,
+            attachmentID: targetSource,
+            expectedJob: targetJob,
+            in: state
+        ), "preprocessing must never delete an output reserved by a composer draft")
+    }
+
+    func testInvalidCrashOutputRekeysOnlyTheExactDurableJob() throws {
+        let messageID = UUID()
+        let conversationID = UUID().uuidString.lowercased()
+        let sourceKey = UUID().uuidString.lowercased()
+        let oldOutputKey = UUID().uuidString.lowercased()
+        let newOutputKey = UUID().uuidString.lowercased()
+        let job = LocalMediaPreprocessingJob(
+            kind: .imageJPEG,
+            sources: [LocalMediaOriginalSource(
+                storageKey: sourceKey,
+                mediaType: "image/heic",
+                fileSize: 2_048,
+                duration: nil
+            )],
+            outputStorageKey: oldOutputKey,
+            outputMediaType: "image/jpeg"
+        )
+        let record = try XCTUnwrap(LocalMediaRecordPolicy.queuedOutgoing(
+            id: sourceKey,
+            messageID: messageID,
+            conversationID: conversationID,
+            mediaType: "image/jpeg",
+            fileSize: 2_048,
+            localStorageKey: sourceKey,
+            storesInline: false,
+            now: Date(timeIntervalSince1970: 1_700_000_000),
+            localStorageKind: .protectedFile,
+            originalSources: job.sources,
+            preprocessingJob: job
+        ))
+        var message = LocalMessage(
+            id: messageID,
+            conversationId: conversationID,
+            senderId: UUID().uuidString.lowercased(),
+            body: "Photo",
+            createdAt: record.createdAt,
+            sentAt: nil,
+            state: .queued,
+            failureReason: nil,
+            isOutgoing: true,
+            pendingAttachment: LocalPendingAttachment(
+                mediaType: "image/jpeg",
+                caption: nil,
+                localStorageKey: sourceKey,
+                byteCount: 2_048
+            ),
+            localMediaRecords: [record]
+        )
+        var state = PersistedState.empty
+        state.messages = [message]
+        XCTAssertTrue(MediaPreprocessingPolicy.isOutputStorageKeyUnowned(
+            newOutputKey,
+            in: state
+        ))
+
+        let siblingSource = UUID().uuidString.lowercased()
+        let sibling = try XCTUnwrap(LocalMediaRecordPolicy.queuedOutgoing(
+            id: newOutputKey,
+            messageID: messageID,
+            conversationID: conversationID,
+            mediaType: "application/pdf",
+            fileSize: 1_024,
+            localStorageKey: siblingSource,
+            storesInline: false,
+            now: Date(),
+            localStorageKind: .protectedFile
+        ))
+        message.localMediaRecords = [record, sibling]
+        XCTAssertFalse(LocalMediaRecordPolicy.rekeyPreprocessingOutput(
+            &message,
+            attachmentID: sourceKey,
+            expectedJob: job,
+            newOutputStorageKey: newOutputKey
+        ), "a sibling ciphertext-spool id owns the destination inside the same message")
+        message.localMediaRecords = [record]
+
+        XCTAssertTrue(LocalMediaRecordPolicy.rekeyPreprocessingOutput(
+            &message,
+            attachmentID: sourceKey,
+            expectedJob: job,
+            newOutputStorageKey: newOutputKey,
+            now: Date(timeIntervalSince1970: 1_700_000_100)
+        ))
+        let replacement = try XCTUnwrap(message.localMediaRecords?.first?.preprocessingJob)
+        XCTAssertEqual(replacement.kind, job.kind)
+        XCTAssertEqual(replacement.sources, job.sources)
+        XCTAssertEqual(replacement.outputMediaType, job.outputMediaType)
+        XCTAssertEqual(replacement.outputStorageKey, newOutputKey)
+        XCTAssertEqual(message.pendingAttachment?.localStorageKey, sourceKey)
+        XCTAssertTrue(message.localMediaStorageKeys.contains(sourceKey))
+        XCTAssertTrue(message.localMediaStorageKeys.contains(newOutputKey))
+        XCTAssertFalse(message.localMediaStorageKeys.contains(oldOutputKey))
+        XCTAssertFalse(LocalMediaRecordPolicy.rekeyPreprocessingOutput(
+            &message,
+            attachmentID: sourceKey,
+            expectedJob: job,
+            newOutputStorageKey: UUID().uuidString.lowercased()
+        ), "the stale processing target cannot mutate the replacement job")
+    }
+
+    func testPreprocessingOutputCannotAliasItsOwnCiphertextSpoolIdentity() {
+        let sourceKey = UUID().uuidString.lowercased()
+        let outputKey = UUID().uuidString.lowercased()
+        let job = LocalMediaPreprocessingJob(
+            kind: .imageJPEG,
+            sources: [LocalMediaOriginalSource(
+                storageKey: sourceKey,
+                mediaType: "image/heic",
+                fileSize: 2_048,
+                duration: nil
+            )],
+            outputStorageKey: outputKey,
+            outputMediaType: "image/jpeg"
+        )
+
+        XCTAssertNil(LocalMediaRecordPolicy.queuedOutgoing(
+            id: outputKey,
+            messageID: UUID(),
+            conversationID: UUID().uuidString.lowercased(),
+            mediaType: "image/jpeg",
+            fileSize: 2_048,
+            localStorageKey: sourceKey,
+            storesInline: false,
+            now: Date(),
+            localStorageKind: .protectedFile,
+            originalSources: job.sources,
+            preprocessingJob: job
+        ))
+    }
+
+    func testPreprocessingRekeyDestinationMustBeGloballyUnowned() throws {
+        let candidate = UUID().uuidString.lowercased()
+        let conversationID = UUID().uuidString.lowercased()
+        var state = PersistedState.empty
+        state.messages = [LocalMessage(
+            id: UUID(),
+            conversationId: conversationID,
+            senderId: UUID().uuidString.lowercased(),
+            body: "Legacy pending attachment",
+            createdAt: Date(),
+            sentAt: nil,
+            state: .queued,
+            failureReason: nil,
+            isOutgoing: true,
+            pendingAttachment: LocalPendingAttachment(
+                mediaType: "image/jpeg",
+                caption: nil,
+                localStorageKey: candidate.uppercased(),
+                byteCount: 1_024
+            )
+        )]
+
+        XCTAssertFalse(
+            MediaPreprocessingPolicy.isOutputStorageKeyUnowned(candidate, in: state),
+            "uppercase legacy state aliases the same canonical on-disk key"
+        )
+        state.messages = []
+        XCTAssertTrue(MediaPreprocessingPolicy.isOutputStorageKeyUnowned(candidate, in: state))
+        let spoolSource = UUID().uuidString.lowercased()
+        let spoolMessageID = UUID()
+        let spoolRecord = try XCTUnwrap(LocalMediaRecordPolicy.queuedOutgoing(
+            id: candidate,
+            messageID: spoolMessageID,
+            conversationID: conversationID,
+            mediaType: "application/pdf",
+            fileSize: 1_024,
+            localStorageKey: spoolSource,
+            storesInline: false,
+            now: Date(),
+            localStorageKind: .protectedFile
+        ))
+        let spoolOwner = LocalMessage(
+            id: spoolMessageID,
+            conversationId: conversationID,
+            senderId: UUID().uuidString.lowercased(),
+            body: "Document",
+            createdAt: Date(),
+            sentAt: nil,
+            state: .queued,
+            failureReason: nil,
+            isOutgoing: true,
+            pendingAttachment: LocalPendingAttachment(
+                mediaType: "application/pdf",
+                caption: nil,
+                localStorageKey: spoolSource,
+                byteCount: 1_024
+            ),
+            localMediaRecords: [spoolRecord]
+        )
+        XCTAssertFalse(spoolOwner.localMediaStorageKeys.contains(candidate))
+        XCTAssertTrue(spoolOwner.localMediaOwnershipKeys.contains(candidate))
+        state.messages = [spoolOwner]
+        XCTAssertFalse(
+            MediaPreprocessingPolicy.isOutputStorageKeyUnowned(candidate, in: state),
+            "a record id reserves the ciphertext-spool namespace even before the spool exists"
+        )
+        state.messages = []
+        state.conversationDrafts = [
+            conversationID: ConversationDraft(
+                body: "",
+                updatedAt: Date(),
+                mediaAttachments: [ConversationDraftMediaAttachment(
+                    id: UUID(),
+                    storageKind: .protectedFile,
+                    mediaType: "image/jpeg",
+                    originalMediaType: "image/heic",
+                    byteCount: 1_024,
+                    displayName: "Draft photo",
+                    duration: nil,
+                    acceptedAt: Date(),
+                    clientMessageID: nil,
+                    preprocessingOutputStorageKey: candidate.uppercased()
+                )]
+            ),
+        ]
+        XCTAssertFalse(
+            MediaPreprocessingPolicy.isOutputStorageKeyUnowned(candidate, in: state),
+            "uppercase draft metadata must still reserve the canonical cache key"
+        )
+    }
+
+    func testSealedLegacyDescriptorReservesAttachmentAndStorageIdentities() throws {
+        let descriptor = try makeDescriptor(mediaType: "image/jpeg")
+        let message = LocalMessage(
+            id: UUID(),
+            conversationId: UUID().uuidString.lowercased(),
+            senderId: UUID().uuidString.lowercased(),
+            body: descriptor.encoded,
+            createdAt: Date(),
+            sentAt: Date(),
+            state: .sent,
+            failureReason: nil,
+            isOutgoing: true
+        )
+
+        XCTAssertTrue(message.localMediaOwnershipKeys.contains(descriptor.attachmentID))
+        XCTAssertTrue(message.localMediaOwnershipKeys.contains(descriptor.storageKey))
+    }
+
+    func testFreshServerStorageAdmissionRejectsEveryLocalOwnershipRole() throws {
+        let targetID = "71000000-0000-4000-8000-000000000001"
+        let targetSource = "71000000-0000-4000-8000-000000000002"
+        let siblingID = "71000000-0000-4000-8000-000000000003"
+        let siblingSource = "71000000-0000-4000-8000-000000000004"
+        let siblingOutput = "71000000-0000-4000-8000-000000000005"
+        let conversationID = "31000000-0000-4000-8000-000000000001"
+        var current = try makeUploadingOwnershipMessage(
+            attachmentID: targetID,
+            localStorageKey: targetSource,
+            conversationID: conversationID
+        )
+        let siblingJob = LocalMediaPreprocessingJob(
+            kind: .imageJPEG,
+            sources: [LocalMediaOriginalSource(
+                storageKey: siblingSource,
+                mediaType: "image/heic",
+                fileSize: 1_024,
+                duration: nil
+            )],
+            outputStorageKey: siblingOutput,
+            outputMediaType: "image/jpeg"
+        )
+        let siblingRecord = try XCTUnwrap(LocalMediaRecordPolicy.queuedOutgoing(
+            id: siblingID,
+            messageID: current.id,
+            conversationID: conversationID,
+            mediaType: "image/jpeg",
+            fileSize: 1_024,
+            localStorageKey: siblingSource,
+            storesInline: false,
+            now: current.createdAt,
+            localStorageKind: .protectedFile,
+            originalSources: siblingJob.sources,
+            preprocessingJob: siblingJob
+        ))
+        current.localMediaRecords?.append(siblingRecord)
+        var state = PersistedState.empty
+        state.messages = [current]
+
+        for collision in [
+            targetID,
+            targetSource,
+            siblingID,
+            siblingSource,
+            siblingOutput,
+        ] {
+            let proposed = uncheckedCheckpoint(
+                current,
+                attachmentID: targetID,
+                storageKey: collision,
+                nextOffset: 0
+            )
+            XCTAssertFalse(
+                LocalMediaStorageOwnershipPolicy.permitsTransition(
+                    from: current,
+                    to: proposed,
+                    in: state
+                ),
+                "fresh server key must not alias local role \(collision)"
+            )
+        }
+
+        let freshKey = "71000000-0000-4000-8000-000000000006"
+        let proposed = uncheckedCheckpoint(
+            current,
+            attachmentID: targetID,
+            storageKey: freshKey,
+            nextOffset: 0
+        )
+        XCTAssertTrue(LocalMediaStorageOwnershipPolicy.permitsTransition(
+            from: current,
+            to: proposed,
+            in: state
+        ))
+
+        let foreignSource = "71000000-0000-4000-8000-000000000007"
+        let foreign = try makeQueuedOwnershipMessage(
+            attachmentID: freshKey,
+            localStorageKey: foreignSource,
+            conversationID: "31000000-0000-4000-8000-000000000002"
+        )
+        state.messages = [current, foreign]
+        XCTAssertFalse(LocalMediaStorageOwnershipPolicy.permitsTransition(
+            from: current,
+            to: proposed,
+            in: state
+        ), "another message's record/spool id owns the namespace")
+
+        let uppercaseAlias = LocalMessage(
+            id: UUID(),
+            conversationId: "31000000-0000-4000-8000-000000000003",
+            senderId: UUID().uuidString.lowercased(),
+            body: "Legacy media",
+            createdAt: Date(),
+            sentAt: nil,
+            state: .queued,
+            failureReason: nil,
+            isOutgoing: true,
+            pendingAttachment: LocalPendingAttachment(
+                mediaType: "image/jpeg",
+                caption: nil,
+                localStorageKey: freshKey.uppercased(),
+                byteCount: 1_024
+            )
+        )
+        state.messages = [current, uppercaseAlias]
+        XCTAssertFalse(LocalMediaStorageOwnershipPolicy.permitsTransition(
+            from: current,
+            to: proposed,
+            in: state
+        ), "uppercase legacy aliases must reserve the canonical storage key")
+    }
+
+    func testFreshAndReplacementServerKeysRejectActiveDraftClaims() throws {
+        let targetID = "72000000-0000-4000-8000-000000000001"
+        let targetSource = "72000000-0000-4000-8000-000000000002"
+        let oldServerKey = "72000000-0000-4000-8000-000000000003"
+        let candidate = "72000000-0000-4000-8000-000000000004"
+        let conversationID = "32000000-0000-4000-8000-000000000001"
+        let uploading = try makeUploadingOwnershipMessage(
+            attachmentID: targetID,
+            localStorageKey: targetSource,
+            conversationID: conversationID
+        )
+        let first = uncheckedCheckpoint(
+            uploading,
+            attachmentID: targetID,
+            storageKey: candidate,
+            nextOffset: 0
+        )
+        var state = PersistedState.empty
+        state.messages = [uploading]
+        state.conversationDrafts = [
+            conversationID: ConversationDraft(
+                body: "Still composing",
+                updatedAt: Date(),
+                mediaAttachments: [ConversationDraftMediaAttachment(
+                    id: UUID(uuidString: candidate)!,
+                    storageKind: .encryptedBlob,
+                    mediaType: "application/pdf",
+                    originalMediaType: nil,
+                    byteCount: 1_024,
+                    displayName: "Statement.pdf",
+                    duration: nil,
+                    acceptedAt: Date(),
+                    clientMessageID: nil,
+                    preprocessingOutputStorageKey: nil
+                )]
+            ),
+        ]
+        XCTAssertFalse(LocalMediaStorageOwnershipPolicy.permitsTransition(
+            from: uploading,
+            to: first,
+            in: state
+        ))
+
+        let checkpointed = uncheckedCheckpoint(
+            uploading,
+            attachmentID: targetID,
+            storageKey: oldServerKey,
+            nextOffset: 0
+        )
+        let replacement = uncheckedCheckpoint(
+            checkpointed,
+            attachmentID: targetID,
+            storageKey: candidate,
+            nextOffset: 0
+        )
+        state.messages = [checkpointed]
+        XCTAssertFalse(LocalMediaStorageOwnershipPolicy.permitsTransition(
+            from: checkpointed,
+            to: replacement,
+            in: state
+        ), "a replacement lease is a fresh claim and cannot take a draft key")
+
+        let outputOwnerID = UUID()
+        state.conversationDrafts = [
+            conversationID: ConversationDraft(
+                body: "Editing photo",
+                updatedAt: Date(),
+                mediaAttachments: [ConversationDraftMediaAttachment(
+                    id: outputOwnerID,
+                    storageKind: .protectedFile,
+                    mediaType: "image/jpeg",
+                    originalMediaType: "image/heic",
+                    byteCount: 1_024,
+                    displayName: "Photo",
+                    duration: nil,
+                    acceptedAt: Date(),
+                    clientMessageID: nil,
+                    preprocessingOutputStorageKey: candidate
+                )]
+            ),
+        ]
+        XCTAssertFalse(LocalMediaStorageOwnershipPolicy.permitsTransition(
+            from: checkpointed,
+            to: replacement,
+            in: state
+        ), "active preprocessing outputs reserve their future file key")
+
+        state.conversationDrafts = nil
+        XCTAssertTrue(LocalMediaStorageOwnershipPolicy.permitsTransition(
+            from: checkpointed,
+            to: replacement,
+            in: state
+        ))
+    }
+
+    func testUnchangedCheckpointAdvancesOnlyForItsExactAttachmentOwner() throws {
+        let targetID = "73000000-0000-4000-8000-000000000001"
+        let targetSource = "73000000-0000-4000-8000-000000000002"
+        let serverKey = "73000000-0000-4000-8000-000000000003"
+        let conversationID = "33000000-0000-4000-8000-000000000001"
+        let uploading = try makeUploadingOwnershipMessage(
+            attachmentID: targetID,
+            localStorageKey: targetSource,
+            conversationID: conversationID
+        )
+        let checkpointed = uncheckedCheckpoint(
+            uploading,
+            attachmentID: targetID,
+            storageKey: serverKey,
+            nextOffset: 0
+        )
+        let advanced = uncheckedCheckpoint(
+            checkpointed,
+            attachmentID: targetID,
+            storageKey: serverKey,
+            nextOffset: 512
+        )
+        var state = PersistedState.empty
+        state.messages = [checkpointed]
+        XCTAssertTrue(LocalMediaStorageOwnershipPolicy.permitsTransition(
+            from: checkpointed,
+            to: advanced,
+            in: state
+        ))
+
+        let sibling = try makeQueuedOwnershipMessage(
+            attachmentID: "73000000-0000-4000-8000-000000000004",
+            localStorageKey: serverKey,
+            conversationID: conversationID,
+            messageID: checkpointed.id
+        ).localMediaRecords!.first!
+        var aliasedCurrent = checkpointed
+        aliasedCurrent.localMediaRecords?.append(sibling)
+        var aliasedAdvanced = advanced
+        aliasedAdvanced.localMediaRecords?.append(sibling)
+        state.messages = [aliasedCurrent]
+        XCTAssertFalse(LocalMediaStorageOwnershipPolicy.permitsTransition(
+            from: aliasedCurrent,
+            to: aliasedAdvanced,
+            in: state
+        ), "same-message sibling ownership must not be hidden by the message-id exemption")
+    }
+
+    func testLegacyV1DescriptorMayStillUseOneRemoteIdentityForReceivedMedia() throws {
+        let mediaID = "74000000-0000-4000-8000-000000000001"
+        let descriptor = try KitMediaMessageDescriptor(
+            attachmentID: mediaID,
+            storageKey: mediaID,
+            mediaType: "image/jpeg",
+            ciphertextByteSize: 1_088,
+            ciphertextSHA256: String(repeating: "a", count: 64),
+            keyMaterial: Data(repeating: 0x74, count: SecureMediaAttachmentCipher.keyMaterialBytes),
+            plaintextByteSize: 1_024,
+            caption: nil
+        )
+        XCTAssertEqual(KitMediaMessageDescriptor.parse(descriptor.encoded), descriptor)
+        let incoming = LocalMessage(
+            id: UUID(),
+            conversationId: "34000000-0000-4000-8000-000000000001",
+            senderId: UUID().uuidString.lowercased(),
+            body: descriptor.encoded,
+            createdAt: Date(),
+            sentAt: Date(),
+            state: .delivered,
+            failureReason: nil,
+            isOutgoing: false
+        )
+        let records = try XCTUnwrap(LocalMediaRecordPolicy.remoteRecords(for: incoming))
+        XCTAssertEqual(records.count, 1)
+        XCTAssertTrue(records[0].isStructurallyValid)
+        XCTAssertEqual(records[0].id, mediaID)
+        XCTAssertEqual(records[0].remoteEncryptedObjectID, mediaID)
+    }
+
+    func testOutboundServerReferencesCannotAliasClientOrSiblingIdentities() throws {
+        let firstID = "75000000-0000-4000-8000-000000000001"
+        let firstSource = "75000000-0000-4000-8000-000000000002"
+        let secondID = "75000000-0000-4000-8000-000000000003"
+        let secondSource = "75000000-0000-4000-8000-000000000004"
+        let conversationID = "35000000-0000-4000-8000-000000000001"
+        let uploading = try makeUploadingOwnershipMessage(
+            attachmentID: firstID,
+            localStorageKey: firstSource,
+            conversationID: conversationID
+        )
+        let aliasedRecord = try XCTUnwrap(
+            uncheckedCheckpoint(
+                uploading,
+                attachmentID: firstID,
+                storageKey: firstSource,
+                nextOffset: 0
+            ).localMediaRecords?.first
+        )
+        XCTAssertFalse(aliasedRecord.isStructurallyValid)
+
+        var batch = try KitMediaMessageV2OutboundBatch.queued(
+            attachments: [
+                .init(
+                    attachmentID: firstID,
+                    mediaType: "image/jpeg",
+                    plaintextByteSize: 1_024,
+                    localStorageKey: firstSource
+                ),
+                .init(
+                    attachmentID: secondID,
+                    mediaType: "application/pdf",
+                    plaintextByteSize: 1_024,
+                    localStorageKey: secondSource
+                ),
+            ],
+            rawCaption: nil,
+            keyMaterialFactory: {
+                Data(repeating: 0x75, count: SecureMediaAttachmentCipher.keyMaterialBytes)
+            }
+        )
+        batch.items[0] = try XCTUnwrap(batch.items[0].uploaded(
+            storageKey: secondID,
+            ciphertextByteSize: 1_088,
+            ciphertextSHA256: String(repeating: "c", count: 64)
+        ))
+        XCTAssertFalse(
+            batch.isStructurallyValid,
+            "a server object may not alias any attachment's permanent spool identity"
+        )
     }
 
     func testRestartKeepsDurablePreprocessingWorkParked() throws {
@@ -865,6 +1821,91 @@ final class ChatMediaPolicyTests: XCTestCase {
         XCTAssertEqual(ConversationListPolicy.togglingMembership("x", in: nil), ["x"])
         XCTAssertEqual(ConversationListPolicy.togglingMembership("x", in: ["x", "y"]), ["y"])
         XCTAssertEqual(ConversationListPolicy.togglingMembership("z", in: ["x"]), ["x", "z"])
+    }
+
+    private func makeQueuedOwnershipMessage(
+        attachmentID: String,
+        localStorageKey: String,
+        conversationID: String,
+        messageID: UUID = UUID()
+    ) throws -> LocalMessage {
+        let createdAt = Date(timeIntervalSince1970: 1_780_000_000)
+        let record = try XCTUnwrap(LocalMediaRecordPolicy.queuedOutgoing(
+            id: attachmentID,
+            messageID: messageID,
+            conversationID: conversationID,
+            mediaType: "application/pdf",
+            fileSize: 1_024,
+            localStorageKey: localStorageKey,
+            storesInline: false,
+            now: createdAt,
+            localStorageKind: .protectedFile
+        ))
+        return LocalMessage(
+            id: messageID,
+            conversationId: conversationID,
+            senderId: "10000000-0000-4000-8000-000000000001",
+            body: "Document",
+            createdAt: createdAt,
+            sentAt: nil,
+            state: .queued,
+            failureReason: nil,
+            isOutgoing: true,
+            pendingAttachment: LocalPendingAttachment(
+                mediaType: "application/pdf",
+                caption: nil,
+                localStorageKey: localStorageKey,
+                byteCount: 1_024
+            ),
+            localMediaRecords: [record]
+        )
+    }
+
+    private func makeUploadingOwnershipMessage(
+        attachmentID: String,
+        localStorageKey: String,
+        conversationID: String
+    ) throws -> LocalMessage {
+        var message = try makeQueuedOwnershipMessage(
+            attachmentID: attachmentID,
+            localStorageKey: localStorageKey,
+            conversationID: conversationID
+        )
+        XCTAssertTrue(LocalMediaRecordPolicy.markUploading(
+            &message,
+            attachmentID: attachmentID
+        ))
+        XCTAssertTrue(LocalMediaRecordPolicy.setCiphertextSpool(
+            &message,
+            attachmentID: attachmentID,
+            byteSize: 1_088,
+            sha256: String(repeating: "b", count: 64)
+        ))
+        return message
+    }
+
+    private func uncheckedCheckpoint(
+        _ message: LocalMessage,
+        attachmentID: String,
+        storageKey: String,
+        nextOffset: Int64
+    ) -> LocalMessage {
+        var proposed = message
+        guard var records = proposed.localMediaRecords,
+              let index = records.firstIndex(where: { $0.id == attachmentID })
+        else {
+            XCTFail("ownership fixture is missing its target record")
+            return message
+        }
+        records[index].resumableUpload = LocalMediaResumableUpload(
+            uploadID: attachmentID,
+            storageKey: storageKey,
+            nextOffset: nextOffset,
+            maxChunkBytes: 256,
+            expiresAt: "2026-09-01T00:00:00Z"
+        )
+        proposed.localMediaRecords = records
+        return proposed
     }
 
     private func rosterSupports(

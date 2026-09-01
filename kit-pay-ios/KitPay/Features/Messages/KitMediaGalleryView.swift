@@ -1,4 +1,5 @@
 import AVFoundation
+import Photos
 import SwiftUI
 import UIKit
 
@@ -190,7 +191,7 @@ struct KitMediaGalleryView: View {
             )
         default:
             GalleryImagePage(
-                data: loaded.data,
+                loaded: loaded,
                 isActive: isActive,
                 onZoomChanged: { zoomed in
                     if isActive { currentPageIsZoomed = zoomed }
@@ -388,11 +389,10 @@ struct KitMediaGalleryView: View {
             }
     }
 
-    /// Leaving the gallery hands a still-playing video to the system's floating window instead of
-    /// cutting it off. This runs *before* the dismissal, because AVKit will not hand off a layer
-    /// that has already been torn out of its window.
+    /// X, drag-to-dismiss and "Show in chat" are explicit stop intents. Picture in Picture is
+    /// reserved for the system background transition; closing a viewer must actually close it.
     private func dismissGallery() {
-        ChatVideoPictureInPicture.shared.startIfPlaying()
+        ChatVideoPictureInPicture.shared.stopForExplicitViewerDismissal()
         onDismiss()
     }
 
@@ -463,6 +463,15 @@ struct KitMediaGalleryView: View {
                 )
             }
         default:
+            if let localFileURL = fresh.localFileURL {
+                shareURL = try? ChatMediaTempFiles.copyTemporaryFile(
+                    from: localFileURL,
+                    mediaType: fresh.mediaType,
+                    suggestedName: "Kit photo"
+                )
+                if shareURL == nil { showToast("Could not share") }
+                return
+            }
             guard let image = UIImage(data: fresh.data),
                   let jpeg = image.jpegData(compressionQuality: 0.9)
             else {
@@ -504,7 +513,31 @@ struct KitMediaGalleryView: View {
                 saveVideo(data: fresh.data, mediaType: fresh.mediaType)
             }
         default:
-            saveImage(data: fresh.data)
+            if let localFileURL = fresh.localFileURL {
+                saveImage(
+                    fileURL: localFileURL,
+                    protectedOriginalLease: fresh.localFileLease
+                )
+            } else {
+                saveImage(data: fresh.data)
+            }
+        }
+    }
+
+    private func saveImage(
+        fileURL: URL,
+        protectedOriginalLease: SecureMediaOriginalAccessLease?
+    ) {
+        PHPhotoLibrary.shared().performChanges {
+            let request = PHAssetCreationRequest.forAsset()
+            request.addResource(with: .photo, fileURL: fileURL, options: nil)
+        } completionHandler: { success, error in
+            // PhotoKit reads the resource asynchronously. Retain receiver-cache ownership until
+            // it has consumed the protected file, just as video export retains its lease.
+            _ = protectedOriginalLease
+            Task { @MainActor in
+                showToast(success && error == nil ? "Saved to Photos" : "Could not save photo")
+            }
         }
     }
 
@@ -665,7 +698,7 @@ private final class GalleryPageLoader: ObservableObject {
 // MARK: - Image page (zoomable)
 
 private struct GalleryImagePage: View {
-    let data: Data
+    let loaded: SecureMediaLoadPolicy.LoadedItem
     let isActive: Bool
     let onZoomChanged: (Bool) -> Void
     let onSingleTap: () -> Void
@@ -700,10 +733,17 @@ private struct GalleryImagePage: View {
                 Color.clear
             }
         }
-        .task(id: data) {
-            let bytes = data
+        .task(id: "\(loaded.localFileURL?.path ?? "inline"):\(loaded.byteCount)") {
+            let fileURL = loaded.localFileURL
+            let bytes = loaded.data
             let image = await Task.detached(priority: .userInitiated) {
-                ChatMediaImageDecoder.downsample(
+                if let fileURL {
+                    return ChatMediaImageDecoder.downsample(
+                        fileURL: fileURL,
+                        maximumPixelSize: 4_096
+                    )
+                }
+                return ChatMediaImageDecoder.downsample(
                     data: bytes,
                     maximumPixelSize: 4_096
                 )

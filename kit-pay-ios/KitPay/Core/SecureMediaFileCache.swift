@@ -74,6 +74,15 @@ struct SecureMediaProtectedFile: Equatable, Sendable {
     let insertion: SecureMediaInsertOutcome
 }
 
+/// Metadata-only inspection of a preprocessing destination. A sealed blob, multiple protected
+/// originals, a non-regular file, or a reserved entry is occupied but cannot be trusted as the
+/// one file-backed output the durable job expects.
+enum SecureMediaProtectedOriginalProbe: Equatable, Sendable {
+    case absent
+    case candidate(fileURL: URL, byteSize: Int)
+    case occupiedInvalid
+}
+
 enum SecureMediaCacheOwnership: Equatable, Sendable {
     case senderOriginal
     case receivedCache
@@ -238,6 +247,30 @@ actor SecureMediaFileCache {
               let sealed = try? ChaChaPoly.SealedBox(combined: sealedData),
               let key = try? encryptionKey(for: accountID),
               let plaintext = try? ChaChaPoly.open(sealed, using: key)
+        else { return nil }
+        recordAccess(to: fileURL, storageKey: storageKey, accountID: accountID)
+        return plaintext
+    }
+
+    /// Reads only the sealed-blob representation. Draft restoration uses this stricter boundary
+    /// so corrupted metadata cannot relabel a protected file as an encrypted blob (or vice versa)
+    /// merely because both representations share the same client media id.
+    func encryptedBlobData(
+        forStorageKey storageKey: String,
+        userID: String,
+        expectedByteCount: Int
+    ) -> Data? {
+        guard expectedByteCount > 0,
+              let accountID = canonicalAccountID(userID),
+              !reservedEvictionKeys.contains(
+                  cacheEntryKey(storageKey: storageKey, accountID: accountID)
+              ),
+              let fileURL = sealedFileURL(forStorageKey: storageKey, accountID: accountID),
+              let sealedData = try? Data(contentsOf: fileURL),
+              let sealed = try? ChaChaPoly.SealedBox(combined: sealedData),
+              let key = try? encryptionKey(for: accountID),
+              let plaintext = try? ChaChaPoly.open(sealed, using: key),
+              plaintext.count == expectedByteCount
         else { return nil }
         recordAccess(to: fileURL, storageKey: storageKey, accountID: accountID)
         return plaintext
@@ -685,6 +718,38 @@ actor SecureMediaFileCache {
             return count
         }
         return data(forStorageKey: storageKey, userID: userID)?.count
+    }
+
+    /// Probes a crash-published preprocessing output without decrypting or materializing a
+    /// `.sealed` representation. Output jobs publish protected files only; any other occupied
+    /// representation is a collision that must be re-keyed around, not read into memory.
+    func probeProtectedOriginal(
+        forStorageKey storageKey: String,
+        userID: String
+    ) -> SecureMediaProtectedOriginalProbe {
+        guard let accountID = canonicalAccountID(userID),
+              let canonicalKey = canonicalStorageKey(storageKey)
+        else { return .absent }
+        let accessKey = cacheEntryKey(storageKey: canonicalKey, accountID: accountID)
+        let manager = FileManager.default
+        let sealedExists = sealedFileURL(
+            forStorageKey: canonicalKey,
+            accountID: accountID
+        ).map { manager.fileExists(atPath: $0.path) } == true
+        let originals = originalFileURLs(
+            forStorageKey: canonicalKey,
+            accountID: accountID
+        ).filter { manager.fileExists(atPath: $0.path) }
+        guard !sealedExists, originals.count == 1, !reservedEvictionKeys.contains(accessKey)
+        else {
+            return sealedExists || !originals.isEmpty ? .occupiedInvalid : .absent
+        }
+        let fileURL = originals[0]
+        guard let byteSize = regularFileByteCount(at: fileURL) else {
+            return .occupiedInvalid
+        }
+        recordAccess(to: fileURL, storageKey: canonicalKey, accountID: accountID)
+        return .candidate(fileURL: fileURL, byteSize: byteSize)
     }
 
     func remove(forStorageKey storageKey: String, userID: String) {

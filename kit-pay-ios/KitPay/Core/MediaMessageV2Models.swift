@@ -792,6 +792,8 @@ struct KitMediaMessageV2OutboundBatch: Codable, Hashable, Sendable {
         if let caption, KitMediaMessageFamilyPolicy.blocksUserAuthoredText(caption) {
             return false
         }
+        let attachmentIDs = Set(items.map(\.attachmentID))
+        guard attachmentIDs.count == items.count else { return false }
         var cacheKeys = Set<String>()
         for item in items {
             // A torn upload triple must read as damage, never as "retry this upload".
@@ -805,7 +807,11 @@ struct KitMediaMessageV2OutboundBatch: Codable, Hashable, Sendable {
                   cacheKeys.insert(item.localStorageKey).inserted
             else { return false }
             if let storageKey = item.storageKey {
-                guard cacheKeys.insert(storageKey).inserted else { return false }
+                // A server object can never take over any item's permanent client identity.
+                // Those ids also address ciphertext spools, including for sibling items.
+                guard !attachmentIDs.contains(storageKey),
+                      cacheKeys.insert(storageKey).inserted
+                else { return false }
             }
         }
         return true

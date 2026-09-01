@@ -13,7 +13,9 @@ This document is the release contract for the iOS messaging-media pipeline.
   account-bound encrypted state. Sign-out purges the account's local media and wrapping key.
 - E2EE is fail-closed. Compression/transcoding, deterministic attachment encryption, upload, and
   Signal fanout happen after the local commit. If secure transmission is unavailable, the message
-  and original remain pending; plaintext is never sent as a fallback.
+  and original remain pending; local admission never performs capability discovery, and plaintext
+  is never sent as a fallback. Authenticated service and recipient-device capability checks run at
+  the background dispatch boundary before any ciphertext upload or Signal fanout.
 - Recipients authenticate and stream-decrypt to an unpublished file, atomically publish the local
   copy, then mark the media `localCached`. Reopening uses that copy without another download.
 - Sent originals are never cache-eviction candidates. Received files use a 512 MiB high-water /
@@ -49,6 +51,12 @@ KITMEDIA2 return to pending from the retained local original and clear only remo
 Immediately before sealing, each resumable READY declaration is replayed exactly: a live lease is
 renewed in place, while a retention-swept object receives a fresh empty session and is refilled
 from retained deterministic ciphertext. Ciphertext spools are removed only after that final pass.
+Every first, resumed, renewed, or replacement server storage key is admitted in the same atomic
+state mutation that checkpoints it. Admission binds the key to one permanent attachment and
+rejects aliases with any message record/spool id, local source, transform output, sibling, other
+message, or active composer draft. A cache copy created before a losing compare-and-set is never
+deleted inline because another actor may have claimed it while file I/O was suspended; the
+bounded, age-gated orphan sweep is the sole reclamation path.
 
 ## Termination-surviving transfer and hard rollout gate
 

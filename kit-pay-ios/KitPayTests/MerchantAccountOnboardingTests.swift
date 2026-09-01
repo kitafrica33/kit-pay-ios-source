@@ -2,6 +2,85 @@ import XCTest
 @testable import KitPay
 
 final class MerchantAccountOnboardingTests: XCTestCase {
+    func testPayerIntentDecodesWhenPrivateWalletTopologyIsOmitted() throws {
+        let data = try XCTUnwrap(
+            """
+            {
+              "id": "intent-public",
+              "type": "merchant_payment_intent",
+              "merchant": {
+                "id": "merchant-public",
+                "public_id": "KTMERCHANT",
+                "display_name": "Kit Store"
+              },
+              "status": "captured",
+              "settlement_mode": "direct",
+              "amount": "1250.00",
+              "currency": {"code": "UGX", "scale": "2"},
+              "wallet_transaction_id": "transaction-public",
+              "expires_at": "2026-09-01T12:15:00Z",
+              "captured_at": "2026-09-01T12:01:00Z",
+              "created_at": "2026-09-01T12:00:00Z"
+            }
+            """.data(using: .utf8)
+        )
+
+        let intent = try JSONDecoder().decode(MerchantPaymentIntentDTO.self, from: data)
+
+        XCTAssertNil(intent.settlementWalletId)
+        XCTAssertNil(intent.sourceWalletId)
+        XCTAssertEqual(intent.walletTransactionId, "transaction-public")
+        XCTAssertEqual(intent.amount, "1250.00")
+    }
+
+    func testMerchantAccountStillRequiresItsSettlementWallet() throws {
+        let data = try XCTUnwrap(
+            """
+            {
+              "id": "merchant-public",
+              "public_id": "KTMERCHANT",
+              "display_name": "Kit Store",
+              "legal_name": null,
+              "country_code": "UG",
+              "status": "active",
+              "created_at": "2026-09-01T12:00:00Z"
+            }
+            """.data(using: .utf8)
+        )
+
+        XCTAssertThrowsError(try JSONDecoder().decode(MerchantAccountDTO.self, from: data))
+    }
+
+    func testMerchantReceiveIntentRequiresTheSelectedSettlementWallet() {
+        let selectedWallet = wallet(
+            id: "selected-business-wallet",
+            accountType: "business",
+            status: "active"
+        )
+
+        XCTAssertTrue(
+            MerchantReceiveIntentPolicy.confirmsCreatedIntent(
+                intent(settlementWalletID: selectedWallet.id),
+                requestedAmount: "1250.00",
+                settlementWallet: selectedWallet
+            )
+        )
+        XCTAssertFalse(
+            MerchantReceiveIntentPolicy.confirmsCreatedIntent(
+                intent(settlementWalletID: nil),
+                requestedAmount: "1250.00",
+                settlementWallet: selectedWallet
+            )
+        )
+        XCTAssertFalse(
+            MerchantReceiveIntentPolicy.confirmsCreatedIntent(
+                intent(settlementWalletID: "other-business-wallet"),
+                requestedAmount: "1250.00",
+                settlementWallet: selectedWallet
+            )
+        )
+    }
+
     func testMerchantHelpUsesOnlyItsCanonicalKitHostedURL() throws {
         let canonical = KitMerchantHelpURLPolicy.canonicalURL
 
@@ -166,6 +245,28 @@ final class MerchantAccountOnboardingTests: XCTestCase {
             settlementWalletId: settlementWalletID,
             status: "active",
             createdAt: "2026-08-21T00:00:00Z"
+        )
+    }
+
+    private func intent(settlementWalletID: String?) -> MerchantPaymentIntentDTO {
+        MerchantPaymentIntentDTO(
+            id: "intent-public",
+            type: "merchant_payment_intent",
+            merchant: MerchantSummaryDTO(
+                id: "merchant-public",
+                publicId: "KTMERCHANT",
+                displayName: "Kit Store"
+            ),
+            status: "pending",
+            settlementMode: "direct",
+            settlementWalletId: settlementWalletID,
+            sourceWalletId: nil,
+            amount: "1250.00",
+            currency: CurrencyDTO(code: "UGX", scale: "2"),
+            walletTransactionId: nil,
+            expiresAt: "2026-09-01T12:15:00Z",
+            capturedAt: nil,
+            createdAt: "2026-09-01T12:00:00Z"
         )
     }
 }

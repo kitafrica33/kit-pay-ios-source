@@ -165,6 +165,27 @@ struct MessagingBackgroundUploadResult: Codable, Equatable, Sendable {
     }
 }
 
+/// Exactly-once ownership for UIApplicationDelegate background-session completions. Work started
+/// for a replaced callback retains its old token and therefore cannot consume the replacement.
+struct MessagingBackgroundEventsCompletionGate: Equatable, Sendable {
+    typealias Token = UInt64
+
+    private(set) var currentToken: Token = 0
+    private(set) var isArmed = false
+
+    mutating func install() -> Token {
+        currentToken &+= 1
+        isArmed = true
+        return currentToken
+    }
+
+    mutating func consume(_ token: Token) -> Bool {
+        guard isArmed, token == currentToken else { return false }
+        isArmed = false
+        return true
+    }
+}
+
 /// Owns the one background URLSession reserved for E2EE attachment chunks. Each chunk is staged
 /// as a protected file before `uploadTask(fromFile:)` is created. Both the system task description
 /// and the completion ledger survive process termination; a relaunched coordinator reattaches to
@@ -210,7 +231,16 @@ final class MessagingBackgroundAttachmentUploader: NSObject, URLSessionDataDeleg
     private var startsInFlight: Set<String> = []
     private var revokedBindings: Set<String> = []
     private var backgroundEventsCompletionHandler: (() -> Void)?
+    /// Installed by AppModel once protected account state can be restored. iOS may relaunch the
+    /// process solely to deliver a completed attachment chunk; keep the system completion open
+    /// until the durable outbox has had an opportunity to consume that result and enqueue the
+    /// next chunk. A bounded watchdog still releases the process if application restoration is
+    /// unable to complete, while the durable result remains available for the next launch.
+    private var backgroundEventsRecoveryHandler: ((@escaping () -> Void) -> Void)?
+    private var backgroundEventsRecoveryInFlight = false
+    private var backgroundEventsWatchdog: DispatchWorkItem?
     private var backgroundEventsFinished = false
+    private var backgroundEventsCompletionGate = MessagingBackgroundEventsCompletionGate()
 
     private override init() {
         super.init()
@@ -252,12 +282,26 @@ final class MessagingBackgroundAttachmentUploader: NSObject, URLSessionDataDeleg
                 return
             }
             if let replaced = self.backgroundEventsCompletionHandler {
+                self.backgroundEventsWatchdog?.cancel()
+                self.backgroundEventsWatchdog = nil
+                self.backgroundEventsRecoveryInFlight = false
                 DispatchQueue.main.async(execute: replaced)
             }
+            _ = self.backgroundEventsCompletionGate.install()
             self.backgroundEventsCompletionHandler = completionHandler
-            if self.backgroundEventsFinished {
-                self.finishBackgroundEvents()
-            }
+            self.recoverBackgroundEventsIfReady()
+        }
+    }
+
+    /// The handler must call its completion after it has restored protected messaging state and
+    /// kicked the durable outbox. It is intentionally retained across URLSession event batches.
+    func installBackgroundEventsRecoveryHandler(
+        _ handler: @escaping (@escaping () -> Void) -> Void
+    ) {
+        delegateQueue.addOperation { [weak self] in
+            guard let self else { return }
+            self.backgroundEventsRecoveryHandler = handler
+            self.recoverBackgroundEventsIfReady()
         }
     }
 
@@ -505,7 +549,7 @@ final class MessagingBackgroundAttachmentUploader: NSObject, URLSessionDataDeleg
 
     func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
         backgroundEventsFinished = true
-        if backgroundEventsCompletionHandler != nil { finishBackgroundEvents() }
+        recoverBackgroundEventsIfReady()
     }
 
     func urlSession(
@@ -535,11 +579,54 @@ final class MessagingBackgroundAttachmentUploader: NSObject, URLSessionDataDeleg
         }
     }
 
-    private func finishBackgroundEvents() {
+    private func finishBackgroundEvents(generation: UInt64) {
         guard let completionHandler = backgroundEventsCompletionHandler else { return }
+        guard backgroundEventsCompletionGate.consume(generation) else { return }
+        backgroundEventsWatchdog?.cancel()
+        backgroundEventsWatchdog = nil
         backgroundEventsCompletionHandler = nil
         backgroundEventsFinished = false
+        backgroundEventsRecoveryInFlight = false
         DispatchQueue.main.async(execute: completionHandler)
+    }
+
+    private func recoverBackgroundEventsIfReady() {
+        guard backgroundEventsFinished,
+              backgroundEventsCompletionHandler != nil,
+              !backgroundEventsRecoveryInFlight
+        else { return }
+        backgroundEventsRecoveryInFlight = true
+        backgroundEventsWatchdog?.cancel()
+        let generation = backgroundEventsCompletionGate.currentToken
+
+        // The OS completion must never be held indefinitely if protected state cannot restore.
+        // Twenty seconds leaves useful execution time below iOS's usual background-event budget;
+        // the already-persisted result makes a watchdog release lossless.
+        let watchdog = DispatchWorkItem { [weak self] in
+            self?.finishBackgroundEvents(generation: generation)
+        }
+        backgroundEventsWatchdog = watchdog
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 20) { [weak self] in
+            guard !watchdog.isCancelled else { return }
+            self?.delegateQueue.addOperation {
+                guard !watchdog.isCancelled else { return }
+                watchdog.perform()
+            }
+        }
+
+        guard let recoveryHandler = backgroundEventsRecoveryHandler else {
+            // AppModel may not exist yet during a background-only process launch. Installing its
+            // handler re-enters this method; until then the watchdog is the safe fallback.
+            backgroundEventsRecoveryInFlight = false
+            return
+        }
+        DispatchQueue.main.async { [weak self] in
+            recoveryHandler {
+                self?.delegateQueue.addOperation { [weak self] in
+                    self?.finishBackgroundEvents(generation: generation)
+                }
+            }
+        }
     }
 
     private func stageChunk(

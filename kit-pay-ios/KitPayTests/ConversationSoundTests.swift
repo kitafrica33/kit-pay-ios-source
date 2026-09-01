@@ -843,6 +843,72 @@ final class ConversationSoundTests: XCTestCase {
         XCTAssertEqual(reply.messageDigest, descriptor.version.messageDigest)
     }
 
+    func testValidatedNotificationTapSurvivesColdLaunchPrivacyQuarantine() throws {
+        let descriptor = try XCTUnwrap(notificationDescriptor())
+        let action = try XCTUnwrap(notificationAction(
+            descriptor,
+            userInfo: notificationUserInfo(descriptor)
+        ))
+
+        let disposition = NotificationResponseDispositionPolicy.disposition(
+            messageAction: action,
+            claimAction: nil,
+            registrationEnabled: false,
+            privacyQuarantineActive: true
+        )
+
+        XCTAssertEqual(disposition, .message(action))
+        XCTAssertTrue(disposition.completesBeforeRouting)
+    }
+
+    func testValidatedClaimTapSurvivesColdLaunchPrivacyQuarantine() throws {
+        let action = try XCTUnwrap(claimNotificationAction(claimNotificationUserInfo()))
+
+        let disposition = NotificationResponseDispositionPolicy.disposition(
+            messageAction: nil,
+            claimAction: action,
+            registrationEnabled: false,
+            privacyQuarantineActive: true
+        )
+
+        XCTAssertEqual(disposition, .claim(action))
+        XCTAssertTrue(disposition.completesBeforeRouting)
+    }
+
+    func testOpaqueNotificationCannotCrossColdLaunchPrivacyQuarantine() {
+        XCTAssertEqual(
+            NotificationResponseDispositionPolicy.disposition(
+                messageAction: nil,
+                claimAction: nil,
+                registrationEnabled: false,
+                privacyQuarantineActive: true
+            ),
+            .ignore
+        )
+        XCTAssertEqual(
+            NotificationResponseDispositionPolicy.disposition(
+                messageAction: nil,
+                claimAction: nil,
+                registrationEnabled: true,
+                privacyQuarantineActive: false
+            ),
+            .opaqueWake
+        )
+    }
+
+    func testInlineReplyKeepsSystemLifetimeUntilDurableQueueingFinishes() throws {
+        let descriptor = try XCTUnwrap(notificationDescriptor())
+        let action = try XCTUnwrap(notificationAction(
+            descriptor,
+            actionIdentifier: MessageNotificationContract.replyActionIdentifier,
+            userInfo: notificationUserInfo(descriptor),
+            userText: "On my way"
+        ))
+        let disposition = NotificationResponseDisposition.message(action)
+
+        XCTAssertFalse(disposition.completesBeforeRouting)
+    }
+
     func testMessageNotificationResponseAcceptsLegacyFiveKeyNotification() throws {
         let descriptor = try XCTUnwrap(notificationDescriptor())
         let legacyRequestIdentifier = try XCTUnwrap(

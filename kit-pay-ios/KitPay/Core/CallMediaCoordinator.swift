@@ -3,10 +3,12 @@ import CallKit
 import Combine
 import Foundation
 import LiveKit
+import OSLog
 import UIKit
 
 enum LiveKitCallMediaError: LocalizedError {
     case audioInitializationFailed
+    case audioSessionConfigurationFailed
     case cameraSwitchUnavailable
     case permissionDenied(String)
     case permissionUnavailableInBackground(String)
@@ -18,6 +20,8 @@ enum LiveKitCallMediaError: LocalizedError {
         switch self {
         case .audioInitializationFailed:
             "Kit could not prepare call audio."
+        case .audioSessionConfigurationFailed:
+            "Kit could not keep two-way call audio active."
         case .cameraSwitchUnavailable:
             "Camera switching is unavailable on this device."
         case .permissionDenied(let medium):
@@ -512,6 +516,38 @@ enum CallAudioRoutePolicy {
     }
 }
 
+/// The one supported two-way CallKit audio shape. Output-only Bluetooth/AirPlay options are
+/// intentionally excluded: a call may never select a route that can play the other participant
+/// but cannot provide the local microphone. Bluetooth HFP preserves bidirectional headset audio.
+enum CallAudioSessionConfigurationPolicy {
+    static func mode(video: Bool) -> AVAudioSession.Mode {
+        video ? .videoChat : .voiceChat
+    }
+
+    static func options(speaker: Bool) -> AVAudioSession.CategoryOptions {
+        var options: AVAudioSession.CategoryOptions = [.allowBluetoothHFP]
+        if speaker { options.insert(.defaultToSpeaker) }
+        return options
+    }
+
+    static func matchesTwoWayCallConfiguration(
+        category: AVAudioSession.Category,
+        mode: AVAudioSession.Mode,
+        options: AVAudioSession.CategoryOptions,
+        video: Bool,
+        speaker: Bool
+    ) -> Bool {
+        guard category == .playAndRecord,
+              mode == self.mode(video: video),
+              options.contains(.allowBluetoothHFP),
+              !options.contains(.allowBluetoothA2DP),
+              !options.contains(.allowAirPlay),
+              options.contains(.defaultToSpeaker) == speaker
+        else { return false }
+        return true
+    }
+}
+
 final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTransport, RoomDelegate, @unchecked Sendable {
     private struct PendingCallKitMicrophoneIntent {
         let callId: String
@@ -544,6 +580,7 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
     var onUnexpectedDisconnect: (@Sendable (String, CallMediaDisconnectEvent) -> Void)?
     var onSDKReconnectStateChanged: (@Sendable (String, Bool) -> Void)?
     var onRemoteParticipantConnected: (@Sendable (String, Date) -> Void)?
+    var onAudioSessionConfigurationFailed: (@Sendable (String) -> Void)?
 
     private var room: Room?
     private var connectedCallId: String?
@@ -570,6 +607,10 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
     /// Fences every suspension inside LiveKit setup. A sign-out disconnect or a replacement call
     /// must prevent the older setup from publishing tracks or clearing the replacement's intent.
     private var connectionGeneration: UInt64 = 0
+    private let audioLogger = Logger(
+        subsystem: "africa.kit.pay.ios",
+        category: "CallKitAudio"
+    )
 
     private static let microphoneModePreferenceKey = "africa.kit.pay.call-microphone-mode"
 
@@ -592,7 +633,7 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
             object: AVAudioSession.sharedInstance(),
             queue: .main
         ) { [weak self] _ in
-            MainActor.assumeIsolated { self?.refreshAudioRoute() }
+            MainActor.assumeIsolated { self?.handleAudioRouteChange() }
         }
     }
 
@@ -973,15 +1014,29 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
 
     @MainActor
     func activateAudioSession(_ session: AVAudioSession, video: Bool) throws {
+        let wasAudioSessionActive = audioSessionIsActive
         wantsVideoAudioMode = video
         // A call that starts with video starts on the speaker, as it does everywhere else; the
         // customer can still turn it off, and that choice survives later reconfiguration.
         if !hasExplicitSpeakerPreference {
             wantsSpeaker = video
         }
-        try applyAudioCategory(session: session, video: video, speaker: wantsSpeaker)
-        try AudioManager.shared.setEngineAvailability(.default)
-        audioSessionIsActive = true
+        do {
+            try applyAudioCategory(session: session, video: video, speaker: wantsSpeaker)
+            try AudioManager.shared.setEngineAvailability(.default)
+            audioSessionIsActive = true
+            audioLogger.info(
+                "call_audio_engine_available video=\(video, privacy: .public) speaker=\(self.wantsSpeaker, privacy: .public)"
+            )
+        } catch {
+            // A failed mid-call reconfiguration must not disable later route self-repair. Initial
+            // activation remains inactive; an already-active CallKit session retains that state.
+            audioSessionIsActive = wasAudioSessionActive
+            audioLogger.error(
+                "call_audio_activation_failed error=\(error.localizedDescription, privacy: .private(mask: .hash))"
+            )
+            throw error
+        }
         // Report the route the session actually settled on. Assuming "video means speaker" showed
         // speaker-on while the call was really playing through a connected headset.
         refreshAudioRoute()
@@ -993,18 +1048,10 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
         video: Bool,
         speaker: Bool
     ) throws {
-        // `allowBluetoothA2DP` and `allowAirPlay` keep an already-paired speaker, car kit, or
-        // AirPlay receiver usable for the call instead of silently dropping to the earpiece.
-        var options: AVAudioSession.CategoryOptions = [
-            .allowBluetoothHFP,
-            .allowBluetoothA2DP,
-            .allowAirPlay,
-        ]
-        if speaker { options.insert(.defaultToSpeaker) }
         try session.setCategory(
             .playAndRecord,
-            mode: video ? .videoChat : .voiceChat,
-            options: options
+            mode: CallAudioSessionConfigurationPolicy.mode(video: video),
+            options: CallAudioSessionConfigurationPolicy.options(speaker: speaker)
         )
     }
 
@@ -1022,6 +1069,40 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
             audioRouteControlLabel = "Speaker"
         }
         try AudioManager.shared.setEngineAvailability(.none)
+        audioLogger.info("call_audio_engine_unavailable")
+    }
+
+    /// A route event can reveal that another playback surface rewrote the process-wide audio
+    /// category. Restore the call's bidirectional category synchronously; a persistent failure is
+    /// escalated to the lifecycle coordinator instead of leaving a connected-but-silent call.
+    @MainActor
+    private func handleAudioRouteChange() {
+        guard audioSessionIsActive else { return }
+        let session = AVAudioSession.sharedInstance()
+        do {
+            if !CallAudioSessionConfigurationPolicy.matchesTwoWayCallConfiguration(
+                category: session.category,
+                mode: session.mode,
+                options: session.categoryOptions,
+                video: wantsVideoAudioMode,
+                speaker: wantsSpeaker
+            ) {
+                try applyAudioCategory(
+                    session: session,
+                    video: wantsVideoAudioMode,
+                    speaker: wantsSpeaker
+                )
+                audioLogger.notice("call_audio_category_restored_after_route_change")
+            }
+            refreshAudioRoute()
+        } catch {
+            audioLogger.error(
+                "call_audio_route_reconciliation_failed error=\(error.localizedDescription, privacy: .private(mask: .hash))"
+            )
+            if let callId = connectedCallId ?? mediaIntentCallId {
+                onAudioSessionConfigurationFailed?(callId)
+            }
+        }
     }
 
     /// Publishes the live output route. Called on every `AVAudioSession` route change and after any
@@ -1444,6 +1525,7 @@ final class CallMediaCoordinator: ObservableObject {
     private var reconnectAttemptsRemaining = CallMediaReconnectPolicy.retryDelaysNanoseconds.count
     private var remoteAbsenceTask: Task<Void, Never>?
     private var remotePresenceCancellable: AnyCancellable?
+    private var callKitAudioErrorRecovery = CallKitAudioSessionErrorRecoveryState()
 
     private init() {
         let media = LiveKitCallMediaTransport()
@@ -1467,6 +1549,14 @@ final class CallMediaCoordinator: ObservableObject {
                 NotificationCoordinator.shared.reportOutgoingCallConnected(
                     callId: callId,
                     connectedAt: connectedAt
+                )
+            }
+        }
+        media.onAudioSessionConfigurationFailed = { [weak self] callId in
+            Task { @MainActor in
+                await self?.callKitAudioSessionConfigurationFailed(
+                    callId: callId,
+                    error: LiveKitCallMediaError.audioSessionConfigurationFailed
                 )
             }
         }
@@ -1583,6 +1673,7 @@ final class CallMediaCoordinator: ObservableObject {
         alignAnswerState(toCallId: nil)
         invalidateReconnect()
         controlError = nil
+        callKitAudioErrorRecovery.reset()
         state = .idle
         retireCallPresentationSurfaces()
         await session.reset()
@@ -1648,6 +1739,12 @@ final class CallMediaCoordinator: ObservableObject {
                 await session.disconnect(callId: handoff.callId)
                 throw CancellationError()
             }
+            // `didActivate` may precede room attachment on a Lock Screen answer. Reconcile again at
+            // this exact authenticated boundary so a transient early configuration error cannot
+            // leave a successfully joined room without two-way audio.
+            try NotificationCoordinator.shared.reconcileCallKitAudioSessionIfNeeded(
+                callId: handoff.callId
+            )
             state = .connected
             startPendingInitialCamera(callId: handoff.callId)
         } catch is CancellationError {
@@ -1782,6 +1879,7 @@ final class CallMediaCoordinator: ObservableObject {
         activeCall = nil
         state = .idle
         controlError = nil
+        callKitAudioErrorRecovery.reset()
     }
 
     /// A cancelled duplicate start request can still deliver the same idempotent server response.
@@ -1834,6 +1932,31 @@ final class CallMediaCoordinator: ObservableObject {
 
     func recordControlError(_ error: Error) {
         controlError = error.localizedDescription
+    }
+
+    /// A CallKit-owned session that still cannot be configured once media is live must not remain
+    /// presented as a healthy but silent call. Connecting calls get their deterministic retry at
+    /// room attachment; connected/reconnecting calls fail through the normal authenticated cleanup.
+    func callKitAudioSessionConfigurationFailed(callId: String, error: Error) async {
+        guard activeCall?.id.caseInsensitiveCompare(callId) == .orderedSame else { return }
+        let message = error.localizedDescription
+        callKitAudioErrorRecovery.recordFailure(callID: callId, message: message)
+        controlError = message
+        guard state == .connected || state == .reconnecting,
+              let lease = activeAccountLease,
+              accountLeaseGate.accepts(lease)
+        else { return }
+        await fail(callId: callId, error: error, lease: lease)
+    }
+
+    /// Clears only the transient audio-configuration error owned by this call. A control failure
+    /// raised after it remains visible, and a late success from an old call cannot touch the new one.
+    func callKitAudioSessionConfigurationSucceeded(callId: String) {
+        guard activeCall?.id.caseInsensitiveCompare(callId) == .orderedSame else { return }
+        controlError = callKitAudioErrorRecovery.recoveredControlError(
+            callID: callId,
+            currentControlError: controlError
+        )
     }
 
     func requestEnd() {
@@ -2051,6 +2174,19 @@ final class CallMediaCoordinator: ObservableObject {
             reconnectStabilityTask = nil
             state = .reconnecting
         } else {
+            do {
+                try NotificationCoordinator.shared.reconcileCallKitAudioSessionIfNeeded(
+                    callId: callId
+                )
+            } catch {
+                Task { @MainActor [weak self] in
+                    await self?.callKitAudioSessionConfigurationFailed(
+                        callId: callId,
+                        error: error
+                    )
+                }
+                return
+            }
             state = .connected
             if reconnectAttemptsRemaining < CallMediaReconnectPolicy.retryDelaysNanoseconds.count {
                 scheduleReconnectBudgetReset(callId: callId)
@@ -2136,6 +2272,9 @@ final class CallMediaCoordinator: ObservableObject {
                     await session.disconnect(callId: callId)
                     return
                 }
+                try NotificationCoordinator.shared.reconcileCallKitAudioSessionIfNeeded(
+                    callId: callId
+                )
                 activeHandoff = refreshedHandoff
                 state = .connected
                 startPendingInitialCamera(callId: callId)
@@ -2293,6 +2432,7 @@ final class CallMediaCoordinator: ObservableObject {
         activeCall = nil
         state = .idle
         controlError = nil
+        callKitAudioErrorRecovery.reset()
         retireCallPresentationSurfaces()
     }
 }

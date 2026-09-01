@@ -68,6 +68,7 @@ final class LocalMediaPerformanceMonitor {
         if let milliseconds = result.captureToVisibleMilliseconds {
             logger.info("capture_to_visible_ms=\(milliseconds, privacy: .public)")
         }
+        retireCompletedMeasurement(mediaID: mediaID, milestones: value)
         return result
     }
 
@@ -81,6 +82,7 @@ final class LocalMediaPerformanceMonitor {
         if let milliseconds = result.captureToPlayableMilliseconds {
             logger.info("capture_to_playable_ms=\(milliseconds, privacy: .public)")
         }
+        retireCompletedMeasurement(mediaID: mediaID, milestones: value)
         return result
     }
 
@@ -112,8 +114,19 @@ final class LocalMediaPerformanceMonitor {
         if let milliseconds = result.captureToServerAcceptedMilliseconds {
             logger.info("capture_to_server_accepted_ms=\(milliseconds, privacy: .public)")
         }
-        milestones.removeValue(forKey: mediaID)
+        retireCompletedMeasurement(mediaID: mediaID, milestones: value)
         return result
+    }
+
+    /// A very fast local/LAN upload may receive server acceptance before SwiftUI mounts the
+    /// staged bubble. Keep that sample until the two local-first milestones have also arrived;
+    /// the global 256-entry bound still retires abandoned measurements deterministically.
+    private func retireCompletedMeasurement(mediaID: UUID, milestones value: Milestones) {
+        guard value.visibleAt != nil,
+              value.playableAt != nil,
+              value.serverAcceptedAt != nil
+        else { return }
+        milestones.removeValue(forKey: mediaID)
     }
 
     func beginRecipientHydration(mediaID: UUID, descriptorObservedAt: Date = Date()) {

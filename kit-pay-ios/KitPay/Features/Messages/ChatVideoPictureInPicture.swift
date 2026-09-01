@@ -90,10 +90,9 @@ enum ChatVideoPictureInPictureHandoffPolicy {
 
 /// Keeps a chat video playing in the system's floating window once the user's attention moves on.
 ///
-/// A video the user started is theirs until it ends: closing the viewer, swiping the gallery away,
-/// or leaving Kit Pay entirely hands playback to Picture in Picture rather than cutting it off.
-/// The little window closes by itself when the video finishes, which is the only ending the user
-/// asked for and did not have to ask for.
+/// Leaving Kit Pay while a video is playing lets AVKit move playback into Picture in Picture.
+/// Explicitly closing or swiping away the viewer remains a stop intent. The floating window closes
+/// itself when playback reaches the natural end.
 ///
 /// The viewer's own teardown — the AVPlayer and the file-protected temporary file the plaintext was
 /// decrypted into — is *deferred* through here while the window is up, so the handed-off video is
@@ -181,19 +180,23 @@ final class ChatVideoPictureInPicture: NSObject {
 
     // MARK: Handing off
 
-    /// Starts the floating window if the bound video is actually playing. Called from the paths
-    /// that take the viewer off screen — the gallery's close button, its swipe-down dismissal —
-    /// *before* the dismissal itself, because AVKit will not hand off a layer already torn out of
-    /// its window. Backgrounding is covered separately, by AVKit's own automatic start.
-    func startIfPlaying() {
-        guard let controller,
-              !isHandedOff,
-              attachedPlayer?.timeControlStatus == .playing,
-              controller.isPictureInPicturePossible,
-              !controller.isPictureInPictureActive
-        else { return }
-        startRequested = true
-        controller.startPictureInPicture()
+    /// An explicit close, drag-dismiss, or "Show in chat" means stop viewing. It must not be
+    /// reinterpreted as a request to keep the same video alive in a floating window. Automatic
+    /// system Picture in Picture when the app backgrounds remains owned by AVKit.
+    func stopForExplicitViewerDismissal() {
+        attachedPlayer?.pause()
+        startRequested = false
+        guard let controller else {
+            finishDeferredTeardown()
+            return
+        }
+        if controller.isPictureInPictureActive {
+            // `GalleryVideoController.teardown()` will hand its resources to us while AVKit
+            // finishes stopping; the delegate releases them exactly once afterwards.
+            controller.stopPictureInPicture()
+        } else {
+            finishDeferredTeardown()
+        }
     }
 
     /// Holds a viewer's teardown for as long as the window is keeping its video alive.

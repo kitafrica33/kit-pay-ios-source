@@ -129,6 +129,29 @@ struct CurrencyDTO: Codable, Hashable {
     let scale: String
 }
 
+/// Versioned marker for pricing payloads that contain customer-facing totals only.
+///
+/// A missing marker is accepted for compatibility with already-deployed servers. Once a server
+/// supplies the marker, an unknown value must fail closed rather than being interpreted as a
+/// customer-safe fee contract.
+enum CustomerPricingContract {
+    static let scope = "customer_totals"
+
+    static func accepts(scope value: String?, authoritativeTotal: String?) -> Bool {
+        guard let value else { return true }
+        return value == Self.scope && authoritativeTotal != nil
+    }
+
+    static func totalsMatch(_ authoritative: String?, legacy: String) -> Bool {
+        guard let authoritative else { return true }
+        let locale = Locale(identifier: "en_US_POSIX")
+        guard let total = Decimal(string: authoritative, locale: locale),
+              let fallback = Decimal(string: legacy, locale: locale)
+        else { return false }
+        return total == fallback
+    }
+}
+
 struct CapabilitiesDTO: Decodable {
     let apiVersion: String?
     let currency: CurrencyDTO
@@ -2696,25 +2719,298 @@ struct Counterparty: Codable, Hashable {
     }
 }
 
+/// The complete customer-visible effect of one transaction on the selected wallet.
+///
+/// A single customer action may have several immutable accounting legs on the server. Those
+/// remain private to Kit's ledger; the client receives only the combined money added/deducted.
+struct CustomerTransactionTotals: Codable, Hashable {
+    let added: String
+    let deducted: String
+}
+
+/// Combined movement in the currently displayed wallet-history page.
+///
+/// These are minor units so aggregation and rendering never pass through binary floating point.
+/// They deliberately describe the customer's wallet only; Kit's institutional ledger remains a
+/// separate, server-side accounting concern.
+struct CustomerTransactionActivitySummary: Equatable {
+    let addedMinorUnits: Int64
+    let deductedMinorUnits: Int64
+
+    static let zero = CustomerTransactionActivitySummary(
+        addedMinorUnits: 0,
+        deductedMinorUnits: 0
+    )
+}
+
 struct WalletTransaction: Codable, Hashable, Identifiable {
     let id: String
     let walletId: String
     let reference: String
     let amount: String
+    var totals: CustomerTransactionTotals? = nil
     let currency: CurrencyDTO
     let type: String
     let direction: String
     let status: String
-    let counterparty: Counterparty?
+    var counterparty: Counterparty?
     let note: String?
     /// Present when a Kit Pay → Kit Pay transfer is held for recipient acceptance.
     var claim: TransferAcceptanceDTO? = nil
     let occurredAt: String
 
     enum CodingKeys: String, CodingKey {
-        case id, reference, amount, currency, type, direction, status, counterparty, note, claim
+        case id, reference, amount, totals, currency, type, direction, status, counterparty, note, claim
         case walletId = "wallet_id"
         case occurredAt = "occurred_at"
+    }
+}
+
+extension WalletTransaction {
+    /// The counterparty identity that is safe to show in customer-facing history and receipts.
+    ///
+    /// Service-backed movements can carry a historical settlement/service wallet in an older
+    /// protected cache. That identity is never the customer's actual counterparty, so only
+    /// transaction families whose counterparty is inherently another customer or merchant may
+    /// surface it.
+    var customerCounterparty: Counterparty? {
+        CustomerTransactionPresentationPolicy.customerCounterparty(for: self)
+    }
+
+    var customerAmountAdded: String {
+        totals?.added ?? "0"
+    }
+
+    var customerAmountDeducted: String {
+        totals?.deducted ?? "0"
+    }
+
+    var customerImpactLabel: String {
+        customerDirection == "credit" ? "Money Added" : "Money Deducted"
+    }
+
+    var customerImpactAmount: String {
+        customerDirection == "credit" ? customerAmountAdded : customerAmountDeducted
+    }
+
+    var customerDirection: String {
+        direction.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+}
+
+/// The fail-closed boundary between Kit's ledger taxonomy and customer-visible activity.
+///
+/// The server remains authoritative for grouping accounting legs into one customer movement, but
+/// an old protected cache or a temporarily incompatible response must not make an institutional
+/// or newly introduced ledger type visible. Adding a new customer transaction therefore requires
+/// an explicit client contract update instead of becoming visible by accident.
+enum CustomerTransactionPresentationPolicy {
+    /// Exact public types emitted by the backend customer-history projection. Legacy aliases and
+    /// internal fee, commission, settlement, rounding, and float types are deliberately absent.
+    static let supportedTypes: Set<String> = [
+        "airtime",
+        "bank_deposit",
+        "bank_reversal",
+        "bank_transfer",
+        "bank_withdrawal",
+        "bill_payment",
+        "internal_transfer",
+        "internal_transfer_reversal",
+        "merchant_escrow_release",
+        "merchant_payment",
+        "merchant_refund",
+        "provider_reversal",
+        "referral_reward",
+        "referral_reward_reversal",
+    ]
+
+    /// These transaction families have an actual customer/merchant on the opposite side. All
+    /// other supported types are service-backed, so a cached counterparty can only be stale
+    /// institutional metadata and must fail closed at presentation time.
+    static let customerCounterpartyTypes: Set<String> = [
+        "internal_transfer",
+        "internal_transfer_reversal",
+        "merchant_escrow_release",
+        "merchant_payment",
+        "merchant_refund",
+    ]
+
+    static func isCustomerVisible(_ transaction: WalletTransaction) -> Bool {
+        supportedTypes.contains(normalizedType(transaction.type))
+            && hasValidCustomerImpact(transaction)
+    }
+
+    static func customerVisibleTransactions(
+        _ transactions: [WalletTransaction]
+    ) -> [WalletTransaction] {
+        transactions.compactMap { transaction in
+            guard isCustomerVisible(transaction) else { return nil }
+            var presented = transaction
+            presented.counterparty = customerCounterparty(for: transaction)
+            return presented
+        }
+    }
+
+    /// Returns only rows that belong to the selected wallet and its currency. This prevents a
+    /// cached page from the previously selected wallet appearing during an asynchronous refresh.
+    static func customerVisibleTransactions(
+        _ transactions: [WalletTransaction],
+        for wallet: Wallet
+    ) -> [WalletTransaction] {
+        guard let walletScale = validScale(wallet.currency),
+              !normalizedCurrencyCode(wallet.currency.code).isEmpty
+        else { return [] }
+
+        return customerVisibleTransactions(transactions).filter { transaction in
+            transaction.walletId.caseInsensitiveCompare(wallet.id) == .orderedSame
+                && normalizedCurrencyCode(transaction.currency.code)
+                    == normalizedCurrencyCode(wallet.currency.code)
+                && validScale(transaction.currency) == walletScale
+        }
+    }
+
+    /// Sums the server-provided combined customer totals for the selected wallet page. Each row
+    /// is independently validated and converted through `Decimal`; malformed or over-precision
+    /// values fail closed. Addition saturates so an unexpectedly large valid page cannot wrap.
+    static func activitySummary(
+        _ transactions: [WalletTransaction],
+        for wallet: Wallet
+    ) -> CustomerTransactionActivitySummary {
+        guard let scale = validScale(wallet.currency) else { return .zero }
+
+        return customerVisibleTransactions(transactions, for: wallet).reduce(into: .zero) {
+            summary, transaction in
+            guard let totals = transaction.totals else { return }
+
+            switch transaction.customerDirection {
+            case "credit":
+                guard let amount = minorUnits(for: totals.added, scale: scale) else { return }
+                summary = CustomerTransactionActivitySummary(
+                    addedMinorUnits: saturatingAdd(summary.addedMinorUnits, amount),
+                    deductedMinorUnits: summary.deductedMinorUnits
+                )
+            case "debit":
+                guard let amount = minorUnits(for: totals.deducted, scale: scale) else { return }
+                summary = CustomerTransactionActivitySummary(
+                    addedMinorUnits: summary.addedMinorUnits,
+                    deductedMinorUnits: saturatingAdd(summary.deductedMinorUnits, amount)
+                )
+            default:
+                return
+            }
+        }
+    }
+
+    static func customerCounterparty(for transaction: WalletTransaction) -> Counterparty? {
+        guard customerCounterpartyTypes.contains(normalizedType(transaction.type)) else {
+            return nil
+        }
+        return transaction.counterparty
+    }
+
+    @discardableResult
+    static func hardenCustomerTransactions(
+        from transactions: inout [WalletTransaction]
+    ) -> Int {
+        let visibleTransactions = transactions.filter(isCustomerVisible)
+        let removedCount = transactions.count - visibleTransactions.count
+        let redactedCounterpartyCount = visibleTransactions.reduce(into: 0) { count, transaction in
+            if transaction.counterparty != nil,
+               customerCounterparty(for: transaction) == nil {
+                count += 1
+            }
+        }
+        transactions = customerVisibleTransactions(transactions)
+        return removedCount + redactedCounterpartyCount
+    }
+
+    private static func normalizedType(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    private static func normalizedCurrencyCode(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+    }
+
+    private static func validScale(_ currency: CurrencyDTO) -> Int? {
+        guard let scale = Int(currency.scale), (0 ... 9).contains(scale) else { return nil }
+        return scale
+    }
+
+    /// Reject malformed aggregate rows before they can reach any customer-facing projection.
+    /// Authoritative responses carry both sides explicitly; exactly one side must be positive and
+    /// it must agree with the transaction direction. Principal-only legacy rows fail closed because
+    /// they cannot prove that fees or companion accounting legs have been included.
+    private static func hasValidCustomerImpact(_ transaction: WalletTransaction) -> Bool {
+        let direction = transaction.direction
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard direction == "credit" || direction == "debit" else { return false }
+
+        guard let totals = transaction.totals,
+              let publicAmount = canonicalNonnegativeAmount(transaction.amount),
+              publicAmount > 0,
+              let added = canonicalNonnegativeAmount(totals.added),
+              let deducted = canonicalNonnegativeAmount(totals.deducted),
+              let scale = validScale(transaction.currency),
+              minorUnits(for: transaction.amount, scale: scale) != nil,
+              minorUnits(for: totals.added, scale: scale) != nil,
+              minorUnits(for: totals.deducted, scale: scale) != nil
+        else { return false }
+
+        switch direction {
+        case "credit":
+            return added == publicAmount && deducted == 0
+        case "debit":
+            return deducted == publicAmount && added == 0
+        default:
+            return false
+        }
+    }
+
+    private static func canonicalNonnegativeAmount(_ raw: String) -> Decimal? {
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let components = value.split(separator: ".", omittingEmptySubsequences: false)
+        guard !value.isEmpty,
+              components.count <= 2,
+              components.allSatisfy({ component in
+                  !component.isEmpty
+                      && component.allSatisfy { character in
+                          character.isASCII && character.isNumber
+                      }
+              }),
+              let amount = Decimal(
+                  string: value,
+                  locale: Locale(identifier: "en_US_POSIX")
+              ),
+              amount >= 0
+        else { return nil }
+        return amount
+    }
+
+    /// Converts a canonical nonnegative decimal into minor units without rounding or `Double`.
+    private static func minorUnits(for raw: String, scale: Int) -> Int64? {
+        guard (0 ... 9).contains(scale),
+              let amount = canonicalNonnegativeAmount(raw)
+        else { return nil }
+
+        var multiplier = Decimal(1)
+        if scale > 0 {
+            for _ in 0 ..< scale { multiplier *= 10 }
+        }
+        let scaled = amount * multiplier
+        var source = scaled
+        var integral = Decimal()
+        NSDecimalRound(&integral, &source, 0, .plain)
+        guard integral == scaled,
+              integral <= Decimal(Int64.max)
+        else { return nil }
+        return NSDecimalNumber(decimal: integral).int64Value
+    }
+
+    private static func saturatingAdd(_ lhs: Int64, _ rhs: Int64) -> Int64 {
+        guard lhs <= Int64.max - rhs else { return Int64.max }
+        return lhs + rhs
     }
 }
 
@@ -3432,21 +3728,117 @@ struct ConversationDraftWriteVersion: Codable, Hashable, Sendable {
     let sequence: UInt64
 }
 
+/// Encrypted, account-bound ownership of one composer attachment before Send is pressed.
+///
+/// The media bytes live in `SecureMediaFileCache`; this manifest deliberately stores only a
+/// permanent client id and bounded metadata, never an absolute path or a remote URL. Persisting
+/// it beside the text draft closes the relaunch gap between selecting/capturing media and
+/// committing the eventual message/outbox row.
+struct ConversationDraftMediaAttachment: Codable, Hashable, Sendable {
+    enum StorageKind: String, Codable, Hashable, Sendable {
+        case encryptedBlob
+        case protectedFile
+    }
+
+    static let maximumDisplayNameScalars = 1_024
+
+    let id: UUID
+    let storageKind: StorageKind
+    /// The representation that will enter the encrypted wire after any durable preprocessing.
+    let mediaType: String
+    /// The exact protected source MIME when `mediaType` is a later optimized representation.
+    let originalMediaType: String?
+    let byteCount: Int
+    let displayName: String
+    let duration: TimeInterval?
+    let acceptedAt: Date
+    let clientMessageID: UUID?
+    let preprocessingOutputStorageKey: String?
+
+    var storageKey: String { id.uuidString.lowercased() }
+
+    static func boundedDisplayName(_ value: String, fallback: String) -> String {
+        var result = ""
+        var scalarCount = 0
+        for character in value where !character.unicodeScalars.contains(where: {
+            $0.value == 0
+        }) {
+            let count = character.unicodeScalars.count
+            guard scalarCount + count <= maximumDisplayNameScalars else { break }
+            result.append(character)
+            scalarCount += count
+        }
+        return result.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? fallback
+            : result
+    }
+
+    var isStructurallyValid: Bool {
+        guard SecureMessagingWire.allowedAttachmentMediaTypes.contains(mediaType),
+              KitChatMediaLimits.fitsLocalOriginal(
+                  byteCount: byteCount,
+                  mediaType: originalMediaType ?? mediaType
+              ),
+              !displayName.isEmpty,
+              displayName.unicodeScalars.count <= Self.maximumDisplayNameScalars,
+              !displayName.unicodeScalars.contains(where: { $0.value == 0 }),
+              duration.map({ $0.isFinite && $0 > 0 }) ?? true,
+              acceptedAt.timeIntervalSinceReferenceDate.isFinite
+        else { return false }
+
+        switch (originalMediaType, preprocessingOutputStorageKey) {
+        case (nil, nil):
+            return true
+        case let (sourceMediaType?, outputStorageKey?):
+            return mediaType == "image/jpeg"
+                && sourceMediaType == sourceMediaType.lowercased()
+                && sourceMediaType.hasPrefix("image/")
+                && sourceMediaType.utf8.count <= 127
+                && sourceMediaType.unicodeScalars.allSatisfy {
+                    $0.value >= 0x21 && $0.value <= 0x7e
+                }
+                && UUID(uuidString: outputStorageKey)?.uuidString.lowercased()
+                    == outputStorageKey
+                && outputStorageKey != storageKey
+        case (.some, nil), (nil, .some):
+            return false
+        }
+    }
+}
+
 struct ConversationDraft: Codable, Hashable, Sendable {
     let body: String
     let updatedAt: Date
     /// Optional keeps drafts written before ordered persistence backward-decodable. Within one
     /// running app, later mutations from the same writer always supersede delayed debounce tasks.
     let writeVersion: ConversationDraftWriteVersion?
+    /// Optional keeps every draft written before local-first composer media backward-decodable.
+    /// An empty array is normalized to nil when written.
+    let mediaAttachments: [ConversationDraftMediaAttachment]?
 
     init(
         body: String,
         updatedAt: Date,
-        writeVersion: ConversationDraftWriteVersion? = nil
+        writeVersion: ConversationDraftWriteVersion? = nil,
+        mediaAttachments: [ConversationDraftMediaAttachment]? = nil
     ) {
         self.body = body
         self.updatedAt = updatedAt
         self.writeVersion = writeVersion
+        self.mediaAttachments = mediaAttachments
+    }
+
+    var localMediaStorageKeys: [String] {
+        let keys = (mediaAttachments ?? []).flatMap { attachment in
+            [attachment.storageKey, attachment.preprocessingOutputStorageKey].compactMap { $0 }
+        }
+        var seen = Set<String>()
+        return keys.compactMap { raw -> String? in
+            guard let canonical = UUID(uuidString: raw)?.uuidString.lowercased(),
+                  seen.insert(canonical).inserted
+            else { return nil }
+            return canonical
+        }
     }
 }
 
@@ -3675,6 +4067,7 @@ struct LocalMediaRecord: Codable, Hashable, Identifiable, Sendable {
               }) ?? true,
               preprocessingJob.map({ job in
                   direction == .sent
+                      && id != job.outputStorageKey
                       && originalSources == job.sources
                       && localStorageKind == .protectedFile
                       && localStorageKey == job.sources.first?.storageKey
@@ -3686,6 +4079,27 @@ struct LocalMediaRecord: Codable, Hashable, Identifiable, Sendable {
                       && [.processing, .failed].contains(processingState)
               }) ?? true
         else { return false }
+
+        // A sender's permanent client id addresses its ciphertext spool, while its local key,
+        // original sources and preprocessing output address plaintext representations. A server
+        // object may never alias any of those roles. Resumable and finalized server references
+        // may coexist only while they name the same object during the READY-to-sealed handoff.
+        if direction == .sent {
+            var clientOwnedKeys = Set([id])
+            if let localStorageKey { clientOwnedKeys.insert(localStorageKey) }
+            clientOwnedKeys.formUnion(originalSources?.map(\.storageKey) ?? [])
+            if let output = preprocessingJob?.outputStorageKey {
+                clientOwnedKeys.insert(output)
+            }
+            let resumableStorageKey = resumableUpload?.storageKey
+            for serverKey in [remoteEncryptedObjectID, resumableStorageKey].compactMap({ $0 }) {
+                guard !clientOwnedKeys.contains(serverKey) else { return false }
+            }
+            if let remoteEncryptedObjectID, let resumableStorageKey,
+               remoteEncryptedObjectID != resumableStorageKey {
+                return false
+            }
+        }
 
         switch localStorageKind {
         case .encryptedState:
@@ -4133,6 +4547,63 @@ enum LocalMediaRecordPolicy {
         }
     }
 
+    /// Binds a completed server object to its attachment without declaring the whole message
+    /// sealed. A batch can finish one item while siblings still upload; retaining the resumable
+    /// checkpoint here permits the final READY lease preflight after an app restart.
+    static func checkpointRemoteObject(
+        _ message: inout LocalMessage,
+        attachmentID: String,
+        remoteStorageKey: String,
+        now: Date = Date()
+    ) -> Bool {
+        guard let remoteStorageKey = canonicalUUID(remoteStorageKey) else { return false }
+        return mutate(&message, attachmentID: attachmentID) { record in
+            guard record.direction == .sent,
+                  record.uploadState == .uploading,
+                  record.remoteEncryptedObjectID.map({ $0 == remoteStorageKey }) ?? true,
+                  (record.resumableUpload?.storageKey).map({
+                      $0 == remoteStorageKey
+                  }) ?? true
+            else { return false }
+            record.remoteEncryptedObjectID = remoteStorageKey
+            record.updatedAt = now
+            return true
+        }
+    }
+
+    /// Retention may replace a completed but unclaimed resumable object with a fresh empty
+    /// lease. Clear the old batch object's record binding and install the replacement checkpoint
+    /// in one message-local transition; the caller persists this together with reopening the
+    /// matching batch item under the account-wide ownership policy.
+    static func replaceCompletedResumableUpload(
+        _ message: inout LocalMessage,
+        attachmentID: String,
+        previousStorageKey: String,
+        checkpoint: LocalMediaResumableUpload,
+        now: Date = Date()
+    ) -> Bool {
+        guard let previousStorageKey = canonicalUUID(previousStorageKey),
+              checkpoint.isStructurallyValid,
+              let replacementStorageKey = checkpoint.storageKey,
+              replacementStorageKey != previousStorageKey
+        else { return false }
+        return mutate(&message, attachmentID: attachmentID) { record in
+            guard record.direction == .sent,
+                  record.uploadState == .uploading,
+                  let spoolSize = record.ciphertextSpoolByteSize,
+                  checkpoint.nextOffset <= spoolSize,
+                  checkpoint.uploadID == record.id,
+                  record.resumableUpload?.uploadID == checkpoint.uploadID,
+                  record.resumableUpload?.storageKey == previousStorageKey,
+                  record.remoteEncryptedObjectID.map({ $0 == previousStorageKey }) ?? true
+            else { return false }
+            record.remoteEncryptedObjectID = nil
+            record.resumableUpload = checkpoint
+            record.updatedAt = now
+            return true
+        }
+    }
+
     /// Drops only the server lease after it expires or disappears. The permanent media id,
     /// outbound key and deterministic ciphertext-spool facts remain pinned, so restarting the
     /// lease cannot create a duplicate attachment or re-encrypt different bytes.
@@ -4483,6 +4954,47 @@ enum LocalMediaRecordPolicy {
         message.localMediaRecords = records
     }
 
+    /// Moves one exact durable preprocessing job to a fresh immutable destination after finding
+    /// an invalid crash remnant at the old key. The old key is intentionally not returned for
+    /// inline deletion: once this state mutation commits it becomes an orphan for the bounded,
+    /// age-gated cache sweep. The caller must prove the new key has no owner in the full state in
+    /// the same store transaction before invoking this message-local transition.
+    static func rekeyPreprocessingOutput(
+        _ message: inout LocalMessage,
+        attachmentID: String,
+        expectedJob: LocalMediaPreprocessingJob,
+        newOutputStorageKey: String,
+        now: Date = Date()
+    ) -> Bool {
+        guard expectedJob.isStructurallyValid,
+              let canonicalOutput = canonicalUUID(newOutputStorageKey),
+              canonicalOutput == newOutputStorageKey,
+              canonicalOutput != expectedJob.outputStorageKey,
+              !expectedJob.sources.contains(where: { $0.storageKey == canonicalOutput }),
+              !message.localMediaOwnershipKeys.contains(canonicalOutput)
+        else { return false }
+        let replacement = LocalMediaPreprocessingJob(
+            kind: expectedJob.kind,
+            sources: expectedJob.sources,
+            outputStorageKey: canonicalOutput,
+            outputMediaType: expectedJob.outputMediaType
+        )
+        guard replacement.isStructurallyValid else { return false }
+        return mutate(&message, attachmentID: attachmentID) { record in
+            guard record.preprocessingJob == expectedJob,
+                  record.id != canonicalOutput,
+                  record.originalSources == expectedJob.sources,
+                  record.uploadState == .pending,
+                  record.encryptionState == .pending,
+                  record.remoteEncryptedObjectID == nil
+            else { return false }
+            record.preprocessingJob = replacement
+            record.processingState = .processing
+            record.updatedAt = now
+            return true
+        }
+    }
+
     /// Atomically switches a preprocessing message from its immediately playable source to the
     /// finished local representation. The outbox command is released by the same store mutation
     /// at the call site, so encryption can never race an incompletely published output.
@@ -4635,6 +5147,73 @@ enum LocalMediaRecordPolicy {
 }
 
 extension LocalMessage {
+    /// The collision namespace is wider than the plaintext files returned by
+    /// `localMediaStorageKeys`: ciphertext spools are addressed by `LocalMediaRecord.id`, and a
+    /// remote or partially damaged row can claim a key before it has a local representation.
+    /// Queue/draft admission uses this fail-closed ownership set; deletion deliberately continues
+    /// to use the narrower structurally validated storage-key set below.
+    var localMediaOwnershipClaims: [String: Set<String>] {
+        var claims: [String: Set<String>] = [:]
+        func canonical(_ raw: String?) -> String? {
+            raw.flatMap { UUID(uuidString: $0)?.uuidString.lowercased() }
+        }
+        func claim(_ rawKey: String?, owner rawOwner: String?) {
+            guard let key = canonical(rawKey) else { return }
+            // Empty is a fail-closed owner for malformed legacy state that names a valid cache
+            // key but cannot bind that key to one canonical attachment identity.
+            let owner = canonical(rawOwner) ?? ""
+            claims[key, default: []].insert(owner)
+        }
+        for record in localMediaRecords ?? [] {
+            claim(record.id, owner: record.id)
+            for key in [
+                record.localStorageKey,
+                record.remoteEncryptedObjectID,
+                record.preprocessingJob?.outputStorageKey,
+                record.resumableUpload?.storageKey,
+            ] {
+                claim(key, owner: record.id)
+            }
+            for source in record.originalSources ?? [] {
+                claim(source.storageKey, owner: record.id)
+            }
+        }
+        if let pending = pendingAttachment?.localStorageKey {
+            let matchingOwners = Set((localMediaRecords ?? []).compactMap { record -> String? in
+                canonical(record.localStorageKey) == canonical(pending)
+                    ? canonical(record.id)
+                    : nil
+            })
+            if matchingOwners.count == 1, let owner = matchingOwners.first {
+                claim(pending, owner: owner)
+            } else {
+                claim(pending, owner: nil)
+            }
+        }
+        if let batch = pendingMediaBatch {
+            for item in batch.items {
+                claim(item.attachmentID, owner: item.attachmentID)
+                claim(item.localStorageKey, owner: item.attachmentID)
+                claim(item.storageKey, owner: item.attachmentID)
+            }
+        }
+        if let descriptor = KitMediaMessageDescriptor.parse(body) {
+            claim(descriptor.attachmentID, owner: descriptor.attachmentID)
+            claim(descriptor.storageKey, owner: descriptor.attachmentID)
+        }
+        if let descriptor = KitMediaMessageV2Descriptor.parse(body) {
+            for item in descriptor.items {
+                claim(item.attachmentID, owner: item.attachmentID)
+                claim(item.storageKey, owner: item.attachmentID)
+            }
+        }
+        return claims
+    }
+
+    var localMediaOwnershipKeys: [String] {
+        localMediaOwnershipClaims.keys.sorted()
+    }
+
     /// Every key this message may hold media under in the encrypted file cache, across both
     /// media generations and every outbound phase: the v1 pending park key, a sealed v1
     /// descriptor's storage key, every v2 batch park/checkpoint key, and every storage key of a
@@ -4670,6 +5249,202 @@ extension LocalMessage {
         return keys.filter {
             UUID(uuidString: $0)?.uuidString.lowercased() == $0 && seen.insert($0).inserted
         }
+    }
+}
+
+/// A server object key paired with the permanent client attachment that is allowed to own it.
+/// Bare storage keys are deliberately insufficient at a persistence boundary: without the
+/// attachment identity a same-message sibling alias is indistinguishable from a valid retry.
+struct LocalMediaStorageBinding: Hashable, Sendable {
+    let attachmentID: String
+    let storageKey: String
+}
+
+/// Account-wide admission for server-issued media object keys.
+///
+/// The policy is evaluated inside the same `SecureLocalStore.update` that replaces a message.
+/// A fresh or replacement key must have no current owner anywhere. An already-checkpointed key
+/// may be repeated only by the exact target record's server fields and its paired batch/wire
+/// projection. Client ids, plaintext keys, preprocessing inputs/outputs, sibling attachments,
+/// other messages, and active drafts can never be reinterpreted as server storage.
+enum LocalMediaStorageOwnershipPolicy {
+    static func permitsTransition(
+        from current: LocalMessage,
+        to proposed: LocalMessage,
+        in state: PersistedState
+    ) -> Bool {
+        guard current.id == proposed.id,
+              current.conversationId == proposed.conversationId,
+              current.senderId == proposed.senderId,
+              current.isOutgoing,
+              proposed.isOutgoing,
+              state.messages.filter({ $0.id == current.id }) == [current],
+              let storageBindings = bindings(in: proposed)
+        else { return false }
+
+        let draftKeys = ConversationDraftPolicy.localMediaStorageKeysOwnedByDrafts(in: state)
+        for binding in storageBindings {
+            guard !draftKeys.contains(binding.storageKey),
+                  proposedClaimsOnlyTargetServerRoles(
+                      binding.storageKey,
+                      attachmentID: binding.attachmentID,
+                      in: proposed
+                  ),
+                  state.messages.allSatisfy({ message in
+                      message.id == current.id
+                          || message.localMediaOwnershipClaims[binding.storageKey] == nil
+                  })
+            else { return false }
+
+            let currentTargetRecords = (current.localMediaRecords ?? []).filter {
+                $0.id == binding.attachmentID
+                    && $0.messageID == current.id
+                    && $0.conversationID == current.conversationId
+                    && $0.direction == .sent
+            }
+            let wasCheckpointedByTarget = currentTargetRecords.count == 1
+                && currentTargetRecords.contains(where: { record in
+                    record.resumableUpload?.storageKey == binding.storageKey
+                        || record.remoteEncryptedObjectID == binding.storageKey
+                })
+            if wasCheckpointedByTarget {
+                guard proposedClaimsOnlyTargetServerRoles(
+                    binding.storageKey,
+                    attachmentID: binding.attachmentID,
+                    in: current
+                ) else { return false }
+            } else {
+                // This is the first admission of a server key, or a lease replacement. Even a
+                // target attachment's own client id/source/output is an existing owner here.
+                guard current.localMediaOwnershipClaims[binding.storageKey] == nil else {
+                    return false
+                }
+            }
+        }
+        return true
+    }
+
+    /// Derives bindings from the complete proposed projection rather than trusting arguments at
+    /// a call site. Every persisted server reference must agree on one attachment owner, and an
+    /// attachment may not name two server objects in one state transition.
+    static func bindings(in message: LocalMessage) -> [LocalMediaStorageBinding]? {
+        var ownerByKey: [String: String] = [:]
+        var keyByOwner: [String: String] = [:]
+
+        func add(_ rawKey: String?, owner rawOwner: String) -> Bool {
+            guard let rawKey,
+                  let key = canonical(rawKey), key == rawKey,
+                  let owner = canonical(rawOwner), owner == rawOwner,
+                  ownerByKey[key].map({ $0 == owner }) ?? true,
+                  keyByOwner[owner].map({ $0 == key }) ?? true
+            else { return false }
+            ownerByKey[key] = owner
+            keyByOwner[owner] = key
+            return true
+        }
+
+        for record in message.localMediaRecords ?? [] where record.direction == .sent {
+            if record.resumableUpload?.storageKey != nil,
+               !add(record.resumableUpload?.storageKey, owner: record.id) {
+                return nil
+            }
+            if record.remoteEncryptedObjectID != nil,
+               !add(record.remoteEncryptedObjectID, owner: record.id) {
+                return nil
+            }
+        }
+        if let batch = message.pendingMediaBatch {
+            guard batch.isStructurallyValid else { return nil }
+            for item in batch.items where item.storageKey != nil {
+                guard add(item.storageKey, owner: item.attachmentID) else { return nil }
+            }
+        }
+        if let descriptor = KitMediaMessageDescriptor.parse(message.body) {
+            guard add(descriptor.storageKey, owner: descriptor.attachmentID) else { return nil }
+        }
+        if let descriptor = KitMediaMessageV2Descriptor.parse(message.body) {
+            for item in descriptor.items {
+                guard add(item.storageKey, owner: item.attachmentID) else { return nil }
+            }
+        }
+
+        let bindings = ownerByKey.map {
+            LocalMediaStorageBinding(attachmentID: $0.value, storageKey: $0.key)
+        }.sorted {
+            if $0.attachmentID == $1.attachmentID {
+                return $0.storageKey < $1.storageKey
+            }
+            return $0.attachmentID < $1.attachmentID
+        }
+        for binding in bindings {
+            let targetRecords = (message.localMediaRecords ?? []).filter {
+                $0.id == binding.attachmentID
+                    && $0.messageID == message.id
+                    && $0.conversationID == message.conversationId
+                    && $0.direction == .sent
+                    && $0.isStructurallyValid
+            }
+            guard targetRecords.count == 1,
+                  targetRecords.contains(where: { record in
+                      record.resumableUpload?.storageKey == binding.storageKey
+                          || record.remoteEncryptedObjectID == binding.storageKey
+                  })
+            else { return nil }
+        }
+        return bindings
+    }
+
+    private static func proposedClaimsOnlyTargetServerRoles(
+        _ storageKey: String,
+        attachmentID: String,
+        in message: LocalMessage
+    ) -> Bool {
+        func matches(_ raw: String?) -> Bool {
+            canonical(raw) == storageKey
+        }
+
+        for record in message.localMediaRecords ?? [] {
+            // These are client-owned roles even when they belong to the target attachment.
+            if matches(record.id)
+                || matches(record.localStorageKey)
+                || matches(record.preprocessingJob?.outputStorageKey)
+                || (record.originalSources ?? []).contains(where: {
+                    matches($0.storageKey)
+                }) {
+                return false
+            }
+            if matches(record.resumableUpload?.storageKey), record.id != attachmentID {
+                return false
+            }
+            if matches(record.remoteEncryptedObjectID), record.id != attachmentID {
+                return false
+            }
+        }
+        if matches(message.pendingAttachment?.localStorageKey) { return false }
+        if let batch = message.pendingMediaBatch {
+            for item in batch.items {
+                if matches(item.attachmentID) || matches(item.localStorageKey) { return false }
+                if matches(item.storageKey), item.attachmentID != attachmentID { return false }
+            }
+        }
+        if let descriptor = KitMediaMessageDescriptor.parse(message.body) {
+            if matches(descriptor.attachmentID) { return false }
+            if matches(descriptor.storageKey), descriptor.attachmentID != attachmentID {
+                return false
+            }
+        }
+        if let descriptor = KitMediaMessageV2Descriptor.parse(message.body) {
+            for item in descriptor.items {
+                if matches(item.attachmentID) { return false }
+                if matches(item.storageKey), item.attachmentID != attachmentID { return false }
+            }
+        }
+        return true
+    }
+
+    private static func canonical(_ raw: String?) -> String? {
+        guard let raw, let uuid = UUID(uuidString: raw) else { return nil }
+        return uuid.uuidString.lowercased()
     }
 }
 
@@ -4793,8 +5568,8 @@ enum SecureMediaLoadPolicy {
     /// never from a row snapshot captured earlier, where only the bytes would be current.
     struct LoadedItem {
         let data: Data
-        /// Non-nil only for a sender-owned protected original. `data` is empty in that case so
-        /// large local video/document presentation remains bounded-memory.
+        /// Non-nil for a sender-owned protected original or persisted receiver cache. `data` is
+        /// empty in that case so large local media presentation remains bounded-memory.
         let localFileURL: URL?
         /// Retains receiver-cache ownership while a file-backed presentation keeps this value.
         /// Sender originals are never eviction candidates, but use the same shape for callers.
@@ -5506,6 +6281,7 @@ struct PersistedState: Codable {
 enum ConversationDraftPolicy {
     static let maximumBodyScalars = 8_000
     static let maximumDraftCount = 200
+    static let maximumMediaAttachments = 8
 
     static func boundedBody(_ body: String) -> String {
         var result = ""
@@ -5536,6 +6312,53 @@ enum ConversationDraftPolicy {
         return boundedBody(draft.body)
     }
 
+    static func mediaAttachments(
+        conversationID: String,
+        ownerUserID: String,
+        in state: PersistedState
+    ) -> [ConversationDraftMediaAttachment] {
+        guard owns(state, ownerUserID: ownerUserID),
+              let conversationID = OutboxPolicy.canonicalConversationID(conversationID),
+              state.conversations.contains(where: {
+                  OutboxPolicy.canonicalConversationID($0.id) == conversationID
+              }),
+              let attachments = state.conversationDrafts?[conversationID]?.mediaAttachments,
+              validMediaAttachments(attachments)
+        else { return [] }
+        return attachments
+    }
+
+    /// Every local media key still reserved by a composer draft. Queue admission may ignore only
+    /// the exact, versioned draft that the same atomic state mutation will consume; a stale body,
+    /// changed manifest, different conversation, or unrelated writer keeps all of its keys live.
+    static func localMediaStorageKeysOwnedByDrafts(
+        in state: PersistedState,
+        excludingSubmittedDraftFor submittedConversationID: String? = nil,
+        submittedBody: String? = nil,
+        submittedMediaAttachments: [ConversationDraftMediaAttachment]? = nil,
+        draftClearVersion: ConversationDraftWriteVersion? = nil,
+        consumingStorageKeys: Set<String>? = nil
+    ) -> Set<String> {
+        let canonicalSubmittedConversationID = submittedConversationID.flatMap {
+            OutboxPolicy.canonicalConversationID($0)
+        }
+        return Set((state.conversationDrafts ?? [:]).flatMap { entry -> [String] in
+            let (conversationID, draft) = entry
+            if let canonicalSubmittedConversationID,
+               conversationID == canonicalSubmittedConversationID,
+               isExactSubmittedDraft(
+                   draft,
+                   submittedBody: submittedBody,
+                   submittedMediaAttachments: submittedMediaAttachments,
+                   draftClearVersion: draftClearVersion,
+                   consumingStorageKeys: consumingStorageKeys
+               ) {
+                return []
+            }
+            return draft.localMediaStorageKeys
+        })
+    }
+
     @discardableResult
     static func store(
         _ body: String,
@@ -5543,6 +6366,7 @@ enum ConversationDraftPolicy {
         ownerUserID: String,
         updatedAt: Date = Date(),
         writeVersion: ConversationDraftWriteVersion? = nil,
+        mediaAttachments requestedMediaAttachments: [ConversationDraftMediaAttachment]? = nil,
         in state: inout PersistedState
     ) -> Bool {
         guard owns(state, ownerUserID: ownerUserID),
@@ -5555,14 +6379,38 @@ enum ConversationDraftPolicy {
         let bounded = boundedBody(body)
         var drafts = state.conversationDrafts ?? [:]
         guard permits(writeVersion, replacing: drafts[conversationID]) else { return false }
-        if bounded.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        let mediaAttachments: [ConversationDraftMediaAttachment]?
+        if let requestedMediaAttachments {
+            guard validMediaAttachments(requestedMediaAttachments) else { return false }
+            mediaAttachments = requestedMediaAttachments.isEmpty ? nil : requestedMediaAttachments
+        } else {
+            mediaAttachments = drafts[conversationID]?.mediaAttachments
+        }
+        if requestedMediaAttachments != nil, let mediaAttachments {
+            let requestedKeys = Set(ConversationDraft(
+                body: bounded,
+                updatedAt: updatedAt,
+                writeVersion: writeVersion,
+                mediaAttachments: mediaAttachments
+            ).localMediaStorageKeys)
+            let otherDraftKeys = Set(drafts.flatMap { entry -> [String] in
+                entry.key == conversationID ? [] : entry.value.localMediaStorageKeys
+            })
+            let messageKeys = Set(state.messages.flatMap(\.localMediaOwnershipKeys))
+            guard otherDraftKeys.isDisjoint(with: requestedKeys),
+                  messageKeys.isDisjoint(with: requestedKeys)
+            else { return false }
+        }
+        let hasText = !bounded.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        if !hasText, mediaAttachments == nil {
             if let writeVersion {
                 // Keep an encrypted, bounded tombstone so a debounce task that was cancelled after
                 // crossing an actor boundary cannot resurrect text cleared by a successful queue.
                 drafts[conversationID] = ConversationDraft(
                     body: "",
                     updatedAt: updatedAt,
-                    writeVersion: writeVersion
+                    writeVersion: writeVersion,
+                    mediaAttachments: nil
                 )
                 pruneOldestDrafts(&drafts, preserving: conversationID)
             } else {
@@ -5570,13 +6418,15 @@ enum ConversationDraftPolicy {
             }
         } else {
             if drafts[conversationID]?.body == bounded,
+               drafts[conversationID]?.mediaAttachments == mediaAttachments,
                drafts[conversationID]?.writeVersion == writeVersion {
                 return false
             }
             drafts[conversationID] = ConversationDraft(
                 body: bounded,
                 updatedAt: updatedAt,
-                writeVersion: writeVersion
+                writeVersion: writeVersion,
+                mediaAttachments: mediaAttachments
             )
             pruneOldestDrafts(&drafts, preserving: conversationID)
         }
@@ -5592,6 +6442,7 @@ enum ConversationDraftPolicy {
         conversationID: String,
         ownerUserID: String,
         writeVersion: ConversationDraftWriteVersion? = nil,
+        submittedMediaAttachments: [ConversationDraftMediaAttachment]? = nil,
         in state: inout PersistedState
     ) -> Bool {
         guard owns(state, ownerUserID: ownerUserID),
@@ -5602,6 +6453,15 @@ enum ConversationDraftPolicy {
         else { return false }
         var drafts = state.conversationDrafts ?? [:]
         let existing = drafts[conversationID]
+        if let submittedMediaAttachments {
+            guard validMediaAttachments(submittedMediaAttachments),
+                  (existing?.mediaAttachments ?? []) == submittedMediaAttachments
+            else { return false }
+        } else if existing?.mediaAttachments?.isEmpty == false {
+            // A media draft can be consumed only by a queue operation carrying its exact
+            // manifest. A text-only or malformed caller must never orphan its local originals.
+            return false
+        }
         guard existing == nil || existing?.body == boundedBody(submittedBody),
               permits(writeVersion, replacing: existing)
         else { return false }
@@ -5609,7 +6469,8 @@ enum ConversationDraftPolicy {
             drafts[conversationID] = ConversationDraft(
                 body: "",
                 updatedAt: Date(),
-                writeVersion: writeVersion
+                writeVersion: writeVersion,
+                mediaAttachments: nil
             )
             pruneOldestDrafts(&drafts, preserving: conversationID)
         } else {
@@ -5636,6 +6497,19 @@ enum ConversationDraftPolicy {
         return permits(candidate.writeVersion, replacing: current)
     }
 
+    private static func validMediaAttachments(
+        _ attachments: [ConversationDraftMediaAttachment]
+    ) -> Bool {
+        guard attachments.count <= maximumMediaAttachments,
+              attachments.allSatisfy(\.isStructurallyValid),
+              Set(attachments.map(\.id)).count == attachments.count
+        else { return false }
+        let outputKeys = attachments.compactMap(\.preprocessingOutputStorageKey)
+        let sourceKeys = Set(attachments.map(\.storageKey))
+        return Set(outputKeys).count == outputKeys.count
+            && sourceKeys.isDisjoint(with: outputKeys)
+    }
+
     private static func permits(
         _ incoming: ConversationDraftWriteVersion?,
         replacing existing: ConversationDraft?
@@ -5648,6 +6522,28 @@ enum ConversationDraftPolicy {
             return true
         }
         return incoming.sequence > existingVersion.sequence
+    }
+
+    private static func isExactSubmittedDraft(
+        _ draft: ConversationDraft,
+        submittedBody: String?,
+        submittedMediaAttachments: [ConversationDraftMediaAttachment]?,
+        draftClearVersion: ConversationDraftWriteVersion?,
+        consumingStorageKeys: Set<String>?
+    ) -> Bool {
+        guard let submittedBody,
+              let submittedMediaAttachments,
+              validMediaAttachments(submittedMediaAttachments),
+              draft.body == boundedBody(submittedBody),
+              (draft.mediaAttachments ?? []) == submittedMediaAttachments,
+              let existingVersion = draft.writeVersion,
+              let draftClearVersion,
+              draftClearVersion.writerID == existingVersion.writerID,
+              draftClearVersion.sequence > existingVersion.sequence,
+              let consumingStorageKeys,
+              Set(draft.localMediaStorageKeys) == consumingStorageKeys
+        else { return false }
+        return true
     }
 
     private static func owns(_ state: PersistedState, ownerUserID: String) -> Bool {
@@ -5668,7 +6564,9 @@ enum ConversationDraftPolicy {
             .filter { $0.key != conversationID }
             .sorted {
                 let lhsIsTombstone = $0.value.body.isEmpty
+                    && ($0.value.mediaAttachments?.isEmpty ?? true)
                 let rhsIsTombstone = $1.value.body.isEmpty
+                    && ($1.value.mediaAttachments?.isEmpty ?? true)
                 if lhsIsTombstone != rhsIsTombstone {
                     return lhsIsTombstone
                 }

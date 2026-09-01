@@ -88,7 +88,7 @@ final class WalletFlowModel: ObservableObject {
                 pin,
                 "Approve sending \(KitMoney.formatted(amount, currency: wallet.currency)) to \(contact.name)"
             )
-            sentTransaction = try await api.transfer(
+            let transaction = try await api.transfer(
                 walletId: wallet.id,
                 destinationWalletId: destinationWalletId,
                 amount: amount,
@@ -96,6 +96,11 @@ final class WalletFlowModel: ObservableObject {
                 idempotencyKey: "ios-transfer-\(UUID().uuidString.lowercased())",
                 stepUpToken: verification.stepUpToken
             )
+            guard CustomerTransactionPresentationPolicy.isCustomerVisible(transaction),
+                  transaction.walletId.caseInsensitiveCompare(wallet.id) == .orderedSame,
+                  transaction.direction.caseInsensitiveCompare("debit") == .orderedSame
+            else { throw WalletFlowError.unconfirmedTransfer }
+            sentTransaction = transaction
             return true
         } catch {
             if WalletTopUpPolicy.isInsufficientFunds(error) {
@@ -1657,18 +1662,51 @@ struct TransactionsView: View {
 
     var body: some View {
         Group {
-            if model.state.transactions.isEmpty {
+            if visibleTransactions.isEmpty {
                 ContentUnavailableView(
                     "No activity yet",
                     systemImage: "clock.arrow.circlepath",
                     description: Text(model.isOnline ? "Wallet transactions will appear here." : "Your latest cached activity is available offline.")
                 )
             } else {
-                List(model.state.transactions) { transaction in
-                    NavigationLink {
-                        TransactionDetailView(transaction: transaction)
-                    } label: {
-                        WalletTransactionRow(transaction: transaction)
+                List {
+                    if let wallet = model.selectedWallet {
+                        Section {
+                            HStack(spacing: 12) {
+                                activityTotal(
+                                    title: "Money Added",
+                                    amount: KitMoney.formatted(
+                                        minorUnits: activitySummary.addedMinorUnits,
+                                        code: wallet.currency.code,
+                                        scale: wallet.currency.decimalScale
+                                    ),
+                                    systemImage: "arrow.down.left",
+                                    color: KitColor.green
+                                )
+                                activityTotal(
+                                    title: "Money Deducted",
+                                    amount: KitMoney.formatted(
+                                        minorUnits: activitySummary.deductedMinorUnits,
+                                        code: wallet.currency.code,
+                                        scale: wallet.currency.decimalScale
+                                    ),
+                                    systemImage: "arrow.up.right",
+                                    color: KitColor.primaryText
+                                )
+                            }
+                            .listRowInsets(EdgeInsets())
+                            .listRowBackground(Color.clear)
+                        }
+                    }
+
+                    Section("Activity") {
+                        ForEach(visibleTransactions) { transaction in
+                            NavigationLink {
+                                TransactionDetailView(transaction: transaction)
+                            } label: {
+                                WalletTransactionRow(transaction: transaction)
+                            }
+                        }
                     }
                 }
                 .scrollContentBackground(.hidden)
@@ -1678,6 +1716,44 @@ struct TransactionsView: View {
         .navigationTitle("Transactions")
         .toolbar { ToolbarItem(placement: .topBarLeading) { Button("Close") { dismiss() } } }
         .refreshable { await model.refresh(userInitiated: true) }
+    }
+
+    private var visibleTransactions: [WalletTransaction] {
+        guard let wallet = model.selectedWallet else { return [] }
+        return CustomerTransactionPresentationPolicy.customerVisibleTransactions(
+            model.state.transactions,
+            for: wallet
+        )
+    }
+
+    private var activitySummary: CustomerTransactionActivitySummary {
+        guard let wallet = model.selectedWallet else { return .zero }
+        return CustomerTransactionPresentationPolicy.activitySummary(
+            visibleTransactions,
+            for: wallet
+        )
+    }
+
+    private func activityTotal(
+        title: String,
+        amount: String,
+        systemImage: String,
+        color: Color
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label(title, systemImage: systemImage)
+                .font(.caption.bold())
+                .foregroundStyle(KitColor.secondaryText)
+            Text(amount)
+                .font(.headline.weight(.bold))
+                .foregroundStyle(color)
+                .lineLimit(1)
+                .minimumScaleFactor(0.72)
+                .accessibilityLabel("\(title), \(amount)")
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(16)
+        .kitGlass(cornerRadius: 20)
     }
 }
 
@@ -1692,22 +1768,27 @@ struct TransactionDetailView: View {
                 // The ledger carries the counterparty's id but not their photo, so the face comes
                 // from the contact directory — which is persisted, so this still resolves offline.
                 RemoteAvatarView(
-                    name: transaction.counterparty?.name ?? "Kit Pay",
-                    avatarURL: model.contactAvatarURL(forUserID: transaction.counterparty?.id),
+                    name: transaction.customerCounterparty?.name ?? "Kit Pay",
+                    avatarURL: model.contactAvatarURL(
+                        forUserID: transaction.customerCounterparty?.id
+                    ),
                     size: 68
                 )
                 VerifiedAccountNameLabel(
                     designation: model.contactVerification(
-                        forUserID: transaction.counterparty?.id
+                        forUserID: transaction.customerCounterparty?.id
                     )
                 ) {
-                    Text(transaction.counterparty?.name ?? transaction.type.displayLabel)
+                    Text(transaction.customerCounterparty?.name ?? transaction.type.displayLabel)
                         .font(.title2.bold())
                         .foregroundStyle(KitColor.primaryText)
                 }
-                Text(transaction.signedDisplayAmount)
+                Text(transaction.customerImpactLabel)
+                    .font(.caption.bold())
+                    .foregroundStyle(KitColor.secondaryText)
+                Text(transaction.customerImpactDisplayAmount)
                     .font(.system(size: 38, weight: .heavy, design: .rounded))
-                    .foregroundStyle(transaction.direction == "credit" ? KitColor.green : KitColor.primaryText)
+                    .foregroundStyle(transaction.customerDirection == "credit" ? KitColor.green : KitColor.primaryText)
                 Text(transaction.status.capitalized)
                     .font(.caption.bold())
                     .padding(.horizontal, 12)
@@ -1763,13 +1844,13 @@ struct WalletTransactionRow: View {
 
     var body: some View {
         HStack(spacing: 13) {
-            Image(systemName: transaction.direction == "credit" ? "arrow.down.left" : "arrow.up.right")
+            Image(systemName: transaction.customerDirection == "credit" ? "arrow.down.left" : "arrow.up.right")
                 .font(.headline)
-                .foregroundStyle(transaction.direction == "credit" ? KitColor.green : KitColor.primaryText)
+                .foregroundStyle(transaction.customerDirection == "credit" ? KitColor.green : KitColor.primaryText)
                 .frame(width: 46, height: 46)
                 .background(.thinMaterial, in: Circle())
             VStack(alignment: .leading, spacing: 3) {
-                Text(transaction.counterparty?.name ?? transaction.type.displayLabel)
+                Text(transaction.customerCounterparty?.name ?? transaction.type.displayLabel)
                     .font(.headline)
                     .foregroundStyle(KitColor.primaryText)
                 Text(transaction.occurredAt.displayDate)
@@ -1777,9 +1858,14 @@ struct WalletTransactionRow: View {
                     .foregroundStyle(KitColor.secondaryText)
             }
             Spacer()
-            Text(transaction.signedDisplayAmount)
-                .font(.subheadline.bold())
-                .foregroundStyle(transaction.direction == "credit" ? KitColor.green : KitColor.primaryText)
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(transaction.customerImpactLabel)
+                    .font(.caption2)
+                    .foregroundStyle(KitColor.secondaryText)
+                Text(transaction.customerImpactDisplayAmount)
+                    .font(.subheadline.bold())
+                    .foregroundStyle(transaction.customerDirection == "credit" ? KitColor.green : KitColor.primaryText)
+            }
         }
         .padding(.vertical, 5)
     }
@@ -1858,12 +1944,15 @@ private enum WalletShare {
 
 private enum WalletFlowError: LocalizedError {
     case pinSetupRejected
+    case unconfirmedTransfer
     case unconfirmedPaymentRequest
     case unconfirmedScheduledPayment
 
     var errorDescription: String? {
         switch self {
         case .pinSetupRejected: "Kit Pay did not confirm the new wallet PIN. Please try again."
+        case .unconfirmedTransfer:
+            "Kit Pay did not confirm the exact transfer total. Check your activity before trying again."
         case .unconfirmedPaymentRequest: "Kit Pay did not confirm the exact payment request. Check your requests before trying again."
         case .unconfirmedScheduledPayment: "Kit Pay did not confirm the exact scheduled payment. Nothing new was scheduled."
         }
@@ -1881,8 +1970,8 @@ extension WalletContactDTO {
 }
 
 private extension WalletTransaction {
-    var signedDisplayAmount: String {
-        KitMoney.signed(amount, currency: currency, direction: direction)
+    var customerImpactDisplayAmount: String {
+        KitMoney.formatted(customerImpactAmount, currency: currency)
     }
 }
 

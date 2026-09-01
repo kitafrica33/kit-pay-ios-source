@@ -340,6 +340,9 @@ enum CustomerFacingPaymentCopy {
     private static let protectedAmountMessage =
         "We couldn't process this amount. Review it and try again."
 
+    private static let protectedAccountingMessage =
+        "We couldn't complete this request. Please try again or contact support with the reference."
+
     static let confirmedMobileMoneyCollectionFailure =
         "The mobile-money network could not complete this collection. No money was added to your wallet. Check your balance and approval prompt before trying again. If your balance changed, do not retry—contact support with the reference."
 
@@ -359,6 +362,22 @@ enum CustomerFacingPaymentCopy {
             options: [.regularExpression, .caseInsensitive]
         ) == nil else {
             return protectedFeeMessage
+        }
+
+        // Internal diagnostics do not always include the word "fee". Treat institutional
+        // accounting vocabulary as confidential even when it appears as a standalone ledger,
+        // settlement-wallet, margin, revenue, reconciliation, rounding, or float detail.
+        let accountingScanMessage = providerNeutralMessage.replacingOccurrences(
+            of: #"[_-]+"#,
+            with: " ",
+            options: .regularExpression
+        )
+        let internalAccountingDetail = #"\b(?:institutional|commission|revenue|ledger|margin|reconciliation|accounting|journal|allocation|posting|processing\s*costs?|settlement\s*(?:wallet|account|ledger|posting|entry|batch|fee|cost)|rounding\s*(?:adjustment|delta)|float\s*(?:wallet|account|funding|balance)|provider\s*(?:fee|cost|float))\b"#
+        guard accountingScanMessage.range(
+            of: internalAccountingDetail,
+            options: [.regularExpression, .caseInsensitive]
+        ) == nil else {
+            return protectedAccountingMessage
         }
 
         // Whole-unit settlement is an internal rail constraint. Inputs are normalized before a

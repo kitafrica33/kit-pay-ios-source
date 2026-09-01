@@ -453,7 +453,8 @@ enum OutboxPolicy {
 
         if let exchangeError = error as? SecureMessagingExchangeError {
             switch exchangeError {
-            case .retryLimitExceeded, .groupCapabilityUnavailable:
+            case .retryLimitExceeded, .groupCapabilityUnavailable,
+                    .richMediaCapabilityUnavailable, .mediaMessageCapabilityUnavailable:
                 return .retry(after: nil)
             case .reactionCapabilityUnavailable, .editCapabilityUnavailable:
                 return .permanent
@@ -462,8 +463,6 @@ enum OutboxPolicy {
             case .invalidRecipient, .invalidConversation, .messageNotRetryable,
                     .invalidServerResponse,
                     .unsupportedEvent, .staleOutboundFanout:
-                return .permanent
-            case .mediaMessageCapabilityUnavailable:
                 return .permanent
             // Both leave the message and command in place with only the fanout cleared; the
             // next pass re-prepares the same client message id.
@@ -484,6 +483,15 @@ enum OutboxPolicy {
                     .replayedKyberBaseKey:
                 return .permanent
             }
+        }
+
+        if let mediaError = error as? SecureMediaAttachmentError {
+            // Recipient/device capability can change independently of this immutable local
+            // message. Keep the original and command pending; malformed local bytes and
+            // authenticated-integrity failures still require explicit user intervention.
+            return mediaError == .incompatibleRecipient
+                ? .retry(after: nil)
+                : .permanent
         }
 
         return .permanent

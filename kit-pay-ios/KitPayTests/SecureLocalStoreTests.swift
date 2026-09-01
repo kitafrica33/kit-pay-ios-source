@@ -857,6 +857,426 @@ final class SecureLocalStoreTests: XCTestCase {
         ))
     }
 
+    func testDraftMediaManifestSurvivesTextWritesAndClearsAtomicallyWithExactSend() throws {
+        let conversationID = "11111111-1111-4111-8111-111111111111"
+        let writerID = UUID(uuidString: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")!
+        let mediaID = UUID(uuidString: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")!
+        var state = communicationState()
+        state.conversations = [Conversation(
+            id: conversationID,
+            title: "ExampleContact",
+            participantUserIds: ["current-user", "recipient-user"],
+            unreadCount: 0,
+            updatedAt: Date(timeIntervalSince1970: 1_800_000_000)
+        )]
+        let attachment = ConversationDraftMediaAttachment(
+            id: mediaID,
+            storageKind: .protectedFile,
+            mediaType: "application/pdf",
+            originalMediaType: nil,
+            byteCount: 4_096,
+            displayName: "Receipt.pdf",
+            duration: nil,
+            acceptedAt: Date(timeIntervalSince1970: 1_800_000_001),
+            clientMessageID: nil,
+            preprocessingOutputStorageKey: nil
+        )
+        let first = ConversationDraftWriteVersion(writerID: writerID, sequence: 1)
+        let textUpdate = ConversationDraftWriteVersion(writerID: writerID, sequence: 2)
+        let send = ConversationDraftWriteVersion(writerID: writerID, sequence: 3)
+
+        XCTAssertTrue(ConversationDraftPolicy.store(
+            "",
+            conversationID: conversationID,
+            ownerUserID: "current-user",
+            writeVersion: first,
+            mediaAttachments: [attachment],
+            in: &state
+        ))
+        XCTAssertEqual(
+            ConversationDraftPolicy.mediaAttachments(
+                conversationID: conversationID,
+                ownerUserID: "current-user",
+                in: state
+            ),
+            [attachment]
+        )
+        // A text-only debounce omits the media argument and must preserve the durable manifest.
+        XCTAssertTrue(ConversationDraftPolicy.store(
+            "Caption",
+            conversationID: conversationID,
+            ownerUserID: "current-user",
+            writeVersion: textUpdate,
+            in: &state
+        ))
+        XCTAssertEqual(state.conversationDrafts?[conversationID]?.mediaAttachments, [attachment])
+
+        var mismatched = attachment
+        let encoded = try JSONEncoder().encode(mismatched)
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        object["displayName"] = "Different.pdf"
+        mismatched = try JSONDecoder().decode(
+            ConversationDraftMediaAttachment.self,
+            from: JSONSerialization.data(withJSONObject: object)
+        )
+        XCTAssertFalse(ConversationDraftPolicy.clearAfterSuccessfulQueue(
+            submittedBody: "Caption",
+            conversationID: conversationID,
+            ownerUserID: "current-user",
+            writeVersion: send,
+            submittedMediaAttachments: [mismatched],
+            in: &state
+        ))
+        XCTAssertEqual(state.conversationDrafts?[conversationID]?.mediaAttachments, [attachment])
+        XCTAssertTrue(ConversationDraftPolicy.clearAfterSuccessfulQueue(
+            submittedBody: "Caption",
+            conversationID: conversationID,
+            ownerUserID: "current-user",
+            writeVersion: send,
+            submittedMediaAttachments: [attachment],
+            in: &state
+        ))
+        XCTAssertNil(state.conversationDrafts?[conversationID]?.mediaAttachments)
+        XCTAssertFalse(ConversationDraftPolicy.store(
+            "Caption",
+            conversationID: conversationID,
+            ownerUserID: "current-user",
+            writeVersion: textUpdate,
+            mediaAttachments: [attachment],
+            in: &state
+        ))
+    }
+
+    func testDraftMediaManifestRejectsOutputCollisionWithAnotherSource() {
+        let conversationID = "11111111-1111-4111-8111-111111111111"
+        let firstID = UUID(uuidString: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")!
+        let secondID = UUID(uuidString: "cccccccc-cccc-4ccc-8ccc-cccccccccccc")!
+        var state = communicationState()
+        state.conversations = [Conversation(
+            id: conversationID,
+            title: "ExampleContact",
+            participantUserIds: ["current-user", "recipient-user"],
+            unreadCount: 0,
+            updatedAt: Date(timeIntervalSince1970: 1_800_000_000)
+        )]
+        let draftsBefore = state.conversationDrafts
+        func image(_ id: UUID, output: String) -> ConversationDraftMediaAttachment {
+            ConversationDraftMediaAttachment(
+                id: id,
+                storageKind: .protectedFile,
+                mediaType: "image/jpeg",
+                originalMediaType: "image/heic",
+                byteCount: 1_024,
+                displayName: "Photo",
+                duration: nil,
+                acceptedAt: Date(timeIntervalSince1970: 1_800_000_001),
+                clientMessageID: nil,
+                preprocessingOutputStorageKey: output
+            )
+        }
+        XCTAssertFalse(ConversationDraftPolicy.store(
+            "",
+            conversationID: conversationID,
+            ownerUserID: "current-user",
+            mediaAttachments: [
+                image(firstID, output: secondID.uuidString.lowercased()),
+                image(secondID, output: UUID().uuidString.lowercased()),
+            ],
+            in: &state
+        ))
+        XCTAssertEqual(state.conversationDrafts, draftsBefore)
+    }
+
+    func testMediaOnlyDraftOutlivesTrueTombstoneAtDraftCapacity() {
+        let conversationIDs = (0 ... ConversationDraftPolicy.maximumDraftCount).map { _ in
+            UUID().uuidString.lowercased()
+        }
+        let mediaConversationID = conversationIDs[0]
+        let tombstoneConversationID = conversationIDs[1]
+        let newConversationID = conversationIDs.last!
+        let mediaID = UUID(uuidString: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")!
+        let attachment = ConversationDraftMediaAttachment(
+            id: mediaID,
+            storageKind: .protectedFile,
+            mediaType: "application/pdf",
+            originalMediaType: nil,
+            byteCount: 4_096,
+            displayName: "Receipt.pdf",
+            duration: nil,
+            acceptedAt: Date(timeIntervalSince1970: 1_800_000_000),
+            clientMessageID: nil,
+            preprocessingOutputStorageKey: nil
+        )
+        var state = communicationState()
+        state.conversations = conversationIDs.map { id in
+            Conversation(
+                id: id,
+                title: "Draft",
+                participantUserIds: ["current-user", "recipient-user"],
+                unreadCount: 0,
+                updatedAt: Date(timeIntervalSince1970: 1_800_000_000)
+            )
+        }
+        var drafts: [String: ConversationDraft] = [
+            mediaConversationID: ConversationDraft(
+                body: "",
+                updatedAt: Date(timeIntervalSince1970: 1),
+                mediaAttachments: [attachment]
+            ),
+            tombstoneConversationID: ConversationDraft(
+                body: "",
+                updatedAt: Date(timeIntervalSince1970: 2),
+                writeVersion: ConversationDraftWriteVersion(writerID: UUID(), sequence: 1)
+            ),
+        ]
+        for index in 2 ..< ConversationDraftPolicy.maximumDraftCount {
+            drafts[conversationIDs[index]] = ConversationDraft(
+                body: "Draft \(index)",
+                updatedAt: Date(timeIntervalSince1970: TimeInterval(index + 2))
+            )
+        }
+        state.conversationDrafts = drafts
+
+        XCTAssertTrue(ConversationDraftPolicy.store(
+            "Newest draft",
+            conversationID: newConversationID,
+            ownerUserID: "current-user",
+            in: &state
+        ))
+
+        XCTAssertEqual(state.conversationDrafts?.count, ConversationDraftPolicy.maximumDraftCount)
+        XCTAssertNotNil(state.conversationDrafts?[mediaConversationID])
+        XCTAssertEqual(
+            state.conversationDrafts?[mediaConversationID]?.mediaAttachments,
+            [attachment]
+        )
+        XCTAssertNil(state.conversationDrafts?[tombstoneConversationID])
+    }
+
+    func testDraftStorageOwnershipIncludesPreprocessingOutputsAndExemptsOnlyExactSend() {
+        let firstConversationID = "11111111-1111-4111-8111-111111111111"
+        let secondConversationID = "22222222-2222-4222-8222-222222222222"
+        let writerID = UUID(uuidString: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")!
+        let firstSource = UUID(uuidString: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")!
+        let firstOutput = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        let secondSource = UUID(uuidString: "dddddddd-dddd-4ddd-8ddd-dddddddddddd")!
+        func image(
+            _ id: UUID,
+            output: String,
+            clientMessageID: UUID? = nil
+        ) -> ConversationDraftMediaAttachment {
+            ConversationDraftMediaAttachment(
+                id: id,
+                storageKind: .protectedFile,
+                mediaType: "image/jpeg",
+                originalMediaType: "image/heic",
+                byteCount: 1_024,
+                displayName: "Photo",
+                duration: nil,
+                acceptedAt: Date(timeIntervalSince1970: 1_800_000_001),
+                clientMessageID: clientMessageID,
+                preprocessingOutputStorageKey: output
+            )
+        }
+        let submitted = image(firstSource, output: firstOutput)
+        let unrelated = image(
+            secondSource,
+            output: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+        )
+        let currentVersion = ConversationDraftWriteVersion(writerID: writerID, sequence: 7)
+        let clearVersion = ConversationDraftWriteVersion(writerID: writerID, sequence: 8)
+        var state = communicationState()
+        state.conversationDrafts = [
+            firstConversationID: ConversationDraft(
+                body: "Caption",
+                updatedAt: Date(),
+                writeVersion: currentVersion,
+                mediaAttachments: [submitted]
+            ),
+            secondConversationID: ConversationDraft(
+                body: "Other",
+                updatedAt: Date(),
+                writeVersion: currentVersion,
+                mediaAttachments: [unrelated]
+            ),
+        ]
+
+        XCTAssertEqual(Set(state.conversationDrafts![firstConversationID]!.localMediaStorageKeys), [
+            firstSource.uuidString.lowercased(), firstOutput,
+        ])
+        XCTAssertEqual(
+            ConversationDraftPolicy.localMediaStorageKeysOwnedByDrafts(in: state),
+            [
+                firstSource.uuidString.lowercased(), firstOutput,
+                secondSource.uuidString.lowercased(),
+                "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+            ]
+        )
+        XCTAssertEqual(
+            ConversationDraftPolicy.localMediaStorageKeysOwnedByDrafts(
+                in: state,
+                excludingSubmittedDraftFor: firstConversationID,
+                submittedBody: "Caption",
+                submittedMediaAttachments: [submitted],
+                draftClearVersion: clearVersion,
+                consumingStorageKeys: [firstSource.uuidString.lowercased(), firstOutput]
+            ),
+            [
+                secondSource.uuidString.lowercased(),
+                "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+            ]
+        )
+        XCTAssertTrue(ConversationDraftPolicy.localMediaStorageKeysOwnedByDrafts(
+            in: state,
+            excludingSubmittedDraftFor: firstConversationID,
+            submittedBody: "Changed caption",
+            submittedMediaAttachments: [submitted],
+            draftClearVersion: clearVersion,
+            consumingStorageKeys: [firstSource.uuidString.lowercased(), firstOutput]
+        ).contains(firstOutput))
+        XCTAssertTrue(ConversationDraftPolicy.localMediaStorageKeysOwnedByDrafts(
+            in: state,
+            excludingSubmittedDraftFor: firstConversationID,
+            submittedBody: "Caption",
+            submittedMediaAttachments: [submitted],
+            draftClearVersion: currentVersion,
+            consumingStorageKeys: [firstSource.uuidString.lowercased(), firstOutput]
+        ).contains(firstOutput))
+        XCTAssertTrue(ConversationDraftPolicy.localMediaStorageKeysOwnedByDrafts(
+            in: state,
+            excludingSubmittedDraftFor: firstConversationID,
+            submittedBody: "Caption",
+            submittedMediaAttachments: [submitted],
+            draftClearVersion: ConversationDraftWriteVersion(
+                writerID: UUID(),
+                sequence: 1
+            ),
+            consumingStorageKeys: [firstSource.uuidString.lowercased(), firstOutput]
+        ).contains(firstOutput), "a different writer cannot claim the draft exemption")
+        XCTAssertTrue(ConversationDraftPolicy.localMediaStorageKeysOwnedByDrafts(
+            in: state,
+            excludingSubmittedDraftFor: firstConversationID,
+            submittedBody: "Caption",
+            submittedMediaAttachments: [submitted],
+            draftClearVersion: clearVersion,
+            consumingStorageKeys: [firstSource.uuidString.lowercased()]
+        ).contains(firstOutput), "a partial queue cannot consume a larger media draft")
+    }
+
+    func testDraftStoreRejectsKeysAlreadyOwnedByAnotherDraft() {
+        let firstConversationID = "11111111-1111-4111-8111-111111111111"
+        let secondConversationID = "22222222-2222-4222-8222-222222222222"
+        let sharedOutput = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        func image(_ source: UUID) -> ConversationDraftMediaAttachment {
+            ConversationDraftMediaAttachment(
+                id: source,
+                storageKind: .protectedFile,
+                mediaType: "image/jpeg",
+                originalMediaType: "image/heic",
+                byteCount: 1_024,
+                displayName: "Photo",
+                duration: nil,
+                acceptedAt: Date(timeIntervalSince1970: 1_800_000_001),
+                clientMessageID: nil,
+                preprocessingOutputStorageKey: sharedOutput
+            )
+        }
+        var state = communicationState()
+        state.conversations = [firstConversationID, secondConversationID].map { id in
+            Conversation(
+                id: id,
+                title: "Draft",
+                participantUserIds: ["current-user", "recipient-user"],
+                unreadCount: 0,
+                updatedAt: Date(timeIntervalSince1970: 1_800_000_000)
+            )
+        }
+        XCTAssertTrue(ConversationDraftPolicy.store(
+            "",
+            conversationID: firstConversationID,
+            ownerUserID: "current-user",
+            mediaAttachments: [image(UUID())],
+            in: &state
+        ))
+        XCTAssertFalse(ConversationDraftPolicy.store(
+            "",
+            conversationID: secondConversationID,
+            ownerUserID: "current-user",
+            mediaAttachments: [image(UUID())],
+            in: &state
+        ))
+        XCTAssertNil(state.conversationDrafts?[secondConversationID])
+    }
+
+    func testDraftStoreRejectsPreprocessingOutputOwnedByAnotherRecordsSpoolID() throws {
+        let conversationID = "11111111-1111-4111-8111-111111111111"
+        let existingConversationID = "22222222-2222-4222-8222-222222222222"
+        let spoolID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        let existingSource = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+        let existingMessageID = UUID()
+        let existingRecord = try XCTUnwrap(LocalMediaRecordPolicy.queuedOutgoing(
+            id: spoolID,
+            messageID: existingMessageID,
+            conversationID: existingConversationID,
+            mediaType: "application/pdf",
+            fileSize: 1_024,
+            localStorageKey: existingSource,
+            storesInline: false,
+            now: Date(),
+            localStorageKind: .protectedFile
+        ))
+        var state = communicationState()
+        state.conversations = [conversationID, existingConversationID].map { id in
+            Conversation(
+                id: id,
+                title: "Draft",
+                participantUserIds: ["current-user", "recipient-user"],
+                unreadCount: 0,
+                updatedAt: Date()
+            )
+        }
+        state.messages = [LocalMessage(
+            id: existingMessageID,
+            conversationId: existingConversationID,
+            senderId: "current-user",
+            body: "Document",
+            createdAt: Date(),
+            sentAt: nil,
+            state: .queued,
+            failureReason: nil,
+            isOutgoing: true,
+            pendingAttachment: LocalPendingAttachment(
+                mediaType: "application/pdf",
+                caption: nil,
+                localStorageKey: existingSource,
+                byteCount: 1_024
+            ),
+            localMediaRecords: [existingRecord]
+        )]
+        let draftAttachment = ConversationDraftMediaAttachment(
+            id: UUID(),
+            storageKind: .protectedFile,
+            mediaType: "image/jpeg",
+            originalMediaType: "image/heic",
+            byteCount: 1_024,
+            displayName: "Photo",
+            duration: nil,
+            acceptedAt: Date(),
+            clientMessageID: nil,
+            preprocessingOutputStorageKey: spoolID
+        )
+        let draftsBefore = state.conversationDrafts
+
+        XCTAssertFalse(ConversationDraftPolicy.store(
+            "",
+            conversationID: conversationID,
+            ownerUserID: "current-user",
+            mediaAttachments: [draftAttachment],
+            in: &state
+        ))
+        XCTAssertEqual(state.conversationDrafts, draftsBefore)
+    }
+
     func testStateWrittenBeforePendingAvatarPersistenceDecodesWithNoAttachment() throws {
         var original = communicationState()
         original.pendingProfileAvatarAttachment = pendingAvatarAttachment()

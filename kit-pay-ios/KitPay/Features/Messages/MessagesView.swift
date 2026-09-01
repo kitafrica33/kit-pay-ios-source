@@ -1426,6 +1426,7 @@ private struct ChatPaymentApproval: Identifiable {
 private struct ConversationDraftPersistenceTaskKey: Hashable {
     let conversationID: String
     let body: String
+    let mediaAttachments: [ConversationDraftMediaAttachment]
     let writeVersion: ConversationDraftWriteVersion?
     let didRestore: Bool
     let isSending: Bool
@@ -1480,6 +1481,7 @@ struct ConversationView: View {
     @State private var scheduleRequest: ChatScheduleRequest?
     @State private var retryingMessageIDs: Set<UUID> = []
     @State private var didRestoreDraft = false
+    @State private var draftRestoreStarted = false
     @State private var draftWriteVersion: ConversationDraftWriteVersion?
     @State private var immediateDraftPersistenceTask: Task<Void, Never>?
     @State private var showPaymentRequest = false
@@ -1774,6 +1776,7 @@ struct ConversationView: View {
     private var canSendMessage: Bool {
         let hasAttachment = !stagedAttachments.isEmpty
         return !isReadOnlyAppReviewPreview
+            && didRestoreDraft
             && model.secureMessagingLocalQueueAvailable
             && conversationMessagingAvailable
             && recipientMessageQueueAllowed
@@ -3006,12 +3009,17 @@ struct ConversationView: View {
             KitMediaEditorView(input: session.input) { output in
                 editorSession = nil
                 if let replacingID = session.replacingAttachmentID {
-                    handleStagedVideoEditOutput(
-                        output,
-                        replacing: replacingID,
-                        original: session.input,
-                        ownsInputFile: session.ownsInputFile
-                    )
+                    switch session.input {
+                    case .photo:
+                        handleStagedPhotoEditOutput(output, replacing: replacingID)
+                    case .video:
+                        handleStagedVideoEditOutput(
+                            output,
+                            replacing: replacingID,
+                            original: session.input,
+                            ownsInputFile: session.ownsInputFile
+                        )
+                    }
                 } else {
                     handleEditorOutput(
                         output,
@@ -3729,6 +3737,7 @@ struct ConversationView: View {
         let draftPersistenceTaskKey = ConversationDraftPersistenceTaskKey(
             conversationID: conversation.id,
             body: draft,
+            mediaAttachments: stagedAttachments.compactMap(\.draftMediaAttachment),
             writeVersion: draftWriteVersion,
             didRestore: didRestoreDraft,
             isSending: isSending
@@ -3819,7 +3828,8 @@ struct ConversationView: View {
             _ = await model.persistConversationDraft(
                 draftPersistenceTaskKey.body,
                 conversationId: draftPersistenceTaskKey.conversationID,
-                writeVersion: writeVersion
+                writeVersion: writeVersion,
+                mediaAttachments: draftPersistenceTaskKey.mediaAttachments
             )
         }
     }
@@ -3827,10 +3837,48 @@ struct ConversationView: View {
     private var conversationLifecycle: some View {
         conversationTasks
         .onAppear {
-            if !isReadOnlyAppReviewPreview, !didRestoreDraft {
-                draftWriteVersion = model.nextConversationDraftWriteVersion()
+            if !isReadOnlyAppReviewPreview, !didRestoreDraft, !draftRestoreStarted {
+                draftRestoreStarted = true
                 draft = model.conversationDraft(for: conversation.id)
-                didRestoreDraft = true
+                Task { @MainActor in
+                    let restored = await model.restoredConversationDraftMedia(
+                        for: conversation.id
+                    )
+                    guard !didRestoreDraft else { return }
+                    let existingIDs = Set(stagedAttachments.map(\.id))
+                    let newAttachments = restored
+                        .filter { !existingIDs.contains($0.manifest.id) }
+                        .map {
+                            ChatStagedAttachment(
+                                restored: $0.manifest,
+                                data: $0.data,
+                                localFileURL: $0.localFileURL
+                            )
+                        }
+                    // A restored attachment was already visible/playable in an earlier process.
+                    // Do not reopen its capture-latency sample with a historical acceptedAt;
+                    // that would measure downtime as UI latency and poison performance telemetry.
+                    stagedAttachments.insert(contentsOf: newAttachments, at: 0)
+                    for attachment in newAttachments {
+                        if attachment.kind == .image, let fileURL = attachment.localFileURL {
+                            scheduleStagedImagePreview(
+                                mediaID: attachment.id,
+                                fileURL: fileURL
+                            )
+                        }
+                        if let fileURL = attachment.localFileURL {
+                            scheduleStagedMediaDuration(
+                                mediaID: attachment.id,
+                                fileURL: fileURL,
+                                mediaType: attachment.mediaType
+                            )
+                        }
+                    }
+                    draftWriteVersion = model.nextConversationDraftWriteVersion()
+                    didRestoreDraft = true
+                    // Rewrites a bounded manifest if any stale/missing media entry was omitted.
+                    persistDraftImmediately()
+                }
             }
             incomingSoundPolicy.beginVisibility(with: messages)
             if !isReadOnlyAppReviewPreview {
@@ -4273,6 +4321,7 @@ struct ConversationView: View {
                     ? "Attachments"
                     : "Attachments and payments"
             )
+            .disabled(!didRestoreDraft || isSending)
 
             HStack(alignment: .bottom, spacing: 4) {
                 TextField(
@@ -4285,7 +4334,8 @@ struct ConversationView: View {
                 .lineLimit(1...5)
                 .focused($isComposerFocused)
                 .disabled(
-                    !model.secureMessagingLocalQueueAvailable
+                    !didRestoreDraft
+                        || !model.secureMessagingLocalQueueAvailable
                         || !conversationMessagingAvailable
                         || isSending
                 )
@@ -4305,11 +4355,13 @@ struct ConversationView: View {
                     .buttonStyle(.plain)
                     .foregroundStyle(KitColor.green)
                     .disabled(
-                        !model.secureMessagingLocalQueueAvailable
+                        !didRestoreDraft
+                            || !model.secureMessagingLocalQueueAvailable
                             || !conversationMessagingAvailable
                     )
                     .opacity(
-                        model.secureMessagingLocalQueueAvailable
+                        didRestoreDraft
+                            && model.secureMessagingLocalQueueAvailable
                             && conversationMessagingAvailable ? 1 : 0.5
                     )
                     .accessibilityLabel("Record a voice note")
@@ -4644,7 +4696,9 @@ struct ConversationView: View {
         let removed = stagedAttachments.first(where: { $0.id == id })
         stagedAttachments.removeAll { $0.id == id }
         if removed != nil {
-            Task { await model.discardStagedMediaOriginal(mediaID: id) }
+            // Commit the manifest removal before deleting bytes. A crash at either side leaves
+            // at worst a bounded cleanup orphan, never a manifest pointing at no media.
+            persistDraftImmediately(removingMediaIDsAfterSuccess: [id])
         }
         if stagedAttachments.isEmpty {
             attachmentLoadGeneration &+= 1
@@ -4752,6 +4806,11 @@ struct ConversationView: View {
     private func detachAppliedShareFromComposer(_ delivery: SharedInboxDelivery) -> Bool {
         attachmentLoadGeneration &+= 1
         let sharedItemIDs = Set(delivery.batch.items.map(\.id))
+        let removedMediaIDs = stagedAttachments.compactMap { attachment in
+            attachment.clientMessageID.map(sharedItemIDs.contains) == true
+                ? attachment.id
+                : nil
+        }
         stagedAttachments.removeAll { attachment in
             attachment.clientMessageID.map(sharedItemIDs.contains) == true
         }
@@ -4775,6 +4834,7 @@ struct ConversationView: View {
         }
         appliedSharedDeliveryID = nil
         appliedSharedOriginalDraft = nil
+        persistDraftImmediately(removingMediaIDsAfterSuccess: removedMediaIDs)
         return removedSharedText
     }
 
@@ -6661,7 +6721,7 @@ struct ConversationView: View {
 
     /// Opens the Send Later picker for whatever is in the composer right now.
     private func openScheduleSheetForDraft() {
-        guard !isReadOnlyAppReviewPreview, canSendMessage else { return }
+        guard didRestoreDraft, !isReadOnlyAppReviewPreview, canSendMessage else { return }
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         let preview: String
         if !stagedAttachments.isEmpty, text.isEmpty {
@@ -6692,7 +6752,7 @@ struct ConversationView: View {
     }
 
     private func sendDraft(deliverAt: Date? = nil) {
-        guard !isReadOnlyAppReviewPreview else { return }
+        guard didRestoreDraft, !isReadOnlyAppReviewPreview else { return }
         guard canSendMessage else { return }
         let submittedDraft = draft
         let submittedText = submittedDraft.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -6710,6 +6770,13 @@ struct ConversationView: View {
             return
         }
         let submittedAttachments = stagedAttachments
+        let submittedDraftMediaAttachments = submittedAttachments.compactMap(
+            \.draftMediaAttachment
+        )
+        guard submittedDraftMediaAttachments.count == submittedAttachments.count else {
+            model.lastError = "Wait for the protected local copies to finish saving, then try again."
+            return
+        }
         // The answer is fixed at the moment Send is pressed. Anything the user swipes to
         // afterwards belongs to the next message, not to this one.
         let answering = replyTarget.flatMap { canReply(to: $0) ? $0 : nil }?
@@ -6737,11 +6804,17 @@ struct ConversationView: View {
             // Draft persistence is best-effort bookkeeping. The message pipeline has its own
             // durability, so a failed draft write (for example a brand-new conversation that
             // has not been persisted yet) must never block the send itself.
-            _ = await model.persistConversationDraft(
+            let draftPersisted = await model.persistConversationDraft(
                 submittedDraft,
                 conversationId: conversation.id,
-                writeVersion: persistenceVersion
+                writeVersion: persistenceVersion,
+                mediaAttachments: submittedDraftMediaAttachments
             )
+            guard submittedAttachments.isEmpty || draftPersisted else {
+                model.lastError = CustomerFacingMessagingCopy.draftSaveFailure
+                isSending = false
+                return
+            }
             let clearVersion = model.nextConversationDraftWriteVersion()
             let allQueued: Bool
             if submittedAttachments.isEmpty {
@@ -6752,6 +6825,7 @@ struct ConversationView: View {
                     body: submittedDraft,
                     clientMessageID: sharedBatchClientMessageID,
                     draftClearVersion: clearVersion,
+                    submittedDraftMediaAttachments: submittedDraftMediaAttachments,
                     deliverAt: deliverAt,
                     replyToServerMessageID: answering
                 )
@@ -6761,6 +6835,7 @@ struct ConversationView: View {
                     text: submittedText,
                     submittedDraft: submittedDraft,
                     clearVersion: clearVersion,
+                    submittedDraftMediaAttachments: submittedDraftMediaAttachments,
                     sharedBatchClientMessageID: sharedBatchClientMessageID,
                     deliverAt: deliverAt,
                     replyToServerMessageID: answering
@@ -6799,6 +6874,7 @@ struct ConversationView: View {
         text: String,
         submittedDraft: String,
         clearVersion: ConversationDraftWriteVersion,
+        submittedDraftMediaAttachments: [ConversationDraftMediaAttachment],
         sharedBatchClientMessageID: UUID?,
         deliverAt: Date? = nil,
         replyToServerMessageID: String? = nil
@@ -6858,6 +6934,7 @@ struct ConversationView: View {
                 // the attachment's own (usually minted-at-queue) identity.
                 clientMessageID: sharedBatchClientMessageID ?? attachment.clientMessageID,
                 submittedDraftBody: submittedDraft,
+                submittedDraftMediaAttachments: submittedDraftMediaAttachments,
                 draftClearVersion: clearVersion,
                 deliverAt: deliverAt,
                 replyToServerMessageID: replyToServerMessageID
@@ -6882,6 +6959,7 @@ struct ConversationView: View {
                 rawCaption: submittedDraft,
                 clientMessageID: sharedBatchClientMessageID,
                 submittedDraftBody: submittedDraft,
+                submittedDraftMediaAttachments: submittedDraftMediaAttachments,
                 draftClearVersion: clearVersion,
                 deliverAt: deliverAt,
                 replyToServerMessageID: replyToServerMessageID
@@ -6917,23 +6995,29 @@ struct ConversationView: View {
         )
     }
 
-    private func persistDraftImmediately() {
+    private func persistDraftImmediately(removingMediaIDsAfterSuccess mediaIDs: [UUID] = []) {
         guard didRestoreDraft, !isSending else { return }
         let currentDraft = draft
+        let mediaAttachments = stagedAttachments.compactMap(\.draftMediaAttachment)
         let writeVersion = model.nextConversationDraftWriteVersion()
         draftWriteVersion = writeVersion
         immediateDraftPersistenceTask?.cancel()
         immediateDraftPersistenceTask = Task {
-            _ = await model.persistConversationDraft(
+            let persisted = await model.persistConversationDraft(
                 currentDraft,
                 conversationId: conversation.id,
-                writeVersion: writeVersion
+                writeVersion: writeVersion,
+                mediaAttachments: mediaAttachments
             )
+            guard persisted else { return }
+            for mediaID in mediaIDs {
+                await model.discardStagedMediaOriginal(mediaID: mediaID)
+            }
         }
     }
 
     private func sendVoiceNote() {
-        guard !isReadOnlyAppReviewPreview else { return }
+        guard didRestoreDraft, !isReadOnlyAppReviewPreview else { return }
         let answering = replyTarget.flatMap { canReply(to: $0) ? $0 : nil }?
             .serverMessageId?
             .lowercased()
@@ -7031,11 +7115,24 @@ struct ConversationView: View {
             model.lastError = "That voice note could not be queued. Its protected draft will be retained for recovery."
             return
         }
+        let retryMediaID = UUID()
+        LocalMediaPerformanceMonitor.shared.begin(mediaID: retryMediaID)
+        guard let permanentURL = await model.persistStagedMediaOriginal(
+            mediaID: retryMediaID,
+            sourceURL: retryURL,
+            mediaType: VoiceNoteRecorder.Recording.mediaType,
+            byteCount: byteCount,
+            moveSource: true
+        ) else {
+            model.lastError = "That voice note could not be saved securely for retry."
+            return
+        }
         recording.removeFiles()
         for id in importedIDs { await model.discardStagedMediaOriginal(mediaID: id) }
         stageAttachment(ChatStagedAttachment(
+            id: retryMediaID,
             kind: .voice,
-            localFileURL: retryURL,
+            localFileURL: permanentURL,
             byteCount: byteCount,
             mediaType: VoiceNoteRecorder.Recording.mediaType,
             displayName: "Voice note",
@@ -7200,15 +7297,15 @@ struct ConversationView: View {
         guard let output else { return }
         let acceptedAt = Date()
         switch output {
-        case .photo(let image):
-            // Give the camera cover a beat to dismiss before presenting the editor cover.
-            Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 350_000_000)
-                editorSession = MediaEditorSession(
-                    input: .photo(image),
-                    acceptedAt: acceptedAt
-                )
-            }
+        case let .photo(fileURL, mediaType, preview):
+            stageCapturedPhoto(
+                fileURL,
+                mediaType: mediaType,
+                preview: preview,
+                mediaID: UUID(),
+                acceptedAt: acceptedAt,
+                opensEditorAfterStaging: true
+            )
         case .video(let url, let mediaType):
             // Adopt and publish the original before opening the optional trim editor. Playback,
             // dismissal and process suspension therefore never depend on export completion.
@@ -7267,15 +7364,18 @@ struct ConversationView: View {
             at: attachment.acceptedAt
         )
         stagedAttachments.append(attachment)
+        persistDraftImmediately()
         guard let data = attachment.data else { return }
         Task {
             let saved = await model.persistStagedMediaOriginal(
                 mediaID: attachment.id,
                 data: data
             )
-            guard !saved,
-                  stagedAttachments.contains(where: { $0.id == attachment.id })
-            else { return }
+            if saved {
+                persistDraftImmediately()
+                return
+            }
+            guard stagedAttachments.contains(where: { $0.id == attachment.id }) else { return }
             model.lastError = "This attachment is visible here, but its protected local copy could not be saved. Please retry before sending."
         }
     }
@@ -7321,6 +7421,10 @@ struct ConversationView: View {
                     }
                     let mediaID = UUID()
                     let mediaType = libraryVideoMediaType(for: item)
+                    LocalMediaPerformanceMonitor.shared.begin(
+                        mediaID: mediaID,
+                        at: acceptedAt
+                    )
                     guard let permanentURL = await model.persistStagedMediaOriginal(
                         mediaID: mediaID,
                         sourceURL: picked.url,
@@ -7363,6 +7467,10 @@ struct ConversationView: View {
                     else { throw AttachmentSelectionError.fileTooLarge }
                     let mediaID = UUID()
                     let sourceMediaType = libraryImageMediaType(for: item, url: picked.url)
+                    LocalMediaPerformanceMonitor.shared.begin(
+                        mediaID: mediaID,
+                        at: acceptedAt
+                    )
                     guard let permanentURL = await model.persistStagedMediaOriginal(
                         mediaID: mediaID,
                         sourceURL: picked.url,
@@ -7468,8 +7576,116 @@ struct ConversationView: View {
             if let index = stagedAttachments.firstIndex(where: { $0.id == mediaID }) {
                 stagedAttachments[index] = stagedAttachments[index]
                     .replacingDuration(duration)
+                persistDraftImmediately()
             }
             await model.persistLocalMediaDuration(mediaID: mediaID, duration: duration)
+        }
+    }
+
+    /// Publishes the decoded camera preview before any encode/import work, then adopts the exact
+    /// AVCapturePhoto bytes as the durable source. The optional editor reads the already-visible
+    /// preview; process death while it is open restores the protected original from the encrypted
+    /// conversation-draft manifest.
+    private func stageCapturedPhoto(
+        _ sourceURL: URL,
+        mediaType: String,
+        preview: UIImage,
+        mediaID: UUID,
+        acceptedAt: Date,
+        opensEditorAfterStaging: Bool
+    ) {
+        LocalMediaPerformanceMonitor.shared.begin(mediaID: mediaID, at: acceptedAt)
+        stageAttachment(ChatStagedAttachment(
+            preparingImage: mediaID,
+            previewImage: preview,
+            displayName: "Photo",
+            acceptedAt: acceptedAt
+        ))
+        attachmentLoadGeneration &+= 1
+        let generation = attachmentLoadGeneration
+        isLoadingAttachment = true
+        Task { @MainActor in
+            var adopted = false
+            defer {
+                if adopted {
+                    try? FileManager.default.removeItem(
+                        at: sourceURL.deletingLastPathComponent()
+                    )
+                }
+                if generation == attachmentLoadGeneration { isLoadingAttachment = false }
+            }
+            do {
+                guard generation == attachmentLoadGeneration,
+                      let size = try sourceURL.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+                      KitChatMediaLimits.fitsLocalOriginal(
+                          byteCount: size,
+                          mediaType: mediaType
+                      )
+                else { throw AttachmentSelectionError.fileTooLarge }
+                guard let permanentURL = await model.persistStagedMediaOriginal(
+                    mediaID: mediaID,
+                    sourceURL: sourceURL,
+                    mediaType: mediaType,
+                    byteCount: size,
+                    moveSource: true
+                ) else { throw AttachmentSelectionError.invalidImage }
+                adopted = true
+                guard generation == attachmentLoadGeneration,
+                      let index = stagedAttachments.firstIndex(where: { $0.id == mediaID })
+                else {
+                    await model.discardStagedMediaOriginal(mediaID: mediaID)
+                    stagedAttachments.removeAll { $0.id == mediaID }
+                    return
+                }
+                stagedAttachments[index] = ChatStagedAttachment(
+                    id: mediaID,
+                    kind: .image,
+                    localFileURL: permanentURL,
+                    byteCount: size,
+                    mediaType: "image/jpeg",
+                    displayName: "Photo",
+                    previewImage: preview,
+                    acceptedAt: acceptedAt,
+                    originalMediaType: mediaType,
+                    preprocessingOutputStorageKey: UUID().uuidString.lowercased()
+                )
+                persistDraftImmediately()
+                if opensEditorAfterStaging {
+                    try? await Task.sleep(nanoseconds: 350_000_000)
+                    guard generation == attachmentLoadGeneration,
+                          stagedAttachments.contains(where: { $0.id == mediaID })
+                    else { return }
+                    editorSession = MediaEditorSession(
+                        id: mediaID,
+                        input: .photo(preview),
+                        acceptedAt: acceptedAt,
+                        replacingAttachmentID: mediaID,
+                        ownsInputFile: false
+                    )
+                }
+            } catch {
+                // Keep the protected camera scratch playable and retryable for this process.
+                // It is not advertised as relaunch-durable unless adoption succeeds.
+                if let size = try? sourceURL.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+                   let index = stagedAttachments.firstIndex(where: { $0.id == mediaID }) {
+                    stagedAttachments[index] = ChatStagedAttachment(
+                        id: mediaID,
+                        kind: .image,
+                        localFileURL: sourceURL,
+                        byteCount: size,
+                        mediaType: "image/jpeg",
+                        displayName: "Photo",
+                        previewImage: preview,
+                        acceptedAt: acceptedAt,
+                        originalMediaType: mediaType,
+                        preprocessingOutputStorageKey: UUID().uuidString.lowercased()
+                    )
+                } else {
+                    stagedAttachments.removeAll { $0.id == mediaID }
+                }
+                model.lastError = (error as? LocalizedError)?.errorDescription
+                    ?? "The photo could not be saved securely."
+            }
         }
     }
 
@@ -7524,6 +7740,59 @@ struct ConversationView: View {
                 previewImage: prepared.preview,
                 acceptedAt: acceptedAt
             )
+            persistDraftImmediately()
+        }
+    }
+
+    /// An accepted photo edit becomes a new immutable local media identity. The captured source
+    /// remains owned by the prior manifest until the edited bytes and replacement manifest are
+    /// durable, so neither a failed encode nor process termination can lose the sender's photo.
+    private func handleStagedPhotoEditOutput(
+        _ output: KitMediaEditorOutput?,
+        replacing attachmentID: UUID
+    ) {
+        guard case .photo(let image) = output,
+              let index = stagedAttachments.firstIndex(where: { $0.id == attachmentID })
+        else { return }
+        let existing = stagedAttachments[index]
+        Task { @MainActor in
+            let prepared = await Task.detached(priority: .userInitiated) {
+                image.jpegData(compressionQuality: 0.9)
+                    .flatMap(AttachmentImageDecoder.secureJPEG(from:))
+            }.value
+            guard let prepared else {
+                model.lastError = AttachmentSelectionError.invalidImage.localizedDescription
+                return
+            }
+            let editedMediaID = UUID()
+            LocalMediaPerformanceMonitor.shared.begin(
+                mediaID: editedMediaID,
+                at: existing.acceptedAt
+            )
+            guard await model.persistStagedMediaOriginal(
+                mediaID: editedMediaID,
+                data: prepared.data
+            ) else {
+                model.lastError = "The edited photo could not be saved securely."
+                return
+            }
+            guard let liveIndex = stagedAttachments.firstIndex(where: {
+                $0.id == attachmentID
+            }) else {
+                await model.discardStagedMediaOriginal(mediaID: editedMediaID)
+                return
+            }
+            stagedAttachments[liveIndex] = ChatStagedAttachment(
+                id: editedMediaID,
+                kind: .image,
+                data: prepared.data,
+                mediaType: "image/jpeg",
+                displayName: existing.displayName,
+                previewImage: prepared.preview,
+                acceptedAt: existing.acceptedAt,
+                clientMessageID: existing.clientMessageID
+            )
+            persistDraftImmediately(removingMediaIDsAfterSuccess: [attachmentID])
         }
     }
 
@@ -7534,6 +7803,7 @@ struct ConversationView: View {
         acceptedAt: Date,
         opensEditorAfterStaging: Bool = false
     ) {
+        LocalMediaPerformanceMonitor.shared.begin(mediaID: mediaID, at: acceptedAt)
         attachmentLoadGeneration &+= 1
         let generation = attachmentLoadGeneration
         isLoadingAttachment = true
@@ -7630,6 +7900,7 @@ struct ConversationView: View {
             }
             let mediaType = libraryVideoMediaType(for: item)
             let mediaID = UUID()
+            LocalMediaPerformanceMonitor.shared.begin(mediaID: mediaID, at: acceptedAt)
             guard let permanentURL = await model.persistStagedMediaOriginal(
                 mediaID: mediaID,
                 sourceURL: picked.url,
@@ -7778,7 +8049,7 @@ struct ConversationView: View {
                     fileURL: permanentURL,
                     mediaType: mediaType
                 )
-                await model.discardStagedMediaOriginal(mediaID: attachmentID)
+                persistDraftImmediately(removingMediaIDsAfterSuccess: [attachmentID])
             } catch {
                 model.lastError = (error as? LocalizedError)?.errorDescription
                     ?? "The trimmed video could not be read."
@@ -7839,6 +8110,10 @@ struct ConversationView: View {
             }
         }
         for item in batch.items {
+            LocalMediaPerformanceMonitor.shared.begin(
+                mediaID: item.id,
+                at: batch.receivedAt
+            )
             guard generation == attachmentLoadGeneration else {
                 await discardPreparedOriginals()
                 retryUnappliedSharedInboxDelivery(delivery)
@@ -7867,7 +8142,11 @@ struct ConversationView: View {
                 retryUnappliedSharedInboxDelivery(delivery)
                 return
             }
-            guard let attachment = preparedSharedItem(item, fileURL: permanentURL) else {
+            guard let attachment = preparedSharedItem(
+                item,
+                fileURL: permanentURL,
+                acceptedAt: batch.receivedAt
+            ) else {
                 await model.discardStagedMediaOriginal(mediaID: item.id)
                 await discardPreparedOriginals()
                 model.lastError = "The shared items could not all be attached. Nothing was removed."
@@ -7889,13 +8168,8 @@ struct ConversationView: View {
             draft = SharedInboxPolicy.composerDraft(existingDraft: draft, sharedText: text)
         }
         appliedSharedOriginalDraft = draft == originalDraft ? nil : originalDraft
-        for attachment in preparedAttachments {
-            LocalMediaPerformanceMonitor.shared.begin(
-                mediaID: attachment.id,
-                at: attachment.acceptedAt
-            )
-        }
         stagedAttachments.append(contentsOf: preparedAttachments)
+        persistDraftImmediately()
         for attachment in preparedAttachments {
             if let fileURL = attachment.localFileURL {
                 scheduleStagedMediaDuration(
@@ -7919,7 +8193,8 @@ struct ConversationView: View {
     /// appeared in the chat.
     private func preparedSharedItem(
         _ item: SharedInboxItem,
-        fileURL: URL
+        fileURL: URL,
+        acceptedAt: Date
     ) -> ChatStagedAttachment? {
         guard item.byteCount > 0 else { return nil }
         if item.mediaType.hasPrefix("image/"),
@@ -7935,6 +8210,7 @@ struct ConversationView: View {
                 mediaType: "image/jpeg",
                 displayName: item.displayName,
                 previewImage: nil,
+                acceptedAt: acceptedAt,
                 clientMessageID: item.id,
                 originalMediaType: item.mediaType,
                 preprocessingOutputStorageKey: UUID().uuidString.lowercased()
@@ -7955,6 +8231,7 @@ struct ConversationView: View {
             mediaType: mediaType,
             displayName: item.displayName,
             previewImage: nil,
+            acceptedAt: acceptedAt,
             clientMessageID: item.id
         )
     }
@@ -8044,6 +8321,7 @@ struct ConversationView: View {
                     acceptedAt: acceptedAt
                 )
                 stagedAttachments[index] = durable
+                persistDraftImmediately()
                 scheduleStagedMediaDuration(
                     mediaID: mediaID,
                     fileURL: permanentURL,

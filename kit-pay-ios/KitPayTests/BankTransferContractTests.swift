@@ -424,7 +424,6 @@ final class BankTransferContractTests: XCTestCase {
         XCTAssertEqual(quote.recipientAmount, "5000.00")
         XCTAssertEqual(quote.processingFee, "6000.00")
         XCTAssertEqual(quote.customerDebit, "11000.00")
-        XCTAssertEqual(quote.kitDebit, "0.00")
         XCTAssertTrue(quote.hasConsistentAmounts)
         XCTAssertTrue(quote.hasValidStepUpBinding)
     }
@@ -469,24 +468,23 @@ final class BankTransferContractTests: XCTestCase {
         XCTAssertFalse(quote.hasValidStepUpBinding)
     }
 
-    func testBankTariffBindsProviderAndKitFeeSplitWithoutDoublingProviderExposure() throws {
+    func testBankQuoteUsesCustomerTotalsAndIgnoresLegacyInstitutionalAliases() throws {
         let quote = explicitSplitQuote(feeMode: .senderAbsorbs)
 
         XCTAssertEqual(quote.processingFee, "6000.00")
-        XCTAssertEqual(quote.providerFee, "3000.00")
-        XCTAssertEqual(quote.kitFee, "3000.00")
-        XCTAssertEqual(quote.providerFeeCap, "3000.00")
-        XCTAssertEqual(quote.maximumProviderTotal, "8000.00")
         XCTAssertEqual(quote.customerDebit, "11000.00")
         XCTAssertEqual(quote.stepUp.intent.count, 18)
         XCTAssertTrue(quote.hasConsistentAmounts)
         XCTAssertTrue(quote.hasValidStepUpBinding)
 
         let decoded: BankTransferQuoteDTO = try decode(explicitSplitQuoteJSON())
-        XCTAssertEqual(decoded.providerFee, "3000.00")
-        XCTAssertEqual(decoded.kitFee, "3000.00")
         XCTAssertTrue(decoded.hasConsistentAmounts)
         XCTAssertTrue(decoded.hasValidStepUpBinding)
+        let customerFields = Set(Mirror(reflecting: decoded).children.compactMap(\.label))
+        XCTAssertTrue(customerFields.isDisjoint(with: [
+            "providerFee", "kitFee", "providerFeeCap", "maximumProviderTotal", "kitDebit",
+            "scheduleVersion",
+        ]))
 
         let incomplete: BankTransferQuoteDTO = try decode(
             explicitSplitQuoteJSON().replacingOccurrences(
@@ -494,47 +492,87 @@ final class BankTransferContractTests: XCTestCase {
                 with: ""
             )
         )
-        XCTAssertFalse(incomplete.hasConsistentAmounts)
-        XCTAssertFalse(incomplete.hasValidStepUpBinding)
+        XCTAssertTrue(incomplete.hasConsistentAmounts)
+        XCTAssertTrue(incomplete.hasValidStepUpBinding)
 
         let pricing = BankTransferOutboundPricingDTO(
             feeMode: .senderAbsorbs,
             recipientAmount: quote.recipientAmount,
             processingFee: quote.processingFee,
-            providerFee: quote.providerFee,
-            kitFee: quote.kitFee,
-            providerFeeCap: quote.providerFeeCap,
-            maximumProviderTotal: quote.maximumProviderTotal,
-            customerDebit: quote.customerDebit,
-            kitDebit: quote.kitDebit,
-            scheduleVersion: quote.scheduleVersion,
-            actualProviderFee: nil,
-            actualProviderTotal: nil
+            customerDebit: quote.customerDebit
         )
         XCTAssertTrue(pricing.hasConsistentAmounts)
         XCTAssertTrue(pricing.matches(quote))
 
         let covered = explicitSplitQuote(feeMode: .kitCovers)
         XCTAssertEqual(covered.customerDebit, "5000.00")
-        XCTAssertEqual(covered.kitDebit, "3000.00")
         XCTAssertTrue(covered.hasConsistentAmounts)
         XCTAssertTrue(covered.hasValidStepUpBinding)
+    }
 
-        XCTAssertFalse(BankTransferMoney.outboundAmountsReconcile(
-            feeMode: .senderAbsorbs,
-            recipientAmount: "5000.00",
-            processingFee: "6000.00",
-            providerFee: "4000.00",
-            kitFee: "3000.00",
-            providerFeeCap: "4000.00",
-            maximumProviderTotal: "9000.00",
-            customerDebit: "11000.00",
-            kitDebit: "0.00"
-        ))
+    func testAggregateOnlyBankQuoteIsAuthoritativeAndFailsClosedOnContractDrift() throws {
+        let json =
+            """
+            {
+              "id":"66666666-6666-4666-8666-666666666666",
+              "action":"transfer",
+              "operation_type":"bank_transfer",
+              "fee_mode":"sender_absorbs",
+              "wallet_id":"33333333-3333-4333-8333-333333333333",
+              "beneficiary_id":"44444444-4444-4444-8444-444444444444",
+              "bank":{"id":"11111111-1111-4111-8111-111111111111","code":"040147","name":"Stanbic Bank Uganda"},
+              "recipient_amount":"5000.00",
+              "processing_fee":"6000.00",
+              "total_fees":"6000.00",
+              "customer_debit":"11000.00",
+              "pricing_scope":"customer_totals",
+              "schedule_verified":true,
+              "currency":{"code":"UGX","scale":"2"},
+              "expires_at":"2099-08-18T23:59:59Z",
+              "step_up":{
+                "purpose":"bank_transfer",
+                "intent":{
+                  "action":"transfer",
+                  "operation_type":"bank_transfer",
+                  "quote_id":"66666666-6666-4666-8666-666666666666",
+                  "wallet_id":"33333333-3333-4333-8333-333333333333",
+                  "beneficiary_id":"44444444-4444-4444-8444-444444444444",
+                  "bank_id":"11111111-1111-4111-8111-111111111111",
+                  "bank_code":"040147",
+                  "fee_mode":"sender_absorbs",
+                  "recipient_amount":"5000.00",
+                  "processing_fee":"6000.00",
+                  "customer_debit":"11000.00",
+                  "currency":"UGX"
+                }
+              }
+            }
+            """
+        let quote: BankTransferQuoteDTO = try decode(json)
+
+        XCTAssertEqual(quote.totalFees, "6000.00")
+        XCTAssertEqual(quote.pricingScope, CustomerPricingContract.scope)
+        XCTAssertTrue(quote.hasConsistentAmounts)
+        XCTAssertTrue(quote.hasValidStepUpBinding)
+
+        let mismatchedTotal: BankTransferQuoteDTO = try decode(
+            json.replacingOccurrences(of: "\"total_fees\":\"6000.00\"", with: "\"total_fees\":\"5999.00\"")
+        )
+        XCTAssertFalse(mismatchedTotal.hasConsistentAmounts)
+
+        let unknownScope: BankTransferQuoteDTO = try decode(
+            json.replacingOccurrences(of: "customer_totals", with: "institutional_split")
+        )
+        XCTAssertFalse(unknownScope.hasConsistentAmounts)
+
+        let unknownIntentKey: BankTransferQuoteDTO = try decode(
+            json.replacingOccurrences(of: "\"intent\":{", with: "\"intent\":{\"private_margin\":\"1.00\",")
+        )
+        XCTAssertFalse(unknownIntentKey.hasValidStepUpBinding)
     }
 
     func testOperationReceiptDecodesQuoteBoundOutboundPricingWithoutGuessingSuccess() throws {
-        let operation: BankingOperationDTO = try decode(
+        let json =
             """
             {
               "id":"55555555-5555-4555-8555-555555555555",
@@ -552,6 +590,8 @@ final class BankTransferContractTests: XCTestCase {
                 "fee_mode":"sender_absorbs",
                 "recipient_amount":"5000.00",
                 "processing_fee":"5000.00",
+                "total_fees":"5000.00",
+                "pricing_scope":"customer_totals",
                 "provider_fee_cap":"5000.00",
                 "maximum_provider_total":"10000.00",
                 "customer_debit":"10000.00",
@@ -577,7 +617,7 @@ final class BankTransferContractTests: XCTestCase {
               "completed_at":null
             }
             """
-        )
+        let operation: BankingOperationDTO = try decode(json)
 
         XCTAssertEqual(operation.type, "bank_transfer")
         XCTAssertEqual(operation.submissionStage, "awaiting_provider")
@@ -587,29 +627,77 @@ final class BankTransferContractTests: XCTestCase {
         XCTAssertEqual(operation.outboundPricing?.feeMode, .senderAbsorbs)
         XCTAssertEqual(operation.outboundPricing?.customerDebit, "10000.00")
         XCTAssertTrue(operation.outboundPricing?.hasConsistentAmounts == true)
+        XCTAssertEqual(operation.customerOutboundPricing?.customerDebit, "10000.00")
+        XCTAssertEqual(operation.customerAmountDeducted, "10000.00")
+        XCTAssertTrue(BankTransferOperationPresentationPolicy.isCustomerVisible(operation))
+        let customerFields = Set(Mirror(reflecting: operation).children.compactMap(\.label))
+        XCTAssertTrue(customerFields.isDisjoint(with: [
+            "providerFee", "platformFee", "roundingAdjustment",
+        ]))
+        let pricingFields = Set(
+            Mirror(reflecting: try XCTUnwrap(operation.outboundPricing)).children.compactMap(\.label)
+        )
+        XCTAssertTrue(pricingFields.isDisjoint(with: [
+            "providerFee", "kitFee", "providerFeeCap", "maximumProviderTotal", "kitDebit",
+            "actualProviderFee", "actualProviderTotal", "scheduleVersion",
+        ]))
         XCTAssertTrue(BankTransferMoney.operationAmount(operation.amount, matchesWholeUGX: "5000"))
         let quote = try sampleQuote()
         XCTAssertTrue(operation.hasSameOutboundBinding(as: quote))
+
+        let untrusted: BankingOperationDTO = try decode(
+            json.replacingOccurrences(of: "customer_totals", with: "institutional_split")
+        )
+        XCTAssertNil(untrusted.customerOutboundPricing)
+        XCTAssertNil(untrusted.customerAmountDeducted)
+
+        let mismatchedTotal: BankingOperationDTO = try decode(
+            json.replacingOccurrences(
+                of: "\"total_fees\":\"5000.00\"",
+                with: "\"total_fees\":\"4999.00\""
+            )
+        )
+        XCTAssertNil(mismatchedTotal.customerOutboundPricing)
+        XCTAssertNil(mismatchedTotal.customerAmountDeducted)
+
+        let principalOnlyLegacy: BankingOperationDTO = try decode(
+            json
+                .replacingOccurrences(of: "\"total_fees\":\"5000.00\",", with: "")
+                .replacingOccurrences(of: "\"pricing_scope\":\"customer_totals\",", with: "")
+        )
+        XCTAssertNil(principalOnlyLegacy.customerOutboundPricing)
+        XCTAssertNil(principalOnlyLegacy.customerAmountDeducted)
+        XCTAssertFalse(
+            BankTransferOperationPresentationPolicy.isCustomerVisible(principalOnlyLegacy)
+        )
+
+        let wrongDirection: BankingOperationDTO = try decode(
+            json.replacingOccurrences(
+                of: "\"direction\":\"outbound\"",
+                with: "\"direction\":\"inbound\""
+            )
+        )
+        XCTAssertFalse(BankTransferOperationPresentationPolicy.isCustomerVisible(wrongDirection))
     }
 
-    func testKitCoversPricingRequiresExactServiceDebit() {
-        XCTAssertTrue(BankTransferMoney.outboundAmountsReconcile(
+    func testKitCoversPricingUsesOnlyTheCustomerDebitContract() {
+        XCTAssertTrue(BankTransferMoney.customerOutboundAmountsReconcile(
             feeMode: .kitCovers,
             recipientAmount: "5000.00",
-            processingFee: "5000.00",
-            providerFeeCap: "5000.00",
-            maximumProviderTotal: "10000.00",
-            customerDebit: "5000.00",
-            kitDebit: "5000.00"
+            totalFees: "5000.00",
+            customerDebit: "5000.00"
         ))
-        XCTAssertFalse(BankTransferMoney.outboundAmountsReconcile(
+        XCTAssertFalse(BankTransferMoney.customerOutboundAmountsReconcile(
             feeMode: .kitCovers,
             recipientAmount: "5000.00",
-            processingFee: "5000.00",
-            providerFeeCap: "5000.00",
-            maximumProviderTotal: "10000.00",
-            customerDebit: "5000.00",
-            kitDebit: "0.00"
+            totalFees: "5000.00",
+            customerDebit: "10000.00"
+        ))
+        XCTAssertFalse(BankTransferMoney.customerOutboundAmountsReconcile(
+            feeMode: .senderAbsorbs,
+            recipientAmount: "5000.00",
+            totalFees: "5000.00",
+            customerDebit: "5000.00"
         ))
     }
 
@@ -712,8 +800,21 @@ final class BankTransferContractTests: XCTestCase {
                 for: providerError,
                 context: .accountVerification
             ),
-            "Kit Pay's payment service is temporarily unavailable."
+            BankTransferActionErrorCopy.accountVerificationFailure
         )
+
+        let internalDiagnostic = APIErrorPayload(
+            code: "BANK_VERIFICATION_PROVIDER_FAILURE",
+            message: "Provider settlement ledger commission allocation failed."
+        )
+        let verificationMessage = BankTransferActionErrorCopy.message(
+            for: internalDiagnostic,
+            context: .accountVerification
+        )
+        XCTAssertEqual(verificationMessage, BankTransferActionErrorCopy.accountVerificationFailure)
+        XCTAssertFalse(verificationMessage.localizedCaseInsensitiveContains("provider"))
+        XCTAssertFalse(verificationMessage.localizedCaseInsensitiveContains("ledger"))
+        XCTAssertFalse(verificationMessage.localizedCaseInsensitiveContains("commission"))
     }
 
     @MainActor
@@ -935,13 +1036,7 @@ final class BankTransferContractTests: XCTestCase {
             ),
             recipientAmount: "5000.00",
             processingFee: "6000.00",
-            providerFee: "3000.00",
-            kitFee: "3000.00",
-            providerFeeCap: "3000.00",
-            maximumProviderTotal: "8000.00",
             customerDebit: customerDebit,
-            kitDebit: kitDebit,
-            scheduleVersion: "kit-bank-v1-2026-08-19",
             scheduleVerified: true,
             currency: CurrencyDTO(code: "UGX", scale: "2"),
             expiresAt: "2099-08-18T23:59:59Z",

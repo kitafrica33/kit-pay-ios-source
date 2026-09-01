@@ -2152,6 +2152,132 @@ final class CallLifecycleTests: XCTestCase {
         )
     }
 
+    func testCallKitAudioGateBindsActivationToExactPrimaryOwner() {
+        let staleCall = UUID(uuidString: "550e8400-e29b-41d4-a716-446655440030")!
+        let primaryCall = UUID(uuidString: "550e8400-e29b-41d4-a716-446655440031")!
+        var gate = CallKitAudioSessionGate()
+
+        gate.claimOwner(staleCall)
+        let staleTicket = gate.beginSystemActivation()!
+        XCTAssertTrue(gate.markConfigured(staleTicket))
+
+        gate.claimOwner(primaryCall)
+
+        XCTAssertFalse(gate.accepts(staleTicket), "Replacing the primary owner must fence old work")
+        XCTAssertEqual(gate.ownerCallUUID, primaryCall)
+        XCTAssertEqual(gate.phase, .awaitingConfiguration)
+        let primaryTicket = gate.reconciliationTicket(for: primaryCall)
+        XCTAssertNotNil(primaryTicket)
+        XCTAssertNil(gate.reconciliationTicket(for: staleCall))
+        XCTAssertTrue(gate.markConfigured(primaryTicket!))
+        XCTAssertEqual(gate.phase, .configured)
+    }
+
+    func testCallKitAudioGateReconcilesActivationThatArrivesBeforeOwner() {
+        let callUUID = UUID(uuidString: "550e8400-e29b-41d4-a716-446655440032")!
+        var gate = CallKitAudioSessionGate()
+
+        XCTAssertNil(gate.beginSystemActivation())
+        XCTAssertEqual(gate.phase, .awaitingOwner)
+
+        gate.claimOwner(callUUID)
+
+        let ticket = gate.reconciliationTicket(for: callUUID)
+        XCTAssertNotNil(ticket)
+        XCTAssertEqual(gate.phase, .awaitingConfiguration)
+        XCTAssertTrue(gate.markConfigured(ticket!))
+    }
+
+    func testCallKitAudioGateRetriesFailureUntilDeactivateInvalidatesIt() {
+        let callUUID = UUID(uuidString: "550e8400-e29b-41d4-a716-446655440033")!
+        let unrelatedCall = UUID(uuidString: "550e8400-e29b-41d4-a716-446655440034")!
+        var gate = CallKitAudioSessionGate()
+        gate.claimOwner(callUUID)
+        let activation = gate.beginSystemActivation()!
+
+        XCTAssertTrue(gate.markConfigurationFailed(activation))
+        XCTAssertEqual(gate.phase, .awaitingConfiguration)
+        XCTAssertFalse(gate.releaseOwner(unrelatedCall))
+        XCTAssertEqual(gate.ownerCallUUID, callUUID)
+
+        let retry = gate.reconciliationTicket(for: callUUID)!
+        gate.deactivate()
+
+        XCTAssertFalse(gate.accepts(activation))
+        XCTAssertFalse(gate.accepts(retry))
+        XCTAssertNil(gate.reconciliationTicket(for: callUUID))
+        XCTAssertEqual(gate.phase, .inactive)
+    }
+
+    func testCallKitAudioGateResetDropsOwnerAcrossProviderReset() {
+        let callUUID = UUID(uuidString: "550e8400-e29b-41d4-a716-446655440035")!
+        var gate = CallKitAudioSessionGate()
+        gate.claimOwner(callUUID)
+        let ticket = gate.beginSystemActivation()!
+
+        gate.reset()
+
+        XCTAssertNil(gate.ownerCallUUID)
+        XCTAssertEqual(gate.phase, .inactive)
+        XCTAssertFalse(gate.accepts(ticket))
+    }
+
+    func testCallKitAudioRecoveryClearsOnlyTheExactFailureItOwns() {
+        let callID = "550e8400-e29b-41d4-a716-446655440036"
+        let otherCallID = "550e8400-e29b-41d4-a716-446655440037"
+        let audioError = "Kit could not keep two-way call audio active."
+        var recovery = CallKitAudioSessionErrorRecoveryState()
+        recovery.recordFailure(callID: callID.uppercased(), message: audioError)
+
+        XCTAssertEqual(
+            recovery.recoveredControlError(
+                callID: otherCallID,
+                currentControlError: audioError
+            ),
+            audioError,
+            "A late success from another call must not clear the active call's error"
+        )
+        XCTAssertNil(
+            recovery.recoveredControlError(
+                callID: callID,
+                currentControlError: audioError
+            ),
+            "A successful exact-call retry must clear its stale configuration error"
+        )
+        XCTAssertEqual(
+            recovery.recoveredControlError(
+                callID: callID,
+                currentControlError: audioError
+            ),
+            audioError,
+            "Recovery ownership is consumed exactly once"
+        )
+    }
+
+    func testCallKitAudioRecoveryPreservesANewerControlError() {
+        let callID = "550e8400-e29b-41d4-a716-446655440038"
+        let audioError = "The audio route could not be configured."
+        let newerError = "The camera could not be enabled."
+        var recovery = CallKitAudioSessionErrorRecoveryState()
+        recovery.recordFailure(callID: callID, message: audioError)
+
+        XCTAssertEqual(
+            recovery.recoveredControlError(
+                callID: callID,
+                currentControlError: newerError
+            ),
+            newerError
+        )
+        XCTAssertEqual(
+            recovery.recoveredControlError(
+                callID: callID,
+                currentControlError: audioError
+            ),
+            audioError,
+            "The superseded audio marker must not clear an error later"
+        )
+    }
+
     func testDeferredCallKitAnswerSurvivesOnlyInitialColdLaunchOwnershipRecovery() {
         let callUUID = UUID(uuidString: "550e8400-e29b-41d4-a716-446655440020")!
         let competingCallUUID = UUID(uuidString: "550e8400-e29b-41d4-a716-446655440025")!
@@ -5207,6 +5333,70 @@ final class CallVideoStatePolicyTests: XCTestCase {
                 originalCallWasVideo: false,
                 localCameraEnabled: false,
                 remoteVideoAvailable: true
+            )
+        )
+    }
+}
+
+final class CallAudioSessionConfigurationPolicyTests: XCTestCase {
+    func testTwoWayCallOptionsPermitHFPButExcludeOutputOnlyRoutes() {
+        let receiverOptions = CallAudioSessionConfigurationPolicy.options(speaker: false)
+        XCTAssertEqual(receiverOptions, [.allowBluetoothHFP])
+        XCTAssertFalse(receiverOptions.contains(.allowBluetoothA2DP))
+        XCTAssertFalse(receiverOptions.contains(.allowAirPlay))
+        XCTAssertFalse(receiverOptions.contains(.defaultToSpeaker))
+
+        let speakerOptions = CallAudioSessionConfigurationPolicy.options(speaker: true)
+        XCTAssertTrue(speakerOptions.contains(.allowBluetoothHFP))
+        XCTAssertTrue(speakerOptions.contains(.defaultToSpeaker))
+        XCTAssertFalse(speakerOptions.contains(.allowBluetoothA2DP))
+        XCTAssertFalse(speakerOptions.contains(.allowAirPlay))
+    }
+
+    func testTwoWayConfigurationMatchesOnlyExpectedModeAndSpeakerPreference() {
+        XCTAssertTrue(
+            CallAudioSessionConfigurationPolicy.matchesTwoWayCallConfiguration(
+                category: .playAndRecord,
+                mode: .voiceChat,
+                options: [.allowBluetoothHFP],
+                video: false,
+                speaker: false
+            )
+        )
+        XCTAssertTrue(
+            CallAudioSessionConfigurationPolicy.matchesTwoWayCallConfiguration(
+                category: .playAndRecord,
+                mode: .videoChat,
+                options: [.allowBluetoothHFP, .defaultToSpeaker],
+                video: true,
+                speaker: true
+            )
+        )
+        XCTAssertFalse(
+            CallAudioSessionConfigurationPolicy.matchesTwoWayCallConfiguration(
+                category: .playback,
+                mode: .spokenAudio,
+                options: [],
+                video: false,
+                speaker: false
+            )
+        )
+        XCTAssertFalse(
+            CallAudioSessionConfigurationPolicy.matchesTwoWayCallConfiguration(
+                category: .playAndRecord,
+                mode: .voiceChat,
+                options: [.allowBluetoothHFP, .allowBluetoothA2DP],
+                video: false,
+                speaker: false
+            )
+        )
+        XCTAssertFalse(
+            CallAudioSessionConfigurationPolicy.matchesTwoWayCallConfiguration(
+                category: .playAndRecord,
+                mode: .voiceChat,
+                options: [.allowBluetoothHFP],
+                video: false,
+                speaker: true
             )
         )
     }

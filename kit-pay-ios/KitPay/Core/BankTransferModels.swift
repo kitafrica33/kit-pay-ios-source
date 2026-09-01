@@ -215,13 +215,9 @@ struct BankTransferQuoteDTO: Decodable, Identifiable {
     let bank: BankTransferQuoteBankDTO
     let recipientAmount: String
     let processingFee: String
-    let providerFee: String?
-    let kitFee: String?
-    let providerFeeCap: String
-    let maximumProviderTotal: String
+    var totalFees: String? = nil
+    var pricingScope: String? = nil
     let customerDebit: String
-    let kitDebit: String
-    let scheduleVersion: String
     let scheduleVerified: Bool
     let currency: CurrencyDTO
     let expiresAt: String
@@ -235,13 +231,9 @@ struct BankTransferQuoteDTO: Decodable, Identifiable {
         case beneficiaryId = "beneficiary_id"
         case recipientAmount = "recipient_amount"
         case processingFee = "processing_fee"
-        case providerFee = "provider_fee"
-        case kitFee = "kit_fee"
-        case providerFeeCap = "provider_fee_cap"
-        case maximumProviderTotal = "maximum_provider_total"
+        case totalFees = "total_fees"
+        case pricingScope = "pricing_scope"
         case customerDebit = "customer_debit"
-        case kitDebit = "kit_debit"
-        case scheduleVersion = "schedule_version"
         case scheduleVerified = "schedule_verified"
         case expiresAt = "expires_at"
         case stepUp = "step_up"
@@ -258,25 +250,20 @@ struct BankTransferQuoteDTO: Decodable, Identifiable {
     }
 
     var hasConsistentAmounts: Bool {
-        BankTransferMoney.outboundAmountsReconcile(
+        CustomerPricingContract.accepts(scope: pricingScope, authoritativeTotal: totalFees)
+            && CustomerPricingContract.totalsMatch(totalFees, legacy: processingFee)
+            && BankTransferMoney.customerOutboundAmountsReconcile(
             feeMode: feeMode,
             recipientAmount: recipientAmount,
-            processingFee: processingFee,
-            providerFee: providerFee,
-            kitFee: kitFee,
-            providerFeeCap: providerFeeCap,
-            maximumProviderTotal: maximumProviderTotal,
-            customerDebit: customerDebit,
-            kitDebit: kitDebit
+            totalFees: totalFees ?? processingFee,
+            customerDebit: customerDebit
         )
     }
 
     var hasValidStepUpBinding: Bool {
-        guard stepUp.purpose == BankTransferContract.purpose,
-              (providerFee == nil) == (kitFee == nil)
-        else { return false }
+        guard stepUp.purpose == BankTransferContract.purpose else { return false }
 
-        var expected = [
+        let expected = [
             "action": action,
             "operation_type": operationType,
             "quote_id": id,
@@ -287,18 +274,16 @@ struct BankTransferQuoteDTO: Decodable, Identifiable {
             "fee_mode": feeMode.rawValue,
             "recipient_amount": recipientAmount,
             "processing_fee": processingFee,
-            "provider_fee_cap": providerFeeCap,
-            "maximum_provider_total": maximumProviderTotal,
             "customer_debit": customerDebit,
-            "kit_debit": kitDebit,
-            "schedule_version": scheduleVersion,
             "currency": currency.code,
         ]
-        if let providerFee, let kitFee {
-            expected["provider_fee"] = providerFee
-            expected["kit_fee"] = kitFee
-        }
-        return stepUp.intent == expected
+        let legacyCompatibilityKeys: Set<String> = [
+            "provider_fee", "kit_fee", "provider_fee_cap", "maximum_provider_total",
+            "kit_debit", "schedule_version",
+        ]
+        let allowedKeys = Set(expected.keys).union(legacyCompatibilityKeys)
+        return Set(stepUp.intent.keys).isSubset(of: allowedKeys)
+            && expected.allSatisfy { stepUp.intent[$0.key] == $0.value }
     }
 }
 
@@ -417,9 +402,6 @@ struct BankingOperationDTO: Decodable, Hashable, Identifiable {
     let feeQuoteId: String?
     let feeMode: String?
     let requestedAmount: String?
-    let providerFee: String?
-    let platformFee: String?
-    let roundingAdjustment: String?
     let totalFees: String?
     let netAmount: String?
     let providerReference: String?
@@ -440,9 +422,6 @@ struct BankingOperationDTO: Decodable, Hashable, Identifiable {
         case feeQuoteId = "fee_quote_id"
         case feeMode = "fee_mode"
         case requestedAmount = "requested_amount"
-        case providerFee = "provider_fee"
-        case platformFee = "platform_fee"
-        case roundingAdjustment = "rounding_adjustment"
         case totalFees = "total_fees"
         case netAmount = "net_amount"
         case providerReference = "provider_reference"
@@ -461,6 +440,29 @@ struct BankingOperationDTO: Decodable, Hashable, Identifiable {
         ["completed", "succeeded"].contains(status.lowercased())
     }
 
+    /// The only outbound pricing shape that is safe to present to a customer.
+    ///
+    /// The operation must advertise the public `customer_totals` contract and reconcile its
+    /// principal with that aggregate. Legacy, institutional, and malformed shapes fail closed
+    /// instead of reaching a customer history row or receipt.
+    var customerOutboundPricing: BankTransferOutboundPricingDTO? {
+        guard let outboundPricing,
+              outboundPricing.pricingScope == CustomerPricingContract.scope,
+              outboundPricing.totalFees != nil,
+              outboundPricing.hasConsistentAmounts,
+              BankTransferMoney.amountsMatch(amount, outboundPricing.recipientAmount)
+        else { return nil }
+        return outboundPricing
+    }
+
+    /// Complete amount removed from the customer's wallet for this operation.
+    ///
+    /// Returning nil prevents the UI from substituting the recipient principal for an unverified
+    /// total wallet debit.
+    var customerAmountDeducted: String? {
+        customerOutboundPricing?.customerDebit
+    }
+
     func hasSameOutboundBinding(as quote: BankTransferQuoteDTO) -> Bool {
         type.caseInsensitiveCompare(BankTransferContract.operationType) == .orderedSame
             && direction.caseInsensitiveCompare("outbound") == .orderedSame
@@ -474,72 +476,62 @@ struct BankingOperationDTO: Decodable, Hashable, Identifiable {
     }
 }
 
+/// Fail-closed boundary for the bank-transfer-specific activity surface.
+///
+/// A principal-only legacy operation cannot prove the complete wallet debit and is therefore not
+/// a customer transaction until the authoritative aggregate pricing contract is available.
+enum BankTransferOperationPresentationPolicy {
+    static func isCustomerVisible(_ operation: BankingOperationDTO) -> Bool {
+        operation.type.caseInsensitiveCompare(BankTransferContract.operationType) == .orderedSame
+            && operation.direction.caseInsensitiveCompare("outbound") == .orderedSame
+            && operation.customerAmountDeducted != nil
+    }
+
+    static func customerVisibleOperations(
+        _ operations: [BankingOperationDTO]
+    ) -> [BankingOperationDTO] {
+        operations.filter(isCustomerVisible)
+    }
+}
+
 struct BankTransferOutboundPricingDTO: Decodable, Hashable {
     let feeMode: BankTransferFeeMode
     let recipientAmount: String
     let processingFee: String
-    let providerFee: String?
-    let kitFee: String?
-    let providerFeeCap: String
-    let maximumProviderTotal: String
+    var totalFees: String? = nil
+    var pricingScope: String? = nil
     let customerDebit: String
-    let kitDebit: String
-    let scheduleVersion: String
-    let actualProviderFee: String?
-    let actualProviderTotal: String?
 
     enum CodingKeys: String, CodingKey {
         case feeMode = "fee_mode"
         case recipientAmount = "recipient_amount"
         case processingFee = "processing_fee"
-        case providerFee = "provider_fee"
-        case kitFee = "kit_fee"
-        case providerFeeCap = "provider_fee_cap"
-        case maximumProviderTotal = "maximum_provider_total"
+        case totalFees = "total_fees"
+        case pricingScope = "pricing_scope"
         case customerDebit = "customer_debit"
-        case kitDebit = "kit_debit"
-        case scheduleVersion = "schedule_version"
-        case actualProviderFee = "actual_provider_fee"
-        case actualProviderTotal = "actual_provider_total"
     }
 
     var hasConsistentAmounts: Bool {
-        BankTransferMoney.outboundAmountsReconcile(
+        CustomerPricingContract.accepts(scope: pricingScope, authoritativeTotal: totalFees)
+            && CustomerPricingContract.totalsMatch(totalFees, legacy: processingFee)
+            && BankTransferMoney.customerOutboundAmountsReconcile(
             feeMode: feeMode,
             recipientAmount: recipientAmount,
-            processingFee: processingFee,
-            providerFee: providerFee,
-            kitFee: kitFee,
-            providerFeeCap: providerFeeCap,
-            maximumProviderTotal: maximumProviderTotal,
-            customerDebit: customerDebit,
-            kitDebit: kitDebit
+            totalFees: totalFees ?? processingFee,
+            customerDebit: customerDebit
         )
     }
 
     func matches(_ quote: BankTransferQuoteDTO) -> Bool {
         feeMode == quote.feeMode
-            && scheduleVersion == quote.scheduleVersion
             && BankTransferMoney.amountsMatch(recipientAmount, quote.recipientAmount)
             && BankTransferMoney.amountsMatch(processingFee, quote.processingFee)
-            && optionalAmountMatches(providerFee, quote.providerFee)
-            && optionalAmountMatches(kitFee, quote.kitFee)
-            && BankTransferMoney.amountsMatch(providerFeeCap, quote.providerFeeCap)
-            && BankTransferMoney.amountsMatch(maximumProviderTotal, quote.maximumProviderTotal)
+            && BankTransferMoney.amountsMatch(
+                totalFees ?? processingFee,
+                quote.totalFees ?? quote.processingFee
+            )
             && BankTransferMoney.amountsMatch(customerDebit, quote.customerDebit)
-            && BankTransferMoney.amountsMatch(kitDebit, quote.kitDebit)
             && hasConsistentAmounts
-    }
-
-    private func optionalAmountMatches(_ lhs: String?, _ rhs: String?) -> Bool {
-        switch (lhs, rhs) {
-        case let (left?, right?):
-            BankTransferMoney.amountsMatch(left, right)
-        case (nil, nil):
-            true
-        default:
-            false
-        }
     }
 }
 
@@ -675,55 +667,29 @@ enum BankTransferMoney {
         return left == right
     }
 
-    static func outboundAmountsReconcile(
+    /// Reconciles only amounts that belong in a customer's payment approval contract.
+    /// Provider cost, Kit margin, settlement caps, and institutional contributions are not
+    /// required by the mobile client and remain private to the server-side ledger.
+    static func customerOutboundAmountsReconcile(
         feeMode: BankTransferFeeMode,
         recipientAmount: String,
-        processingFee: String,
-        providerFee: String? = nil,
-        kitFee: String? = nil,
-        providerFeeCap: String,
-        maximumProviderTotal: String,
-        customerDebit: String,
-        kitDebit: String
+        totalFees: String,
+        customerDebit: String
     ) -> Bool {
         let locale = Locale(identifier: "en_US_POSIX")
         guard let recipient = Decimal(string: recipientAmount, locale: locale), recipient > 0,
-              let fee = Decimal(string: processingFee, locale: locale), fee >= 0,
-              let providerCap = Decimal(string: providerFeeCap, locale: locale), providerCap >= 0,
-              let maximumTotal = Decimal(string: maximumProviderTotal, locale: locale),
-              let customer = Decimal(string: customerDebit, locale: locale), customer > 0,
-              let kit = Decimal(string: kitDebit, locale: locale), kit >= 0,
-              (providerFee == nil) == (kitFee == nil)
-        else { return false }
-
-        let provider: Decimal
-        let platform: Decimal
-        if let providerFee, let kitFee {
-            guard let parsedProvider = Decimal(string: providerFee, locale: locale),
-                  let parsedPlatform = Decimal(string: kitFee, locale: locale)
-            else { return false }
-            provider = parsedProvider
-            platform = parsedPlatform
-        } else {
-            provider = providerCap
-            platform = 0
-        }
-        guard provider >= 0,
-              platform >= 0,
-              providerCap == provider,
-              fee == provider + platform,
-              maximumTotal == recipient + provider
+              let fee = Decimal(string: totalFees, locale: locale), fee >= 0,
+              let customer = Decimal(string: customerDebit, locale: locale), customer > 0
         else { return false }
 
         switch feeMode {
-        case .senderAbsorbs:
-            return customer == recipient + fee && kit == 0
-        case .beneficiaryAbsorbs:
-            return customer == recipient + fee && kit == 0
+        case .senderAbsorbs, .beneficiaryAbsorbs:
+            return customer == recipient + fee
         case .kitCovers:
-            return customer == recipient && kit == providerCap
+            return customer == recipient
         }
     }
+
 }
 
 enum BankDepositMoney {

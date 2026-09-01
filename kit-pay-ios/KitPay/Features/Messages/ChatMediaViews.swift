@@ -120,6 +120,49 @@ struct ChatStagedAttachment: Identifiable {
     var isFileBacked: Bool { localFileURL != nil && data == nil }
     var byteLabel: String { ChatMediaBytes.label(byteCount) }
 
+    /// The encrypted draft persists only attachments whose app-owned bytes already exist. A
+    /// camera preview or security-scoped provider URL remains visible while its import runs, but
+    /// cannot claim restart durability until that import has been verified by AppModel.
+    var draftMediaAttachment: ConversationDraftMediaAttachment? {
+        guard byteCount > 0, data != nil || localFileURL != nil else { return nil }
+        let attachment = ConversationDraftMediaAttachment(
+            id: id,
+            storageKind: isFileBacked ? .protectedFile : .encryptedBlob,
+            mediaType: mediaType,
+            originalMediaType: originalMediaType,
+            byteCount: byteCount,
+            displayName: ConversationDraftMediaAttachment.boundedDisplayName(
+                displayName,
+                fallback: kind.previewLabel
+            ),
+            duration: duration,
+            acceptedAt: acceptedAt,
+            clientMessageID: clientMessageID,
+            preprocessingOutputStorageKey: preprocessingOutputStorageKey
+        )
+        return attachment.isStructurallyValid ? attachment : nil
+    }
+
+    init(
+        restored manifest: ConversationDraftMediaAttachment,
+        data: Data?,
+        localFileURL: URL?
+    ) {
+        self.id = manifest.id
+        self.kind = KitChatMediaKind(mediaType: manifest.mediaType)
+        self.data = data
+        self.localFileURL = localFileURL
+        self.byteCount = manifest.byteCount
+        self.mediaType = manifest.mediaType
+        self.originalMediaType = manifest.originalMediaType
+        self.preprocessingOutputStorageKey = manifest.preprocessingOutputStorageKey
+        self.displayName = manifest.displayName
+        self.previewImage = nil
+        self.duration = manifest.duration
+        self.acceptedAt = manifest.acceptedAt
+        self.clientMessageID = manifest.clientMessageID
+    }
+
     func replacingDuration(_ duration: TimeInterval) -> ChatStagedAttachment {
         guard duration.isFinite, duration > 0 else { return self }
         if let localFileURL {
@@ -493,10 +536,7 @@ struct PendingSecureMediaMessageView: View {
     private var pendingContent: some View {
         if let loaded,
            KitChatMediaKind(mediaType: loaded.mediaType) == .image,
-           let image = ChatMediaImageDecoder.downsample(
-               data: loaded.data,
-               maximumPixelSize: 2_048
-           ) {
+           let image = loaded.downsampledImage(maximumPixelSize: 2_048) {
             Button {
                 LocalMediaPerformanceMonitor.shared.markPlayable(mediaID: mediaID)
                 presentedMedia = PendingMediaPresentation(
@@ -505,7 +545,7 @@ struct PendingSecureMediaMessageView: View {
                     fileURL: nil,
                     displayName: title,
                     mediaType: loaded.mediaType,
-                    byteCount: loaded.data.count,
+                    byteCount: loaded.byteCount,
                     ownsTemporaryFile: false,
                     protectedOriginalLease: nil
                 )
@@ -597,10 +637,7 @@ struct PendingSecureMediaMessageView: View {
         loaded = fresh
         if markPlayableWhenLoaded,
            KitChatMediaKind(mediaType: fresh.mediaType) == .image,
-           ChatMediaImageDecoder.downsample(
-               data: fresh.data,
-               maximumPixelSize: 256
-           ) != nil {
+           fresh.downsampledImage(maximumPixelSize: 256) != nil {
             LocalMediaPerformanceMonitor.shared.markPlayable(mediaID: mediaID)
         }
     }
@@ -660,10 +697,7 @@ struct PendingSecureMediaMessageView: View {
         guard let loaded else { return }
         switch KitChatMediaKind(mediaType: loaded.mediaType) {
         case .image:
-            guard let image = ChatMediaImageDecoder.downsample(
-                data: loaded.data,
-                maximumPixelSize: 4_096
-            ) else {
+            guard let image = loaded.downsampledImage(maximumPixelSize: 4_096) else {
                 errorMessage = "Local copy unavailable"
                 return
             }
@@ -673,7 +707,7 @@ struct PendingSecureMediaMessageView: View {
                 fileURL: nil,
                 displayName: title,
                 mediaType: loaded.mediaType,
-                byteCount: loaded.data.count,
+                byteCount: loaded.byteCount,
                 ownsTemporaryFile: false,
                 protectedOriginalLease: nil
             )
@@ -847,12 +881,7 @@ struct SecureMediaBatchItemView: View {
                     itemIndex: itemIndex
                 )
                 if kind == .image,
-                   loader.data.flatMap({
-                       ChatMediaImageDecoder.downsample(
-                           data: $0,
-                           maximumPixelSize: 256
-                       )
-                   }) != nil,
+                   loader.loaded?.downsampledImage(maximumPixelSize: 256) != nil,
                    let id = UUID(uuidString: attachmentID) {
                     LocalMediaPerformanceMonitor.shared.markPlayable(mediaID: id)
                 }
@@ -873,9 +902,7 @@ struct SecureMediaBatchItemView: View {
 
     @ViewBuilder
     private var imageCell: some View {
-        if let image = loader.data.flatMap({
-            ChatMediaImageDecoder.downsample(data: $0, maximumPixelSize: 1_024)
-        }) {
+        if let image = loader.loaded?.downsampledImage(maximumPixelSize: 1_024) {
             Image(uiImage: image)
                 .resizable()
                 .scaledToFill()
@@ -892,10 +919,7 @@ struct SecureMediaBatchItemView: View {
                                   messageID: message.id,
                                   conversationId: message.conversationId,
                                   itemIndex: itemIndex
-                              ), ChatMediaImageDecoder.downsample(
-                                  data: fresh.data,
-                                  maximumPixelSize: 256
-                              ) != nil else { return }
+                              ), fresh.downsampledImage(maximumPixelSize: 256) != nil else { return }
                         showsImageViewer = true
                     }
                 }
@@ -1156,15 +1180,21 @@ struct SecureImageMessageView: View {
     @State private var showsViewer = false
 
     private var image: UIImage? {
-        // Identity-resolved bytes only: the captured row's inline slot is a snapshot, and the
-        // loader serves the same inline bytes through the current-row resolution instead.
-        loader.data.flatMap {
-            ChatMediaThumbnailStore.shared.thumbnail(
+        // The loader resolves the current persisted row first. Protected originals and receiver
+        // cache files downsample directly from disk; legacy inline blobs keep the data path.
+        guard let loaded = loader.loaded else { return nil }
+        if let localFileURL = loaded.localFileURL {
+            return ChatMediaThumbnailStore.shared.thumbnail(
                 forKey: descriptor.storageKey,
                 maxPixel: 1_024,
-                from: $0
+                fromFileURL: localFileURL
             )
         }
+        return ChatMediaThumbnailStore.shared.thumbnail(
+            forKey: descriptor.storageKey,
+            maxPixel: 1_024,
+            from: loaded.data
+        )
     }
 
     var body: some View {
@@ -1187,13 +1217,12 @@ struct SecureImageMessageView: View {
                                 guard !loader.isLoading,
                                       let fresh = await loader.refreshForPresentation(
                                           model: model,
-                                          messageID: message.id,
-                                          conversationId: message.conversationId,
-                                          itemIndex: nil
-                                      ), ChatMediaImageDecoder.downsample(
-                                          data: fresh.data,
-                                          maximumPixelSize: 256
-                                      ) != nil else { return }
+                                      messageID: message.id,
+                                      conversationId: message.conversationId,
+                                      itemIndex: nil
+                                      ), fresh.downsampledImage(maximumPixelSize: 256) != nil else {
+                                    return
+                                }
                                 showsViewer = true
                             }
                         }

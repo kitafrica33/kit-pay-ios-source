@@ -181,8 +181,8 @@ enum AppStoreScreenshotFixture {
         decode(
             """
             [
-              {"id":"12000000-0000-4000-8000-000000000001","reference":"MOMO-240826-8124","type":"mobile_money","direction":"inbound","status":"completed","submission_stage":"completed","bank_id":"10000000-0000-4000-8000-000000000001","beneficiary_id":"11000000-0000-4000-8000-000000000001","wallet_id":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","amount":"150000","currency":{"code":"UGX","scale":"0"},"provider_reference":"MTN884205","wallet_transaction_id":"dddddddd-dddd-4ddd-8ddd-dddddddddd01","created_at":"2026-08-24T08:50:00Z","completed_at":"2026-08-24T08:51:00Z","mobile_money_type":"collection","network":{"id":"10000000-0000-4000-8000-000000000001","code":"MTN","name":"MTN Mobile Money","currency":{"code":"UGX","scale":"0"},"capabilities":{"collections":true,"payouts":true,"account_verification":true}},"fee_mode":"inclusive","requested_amount":"150000","provider_fee":"500","platform_fee":"0","rounding_adjustment":"0","total_fees":"500","net_amount":"149500"},
-              {"id":"12000000-0000-4000-8000-000000000002","reference":"MOMO-230826-7391","type":"mobile_money","direction":"outbound","status":"completed","submission_stage":"completed","bank_id":"10000000-0000-4000-8000-000000000002","beneficiary_id":"11000000-0000-4000-8000-000000000002","wallet_id":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","amount":"50000","currency":{"code":"UGX","scale":"0"},"provider_reference":"AIR731905","wallet_transaction_id":"dddddddd-dddd-4ddd-8ddd-dddddddddd02","created_at":"2026-08-23T14:20:00Z","completed_at":"2026-08-23T14:21:00Z","mobile_money_type":"payout","network":{"id":"10000000-0000-4000-8000-000000000002","code":"AIRTEL","name":"Airtel Money","currency":{"code":"UGX","scale":"0"},"capabilities":{"collections":true,"payouts":true,"account_verification":true}},"outbound_quote_id":"12000000-0000-4000-8000-000000000012","outbound_pricing":{"fee_mode":"sender_absorbs","recipient_amount":"50000","processing_fee":"500","provider_fee":"500","kit_fee":"0","provider_fee_cap":"500","maximum_provider_total":"50500","customer_debit":"50500","kit_debit":"0","schedule_version":"ug-mobile-money-2026-04-01"}}
+              {"id":"12000000-0000-4000-8000-000000000001","reference":"MOMO-240826-8124","type":"deposit","direction":"inbound","status":"completed","submission_stage":"completed","bank_id":"10000000-0000-4000-8000-000000000001","beneficiary_id":"11000000-0000-4000-8000-000000000001","wallet_id":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","amount":"150000","currency":{"code":"UGX","scale":"0"},"provider_reference":"MTN884205","wallet_transaction_id":"dddddddd-dddd-4ddd-8ddd-dddddddddd01","created_at":"2026-08-24T08:50:00Z","completed_at":"2026-08-24T08:51:00Z","mobile_money_type":"collection","network":{"id":"10000000-0000-4000-8000-000000000001","code":"MTN","name":"MTN Mobile Money","currency":{"code":"UGX","scale":"0"},"capabilities":{"collections":true,"payouts":true,"account_verification":true}},"fee_mode":"inclusive","requested_amount":"150000","total_fees":"500","net_amount":"149500","pricing_scope":"customer_totals"},
+              {"id":"12000000-0000-4000-8000-000000000002","reference":"MOMO-230826-7391","type":"withdrawal","direction":"outbound","status":"completed","submission_stage":"completed","bank_id":"10000000-0000-4000-8000-000000000002","beneficiary_id":"11000000-0000-4000-8000-000000000002","wallet_id":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","amount":"50000","currency":{"code":"UGX","scale":"0"},"provider_reference":"AIR731905","wallet_transaction_id":"dddddddd-dddd-4ddd-8ddd-dddddddddd02","created_at":"2026-08-23T14:20:00Z","completed_at":"2026-08-23T14:21:00Z","mobile_money_type":"payout","network":{"id":"10000000-0000-4000-8000-000000000002","code":"AIRTEL","name":"Airtel Money","currency":{"code":"UGX","scale":"0"},"capabilities":{"collections":true,"payouts":true,"account_verification":true}},"outbound_quote_id":"12000000-0000-4000-8000-000000000012","outbound_pricing":{"fee_mode":"sender_absorbs","recipient_amount":"50000","processing_fee":"500","total_fees":"500","pricing_scope":"customer_totals","customer_debit":"50500"}}
             ]
             """
         )
@@ -214,8 +214,8 @@ enum AppStoreScreenshotFixture {
         decode(
             """
             [
-              {"id":"15000000-0000-4000-8000-000000000001","reference":"BANK-240826-1842","type":"bank_transfer","direction":"outbound","status":"completed","submission_stage":"completed","bank_id":"13000000-0000-4000-8000-000000000001","beneficiary_id":"14000000-0000-4000-8000-000000000001","wallet_id":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","amount":"275000","currency":{"code":"UGX","scale":"0"},"provider_reference":"STB420184","wallet_transaction_id":"dddddddd-dddd-4ddd-8ddd-dddddddddd03","created_at":"2026-08-24T07:30:00Z","completed_at":"2026-08-24T07:31:00Z"},
-              {"id":"15000000-0000-4000-8000-000000000002","reference":"BANK-220826-3390","type":"bank_transfer","direction":"outbound","status":"completed","submission_stage":"completed","bank_id":"13000000-0000-4000-8000-000000000002","beneficiary_id":"14000000-0000-4000-8000-000000000002","wallet_id":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","amount":"640000","currency":{"code":"UGX","scale":"0"},"provider_reference":"CEN739184","wallet_transaction_id":"dddddddd-dddd-4ddd-8ddd-dddddddddd04","created_at":"2026-08-22T11:05:00Z","completed_at":"2026-08-22T11:06:00Z"}
+              {"id":"15000000-0000-4000-8000-000000000001","reference":"BANK-240826-1842","type":"bank_transfer","direction":"outbound","status":"completed","submission_stage":"completed","bank_id":"13000000-0000-4000-8000-000000000001","beneficiary_id":"14000000-0000-4000-8000-000000000001","wallet_id":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","amount":"275000","outbound_pricing":{"fee_mode":"sender_absorbs","recipient_amount":"275000","processing_fee":"0","total_fees":"0","pricing_scope":"customer_totals","customer_debit":"275000"},"currency":{"code":"UGX","scale":"0"},"provider_reference":"STB420184","wallet_transaction_id":"dddddddd-dddd-4ddd-8ddd-dddddddddd03","created_at":"2026-08-24T07:30:00Z","completed_at":"2026-08-24T07:31:00Z"},
+              {"id":"15000000-0000-4000-8000-000000000002","reference":"BANK-220826-3390","type":"bank_transfer","direction":"outbound","status":"completed","submission_stage":"completed","bank_id":"13000000-0000-4000-8000-000000000002","beneficiary_id":"14000000-0000-4000-8000-000000000002","wallet_id":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","amount":"640000","outbound_pricing":{"fee_mode":"sender_absorbs","recipient_amount":"640000","processing_fee":"0","total_fees":"0","pricing_scope":"customer_totals","customer_debit":"640000"},"currency":{"code":"UGX","scale":"0"},"provider_reference":"CEN739184","wallet_transaction_id":"dddddddd-dddd-4ddd-8ddd-dddddddddd04","created_at":"2026-08-22T11:05:00Z","completed_at":"2026-08-22T11:06:00Z"}
             ]
             """
         )
@@ -347,9 +347,9 @@ enum AppStoreScreenshotFixture {
 
     private static var transactions: [WalletTransaction] {
         [
-            transaction(1, amount: "150000", type: "mobile_money", direction: "credit", name: "MTN Mobile Money", note: "Money added", hour: 8),
-            transaction(2, amount: "75000", type: "transfer", direction: "debit", name: "Amina Demo", note: "Market delivery", hour: 7),
-            transaction(3, amount: "320000", type: "transfer", direction: "credit", name: "Brian Sample", note: "Project contribution", hour: 6),
+            transaction(1, amount: "149500", type: "bank_deposit", direction: "credit", name: "MTN Mobile Money", note: "Money added", hour: 8),
+            transaction(2, amount: "50500", type: "bank_withdrawal", direction: "debit", name: "Amina Demo", note: "Airtel Money", hour: 7),
+            transaction(3, amount: "320000", type: "internal_transfer", direction: "credit", name: "Brian Sample", note: "Project contribution", hour: 6),
             transaction(4, amount: "45000", type: "airtime", direction: "debit", name: "Airtime", note: "+256 759 ••• 200", hour: 5),
             transaction(5, amount: "275000", type: "bank_transfer", direction: "debit", name: "Stanbic Bank Uganda", note: "Amina Demo", hour: 4),
             transaction(6, amount: "85000", type: "bill_payment", direction: "debit", name: "NWSC", note: "Water bill", hour: 3),
@@ -413,6 +413,10 @@ enum AppStoreScreenshotFixture {
             walletId: walletID,
             reference: String(format: "KIT-240826-%04d", 4100 + index),
             amount: amount,
+            totals: CustomerTransactionTotals(
+                added: direction == "credit" ? amount : "0",
+                deducted: direction == "debit" ? amount : "0"
+            ),
             currency: currency,
             type: type,
             direction: direction,

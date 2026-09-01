@@ -591,20 +591,30 @@ final class PaymentRailContractTests: XCTestCase {
         )
     }
 
-    func testMobileMoneyHistoryUsesExactWalletTransactionIdentityWhenAvailable() {
+    func testMobileMoneyHistoryUsesExactWalletTransactionIdentityWhenAvailable() throws {
+        let pricing = MobileMoneyOutboundPricingDTO(
+            feeMode: .senderAbsorbs,
+            recipientAmount: "500.00",
+            processingFee: "150.00",
+            totalFees: "150.00",
+            pricingScope: CustomerPricingContract.scope,
+            customerDebit: "650.00"
+        )
         let operation = mobileMoneyOperation(
             status: "succeeded",
             type: "payout",
             failureCode: "",
-            walletTransactionId: "wallet-transaction-exact"
+            walletTransactionId: "wallet-transaction-exact",
+            outboundPricing: pricing
         )
         let decoy = WalletTransaction(
             id: "wallet-transaction-decoy",
             walletId: operation.walletId,
             reference: operation.reference,
             amount: "999.00",
+            totals: CustomerTransactionTotals(added: "0", deducted: "999.00"),
             currency: operation.currency,
-            type: "transfer",
+            type: "internal_transfer",
             direction: "debit",
             status: "completed",
             counterparty: nil,
@@ -616,8 +626,9 @@ final class PaymentRailContractTests: XCTestCase {
             walletId: operation.walletId,
             reference: "LEDGER-REFERENCE",
             amount: "650.00",
+            totals: CustomerTransactionTotals(added: "0", deducted: "650.00"),
             currency: operation.currency,
-            type: "mobile_money_payout",
+            type: "bank_withdrawal",
             direction: "debit",
             status: "completed",
             counterparty: nil,
@@ -625,17 +636,37 @@ final class PaymentRailContractTests: XCTestCase {
             occurredAt: "2026-08-19T12:00:10Z"
         )
 
-        let presented = MobileMoneyTransactionPresentation.transaction(
+        let presented = try XCTUnwrap(MobileMoneyTransactionPresentation.transaction(
             for: operation,
             accounts: [],
             walletTransactions: [decoy, exact]
-        )
+        ))
 
         XCTAssertEqual(presented, exact)
         XCTAssertNotEqual(presented, decoy)
+
+        let wrongAmountForExactID = WalletTransaction(
+            id: exact.id,
+            walletId: exact.walletId,
+            reference: exact.reference,
+            amount: "651.00",
+            totals: CustomerTransactionTotals(added: "0", deducted: "651.00"),
+            currency: exact.currency,
+            type: exact.type,
+            direction: exact.direction,
+            status: exact.status,
+            counterparty: nil,
+            note: nil,
+            occurredAt: exact.occurredAt
+        )
+        XCTAssertNil(MobileMoneyTransactionPresentation.transaction(
+            for: operation,
+            accounts: [],
+            walletTransactions: [wrongAmountForExactID]
+        ))
     }
 
-    func testPendingMobileMoneyHistoryUsesStableOperationBoundTransactionFallback() {
+    func testPendingMobileMoneyHistoryUsesStableOperationBoundTransactionFallback() throws {
         let accountID = "33333333-3333-4333-8333-333333333333"
         let network = MobileMoneyNetworkDTO(
             id: "network-airtel",
@@ -657,15 +688,9 @@ final class PaymentRailContractTests: XCTestCase {
             feeMode: .senderAbsorbs,
             recipientAmount: "500.00",
             processingFee: "150.00",
-            providerFee: "150.00",
-            kitFee: "0.00",
-            providerFeeCap: "150.00",
-            maximumProviderTotal: "650.00",
-            customerDebit: "650.00",
-            kitDebit: "0.00",
-            scheduleVersion: "v1",
-            actualProviderFee: nil,
-            actualProviderTotal: nil
+            totalFees: "150.00",
+            pricingScope: CustomerPricingContract.scope,
+            customerDebit: "650.00"
         )
         let operation = mobileMoneyOperation(
             status: "processing",
@@ -675,19 +700,93 @@ final class PaymentRailContractTests: XCTestCase {
             outboundPricing: pricing
         )
 
-        let presented = MobileMoneyTransactionPresentation.transaction(
+        let presented = try XCTUnwrap(MobileMoneyTransactionPresentation.transaction(
             for: operation,
             accounts: [beneficiary],
             walletTransactions: []
-        )
+        ))
 
         XCTAssertEqual(presented.id, "mobile-money-operation:\(operation.id)")
         XCTAssertEqual(presented.walletId, operation.walletId)
         XCTAssertEqual(presented.reference, operation.reference)
         XCTAssertEqual(presented.amount, "650.00")
+        XCTAssertEqual(presented.totals?.added, "0")
+        XCTAssertEqual(presented.totals?.deducted, "650.00")
+        XCTAssertEqual(presented.type, "bank_withdrawal")
+        XCTAssertTrue(CustomerTransactionPresentationPolicy.isCustomerVisible(presented))
         XCTAssertEqual(presented.direction, "debit")
         XCTAssertEqual(presented.counterparty?.id, beneficiary.id)
         XCTAssertEqual(presented.counterparty?.name, beneficiary.accountName)
+
+        let unsafeScope = mobileMoneyOperation(
+            status: "processing",
+            type: "payout",
+            failureCode: "",
+            beneficiaryId: accountID,
+            outboundPricing: pricing,
+            pricingScope: "institutional_split"
+        )
+        XCTAssertNil(unsafeScope.customerTransactionFee)
+        XCTAssertNil(MobileMoneyTransactionPresentation.transaction(
+            for: unsafeScope,
+            accounts: [beneficiary],
+            walletTransactions: []
+        ))
+    }
+
+    func testMobileMoneyHistoryRejectsInternalAndUnverifiedOperationShapes() {
+        let safe = mobileMoneyOperation(
+            status: "succeeded",
+            type: "collection",
+            failureCode: "",
+            amount: "517.00",
+            totalFees: "17.00",
+            netAmount: "500.00",
+            pricingScope: CustomerPricingContract.scope
+        )
+        XCTAssertTrue(MobileMoneyOperationPresentationPolicy.isCustomerVisible(safe))
+
+        let internalType = mobileMoneyOperation(
+            status: "succeeded",
+            type: "collection",
+            failureCode: "",
+            operationType: "operator_provider_fee_funding",
+            amount: "517.00",
+            totalFees: "17.00",
+            netAmount: "500.00",
+            pricingScope: CustomerPricingContract.scope
+        )
+        let wrongDirection = mobileMoneyOperation(
+            status: "succeeded",
+            type: "collection",
+            failureCode: "",
+            direction: "outbound",
+            amount: "517.00",
+            totalFees: "17.00",
+            netAmount: "500.00",
+            pricingScope: CustomerPricingContract.scope
+        )
+        let principalOnlyLegacy = mobileMoneyOperation(
+            status: "succeeded",
+            type: "collection",
+            failureCode: "",
+            amount: "500.00"
+        )
+
+        for operation in [internalType, wrongDirection, principalOnlyLegacy] {
+            XCTAssertFalse(MobileMoneyOperationPresentationPolicy.isCustomerVisible(operation))
+            XCTAssertNil(MobileMoneyTransactionPresentation.transaction(
+                for: operation,
+                accounts: [],
+                walletTransactions: []
+            ))
+        }
+        XCTAssertEqual(
+            MobileMoneyOperationPresentationPolicy.customerVisibleOperations(
+                [internalType, safe, wrongDirection, principalOnlyLegacy]
+            ).map(\.id),
+            [safe.id]
+        )
     }
 
     private let unitedStates = Locale(identifier: "en_US")
@@ -777,6 +876,98 @@ final class PaymentRailContractTests: XCTestCase {
         XCTAssertEqual(
             KitMoney.signed("1250000", currency: currency, direction: "hold", locale: unitedStates),
             "UGX 1,250,000"
+        )
+    }
+
+    func testCustomerHistoryUsesCombinedTotalsWithoutExposingAccountingLegs() throws {
+        let transaction: WalletTransaction = try decode(
+            """
+            {
+              "id":"11111111-1111-4111-8111-111111111111",
+              "wallet_id":"22222222-2222-4222-8222-222222222222",
+              "reference":"KWB-CUSTOMER-TRANSFER",
+              "amount":"56000.00",
+              "totals":{"added":"0.00","deducted":"56000.00"},
+              "currency":{"code":"UGX","scale":"2"},
+              "type":"bank_transfer",
+              "direction":" DEBIT ",
+              "status":"completed",
+              "counterparty":null,
+              "note":null,
+              "claim":null,
+              "occurred_at":"2026-08-31T12:00:00Z"
+            }
+            """
+        )
+
+        XCTAssertEqual(transaction.customerAmountAdded, "0.00")
+        XCTAssertEqual(transaction.customerAmountDeducted, "56000.00")
+        XCTAssertEqual(transaction.customerImpactLabel, "Money Deducted")
+        XCTAssertEqual(transaction.customerImpactAmount, "56000.00")
+        XCTAssertTrue(CustomerTransactionPresentationPolicy.isCustomerVisible(transaction))
+
+        let receipt = try XCTUnwrap(
+            KitReceiptContent.from(transaction: transaction, senderName: "Kit Customer")
+        )
+        XCTAssertEqual(receipt.headlineAmount, "UGX 56,000")
+        XCTAssertEqual(receipt.directionLine, "Money deducted")
+        XCTAssertEqual(
+            receipt.rows.first(where: { $0.label == "Money Deducted" })?.value,
+            "UGX 56,000"
+        )
+        XCTAssertNil(receipt.rows.first(where: { $0.label == "Wallet" }))
+        XCTAssertFalse(receipt.rows.contains(where: {
+            $0.value == "22222222-2222-4222-8222-222222222222"
+        }))
+        XCTAssertFalse(receipt.shareMessage.contains("Kit Pay user"))
+
+        let internalEntry = WalletTransaction(
+            id: transaction.id,
+            walletId: transaction.walletId,
+            reference: transaction.reference,
+            amount: transaction.amount,
+            totals: transaction.totals,
+            currency: transaction.currency,
+            type: "institutional_commission",
+            direction: transaction.direction,
+            status: transaction.status,
+            counterparty: transaction.counterparty,
+            note: transaction.note,
+            claim: transaction.claim,
+            occurredAt: transaction.occurredAt
+        )
+        XCTAssertNil(
+            KitReceiptContent.from(transaction: internalEntry, senderName: "Kit Customer")
+        )
+    }
+
+    func testLegacyCustomerHistoryAndReceiptFailClosedWithoutCombinedTotals() throws {
+        let transaction: WalletTransaction = try decode(
+            """
+            {
+              "id":"11111111-1111-4111-8111-111111111112",
+              "wallet_id":"22222222-2222-4222-8222-222222222222",
+              "reference":"LEGACY-CREDIT",
+              "amount":"1000.00",
+              "currency":{"code":"UGX","scale":"2"},
+              "type":"bank_deposit",
+              "direction":"credit",
+              "status":"completed",
+              "counterparty":null,
+              "note":null,
+              "claim":null,
+              "occurred_at":"2026-08-31T12:00:00Z"
+            }
+            """
+        )
+
+        XCTAssertNil(transaction.totals)
+        XCTAssertEqual(transaction.customerAmountAdded, "0")
+        XCTAssertEqual(transaction.customerAmountDeducted, "0")
+        XCTAssertEqual(transaction.customerImpactLabel, "Money Added")
+        XCTAssertFalse(CustomerTransactionPresentationPolicy.isCustomerVisible(transaction))
+        XCTAssertNil(
+            KitReceiptContent.from(transaction: transaction, senderName: "Kit Customer")
         )
     }
 
@@ -1132,15 +1323,90 @@ final class PaymentRailContractTests: XCTestCase {
         XCTAssertEqual(quote.providerAmount, "517.00")
         XCTAssertEqual(quote.totalFees, "17.00")
         XCTAssertEqual(quote.walletCredit, "500.00")
-        XCTAssertEqual(quote.roundingAdjustment, "0.45")
-        XCTAssertTrue(quote.providerFeeEstimated)
         XCTAssertFalse(quote.isExpired)
         XCTAssertEqual(quote.stepUp.purpose, "mobile_money_collection")
         XCTAssertEqual(quote.stepUp.intent["quote_id"], quote.id)
+        XCTAssertTrue(quote.hasValidStepUpBinding)
+        let customerFields = Set(Mirror(reflecting: quote).children.compactMap(\.label))
+        XCTAssertTrue(customerFields.isDisjoint(with: [
+            "providerFee", "platformFee", "roundingAdjustment", "providerFeeEstimated",
+        ]))
 
         let operation = try jsonObject(CreateQuotedMobileMoneyCollectionRequest(quoteId: quote.id))
         XCTAssertEqual(operation["quote_id"] as? String, quote.id)
         XCTAssertEqual(Set(operation.keys), ["quote_id"])
+    }
+
+    func testAggregateOnlyCollectionQuoteRejectsUnknownScopeAndStepUpExtras() throws {
+        let json =
+            """
+            {
+              "id":"11111111-1111-1111-1111-111111111111",
+              "action":"collection",
+              "fee_mode":"gross_up",
+              "wallet_id":"22222222-2222-2222-2222-222222222222",
+              "account_id":"33333333-3333-3333-3333-333333333333",
+              "network":"MTN",
+              "requested_amount":"500.00",
+              "provider_amount":"517.00",
+              "total_fees":"17.00",
+              "wallet_credit":"500.00",
+              "pricing_scope":"customer_totals",
+              "currency":{"code":"UGX","scale":"2"},
+              "expires_at":"2099-08-18T12:05:00Z",
+              "step_up":{
+                "purpose":"mobile_money_collection",
+                "intent":{
+                  "action":"collection",
+                  "quote_id":"11111111-1111-1111-1111-111111111111",
+                  "wallet_id":"22222222-2222-2222-2222-222222222222",
+                  "mobile_money_account_id":"33333333-3333-3333-3333-333333333333",
+                  "network":"MTN",
+                  "fee_mode":"gross_up",
+                  "requested_amount":"500.00",
+                  "provider_amount":"517.00",
+                  "total_fees":"17.00",
+                  "wallet_credit":"500.00",
+                  "currency":"UGX"
+                }
+              }
+            }
+            """
+        let quote: MobileMoneyCollectionQuoteDTO = try decode(json)
+
+        XCTAssertEqual(quote.pricingScope, CustomerPricingContract.scope)
+        XCTAssertTrue(quote.hasConsistentCustomerAmounts)
+        XCTAssertTrue(quote.hasValidStepUpBinding)
+
+        let unknownScope: MobileMoneyCollectionQuoteDTO = try decode(
+            json.replacingOccurrences(of: "customer_totals", with: "institutional_split")
+        )
+        XCTAssertFalse(unknownScope.hasConsistentCustomerAmounts)
+
+        let wrongFeeTreatment: MobileMoneyCollectionQuoteDTO = try decode(
+            json.replacingOccurrences(of: "gross_up", with: "inclusive")
+        )
+        XCTAssertFalse(wrongFeeTreatment.hasConsistentCustomerAmounts)
+
+        let inclusive: MobileMoneyCollectionQuoteDTO = try decode(
+            json
+                .replacingOccurrences(of: "gross_up", with: "inclusive")
+                .replacingOccurrences(
+                    of: "\"provider_amount\":\"517.00\"",
+                    with: "\"provider_amount\":\"500.00\""
+                )
+                .replacingOccurrences(
+                    of: "\"wallet_credit\":\"500.00\"",
+                    with: "\"wallet_credit\":\"483.00\""
+                )
+        )
+        XCTAssertTrue(inclusive.hasConsistentCustomerAmounts)
+        XCTAssertTrue(inclusive.hasValidStepUpBinding)
+
+        let unknownIntentKey: MobileMoneyCollectionQuoteDTO = try decode(
+            json.replacingOccurrences(of: "\"intent\":{", with: "\"intent\":{\"private_margin\":\"1.00\",")
+        )
+        XCTAssertFalse(unknownIntentKey.hasValidStepUpBinding)
     }
 
     func testPayoutQuoteRequestUsesExplicitFeePayerAndWholeUGXAmount() throws {
@@ -1199,8 +1465,6 @@ final class PaymentRailContractTests: XCTestCase {
         XCTAssertEqual(quote.feeMode, .beneficiaryAbsorbs)
         XCTAssertEqual(quote.enteredAmount, "500.00")
         XCTAssertEqual(quote.recipientAmount, "350.00")
-        XCTAssertEqual(quote.providerFee, "100.00")
-        XCTAssertEqual(quote.kitFee, "50.00")
         XCTAssertEqual(quote.customerDebit, "500.00")
         XCTAssertTrue(quote.hasConsistentAmounts)
 
@@ -1208,35 +1472,21 @@ final class PaymentRailContractTests: XCTestCase {
             feeMode: quote.feeMode,
             recipientAmount: quote.recipientAmount,
             processingFee: quote.processingFee,
-            providerFee: quote.providerFee,
-            kitFee: quote.kitFee,
-            providerFeeCap: quote.providerFeeCap,
-            maximumProviderTotal: quote.maximumProviderTotal,
-            customerDebit: quote.customerDebit,
-            kitDebit: quote.kitDebit,
-            scheduleVersion: quote.scheduleVersion,
-            actualProviderFee: nil,
-            actualProviderTotal: nil
+            customerDebit: quote.customerDebit
         )
         XCTAssertTrue(pricing.hasConsistentAmounts)
         XCTAssertTrue(pricing.matches(quote))
 
-        let forgedFeeSplit = MobileMoneyOutboundPricingDTO(
+        let aggregatePricing = MobileMoneyOutboundPricingDTO(
             feeMode: quote.feeMode,
             recipientAmount: quote.recipientAmount,
             processingFee: quote.processingFee,
-            providerFee: "99.00",
-            kitFee: "51.00",
-            providerFeeCap: quote.providerFeeCap,
-            maximumProviderTotal: quote.maximumProviderTotal,
-            customerDebit: quote.customerDebit,
-            kitDebit: quote.kitDebit,
-            scheduleVersion: quote.scheduleVersion,
-            actualProviderFee: nil,
-            actualProviderTotal: nil
+            totalFees: quote.processingFee,
+            pricingScope: CustomerPricingContract.scope,
+            customerDebit: quote.customerDebit
         )
-        XCTAssertFalse(forgedFeeSplit.hasConsistentAmounts)
-        XCTAssertFalse(forgedFeeSplit.matches(quote))
+        XCTAssertTrue(aggregatePricing.hasConsistentAmounts)
+        XCTAssertTrue(aggregatePricing.matches(quote))
     }
 
     func testPayoutQuoteBindsRecipientFeeAndExactDebitToStepUp() throws {
@@ -1289,8 +1539,6 @@ final class PaymentRailContractTests: XCTestCase {
         XCTAssertEqual(quote.feeMode, .senderAbsorbs)
         XCTAssertEqual(quote.recipientAmount, "500.00")
         XCTAssertEqual(quote.processingFee, "1500.00")
-        XCTAssertEqual(quote.providerFee, quote.providerFeeCap)
-        XCTAssertEqual(quote.kitFee, "0.00")
         XCTAssertEqual(quote.customerDebit, "2000.00")
         XCTAssertTrue(quote.scheduleVerified)
         XCTAssertTrue(quote.hasConsistentAmounts)
@@ -1298,10 +1546,74 @@ final class PaymentRailContractTests: XCTestCase {
         XCTAssertEqual(quote.stepUp.purpose, "mobile_money_payout")
         XCTAssertEqual(quote.stepUp.intent["quote_id"], quote.id)
         XCTAssertEqual(quote.stepUp.intent["customer_debit"], quote.customerDebit)
+        XCTAssertTrue(quote.hasValidStepUpBinding)
+        let customerFields = Set(Mirror(reflecting: quote).children.compactMap(\.label))
+        XCTAssertTrue(customerFields.isDisjoint(with: [
+            "providerFee", "kitFee", "providerFeeCap", "maximumProviderTotal", "kitDebit",
+            "scheduleVersion",
+        ]))
 
         let operation = try jsonObject(CreateQuotedMobileMoneyPayoutRequest(quoteId: quote.id))
         XCTAssertEqual(operation["quote_id"] as? String, quote.id)
         XCTAssertEqual(Set(operation.keys), ["quote_id"])
+    }
+
+    func testAggregateOnlyPayoutQuoteRejectsConflictingTotalsScopeAndStepUpExtras() throws {
+        let json =
+            """
+            {
+              "id":"11111111-1111-1111-1111-111111111111",
+              "action":"payout",
+              "fee_mode":"sender_absorbs",
+              "wallet_id":"22222222-2222-2222-2222-222222222222",
+              "account_id":"33333333-3333-3333-3333-333333333333",
+              "network":"MTN",
+              "recipient_amount":"500.00",
+              "processing_fee":"1500.00",
+              "total_fees":"1500.00",
+              "customer_debit":"2000.00",
+              "pricing_scope":"customer_totals",
+              "schedule_verified":true,
+              "currency":{"code":"UGX","scale":"2"},
+              "expires_at":"2099-08-18T12:05:00Z",
+              "step_up":{
+                "purpose":"mobile_money_payout",
+                "intent":{
+                  "action":"payout",
+                  "quote_id":"11111111-1111-1111-1111-111111111111",
+                  "wallet_id":"22222222-2222-2222-2222-222222222222",
+                  "mobile_money_account_id":"33333333-3333-3333-3333-333333333333",
+                  "network":"MTN",
+                  "fee_mode":"sender_absorbs",
+                  "recipient_amount":"500.00",
+                  "processing_fee":"1500.00",
+                  "customer_debit":"2000.00",
+                  "currency":"UGX"
+                }
+              }
+            }
+            """
+        let quote: MobileMoneyPayoutQuoteDTO = try decode(json)
+
+        XCTAssertEqual(quote.totalFees, "1500.00")
+        XCTAssertEqual(quote.pricingScope, CustomerPricingContract.scope)
+        XCTAssertTrue(quote.hasConsistentAmounts)
+        XCTAssertTrue(quote.hasValidStepUpBinding)
+
+        let mismatchedTotal: MobileMoneyPayoutQuoteDTO = try decode(
+            json.replacingOccurrences(of: "\"total_fees\":\"1500.00\"", with: "\"total_fees\":\"1499.00\"")
+        )
+        XCTAssertFalse(mismatchedTotal.hasConsistentAmounts)
+
+        let unknownScope: MobileMoneyPayoutQuoteDTO = try decode(
+            json.replacingOccurrences(of: "customer_totals", with: "institutional_split")
+        )
+        XCTAssertFalse(unknownScope.hasConsistentAmounts)
+
+        let unknownIntentKey: MobileMoneyPayoutQuoteDTO = try decode(
+            json.replacingOccurrences(of: "\"intent\":{", with: "\"intent\":{\"private_margin\":\"1.00\",")
+        )
+        XCTAssertFalse(unknownIntentKey.hasValidStepUpBinding)
     }
 
     func testKitCoveredPayoutStillPreservesFullRecipientAmount() throws {
@@ -1333,7 +1645,6 @@ final class PaymentRailContractTests: XCTestCase {
 
         XCTAssertEqual(quote.feeMode, .kitCovers)
         XCTAssertEqual(quote.recipientAmount, quote.customerDebit)
-        XCTAssertEqual(quote.processingFee, quote.kitDebit)
         XCTAssertTrue(quote.hasConsistentAmounts)
     }
 
@@ -1351,19 +1662,19 @@ final class PaymentRailContractTests: XCTestCase {
     }
 
     func testMobileMoneyOperationDecodesNullableProviderFields() throws {
-        let operation: MobileMoneyOperationDTO = try decode(
+        let json =
             """
             {
               "id":"11111111-1111-1111-1111-111111111111",
               "reference":"MM-1",
               "type":"deposit",
-              "direction":"credit",
+              "direction":"inbound",
               "status":"pending",
               "submission_stage":null,
               "bank_id":"22222222-2222-2222-2222-222222222222",
               "beneficiary_id":null,
               "wallet_id":"33333333-3333-3333-3333-333333333333",
-              "amount":"1000.00",
+              "amount":"517.00",
               "currency":{"code":"UGX","scale":"2"},
               "provider_reference":null,
               "wallet_transaction_id":null,
@@ -1374,11 +1685,12 @@ final class PaymentRailContractTests: XCTestCase {
               "fee_quote_id":"44444444-4444-4444-4444-444444444444",
               "fee_mode":"gross_up",
               "requested_amount":"500.00",
-              "provider_fee":"12.93",
-              "platform_fee":"3.62",
-              "rounding_adjustment":"0.45",
+              "provider_fee":"17.00",
+              "platform_fee":"0.00",
+              "rounding_adjustment":"0.00",
               "total_fees":"17.00",
               "net_amount":"500.00",
+              "pricing_scope":"customer_totals",
               "network":{
                 "id":"22222222-2222-2222-2222-222222222222",
                 "code":"MTN",
@@ -1388,16 +1700,34 @@ final class PaymentRailContractTests: XCTestCase {
               }
             }
             """
-        )
+        let operation: MobileMoneyOperationDTO = try decode(json)
         XCTAssertEqual(operation.mobileMoneyType, "collection")
-        XCTAssertEqual(operation.amount, "1000.00")
+        XCTAssertEqual(operation.amount, "517.00")
         XCTAssertFalse(operation.isTerminal)
         XCTAssertNil(operation.providerReference)
         XCTAssertEqual(operation.feeMode, .grossUp)
         XCTAssertEqual(operation.netAmount, "500.00")
         XCTAssertEqual(operation.totalFees, "17.00")
+        XCTAssertEqual(operation.pricingScope, CustomerPricingContract.scope)
         XCTAssertEqual(operation.customerTransactionFee, "17.00")
+        XCTAssertEqual(operation.customerImpactLabel, "Money Added")
+        XCTAssertEqual(operation.customerImpactAmount, "500.00")
         XCTAssertNil(operation.outboundPricing)
+
+        let untrusted: MobileMoneyOperationDTO = try decode(
+            json.replacingOccurrences(of: "customer_totals", with: "institutional_split")
+        )
+        XCTAssertNil(untrusted.customerTransactionFee)
+        XCTAssertNil(untrusted.customerImpactAmount)
+
+        let inconsistent: MobileMoneyOperationDTO = try decode(
+            json.replacingOccurrences(
+                of: "\"net_amount\":\"500.00\"",
+                with: "\"net_amount\":\"499.00\""
+            )
+        )
+        XCTAssertNil(inconsistent.customerTransactionFee)
+        XCTAssertNil(inconsistent.customerImpactAmount)
     }
 
     func testMobileMoneyOperationDecodesLegacyResponseWithoutFeeFields() throws {
@@ -1439,6 +1769,9 @@ final class PaymentRailContractTests: XCTestCase {
         XCTAssertNil(operation.netAmount)
         XCTAssertNil(operation.outboundQuoteId)
         XCTAssertNil(operation.outboundPricing)
+        XCTAssertNil(operation.customerImpactLabel)
+        XCTAssertNil(operation.customerImpactAmount)
+        XCTAssertFalse(MobileMoneyOperationPresentationPolicy.isCustomerVisible(operation))
     }
 
     func testMobileMoneyOperationRefreshPolicyPollsPendingRowsWithBoundedBackoff() {
@@ -1645,6 +1978,8 @@ final class PaymentRailContractTests: XCTestCase {
                 "fee_mode":"sender_absorbs",
                 "recipient_amount":"500.00",
                 "processing_fee":"10.00",
+                "total_fees":"10.00",
+                "pricing_scope":"customer_totals",
                 "provider_fee":"10.00",
                 "kit_fee":"0.00",
                 "provider_fee_cap":"10.00",
@@ -1672,13 +2007,36 @@ final class PaymentRailContractTests: XCTestCase {
         XCTAssertEqual(operation.outboundPricing?.feeMode, .senderAbsorbs)
         XCTAssertEqual(operation.outboundPricing?.recipientAmount, "500.00")
         XCTAssertEqual(operation.outboundPricing?.processingFee, "10.00")
-        XCTAssertEqual(operation.outboundPricing?.providerFee, "10.00")
-        XCTAssertEqual(operation.outboundPricing?.kitFee, "0.00")
+        XCTAssertEqual(operation.outboundPricing?.totalFees, "10.00")
+        XCTAssertEqual(operation.outboundPricing?.pricingScope, CustomerPricingContract.scope)
         XCTAssertEqual(operation.customerTransactionFee, "10.00")
         XCTAssertEqual(operation.outboundPricing?.customerDebit, "510.00")
-        XCTAssertEqual(operation.outboundPricing?.scheduleVersion, "rukapay-v8-20260818")
-        XCTAssertNil(operation.outboundPricing?.actualProviderFee)
-        XCTAssertNil(operation.outboundPricing?.actualProviderTotal)
+        XCTAssertEqual(operation.customerImpactLabel, "Money Deducted")
+        XCTAssertEqual(operation.customerImpactAmount, "510.00")
+        let customerFields = Set(
+            Mirror(reflecting: try XCTUnwrap(operation.outboundPricing)).children.compactMap(\.label)
+        )
+        XCTAssertTrue(customerFields.isDisjoint(with: [
+            "providerFee", "kitFee", "providerFeeCap", "maximumProviderTotal", "kitDebit",
+            "actualProviderFee", "actualProviderTotal", "scheduleVersion",
+        ]))
+
+        let untrustedPricing = MobileMoneyOutboundPricingDTO(
+            feeMode: .senderAbsorbs,
+            recipientAmount: "500.00",
+            processingFee: "10.00",
+            totalFees: "10.00",
+            pricingScope: "institutional_split",
+            customerDebit: "510.00"
+        )
+        let untrusted = mobileMoneyOperation(
+            status: "pending",
+            type: MobileMoneyAction.payout.rawValue,
+            failureCode: "",
+            outboundPricing: untrustedPricing
+        )
+        XCTAssertNil(untrusted.customerTransactionFee)
+        XCTAssertNil(untrusted.customerImpactAmount)
     }
 
     func testMerchantQRResolutionAndPaymentModelsDecode() throws {
@@ -1754,22 +2112,29 @@ final class PaymentRailContractTests: XCTestCase {
         status: String,
         type: String,
         failureCode: String,
+        operationType: String? = nil,
+        direction: String? = nil,
         beneficiaryId: String? = nil,
         walletTransactionId: String? = nil,
         outboundPricing: MobileMoneyOutboundPricingDTO? = nil,
-        netAmount: String? = nil
+        amount: String = "500.00",
+        totalFees: String? = nil,
+        netAmount: String? = nil,
+        pricingScope: String? = nil
     ) -> MobileMoneyOperationDTO {
         MobileMoneyOperationDTO(
             id: id,
             reference: "MM-FAILURE",
-            type: type == MobileMoneyAction.collection.rawValue ? "deposit" : "withdrawal",
-            direction: type == MobileMoneyAction.collection.rawValue ? "credit" : "outbound",
+            type: operationType
+                ?? (type == MobileMoneyAction.collection.rawValue ? "deposit" : "withdrawal"),
+            direction: direction
+                ?? (type == MobileMoneyAction.collection.rawValue ? "inbound" : "outbound"),
             status: status,
             submissionStage: status == "failed" ? "terminal" : "awaiting_provider",
             bankId: "22222222-2222-2222-2222-222222222222",
             beneficiaryId: beneficiaryId,
             walletId: walletId,
-            amount: "500.00",
+            amount: amount,
             currency: CurrencyDTO(code: "UGX", scale: "2"),
             providerReference: nil,
             walletTransactionId: walletTransactionId,
@@ -1792,11 +2157,9 @@ final class PaymentRailContractTests: XCTestCase {
             feeQuoteId: nil,
             feeMode: nil,
             requestedAmount: nil,
-            providerFee: nil,
-            platformFee: nil,
-            roundingAdjustment: nil,
-            totalFees: nil,
-            netAmount: netAmount
+            totalFees: totalFees,
+            netAmount: netAmount,
+            pricingScope: pricingScope
         )
     }
 }

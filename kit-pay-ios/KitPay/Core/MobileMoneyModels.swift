@@ -36,13 +36,10 @@ struct MobileMoneyCollectionQuoteDTO: Decodable, Identifiable {
     let network: String
     let requestedAmount: String
     let providerAmount: String
-    let providerFee: String
-    let platformFee: String
-    let roundingAdjustment: String
     let totalFees: String
     let walletCredit: String
+    var pricingScope: String? = nil
     let currency: CurrencyDTO
-    let providerFeeEstimated: Bool
     let expiresAt: String
     let stepUp: MobileMoneyQuoteStepUpDTO
 
@@ -53,12 +50,9 @@ struct MobileMoneyCollectionQuoteDTO: Decodable, Identifiable {
         case accountId = "account_id"
         case requestedAmount = "requested_amount"
         case providerAmount = "provider_amount"
-        case providerFee = "provider_fee"
-        case platformFee = "platform_fee"
-        case roundingAdjustment = "rounding_adjustment"
         case totalFees = "total_fees"
         case walletCredit = "wallet_credit"
-        case providerFeeEstimated = "provider_fee_estimated"
+        case pricingScope = "pricing_scope"
         case expiresAt = "expires_at"
         case stepUp = "step_up"
     }
@@ -66,6 +60,50 @@ struct MobileMoneyCollectionQuoteDTO: Decodable, Identifiable {
     var isExpired: Bool {
         guard let date = ISO8601DateFormatter().date(from: expiresAt) else { return true }
         return date <= Date()
+    }
+
+    var hasConsistentCustomerAmounts: Bool {
+        let locale = Locale(identifier: "en_US_POSIX")
+        guard CustomerPricingContract.accepts(
+            scope: pricingScope,
+            authoritativeTotal: totalFees
+        ),
+              let requested = Decimal(string: requestedAmount, locale: locale), requested > 0,
+              let payment = Decimal(string: providerAmount, locale: locale), payment > 0,
+              let fee = Decimal(string: totalFees, locale: locale), fee >= 0,
+              let credit = Decimal(string: walletCredit, locale: locale), credit > 0
+        else { return false }
+        guard payment == credit + fee else { return false }
+
+        switch feeMode {
+        case .inclusive:
+            return payment == requested
+        case .grossUp:
+            return credit == requested
+        }
+    }
+
+    var hasValidStepUpBinding: Bool {
+        guard stepUp.purpose == MobileMoneyAction.collection.purpose else { return false }
+        let expected = [
+            "action": MobileMoneyAction.collection.rawValue,
+            "quote_id": id,
+            "wallet_id": walletId,
+            "mobile_money_account_id": accountId,
+            "network": network,
+            "fee_mode": feeMode.rawValue,
+            "requested_amount": requestedAmount,
+            "provider_amount": providerAmount,
+            "total_fees": totalFees,
+            "wallet_credit": walletCredit,
+            "currency": currency.code,
+        ]
+        let legacyCompatibilityKeys: Set<String> = [
+            "provider_fee", "platform_fee", "rounding_adjustment",
+        ]
+        let allowedKeys = Set(expected.keys).union(legacyCompatibilityKeys)
+        return Set(stepUp.intent.keys).isSubset(of: allowedKeys)
+            && expected.allSatisfy { stepUp.intent[$0.key] == $0.value }
     }
 }
 
@@ -78,13 +116,9 @@ struct MobileMoneyPayoutQuoteDTO: Decodable, Identifiable {
     let network: String
     let recipientAmount: String
     let processingFee: String
-    let providerFee: String
-    let kitFee: String
-    let providerFeeCap: String
-    let maximumProviderTotal: String
+    var totalFees: String? = nil
+    var pricingScope: String? = nil
     let customerDebit: String
-    let kitDebit: String
-    let scheduleVersion: String
     let scheduleVerified: Bool
     let currency: CurrencyDTO
     let expiresAt: String
@@ -97,13 +131,9 @@ struct MobileMoneyPayoutQuoteDTO: Decodable, Identifiable {
         case accountId = "account_id"
         case recipientAmount = "recipient_amount"
         case processingFee = "processing_fee"
-        case providerFee = "provider_fee"
-        case kitFee = "kit_fee"
-        case providerFeeCap = "provider_fee_cap"
-        case maximumProviderTotal = "maximum_provider_total"
+        case totalFees = "total_fees"
+        case pricingScope = "pricing_scope"
         case customerDebit = "customer_debit"
-        case kitDebit = "kit_debit"
-        case scheduleVersion = "schedule_version"
         case scheduleVerified = "schedule_verified"
         case expiresAt = "expires_at"
         case stepUp = "step_up"
@@ -123,27 +153,47 @@ struct MobileMoneyPayoutQuoteDTO: Decodable, Identifiable {
 
     var hasConsistentAmounts: Bool {
         let locale = Locale(identifier: "en_US_POSIX")
-        guard let recipient = Decimal(string: recipientAmount, locale: locale), recipient > 0,
-              let fee = Decimal(string: processingFee, locale: locale), fee >= 0,
-              let provider = Decimal(string: providerFee, locale: locale), provider >= 0,
-              let kitFeeComponent = Decimal(string: kitFee, locale: locale), kitFeeComponent >= 0,
-              let providerCap = Decimal(string: providerFeeCap, locale: locale), providerCap >= 0,
-              let maximumTotal = Decimal(string: maximumProviderTotal, locale: locale),
-              let customer = Decimal(string: customerDebit, locale: locale), customer > 0,
-              let kit = Decimal(string: kitDebit, locale: locale), kit >= 0,
-              fee == provider + kitFeeComponent,
-              providerCap == provider,
-              maximumTotal == recipient + providerCap
+        guard CustomerPricingContract.accepts(
+            scope: pricingScope,
+            authoritativeTotal: totalFees
+        ),
+              CustomerPricingContract.totalsMatch(totalFees, legacy: processingFee),
+              let recipient = Decimal(string: recipientAmount, locale: locale), recipient > 0,
+              let fee = Decimal(string: totalFees ?? processingFee, locale: locale), fee >= 0,
+              let customer = Decimal(string: customerDebit, locale: locale), customer > 0
         else { return false }
 
         switch feeMode {
         case .senderAbsorbs:
-            return customer == recipient + fee && kit == 0
+            return customer == recipient + fee
         case .beneficiaryAbsorbs:
-            return customer == recipient + fee && kit == 0
+            return customer == recipient + fee
         case .kitCovers:
-            return customer == recipient && kit == providerCap
+            return customer == recipient
         }
+    }
+
+    var hasValidStepUpBinding: Bool {
+        guard stepUp.purpose == MobileMoneyAction.payout.purpose else { return false }
+        let expected = [
+            "action": MobileMoneyAction.payout.rawValue,
+            "quote_id": id,
+            "wallet_id": walletId,
+            "mobile_money_account_id": accountId,
+            "network": network,
+            "fee_mode": feeMode.rawValue,
+            "recipient_amount": recipientAmount,
+            "processing_fee": processingFee,
+            "customer_debit": customerDebit,
+            "currency": currency.code,
+        ]
+        let legacyCompatibilityKeys: Set<String> = [
+            "provider_fee", "kit_fee", "provider_fee_cap", "maximum_provider_total",
+            "kit_debit", "schedule_version",
+        ]
+        let allowedKeys = Set(expected.keys).union(legacyCompatibilityKeys)
+        return Set(stepUp.intent.keys).isSubset(of: allowedKeys)
+            && expected.allSatisfy { stepUp.intent[$0.key] == $0.value }
     }
 }
 
@@ -188,65 +238,48 @@ struct MobileMoneyOutboundPricingDTO: Decodable, Hashable {
     let feeMode: MobileMoneyPayoutFeeMode
     let recipientAmount: String
     let processingFee: String
-    let providerFee: String
-    let kitFee: String
-    let providerFeeCap: String
-    let maximumProviderTotal: String
+    var totalFees: String? = nil
+    var pricingScope: String? = nil
     let customerDebit: String
-    let kitDebit: String
-    let scheduleVersion: String
-    let actualProviderFee: String?
-    let actualProviderTotal: String?
 
     enum CodingKeys: String, CodingKey {
         case feeMode = "fee_mode"
         case recipientAmount = "recipient_amount"
         case processingFee = "processing_fee"
-        case providerFee = "provider_fee"
-        case kitFee = "kit_fee"
-        case providerFeeCap = "provider_fee_cap"
-        case maximumProviderTotal = "maximum_provider_total"
+        case totalFees = "total_fees"
+        case pricingScope = "pricing_scope"
         case customerDebit = "customer_debit"
-        case kitDebit = "kit_debit"
-        case scheduleVersion = "schedule_version"
-        case actualProviderFee = "actual_provider_fee"
-        case actualProviderTotal = "actual_provider_total"
     }
 
     var hasConsistentAmounts: Bool {
         let locale = Locale(identifier: "en_US_POSIX")
-        guard let recipient = Decimal(string: recipientAmount, locale: locale), recipient > 0,
-              let fee = Decimal(string: processingFee, locale: locale), fee >= 0,
-              let provider = Decimal(string: providerFee, locale: locale), provider >= 0,
-              let kitFeeComponent = Decimal(string: kitFee, locale: locale), kitFeeComponent >= 0,
-              let providerCap = Decimal(string: providerFeeCap, locale: locale), providerCap >= 0,
-              let maximumTotal = Decimal(string: maximumProviderTotal, locale: locale),
-              let customer = Decimal(string: customerDebit, locale: locale), customer > 0,
-              let kit = Decimal(string: kitDebit, locale: locale), kit >= 0,
-              fee == provider + kitFeeComponent,
-              providerCap == provider,
-              maximumTotal == recipient + providerCap
+        guard CustomerPricingContract.accepts(
+            scope: pricingScope,
+            authoritativeTotal: totalFees
+        ),
+              CustomerPricingContract.totalsMatch(totalFees, legacy: processingFee),
+              let recipient = Decimal(string: recipientAmount, locale: locale), recipient > 0,
+              let fee = Decimal(string: totalFees ?? processingFee, locale: locale), fee >= 0,
+              let customer = Decimal(string: customerDebit, locale: locale), customer > 0
         else { return false }
 
         switch feeMode {
         case .senderAbsorbs, .beneficiaryAbsorbs:
-            return customer == recipient + fee && kit == 0
+            return customer == recipient + fee
         case .kitCovers:
-            return customer == recipient && kit == providerCap
+            return customer == recipient
         }
     }
 
     func matches(_ quote: MobileMoneyPayoutQuoteDTO) -> Bool {
         feeMode == quote.feeMode
-            && scheduleVersion == quote.scheduleVersion
             && MobileMoneyAmount.amountsMatch(recipientAmount, quote.recipientAmount)
             && MobileMoneyAmount.amountsMatch(processingFee, quote.processingFee)
-            && MobileMoneyAmount.amountsMatch(providerFee, quote.providerFee)
-            && MobileMoneyAmount.amountsMatch(kitFee, quote.kitFee)
-            && MobileMoneyAmount.amountsMatch(providerFeeCap, quote.providerFeeCap)
-            && MobileMoneyAmount.amountsMatch(maximumProviderTotal, quote.maximumProviderTotal)
+            && MobileMoneyAmount.amountsMatch(
+                totalFees ?? processingFee,
+                quote.totalFees ?? quote.processingFee
+            )
             && MobileMoneyAmount.amountsMatch(customerDebit, quote.customerDebit)
-            && MobileMoneyAmount.amountsMatch(kitDebit, quote.kitDebit)
             && hasConsistentAmounts
     }
 }
@@ -358,11 +391,9 @@ struct MobileMoneyOperationDTO: Decodable, Hashable, Identifiable {
     let feeQuoteId: String?
     let feeMode: MobileMoneyFeeMode?
     let requestedAmount: String?
-    let providerFee: String?
-    let platformFee: String?
-    let roundingAdjustment: String?
     let totalFees: String?
     let netAmount: String?
+    var pricingScope: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case id, reference, type, direction, status, amount, currency, failure, network
@@ -380,11 +411,9 @@ struct MobileMoneyOperationDTO: Decodable, Hashable, Identifiable {
         case feeQuoteId = "fee_quote_id"
         case feeMode = "fee_mode"
         case requestedAmount = "requested_amount"
-        case providerFee = "provider_fee"
-        case platformFee = "platform_fee"
-        case roundingAdjustment = "rounding_adjustment"
         case totalFees = "total_fees"
         case netAmount = "net_amount"
+        case pricingScope = "pricing_scope"
     }
 
     var isTerminal: Bool {
@@ -400,16 +429,78 @@ struct MobileMoneyOperationDTO: Decodable, Hashable, Identifiable {
         status.caseInsensitiveCompare("failed") == .orderedSame
     }
 
-    /// The single combined fee disclosed to the customer. Provider, platform, cap, and
-    /// settlement components remain available only for internal response-binding validation.
+    var customerImpactLabel: String? {
+        guard let customerTransactionType =
+            MobileMoneyOperationPresentationPolicy.customerTransactionType(for: self)
+        else { return nil }
+        if customerTransactionType == "bank_deposit" {
+            return "Money Added"
+        }
+        return "Money Deducted"
+    }
+
+    /// Complete customer-visible wallet effect of this operation.
+    ///
+    /// Collections credit the net amount after the single disclosed total fee. Payouts debit the
+    /// aggregate customer amount. A supplied but untrusted pricing shape returns nil so a
+    /// feature-specific history cannot disagree with the authoritative wallet history.
+    var customerImpactAmount: String? {
+        guard let customerTransactionType =
+            MobileMoneyOperationPresentationPolicy.customerTransactionType(for: self)
+        else { return nil }
+        if customerTransactionType == "bank_deposit" {
+            return customerCollectionCredit
+        }
+        guard let pricing = outboundPricing,
+              pricing.pricingScope == CustomerPricingContract.scope,
+              pricing.totalFees != nil,
+              pricing.hasConsistentAmounts,
+              MobileMoneyAmount.amountsMatch(amount, pricing.recipientAmount)
+        else { return nil }
+        // The backend's payout contract is nested under `outbound_pricing`. Some transition
+        // responses also repeat the aggregate at the operation level; if either outer field is
+        // present, require the complete pair to agree with the nested public total.
+        if pricingScope != nil || totalFees != nil {
+            guard pricingScope == CustomerPricingContract.scope,
+                  let totalFees,
+                  CustomerPricingContract.totalsMatch(
+                      totalFees,
+                      legacy: pricing.totalFees ?? pricing.processingFee
+                  )
+            else { return nil }
+        }
+        return pricing.customerDebit
+    }
+
+    private var customerCollectionCredit: String? {
+        guard pricingScope == CustomerPricingContract.scope,
+              let netAmount,
+              let totalFees
+        else { return nil }
+
+        let locale = Locale(identifier: "en_US_POSIX")
+        guard let gross = Decimal(string: amount, locale: locale), gross > 0,
+              let fee = Decimal(string: totalFees, locale: locale), fee >= 0,
+              let credit = Decimal(string: netAmount, locale: locale), credit > 0,
+              gross == credit + fee
+        else { return nil }
+        return netAmount
+    }
+
+    /// The single combined fee disclosed to the customer. Legacy split-shaped keys are
+    /// decode-only compatibility aliases and are never used to present institutional accounting.
     var customerTransactionFee: String? {
+        guard MobileMoneyOperationPresentationPolicy.isCustomerVisible(self) else { return nil }
+
         if mobileMoneyType.caseInsensitiveCompare(MobileMoneyAction.collection.rawValue)
             == .orderedSame {
+            guard customerCollectionCredit != nil else { return nil }
             return totalFees
         }
         if mobileMoneyType.caseInsensitiveCompare(MobileMoneyAction.payout.rawValue)
             == .orderedSame {
-            return outboundPricing?.processingFee
+            guard outboundPricing?.hasConsistentAmounts == true else { return nil }
+            return outboundPricing?.totalFees ?? outboundPricing?.processingFee
         }
         return nil
     }
@@ -425,6 +516,44 @@ struct MobileMoneyOperationDTO: Decodable, Hashable, Identifiable {
         return CustomerFacingPaymentCopy.confirmedMobileMoneyCollectionFailureMessage(
             for: failure.code
         )
+    }
+}
+
+/// Allows only the mobile-money operation shapes emitted by the customer-safe banking API.
+/// Unknown operation types, mismatched directions, and rows without verified aggregate pricing
+/// never enter feature history or produce a receipt.
+enum MobileMoneyOperationPresentationPolicy {
+    static func customerTransactionType(for operation: MobileMoneyOperationDTO) -> String? {
+        let action = normalized(operation.mobileMoneyType)
+        let type = normalized(operation.type)
+        let direction = normalized(operation.direction)
+
+        switch action {
+        case MobileMoneyAction.collection.rawValue:
+            guard type == "deposit", direction == "inbound" else { return nil }
+            return "bank_deposit"
+        case MobileMoneyAction.payout.rawValue:
+            guard ["withdrawal", "bank_transfer"].contains(type), direction == "outbound"
+            else { return nil }
+            return type == "withdrawal" ? "bank_withdrawal" : "bank_transfer"
+        default:
+            return nil
+        }
+    }
+
+    static func isCustomerVisible(_ operation: MobileMoneyOperationDTO) -> Bool {
+        customerTransactionType(for: operation) != nil
+            && operation.customerImpactAmount != nil
+    }
+
+    static func customerVisibleOperations(
+        _ operations: [MobileMoneyOperationDTO]
+    ) -> [MobileMoneyOperationDTO] {
+        operations.filter(isCustomerVisible)
+    }
+
+    private static func normalized(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 }
 
@@ -976,15 +1105,26 @@ enum MobileMoneyTransactionPresentation {
         for operation: MobileMoneyOperationDTO,
         accounts: [MobileMoneyAccountDTO],
         walletTransactions: [WalletTransaction]
-    ) -> WalletTransaction {
+    ) -> WalletTransaction? {
+        guard let customerTransactionType =
+            MobileMoneyOperationPresentationPolicy.customerTransactionType(for: operation)
+        else { return nil }
+        guard let operationAmount = operation.customerImpactAmount else { return nil }
+
         if let walletTransactionID = operation.walletTransactionId?.trimmingCharacters(
             in: .whitespacesAndNewlines
         ),
             !walletTransactionID.isEmpty,
             let exact = walletTransactions.first(where: {
                 $0.id.caseInsensitiveCompare(walletTransactionID) == .orderedSame
-                    && $0.walletId.caseInsensitiveCompare(operation.walletId) == .orderedSame
             }) {
+            guard exact.walletId.caseInsensitiveCompare(operation.walletId) == .orderedSame,
+                  CustomerTransactionPresentationPolicy.isCustomerVisible(exact),
+                  exact.type.caseInsensitiveCompare(customerTransactionType) == .orderedSame,
+                  exact.currency == operation.currency,
+                  exact.customerDirection == (operationIsCollection(operation) ? "credit" : "debit"),
+                  MobileMoneyAmount.amountsMatch(exact.customerImpactAmount, operationAmount)
+            else { return nil }
             return exact
         }
 
@@ -993,14 +1133,10 @@ enum MobileMoneyTransactionPresentation {
                 $0.id.caseInsensitiveCompare(beneficiaryID) == .orderedSame
             }
         }
-        let isCollection = operation.mobileMoneyType.caseInsensitiveCompare(
-            MobileMoneyAction.collection.rawValue
-        ) == .orderedSame
+        let isCollection = operationIsCollection(operation)
         let transactionID = nonBlank(operation.walletTransactionId)
             ?? "mobile-money-operation:\(operation.id)"
-        let amount = isCollection
-            ? operation.netAmount ?? operation.amount
-            : operation.outboundPricing?.customerDebit ?? operation.amount
+        let amount = operationAmount
         let counterpartyName = nonBlank(account?.accountName)
             ?? account?.label
             ?? operation.network.name
@@ -1008,15 +1144,17 @@ enum MobileMoneyTransactionPresentation {
             CustomerFacingPaymentCopy.neutralizedServiceMessage($0)
         } ?? account.map { "\($0.network.name) • \($0.phoneNumberMasked)" }
 
-        return WalletTransaction(
+        let transaction = WalletTransaction(
             id: transactionID,
             walletId: operation.walletId,
             reference: operation.reference,
             amount: amount,
+            totals: CustomerTransactionTotals(
+                added: isCollection ? amount : "0",
+                deducted: isCollection ? "0" : amount
+            ),
             currency: operation.currency,
-            type: operation.type.isEmpty
-                ? "mobile_money_\(operation.mobileMoneyType.lowercased())"
-                : operation.type,
+            type: customerTransactionType,
             direction: isCollection ? "credit" : "debit",
             status: operation.isSuccessful ? "completed" : operation.status,
             counterparty: Counterparty(
@@ -1028,6 +1166,10 @@ enum MobileMoneyTransactionPresentation {
             note: note,
             occurredAt: operation.completedAt ?? operation.createdAt ?? ""
         )
+        guard CustomerTransactionPresentationPolicy.isCustomerVisible(transaction) else {
+            return nil
+        }
+        return transaction
     }
 
     private static func nonBlank(_ value: String?) -> String? {
@@ -1035,6 +1177,12 @@ enum MobileMoneyTransactionPresentation {
               !trimmed.isEmpty
         else { return nil }
         return trimmed
+    }
+
+    private static func operationIsCollection(_ operation: MobileMoneyOperationDTO) -> Bool {
+        operation.mobileMoneyType.caseInsensitiveCompare(
+            MobileMoneyAction.collection.rawValue
+        ) == .orderedSame
     }
 }
 

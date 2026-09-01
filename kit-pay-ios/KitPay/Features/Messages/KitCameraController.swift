@@ -1,6 +1,8 @@
 import AVFoundation
 import Foundation
+import ImageIO
 import UIKit
+import UniformTypeIdentifiers
 
 /// Owns plaintext camera/editor scratch files. Every directory is protected before AVFoundation
 /// receives its output URL, and leftovers from a crash or process termination are removed at the
@@ -67,7 +69,9 @@ enum KitCaptureTemporaryFileStore {
 /// Final artifact produced by the in-app camera. Videos are temporary files the caller owns
 /// (and removes after reading).
 enum KitCameraOutput {
-    case photo(UIImage)
+    /// The exact AVCapturePhoto bytes are retained beside the decoded preview. The preview can
+    /// render immediately; the file is the secure source of truth adopted into Sent Media.
+    case photo(fileURL: URL, mediaType: String, preview: UIImage)
     case video(URL, mediaType: String)
 }
 
@@ -234,7 +238,7 @@ final class KitCameraController: NSObject, ObservableObject, @unchecked Sendable
 
     // MARK: Photo
 
-    func capturePhoto(completion: @escaping (UIImage?) -> Void) {
+    func capturePhoto(completion: @escaping (KitCameraOutput?) -> Void) {
         sessionQueue.async { [weak self] in
             guard let self, self.videoInput != nil else {
                 DispatchQueue.main.async { completion(nil) }
@@ -247,9 +251,9 @@ final class KitCameraController: NSObject, ObservableObject, @unchecked Sendable
                 DispatchQueue.main.sync { flashOn = self.flashEnabled }
                 settings.flashMode = flashOn ? .on : .off
             }
-            let delegate = PhotoCaptureDelegate { [weak self] image in
+            let delegate = PhotoCaptureDelegate { [weak self] result in
                 DispatchQueue.main.async {
-                    completion(image)
+                    completion(result)
                     self?.activePhotoDelegate = nil
                 }
             }
@@ -644,9 +648,9 @@ final class KitCameraController: NSObject, ObservableObject, @unchecked Sendable
 // MARK: - Capture delegates
 
 private final class PhotoCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegate {
-    private let completion: (UIImage?) -> Void
+    private let completion: (KitCameraOutput?) -> Void
 
-    init(completion: @escaping (UIImage?) -> Void) {
+    init(completion: @escaping (KitCameraOutput?) -> Void) {
         self.completion = completion
     }
 
@@ -662,7 +666,33 @@ private final class PhotoCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegat
             completion(nil)
             return
         }
-        completion(image)
+        let mediaType = Self.mediaType(for: data)
+        let fileExtension = SecureMediaLocalFilePolicy.fileExtension(for: mediaType)
+        do {
+            let url = try KitCaptureTemporaryFileStore.makeFileURL(
+                directoryPrefix: KitCaptureTemporaryFileStore.cameraDirectoryPrefix,
+                fileName: "photo.\(fileExtension)"
+            )
+            do {
+                try data.write(to: url, options: .atomic)
+                try KitCaptureTemporaryFileStore.protectFile(at: url)
+                completion(.photo(fileURL: url, mediaType: mediaType, preview: image))
+            } catch {
+                try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
+                throw error
+            }
+        } catch {
+            completion(nil)
+        }
+    }
+
+    private static func mediaType(for data: Data) -> String {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let identifier = CGImageSourceGetType(source) as String?,
+              let mediaType = UTType(identifier)?.preferredMIMEType?.lowercased(),
+              mediaType.hasPrefix("image/")
+        else { return "image/jpeg" }
+        return mediaType
     }
 }
 

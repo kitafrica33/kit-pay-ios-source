@@ -711,8 +711,18 @@ private struct MediaLibraryGridCell: View {
             }
         } else {
             let data = loaded.data
+            let localFileURL = loaded.localFileURL
             image = await Task.detached(priority: .utility) {
-                ConversationMediaThumbnailFactory.imageThumbnail(data: data, maxPixel: pixel)
+                if let localFileURL {
+                    return ChatMediaImageDecoder.downsample(
+                        fileURL: localFileURL,
+                        maximumPixelSize: Int(pixel)
+                    )
+                }
+                return ConversationMediaThumbnailFactory.imageThumbnail(
+                    data: data,
+                    maxPixel: pixel
+                )
             }.value
         }
         guard let image else { return }

@@ -23,7 +23,7 @@ struct KitReceiptContent {
     let headlineAmount: String
     /// "Sent to ABC Company" / "Received from ABC Company".
     let directionLine: String
-    /// Reference, Date, Type, Status, From/To, Note, Wallet — only non-empty values.
+    /// Reference, Date, Type, Status, From/To and Note — only non-empty values.
     let rows: [(label: String, value: String)]
     /// "Sent UGX 150,000 to ABC. Receipt attached." — direction and status aware.
     let shareMessage: String
@@ -32,7 +32,15 @@ struct KitReceiptContent {
     /// Product-specific verification language shown in the footer.
     let footerNote: String
 
-    static func from(transaction: WalletTransaction, senderName: String?) -> KitReceiptContent {
+    static func from(transaction: WalletTransaction, senderName: String?) -> KitReceiptContent? {
+        // Receipt generation is a separate customer-facing projection boundary. Do not rely on
+        // the list screen having filtered this value: a stale navigation value, restored state,
+        // or future call site must not turn a principal-only or internal ledger row into an
+        // exportable customer receipt.
+        guard CustomerTransactionPresentationPolicy.isCustomerVisible(transaction) else {
+            return nil
+        }
+
         // Mirrors TransactionDetailView.statusColor exactly: anything not explicitly terminal
         // is treated as pending. A non-successful payment must never read as successful.
         let disposition: Disposition
@@ -55,19 +63,22 @@ struct KitReceiptContent {
         case .reversed: statusLabel = "Payment Reversed"
         }
 
-        let headlineAmount = KitMoney.formatted(transaction.amount, currency: transaction.currency)
+        let headlineAmount = KitMoney.formatted(
+            transaction.customerImpactAmount,
+            currency: transaction.currency
+        )
 
         let typeLabel = transaction.type.replacingOccurrences(of: "_", with: " ").capitalized
-        let counterpartyName = trimmedNonEmpty(transaction.counterparty?.name) ?? "Kit Pay user"
+        let counterpartyName = trimmedNonEmpty(transaction.customerCounterparty?.name)
 
         let directionLine: String
-        switch transaction.direction {
+        switch transaction.customerDirection {
         case "debit":
-            directionLine = "Sent to \(counterpartyName)"
+            directionLine = counterpartyName.map { "Sent to \($0)" } ?? "Money deducted"
         case "credit":
-            directionLine = "Received from \(counterpartyName)"
+            directionLine = counterpartyName.map { "Received from \($0)" } ?? "Money added"
         default:
-            directionLine = trimmedNonEmpty(transaction.counterparty?.name) ?? typeLabel
+            directionLine = counterpartyName ?? typeLabel
         }
 
         var rows: [(label: String, value: String)] = []
@@ -79,7 +90,8 @@ struct KitReceiptContent {
         appendRow("Date", displayDate(from: transaction.occurredAt))
         appendRow("Type", typeLabel)
         appendRow("Status", transaction.status.capitalized)
-        switch transaction.direction {
+        appendRow(transaction.customerImpactLabel, headlineAmount)
+        switch transaction.customerDirection {
         case "debit":
             appendRow("From", trimmedNonEmpty(senderName))
             appendRow("To", counterpartyName)
@@ -87,25 +99,36 @@ struct KitReceiptContent {
             appendRow("From", counterpartyName)
             appendRow("To", trimmedNonEmpty(senderName))
         default:
-            appendRow("Counterparty", transaction.counterparty?.name)
+            appendRow("Counterparty", counterpartyName)
         }
         appendRow("Note", transaction.note)
-        appendRow("Wallet", transaction.walletId)
 
         // "to" for debits (and unknown directions), "from" for credits.
-        let preposition = transaction.direction == "credit" ? "from" : "to"
+        let preposition = transaction.customerDirection == "credit" ? "from" : "to"
         let shareMessage: String
         switch disposition {
         case .successful:
-            shareMessage = transaction.direction == "credit"
-                ? "Received \(headlineAmount) from \(counterpartyName). Receipt attached."
-                : "Sent \(headlineAmount) to \(counterpartyName). Receipt attached."
+            if transaction.customerDirection == "credit" {
+                shareMessage = counterpartyName.map {
+                    "Received \(headlineAmount) from \($0). Receipt attached."
+                } ?? "Money added: \(headlineAmount). Receipt attached."
+            } else {
+                shareMessage = counterpartyName.map {
+                    "Sent \(headlineAmount) to \($0). Receipt attached."
+                } ?? "Money deducted: \(headlineAmount). Receipt attached."
+            }
         case .pending:
-            shareMessage = "Payment of \(headlineAmount) \(preposition) \(counterpartyName) is pending. Receipt attached."
+            shareMessage = counterpartyName.map {
+                "Payment of \(headlineAmount) \(preposition) \($0) is pending. Receipt attached."
+            } ?? "Payment of \(headlineAmount) is pending. Receipt attached."
         case .failed:
-            shareMessage = "Payment of \(headlineAmount) \(preposition) \(counterpartyName) failed. Receipt attached."
+            shareMessage = counterpartyName.map {
+                "Payment of \(headlineAmount) \(preposition) \($0) failed. Receipt attached."
+            } ?? "Payment of \(headlineAmount) failed. Receipt attached."
         case .reversed:
-            shareMessage = "Payment of \(headlineAmount) \(preposition) \(counterpartyName) was reversed. Receipt attached."
+            shareMessage = counterpartyName.map {
+                "Payment of \(headlineAmount) \(preposition) \($0) was reversed. Receipt attached."
+            } ?? "Payment of \(headlineAmount) was reversed. Receipt attached."
         }
 
         let safeReference = sanitizedFileComponent(transaction.reference)
@@ -739,7 +762,14 @@ struct ShareReceiptButton: View {
         guard !isGenerating else { return }
         isGenerating = true
         generationError = nil
-        let content = KitReceiptContent.from(transaction: transaction, senderName: senderName)
+        guard let content = KitReceiptContent.from(
+            transaction: transaction,
+            senderName: senderName
+        ) else {
+            generationError = "This transaction is not available for receipt export."
+            isGenerating = false
+            return
+        }
         Task { @MainActor in
             do {
                 let url = try KitReceiptPDFRenderer.render(content)

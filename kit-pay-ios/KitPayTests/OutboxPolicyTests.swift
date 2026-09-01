@@ -424,6 +424,26 @@ final class OutboxPolicyTests: XCTestCase {
         )
         XCTAssertEqual(
             OutboxPolicy.failureDecision(
+                for: SecureMessagingExchangeError.richMediaCapabilityUnavailable
+            ),
+            .retry(after: nil)
+        )
+        XCTAssertEqual(
+            OutboxPolicy.failureDecision(
+                for: SecureMessagingExchangeError.mediaMessageCapabilityUnavailable
+            ),
+            .retry(after: nil)
+        )
+        XCTAssertEqual(
+            OutboxPolicy.failureDecision(for: SecureMediaAttachmentError.incompatibleRecipient),
+            .retry(after: nil)
+        )
+        XCTAssertEqual(
+            OutboxPolicy.failureDecision(for: SecureMediaAttachmentError.invalidMedia),
+            .permanent
+        )
+        XCTAssertEqual(
+            OutboxPolicy.failureDecision(
                 for: SecureMessagingExchangeError.reactionCapabilityUnavailable
             ),
             .permanent

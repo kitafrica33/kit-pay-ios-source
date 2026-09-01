@@ -105,7 +105,9 @@ struct MerchantPaymentIntentDTO: Decodable, Hashable, Identifiable {
     let merchant: MerchantSummaryDTO
     let status: String
     let settlementMode: String
-    let settlementWalletId: String
+    /// Present only on merchant-authorized projections. Payer responses deliberately omit the
+    /// merchant's internal settlement topology.
+    let settlementWalletId: String?
     let sourceWalletId: String?
     let amount: String
     let currency: CurrencyDTO
@@ -123,6 +125,21 @@ struct MerchantPaymentIntentDTO: Decodable, Hashable, Identifiable {
         case expiresAt = "expires_at"
         case capturedAt = "captured_at"
         case createdAt = "created_at"
+    }
+}
+
+enum MerchantReceiveIntentPolicy {
+    /// Creating a QR is a merchant-only flow, so its response must still prove that the intent is
+    /// attached to the business wallet the merchant selected. A payer-safe projection with this
+    /// field omitted is valid for payment confirmation, but cannot authorize issuing a QR.
+    static func confirmsCreatedIntent(
+        _ intent: MerchantPaymentIntentDTO,
+        requestedAmount: String,
+        settlementWallet: Wallet
+    ) -> Bool {
+        intent.settlementWalletId == settlementWallet.id
+            && intent.amount == requestedAmount
+            && intent.currency == settlementWallet.currency
     }
 }
 

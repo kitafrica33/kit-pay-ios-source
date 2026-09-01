@@ -2,6 +2,7 @@ import AVFoundation
 import CallKit
 import CryptoKit
 import Foundation
+import OSLog
 import PushKit
 import UIKit
 import UserNotifications
@@ -310,6 +311,46 @@ struct WalletClaimNavigationRequest: Equatable, Identifiable, Sendable {
     init(id: UUID = UUID(), claimID: String) {
         self.id = id
         self.claimID = claimID
+    }
+}
+
+enum NotificationResponseDisposition: Equatable, Sendable {
+    case message(MessageNotificationAction)
+    case claim(ClaimablePaymentNotificationAction)
+    case opaqueWake
+    case ignore
+
+    /// Opening a notification launches the app and can finish UIKit's handoff before protected
+    /// state, Signal sessions, and the target conversation have finished restoring. Holding the
+    /// completion handler across that work lets iOS kill a cold launch as unresponsive. Inline
+    /// reply is the exception: it may run without foregrounding Kit Pay, so its brief durable
+    /// outbox write keeps the system response lifetime until the write has completed.
+    var completesBeforeRouting: Bool {
+        switch self {
+        case .message(let action):
+            if case .reply = action.kind { return false }
+            return true
+        case .claim, .opaqueWake, .ignore:
+            return true
+        }
+    }
+}
+
+enum NotificationResponseDispositionPolicy {
+    /// Strictly validated message/payment actions remain admissible during cold-launch privacy
+    /// quarantine. Their handlers wait for protected-state restoration and re-prove the account,
+    /// conversation, and authoritative payment before navigating. An opaque provider payload has
+    /// no such binding and is forwarded only after normal notification ownership is active.
+    static func disposition(
+        messageAction: MessageNotificationAction?,
+        claimAction: ClaimablePaymentNotificationAction?,
+        registrationEnabled: Bool,
+        privacyQuarantineActive: Bool
+    ) -> NotificationResponseDisposition {
+        if let messageAction { return .message(messageAction) }
+        if let claimAction { return .claim(claimAction) }
+        guard registrationEnabled, !privacyQuarantineActive else { return .ignore }
+        return .opaqueWake
     }
 }
 
@@ -1715,6 +1756,10 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
 
     private let callProvider: CXProvider
     private let callController = CXCallController()
+    private let callAudioLogger = Logger(
+        subsystem: "africa.kit.pay.ios",
+        category: "CallKitAudio"
+    )
     /// Constructed with the process-wide notification coordinator so background suspension is
     /// observed even before the first call action reaches the audio layer.
     private let callSounds = CallProgressSoundPlayer.shared
@@ -1757,10 +1802,9 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
     /// Caller identity, media credentials, and backend authority remain absent until promotion.
     private var deferredPrimaryAnswerGate = DeferredCallKitAnswerGate()
     private var deferredPrimaryAnswerActions: [UUID: CXAnswerCallAction] = [:]
-    /// Fences CallKit audio callbacks that were queued before a later deactivate, reset, or account
-    /// transition. The expected-active bit prevents an older activation task from winning last.
-    private var callKitAudioTransitionGeneration: UInt64 = 0
-    private var callKitAudioExpectedActive = false
+    /// Binds CallKit's UUID-less audio callbacks to the exact primary Answer/Start action and
+    /// fences callbacks queued before a deactivate, reset, or account transition.
+    private var callKitAudioSessionGate = CallKitAudioSessionGate()
     /// Set when Apple reports that APNs registration failed.
     ///
     /// Registration was previously attempted exactly once per sign-in and the failure callback was
@@ -1818,8 +1862,7 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
     }
 
     private func invalidateCallKitAudio(resetSounds: Bool) {
-        callKitAudioTransitionGeneration &+= 1
-        callKitAudioExpectedActive = false
+        callKitAudioSessionGate.deactivate()
         if resetSounds {
             callSounds.resetForSessionReplacement()
         } else {
@@ -1985,6 +2028,7 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
         pushTokens.remove(provider: "apns")
         pushTokens.remove(provider: "apns_voip")
         discardQuarantinedIncomingCalls()
+        callKitAudioSessionGate.reset()
     }
 
     /// Revokes call admission and clears CallKit state without deleting cached push tokens. AppModel
@@ -2016,6 +2060,7 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
         callDisplayNames.removeAll()
         callAdmissionGenerations.removeAll()
         pendingCallEvents.removeAll()
+        callKitAudioSessionGate.reset()
         communicationOwnerFingerprint = nil
     }
 
@@ -2126,6 +2171,7 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
         backendCallIds[callUUID] = handoff.callId.lowercased()
         callAdmissionGenerations[callUUID] = callRegistryGeneration
         outgoingCalls.insert(callUUID)
+        callKitAudioSessionGate.claimOwner(callUUID)
         pendingOutgoingMedia[callUUID] = request
         videoCalls[callUUID] = handoff.video
         callDisplayNames[callUUID] = handoff.participantName
@@ -2152,12 +2198,60 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
     }
 
     private func currentCallKitAudioOwnerUUID() -> UUID? {
-        let candidates = backendCallIds.keys.filter { callUUID in
-            hasCurrentCallRegistryOwnership(callUUID)
-                && (answeredCalls.contains(callUUID) || outgoingCalls.contains(callUUID))
+        guard let callUUID = callKitAudioSessionGate.ownerCallUUID,
+              hasCurrentCallRegistryOwnership(callUUID),
+              answeredCalls.contains(callUUID) || outgoingCalls.contains(callUUID)
+        else { return nil }
+        return callUUID
+    }
+
+    /// Re-applies CallKit-owned audio when the LiveKit room attaches after `didActivate`, or when
+    /// the first activation attempt failed before the room existed. There is deliberately no timer:
+    /// the authenticated room boundary is the deterministic second opportunity to reconcile.
+    @MainActor
+    func reconcileCallKitAudioSessionIfNeeded(callId: String) throws {
+        guard registrationEnabled,
+              !privacyQuarantineActive,
+              let callUUID = UUID(uuidString: callId),
+              currentCallKitAudioOwnerUUID() == callUUID,
+              let ticket = callKitAudioSessionGate.reconciliationTicket(for: callUUID)
+        else { return }
+        try configureCallKitAudioSession(
+            AVAudioSession.sharedInstance(),
+            ticket: ticket,
+            source: "room-attachment"
+        )
+    }
+
+    @MainActor
+    private func configureCallKitAudioSession(
+        _ audioSession: AVAudioSession,
+        ticket: CallKitAudioSessionGate.Ticket,
+        source: String
+    ) throws {
+        guard callKitAudioSessionGate.accepts(ticket),
+              currentCallKitAudioOwnerUUID() == ticket.ownerCallUUID
+        else { return }
+        do {
+            try CallMediaCoordinator.shared.activateAudioSession(
+                audioSession,
+                video: videoCalls[ticket.ownerCallUUID]
+            )
+            guard callKitAudioSessionGate.markConfigured(ticket) else { return }
+            CallMediaCoordinator.shared.callKitAudioSessionConfigurationSucceeded(
+                callId: ticket.ownerCallUUID.uuidString.lowercased()
+            )
+            callSounds.callKitAudioDidActivate()
+            callAudioLogger.info("call_audio_configured source=\(source, privacy: .public)")
+        } catch {
+            if callKitAudioSessionGate.markConfigurationFailed(ticket) {
+                callSounds.callKitAudioDidDeactivate()
+                callAudioLogger.error(
+                    "call_audio_configuration_failed source=\(source, privacy: .public) error=\(error.localizedDescription, privacy: .private(mask: .hash))"
+                )
+            }
+            throw error
         }
-        guard candidates.count == 1 else { return nil }
-        return candidates[0]
     }
 
     private func authenticatedUnansweredIncomingCall(
@@ -2518,6 +2612,7 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
         incomingCalls.removeValue(forKey: callUUID)
         answeredCalls.remove(callUUID)
         outgoingCalls.remove(callUUID)
+        callKitAudioSessionGate.releaseOwner(callUUID)
         connectedOutgoingCalls.remove(callUUID)
         pendingOutgoingMedia.removeValue(forKey: callUUID)
         videoCalls.removeValue(forKey: callUUID)
@@ -2889,42 +2984,53 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
         let content = response.notification.request.content
-        guard registrationEnabled, !privacyQuarantineActive else {
-            completionHandler()
-            return
-        }
         let userText = (response as? UNTextInputNotificationResponse)?.userText
-        if let action = MessageNotificationResponsePolicy.action(
+        let messageAction = MessageNotificationResponsePolicy.action(
             actionIdentifier: response.actionIdentifier,
             requestIdentifier: response.notification.request.identifier,
             categoryIdentifier: content.categoryIdentifier,
             threadIdentifier: content.threadIdentifier,
             userInfo: content.userInfo,
             userText: userText
-        ) {
-            Task {
-                await MessageNotificationActionDispatcher.shared.dispatch(action)
-                completionHandler()
-            }
-            return
-        }
-        if let action = ClaimablePaymentNotificationResponsePolicy.action(
+        )
+        let claimAction = ClaimablePaymentNotificationResponsePolicy.action(
             actionIdentifier: response.actionIdentifier,
             categoryIdentifier: content.categoryIdentifier,
             threadIdentifier: content.threadIdentifier,
             userInfo: content.userInfo
-        ) {
+        )
+        let disposition = NotificationResponseDispositionPolicy.disposition(
+            messageAction: messageAction,
+            claimAction: claimAction,
+            registrationEnabled: registrationEnabled,
+            privacyQuarantineActive: privacyQuarantineActive
+        )
+
+        switch disposition {
+        case .message(let action):
+            if disposition.completesBeforeRouting {
+                // A default tap foregrounds the app. Release UIKit immediately, then let the
+                // actor retain the route while AppModel restores protected/account-bound state.
+                completionHandler()
+                Task { await MessageNotificationActionDispatcher.shared.dispatch(action) }
+                return
+            }
             Task {
-                await ClaimablePaymentNotificationActionDispatcher.shared.dispatch(action)
+                await MessageNotificationActionDispatcher.shared.dispatch(action)
                 completionHandler()
             }
-            return
+        case .claim(let action):
+            completionHandler()
+            Task { await ClaimablePaymentNotificationActionDispatcher.shared.dispatch(action) }
+        case .opaqueWake:
+            NotificationCenter.default.post(
+                name: .kitRemoteWakeReceived,
+                object: content.userInfo
+            )
+            completionHandler()
+        case .ignore:
+            completionHandler()
         }
-        NotificationCenter.default.post(
-            name: .kitRemoteWakeReceived,
-            object: content.userInfo
-        )
-        completionHandler()
     }
 
     @MainActor
@@ -3121,6 +3227,7 @@ extension NotificationCoordinator: CXProviderDelegate {
         videoCalls.removeAll()
         callDisplayNames.removeAll()
         callAdmissionGenerations.removeAll()
+        callKitAudioSessionGate.reset()
         Task { @MainActor in
             for callId in calls.values {
                 await CallMediaCoordinator.shared.disconnectFromCallKit(callId: callId)
@@ -3280,6 +3387,7 @@ extension NotificationCoordinator: CXProviderDelegate {
 
         ringExpiryTasks.removeValue(forKey: action.callUUID)?.cancel()
         answeredCalls.insert(action.callUUID)
+        callKitAudioSessionGate.claimOwner(action.callUUID)
         callSounds.incomingCallAnswered(callID: callId)
         action.fulfill()
         recordAndPublishCallEvent(
@@ -3409,58 +3517,54 @@ extension NotificationCoordinator: CXProviderDelegate {
             invalidateCallKitAudio(resetSounds: false)
             return
         }
-        callKitAudioTransitionGeneration &+= 1
-        let transitionGeneration = callKitAudioTransitionGeneration
         let registryGeneration = callRegistryGeneration
-        callKitAudioExpectedActive = true
-        guard let expectedCallUUID = currentCallKitAudioOwnerUUID() else {
-            callKitAudioExpectedActive = false
+        guard let ticket = callKitAudioSessionGate.beginSystemActivation() else {
             callSounds.callKitAudioDidDeactivate()
+            callAudioLogger.error("call_audio_activation_waiting_for_exact_owner")
+            return
+        }
+        guard currentCallKitAudioOwnerUUID() == ticket.ownerCallUUID else {
+            callKitAudioSessionGate.releaseOwner(ticket.ownerCallUUID)
+            callSounds.callKitAudioDidDeactivate()
+            callAudioLogger.error("call_audio_activation_rejected_stale_owner")
             return
         }
         Task { @MainActor [weak self] in
             guard let self,
-                  self.callKitAudioTransitionGeneration == transitionGeneration,
-                  self.callKitAudioExpectedActive,
+                  self.callKitAudioSessionGate.accepts(ticket),
                   self.callRegistryGeneration == registryGeneration,
-                  self.hasCurrentCallRegistryOwnership(expectedCallUUID),
-                  self.answeredCalls.contains(expectedCallUUID)
-                    || self.outgoingCalls.contains(expectedCallUUID)
+                  self.currentCallKitAudioOwnerUUID() == ticket.ownerCallUUID
             else { return }
             do {
-                try CallMediaCoordinator.shared.activateAudioSession(
+                try self.configureCallKitAudioSession(
                     audioSession,
-                    video: self.videoCalls[expectedCallUUID]
+                    ticket: ticket,
+                    source: "callkit-activation"
                 )
-                guard self.callKitAudioTransitionGeneration == transitionGeneration,
-                      self.callKitAudioExpectedActive,
-                      self.callRegistryGeneration == registryGeneration,
-                      self.hasCurrentCallRegistryOwnership(expectedCallUUID)
-                else { return }
-                self.callSounds.callKitAudioDidActivate()
             } catch {
-                guard self.callKitAudioTransitionGeneration == transitionGeneration else { return }
-                self.callKitAudioExpectedActive = false
-                self.callSounds.callKitAudioDidDeactivate()
-                CallMediaCoordinator.shared.recordControlError(error)
+                guard self.callKitAudioSessionGate.accepts(ticket) else { return }
+                await CallMediaCoordinator.shared.callKitAudioSessionConfigurationFailed(
+                    callId: ticket.ownerCallUUID.uuidString.lowercased(),
+                    error: error
+                )
             }
         }
     }
 
     func provider(_ provider: CXProvider, didDeactivate audioSession: AVAudioSession) {
-        callKitAudioTransitionGeneration &+= 1
-        let transitionGeneration = callKitAudioTransitionGeneration
-        callKitAudioExpectedActive = false
+        callKitAudioSessionGate.deactivate()
+        let transitionGeneration = callKitAudioSessionGate.generation
         callSounds.callKitAudioDidDeactivate()
+        callAudioLogger.info("call_audio_deactivated")
         Task { @MainActor [weak self] in
             guard let self,
-                  self.callKitAudioTransitionGeneration == transitionGeneration,
-                  !self.callKitAudioExpectedActive
+                  self.callKitAudioSessionGate.generation == transitionGeneration,
+                  self.callKitAudioSessionGate.phase == .inactive
             else { return }
             do {
                 try CallMediaCoordinator.shared.deactivateAudioSession()
             } catch {
-                guard self.callKitAudioTransitionGeneration == transitionGeneration else { return }
+                guard self.callKitAudioSessionGate.generation == transitionGeneration else { return }
                 CallMediaCoordinator.shared.recordControlError(error)
             }
         }

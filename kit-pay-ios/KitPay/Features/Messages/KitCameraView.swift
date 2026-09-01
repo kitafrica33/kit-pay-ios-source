@@ -326,9 +326,9 @@ struct KitCameraView: View {
         switch controller.mode {
         case .photo:
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
-            controller.capturePhoto { image in
-                guard let image else { return }
-                finish(with: .photo(image))
+            controller.capturePhoto { output in
+                guard let output else { return }
+                finish(with: output)
             }
         case .video:
             if controller.isRecording {

@@ -578,22 +578,12 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
         XCTAssertTrue(SecureMessagingReleaseGate.enabled)
     }
 
-    func testLocalQueueReleaseGateAllowsDiscoveryGapButHonorsAuthoritativeWithdrawal() {
+    func testLocalQueueReleaseGateNeverDependsOnNetworkDiscovery() {
         XCTAssertTrue(SecureMessagingLocalQueueReleasePolicy.permits(
-            buildEnabled: true,
-            serverAdvertisesReviewedMessaging: nil
-        ))
-        XCTAssertTrue(SecureMessagingLocalQueueReleasePolicy.permits(
-            buildEnabled: true,
-            serverAdvertisesReviewedMessaging: true
+            buildEnabled: true
         ))
         XCTAssertFalse(SecureMessagingLocalQueueReleasePolicy.permits(
-            buildEnabled: true,
-            serverAdvertisesReviewedMessaging: false
-        ))
-        XCTAssertFalse(SecureMessagingLocalQueueReleasePolicy.permits(
-            buildEnabled: false,
-            serverAdvertisesReviewedMessaging: nil
+            buildEnabled: false
         ))
     }
 
@@ -2342,6 +2332,165 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
             abs(restoredCommand.nextAttemptAt.timeIntervalSince(command.nextAttemptAt)),
             1
         )
+    }
+
+    func testSingleMediaQueueRejectsAnotherDraftOutputButConsumesItsExactDraft() async throws {
+        let localUserID = "10000000-0000-4000-8000-000000000071"
+        let recipientUserID = "10000000-0000-4000-8000-000000000072"
+        let conversationID = "30000000-0000-4000-8000-000000000071"
+        let otherConversationID = "30000000-0000-4000-8000-000000000072"
+        let offeredMediaID = UUID(uuidString: "70000000-0000-4000-8000-000000000071")!
+        let otherSourceID = UUID(uuidString: "70000000-0000-4000-8000-000000000072")!
+        let media = Data(repeating: 0x71, count: 512)
+        let writerID = UUID(uuidString: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")!
+        let exactAttachment = ConversationDraftMediaAttachment(
+            id: offeredMediaID,
+            storageKind: .encryptedBlob,
+            mediaType: "image/jpeg",
+            originalMediaType: nil,
+            byteCount: media.count,
+            displayName: "Photo.jpg",
+            duration: nil,
+            acceptedAt: Date(timeIntervalSince1970: 1_755_604_800),
+            clientMessageID: nil,
+            preprocessingOutputStorageKey: nil
+        )
+        let conflictingAttachment = ConversationDraftMediaAttachment(
+            id: otherSourceID,
+            storageKind: .protectedFile,
+            mediaType: "image/jpeg",
+            originalMediaType: "image/heic",
+            byteCount: media.count,
+            displayName: "Other photo",
+            duration: nil,
+            acceptedAt: Date(timeIntervalSince1970: 1_755_604_800),
+            clientMessageID: nil,
+            preprocessingOutputStorageKey: offeredMediaID.uuidString.lowercased()
+        )
+        let store = try await makeStore(userID: localUserID)
+        var crypto = SecureMessagingPersistentState.empty
+        crypto.enrollment = raceEnrollment(userID: localUserID)
+        try await store.update { state in
+            state.communicationOwnerUserID = localUserID
+            state.secureMessaging = crypto
+            state.conversations = [conversationID, otherConversationID].map { id in
+                Conversation(
+                    id: id,
+                    title: "Peer",
+                    participantUserIds: [localUserID, recipientUserID],
+                    unreadCount: 0,
+                    updatedAt: Date(timeIntervalSince1970: 1_755_604_800)
+                )
+            }
+            state.conversationDrafts = [
+                otherConversationID: ConversationDraft(
+                    body: "Other draft",
+                    updatedAt: Date(),
+                    writeVersion: ConversationDraftWriteVersion(
+                        writerID: UUID(),
+                        sequence: 1
+                    ),
+                    mediaAttachments: [conflictingAttachment]
+                ),
+            ]
+        }
+        let blobs = InMemoryMediaBlobStore(seed: [
+            offeredMediaID.uuidString.lowercased(): media,
+        ])
+        let coordinator = SecureMessagingExchangeCoordinator(
+            transport: OfflineExchangeTransport(),
+            store: store,
+            engine: SecureMessagingCryptoEngine(),
+            provisioningPreKeyCount: 1,
+            mediaBlobs: blobs.access(forUserID: localUserID)
+        )
+
+        do {
+            _ = try await coordinator.queueDeferredImage(
+                forUserID: localUserID,
+                conversationID: conversationID,
+                expectedRecipientUserID: recipientUserID,
+                title: "Peer",
+                mediaData: media,
+                mediaType: "image/jpeg",
+                caption: "Caption",
+                localStorageKey: offeredMediaID.uuidString.lowercased(),
+                localMediaID: offeredMediaID,
+                localStorageKind: .encryptedBlob
+            )
+            XCTFail("another draft's preprocessing output must block queue admission")
+        } catch {
+            // Expected: no storage key can acquire a second durable owner.
+        }
+        var snapshot = await store.snapshot()
+        XCTAssertTrue(snapshot.messages.isEmpty)
+        XCTAssertTrue(snapshot.outbox.isEmpty)
+        XCTAssertEqual(
+            snapshot.conversationDrafts?[otherConversationID]?.mediaAttachments,
+            [conflictingAttachment]
+        )
+
+        let currentVersion = ConversationDraftWriteVersion(writerID: writerID, sequence: 1)
+        let clearVersion = ConversationDraftWriteVersion(writerID: writerID, sequence: 2)
+        try await store.update { state in
+            state.conversationDrafts = [
+                conversationID: ConversationDraft(
+                    body: "Caption",
+                    updatedAt: Date(),
+                    writeVersion: currentVersion,
+                    mediaAttachments: [exactAttachment]
+                ),
+            ]
+        }
+        let differentMediaID = UUID(uuidString: "70000000-0000-4000-8000-000000000079")!
+        do {
+            _ = try await coordinator.queueDeferredImage(
+                forUserID: localUserID,
+                conversationID: conversationID,
+                expectedRecipientUserID: recipientUserID,
+                title: "Peer",
+                mediaData: media,
+                mediaType: "image/jpeg",
+                caption: "Caption",
+                localStorageKey: differentMediaID.uuidString.lowercased(),
+                localMediaID: differentMediaID,
+                localStorageKind: .encryptedBlob,
+                submittedDraftBody: "Caption",
+                submittedDraftMediaAttachments: [exactAttachment],
+                draftClearVersion: clearVersion
+            )
+            XCTFail("an exact stored manifest must not exempt different queued media")
+        } catch {
+            // Expected: caller-supplied draft metadata is bound to the queued storage identity.
+        }
+        snapshot = await store.snapshot()
+        XCTAssertTrue(snapshot.messages.isEmpty)
+        XCTAssertEqual(
+            snapshot.conversationDrafts?[conversationID]?.mediaAttachments,
+            [exactAttachment]
+        )
+        _ = try await coordinator.queueDeferredImage(
+            forUserID: localUserID,
+            conversationID: conversationID,
+            expectedRecipientUserID: recipientUserID,
+            title: "Peer",
+            mediaData: media,
+            mediaType: "image/jpeg",
+            caption: "Caption",
+            localStorageKey: offeredMediaID.uuidString.lowercased(),
+            localMediaID: offeredMediaID,
+            localStorageKind: .encryptedBlob,
+            submittedDraftBody: "Caption",
+            submittedDraftMediaAttachments: [exactAttachment],
+            draftClearVersion: clearVersion
+        )
+
+        snapshot = await store.snapshot()
+        XCTAssertEqual(snapshot.messages.count, 1)
+        XCTAssertEqual(snapshot.outbox.count, 1)
+        XCTAssertEqual(snapshot.conversationDrafts?[conversationID]?.body, "")
+        XCTAssertNil(snapshot.conversationDrafts?[conversationID]?.mediaAttachments)
+        XCTAssertEqual(snapshot.conversationDrafts?[conversationID]?.writeVersion, clearVersion)
     }
 
     func testDeferredImageCheckpointSurvivesRelaunchWithoutUploadingTwice() async throws {
@@ -5034,6 +5183,437 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
         XCTAssertEqual(survivingKeys, [firstParkKey, secondParkKey])
     }
 
+    func testDeferredMediaBatchRejectsParkKeyOwnedByAnotherDraft() async throws {
+        let localUserID = "10000000-0000-4000-8000-000000000073"
+        let recipientUserID = "10000000-0000-4000-8000-000000000074"
+        let conversationID = "30000000-0000-4000-8000-000000000073"
+        let otherConversationID = "30000000-0000-4000-8000-000000000074"
+        let firstParkKey = "70000000-0000-4000-8000-000000000073"
+        let secondParkKey = "70000000-0000-4000-8000-000000000074"
+        let firstPlaintext = Data(repeating: 0x73, count: 300)
+        let secondPlaintext = Data(repeating: 0x74, count: 517)
+        let batch = try KitMediaMessageV2OutboundBatch.queued(
+            attachments: [
+                .init(
+                    attachmentID: firstParkKey,
+                    mediaType: "image/jpeg",
+                    plaintextByteSize: firstPlaintext.count,
+                    localStorageKey: firstParkKey
+                ),
+                .init(
+                    attachmentID: secondParkKey,
+                    mediaType: "video/mp4",
+                    plaintextByteSize: secondPlaintext.count,
+                    localStorageKey: secondParkKey
+                ),
+            ],
+            rawCaption: "Offline batch",
+            keyMaterialFactory: {
+                Data(repeating: 0x73, count: SecureMediaAttachmentCipher.keyMaterialBytes)
+            }
+        )
+        let draftAttachment = ConversationDraftMediaAttachment(
+            id: UUID(uuidString: firstParkKey)!,
+            storageKind: .encryptedBlob,
+            mediaType: "image/jpeg",
+            originalMediaType: nil,
+            byteCount: firstPlaintext.count,
+            displayName: "Reserved photo",
+            duration: nil,
+            acceptedAt: Date(),
+            clientMessageID: nil,
+            preprocessingOutputStorageKey: nil
+        )
+        let store = try await makeStore(userID: localUserID)
+        try await store.update { state in
+            state.communicationOwnerUserID = localUserID
+            var crypto = SecureMessagingPersistentState.empty
+            crypto.enrollment = raceEnrollment(userID: localUserID)
+            state.secureMessaging = crypto
+            state.conversations = [conversationID, otherConversationID].map { id in
+                Conversation(
+                    id: id,
+                    title: "Peer",
+                    participantUserIds: [localUserID, recipientUserID],
+                    unreadCount: 0,
+                    updatedAt: Date(timeIntervalSince1970: 1_755_604_800)
+                )
+            }
+            state.conversationDrafts = [
+                otherConversationID: ConversationDraft(
+                    body: "Reserved",
+                    updatedAt: Date(),
+                    writeVersion: ConversationDraftWriteVersion(
+                        writerID: UUID(),
+                        sequence: 1
+                    ),
+                    mediaAttachments: [draftAttachment]
+                ),
+            ]
+        }
+        let blobs = InMemoryMediaBlobStore(seed: [
+            firstParkKey: firstPlaintext,
+            secondParkKey: secondPlaintext,
+        ])
+        let coordinator = SecureMessagingExchangeCoordinator(
+            transport: OfflineExchangeTransport(),
+            store: store,
+            engine: SecureMessagingCryptoEngine(),
+            provisioningPreKeyCount: 1,
+            mediaBlobs: blobs.access(forUserID: localUserID)
+        )
+
+        do {
+            _ = try await coordinator.queueDeferredMediaBatch(
+                forUserID: localUserID,
+                conversationID: conversationID,
+                expectedRecipientUserID: recipientUserID,
+                title: "Peer",
+                batch: batch
+            )
+            XCTFail("a batch must not reuse another draft's local media key")
+        } catch {
+            // Expected: the draft remains the sole durable owner.
+        }
+
+        let snapshot = await store.snapshot()
+        XCTAssertTrue(snapshot.messages.isEmpty)
+        XCTAssertTrue(snapshot.outbox.isEmpty)
+        XCTAssertEqual(snapshot.conversationDrafts?[otherConversationID]?.mediaAttachments, [draftAttachment])
+        let retainedKeys = await blobs.storageKeys()
+        XCTAssertEqual(retainedKeys, [firstParkKey, secondParkKey])
+    }
+
+    func testDeferredMediaBatchRejectsOutputKeyOwnedByAnotherRecordsSpoolID() async throws {
+        let localUserID = "10000000-0000-4000-8000-000000000083"
+        let recipientUserID = "10000000-0000-4000-8000-000000000084"
+        let conversationID = "30000000-0000-4000-8000-000000000083"
+        let existingConversationID = "30000000-0000-4000-8000-000000000084"
+        let firstSourceKey = "70000000-0000-4000-8000-000000000083"
+        let secondSourceKey = "70000000-0000-4000-8000-000000000084"
+        let collidingSpoolID = "70000000-0000-4000-8000-000000000085"
+        let existingSourceKey = "70000000-0000-4000-8000-000000000086"
+        let firstBytes = Data(repeating: 0x83, count: 300)
+        let secondBytes = Data(repeating: 0x84, count: 517)
+        let firstURL = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "kit-preprocess-source-\(UUID().uuidString).heic"
+        )
+        try firstBytes.write(to: firstURL, options: .atomic)
+        defer { try? FileManager.default.removeItem(at: firstURL) }
+        let job = LocalMediaPreprocessingJob(
+            kind: .imageJPEG,
+            sources: [LocalMediaOriginalSource(
+                storageKey: firstSourceKey,
+                mediaType: "image/heic",
+                fileSize: firstBytes.count,
+                duration: nil
+            )],
+            outputStorageKey: collidingSpoolID,
+            outputMediaType: "image/jpeg"
+        )
+        let batch = try KitMediaMessageV2OutboundBatch.queued(
+            attachments: [
+                .init(
+                    attachmentID: firstSourceKey,
+                    mediaType: "image/jpeg",
+                    plaintextByteSize: firstBytes.count,
+                    localStorageKey: firstSourceKey
+                ),
+                .init(
+                    attachmentID: secondSourceKey,
+                    mediaType: "application/pdf",
+                    plaintextByteSize: secondBytes.count,
+                    localStorageKey: secondSourceKey
+                ),
+            ],
+            rawCaption: "Two files",
+            keyMaterialFactory: {
+                Data(repeating: 0x83, count: SecureMediaAttachmentCipher.keyMaterialBytes)
+            }
+        )
+        let store = try await makeStore(userID: localUserID)
+        let existingMessageID = UUID()
+        let existingRecord = try XCTUnwrap(LocalMediaRecordPolicy.queuedOutgoing(
+            id: collidingSpoolID,
+            messageID: existingMessageID,
+            conversationID: existingConversationID,
+            mediaType: "application/pdf",
+            fileSize: 1_024,
+            localStorageKey: existingSourceKey,
+            storesInline: false,
+            now: Date(),
+            localStorageKind: .protectedFile
+        ))
+        var crypto = SecureMessagingPersistentState.empty
+        crypto.enrollment = raceEnrollment(userID: localUserID)
+        try await store.update { state in
+            state.communicationOwnerUserID = localUserID
+            state.secureMessaging = crypto
+            state.conversations = [conversationID, existingConversationID].map { id in
+                Conversation(
+                    id: id,
+                    title: "Peer",
+                    participantUserIds: [localUserID, recipientUserID],
+                    unreadCount: 0,
+                    updatedAt: Date()
+                )
+            }
+            state.messages = [LocalMessage(
+                id: existingMessageID,
+                conversationId: existingConversationID,
+                senderId: localUserID,
+                body: "Existing document",
+                createdAt: Date(),
+                sentAt: nil,
+                state: .queued,
+                failureReason: nil,
+                isOutgoing: true,
+                pendingAttachment: LocalPendingAttachment(
+                    mediaType: "application/pdf",
+                    caption: nil,
+                    localStorageKey: existingSourceKey,
+                    byteCount: 1_024
+                ),
+                localMediaRecords: [existingRecord]
+            )]
+        }
+        let blobs = InMemoryMediaBlobStore(
+            seed: [secondSourceKey: secondBytes],
+            protectedFiles: [firstSourceKey: firstURL]
+        )
+        let coordinator = SecureMessagingExchangeCoordinator(
+            transport: OfflineExchangeTransport(),
+            store: store,
+            engine: SecureMessagingCryptoEngine(),
+            provisioningPreKeyCount: 1,
+            mediaBlobs: blobs.access(forUserID: localUserID)
+        )
+
+        do {
+            _ = try await coordinator.queueDeferredMediaBatch(
+                forUserID: localUserID,
+                conversationID: conversationID,
+                expectedRecipientUserID: recipientUserID,
+                title: "Peer",
+                batch: batch,
+                localStorageKinds: [.protectedFile, .encryptedBlob],
+                preprocessingJobs: [job, nil]
+            )
+            XCTFail("a preprocessing output cannot alias another record's ciphertext-spool id")
+        } catch {
+            // Expected: no file/object key may gain a second durable owner.
+        }
+
+        let snapshot = await store.snapshot()
+        XCTAssertEqual(snapshot.messages.count, 1)
+        XCTAssertTrue(snapshot.outbox.isEmpty)
+        XCTAssertEqual(snapshot.messages.first?.localMediaRecords?.first?.id, collidingSpoolID)
+    }
+
+    func testDeferredMediaBatchRejectsOutputAliasingSiblingAttachmentID() async throws {
+        let localUserID = "10000000-0000-4000-8000-000000000091"
+        let recipientUserID = "10000000-0000-4000-8000-000000000092"
+        let conversationID = "30000000-0000-4000-8000-000000000091"
+        let firstAttachmentID = "70000000-0000-4000-8000-000000000091"
+        let firstSourceKey = "70000000-0000-4000-8000-000000000092"
+        let secondAttachmentID = "70000000-0000-4000-8000-000000000093"
+        let secondSourceKey = "70000000-0000-4000-8000-000000000094"
+        let job = LocalMediaPreprocessingJob(
+            kind: .imageJPEG,
+            sources: [LocalMediaOriginalSource(
+                storageKey: firstSourceKey,
+                mediaType: "image/heic",
+                fileSize: 300,
+                duration: nil
+            )],
+            outputStorageKey: secondAttachmentID,
+            outputMediaType: "image/jpeg"
+        )
+        let batch = try KitMediaMessageV2OutboundBatch.queued(
+            attachments: [
+                .init(
+                    attachmentID: firstAttachmentID,
+                    mediaType: "image/jpeg",
+                    plaintextByteSize: 300,
+                    localStorageKey: firstSourceKey
+                ),
+                .init(
+                    attachmentID: secondAttachmentID,
+                    mediaType: "application/pdf",
+                    plaintextByteSize: 517,
+                    localStorageKey: secondSourceKey
+                ),
+            ],
+            rawCaption: nil,
+            keyMaterialFactory: {
+                Data(repeating: 0x91, count: SecureMediaAttachmentCipher.keyMaterialBytes)
+            }
+        )
+        let store = try await makeStore(userID: localUserID)
+        var crypto = SecureMessagingPersistentState.empty
+        crypto.enrollment = raceEnrollment(userID: localUserID)
+        try await store.update { state in
+            state.communicationOwnerUserID = localUserID
+            state.secureMessaging = crypto
+            state.conversations = [Conversation(
+                id: conversationID,
+                title: "Peer",
+                participantUserIds: [localUserID, recipientUserID],
+                unreadCount: 0,
+                updatedAt: Date()
+            )]
+        }
+        let coordinator = SecureMessagingExchangeCoordinator(
+            transport: OfflineExchangeTransport(),
+            store: store,
+            engine: SecureMessagingCryptoEngine(),
+            provisioningPreKeyCount: 1,
+            mediaBlobs: InMemoryMediaBlobStore(seed: [:]).access(forUserID: localUserID)
+        )
+
+        do {
+            _ = try await coordinator.queueDeferredMediaBatch(
+                forUserID: localUserID,
+                conversationID: conversationID,
+                expectedRecipientUserID: recipientUserID,
+                title: "Peer",
+                batch: batch,
+                localStorageKinds: [.protectedFile, .encryptedBlob],
+                preprocessingJobs: [job, nil]
+            )
+            XCTFail("one item's output cannot alias a sibling attachment/spool identity")
+        } catch {
+            // Expected before any media read or durable queue mutation.
+        }
+
+        let snapshot = await store.snapshot()
+        XCTAssertTrue(snapshot.messages.isEmpty)
+        XCTAssertTrue(snapshot.outbox.isEmpty)
+    }
+
+    func testIdempotentMediaBatchRetryNeverDeletesAnotherDraftsParkedBytes() async throws {
+        let localUserID = "10000000-0000-4000-8000-000000000075"
+        let recipientUserID = "10000000-0000-4000-8000-000000000076"
+        let conversationID = "30000000-0000-4000-8000-000000000075"
+        let otherConversationID = "30000000-0000-4000-8000-000000000076"
+        let stableMessageID = UUID(uuidString: "80000000-0000-4000-8000-000000000075")!
+        let originalKeys = [
+            "70000000-0000-4000-8000-000000000075",
+            "70000000-0000-4000-8000-000000000076",
+        ]
+        let retryKeys = [
+            "70000000-0000-4000-8000-000000000077",
+            "70000000-0000-4000-8000-000000000078",
+        ]
+        let payloads = [Data(repeating: 0x75, count: 300), Data(repeating: 0x76, count: 517)]
+        func batch(keys: [String]) throws -> KitMediaMessageV2OutboundBatch {
+            try KitMediaMessageV2OutboundBatch.queued(
+                attachments: [
+                    .init(
+                        mediaType: "image/jpeg",
+                        plaintextByteSize: payloads[0].count,
+                        localStorageKey: keys[0]
+                    ),
+                    .init(
+                        mediaType: "video/mp4",
+                        plaintextByteSize: payloads[1].count,
+                        localStorageKey: keys[1]
+                    ),
+                ],
+                rawCaption: "Same logical batch",
+                keyMaterialFactory: {
+                    Data(repeating: 0x75, count: SecureMediaAttachmentCipher.keyMaterialBytes)
+                }
+            )
+        }
+        let originalBatch = try batch(keys: originalKeys)
+        let replayBatch = try batch(keys: retryKeys)
+        let store = try await makeStore(userID: localUserID)
+        try await store.update { state in
+            state.communicationOwnerUserID = localUserID
+            var crypto = SecureMessagingPersistentState.empty
+            crypto.enrollment = raceEnrollment(userID: localUserID)
+            state.secureMessaging = crypto
+            state.conversations = [conversationID, otherConversationID].map { id in
+                Conversation(
+                    id: id,
+                    title: "Peer",
+                    participantUserIds: [localUserID, recipientUserID],
+                    unreadCount: 0,
+                    updatedAt: Date(timeIntervalSince1970: 1_755_604_800)
+                )
+            }
+        }
+        let blobs = InMemoryMediaBlobStore(seed: [
+            originalKeys[0]: payloads[0], originalKeys[1]: payloads[1],
+            retryKeys[0]: payloads[0], retryKeys[1]: payloads[1],
+        ])
+        let coordinator = SecureMessagingExchangeCoordinator(
+            transport: OfflineExchangeTransport(),
+            store: store,
+            engine: SecureMessagingCryptoEngine(),
+            provisioningPreKeyCount: 1,
+            mediaBlobs: blobs.access(forUserID: localUserID)
+        )
+        _ = try await coordinator.queueDeferredMediaBatch(
+            forUserID: localUserID,
+            conversationID: conversationID,
+            expectedRecipientUserID: recipientUserID,
+            title: "Peer",
+            batch: originalBatch,
+            clientMessageID: stableMessageID
+        )
+        let draftAttachment = ConversationDraftMediaAttachment(
+            id: UUID(uuidString: retryKeys[0])!,
+            storageKind: .encryptedBlob,
+            mediaType: "image/jpeg",
+            originalMediaType: nil,
+            byteCount: payloads[0].count,
+            displayName: "Still composing.jpg",
+            duration: nil,
+            acceptedAt: Date(),
+            clientMessageID: nil,
+            preprocessingOutputStorageKey: nil
+        )
+        try await store.update { state in
+            state.conversationDrafts = [
+                otherConversationID: ConversationDraft(
+                    body: "Still composing",
+                    updatedAt: Date(),
+                    writeVersion: ConversationDraftWriteVersion(
+                        writerID: UUID(),
+                        sequence: 1
+                    ),
+                    mediaAttachments: [draftAttachment]
+                ),
+            ]
+        }
+
+        do {
+            _ = try await coordinator.queueDeferredMediaBatch(
+                forUserID: localUserID,
+                conversationID: conversationID,
+                expectedRecipientUserID: recipientUserID,
+                title: "Peer",
+                batch: replayBatch,
+                clientMessageID: stableMessageID
+            )
+            XCTFail("idempotent replay must not consume storage owned by another draft")
+        } catch {
+            // Expected: fail closed rather than delete a live draft's bytes as retry scratch.
+        }
+
+        let snapshot = await store.snapshot()
+        XCTAssertEqual(snapshot.messages.count, 1)
+        XCTAssertEqual(snapshot.outbox.count, 1)
+        XCTAssertEqual(snapshot.conversationDrafts?[otherConversationID]?.mediaAttachments, [draftAttachment])
+        let retainedKeys = await blobs.storageKeys()
+        XCTAssertEqual(
+            retainedKeys,
+            Set(originalKeys + retryKeys)
+        )
+    }
+
     /// Flush end-to-end up to the send boundary: the fresh capabilities+roster admission gate
     /// passes, every item uploads exactly once in ascending attachment-id order, and one
     /// KITMEDIA2 descriptor carrying the caption becomes the durable body — all before any
@@ -5543,9 +6123,11 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
         XCTAssertEqual(reopenedRecord.encryptionState, .pending)
         XCTAssertTrue(reopenedRecord.isStructurallyValid)
         let retainedOriginal = await blobs.read(mediaID)
-        let expiredCopy = await blobs.read(expiredStorageKey)
+        let orphanedExpiredCopy = await blobs.read(expiredStorageKey)
         XCTAssertEqual(retainedOriginal, plaintext)
-        XCTAssertNil(expiredCopy)
+        // The state mutation has released this key, but deletion is deliberately deferred to the
+        // age-gated orphan sweep so a concurrent writer cannot claim it during the CAS suspension.
+        XCTAssertEqual(orphanedExpiredCopy, plaintext)
     }
 
     func testExpiredBatchReferencesRebindToRetainedOriginalsWithoutChangingIdentity() async throws {
@@ -5724,12 +6306,14 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
         })
         let retainedFirst = await blobs.read(firstMediaID)
         let retainedSecond = await blobs.read(secondMediaID)
-        let removedFirstRemoteCopy = await blobs.read(firstExpiredKey)
-        let removedSecondRemoteCopy = await blobs.read(secondExpiredKey)
+        let orphanedFirstRemoteCopy = await blobs.read(firstExpiredKey)
+        let orphanedSecondRemoteCopy = await blobs.read(secondExpiredKey)
         XCTAssertEqual(retainedFirst, firstPlaintext)
         XCTAssertEqual(retainedSecond, secondPlaintext)
-        XCTAssertNil(removedFirstRemoteCopy)
-        XCTAssertNil(removedSecondRemoteCopy)
+        // Reopening releases both keys atomically. Their bytes stay until the age-gated orphan
+        // sweep, avoiding an inline-delete race with a draft or queue writer claiming either key.
+        XCTAssertEqual(orphanedFirstRemoteCopy, firstPlaintext)
+        XCTAssertEqual(orphanedSecondRemoteCopy, secondPlaintext)
     }
 
     /// Shared setup for the flush-stage tests: a queued two-item batch with caption, a real
@@ -5850,6 +6434,21 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
             "version": SecureMessagingWire.protocolVersion,
             "suite": SecureMessagingWire.protocolSuite,
             "post_quantum": true,
+            "rich_media": [
+                "ready": true,
+                "profile": MessagingRichMediaCapabilityPolicy.profile,
+                "supported_platforms": ["ios"],
+                "minimum_ios_version": MessagingRichMediaCapabilityPolicy.minimumIOSRelease,
+                "minimum_ciphertext_bytes": SecureMessagingWire.minimumAttachmentCiphertextBytes,
+                "maximum_plaintext_bytes": SecureMediaAttachmentCipher.maximumPlaintextBytes,
+                "maximum_ciphertext_bytes": SecureMessagingWire.maximumAttachmentCiphertextBytes,
+                "large_attachment_capability": MessagingRichMediaCapabilityPolicy
+                    .extendedSizeDeviceCapabilityKey,
+                "large_attachment_supported_platforms": ["ios"],
+                "large_attachment_minimum_ios_version": MessagingRichMediaCapabilityPolicy
+                    .extendedSizeMinimumIOSRelease,
+                "media_types": SecureMessagingWire.allowedAttachmentMediaTypes.sorted(),
+            ],
         ]
         var features: [String: Any] = [:]
         if enabled {
@@ -6772,12 +7371,27 @@ private struct MediaBatchRecordedUpload: Equatable, Sendable {
 /// choreography depends on.
 private actor InMemoryMediaBlobStore {
     private var blobs: [String: Data]
+    private var protectedFiles: [String: URL]
 
-    init(seed: [String: Data]) {
+    init(seed: [String: Data], protectedFiles: [String: URL] = [:]) {
         blobs = seed
+        self.protectedFiles = protectedFiles
     }
 
     func read(_ storageKey: String) -> Data? { blobs[storageKey] }
+
+    func byteCount(_ storageKey: String) -> Int? {
+        if let data = blobs[storageKey] { return data.count }
+        guard let url = protectedFiles[storageKey] else { return nil }
+        return try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize
+    }
+
+    func protectedOriginalURL(_ storageKey: String, expectedByteCount: Int) -> URL? {
+        guard let url = protectedFiles[storageKey],
+              byteCount(storageKey) == expectedByteCount
+        else { return nil }
+        return url
+    }
 
     func duplicate(fromKey: String, toKey: String) -> SecureMediaDuplicateOutcome {
         guard let source = blobs[fromKey] else { return .sourceMissing }
@@ -6814,9 +7428,12 @@ private actor InMemoryMediaBlobStore {
             },
             byteCount: { key, userID in
                 guard userID == expectedUserID else { return nil }
-                return await self.read(key)?.count
+                return await self.byteCount(key)
             },
-            protectedOriginalURL: { _, _, _ in nil },
+            protectedOriginalURL: { key, userID, expectedByteCount in
+                guard userID == expectedUserID else { return nil }
+                return await self.protectedOriginalURL(key, expectedByteCount: expectedByteCount)
+            },
             duplicateIfAbsent: { fromKey, toKey, userID in
                 guard userID == expectedUserID else { return .sourceMissing }
                 return await self.duplicate(fromKey: fromKey, toKey: toKey)

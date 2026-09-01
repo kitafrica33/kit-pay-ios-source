@@ -55,6 +55,9 @@ enum BankTransferActionErrorContext: CaseIterable, Hashable {
 }
 
 enum BankTransferActionErrorCopy {
+    static let accountVerificationFailure =
+        "We couldn't verify this bank account. Check the details and try again."
+
     static func transferContext(
         submissionStarted: Bool
     ) -> BankTransferActionErrorContext {
@@ -69,6 +72,14 @@ enum BankTransferActionErrorCopy {
         if let clientError = error as? APIClientError,
            case .invalidPayload = clientError {
             return context.invalidPayloadMessage
+        }
+        if context == .accountVerification {
+            if let flowError = error as? BankTransferFlowError {
+                return flowError.localizedDescription
+            }
+            // Bank/provider error payloads are operational diagnostics. Do not use their raw
+            // message as customer copy, even if today's wording appears harmless.
+            return accountVerificationFailure
         }
         if feeMode == .kitCovers,
            let payload = error as? APIErrorPayload,
@@ -112,7 +123,9 @@ final class BankTransferViewModel: ObservableObject {
         if AppStoreScreenshotFixture.isActive {
             banks = AppStoreScreenshotFixture.banks
             beneficiaries = AppStoreScreenshotFixture.bankBeneficiaries
-            operations = AppStoreScreenshotFixture.bankOperations
+            operations = BankTransferOperationPresentationPolicy.customerVisibleOperations(
+                AppStoreScreenshotFixture.bankOperations
+            )
             loadedBankCountry = "UG"
         }
 #endif
@@ -134,7 +147,9 @@ final class BankTransferViewModel: ObservableObject {
         if AppStoreScreenshotFixture.isActive {
             banks = AppStoreScreenshotFixture.banks
             beneficiaries = AppStoreScreenshotFixture.bankBeneficiaries
-            operations = AppStoreScreenshotFixture.bankOperations
+            operations = BankTransferOperationPresentationPolicy.customerVisibleOperations(
+                AppStoreScreenshotFixture.bankOperations
+            )
             loadedBankCountry = "UG"
             bankCatalogErrorMessage = nil
             beneficiaryLoadErrorMessage = nil
@@ -248,8 +263,9 @@ final class BankTransferViewModel: ObservableObject {
 
         switch results.operations {
         case .success(let operationList):
-            operations = (operationList.items ?? [])
-                .filter { $0.type.caseInsensitiveCompare(BankTransferContract.operationType) == .orderedSame }
+            operations = BankTransferOperationPresentationPolicy.customerVisibleOperations(
+                operationList.items ?? []
+            )
                 .sorted { ($0.createdAt ?? "") > ($1.createdAt ?? "") }
             operations.filter { !$0.isTerminal }.forEach { pollOperation($0.id) }
             operationLoadErrorMessage = nil
@@ -355,12 +371,9 @@ final class BankTransferViewModel: ObservableObject {
                 pollCount += 1
             }
             guard result.isVerified else {
-                throw BankTransferFlowError.verificationIncomplete(
-                    result.failure?.message
-                        ?? (result.isPending
-                            ? "The bank is still verifying this account. Try again shortly."
-                            : "The bank could not verify this account.")
-                )
+                throw result.isPending
+                    ? BankTransferFlowError.verificationPending
+                    : BankTransferFlowError.verificationFailed
             }
             return result
         } catch is CancellationError {
@@ -598,7 +611,6 @@ final class BankTransferViewModel: ObservableObject {
               quote.bank.id == beneficiary.bank.id,
               quote.bank.code.caseInsensitiveCompare(beneficiary.bank.code) == .orderedSame,
               quote.scheduleVerified,
-              !quote.scheduleVersion.isEmpty,
               quote.currency == wallet.currency,
               quote.currency.code.caseInsensitiveCompare("UGX") == .orderedSame,
               BankTransferMoney.amountsMatch(quote.enteredAmount, amount),
@@ -612,7 +624,8 @@ final class BankTransferViewModel: ObservableObject {
         quote: BankTransferQuoteDTO,
         beneficiary: BankBeneficiaryDTO
     ) throws {
-        guard operation.hasSameOutboundBinding(as: quote),
+        guard BankTransferOperationPresentationPolicy.isCustomerVisible(operation),
+              operation.hasSameOutboundBinding(as: quote),
               operation.beneficiaryId == beneficiary.id,
               operation.bankId == beneficiary.bank.id
         else { throw BankTransferFlowError.operationMismatch }
@@ -651,6 +664,11 @@ final class BankTransferViewModel: ObservableObject {
 
     private func upsert(_ operation: BankingOperationDTO) {
         operations.removeAll { $0.id == operation.id }
+        guard BankTransferOperationPresentationPolicy.isCustomerVisible(operation) else {
+            operationPollTasks[operation.id]?.cancel()
+            operationPollTasks[operation.id] = nil
+            return
+        }
         operations.insert(operation, at: 0)
     }
 
@@ -2820,9 +2838,18 @@ private struct BankTransferPaymentView: View {
                 Text(presentation.title)
                     .font(.largeTitle.bold())
                     .foregroundStyle(.primary)
-                Text(BankTransferDisplay.amount(operation.amount, currency: operation.currency))
-                    .font(.system(size: 34, weight: .heavy, design: .rounded))
-                    .foregroundStyle(.primary)
+                Text("Money Deducted")
+                    .font(.caption.bold())
+                    .foregroundStyle(.secondary)
+                if let customerAmount = operation.customerAmountDeducted {
+                    Text(BankTransferDisplay.amount(customerAmount, currency: operation.currency))
+                        .font(.system(size: 34, weight: .heavy, design: .rounded))
+                        .foregroundStyle(.primary)
+                } else {
+                    Text("Amount unavailable")
+                        .font(.headline)
+                        .foregroundStyle(.secondary)
+                }
                 Text(presentation.message)
                     .multilineTextAlignment(.center)
                     .foregroundStyle(.secondary)
@@ -2832,7 +2859,7 @@ private struct BankTransferPaymentView: View {
                     receiptRow("Bank", beneficiary.bank.name)
                     receiptRow("Account", beneficiary.accountNumberMasked)
                     receiptRow("Status", operation.status.replacingOccurrences(of: "_", with: " ").capitalized)
-                    if let pricing = operation.outboundPricing {
+                    if let pricing = operation.customerOutboundPricing {
                         receiptRow(
                             CustomerFacingPaymentCopy.transactionFeeTitle,
                             BankTransferDisplay.amount(
@@ -2915,9 +2942,20 @@ private struct BankTransferOperationRow: View {
                     .foregroundStyle(presentation.color)
             }
             Spacer()
-            Text(BankTransferDisplay.amount(operation.amount, currency: operation.currency))
-                .font(.subheadline.bold())
-                .foregroundStyle(.primary)
+            VStack(alignment: .trailing, spacing: 3) {
+                Text("Money Deducted")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                if let customerAmount = operation.customerAmountDeducted {
+                    Text(BankTransferDisplay.amount(customerAmount, currency: operation.currency))
+                        .font(.subheadline.bold())
+                        .foregroundStyle(.primary)
+                } else {
+                    Text("Amount unavailable")
+                        .font(.caption.bold())
+                        .foregroundStyle(.secondary)
+                }
+            }
         }
         .padding(14)
         .kitGlass(cornerRadius: 20, shadow: false)
@@ -2957,9 +2995,21 @@ private struct BankTransferHistoryReceiptView: View {
                     Text(presentation.title)
                         .font(.largeTitle.bold())
                         .foregroundStyle(.primary)
-                    Text(BankTransferDisplay.amount(operation.amount, currency: operation.currency))
-                        .font(.system(size: 34, weight: .heavy, design: .rounded))
-                        .foregroundStyle(.primary)
+                    Text("Money Deducted")
+                        .font(.caption.bold())
+                        .foregroundStyle(.secondary)
+                    if let customerAmount = operation.customerAmountDeducted {
+                        Text(BankTransferDisplay.amount(
+                            customerAmount,
+                            currency: operation.currency
+                        ))
+                            .font(.system(size: 34, weight: .heavy, design: .rounded))
+                            .foregroundStyle(.primary)
+                    } else {
+                        Text("Amount unavailable")
+                            .font(.headline)
+                            .foregroundStyle(.secondary)
+                    }
                     Text(presentation.message)
                         .multilineTextAlignment(.center)
                         .foregroundStyle(.secondary)
@@ -2974,7 +3024,7 @@ private struct BankTransferHistoryReceiptView: View {
                             "Status",
                             operation.status.replacingOccurrences(of: "_", with: " ").capitalized
                         )
-                        if let pricing = operation.outboundPricing {
+                        if let pricing = operation.customerOutboundPricing {
                             receiptRow(
                                 CustomerFacingPaymentCopy.transactionFeeTitle,
                                 BankTransferDisplay.amount(
@@ -3119,7 +3169,8 @@ private enum BankTransferDisplay {
 
 private enum BankTransferFlowError: LocalizedError {
     case verificationMismatch
-    case verificationIncomplete(String)
+    case verificationPending
+    case verificationFailed
     case unconfirmedBeneficiary
     case quoteMismatch
     case quoteExpired
@@ -3130,8 +3181,10 @@ private enum BankTransferFlowError: LocalizedError {
         switch self {
         case .verificationMismatch:
             "Kit Pay could not confirm that the bank verified the selected account. Nothing was saved."
-        case .verificationIncomplete(let message):
-            message
+        case .verificationPending:
+            "The bank is still verifying this account. Try again shortly."
+        case .verificationFailed:
+            BankTransferActionErrorCopy.accountVerificationFailure
         case .unconfirmedBeneficiary:
             "Kit Pay did not confirm this verified beneficiary. Refresh before trying again."
         case .quoteMismatch:

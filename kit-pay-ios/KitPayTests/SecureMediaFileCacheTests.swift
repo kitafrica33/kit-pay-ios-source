@@ -56,6 +56,93 @@ final class SecureMediaFileCacheTests: XCTestCase {
         XCTAssertEqual(identicalOutcome, .alreadyPresent)
     }
 
+    func testDraftRestoreCannotConfuseSealedAndProtectedRepresentations() async throws {
+        let sealedKey = UUID().uuidString.lowercased()
+        let sealed = Data("sealed draft".utf8)
+        let insert = await cache.insertIfAbsent(
+            sealed,
+            forStorageKey: sealedKey,
+            userID: userID
+        )
+        XCTAssertEqual(insert, .stored)
+        let restoredSealed = await cache.encryptedBlobData(
+            forStorageKey: sealedKey,
+            userID: userID,
+            expectedByteCount: sealed.count
+        )
+        XCTAssertEqual(restoredSealed, sealed)
+        let sealedAsProtected = await cache.protectedOriginalURL(
+            forStorageKey: sealedKey,
+            userID: userID,
+            expectedByteCount: sealed.count
+        )
+        XCTAssertNil(sealedAsProtected)
+
+        let protectedKey = UUID().uuidString.lowercased()
+        let source = temporaryDirectory.appendingPathComponent("draft.pdf")
+        let protected = Data("protected draft".utf8)
+        try protected.write(to: source)
+        let url = try await cache.importProtectedOriginal(
+            from: source,
+            forStorageKey: protectedKey,
+            userID: userID,
+            mediaType: "application/pdf",
+            expectedByteCount: protected.count,
+            moveSource: true
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+        let protectedAsSealed = await cache.encryptedBlobData(
+            forStorageKey: protectedKey,
+            userID: userID,
+            expectedByteCount: protected.count
+        )
+        XCTAssertNil(protectedAsSealed)
+    }
+
+    func testPreprocessingProbeNeverMaterializesASealedCollision() async throws {
+        let missingKey = UUID().uuidString.lowercased()
+        let missing = await cache.probeProtectedOriginal(
+            forStorageKey: missingKey,
+            userID: userID
+        )
+        XCTAssertEqual(missing, .absent)
+
+        let sealedKey = UUID().uuidString.lowercased()
+        let sealed = Data(repeating: 0x61, count: 2 * 1_024 * 1_024)
+        let sealedInsertion = await cache.insertIfAbsent(
+            sealed,
+            forStorageKey: sealedKey,
+            userID: userID
+        )
+        XCTAssertEqual(sealedInsertion, .stored)
+        let sealedProbe = await cache.probeProtectedOriginal(
+            forStorageKey: sealedKey,
+            userID: userID
+        )
+        XCTAssertEqual(sealedProbe, .occupiedInvalid)
+
+        let protectedKey = UUID().uuidString.lowercased()
+        let protectedBytes = Data(repeating: 0x62, count: 4_096)
+        let sourceURL = temporaryDirectory.appendingPathComponent("preprocessed.jpg")
+        try protectedBytes.write(to: sourceURL, options: .atomic)
+        let protectedURL = try await cache.importProtectedOriginal(
+            from: sourceURL,
+            forStorageKey: protectedKey,
+            userID: userID,
+            mediaType: "image/jpeg",
+            expectedByteCount: protectedBytes.count,
+            moveSource: true
+        )
+        let protectedProbe = await cache.probeProtectedOriginal(
+            forStorageKey: protectedKey,
+            userID: userID
+        )
+        XCTAssertEqual(
+            protectedProbe,
+            .candidate(fileURL: protectedURL, byteSize: protectedBytes.count)
+        )
+    }
+
     func testInsertOutcomeIsTheDeletionLicenseAfterAFailedRevalidation() async throws {
         let key = UUID().uuidString
         let plaintext = Data("downloaded plaintext".utf8)

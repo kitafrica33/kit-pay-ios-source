@@ -50,6 +50,23 @@ enum ChatMediaImageDecoder {
     }
 }
 
+extension SecureMediaLoadPolicy.LoadedItem {
+    /// Decode a bounded display representation without first copying a protected original into
+    /// one whole-file Data value. Inline/legacy encrypted blobs retain their existing data path.
+    func downsampledImage(maximumPixelSize: Int) -> UIImage? {
+        if let localFileURL {
+            return ChatMediaImageDecoder.downsample(
+                fileURL: localFileURL,
+                maximumPixelSize: maximumPixelSize
+            )
+        }
+        return ChatMediaImageDecoder.downsample(
+            data: data,
+            maximumPixelSize: maximumPixelSize
+        )
+    }
+}
+
 /// In-memory, size-capped thumbnail cache for chat media. Keyed by descriptor storage key +
 /// pixel bucket. Never persists thumbnails to disk (plaintext stays in the encrypted caches).
 @MainActor

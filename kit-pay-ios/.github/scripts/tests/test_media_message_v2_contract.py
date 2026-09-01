@@ -224,6 +224,9 @@ class MediaMessageV2SourceContract(unittest.TestCase):
         gallery = (ROOT / "KitPay/Features/Messages/KitMediaGalleryView.swift").read_text(
             encoding="utf-8"
         )
+        thumbnails = (ROOT / "KitPay/Features/Messages/ChatMediaThumbnails.swift").read_text(
+            encoding="utf-8"
+        )
         page_start = gallery.index("private struct GalleryImagePage")
         page = gallery[page_start:]
         view_code = "\n".join(
@@ -235,9 +238,24 @@ class MediaMessageV2SourceContract(unittest.TestCase):
 
         self.assertNotIn("UIImage(data:", view_code)
         self.assertNotIn("UIImage.init(data:", view_code)
-        self.assertIn("ChatMediaImageDecoder.downsample", view_code)
+        self.assertIn("downsampledImage(", view_code)
+        self.assertIn("CGImageSourceCreateWithURL", thumbnails)
         self.assertIn("maximumPixelSize: 4_096", page_code)
         self.assertNotIn("UIImage(data:", page_code)
+
+    def test_explicit_gallery_dismissal_does_not_start_picture_in_picture(self) -> None:
+        """Closing, dragging away, and Show in chat share dismissGallery. Those explicit user
+        exits must stop playback; only an app background transition may retain it in PiP."""
+        gallery = (ROOT / "KitPay/Features/Messages/KitMediaGalleryView.swift").read_text(
+            encoding="utf-8"
+        )
+        picture_in_picture = (
+            ROOT / "KitPay/Features/Messages/ChatVideoPictureInPicture.swift"
+        ).read_text(encoding="utf-8")
+        dismiss = "\n".join(function_body(gallery, "private func dismissGallery()"))
+        self.assertIn("stopForExplicitViewerDismissal()", dismiss)
+        self.assertNotIn("startIfPlaying()", dismiss)
+        self.assertIn("func stopForExplicitViewerDismissal()", picture_in_picture)
 
     def test_ready_leases_are_replayed_at_the_sealing_boundary(self) -> None:
         """Resumable ciphertext must stay retained until an exact READY replay immediately
@@ -339,6 +357,215 @@ class MediaMessageV2SourceContract(unittest.TestCase):
             "MessagingRichMediaCapabilityPolicy.supportsPlaintextByteSizeAcrossRoster(", body
         )
         self.assertIn("maximumAggregateCiphertextBytes", body)
+
+    def test_recipient_hydration_republishes_final_child_states_before_retry(self) -> None:
+        """Concurrent children can finish out of order. The retry decision must follow a fresh
+        protected-store projection so a late failure cannot remain published as downloading."""
+        app_model = (ROOT / "KitPay/App/AppModel.swift").read_text(encoding="utf-8")
+        start = app_model.index("private func schedulePendingMediaHydration()")
+        end = app_model.index("private var hasPendingReceivedMediaHydration", start)
+        body = app_model[start:end]
+        run = body.index("await self.runPendingMediaHydration")
+        publish = body.index("await self.publishLatestState()", run)
+        pending_after = body.index("let pendingAfter", publish)
+        self.assertLess(run, publish)
+        self.assertLess(publish, pending_after)
+
+    def test_direct_recipient_hydration_failure_is_republished_for_retry(self) -> None:
+        """A visible bubble can invoke hydration without the background pass. Its failure must
+        leave the published row in `failed`, not stranded in the intermediate downloading state."""
+        app_model = (ROOT / "KitPay/App/AppModel.swift").read_text(encoding="utf-8")
+        start = app_model.index("func loadProtectedLocalMediaFile(")
+        end = app_model.index("private func schedulePendingMediaHydration()", start)
+        body = app_model[start:end]
+        failure = body.index("LocalMediaRecordPolicy.markDownloadFailed(")
+        publish = body.index("await publishLatestState()", failure)
+        self.assertLess(failure, publish)
+
+    def test_composer_media_has_an_encrypted_restart_manifest(self) -> None:
+        models = (ROOT / "KitPay/Core/Models.swift").read_text(encoding="utf-8")
+        messages = (ROOT / "KitPay/Features/Messages/MessagesView.swift").read_text(
+            encoding="utf-8"
+        )
+        coordinator = COORDINATOR.read_text(encoding="utf-8")
+        self.assertIn("struct ConversationDraftMediaAttachment", models)
+        self.assertIn(
+            "let mediaAttachments: [ConversationDraftMediaAttachment]?",
+            models,
+        )
+        self.assertIn("restoredConversationDraftMedia(", messages)
+        self.assertIn("mediaAttachments: submittedDraftMediaAttachments", messages)
+        self.assertIn(
+            "submittedMediaAttachments: submittedDraftMediaAttachments",
+            coordinator,
+        )
+
+    def test_send_waits_for_async_media_draft_restoration(self) -> None:
+        """A fast tap during relaunch must not clear an attachment manifest that the async
+        protected-file restoration has not projected into the composer yet."""
+        messages = (ROOT / "KitPay/Features/Messages/MessagesView.swift").read_text(
+            encoding="utf-8"
+        )
+        send = "\n".join(function_body(messages, "private func sendDraft("))
+        voice = "\n".join(function_body(messages, "private func sendVoiceNote()"))
+        self.assertIn("guard didRestoreDraft", send)
+        self.assertIn("guard didRestoreDraft", voice)
+        can_send_start = messages.index("private var canSendMessage: Bool")
+        can_send_end = messages.index("private var cameraPullIsEligible", can_send_start)
+        self.assertIn("&& didRestoreDraft", messages[can_send_start:can_send_end])
+        restore_start = messages.index("let restored = await model.restoredConversationDraftMedia(")
+        restore_end = messages.index(
+            "stagedAttachments.insert(contentsOf: newAttachments", restore_start
+        )
+        self.assertNotIn(
+            "LocalMediaPerformanceMonitor.shared.begin",
+            messages[restore_start:restore_end],
+        )
+
+    def test_camera_preserves_avcapturephoto_bytes_before_background_processing(self) -> None:
+        camera = (ROOT / "KitPay/Features/Messages/KitCameraController.swift").read_text(
+            encoding="utf-8"
+        )
+        messages = (ROOT / "KitPay/Features/Messages/MessagesView.swift").read_text(
+            encoding="utf-8"
+        )
+        capture = "\n".join(function_body(camera, "func photoOutput("))
+        stage = "\n".join(function_body(messages, "private func stageCapturedPhoto("))
+        self.assertIn("photo.fileDataRepresentation()", capture)
+        self.assertIn("KitCaptureTemporaryFileStore.makeFileURL(", capture)
+        self.assertIn("case photo(fileURL: URL", camera)
+        self.assertLess(stage.index("stageAttachment("), stage.index("persistStagedMediaOriginal("))
+        self.assertIn("originalMediaType: mediaType", stage)
+
+    def test_concurrent_hydration_reserves_aggregate_disk_and_rotates_failures(self) -> None:
+        app_model = (ROOT / "KitPay/App/AppModel.swift").read_text(encoding="utf-8")
+        load = "\n".join(function_body(app_model, "func loadProtectedLocalMediaFile("))
+        run = "\n".join(function_body(app_model, "private func runPendingMediaHydration("))
+        self.assertIn("reserveReceivedMediaHydrationCapacity(", load)
+        self.assertIn("defer { receivedMediaHydrationReservations", load)
+        self.assertIn("lastAttemptAt", run)
+        self.assertIn("targets.sorted", run)
+
+    def test_preprocessing_overlaps_only_independent_outbox_commands(self) -> None:
+        app_model = (ROOT / "KitPay/App/AppModel.swift").read_text(encoding="utf-8")
+        run = "\n".join(function_body(app_model, "private func runPendingMediaPreprocessing("))
+        self.assertIn("targetsByCommand", run)
+        self.assertIn("MediaPreprocessingPolicy.maximumConcurrentJobs", run)
+        self.assertIn("withTaskGroup", run)
+        self.assertIn("processPendingMediaPreprocessingTargets(", run)
+        self.assertIn("lastAttemptAt", run)
+        self.assertIn("targets.sorted", run)
+
+    def test_preprocessing_validates_crash_output_and_rekeys_without_inline_removal(self) -> None:
+        app_model = (ROOT / "KitPay/App/AppModel.swift").read_text(encoding="utf-8")
+        policy = "\n".join(function_body(app_model, "static func canReplaceOutput("))
+        validator = "\n".join(function_body(app_model, "static func isValidPublishedOutput("))
+        rekey = "\n".join(function_body(app_model, "private func rekeyInvalidPreprocessingOutput("))
+        preprocess = "\n".join(function_body(app_model, "private func preprocessLocalMedia("))
+        self.assertIn("localMediaStorageKeysOwnedByDrafts", policy)
+        self.assertIn("recordOwners.count == 1", policy)
+        self.assertIn("owner.record.preprocessingJob == expectedJob", policy)
+        self.assertIn("MediaPreprocessingPolicy.canReplaceOutput(", preprocess)
+        self.assertNotIn("SecureMediaFileCache.shared.remove(", preprocess)
+        self.assertIn("CGImageSourceCreateThumbnailAtIndex", validator)
+        self.assertIn("asset.loadTracks(withMediaType: .audio)", validator)
+        self.assertIn("probeProtectedOriginal(", preprocess)
+        self.assertNotIn("SecureMediaFileCache.shared.byteCount(", preprocess)
+        self.assertIn("MediaPreprocessingPolicy.isValidPublishedOutput(", preprocess)
+        self.assertIn("rekeyInvalidPreprocessingOutput(", preprocess)
+        self.assertIn("MediaPreprocessingPolicy.canReplaceOutput(", rekey)
+        self.assertIn("MediaPreprocessingPolicy.isOutputStorageKeyUnowned(", rekey)
+        self.assertIn("LocalMediaRecordPolicy.rekeyPreprocessingOutput(", rekey)
+        self.assertNotIn("SecureMediaFileCache.shared.remove(", rekey)
+        self.assertLess(
+            preprocess.rindex("MediaPreprocessingPolicy.canReplaceOutput("),
+            preprocess.index("SecureMediaFileCache.shared.importProtectedOriginal("),
+        )
+
+    def test_queue_collision_namespace_includes_record_ids_and_storage_keys(self) -> None:
+        models = (ROOT / "KitPay/Core/Models.swift").read_text(encoding="utf-8")
+        coordinator = (ROOT / "KitPay/Core/SecureMessagingCoordinator.swift").read_text(
+            encoding="utf-8"
+        )
+        ownership = "\n".join(function_body(models, "var localMediaOwnershipClaims:"))
+        storage_admission = "\n".join(
+            function_body(models, "static func permitsTransition(")
+        )
+        replacement = "\n".join(
+            function_body(coordinator, "private func replaceDeferredMessageProjection(")
+        )
+        single = "\n".join(function_body(coordinator, "func queueDeferredImage("))
+        batch = "\n".join(function_body(coordinator, "func queueDeferredMediaBatch("))
+        draft_store = "\n".join(function_body(models, "static func store("))
+        self.assertIn("record.id", ownership)
+        self.assertIn("record.preprocessingJob?.outputStorageKey", ownership)
+        self.assertIn("localMediaStorageKeysOwnedByDrafts", storage_admission)
+        self.assertIn("proposedClaimsOnlyTargetServerRoles", storage_admission)
+        self.assertIn("LocalMediaStorageOwnershipPolicy.permitsTransition", replacement)
+        self.assertIn("proposedOwnershipKeys", single)
+        self.assertIn("localMediaOwnershipKeys", single)
+        self.assertIn("offeredOwnershipKeys", batch)
+        self.assertIn("localMediaOwnershipKeys", batch)
+        self.assertIn("localMediaOwnershipKeys", draft_store)
+
+    def test_server_storage_keys_are_target_bound_inside_the_projection_cas(self) -> None:
+        models = (ROOT / "KitPay/Core/Models.swift").read_text(encoding="utf-8")
+        coordinator = (ROOT / "KitPay/Core/SecureMessagingCoordinator.swift").read_text(
+            encoding="utf-8"
+        )
+        admission = "\n".join(function_body(models, "static func permitsTransition("))
+        binding_derivation = "\n".join(function_body(models, "static func bindings("))
+        replacement = "\n".join(
+            function_body(coordinator, "private func replaceDeferredMessageProjection(")
+        )
+        preparation = "\n".join(function_body(coordinator, "func prepareDeferredMessage("))
+        self.assertIn("localMediaStorageKeysOwnedByDrafts", admission)
+        self.assertIn("current.localMediaOwnershipClaims", admission)
+        self.assertIn("proposedClaimsOnlyTargetServerRoles", admission)
+        self.assertIn("record.resumableUpload?.storageKey", binding_derivation)
+        self.assertIn("record.remoteEncryptedObjectID", binding_derivation)
+        self.assertIn("LocalMediaStorageOwnershipPolicy.permitsTransition", replacement)
+        self.assertEqual(coordinator.count("LocalMediaRecordPolicy.setResumableUpload("), 4)
+        self.assertEqual(
+            coordinator.count("LocalMediaRecordPolicy.replaceCompletedResumableUpload("),
+            1,
+        )
+        self.assertNotIn("removeDuplicate(", preparation)
+
+    def test_single_media_queue_never_deletes_scratch_after_an_await(self) -> None:
+        app_model = (ROOT / "KitPay/App/AppModel.swift").read_text(encoding="utf-8")
+        queue = "\n".join(function_body(app_model, "func queueMediaMessage("))
+        self.assertIn("insertIfAbsent(", queue)
+        self.assertNotIn("SecureMediaFileCache.shared.remove(", queue)
+        self.assertIn("age-gated orphan sweep", queue)
+
+    def test_local_media_admission_never_waits_for_network_capabilities(self) -> None:
+        """A selected original and its pending bubble must commit without a capability request.
+        Service and device compatibility remain mandatory at the background upload boundary."""
+        app_model = (ROOT / "KitPay/App/AppModel.swift").read_text(encoding="utf-8")
+        coordinator = COORDINATOR.read_text(encoding="utf-8")
+        single = "\n".join(function_body(app_model, "func queueMediaMessage("))
+        batch = "\n".join(function_body(app_model, "func queueMediaMessageBatch("))
+        upload = "\n".join(
+            function_body(coordinator, "private func uploadDeferredMediaDescriptor(")
+        )
+
+        for queue in (single, batch):
+            self.assertNotIn("reloadCapabilities()", queue)
+        self.assertNotIn("enablesMessagingRichMedia", single)
+        self.assertNotIn("enablesMessagingMediaMessageV2", batch)
+        self.assertIn("queueDeferredImage(", single)
+        self.assertIn("queueDeferredMediaBatch(", batch)
+        self.assertIn("requiresAdvertisedRichMediaCapability", upload)
+        self.assertEqual(upload.count("capabilities.enablesMessagingRichMedia"), 2)
+        self.assertLess(
+            upload.index("prepareCiphertextSpool"),
+            upload.index("capabilities.enablesMessagingRichMedia"),
+        )
+        self.assertLess(
+            upload.index("capabilities.enablesMessagingRichMedia"),
+            upload.index("uploadMessagingAttachment("),
+        )
 
     def test_linux_gate_compiles_production_sources(self) -> None:
         gate = LINUX_GATE.read_text(encoding="utf-8")

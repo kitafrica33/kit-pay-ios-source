@@ -4,6 +4,7 @@ import CallKit
 import Contacts
 import AVFoundation
 import Foundation
+import ImageIO
 import UIKit
 
 struct SecureMessagingSyncErrorOwnership {
@@ -720,7 +721,12 @@ struct CapabilitiesRequestResolutionTracker {
 }
 
 enum MediaHydrationPolicy {
-    static let maximumItemsPerPass = 4
+    /// A KITMEDIA2 message may carry eight items. One pass must therefore admit several complete
+    /// messages instead of hydrating half an album and deferring the rest for five minutes.
+    static let maximumItemsPerPass = 32
+    /// Bound radio, CPU and temporary ciphertext pressure while still overlapping independent
+    /// downloads. Each task persists its own stable media identity and revalidates after awaits.
+    static let maximumConcurrentDownloads = 4
     static let retryDelay: TimeInterval = 5 * 60
     static let maximumReceivedCacheBytes: Int64 = 512 * 1_024 * 1_024
     static let targetReceivedCacheBytes: Int64 = 384 * 1_024 * 1_024
@@ -740,6 +746,178 @@ enum MediaHydrationPolicy {
         let required = reserveBytes + min(Int64.max - reserveBytes, bytes * 2)
         return available >= required
     }
+}
+
+enum MediaPreprocessingPolicy {
+    /// One pass is bounded so foreground work cannot monopolize local media processing.
+    static let maximumItemsPerPass = 8
+    /// Two independent jobs overlap file I/O and codec work while keeping peak image/video
+    /// memory predictable on older devices. Per-message completion remains serialized by the
+    /// encrypted store actor, and immutable media/output IDs make each job independent.
+    static let maximumConcurrentJobs = 2
+    static let retryDelay: TimeInterval = 30
+
+    /// Content validation for an output that may have been published immediately before a
+    /// process death. Size and filename are not authority: a JPEG must both carry the JPEG
+    /// signature and decode through ImageIO, while a voice assembly must be a playable asset
+    /// with an audio track and a finite positive duration. This work stays off the main actor.
+    static func isValidPublishedOutput(
+        at fileURL: URL,
+        for job: LocalMediaPreprocessingJob
+    ) async -> Bool {
+        guard job.isStructurallyValid else { return false }
+        switch job.kind {
+        case .imageJPEG:
+            return await Task.detached(priority: .utility) {
+                guard let handle = try? FileHandle(forReadingFrom: fileURL) else { return false }
+                defer { try? handle.close() }
+                guard let signature = try? handle.read(upToCount: 3),
+                      signature == Data([0xff, 0xd8, 0xff])
+                else { return false }
+                let sourceOptions = [kCGImageSourceShouldCache: false] as CFDictionary
+                guard let source = CGImageSourceCreateWithURL(
+                          fileURL as CFURL,
+                          sourceOptions
+                      ),
+                      CGImageSourceGetCount(source) > 0,
+                      CGImageSourceGetStatusAtIndex(source, 0) == .statusComplete
+                else { return false }
+                let decodeOptions: [CFString: Any] = [
+                    kCGImageSourceCreateThumbnailFromImageAlways: true,
+                    kCGImageSourceCreateThumbnailWithTransform: true,
+                    kCGImageSourceShouldCacheImmediately: true,
+                    kCGImageSourceThumbnailMaxPixelSize: 2,
+                ]
+                return CGImageSourceCreateThumbnailAtIndex(
+                    source,
+                    0,
+                    decodeOptions as CFDictionary
+                ) != nil
+            }.value
+        case .voiceAssembly:
+            let hasMPEG4Container = await Task.detached(priority: .utility) {
+                guard let handle = try? FileHandle(forReadingFrom: fileURL) else { return false }
+                defer { try? handle.close() }
+                guard let header = try? handle.read(upToCount: 8), header.count == 8 else {
+                    return false
+                }
+                return Data(header[4 ..< 8]) == Data("ftyp".utf8)
+            }.value
+            guard hasMPEG4Container else { return false }
+            let asset = AVURLAsset(url: fileURL)
+            do {
+                async let isPlayable = asset.load(.isPlayable)
+                async let duration = asset.load(.duration)
+                async let audioTracks = asset.loadTracks(withMediaType: .audio)
+                let (playable, loadedDuration, tracks) = try await (
+                    isPlayable,
+                    duration,
+                    audioTracks
+                )
+                let seconds = loadedDuration.seconds
+                return playable && !tracks.isEmpty && seconds.isFinite && seconds > 0
+            } catch {
+                return false
+            }
+        }
+    }
+
+    private static func canonicalOwnershipKeys(_ rawKeys: [String]) -> [String] {
+        rawKeys.compactMap { UUID(uuidString: $0)?.uuidString.lowercased() }
+    }
+
+    private static func rawRecordStorageKeys(_ record: LocalMediaRecord) -> [String] {
+        canonicalOwnershipKeys([
+            record.id,
+            record.localStorageKey,
+            record.remoteEncryptedObjectID,
+            record.resumableUpload?.storageKey,
+        ].compactMap { $0 }
+            + (record.originalSources?.map(\.storageKey) ?? [])
+            + [record.preprocessingJob?.outputStorageKey].compactMap { $0 })
+    }
+
+    private static func nonRecordStorageKeys(_ message: LocalMessage) -> [String] {
+        var keys = [message.pendingAttachment?.localStorageKey].compactMap { $0 }
+        if let batch = message.pendingMediaBatch {
+            keys.append(contentsOf: batch.items.flatMap {
+                [$0.attachmentID, $0.localStorageKey, $0.storageKey].compactMap { $0 }
+            })
+        }
+        if let descriptor = KitMediaMessageDescriptor.parse(message.body) {
+            keys.append(descriptor.storageKey)
+            keys.append(descriptor.attachmentID)
+        }
+        if let descriptor = KitMediaMessageV2Descriptor.parse(message.body) {
+            keys.append(contentsOf: descriptor.items.map(\.storageKey))
+            keys.append(contentsOf: descriptor.items.map(\.attachmentID))
+        }
+        return canonicalOwnershipKeys(keys)
+    }
+
+    /// A newly minted preprocessing destination is admitted only while no persisted draft or
+    /// message refers to it, including malformed legacy records whose normal projections fail
+    /// structural validation. The check and state re-key run inside one store transaction.
+    static func isOutputStorageKeyUnowned(
+        _ storageKey: String,
+        in state: PersistedState
+    ) -> Bool {
+        guard UUID(uuidString: storageKey)?.uuidString.lowercased() == storageKey,
+              !ConversationDraftPolicy.localMediaStorageKeysOwnedByDrafts(in: state)
+                  .contains(storageKey)
+        else { return false }
+        return state.messages.allSatisfy { message in
+            !(message.localMediaRecords ?? []).contains {
+                rawRecordStorageKeys($0).contains(storageKey)
+            } && !nonRecordStorageKeys(message).contains(storageKey)
+        }
+    }
+
+    /// A preprocessing retry may replace only its own unpublished output. Drafts and any other
+    /// message are independent owners even when damaged legacy state aliases the same UUID.
+    static func canReplaceOutput(
+        storageKey: String,
+        ownedBy messageID: UUID,
+        attachmentID: String,
+        expectedJob: LocalMediaPreprocessingJob,
+        in state: PersistedState
+    ) -> Bool {
+        guard UUID(uuidString: storageKey)?.uuidString.lowercased() == storageKey,
+              expectedJob.isStructurallyValid,
+              expectedJob.outputStorageKey == storageKey,
+              ConversationDraftPolicy.localMediaStorageKeysOwnedByDrafts(in: state)
+                  .contains(storageKey) == false,
+              state.messages.filter({ $0.id == messageID }).count == 1,
+              state.messages.contains(where: { $0.id == messageID })
+        else { return false }
+        let recordOwners = state.messages.flatMap { message in
+            (message.localMediaRecords ?? []).compactMap { record
+                -> (outerMessageID: UUID, record: LocalMediaRecord)? in
+                rawRecordStorageKeys(record).contains(storageKey)
+                    ? (message.id, record)
+                    : nil
+            }
+        }
+        guard recordOwners.count == 1, let owner = recordOwners.first else { return false }
+        let nonRecordOwners = state.messages.flatMap { message -> [(UUID, String)] in
+            nonRecordStorageKeys(message)
+                .filter { $0 == storageKey }
+                .map { (message.id, $0) }
+        }
+        return nonRecordOwners.isEmpty
+            && owner.outerMessageID == messageID
+            && owner.record.messageID == messageID
+            && owner.record.id == attachmentID
+            && owner.record.id != storageKey
+            && owner.record.preprocessingJob == expectedJob
+            && owner.record.isStructurallyValid
+    }
+}
+
+struct RestoredConversationDraftMediaAttachment {
+    let manifest: ConversationDraftMediaAttachment
+    let data: Data?
+    let localFileURL: URL?
 }
 
 @MainActor
@@ -916,6 +1094,10 @@ final class AppModel: ObservableObject {
     private var mediaPreprocessingGeneration: UInt64 = 0
     private var mediaHydrationTask: Task<Void, Never>?
     private var mediaHydrationGeneration: UInt64 = 0
+    /// Main-actor reservations cover plaintext + transient ciphertext overlap across concurrent
+    /// hydrations. Per-download free-space checks alone let four 200 MiB items all observe the
+    /// same pre-download capacity and overcommit the volume.
+    private var receivedMediaHydrationReservations: [UUID: Int] = [:]
     private var automaticBackupBackgroundTransitionTask: Task<Void, Never>?
     private var automaticBackupBackgroundTaskIdentifier: UIBackgroundTaskIdentifier = .invalid
     private var queuedCallSystemActions: [CallSystemAction] = []
@@ -1015,6 +1197,17 @@ final class AppModel: ObservableObject {
         }
         CommunicationBackgroundReplayScheduler.shared.installHandler { [weak self] task in
             Task { @MainActor in await self?.handleBackgroundCommunicationReplay(task) }
+        }
+        MessagingBackgroundAttachmentUploader.shared.installBackgroundEventsRecoveryHandler {
+            [weak self] completion in
+            Task { @MainActor in
+                guard let self else {
+                    completion()
+                    return
+                }
+                await self.recoverCompletedBackgroundMediaUpload()
+                completion()
+            }
         }
 
         MessageBackupRefreshScheduler.shared.installHandler { [weak self] task in
@@ -1446,11 +1639,7 @@ final class AppModel: ObservableObject {
     /// composer while retaining the no-plaintext-network invariant.
     var secureMessagingLocalQueueAvailable: Bool {
         SecureMessagingLocalQueueReleasePolicy.permits(
-            buildEnabled: SecureMessagingReleaseGate.enabled,
-            serverAdvertisesReviewedMessaging: capabilities.map {
-                $0.supportsFeature("messaging")
-                    && $0.protocols?.messaging?.supportsReviewedV2 == true
-            }
+            buildEnabled: SecureMessagingReleaseGate.enabled
         )
             && isSignedIn
             && !isSigningOut
@@ -2123,7 +2312,11 @@ final class AppModel: ObservableObject {
         let projection = await store.projection()
         guard projection.revision >= publishedStateRevision else { return state }
         publishedStateRevision = projection.revision
-        let displayedState = appReviewDemoProjectedState(from: projection.state)
+        var displayedState = appReviewDemoProjectedState(from: projection.state)
+        displayedState.transactions =
+            CustomerTransactionPresentationPolicy.customerVisibleTransactions(
+                displayedState.transactions
+            )
         state = displayedState
         syncAvatarCacheAccount()
         publishSharedDestinationsIfPossible()
@@ -2544,6 +2737,10 @@ final class AppModel: ObservableObject {
         let removedLegacyCallAttempts = OutboxPolicy.removeLegacyCallAttempts(
             in: &migratedState
         )
+        let hardenedCustomerTransactions =
+            CustomerTransactionPresentationPolicy.hardenCustomerTransactions(
+                from: &migratedState.transactions
+            )
         let mediaRecoveryDate = Date()
         let recoveredLocalMediaRecords = migratedState.messages.indices.reduce(into: 0) {
             count, index in
@@ -2557,6 +2754,7 @@ final class AppModel: ObservableObject {
         if OutboxPolicy.quarantineMessagesWithoutServerConversation(in: &migratedState) > 0
             || ownerWasMigrated
             || removedLegacyCallAttempts > 0
+            || hardenedCustomerTransactions > 0
             || recoveredLocalMediaRecords > 0 {
             do {
                 try await store.replace(migratedState)
@@ -2577,6 +2775,9 @@ final class AppModel: ObservableObject {
             if authoritative.profile?.id == restoredUserID {
                 let retainedKeys = Set(
                     authoritative.messages.flatMap(\.localMediaStorageKeys)
+                ).union(
+                    authoritative.conversationDrafts?.values
+                        .flatMap(\.localMediaStorageKeys) ?? []
                 )
                 let retainedSpoolKeys = Set(
                     authoritative.messages.flatMap { message in
@@ -6472,11 +6673,14 @@ final class AppModel: ObservableObject {
 
         if let selectedWalletID = state.selectedWalletId {
             do {
-                let transactions = try await APIClientSessionBinding.$sessionID.withValue(
-                    expectedSessionID
-                ) {
-                    try await api.transactions(walletId: selectedWalletID).items
-                }
+                let transactions = CustomerTransactionPresentationPolicy
+                    .customerVisibleTransactions(
+                        try await APIClientSessionBinding.$sessionID.withValue(
+                            expectedSessionID
+                        ) {
+                            try await api.transactions(walletId: selectedWalletID).items
+                        }
+                    )
                 guard await callHistoryContextIsCurrent(
                     accountEpoch: expectedAccountEpoch,
                     sessionID: expectedSessionID,
@@ -9235,7 +9439,8 @@ final class AppModel: ObservableObject {
     func persistConversationDraft(
         _ body: String,
         conversationId: String,
-        writeVersion: ConversationDraftWriteVersion
+        writeVersion: ConversationDraftWriteVersion,
+        mediaAttachments: [ConversationDraftMediaAttachment]? = nil
     ) async -> Bool {
         guard !isReadOnlyAppReviewDemoConversation(conversationId) else { return false }
         let expectedAccountEpoch = accountEpoch
@@ -9246,6 +9451,30 @@ final class AppModel: ObservableObject {
               let canonicalConversationID = OutboxPolicy.canonicalConversationID(conversationId)
         else { return false }
         let boundedBody = ConversationDraftPolicy.boundedBody(body)
+        if let mediaAttachments {
+            guard mediaAttachments.count <= ConversationDraftPolicy.maximumMediaAttachments,
+                  mediaAttachments.allSatisfy(\.isStructurallyValid),
+                  Set(mediaAttachments.map(\.id)).count == mediaAttachments.count
+            else { return false }
+            for attachment in mediaAttachments {
+                let available: Bool
+                switch attachment.storageKind {
+                case .protectedFile:
+                    available = await SecureMediaFileCache.shared.protectedOriginalURL(
+                        forStorageKey: attachment.storageKey,
+                        userID: userID,
+                        expectedByteCount: attachment.byteCount
+                    ) != nil
+                case .encryptedBlob:
+                    available = await SecureMediaFileCache.shared.encryptedBlobData(
+                        forStorageKey: attachment.storageKey,
+                        userID: userID,
+                        expectedByteCount: attachment.byteCount
+                    ) != nil
+                }
+                guard available else { return false }
+            }
+        }
         do {
             try Task.checkCancellation()
             try await store.update { persisted in
@@ -9265,6 +9494,7 @@ final class AppModel: ObservableObject {
                     conversationID: canonicalConversationID,
                     ownerUserID: userID,
                     writeVersion: writeVersion,
+                    mediaAttachments: mediaAttachments,
                     in: &persisted
                 )
             }
@@ -9280,6 +9510,12 @@ final class AppModel: ObservableObject {
                     == .orderedSame
             else { return false }
             let snapshotDraft = snapshot.conversationDrafts?[canonicalConversationID]
+            guard snapshotDraft?.writeVersion == writeVersion,
+                  snapshotDraft?.body == boundedBody,
+                  mediaAttachments.map({ requested in
+                      (snapshotDraft?.mediaAttachments ?? []) == requested
+                  }) ?? true
+            else { return false }
             let currentDraft = state.conversationDrafts?[canonicalConversationID]
             if ConversationDraftPolicy.shouldApplySnapshotDraft(
                 snapshotDraft,
@@ -9322,6 +9558,60 @@ final class AppModel: ObservableObject {
         )
     }
 
+    /// Restores composer-owned media only from the exact storage representation committed in the
+    /// encrypted account state. Missing/corrupt bytes are omitted rather than exposing a broken
+    /// chip; the next versioned draft write repairs the manifest without touching another account.
+    func restoredConversationDraftMedia(
+        for conversationId: String
+    ) async -> [RestoredConversationDraftMediaAttachment] {
+        let expectedAccountEpoch = accountEpoch
+        let snapshot = await store.snapshot()
+        guard let userID = snapshot.profile?.id,
+              snapshot.communicationOwnerUserID?.caseInsensitiveCompare(userID) == .orderedSame
+        else { return [] }
+        let manifests = ConversationDraftPolicy.mediaAttachments(
+            conversationID: conversationId,
+            ownerUserID: userID,
+            in: snapshot
+        )
+        var restored: [RestoredConversationDraftMediaAttachment] = []
+        restored.reserveCapacity(manifests.count)
+        for manifest in manifests {
+            guard !Task.isCancelled else { return [] }
+            switch manifest.storageKind {
+            case .protectedFile:
+                guard let url = await SecureMediaFileCache.shared.protectedOriginalURL(
+                    forStorageKey: manifest.storageKey,
+                    userID: userID,
+                    expectedByteCount: manifest.byteCount
+                ) else { continue }
+                restored.append(RestoredConversationDraftMediaAttachment(
+                    manifest: manifest,
+                    data: nil,
+                    localFileURL: url
+                ))
+            case .encryptedBlob:
+                guard let data = await SecureMediaFileCache.shared.encryptedBlobData(
+                    forStorageKey: manifest.storageKey,
+                    userID: userID,
+                    expectedByteCount: manifest.byteCount
+                ) else { continue }
+                restored.append(RestoredConversationDraftMediaAttachment(
+                    manifest: manifest,
+                    data: data,
+                    localFileURL: nil
+                ))
+            }
+        }
+        let current = await store.snapshot()
+        guard !Task.isCancelled,
+              expectedAccountEpoch == accountEpoch,
+              current.profile?.id.caseInsensitiveCompare(userID) == .orderedSame,
+              current.communicationOwnerUserID?.caseInsensitiveCompare(userID) == .orderedSame
+        else { return [] }
+        return restored
+    }
+
     func nextConversationDraftWriteVersion() -> ConversationDraftWriteVersion {
         conversationDraftWriteSequence &+= 1
         if conversationDraftWriteSequence == 0 {
@@ -9342,6 +9632,7 @@ final class AppModel: ObservableObject {
         body: String,
         clientMessageID: UUID? = nil,
         draftClearVersion: ConversationDraftWriteVersion? = nil,
+        submittedDraftMediaAttachments: [ConversationDraftMediaAttachment]? = nil,
         deliverAt: Date? = nil,
         replyToServerMessageID: String? = nil
     ) async -> Bool {
@@ -9356,6 +9647,7 @@ final class AppModel: ObservableObject {
             body: body,
             clientMessageID: clientMessageID,
             draftClearVersion: draftClearVersion,
+            submittedDraftMediaAttachments: submittedDraftMediaAttachments,
             submissionKind: .userText,
             deliverAt: deliverAt,
             replyToServerMessageID: replyToServerMessageID
@@ -9520,6 +9812,7 @@ final class AppModel: ObservableObject {
         body: String,
         clientMessageID: UUID?,
         draftClearVersion: ConversationDraftWriteVersion?,
+        submittedDraftMediaAttachments: [ConversationDraftMediaAttachment]? = nil,
         submissionKind: SecureMessageSubmissionKind,
         deliverAt: Date? = nil,
         replyToServerMessageID: String? = nil
@@ -9659,6 +9952,7 @@ final class AppModel: ObservableObject {
                 text: trimmed,
                 clientMessageID: clientMessageID,
                 submittedDraftBody: draftClearVersion == nil ? nil : body,
+                submittedDraftMediaAttachments: submittedDraftMediaAttachments,
                 draftClearVersion: draftClearVersion,
                 deliverAt: deliverAt,
                 replyToServerMessageID: replyTarget
@@ -9997,6 +10291,10 @@ final class AppModel: ObservableObject {
                 // plaintext is not.
                 if let cancelled = removed {
                     let survivorKeys = Set(persisted.messages.flatMap(\.localMediaStorageKeys))
+                        .union(
+                            persisted.conversationDrafts?.values
+                                .flatMap(\.localMediaStorageKeys) ?? []
+                        )
                     deletableMediaKeys = cancelled.localMediaStorageKeys
                         .filter { !survivorKeys.contains($0) }
                 }
@@ -10148,6 +10446,7 @@ final class AppModel: ObservableObject {
             }
             return false
         }
+        LocalMediaPerformanceMonitor.shared.markPlayable(mediaID: mediaID)
         return true
     }
 
@@ -10190,6 +10489,7 @@ final class AppModel: ObservableObject {
             await SecureMediaFileCache.shared.remove(forStorageKey: key, userID: userID)
             return nil
         }
+        LocalMediaPerformanceMonitor.shared.markPlayable(mediaID: mediaID)
         return destination
     }
 
@@ -10202,7 +10502,9 @@ final class AppModel: ObservableObject {
         guard snapshot.messages.allSatisfy({ message in
             !(message.localMediaRecords ?? []).contains(where: { $0.id == key })
                 && !message.localMediaStorageKeys.contains(key)
-        }) else { return }
+        }), snapshot.conversationDrafts?.values.allSatisfy({ draft in
+            !draft.localMediaStorageKeys.contains(key)
+        }) != false else { return }
         await SecureMediaFileCache.shared.remove(forStorageKey: key, userID: userID)
     }
 
@@ -10287,6 +10589,7 @@ final class AppModel: ObservableObject {
         preprocessingJob: LocalMediaPreprocessingJob? = nil,
         clientMessageID: UUID? = nil,
         submittedDraftBody: String? = nil,
+        submittedDraftMediaAttachments: [ConversationDraftMediaAttachment]? = nil,
         draftClearVersion: ConversationDraftWriteVersion? = nil,
         deliverAt: Date? = nil,
         replyToServerMessageID: String? = nil
@@ -10295,7 +10598,9 @@ final class AppModel: ObservableObject {
             lastError = "This App Review preview is read-only."
             return false
         }
-        guard (submittedDraftBody == nil) == (draftClearVersion == nil) else {
+        guard (submittedDraftBody == nil) == (draftClearVersion == nil),
+              draftClearVersion != nil || submittedDraftMediaAttachments == nil
+        else {
             lastError = CustomerFacingMessagingCopy.draftSaveFailure
             return false
         }
@@ -10330,17 +10635,6 @@ final class AppModel: ObservableObject {
         }
         let mediaByteCount = mediaData?.count ?? plaintextByteSize ?? 0
         let kind = KitChatMediaKind(mediaType: mediaType)
-        if kind != .image, isOnline, capabilities?.enablesMessagingRichMedia != true {
-            // A server rollout can complete while this process still holds its launch snapshot.
-            // Refresh once at send time before presenting an unavailable result. Offline, the
-            // message queues locally and the authoritative capability/roster gates run at flush.
-            _ = await reloadCapabilities()
-            guard capabilities?.enablesMessagingRichMedia == true else {
-                lastError =
-                    "Voice notes, videos, and documents are not available on this Kit Pay service yet."
-                return false
-            }
-        }
         guard KitChatMediaLimits.fits(mediaByteCount, kind: kind),
               mediaData.map({ !$0.isEmpty && $0.count == mediaByteCount }) ?? true
         else {
@@ -10389,7 +10683,6 @@ final class AppModel: ObservableObject {
         // outbox and can never be required to view bytes this device already owns.
         let stableMediaID = localMediaID ?? UUID()
         let parkedLocalKey = stableMediaID.uuidString.lowercased()
-        let createdLocalOriginal: Bool
         if let mediaData {
             let insert = await SecureMediaFileCache.shared.insertIfAbsent(
                 mediaData,
@@ -10405,7 +10698,6 @@ final class AppModel: ObservableObject {
                 lastError = "This attachment could not be saved securely on this device."
                 return false
             }
-            createdLocalOriginal = insert == .stored
         } else {
             guard localMediaID != nil,
                   localStorageKind == .protectedFile,
@@ -10422,7 +10714,6 @@ final class AppModel: ObservableObject {
                 lastError = "This attachment could not be saved securely on this device."
                 return false
             }
-            createdLocalOriginal = false
         }
         if let preprocessingJob {
             guard preprocessingJob.isStructurallyValid,
@@ -10453,17 +10744,14 @@ final class AppModel: ObservableObject {
             isGroup: isGroupTarget,
             groupCapabilityEnabled: messagingGroupsEnabled
         ) else {
-            if createdLocalOriginal {
-                await SecureMediaFileCache.shared.remove(
-                    forStorageKey: parkedLocalKey,
-                    userID: userID
-                )
-            }
+            // The key may have become draft-owned while this task crossed an actor boundary.
+            // Leave an uncommitted park to bounded orphan reconciliation rather than deleting
+            // bytes whose current state ownership cannot be proven atomically with file I/O.
             lastError = "Group messaging is not available right now. You can still read this conversation."
             return false
         }
         do {
-            let queued = try await SecureMessagingExchangeCoordinator.shared.queueDeferredImage(
+            _ = try await SecureMessagingExchangeCoordinator.shared.queueDeferredImage(
                 forUserID: userID,
                 conversationID: cleanConversationId,
                 expectedRecipientUserID: recipientUserID,
@@ -10479,6 +10767,7 @@ final class AppModel: ObservableObject {
                 preprocessingJob: preprocessingJob,
                 clientMessageID: clientMessageID,
                 submittedDraftBody: submittedDraftBody,
+                submittedDraftMediaAttachments: submittedDraftMediaAttachments,
                 draftClearVersion: draftClearVersion,
                 deliverAt: deliverAt,
                 replyToServerMessageID: replyTarget
@@ -10488,24 +10777,6 @@ final class AppModel: ObservableObject {
                 userID: userID,
                 sessionID: expectedSessionID
             )
-            if createdLocalOriginal {
-                // An exact retry can have prepared a fresh local original before the coordinator
-                // discovers that the stable message already exists. Keep it only when the
-                // durable record for this message owns this exact key.
-                let persisted = await store.snapshot()
-                let ownsParkedCopy = persisted.messages.first(where: {
-                    $0.id == queued.clientMessageID
-                })?.localMediaRecords?.contains(where: {
-                    $0.id == stableMediaID.uuidString.lowercased()
-                        && $0.localStorageKey == parkedLocalKey
-                }) == true
-                if !ownsParkedCopy {
-                    await SecureMediaFileCache.shared.remove(
-                        forStorageKey: parkedLocalKey,
-                        userID: userID
-                    )
-                }
-            }
             guard reloaded else { return false }
             // Media bytes, pending attachment metadata and the outbox command are protected by
             // the same local commit. Upload/encryption replay continues independently from here;
@@ -10517,12 +10788,8 @@ final class AppModel: ObservableObject {
             }
             return true
         } catch {
-            if createdLocalOriginal {
-                await SecureMediaFileCache.shared.remove(
-                    forStorageKey: parkedLocalKey,
-                    userID: userID
-                )
-            }
+            // Never delete after an awaited queue attempt. A concurrent composer save can claim
+            // this same permanent id; the age-gated orphan sweep safely handles true leftovers.
             return await queueMediaMessageFailureResult(
                 error,
                 accountEpoch: expectedAccountEpoch,
@@ -10550,6 +10817,7 @@ final class AppModel: ObservableObject {
         rawCaption: String?,
         clientMessageID: UUID? = nil,
         submittedDraftBody: String? = nil,
+        submittedDraftMediaAttachments: [ConversationDraftMediaAttachment]? = nil,
         draftClearVersion: ConversationDraftWriteVersion? = nil,
         deliverAt: Date? = nil,
         replyToServerMessageID: String? = nil
@@ -10558,7 +10826,9 @@ final class AppModel: ObservableObject {
             lastError = "This App Review preview is read-only."
             return false
         }
-        guard (submittedDraftBody == nil) == (draftClearVersion == nil) else {
+        guard (submittedDraftBody == nil) == (draftClearVersion == nil),
+              draftClearVersion != nil || submittedDraftMediaAttachments == nil
+        else {
             lastError = CustomerFacingMessagingCopy.draftSaveFailure
             return false
         }
@@ -10614,19 +10884,6 @@ final class AppModel: ObservableObject {
         ) else {
             lastError = "Group messaging is not available right now. You can still read this conversation."
             return false
-        }
-        // Compose is capability-gated (§6). A server rollout can complete while this process
-        // still holds its launch snapshot, so refresh once at send time before presenting an
-        // unavailable result; a withdrawal fails the whole batch visibly — the send never
-        // silently degrades into per-attachment legacy messages from inside this API. Offline,
-        // the batch queues locally and the authoritative admission gate runs at flush.
-        if isOnline, capabilities?.enablesMessagingMediaMessageV2 != true {
-            _ = await reloadCapabilities()
-            guard capabilities?.enablesMessagingMediaMessageV2 == true else {
-                lastError =
-                    "Sending multiple attachments in one message is not available on this Kit Pay service yet."
-                return false
-            }
         }
         guard secureMessagingLocalQueueAvailable else {
             lastError = messagingSendFailureMessage
@@ -10776,12 +11033,13 @@ final class AppModel: ObservableObject {
                 preprocessingJobs: preprocessingJobs,
                 clientMessageID: clientMessageID,
                 submittedDraftBody: submittedDraftBody,
+                submittedDraftMediaAttachments: submittedDraftMediaAttachments,
                 draftClearVersion: draftClearVersion,
                 deliverAt: deliverAt,
                 replyToServerMessageID: replyTarget
             )
-            // On an idempotent replay of an already-durable batch the coordinator itself
-            // removes the redundant scratch parks this call offered; nothing to reconcile here.
+            // An idempotent replay leaves redundant scratch parks for bounded cache maintenance;
+            // deleting them inline could race a composer draft that just acquired the same key.
             guard await reloadOutboxStateIfCurrent(
                 accountEpoch: expectedAccountEpoch,
                 userID: userID,
@@ -10846,6 +11104,7 @@ final class AppModel: ObservableObject {
         let attachmentID: String
         let commandID: UUID
         let job: LocalMediaPreprocessingJob
+        let lastAttemptAt: Date
     }
 
     private var hasPendingMediaPreprocessing: Bool {
@@ -10871,14 +11130,16 @@ final class AppModel: ObservableObject {
         let generation = mediaPreprocessingGeneration
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
-            await self.runPendingMediaPreprocessing(maximumItems: 8)
+            await self.runPendingMediaPreprocessing(
+                maximumItems: MediaPreprocessingPolicy.maximumItemsPerPass
+            )
             guard self.mediaPreprocessingGeneration == generation else { return }
             self.mediaPreprocessingTask = nil
             self.scheduleOutboxWake()
             if self.isOnline { await self.flushOutbox() }
             if self.hasPendingMediaPreprocessing {
                 Task { @MainActor [weak self] in
-                    try? await Task.sleep(for: .seconds(30))
+                    try? await Task.sleep(for: .seconds(MediaPreprocessingPolicy.retryDelay))
                     guard !Task.isCancelled,
                           let self,
                           self.mediaPreprocessingGeneration == generation
@@ -10917,118 +11178,252 @@ final class AppModel: ObservableObject {
                     conversationID: message.conversationId,
                     attachmentID: record.id,
                     commandID: command.id,
-                    job: job
+                    job: job,
+                    lastAttemptAt: record.updatedAt
                 ))
             }
         }
 
-        for target in targets.prefix(maximumItems) {
-            guard !Task.isCancelled,
-                  await outboxContextIsCurrent(
-                      accountEpoch: expectedAccountEpoch,
-                      userID: userID,
-                      sessionID: sessionID
-                  )
-            else { return }
-            do {
-                try await store.update { persisted in
-                    guard persisted.profile?.id == userID,
-                          let commandIndex = persisted.outbox.firstIndex(where: {
-                              $0.id == target.commandID
-                                  && $0.messageId == target.messageID
-                                  && $0.awaitingMediaPreprocessing == true
-                          }),
-                          persisted.outbox[commandIndex].failureDisposition == nil,
-                          let messageIndex = persisted.messages.firstIndex(where: {
-                              $0.id == target.messageID
-                                  && $0.conversationId == target.conversationID
-                          }),
-                          LocalMediaRecordPolicy.markPreprocessingStarted(
-                              &persisted.messages[messageIndex],
-                              attachmentID: target.attachmentID,
-                              expectedJob: target.job
-                          )
-                    else { throw CancellationError() }
-                }
-                let byteCount = try await preprocessLocalMedia(
-                    target,
-                    userID: userID,
-                    accountEpoch: expectedAccountEpoch,
-                    sessionID: sessionID
-                )
-                guard await outboxContextIsCurrent(
-                    accountEpoch: expectedAccountEpoch,
-                    userID: userID,
-                    sessionID: sessionID
-                ), await SecureMediaFileCache.shared.protectedOriginalURL(
-                    forStorageKey: target.job.outputStorageKey,
-                    userID: userID,
-                    expectedByteCount: byteCount
-                ) != nil
-                else { throw CancellationError() }
-                try await store.update { persisted in
-                    guard persisted.profile?.id == userID,
-                          let commandIndex = persisted.outbox.firstIndex(where: {
-                              $0.id == target.commandID
-                                  && $0.messageId == target.messageID
-                                  && $0.awaitingMediaPreprocessing == true
-                          }),
-                          let messageIndex = persisted.messages.firstIndex(where: {
-                              $0.id == target.messageID
-                                  && $0.conversationId == target.conversationID
-                          }),
-                          LocalMediaRecordPolicy.completePreprocessing(
-                              &persisted.messages[messageIndex],
-                              attachmentID: target.attachmentID,
-                              expectedJob: target.job,
-                              outputByteCount: byteCount
-                          )
-                    else { throw CancellationError() }
-                    let stillHasPreprocessing = (
-                        persisted.messages[messageIndex].localMediaRecords ?? []
-                    ).contains { $0.preprocessingJob != nil }
-                    if !stillHasPreprocessing {
-                        persisted.outbox[commandIndex].awaitingMediaPreprocessing = nil
-                        if persisted.outbox[commandIndex].scheduledAt == nil {
-                            persisted.outbox[commandIndex].nextAttemptAt = Date()
-                        }
-                    }
-                }
-                guard await outboxContextIsCurrent(
-                    accountEpoch: expectedAccountEpoch,
-                    userID: userID,
-                    sessionID: sessionID
-                ) else { return }
-                await publishLatestState()
-            } catch is CancellationError {
-                return
-            } catch {
-                try? await store.update { persisted in
-                    guard persisted.profile?.id == userID,
-                          persisted.outbox.contains(where: {
-                              $0.id == target.commandID
-                                  && $0.messageId == target.messageID
-                                  && $0.awaitingMediaPreprocessing == true
-                          }),
-                          let messageIndex = persisted.messages.firstIndex(where: {
-                              $0.id == target.messageID
-                                  && $0.conversationId == target.conversationID
-                          })
-                    else { return }
-                    _ = LocalMediaRecordPolicy.markPreprocessingFailed(
-                        &persisted.messages[messageIndex],
-                        attachmentID: target.attachmentID,
-                        expectedJob: target.job
+        // Starting/failing a job advances `updatedAt`, so oldest-first admission rotates a bad
+        // codec input behind untouched work instead of blocking the first eight rows forever.
+        let selected = Array(targets.sorted { lhs, rhs in
+            if lhs.lastAttemptAt != rhs.lastAttemptAt {
+                return lhs.lastAttemptAt < rhs.lastAttemptAt
+            }
+            if lhs.messageID != rhs.messageID {
+                return lhs.messageID.uuidString < rhs.messageID.uuidString
+            }
+            return lhs.attachmentID < rhs.attachmentID
+        }.prefix(maximumItems))
+        guard !selected.isEmpty else { return }
+        // Attachments sharing one outbox command are one logical message. Keep that command's
+        // mutations ordered while overlapping work belonging to independent messages.
+        var commandOrder: [UUID] = []
+        var targetsByCommand: [UUID: [PendingMediaPreprocessingTarget]] = [:]
+        for target in selected {
+            if targetsByCommand[target.commandID] == nil {
+                commandOrder.append(target.commandID)
+            }
+            targetsByCommand[target.commandID, default: []].append(target)
+        }
+        let groups = commandOrder.compactMap { targetsByCommand[$0] }
+        await withTaskGroup(of: Void.self) { group in
+            var nextIndex = 0
+            let initialCount = min(
+                MediaPreprocessingPolicy.maximumConcurrentJobs,
+                groups.count
+            )
+            while nextIndex < initialCount {
+                let targets = groups[nextIndex]
+                nextIndex += 1
+                group.addTask { @MainActor [weak self] in
+                    await self?.processPendingMediaPreprocessingTargets(
+                        targets,
+                        userID: userID,
+                        accountEpoch: expectedAccountEpoch,
+                        sessionID: sessionID
                     )
                 }
-                guard await outboxContextIsCurrent(
-                    accountEpoch: expectedAccountEpoch,
-                    userID: userID,
-                    sessionID: sessionID
-                ) else { return }
-                await publishLatestState()
+            }
+            while await group.next() != nil {
+                guard nextIndex < groups.count, !Task.isCancelled else { continue }
+                let targets = groups[nextIndex]
+                nextIndex += 1
+                group.addTask { @MainActor [weak self] in
+                    await self?.processPendingMediaPreprocessingTargets(
+                        targets,
+                        userID: userID,
+                        accountEpoch: expectedAccountEpoch,
+                        sessionID: sessionID
+                    )
+                }
             }
         }
+    }
+
+    private func processPendingMediaPreprocessingTargets(
+        _ targets: [PendingMediaPreprocessingTarget],
+        userID: String,
+        accountEpoch expectedAccountEpoch: UUID,
+        sessionID: String
+    ) async {
+        for target in targets {
+            guard !Task.isCancelled else { return }
+            await processPendingMediaPreprocessingTarget(
+                target,
+                userID: userID,
+                accountEpoch: expectedAccountEpoch,
+                sessionID: sessionID
+            )
+        }
+    }
+
+    private func processPendingMediaPreprocessingTarget(
+        _ target: PendingMediaPreprocessingTarget,
+        userID: String,
+        accountEpoch expectedAccountEpoch: UUID,
+        sessionID: String
+    ) async {
+        guard !Task.isCancelled,
+              await outboxContextIsCurrent(
+                  accountEpoch: expectedAccountEpoch,
+                  userID: userID,
+                  sessionID: sessionID
+              )
+        else { return }
+        do {
+            try await store.update { persisted in
+                guard persisted.profile?.id == userID,
+                      let commandIndex = persisted.outbox.firstIndex(where: {
+                          $0.id == target.commandID
+                              && $0.messageId == target.messageID
+                              && $0.awaitingMediaPreprocessing == true
+                      }),
+                      persisted.outbox[commandIndex].failureDisposition == nil,
+                      let messageIndex = persisted.messages.firstIndex(where: {
+                          $0.id == target.messageID
+                              && $0.conversationId == target.conversationID
+                      }),
+                      LocalMediaRecordPolicy.markPreprocessingStarted(
+                          &persisted.messages[messageIndex],
+                          attachmentID: target.attachmentID,
+                          expectedJob: target.job
+                      )
+                else { throw CancellationError() }
+            }
+            let byteCount = try await preprocessLocalMedia(
+                target,
+                userID: userID,
+                accountEpoch: expectedAccountEpoch,
+                sessionID: sessionID
+            )
+            guard await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: userID,
+                sessionID: sessionID
+            ), await SecureMediaFileCache.shared.protectedOriginalURL(
+                forStorageKey: target.job.outputStorageKey,
+                userID: userID,
+                expectedByteCount: byteCount
+            ) != nil
+            else { throw CancellationError() }
+            try await store.update { persisted in
+                guard persisted.profile?.id == userID,
+                      let commandIndex = persisted.outbox.firstIndex(where: {
+                          $0.id == target.commandID
+                              && $0.messageId == target.messageID
+                              && $0.awaitingMediaPreprocessing == true
+                      }),
+                      let messageIndex = persisted.messages.firstIndex(where: {
+                          $0.id == target.messageID
+                              && $0.conversationId == target.conversationID
+                      }),
+                      LocalMediaRecordPolicy.completePreprocessing(
+                          &persisted.messages[messageIndex],
+                          attachmentID: target.attachmentID,
+                          expectedJob: target.job,
+                          outputByteCount: byteCount
+                      )
+                else { throw CancellationError() }
+                let stillHasPreprocessing = (
+                    persisted.messages[messageIndex].localMediaRecords ?? []
+                ).contains { $0.preprocessingJob != nil }
+                if !stillHasPreprocessing {
+                    persisted.outbox[commandIndex].awaitingMediaPreprocessing = nil
+                    if persisted.outbox[commandIndex].scheduledAt == nil {
+                        persisted.outbox[commandIndex].nextAttemptAt = Date()
+                    }
+                }
+            }
+            guard await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: userID,
+                sessionID: sessionID
+            ) else { return }
+            await publishLatestState()
+        } catch is CancellationError {
+            return
+        } catch {
+            try? await store.update { persisted in
+                guard persisted.profile?.id == userID,
+                      persisted.outbox.contains(where: {
+                          $0.id == target.commandID
+                              && $0.messageId == target.messageID
+                              && $0.awaitingMediaPreprocessing == true
+                      }),
+                      let messageIndex = persisted.messages.firstIndex(where: {
+                          $0.id == target.messageID
+                              && $0.conversationId == target.conversationID
+                      })
+                else { return }
+                _ = LocalMediaRecordPolicy.markPreprocessingFailed(
+                    &persisted.messages[messageIndex],
+                    attachmentID: target.attachmentID,
+                    expectedJob: target.job
+                )
+            }
+            guard await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: userID,
+                sessionID: sessionID
+            ) else { return }
+            await publishLatestState()
+        }
+    }
+
+    /// An occupied preprocessing destination that is not a valid completed output is immutable
+    /// residue, not a file we may replace. Re-key the exact durable job atomically and leave the
+    /// old bytes for age-gated orphan reconciliation. Throwing cancellation at the call site
+    /// prevents the stale in-memory target from being marked failed over the replacement job.
+    private func rekeyInvalidPreprocessingOutput(
+        _ target: PendingMediaPreprocessingTarget,
+        userID: String,
+        accountEpoch expectedAccountEpoch: UUID,
+        sessionID: String
+    ) async throws {
+        guard await outboxContextIsCurrent(
+            accountEpoch: expectedAccountEpoch,
+            userID: userID,
+            sessionID: sessionID
+        ) else { throw CancellationError() }
+        let replacementOutputKey = UUID().uuidString.lowercased()
+        try await store.update { persisted in
+            guard persisted.profile?.id == userID,
+                  persisted.outbox.contains(where: {
+                      $0.id == target.commandID
+                          && $0.messageId == target.messageID
+                          && $0.awaitingMediaPreprocessing == true
+                          && $0.failureDisposition == nil
+                  }),
+                  MediaPreprocessingPolicy.canReplaceOutput(
+                      storageKey: target.job.outputStorageKey,
+                      ownedBy: target.messageID,
+                      attachmentID: target.attachmentID,
+                      expectedJob: target.job,
+                      in: persisted
+                  ),
+                  MediaPreprocessingPolicy.isOutputStorageKeyUnowned(
+                      replacementOutputKey,
+                      in: persisted
+                  ),
+                  let messageIndex = persisted.messages.firstIndex(where: {
+                      $0.id == target.messageID
+                          && $0.conversationId == target.conversationID
+                  }),
+                  LocalMediaRecordPolicy.rekeyPreprocessingOutput(
+                      &persisted.messages[messageIndex],
+                      attachmentID: target.attachmentID,
+                      expectedJob: target.job,
+                      newOutputStorageKey: replacementOutputKey
+                  )
+            else { throw CancellationError() }
+        }
+        guard await outboxContextIsCurrent(
+            accountEpoch: expectedAccountEpoch,
+            userID: userID,
+            sessionID: sessionID
+        ) else { throw CancellationError() }
+        await publishLatestState()
     }
 
     private func preprocessLocalMedia(
@@ -11037,6 +11432,61 @@ final class AppModel: ObservableObject {
         accountEpoch expectedAccountEpoch: UUID,
         sessionID: String
     ) async throws -> Int {
+        guard await outboxContextIsCurrent(
+            accountEpoch: expectedAccountEpoch,
+            userID: userID,
+            sessionID: sessionID
+        ) else { throw CancellationError() }
+
+        let ownershipSnapshot = await store.snapshot()
+        guard ownershipSnapshot.profile?.id == userID,
+              MediaPreprocessingPolicy.canReplaceOutput(
+                  storageKey: target.job.outputStorageKey,
+                  ownedBy: target.messageID,
+                  attachmentID: target.attachmentID,
+                  expectedJob: target.job,
+                  in: ownershipSnapshot
+              )
+        else { throw SecureMediaAttachmentError.invalidMedia }
+        // A prior process may have atomically published this job's output before it could commit
+        // the state transition. Reuse it only after decoding its actual content. An occupied but
+        // invalid destination is never deleted or overwritten; the durable job moves to a fresh
+        // key and the bounded orphan sweep retires the old bytes after its grace window.
+        let existingOutput = await SecureMediaFileCache.shared.probeProtectedOriginal(
+            forStorageKey: target.job.outputStorageKey,
+            userID: userID
+        )
+        switch existingOutput {
+        case .candidate(let existingURL, let existingByteCount):
+            if KitChatMediaLimits.fits(
+                   existingByteCount,
+                   kind: KitChatMediaKind(mediaType: target.job.outputMediaType)
+               ),
+               await MediaPreprocessingPolicy.isValidPublishedOutput(
+                   at: existingURL,
+                   for: target.job
+               ) {
+                return existingByteCount
+            }
+            try await rekeyInvalidPreprocessingOutput(
+                target,
+                userID: userID,
+                accountEpoch: expectedAccountEpoch,
+                sessionID: sessionID
+            )
+            throw CancellationError()
+        case .occupiedInvalid:
+            try await rekeyInvalidPreprocessingOutput(
+                target,
+                userID: userID,
+                accountEpoch: expectedAccountEpoch,
+                sessionID: sessionID
+            )
+            throw CancellationError()
+        case .absent:
+            break
+        }
+
         var sourceURLs: [URL] = []
         sourceURLs.reserveCapacity(target.job.sources.count)
         for source in target.job.sources {
@@ -11052,13 +11502,6 @@ final class AppModel: ObservableObject {
             userID: userID,
             sessionID: sessionID
         ) else { throw CancellationError() }
-
-        // The output key belongs exclusively to this durable job. Removing an unpublished crash
-        // remnant makes voice export retries deterministic even when container metadata differs.
-        await SecureMediaFileCache.shared.remove(
-            forStorageKey: target.job.outputStorageKey,
-            userID: userID
-        )
         let outputURL: URL
         switch target.job.kind {
         case .voiceAssembly:
@@ -11094,8 +11537,22 @@ final class AppModel: ObservableObject {
                   accountEpoch: expectedAccountEpoch,
                   userID: userID,
                   sessionID: sessionID
+              ),
+              await MediaPreprocessingPolicy.isValidPublishedOutput(
+                  at: outputURL,
+                  for: target.job
               )
         else { throw SecureMediaAttachmentError.invalidMedia }
+        let publicationSnapshot = await store.snapshot()
+        guard publicationSnapshot.profile?.id == userID,
+              MediaPreprocessingPolicy.canReplaceOutput(
+                  storageKey: target.job.outputStorageKey,
+                  ownedBy: target.messageID,
+                  attachmentID: target.attachmentID,
+                  expectedJob: target.job,
+                  in: publicationSnapshot
+              )
+        else { throw CancellationError() }
         _ = try await SecureMediaFileCache.shared.importProtectedOriginal(
             from: outputURL,
             forStorageKey: target.job.outputStorageKey,
@@ -11287,12 +11744,12 @@ final class AppModel: ObservableObject {
               identity.remote != nil,
               isOnline,
               secureMessagingAvailable,
-              MediaHydrationPolicy.hasCapacity(
-                  plaintextByteCount: identity.size,
-                  volumeURL: FileManager.default.temporaryDirectory
-              ),
               let sessionID = await sessions.current()?.sessionId
         else { return nil }
+        guard let capacityReservation = reserveReceivedMediaHydrationCapacity(
+            plaintextByteCount: identity.size
+        ) else { return nil }
+        defer { receivedMediaHydrationReservations[capacityReservation] = nil }
         if let mediaID = UUID(uuidString: identity.id) {
             LocalMediaPerformanceMonitor.shared.beginRecipientHydration(
                 mediaID: mediaID,
@@ -11409,6 +11866,14 @@ final class AppModel: ObservableObject {
                         )
                     }
                 }
+                // This method is also called directly from a visible bubble, outside the
+                // background hydration pass. Publish its terminal failure so the row leaves
+                // `.downloading` immediately and the customer's Retry action becomes available.
+                // `publishLatestState` revision-fences older snapshots and accountEpoch prevents
+                // a completed request from crossing sign-out/account replacement.
+                if expectedAccountEpoch == accountEpoch {
+                    await publishLatestState()
+                }
             }
             return nil
         }
@@ -11429,10 +11894,22 @@ final class AppModel: ObservableObject {
         let generation = mediaHydrationGeneration
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
+            let pendingBefore = self.pendingReceivedMediaHydrationCount
             await self.runPendingMediaHydration(maximumItems: MediaHydrationPolicy.maximumItemsPerPass)
             guard self.mediaHydrationGeneration == generation else { return }
+            // Concurrent children commit independently. An early success can publish while a
+            // sibling is still `.downloading`, then that sibling can fail without publishing.
+            // Refresh after the whole pass so retry admission observes durable final states.
+            await self.publishLatestState()
+            guard self.mediaHydrationGeneration == generation else { return }
             self.mediaHydrationTask = nil
-            if self.hasPendingReceivedMediaHydration {
+            let pendingAfter = self.pendingReceivedMediaHydrationCount
+            if pendingAfter > 0, pendingAfter < pendingBefore {
+                // Useful progress means there may simply have been more work than one bounded
+                // pass admitted. Continue immediately; a failure-only pass uses the delayed BG
+                // retry below and cannot spin or hammer the attachment service.
+                _ = self.schedulePendingMediaHydration()
+            } else if pendingAfter > 0 {
                 CommunicationBackgroundReplayScheduler.shared.schedule(
                     earliestBeginDate: Date().addingTimeInterval(MediaHydrationPolicy.retryDelay)
                 )
@@ -11443,14 +11920,38 @@ final class AppModel: ObservableObject {
     }
 
     private var hasPendingReceivedMediaHydration: Bool {
-        state.messages.contains { message in
-            !message.isOutgoing && (message.localMediaRecords ?? []).contains { record in
+        pendingReceivedMediaHydrationCount > 0
+    }
+
+    private var pendingReceivedMediaHydrationCount: Int {
+        state.messages.reduce(into: 0) { count, message in
+            guard !message.isOutgoing else { return }
+            count += (message.localMediaRecords ?? []).filter { record in
                 record.direction == .received
                     && record.availabilityState == .remoteOnly
                     && record.cacheEvictedAt == nil
                     && [.pending, .failed].contains(record.downloadState)
-            }
+            }.count
         }
+    }
+
+    private func reserveReceivedMediaHydrationCapacity(
+        plaintextByteCount: Int
+    ) -> UUID? {
+        guard plaintextByteCount > 0 else { return nil }
+        var aggregate = plaintextByteCount
+        for reserved in receivedMediaHydrationReservations.values {
+            let (next, overflow) = aggregate.addingReportingOverflow(reserved)
+            guard !overflow else { return nil }
+            aggregate = next
+        }
+        guard MediaHydrationPolicy.hasCapacity(
+            plaintextByteCount: aggregate,
+            volumeURL: FileManager.default.temporaryDirectory
+        ) else { return nil }
+        let token = UUID()
+        receivedMediaHydrationReservations[token] = plaintextByteCount
+        return token
     }
 
     private func runPendingMediaHydration(maximumItems: Int) async {
@@ -11460,39 +11961,93 @@ final class AppModel: ObservableObject {
         let expectedAccountEpoch = accountEpoch
         let snapshot = await store.snapshot()
         guard snapshot.profile?.id == userID else { return }
-        var targets: [(messageID: UUID, conversationID: String, itemIndex: Int?)] = []
+        var targets: [(
+            messageID: UUID,
+            conversationID: String,
+            itemIndex: Int?,
+            lastAttemptAt: Date
+        )] = []
         for message in snapshot.messages where !message.isOutgoing {
-            let pendingIDs = Set((message.localMediaRecords ?? []).filter { record in
+            let pendingRecords = (message.localMediaRecords ?? []).filter { record in
                 record.direction == .received
                     && record.availabilityState == .remoteOnly
                     && record.cacheEvictedAt == nil
                     && [.pending, .failed].contains(record.downloadState)
-            }.map(\.id))
-            guard !pendingIDs.isEmpty else { continue }
+            }
+            let pendingByID = Dictionary(grouping: pendingRecords, by: \.id)
+                .compactMapValues { $0.count == 1 ? $0[0] : nil }
+            guard !pendingByID.isEmpty else { continue }
             if let descriptor = KitMediaMessageDescriptor.parse(message.body),
-               pendingIDs.contains(descriptor.attachmentID) {
-                targets.append((message.id, message.conversationId, nil))
+               let record = pendingByID[descriptor.attachmentID] {
+                targets.append((message.id, message.conversationId, nil, record.updatedAt))
             } else if let descriptor = KitMediaMessageV2Descriptor.parse(message.body) {
                 for (index, item) in descriptor.items.enumerated()
-                    where pendingIDs.contains(item.attachmentID) {
-                    targets.append((message.id, message.conversationId, index))
+                    where pendingByID[item.attachmentID] != nil {
+                    targets.append((
+                        message.id,
+                        message.conversationId,
+                        index,
+                        pendingByID[item.attachmentID]!.updatedAt
+                    ))
                 }
             }
         }
-        for target in targets.prefix(maximumItems) {
-            guard !Task.isCancelled,
-                  isOnline,
-                  await outboxContextIsCurrent(
-                      accountEpoch: expectedAccountEpoch,
-                      userID: userID,
-                      sessionID: sessionID
-                  )
-            else { return }
-            _ = await loadProtectedLocalMediaFile(
-                messageID: target.messageID,
-                conversationId: target.conversationID,
-                itemIndex: target.itemIndex
-            )
+        // A failed attempt updates `updatedAt`; oldest-first scheduling therefore rotates a
+        // permanently failing row behind untouched work instead of starving every later album.
+        let selected = Array(targets.sorted { lhs, rhs in
+            if lhs.lastAttemptAt != rhs.lastAttemptAt {
+                return lhs.lastAttemptAt < rhs.lastAttemptAt
+            }
+            if lhs.messageID != rhs.messageID {
+                return lhs.messageID.uuidString < rhs.messageID.uuidString
+            }
+            return (lhs.itemIndex ?? -1) < (rhs.itemIndex ?? -1)
+        }.prefix(maximumItems))
+        guard !selected.isEmpty else { return }
+        await withTaskGroup(of: Void.self) { group in
+            var nextIndex = 0
+            let initialCount = min(MediaHydrationPolicy.maximumConcurrentDownloads, selected.count)
+            while nextIndex < initialCount {
+                let target = selected[nextIndex]
+                nextIndex += 1
+                group.addTask { @MainActor [weak self] in
+                    guard let self,
+                          !Task.isCancelled,
+                          self.isOnline,
+                          await self.outboxContextIsCurrent(
+                              accountEpoch: expectedAccountEpoch,
+                              userID: userID,
+                              sessionID: sessionID
+                          )
+                    else { return }
+                    _ = await self.loadProtectedLocalMediaFile(
+                        messageID: target.messageID,
+                        conversationId: target.conversationID,
+                        itemIndex: target.itemIndex
+                    )
+                }
+            }
+            while await group.next() != nil {
+                guard nextIndex < selected.count, !Task.isCancelled else { continue }
+                let target = selected[nextIndex]
+                nextIndex += 1
+                group.addTask { @MainActor [weak self] in
+                    guard let self,
+                          !Task.isCancelled,
+                          self.isOnline,
+                          await self.outboxContextIsCurrent(
+                              accountEpoch: expectedAccountEpoch,
+                              userID: userID,
+                              sessionID: sessionID
+                          )
+                    else { return }
+                    _ = await self.loadProtectedLocalMediaFile(
+                        messageID: target.messageID,
+                        conversationId: target.conversationID,
+                        itemIndex: target.itemIndex
+                    )
+                }
+            }
         }
     }
 
@@ -11758,20 +12313,11 @@ final class AppModel: ObservableObject {
                 attachmentID: mediaIdentity.id,
                 accessLease: accessLease
             )
-            if KitChatMediaKind(mediaType: mediaIdentity.type) != .image {
-                return SecureMediaLoadPolicy.LoadedItem(localFile: localFile)
-            }
-            guard let local = try? Data(
-                contentsOf: accessLease.fileURL,
-                options: [.mappedIfSafe]
-            ),
-                  local.count == mediaIdentity.size
-            else { throw SecureMediaAttachmentError.invalidCiphertext }
-            return SecureMediaLoadPolicy.LoadedItem(
-                data: local,
-                mediaType: mediaIdentity.type,
-                caption: localFile.caption
-            )
+            // Images use the protected file too. ImageIO can downsample directly from the URL;
+            // materializing a potentially 200 MiB compressed original into Data first provides
+            // no additional integrity (the protected-cache lease already verified identity) and
+            // creates avoidable memory pressure.
+            return SecureMediaLoadPolicy.LoadedItem(localFile: localFile)
         }
         if let localRecord,
            localRecord.localStorageKind == .encryptedBlob,
@@ -11857,17 +12403,7 @@ final class AppModel: ObservableObject {
                 itemIndex: itemIndex
             ), await currentResolution() == resolved
             else { throw SecureMediaAttachmentError.invalidCiphertext }
-            if KitChatMediaKind(mediaType: item.mediaType) != .image {
-                return SecureMediaLoadPolicy.LoadedItem(localFile: file)
-            }
-            guard let data = try? Data(contentsOf: file.url, options: [.mappedIfSafe]),
-                  data.count == item.plaintextByteSize
-            else { throw SecureMediaAttachmentError.invalidCiphertext }
-            return SecureMediaLoadPolicy.LoadedItem(
-                data: data,
-                mediaType: item.mediaType,
-                caption: nil
-            )
+            return SecureMediaLoadPolicy.LoadedItem(localFile: file)
 
         case .single(let descriptor, let descriptorText, let inlineData):
             // The policy carries inline bytes only at the exact declared size, and they live on
@@ -11910,17 +12446,7 @@ final class AppModel: ObservableObject {
                 itemIndex: nil
             ), await bodyIsCurrent()
             else { throw SecureMediaAttachmentError.invalidCiphertext }
-            if KitChatMediaKind(mediaType: descriptor.mediaType) != .image {
-                return SecureMediaLoadPolicy.LoadedItem(localFile: file)
-            }
-            guard let data = try? Data(contentsOf: file.url, options: [.mappedIfSafe]),
-                  data.count == descriptor.plaintextByteSize
-            else { throw SecureMediaAttachmentError.invalidCiphertext }
-            return SecureMediaLoadPolicy.LoadedItem(
-                data: data,
-                mediaType: descriptor.mediaType,
-                caption: descriptor.caption
-            )
+            return SecureMediaLoadPolicy.LoadedItem(localFile: file)
         }
     }
 
@@ -12556,6 +13082,10 @@ final class AppModel: ObservableObject {
                     persisted.messages
                         .filter { writableConversationIDs.contains($0.conversationId) }
                         .flatMap(\.localMediaStorageKeys)
+                ).union(
+                    persisted.conversationDrafts?
+                        .filter { writableConversationIDs.contains($0.key) }
+                        .flatMap { $0.value.localMediaStorageKeys } ?? []
                 )
                 persisted.conversations.removeAll { writableConversationIDs.contains($0.id) }
                 persisted.groupProjectionUpdatedAt =
@@ -12573,7 +13103,14 @@ final class AppModel: ObservableObject {
                     .filter { !writableConversationIDs.contains($0) }
                 persisted.mutedConversationIds = persisted.mutedConversationIds?
                     .filter { !writableConversationIDs.contains($0) }
+                persisted.conversationDrafts = persisted.conversationDrafts?.filter {
+                    !writableConversationIDs.contains($0.key)
+                }
                 let survivorKeys = Set(persisted.messages.flatMap(\.localMediaStorageKeys))
+                    .union(
+                        persisted.conversationDrafts?.values
+                            .flatMap(\.localMediaStorageKeys) ?? []
+                    )
                 deletableKeys = candidateKeys.subtracting(survivorKeys).sorted()
             }
             await publishLatestState()
@@ -12616,6 +13153,10 @@ final class AppModel: ObservableObject {
                         && command.messageId.map(messageIDs.contains) == true
                 }
                 let survivorKeys = Set(persisted.messages.flatMap(\.localMediaStorageKeys))
+                    .union(
+                        persisted.conversationDrafts?.values
+                            .flatMap(\.localMediaStorageKeys) ?? []
+                    )
                 deletableKeys = candidateKeys.subtracting(survivorKeys).sorted()
             }
             await publishLatestState()
@@ -15150,6 +15691,29 @@ final class AppModel: ObservableObject {
         completion.finish(success: succeeded)
     }
 
+    /// A background URLSession can finish a ciphertext chunk after this process was terminated.
+    /// Restore the account-bound projection first, then let the exact durable outbox row consume
+    /// that completion and advance its resumable offset. The uploader keeps iOS's event callback
+    /// alive around this method (with its own bounded watchdog), so scheduling the next chunk is
+    /// deterministic rather than waiting for an unrelated foreground refresh.
+    private func recoverCompletedBackgroundMediaUpload() async {
+        if let restoreTask { await restoreTask.value }
+        for _ in 0 ..< 30 where !hasConnectivityStatus {
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        guard isOnline,
+              isSignedIn,
+              accountSetupStep == nil,
+              communicationAccessGranted
+        else {
+            scheduleOutboxWake()
+            return
+        }
+        schedulePendingMediaPreprocessing()
+        await drainReadyOutbox(maximumPasses: 1)
+        scheduleOutboxWake()
+    }
+
     private func contactsDidChange() {
         contactChangeDebounceTask?.cancel()
         contactChangeDebounceTask = Task { [weak self] in
@@ -17190,16 +17754,14 @@ enum SecureMessagingReleaseGate {
     static let enabled = true
 }
 
-/// Local queueing tolerates an absent capability document (startup, failed refresh, offline),
-/// because transport revalidates it before encryption/fanout. Once an authenticated server
-/// document is present, however, an explicit feature/protocol withdrawal is authoritative and
-/// composition remains fail-closed.
+/// Local queueing is deliberately independent of capability discovery. Capture/selection has
+/// already produced an app-owned original, and the protected outbox is not a network boundary.
+/// The dispatcher revalidates the authenticated server and device-roster contracts before any
+/// ciphertext upload or fanout; an unavailable/withdrawn contract therefore leaves the exact
+/// local message pending instead of making the composer wait for the network.
 enum SecureMessagingLocalQueueReleasePolicy {
-    static func permits(
-        buildEnabled: Bool,
-        serverAdvertisesReviewedMessaging: Bool?
-    ) -> Bool {
-        buildEnabled && serverAdvertisesReviewedMessaging != false
+    static func permits(buildEnabled: Bool) -> Bool {
+        buildEnabled
     }
 }
 

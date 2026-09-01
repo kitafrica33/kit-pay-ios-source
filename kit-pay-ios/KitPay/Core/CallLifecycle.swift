@@ -832,6 +832,144 @@ enum ProtectedCallRecoveryPolicy {
     }
 }
 
+/// Owns the exact CallKit call whose system-activated audio session may drive LiveKit.
+///
+/// CallKit does not include a call UUID in `provider(_:didActivate:)`. Inferring the owner by
+/// counting every answered/outgoing registry entry is unsafe: one stale entry can make a valid
+/// Lock Screen answer silently skip audio. The primary Answer/Start action instead claims one
+/// owner explicitly, while generation-scoped tickets fence callbacks queued before a deactivate,
+/// replacement call, provider reset, or account transition.
+struct CallKitAudioSessionGate: Sendable {
+    enum Phase: Equatable, Sendable {
+        case inactive
+        /// CallKit activated before the primary action established its exact owner. This is kept
+        /// distinct from inactive so room attachment can reconcile without waiting for another
+        /// system callback.
+        case awaitingOwner
+        case awaitingConfiguration
+        case configured
+    }
+
+    struct Ticket: Equatable, Sendable {
+        fileprivate let generation: UInt64
+        let ownerCallUUID: UUID
+    }
+
+    private(set) var ownerCallUUID: UUID?
+    private(set) var phase: Phase = .inactive
+    private(set) var generation: UInt64 = 0
+
+    /// A new primary call supersedes stale registry bookkeeping. Waiting-call Answer actions never
+    /// call this method, so they cannot steal audio from the connected room.
+    mutating func claimOwner(_ callUUID: UUID) {
+        guard ownerCallUUID != callUUID else { return }
+        generation &+= 1
+        ownerCallUUID = callUUID
+        if phase != .inactive {
+            phase = .awaitingConfiguration
+        }
+    }
+
+    @discardableResult
+    mutating func releaseOwner(_ callUUID: UUID) -> Bool {
+        guard ownerCallUUID == callUUID else { return false }
+        generation &+= 1
+        ownerCallUUID = nil
+        phase = .inactive
+        return true
+    }
+
+    /// Begins one system activation. A missing owner is retained as an explicit race state rather
+    /// than being mistaken for a deactivation; claiming the owner and attaching the room can then
+    /// reconcile the already-active session.
+    mutating func beginSystemActivation() -> Ticket? {
+        generation &+= 1
+        guard let ownerCallUUID else {
+            phase = .awaitingOwner
+            return nil
+        }
+        phase = .awaitingConfiguration
+        return Ticket(generation: generation, ownerCallUUID: ownerCallUUID)
+    }
+
+    /// Returns the current ticket only while CallKit still owns an active session for this exact
+    /// call. It is used when the LiveKit room attaches after the system activation callback.
+    func reconciliationTicket(for callUUID: UUID) -> Ticket? {
+        guard ownerCallUUID == callUUID,
+              phase == .awaitingConfiguration || phase == .configured
+        else { return nil }
+        return Ticket(generation: generation, ownerCallUUID: callUUID)
+    }
+
+    func accepts(_ ticket: Ticket) -> Bool {
+        generation == ticket.generation
+            && ownerCallUUID == ticket.ownerCallUUID
+            && (phase == .awaitingConfiguration || phase == .configured)
+    }
+
+    @discardableResult
+    mutating func markConfigured(_ ticket: Ticket) -> Bool {
+        guard accepts(ticket) else { return false }
+        phase = .configured
+        return true
+    }
+
+    /// A configuration error keeps the active CallKit ownership pending. Room attachment or a
+    /// subsequent route event can retry deterministically; deactivation still invalidates it.
+    @discardableResult
+    mutating func markConfigurationFailed(_ ticket: Ticket) -> Bool {
+        guard accepts(ticket) else { return false }
+        phase = .awaitingConfiguration
+        return true
+    }
+
+    mutating func deactivate() {
+        generation &+= 1
+        phase = .inactive
+    }
+
+    mutating func reset() {
+        generation &+= 1
+        ownerCallUUID = nil
+        phase = .inactive
+    }
+}
+
+/// Owns the customer-visible error written by one CallKit audio configuration failure.
+/// A later successful retry may clear only that exact error for that exact call; it must never
+/// erase a newer camera, microphone, route, or replacement-call error.
+struct CallKitAudioSessionErrorRecoveryState: Sendable {
+    private struct Failure: Sendable {
+        let callID: String
+        let message: String
+    }
+
+    private var failure: Failure?
+
+    mutating func recordFailure(callID: String, message: String) {
+        failure = Failure(callID: canonical(callID), message: message)
+    }
+
+    mutating func recoveredControlError(
+        callID: String,
+        currentControlError: String?
+    ) -> String? {
+        guard let failure,
+              failure.callID == canonical(callID)
+        else { return currentControlError }
+        self.failure = nil
+        return currentControlError == failure.message ? nil : currentControlError
+    }
+
+    mutating func reset() {
+        failure = nil
+    }
+
+    private func canonical(_ callID: String) -> String {
+        callID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+}
+
 /// A generation-scoped latch for CallKit work that can arrive before `AppModel` has recovered its
 /// exact account/session lease. Unlike waiting on the whole restore task, `.ready` releases callers
 /// immediately even if the foreground biometric prompt is still suspended. Resetting for a new

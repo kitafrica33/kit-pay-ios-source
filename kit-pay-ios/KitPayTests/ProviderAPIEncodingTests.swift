@@ -184,6 +184,20 @@ final class ProviderAPIEncodingTests: XCTestCase {
         )
     }
 
+    func testMobileMoneyAccountVerificationNeverDisplaysRawProviderDiagnostics() {
+        let error = APIErrorPayload(
+            code: "MOBILE_MONEY_VERIFICATION_PROVIDER_FAILURE",
+            message: "MTN gateway settlement ledger commission allocation failed."
+        )
+
+        let displayed = MobileMoneyAccountVerificationErrorCopy.message(for: error)
+
+        XCTAssertEqual(displayed, MobileMoneyAccountVerificationErrorCopy.genericFailure)
+        for forbidden in ["MTN", "gateway", "settlement", "ledger", "commission"] {
+            XCTAssertFalse(displayed.localizedCaseInsensitiveContains(forbidden))
+        }
+    }
+
     func testCustomerFacingPaymentCopyNeverExposesInternalFeeBreakdown() {
         let protectedCopy =
             "We couldn't complete this request. Review the transaction fee and total before continuing."
@@ -214,6 +228,36 @@ final class ProviderAPIEncodingTests: XCTestCase {
             ),
             "The transaction fee changed. Review the latest total."
         )
+    }
+
+    func testCustomerFacingPaymentCopyNeverExposesStandaloneAccountingDiagnostics() {
+        let protectedCopy =
+            "We couldn't complete this request. Please try again or contact support with the reference."
+        let internalMessages = [
+            "institutional revenue ledger settlement wallet margin allocation",
+            "Commission allocation failed.",
+            "Revenue ledger entry is missing.",
+            "Settlement account reconciliation failed.",
+            "Rounding adjustment could not be posted.",
+            "Provider float balance is unavailable.",
+            "institutional_commission posting failed.",
+            "settlement-wallet ledger mismatch.",
+            "provider_float balance unavailable.",
+            "Internal accounting posting failed.",
+            "Processing cost allocation failed.",
+            "journal_entry could not be written.",
+        ]
+
+        for message in internalMessages {
+            let displayed = CustomerFacingPaymentCopy.neutralizedServiceMessage(message)
+            XCTAssertEqual(displayed, protectedCopy)
+            for forbidden in [
+                "institutional", "commission", "revenue", "ledger", "settlement", "margin",
+                "reconciliation", "rounding", "provider float",
+            ] {
+                XCTAssertFalse(displayed.localizedCaseInsensitiveContains(forbidden))
+            }
+        }
     }
 
     func testCustomerFacingPaymentCopyNeverExposesWholeUnitRailConstraints() {

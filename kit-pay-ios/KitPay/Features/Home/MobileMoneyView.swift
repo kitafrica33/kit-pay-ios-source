@@ -24,6 +24,21 @@ enum MobileMoneySavedAccountClientError: LocalizedError {
     }
 }
 
+/// Account verification is a customer identity check, not a provider-diagnostics surface.
+/// Preserve only client-authored flow errors; transport and server payload text is deliberately
+/// collapsed so an upstream response cannot expose provider, ledger, or settlement internals.
+enum MobileMoneyAccountVerificationErrorCopy {
+    static let genericFailure =
+        "We couldn't verify these account details. Review them and try again."
+
+    static func message(for error: Error) -> String {
+        if let flowError = error as? MobileMoneyFlowError {
+            return flowError.localizedDescription
+        }
+        return genericFailure
+    }
+}
+
 @MainActor
 final class MobileMoneyViewModel: ObservableObject {
     @Published private(set) var networks: [MobileMoneyNetworkDTO] = []
@@ -57,7 +72,9 @@ final class MobileMoneyViewModel: ObservableObject {
         if AppStoreScreenshotFixture.isActive {
             networks = AppStoreScreenshotFixture.mobileMoneyNetworks
             accounts = AppStoreScreenshotFixture.mobileMoneyAccounts
-            operations = AppStoreScreenshotFixture.mobileMoneyOperations
+            operations = MobileMoneyOperationPresentationPolicy.customerVisibleOperations(
+                AppStoreScreenshotFixture.mobileMoneyOperations
+            )
         }
 #endif
     }
@@ -71,7 +88,9 @@ final class MobileMoneyViewModel: ObservableObject {
         if AppStoreScreenshotFixture.isActive {
             networks = AppStoreScreenshotFixture.mobileMoneyNetworks
             accounts = AppStoreScreenshotFixture.mobileMoneyAccounts
-            operations = AppStoreScreenshotFixture.mobileMoneyOperations
+            operations = MobileMoneyOperationPresentationPolicy.customerVisibleOperations(
+                AppStoreScreenshotFixture.mobileMoneyOperations
+            )
             errorMessage = nil
             return
         }
@@ -276,9 +295,9 @@ final class MobileMoneyViewModel: ObservableObject {
                 pollCount += 1
             }
             guard result.isVerified else {
-                throw MobileMoneyFlowError.verificationIncomplete(
-                    result.failure?.message ?? "The account is still being verified. Try again shortly."
-                )
+                throw result.isPending
+                    ? MobileMoneyFlowError.verificationPending
+                    : MobileMoneyFlowError.verificationFailed
             }
 
             let accountKey = key(
@@ -301,7 +320,7 @@ final class MobileMoneyViewModel: ObservableObject {
             pendingKeys["account:\(result.id):\(kind):\(cleanLabel)"] = nil
             return true
         } catch {
-            errorMessage = message(for: error)
+            errorMessage = MobileMoneyAccountVerificationErrorCopy.message(for: error)
             return false
         }
     }
@@ -396,9 +415,9 @@ final class MobileMoneyViewModel: ObservableObject {
                   let verifiedName = result.verifiedAccountName?.trimmingCharacters(in: .whitespacesAndNewlines),
                   !verifiedName.isEmpty
             else {
-                throw MobileMoneyFlowError.verificationIncomplete(
-                    "We couldn't confirm the account name for this number. Check the details and try again."
-                )
+                throw result.isPending
+                    ? MobileMoneyFlowError.verificationPending
+                    : MobileMoneyFlowError.verificationFailed
             }
 
             let label = String(verifiedName.prefix(100))
@@ -435,7 +454,7 @@ final class MobileMoneyViewModel: ObservableObject {
             return
         } catch {
             guard payoutLookupGeneration.accepts(requestID, request: request) else { return }
-            let message = message(for: error)
+            let message = MobileMoneyAccountVerificationErrorCopy.message(for: error)
             payoutLookupState = .failed(request, message)
             errorMessage = message
         }
@@ -672,6 +691,7 @@ final class MobileMoneyViewModel: ObservableObject {
                 stepUpToken: verification.stepUpToken
             )
             guard operation.mobileMoneyType == MobileMoneyAction.collection.rawValue,
+                  MobileMoneyOperationPresentationPolicy.isCustomerVisible(operation),
                   operation.walletId == quote.walletId,
                   MobileMoneyAmount.amountsMatch(operation.amount, quote.providerAmount),
                   operation.currency == quote.currency,
@@ -784,6 +804,7 @@ final class MobileMoneyViewModel: ObservableObject {
                 stepUpToken: verification.stepUpToken
             )
             guard operation.mobileMoneyType == MobileMoneyAction.payout.rawValue,
+                  MobileMoneyOperationPresentationPolicy.isCustomerVisible(operation),
                   operation.outboundQuoteId == quote.id,
                   operation.walletId == quote.walletId,
                   operation.beneficiaryId == account.id,
@@ -878,6 +899,10 @@ final class MobileMoneyViewModel: ObservableObject {
     private func upsert(_ operation: MobileMoneyOperationDTO) {
         let key = operationPollKey(operation.id)
         operations.removeAll { operationPollKey($0.id) == key }
+        guard MobileMoneyOperationPresentationPolicy.isCustomerVisible(operation) else {
+            cancelOperationPoll(key: key)
+            return
+        }
         operations.append(operation)
         sortOperations()
         reconcileOperationPollers()
@@ -890,15 +915,20 @@ final class MobileMoneyViewModel: ObservableObject {
     }
 
     private func merge(_ recentOperations: [MobileMoneyOperationDTO]) {
+        let visible = MobileMoneyOperationPresentationPolicy.customerVisibleOperations(
+            recentOperations
+        )
         let incomingIDs = Set(recentOperations.map { operationPollKey($0.id) })
         operations.removeAll { incomingIDs.contains(operationPollKey($0.id)) }
-        operations.append(contentsOf: recentOperations)
+        operations.append(contentsOf: visible)
         sortOperations()
         reconcileOperationPollers()
     }
 
     private func replaceOperations(_ replacements: [MobileMoneyOperationDTO]) {
-        operations = replacements
+        operations = MobileMoneyOperationPresentationPolicy.customerVisibleOperations(
+            replacements
+        )
         sortOperations()
         reconcileOperationPollers()
     }
@@ -966,7 +996,6 @@ final class MobileMoneyViewModel: ObservableObject {
         amount: String,
         feeMode: MobileMoneyFeeMode
     ) throws {
-        let intent = quote.stepUp.intent
         guard !quote.isExpired else { throw MobileMoneyFlowError.quoteExpired }
         guard quote.action == MobileMoneyAction.collection.rawValue,
               MobileMoneySavedAccountActionPolicy.canCollect(from: account),
@@ -975,22 +1004,9 @@ final class MobileMoneyViewModel: ObservableObject {
               quote.accountId == account.id,
               quote.network.caseInsensitiveCompare(account.network.code) == .orderedSame,
               MobileMoneyAmount.amountsMatch(quote.requestedAmount, amount),
+              quote.hasConsistentCustomerAmounts,
               quote.currency == wallet.currency,
-              quote.stepUp.purpose == MobileMoneyAction.collection.purpose,
-              intent["action"] == MobileMoneyAction.collection.rawValue,
-              intent["quote_id"] == quote.id,
-              intent["wallet_id"] == quote.walletId,
-              intent["mobile_money_account_id"] == quote.accountId,
-              intent["network"] == quote.network,
-              intent["fee_mode"] == quote.feeMode.rawValue,
-              intent["requested_amount"] == quote.requestedAmount,
-              intent["provider_amount"] == quote.providerAmount,
-              intent["provider_fee"] == quote.providerFee,
-              intent["platform_fee"] == quote.platformFee,
-              intent["rounding_adjustment"] == quote.roundingAdjustment,
-              intent["total_fees"] == quote.totalFees,
-              intent["wallet_credit"] == quote.walletCredit,
-              intent["currency"] == quote.currency.code
+              quote.hasValidStepUpBinding
         else { throw MobileMoneyFlowError.quoteMismatch }
     }
 
@@ -1001,11 +1017,9 @@ final class MobileMoneyViewModel: ObservableObject {
         amount: String,
         feeMode: MobileMoneyPayoutFeeMode
     ) throws {
-        let intent = quote.stepUp.intent
         guard !quote.isExpired else { throw MobileMoneyFlowError.quoteExpired }
         guard quote.action == MobileMoneyAction.payout.rawValue,
               quote.scheduleVerified,
-              !quote.scheduleVersion.isEmpty,
               quote.hasConsistentAmounts,
               account.isPayoutCapable,
               quote.feeMode == feeMode,
@@ -1014,23 +1028,7 @@ final class MobileMoneyViewModel: ObservableObject {
               quote.network.caseInsensitiveCompare(account.network.code) == .orderedSame,
               MobileMoneyAmount.amountsMatch(quote.enteredAmount, amount),
               quote.currency == wallet.currency,
-              quote.stepUp.purpose == MobileMoneyAction.payout.purpose,
-              intent["action"] == MobileMoneyAction.payout.rawValue,
-              intent["quote_id"] == quote.id,
-              intent["wallet_id"] == quote.walletId,
-              intent["mobile_money_account_id"] == quote.accountId,
-              intent["network"] == quote.network,
-              intent["fee_mode"] == quote.feeMode.rawValue,
-              intent["recipient_amount"] == quote.recipientAmount,
-              intent["processing_fee"] == quote.processingFee,
-              intent["provider_fee"] == quote.providerFee,
-              intent["kit_fee"] == quote.kitFee,
-              intent["provider_fee_cap"] == quote.providerFeeCap,
-              intent["maximum_provider_total"] == quote.maximumProviderTotal,
-              intent["customer_debit"] == quote.customerDebit,
-              intent["kit_debit"] == quote.kitDebit,
-              intent["schedule_version"] == quote.scheduleVersion,
-              intent["currency"] == quote.currency.code
+              quote.hasValidStepUpBinding
         else { throw MobileMoneyFlowError.quoteMismatch }
     }
 
@@ -1055,7 +1053,8 @@ private enum MobileMoneyFlowError: LocalizedError {
     case unconfirmedOperation
     case quoteExpired
     case quoteMismatch
-    case verificationIncomplete(String)
+    case verificationPending
+    case verificationFailed
 
     var errorDescription: String? {
         switch self {
@@ -1069,8 +1068,10 @@ private enum MobileMoneyFlowError: LocalizedError {
             "This review expired. Check the latest transaction fee and total before approving."
         case .quoteMismatch:
             "The transaction fee or total changed. Review the latest amounts and try again."
-        case .verificationIncomplete(let message):
-            message
+        case .verificationPending:
+            "The account is still being verified. Try again shortly."
+        case .verificationFailed:
+            MobileMoneyAccountVerificationErrorCopy.genericFailure
         }
     }
 }
@@ -1392,7 +1393,22 @@ struct MobileMoneyView: View {
                             }
                             Spacer()
                             VStack(alignment: .trailing, spacing: 3) {
-                                Text(KitMoney.formatted(operation.amount, currency: operation.currency)).font(.subheadline.bold())
+                                if let impactLabel = operation.customerImpactLabel {
+                                    Text(impactLabel)
+                                        .font(.caption2)
+                                        .foregroundStyle(KitColor.secondaryText)
+                                }
+                                if let impactAmount = operation.customerImpactAmount {
+                                    Text(KitMoney.formatted(
+                                        impactAmount,
+                                        currency: operation.currency
+                                    ))
+                                        .font(.subheadline.bold())
+                                } else {
+                                    Text("Amount unavailable")
+                                        .font(.caption.bold())
+                                        .foregroundStyle(KitColor.secondaryText)
+                                }
                                 Text(MobileMoneyOperationStatusPresentation.customerText(
                                     for: operation
                                 ))
@@ -1779,10 +1795,21 @@ private struct MobileMoneySavedAccountDetailView: View {
             }
             Spacer(minLength: 8)
             VStack(alignment: .trailing, spacing: 4) {
-                Text(displayAmount(operation.amount, currency: operation.currency))
-                    .font(.subheadline.bold())
-                    .foregroundStyle(KitColor.primaryText)
-                    .monospacedDigit()
+                if let impactLabel = operation.customerImpactLabel {
+                    Text(impactLabel)
+                        .font(.caption2)
+                        .foregroundStyle(KitColor.secondaryText)
+                }
+                if let impactAmount = operation.customerImpactAmount {
+                    Text(displayAmount(impactAmount, currency: operation.currency))
+                        .font(.subheadline.bold())
+                        .foregroundStyle(KitColor.primaryText)
+                        .monospacedDigit()
+                } else {
+                    Text("Amount unavailable")
+                        .font(.caption.bold())
+                        .foregroundStyle(KitColor.secondaryText)
+                }
                 Text(activityStatus(operation))
                     .font(.caption2.bold())
                     .foregroundStyle(activityStatusColor(operation))
@@ -2768,12 +2795,6 @@ struct MobileMoneyOperationView: View {
                     emphasized: true
                 )
 
-                if quote.providerFeeEstimated {
-                    Text("The transaction fee is estimated from the current rate. The final amount remains available in your transaction history.")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
             } else if !amount.isEmpty, !accountID.isEmpty {
                 Text("Enter an amount greater than zero to review the exact total and wallet credit.")
                     .font(.caption)

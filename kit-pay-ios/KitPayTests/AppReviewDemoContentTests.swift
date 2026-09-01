@@ -426,6 +426,7 @@ final class AppReviewDemoContentTests: XCTestCase {
                 walletId: state.wallets[0].id,
                 reference: "APP-REVIEW-PRESERVED",
                 amount: "50.00",
+                totals: CustomerTransactionTotals(added: "50.00", deducted: "0"),
                 currency: CurrencyDTO(code: "UGX", scale: "2"),
                 type: "internal_transfer",
                 direction: "credit",

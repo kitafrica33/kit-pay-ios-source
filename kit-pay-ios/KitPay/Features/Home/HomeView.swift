@@ -588,13 +588,16 @@ struct HomeView: View {
 
     private func transactionRow(_ transaction: WalletTransaction) -> some View {
         HStack(spacing: 13) {
-            Image(systemName: transaction.direction == "credit" ? "arrow.down.left" : "arrow.up.right")
+            Image(systemName: transaction.customerDirection == "credit" ? "arrow.down.left" : "arrow.up.right")
                 .font(.headline)
-                .foregroundStyle(transaction.direction == "credit" ? KitColor.green : KitColor.primaryText)
+                .foregroundStyle(transaction.customerDirection == "credit" ? KitColor.green : KitColor.primaryText)
                 .frame(width: 46, height: 46)
                 .background(.thinMaterial, in: Circle())
             VStack(alignment: .leading, spacing: 3) {
-                Text(transaction.counterparty?.name ?? transaction.type.replacingOccurrences(of: "_", with: " ").capitalized)
+                Text(
+                    transaction.customerCounterparty?.name
+                        ?? transaction.type.replacingOccurrences(of: "_", with: " ").capitalized
+                )
                     .font(.body.bold())
                     .foregroundStyle(KitColor.primaryText)
                 Text(transaction.note ?? transaction.reference)
@@ -603,14 +606,18 @@ struct HomeView: View {
                     .lineLimit(1)
             }
             Spacer()
-            Text(KitMoney.signed(
-                transaction.amount,
-                currency: transaction.currency,
-                direction: transaction.direction
-            ))
-                .font(.subheadline.bold())
-                .monospacedDigit()
-                .foregroundStyle(transaction.direction == "credit" ? KitColor.green : KitColor.primaryText)
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(transaction.customerImpactLabel)
+                    .font(.caption2)
+                    .foregroundStyle(KitColor.secondaryText)
+                Text(KitMoney.formatted(
+                    transaction.customerImpactAmount,
+                    currency: transaction.currency
+                ))
+                    .font(.subheadline.bold())
+                    .monospacedDigit()
+                    .foregroundStyle(transaction.customerDirection == "credit" ? KitColor.green : KitColor.primaryText)
+            }
         }
         .padding(14)
         .kitGlass(cornerRadius: 20, shadow: false)

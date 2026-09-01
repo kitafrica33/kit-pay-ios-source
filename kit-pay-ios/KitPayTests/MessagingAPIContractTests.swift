@@ -8,6 +8,16 @@ final class MessagingAPIContractTests: XCTestCase {
     private let messageId = "33333333-3333-4333-8333-333333333333"
     private let rosterRevision = "v1:sha256:" + String(repeating: "a", count: 64)
 
+    func testBackgroundEventsCompletionGateRejectsReplacedAndDuplicateCallbacks() {
+        var gate = MessagingBackgroundEventsCompletionGate()
+        let replaced = gate.install()
+        let current = gate.install()
+
+        XCTAssertFalse(gate.consume(replaced))
+        XCTAssertTrue(gate.consume(current))
+        XCTAssertFalse(gate.consume(current))
+    }
+
     func testBackgroundUploadTaskDescriptionRoundTripsWithoutCredentials() throws {
         let accountID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         let sessionID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
