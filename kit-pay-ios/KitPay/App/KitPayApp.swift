@@ -119,6 +119,9 @@ struct KitPayApp: App {
                         // Waiting for `.background` leaks a live socket while Control Center,
                         // permission prompts, or the app switcher obscure the protected UI.
                         KitPresenceCenter.shared.setForeground(false)
+                        // Clear any prior foreground-stop intent before AVKit can begin an
+                        // automatic chat-video handoff for this deactivation.
+                        ChatVideoPictureInPicture.shared.prepareForBackgrounding()
                         // The foreground→background transition point: the last moment iOS allows
                         // a programmatic Picture in Picture start, so an ongoing video call keeps
                         // showing after the user leaves the app. No-op for audio calls, when

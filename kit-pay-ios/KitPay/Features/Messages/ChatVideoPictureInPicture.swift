@@ -223,13 +223,202 @@ enum ChatVideoPictureInPictureHandoffPolicy {
         ownerMatches: Bool,
         hasController: Bool,
         startRequested: Bool,
+        stopRequested: Bool,
         isActive: Bool,
         alreadyRetained: Bool
     ) -> Bool {
         ownerMatches
             && hasController
-            && !alreadyRetained
-            && (startRequested || isActive)
+            && (alreadyRetained || startRequested || stopRequested || isActive)
+    }
+}
+
+enum ChatVideoPictureInPictureCallbackPolicy {
+    static func accepts(currentController: AnyObject?, callbackController: AnyObject) -> Bool {
+        currentController === callbackController
+    }
+}
+
+/// Restores the delegate's invocation order after callbacks cross independent actor hops.
+/// Sequence numbers are assigned synchronously at the protocol boundary; an early-arriving task
+/// waits for any lower-numbered callback instead of applying AVKit lifecycle events out of order.
+struct ChatVideoPictureInPictureCallbackOrder<Event> {
+    private var nextSequence: UInt64 = 0
+    private var pending: [UInt64: Event] = [:]
+
+    mutating func insert(_ event: Event, sequence: UInt64) -> [Event] {
+        guard sequence >= nextSequence else { return [] }
+        pending[sequence] = event
+
+        var ready: [Event] = []
+        while let event = pending.removeValue(forKey: nextSequence) {
+            ready.append(event)
+            nextSequence &+= 1
+        }
+        return ready
+    }
+}
+
+private enum ChatVideoPictureInPictureCallbackEvent {
+    case willStart
+    case didStart
+    case willStop
+    case failedToStart
+    case didStop
+    case restore
+}
+
+private enum ChatVideoPictureInPictureReportedTransition: Equatable {
+    case starting
+    case stopping
+}
+
+private final class ChatVideoPictureInPictureCallbackSequencer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var nextSequence: UInt64 = 0
+    private var reportedTransitions: [ObjectIdentifier: ChatVideoPictureInPictureReportedTransition] = [:]
+
+    func takeNext(
+        for controller: AnyObject,
+        event: ChatVideoPictureInPictureCallbackEvent
+    ) -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        let controllerID = ObjectIdentifier(controller)
+        switch event {
+        case .willStart:
+            reportedTransitions[controllerID] = .starting
+        case .willStop:
+            reportedTransitions[controllerID] = .stopping
+        case .didStart:
+            if reportedTransitions[controllerID] == .starting {
+                reportedTransitions[controllerID] = nil
+            }
+        case .failedToStart, .didStop:
+            reportedTransitions[controllerID] = nil
+        case .restore:
+            break
+        }
+        let sequence = nextSequence
+        nextSequence &+= 1
+        return sequence
+    }
+
+    func reportedTransition(
+        for controller: AnyObject
+    ) -> ChatVideoPictureInPictureReportedTransition? {
+        lock.lock()
+        defer { lock.unlock() }
+        return reportedTransitions[ObjectIdentifier(controller)]
+    }
+
+    func clearReportedTransition(for controller: AnyObject) {
+        lock.lock()
+        defer { lock.unlock() }
+        reportedTransitions[ObjectIdentifier(controller)] = nil
+    }
+}
+
+private let chatVideoPictureInPictureCallbackSequencer =
+    ChatVideoPictureInPictureCallbackSequencer()
+
+/// Records stop intent across AVKit's asynchronous Picture-in-Picture transitions.
+///
+/// `isPictureInPictureActive` can still be false after a start callback and can become false
+/// before the matching stop callback. The controller and player must stay alive throughout both
+/// gaps, and a foreground or terminal stop requested during a pending start must be honored as
+/// soon as AVKit reports success.
+struct ChatVideoPictureInPictureLifecycleIntent {
+    enum TerminalStopAction: Equatable {
+        case releaseNow
+        case waitForTransition
+        case stopPictureInPicture
+    }
+
+    private(set) var startRequested = false
+    private(set) var stopRequested = false
+    private(set) var shouldStopAfterStart = false
+    private(set) var shouldReleaseAfterTransition = false
+
+    var transitionInFlight: Bool {
+        startRequested || stopRequested
+    }
+
+    mutating func willStart() {
+        startRequested = true
+    }
+
+    /// Clears a foreground stop left by a transition whose start callback never arrived. This is
+    /// called at the next scene deactivation before AVKit can begin another automatic handoff.
+    mutating func prepareForBackgrounding() {
+        guard !shouldReleaseAfterTransition else { return }
+        shouldStopAfterStart = false
+    }
+
+    mutating func willStop() {
+        startRequested = false
+        stopRequested = true
+        shouldStopAfterStart = false
+    }
+
+    /// Returns true when PiP is already active and can be stopped immediately. A pending start is
+    /// stopped from `didStart`, after AVKit is ready to accept the request.
+    mutating func foregroundStopRequested(isPictureInPictureActive: Bool) -> Bool {
+        guard !stopRequested else { return false }
+        if isPictureInPictureActive {
+            startRequested = false
+            stopRequested = true
+            shouldStopAfterStart = false
+            return true
+        }
+        shouldStopAfterStart = true
+        return false
+    }
+
+    /// A close, drag-dismiss, "Show in chat", or playback end also releases the binding, but only
+    /// once AVKit no longer owns it.
+    mutating func terminalStopRequested(
+        isPictureInPictureActive: Bool
+    ) -> TerminalStopAction {
+        shouldReleaseAfterTransition = true
+        if stopRequested { return .waitForTransition }
+        if isPictureInPictureActive {
+            startRequested = false
+            stopRequested = true
+            shouldStopAfterStart = false
+            return .stopPictureInPicture
+        }
+        if startRequested {
+            shouldStopAfterStart = true
+            return .waitForTransition
+        }
+        return .releaseNow
+    }
+
+    /// Returns true when a stop was requested while the start was still pending.
+    mutating func didStart() -> Bool {
+        startRequested = false
+        defer { shouldStopAfterStart = false }
+        if shouldStopAfterStart { stopRequested = true }
+        return shouldStopAfterStart
+    }
+
+    /// Completes either a failed start or a finished stop and reports whether the controller was
+    /// terminally dismissed rather than merely returned to its still-visible inline viewer.
+    mutating func transitionFinished() -> Bool {
+        let shouldRelease = shouldReleaseAfterTransition
+        startRequested = false
+        stopRequested = false
+        shouldStopAfterStart = false
+        shouldReleaseAfterTransition = false
+        return shouldRelease
+    }
+
+    mutating func reset() {
+        startRequested = false
+        stopRequested = false
+        shouldStopAfterStart = false
+        shouldReleaseAfterTransition = false
     }
 }
 
@@ -255,10 +444,10 @@ final class ChatVideoPictureInPicture: NSObject {
     /// Bound to the same viewer as `galleryIdentity`. A later gallery can never redirect restore
     /// for a video that is already floating over the app.
     private var restoreHandler: ((ChatVideoGalleryIdentity) -> Void)?
-    /// Set before calling AVKit and cleared only when AVKit confirms success/failure. This closes
-    /// the start→active race in which the gallery disappears while `isPictureInPictureActive` is
-    /// still false.
-    private var startRequested = false
+    /// Keeps asynchronous start/stop intent independent of AVKit's lagging synchronous flags.
+    private var lifecycleIntent = ChatVideoPictureInPictureLifecycleIntent()
+    private var delegateCallbackOrder =
+        ChatVideoPictureInPictureCallbackOrder<() -> Void>()
     /// The owning viewer's teardown, held for as long as the window keeps the video alive.
     private var deferredTeardown: (() -> Void)?
 
@@ -268,7 +457,8 @@ final class ChatVideoPictureInPicture: NSObject {
 
     /// True while the floating window is up (or on its way up) for a handed-off video.
     var isHandedOff: Bool {
-        startRequested
+        lifecycleIntent.transitionInFlight
+            || reportedTransitionInFlight
             || deferredTeardown != nil
             || controller?.isPictureInPictureActive == true
     }
@@ -325,21 +515,34 @@ final class ChatVideoPictureInPicture: NSObject {
 
     // MARK: Handing off
 
+    /// Marks the boundary before AVKit may automatically start PiP. A later foreground event is
+    /// then preserved even if its main-actor work runs before AVKit's will-start callback hop.
+    func prepareForBackgrounding() {
+        lifecycleIntent.prepareForBackgrounding()
+    }
+
     /// An explicit close, drag-dismiss, or "Show in chat" means stop viewing. It must not be
     /// reinterpreted as a request to keep the same video alive in a floating window. Automatic
     /// system Picture in Picture when the app backgrounds remains owned by AVKit.
     func stopForExplicitViewerDismissal() {
         attachedPlayer?.pause()
-        startRequested = false
         guard let controller else {
             finishDeferredTeardown()
             return
         }
-        if controller.isPictureInPictureActive {
+        synchronizeReportedTransition(for: controller)
+        controller.canStartPictureInPictureAutomaticallyFromInline = false
+        switch lifecycleIntent.terminalStopRequested(
+            isPictureInPictureActive: controller.isPictureInPictureActive
+        ) {
+        case .stopPictureInPicture:
             // `GalleryVideoController.teardown()` will hand its resources to us while AVKit
             // finishes stopping; the delegate releases them exactly once afterwards.
             controller.stopPictureInPicture()
-        } else {
+        case .waitForTransition:
+            // AVKit ignores a stop until start completes. `didStart` delivers this intent.
+            break
+        case .releaseNow:
             finishDeferredTeardown()
         }
     }
@@ -350,15 +553,24 @@ final class ChatVideoPictureInPicture: NSObject {
     /// the closure runs later, on whichever way the window ends. Returns false when there is
     /// nothing to hand off and the caller should clean up now, as it always did.
     func retainTeardown(owner: AnyObject, _ teardown: @escaping () -> Void) -> Bool {
+        let reportedTransition = controller.flatMap {
+            chatVideoPictureInPictureCallbackSequencer.reportedTransition(for: $0)
+        }
         let shouldRetain = ChatVideoPictureInPictureHandoffPolicy.shouldRetainTeardown(
             ownerMatches: ownerID == ObjectIdentifier(owner),
             hasController: controller != nil,
-            startRequested: startRequested,
+            startRequested:
+                lifecycleIntent.startRequested || reportedTransition == .starting,
+            stopRequested:
+                lifecycleIntent.stopRequested || reportedTransition == .stopping,
             isActive: controller?.isPictureInPictureActive == true,
             alreadyRetained: deferredTeardown != nil
         )
         guard shouldRetain else { return false }
-        deferredTeardown = teardown
+        // `teardown()` can be delivered more than once by SwiftUI. The first closure already owns
+        // the same viewer resources; replacing it is unnecessary, while returning false would
+        // tell the duplicate caller to delete a file AVKit still owns.
+        if deferredTeardown == nil { deferredTeardown = teardown }
         return true
     }
 
@@ -368,9 +580,16 @@ final class ChatVideoPictureInPicture: NSObject {
     /// itself rather than sitting on the user's screen showing a frozen last frame.
     func stopForPlaybackEnd(owner: AnyObject) {
         guard ownerID == ObjectIdentifier(owner), let controller else { return }
-        if controller.isPictureInPictureActive {
+        synchronizeReportedTransition(for: controller)
+        controller.canStartPictureInPictureAutomaticallyFromInline = false
+        switch lifecycleIntent.terminalStopRequested(
+            isPictureInPictureActive: controller.isPictureInPictureActive
+        ) {
+        case .stopPictureInPicture:
             controller.stopPictureInPicture()
-        } else {
+        case .waitForTransition:
+            break
+        case .releaseNow:
             finishDeferredTeardown()
         }
     }
@@ -382,9 +601,12 @@ final class ChatVideoPictureInPicture: NSObject {
               // No deferred teardown means the gallery is still alive: this is automatic
               // background PiP and playback belongs back in that on-screen viewer. A manual
               // dismissal has a deferred teardown and keeps floating after foregrounding.
-              deferredTeardown == nil,
-              controller.isPictureInPictureActive
+              deferredTeardown == nil
         else { return }
+        synchronizeReportedTransition(for: controller)
+        guard lifecycleIntent.foregroundStopRequested(
+            isPictureInPictureActive: controller.isPictureInPictureActive
+        ) else { return }
         controller.stopPictureInPicture()
     }
 
@@ -396,13 +618,58 @@ final class ChatVideoPictureInPicture: NSObject {
     }
 
     private func releaseController() {
+        if let controller {
+            chatVideoPictureInPictureCallbackSequencer.clearReportedTransition(for: controller)
+        }
         controller?.delegate = nil
         controller = nil
         ownerID = nil
         attachedPlayer = nil
         galleryIdentity = nil
         restoreHandler = nil
-        startRequested = false
+        lifecycleIntent.reset()
+    }
+
+    private func enqueueDelegateCallback(
+        sequence: UInt64,
+        _ callback: @escaping () -> Void
+    ) {
+        for readyCallback in delegateCallbackOrder.insert(callback, sequence: sequence) {
+            readyCallback()
+        }
+    }
+
+    private func acceptsCallback(from callbackController: AVPictureInPictureController) -> Bool {
+        let accepted = ChatVideoPictureInPictureCallbackPolicy.accepts(
+            currentController: controller,
+            callbackController: callbackController
+        )
+        if !accepted {
+            chatVideoPictureInPictureCallbackSequencer.clearReportedTransition(
+                for: callbackController
+            )
+        }
+        return accepted
+    }
+
+    private var reportedTransitionInFlight: Bool {
+        guard let controller else { return false }
+        return chatVideoPictureInPictureCallbackSequencer.reportedTransition(
+            for: controller
+        ) != nil
+    }
+
+    private func synchronizeReportedTransition(
+        for controller: AVPictureInPictureController
+    ) {
+        switch chatVideoPictureInPictureCallbackSequencer.reportedTransition(for: controller) {
+        case .starting:
+            if !lifecycleIntent.transitionInFlight { lifecycleIntent.willStart() }
+        case .stopping:
+            if !lifecycleIntent.stopRequested { lifecycleIntent.willStop() }
+        case nil:
+            break
+        }
     }
 }
 
@@ -410,16 +677,56 @@ extension ChatVideoPictureInPicture: AVPictureInPictureControllerDelegate {
     nonisolated func pictureInPictureControllerWillStartPictureInPicture(
         _ pictureInPictureController: AVPictureInPictureController
     ) {
+        let sequence = chatVideoPictureInPictureCallbackSequencer.takeNext(
+            for: pictureInPictureController,
+            event: .willStart
+        )
         Task { @MainActor [weak self] in
-            self?.startRequested = true
+            guard let self else { return }
+            self.enqueueDelegateCallback(sequence: sequence) { [weak self] in
+                guard let self, self.acceptsCallback(from: pictureInPictureController) else {
+                    return
+                }
+                self.lifecycleIntent.willStart()
+            }
         }
     }
 
     nonisolated func pictureInPictureControllerDidStartPictureInPicture(
         _ pictureInPictureController: AVPictureInPictureController
     ) {
+        let sequence = chatVideoPictureInPictureCallbackSequencer.takeNext(
+            for: pictureInPictureController,
+            event: .didStart
+        )
         Task { @MainActor [weak self] in
-            self?.startRequested = false
+            guard let self else { return }
+            self.enqueueDelegateCallback(sequence: sequence) { [weak self] in
+                guard let self, self.acceptsCallback(from: pictureInPictureController) else {
+                    return
+                }
+                if self.lifecycleIntent.didStart() {
+                    pictureInPictureController.stopPictureInPicture()
+                }
+            }
+        }
+    }
+
+    nonisolated func pictureInPictureControllerWillStopPictureInPicture(
+        _ pictureInPictureController: AVPictureInPictureController
+    ) {
+        let sequence = chatVideoPictureInPictureCallbackSequencer.takeNext(
+            for: pictureInPictureController,
+            event: .willStop
+        )
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.enqueueDelegateCallback(sequence: sequence) { [weak self] in
+                guard let self, self.acceptsCallback(from: pictureInPictureController) else {
+                    return
+                }
+                self.lifecycleIntent.willStop()
+            }
         }
     }
 
@@ -430,18 +737,42 @@ extension ChatVideoPictureInPicture: AVPictureInPictureControllerDelegate {
         // Picture in Picture is a convenience on top of a video that was already playing. A
         // refusal must never strand the viewer's teardown, or the temporary plaintext file would
         // outlive the session that created it.
+        let sequence = chatVideoPictureInPictureCallbackSequencer.takeNext(
+            for: pictureInPictureController,
+            event: .failedToStart
+        )
         Task { @MainActor [weak self] in
-            self?.startRequested = false
-            self?.finishDeferredTeardown()
+            guard let self else { return }
+            self.enqueueDelegateCallback(sequence: sequence) { [weak self] in
+                guard let self, self.acceptsCallback(from: pictureInPictureController) else {
+                    return
+                }
+                let shouldRelease = self.lifecycleIntent.transitionFinished()
+                if shouldRelease || self.deferredTeardown != nil {
+                    self.finishDeferredTeardown()
+                }
+            }
         }
     }
 
     nonisolated func pictureInPictureControllerDidStopPictureInPicture(
         _ pictureInPictureController: AVPictureInPictureController
     ) {
+        let sequence = chatVideoPictureInPictureCallbackSequencer.takeNext(
+            for: pictureInPictureController,
+            event: .didStop
+        )
         Task { @MainActor [weak self] in
-            self?.startRequested = false
-            self?.finishDeferredTeardown()
+            guard let self else { return }
+            self.enqueueDelegateCallback(sequence: sequence) { [weak self] in
+                guard let self, self.acceptsCallback(from: pictureInPictureController) else {
+                    return
+                }
+                let shouldRelease = self.lifecycleIntent.transitionFinished()
+                if shouldRelease || self.deferredTeardown != nil {
+                    self.finishDeferredTeardown()
+                }
+            }
         }
     }
 
@@ -449,17 +780,27 @@ extension ChatVideoPictureInPicture: AVPictureInPictureControllerDelegate {
         _ pictureInPictureController: AVPictureInPictureController,
         restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler: @escaping (Bool) -> Void
     ) {
+        let sequence = chatVideoPictureInPictureCallbackSequencer.takeNext(
+            for: pictureInPictureController,
+            event: .restore
+        )
         Task { @MainActor [weak self] in
             guard let self else {
                 completionHandler(false)
                 return
             }
-            if let galleryIdentity = self.galleryIdentity,
-               let restoreHandler = self.restoreHandler {
-                restoreHandler(galleryIdentity)
-                completionHandler(true)
-            } else {
-                completionHandler(false)
+            self.enqueueDelegateCallback(sequence: sequence) { [weak self] in
+                guard let self, self.acceptsCallback(from: pictureInPictureController) else {
+                    completionHandler(false)
+                    return
+                }
+                if let galleryIdentity = self.galleryIdentity,
+                   let restoreHandler = self.restoreHandler {
+                    restoreHandler(galleryIdentity)
+                    completionHandler(true)
+                } else {
+                    completionHandler(false)
+                }
             }
         }
     }

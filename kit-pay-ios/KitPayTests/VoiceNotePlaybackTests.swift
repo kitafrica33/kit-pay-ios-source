@@ -210,6 +210,7 @@ final class VoiceNotePlaybackTests: XCTestCase {
                 ownerMatches: true,
                 hasController: true,
                 startRequested: true,
+                stopRequested: false,
                 isActive: false,
                 alreadyRetained: false
             ),
@@ -223,29 +224,22 @@ final class VoiceNotePlaybackTests: XCTestCase {
                 ownerMatches: true,
                 hasController: true,
                 startRequested: false,
+                stopRequested: false,
                 isActive: true,
                 alreadyRetained: false
             )
         )
     }
 
-    func testPictureInPictureNeverRetainsAnUnrelatedOrDuplicateTeardown() {
+    func testPictureInPictureNeverRetainsAnUnrelatedTeardown() {
         XCTAssertFalse(
             ChatVideoPictureInPictureHandoffPolicy.shouldRetainTeardown(
                 ownerMatches: false,
                 hasController: true,
                 startRequested: true,
+                stopRequested: false,
                 isActive: false,
                 alreadyRetained: false
-            )
-        )
-        XCTAssertFalse(
-            ChatVideoPictureInPictureHandoffPolicy.shouldRetainTeardown(
-                ownerMatches: true,
-                hasController: true,
-                startRequested: true,
-                isActive: false,
-                alreadyRetained: true
             )
         )
         XCTAssertFalse(
@@ -253,8 +247,155 @@ final class VoiceNotePlaybackTests: XCTestCase {
                 ownerMatches: true,
                 hasController: false,
                 startRequested: true,
+                stopRequested: false,
                 isActive: false,
                 alreadyRetained: false
+            )
+        )
+    }
+
+    func testPictureInPictureDuplicateTeardownRemainsDeferred() {
+        XCTAssertTrue(
+            ChatVideoPictureInPictureHandoffPolicy.shouldRetainTeardown(
+                ownerMatches: true,
+                hasController: true,
+                startRequested: false,
+                stopRequested: false,
+                isActive: false,
+                alreadyRetained: true
+            ),
+            "A duplicate callback must not tear down resources retained by the first callback"
+        )
+    }
+
+    func testPictureInPictureRetainsTeardownUntilPendingStopFinishes() {
+        XCTAssertTrue(
+            ChatVideoPictureInPictureHandoffPolicy.shouldRetainTeardown(
+                ownerMatches: true,
+                hasController: true,
+                startRequested: false,
+                stopRequested: true,
+                isActive: false,
+                alreadyRetained: false
+            ),
+            "AVKit may clear its active flag before delivering did-stop"
+        )
+    }
+
+    func testPictureInPictureForegroundIntentStopsAStartThatCompletesLate() {
+        var intent = ChatVideoPictureInPictureLifecycleIntent()
+
+        intent.willStart()
+        XCTAssertFalse(intent.foregroundStopRequested(isPictureInPictureActive: false))
+        XCTAssertTrue(intent.shouldStopAfterStart)
+        XCTAssertTrue(intent.didStart())
+        XCTAssertTrue(intent.stopRequested)
+        XCTAssertFalse(intent.transitionFinished())
+    }
+
+    func testPictureInPictureForegroundIntentSurvivesAReorderedWillStartHop() {
+        var intent = ChatVideoPictureInPictureLifecycleIntent()
+
+        XCTAssertFalse(intent.foregroundStopRequested(isPictureInPictureActive: false))
+        intent.willStart()
+        XCTAssertTrue(intent.didStart())
+    }
+
+    func testPictureInPictureDelayedWillStartDoesNotEraseAnIssuedStop() {
+        var intent = ChatVideoPictureInPictureLifecycleIntent()
+
+        XCTAssertTrue(intent.foregroundStopRequested(isPictureInPictureActive: true))
+        intent.willStart()
+        XCTAssertTrue(intent.stopRequested)
+        XCTAssertFalse(intent.didStart())
+        XCTAssertTrue(intent.transitionInFlight)
+    }
+
+    func testPictureInPictureNewBackgroundingClearsAnUnmatchedForegroundIntent() {
+        var intent = ChatVideoPictureInPictureLifecycleIntent()
+
+        XCTAssertFalse(intent.foregroundStopRequested(isPictureInPictureActive: false))
+        intent.prepareForBackgrounding()
+        intent.willStart()
+        XCTAssertFalse(intent.didStart())
+    }
+
+    func testPictureInPictureExplicitDismissalWaitsForPendingStartAndStop() {
+        var intent = ChatVideoPictureInPictureLifecycleIntent()
+
+        intent.willStart()
+        XCTAssertEqual(
+            intent.terminalStopRequested(isPictureInPictureActive: false),
+            .waitForTransition
+        )
+        XCTAssertTrue(intent.shouldReleaseAfterTransition)
+        XCTAssertTrue(intent.didStart())
+        XCTAssertTrue(intent.transitionInFlight)
+        XCTAssertTrue(intent.transitionFinished())
+    }
+
+    func testPictureInPictureExplicitDismissalTracksActiveStopUntilCallback() {
+        var intent = ChatVideoPictureInPictureLifecycleIntent()
+
+        XCTAssertEqual(
+            intent.terminalStopRequested(isPictureInPictureActive: true),
+            .stopPictureInPicture
+        )
+        XCTAssertTrue(intent.stopRequested)
+        XCTAssertTrue(intent.transitionInFlight)
+        XCTAssertTrue(intent.transitionFinished())
+    }
+
+    func testPictureInPictureTracksASystemInitiatedStopUntilCallback() {
+        var intent = ChatVideoPictureInPictureLifecycleIntent()
+
+        intent.willStop()
+        XCTAssertTrue(intent.stopRequested)
+        XCTAssertEqual(
+            intent.terminalStopRequested(isPictureInPictureActive: true),
+            .waitForTransition
+        )
+        XCTAssertTrue(intent.transitionFinished())
+    }
+
+    func testPictureInPictureIdleDismissalCanReleaseImmediately() {
+        var intent = ChatVideoPictureInPictureLifecycleIntent()
+
+        XCTAssertEqual(
+            intent.terminalStopRequested(isPictureInPictureActive: false),
+            .releaseNow
+        )
+    }
+
+    func testPictureInPictureCallbacksKeepInvocationOrderAcrossActorHops() {
+        var order = ChatVideoPictureInPictureCallbackOrder<String>()
+
+        XCTAssertEqual(order.insert("didStart", sequence: 1), [])
+        XCTAssertEqual(order.insert("willStart", sequence: 0), ["willStart", "didStart"])
+        XCTAssertEqual(order.insert("didStop", sequence: 3), [])
+        XCTAssertEqual(order.insert("willStop", sequence: 2), ["willStop", "didStop"])
+    }
+
+    func testPictureInPictureRejectsCallbacksFromAReplacedController() {
+        let oldController = NSObject()
+        let replacementController = NSObject()
+
+        XCTAssertTrue(
+            ChatVideoPictureInPictureCallbackPolicy.accepts(
+                currentController: oldController,
+                callbackController: oldController
+            )
+        )
+        XCTAssertFalse(
+            ChatVideoPictureInPictureCallbackPolicy.accepts(
+                currentController: replacementController,
+                callbackController: oldController
+            )
+        )
+        XCTAssertFalse(
+            ChatVideoPictureInPictureCallbackPolicy.accepts(
+                currentController: nil,
+                callbackController: oldController
             )
         )
     }

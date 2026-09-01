@@ -323,6 +323,57 @@ class MediaMessageV2SourceContract(unittest.TestCase):
         self.assertNotIn("startIfPlaying()", dismiss)
         self.assertIn("func stopForExplicitViewerDismissal()", picture_in_picture)
 
+    def test_picture_in_picture_transitions_retain_resources_and_reject_stale_callbacks(
+        self,
+    ) -> None:
+        """AVKit's active flag does not cover pending starts/stops. Both transition edges must
+        retain the player/file, and callbacks from a released controller must not touch a new one."""
+        picture_in_picture = VIDEO_PLAYBACK.read_text(encoding="utf-8")
+        gallery = MEDIA_GALLERY.read_text(encoding="utf-8")
+
+        self.assertIn("struct ChatVideoPictureInPictureLifecycleIntent", picture_in_picture)
+        self.assertIn("startRequested || stopRequested", picture_in_picture)
+        self.assertIn(
+            "pictureInPictureControllerWillStopPictureInPicture(",
+            picture_in_picture,
+        )
+        self.assertIn(
+            "alreadyRetained || startRequested || stopRequested || isActive",
+            picture_in_picture,
+        )
+        self.assertIn(
+            "if deferredTeardown == nil { deferredTeardown = teardown }",
+            picture_in_picture,
+        )
+        self.assertIn(
+            "ChatVideoPictureInPictureCallbackOrder<() -> Void>",
+            picture_in_picture,
+        )
+        self.assertIn("reportedTransitionInFlight", picture_in_picture)
+        self.assertIn("synchronizeReportedTransition(for: controller)", picture_in_picture)
+        self.assertIn("func prepareForBackgrounding()", picture_in_picture)
+        self.assertIn(
+            "ChatVideoPictureInPicture.shared.prepareForBackgrounding()",
+            (ROOT / "KitPay/App/KitPayApp.swift").read_text(encoding="utf-8"),
+        )
+        self.assertGreaterEqual(
+            picture_in_picture.count("self.acceptsCallback(from: pictureInPictureController)"),
+            6,
+        )
+        release = "\n".join(function_body(gallery, "private func releaseResources()"))
+        for cleared_resource in (
+            "timeObserver = nil",
+            "player = nil",
+            "playerItem = nil",
+            "asset = nil",
+            "playbackFileHandle = nil",
+            "temporaryAliasURL = nil",
+            "sourceFileURL = nil",
+            "ownsFileURL = false",
+            "protectedOriginalLease = nil",
+        ):
+            self.assertIn(cleared_resource, release)
+
     def test_ready_leases_are_replayed_at_the_sealing_boundary(self) -> None:
         """Resumable ciphertext must stay retained until an exact READY replay immediately
         before sealing; a swept batch item reopens without changing local identity/key material."""
