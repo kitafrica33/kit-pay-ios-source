@@ -25,6 +25,8 @@ jobs:
         run: python3 -m unittest discover -s .github/scripts/tests -p 'test_*screenshots.py'
       - name: Test contact-sync recovery source contract
         run: python3 -m unittest discover -s .github/scripts/tests -p 'test_contact_sync_recovery.py'
+      - name: Test wallet-refresh reliability source contract
+        run: python3 -m unittest discover -s .github/scripts/tests -p 'test_wallet_refresh_reliability.py'
       - name: Test verification-badge placement source contract
         run: python3 -m unittest discover -s .github/scripts/tests -p 'test_verification_badge_placement.py'
       - name: Test media-message-v2 source contract

@@ -6560,9 +6560,10 @@ final class AppModel: ObservableObject {
         // and nothing is made durable or replayable after relaunch.
         resumeEphemeralOutgoingCallIfPossible()
 
-        // Connectivity recovery prioritizes user-created work. A large wallet/bootstrap or
-        // call-history refresh must never sit in front of queued encrypted messages.
-        await flushOutbox()
+        // Wake durable communication work without putting finance behind it. A resumable media
+        // upload or E2EE recovery can legitimately take minutes; bootstrap and wallet history
+        // must still refresh immediately and independently on the same foreground visit.
+        scheduleOutboxWake()
         guard !Task.isCancelled,
               !isSigningOut,
               isSignedIn,
@@ -6651,6 +6652,15 @@ final class AppModel: ObservableObject {
             return
         }
 
+        // Wallet history is an independent customer-facing projection. Keep it ahead of privacy,
+        // E2EE and media synchronization so a slow communication lane can never leave an empty or
+        // stale Recent transactions section after bootstrap has already refreshed the balance.
+        await refreshSelectedWalletTransactions(
+            accountEpoch: expectedAccountEpoch,
+            sessionID: expectedSessionID,
+            userID: expectedUserID
+        )
+
         // Communication blocks are account-wide authorization state. Refresh them before
         // rebuilding recipient pickers so a stale local contact cannot remain selectable.
         await loadCommunicationPrivacy()
@@ -6673,60 +6683,6 @@ final class AppModel: ObservableObject {
             userID: expectedUserID
         ) else { return }
 
-        if let selectedWalletID = state.selectedWalletId,
-           let selectedWallet = state.wallets.first(where: { $0.id == selectedWalletID }) {
-            do {
-                let transactions = CustomerTransactionPresentationPolicy
-                    .customerVisibleTransactions(
-                        try await APIClientSessionBinding.$sessionID.withValue(
-                            expectedSessionID
-                        ) {
-                            try await api.transactions(walletId: selectedWalletID).items
-                        },
-                        for: selectedWallet
-                    )
-                guard await callHistoryContextIsCurrent(
-                    accountEpoch: expectedAccountEpoch,
-                    sessionID: expectedSessionID,
-                    userID: expectedUserID
-                ) else { return }
-                try await store.update { persisted in
-                    guard persisted.profile?.id.caseInsensitiveCompare(expectedUserID)
-                            == .orderedSame,
-                          persisted.selectedWalletId == selectedWalletID
-                    else { throw StoreError.accountChanged }
-                    persisted.transactions = transactions
-                    // The page above is only the latest slice of one wallet, so the starter
-                    // checklist's account-wide milestone is remembered the moment a settled
-                    // movement is seen in server-confirmed rows — and never recomputed away.
-                    // Demo content is projected in memory only and can never reach this write.
-                    if persisted.starterFirstTransactionAt == nil,
-                       HomeStarterChecklistPolicy.hasMadeFirstTransaction(
-                           transactions: transactions
-                       ) {
-                        persisted.starterFirstTransactionAt = Date()
-                    }
-                }
-                guard await callHistoryContextIsCurrent(
-                    accountEpoch: expectedAccountEpoch,
-                    sessionID: expectedSessionID,
-                    userID: expectedUserID
-                ) else { return }
-                await publishLatestState()
-            } catch {
-                if RefreshCancellationPolicy.shouldSuppress(
-                    error,
-                    taskIsCancelled: Task.isCancelled
-                ) { return }
-                guard await callHistoryContextIsCurrent(
-                    accountEpoch: expectedAccountEpoch,
-                    sessionID: expectedSessionID,
-                    userID: expectedUserID
-                ) else { return }
-                lastError = error.localizedDescription
-            }
-        }
-
         await confirmStarterMilestonesFromServerIfSupported(
             accountEpoch: expectedAccountEpoch,
             sessionID: expectedSessionID,
@@ -6735,6 +6691,69 @@ final class AppModel: ObservableObject {
 
         if callsFeatureEnabled {
             await loadCallContacts()
+        }
+    }
+
+    /// Refreshes only the currently selected wallet's customer-safe activity projection.
+    /// Keeping this operation separate from communication sync also gives pull-to-refresh a
+    /// deterministic finance completion point even when media upload or E2EE recovery continues.
+    private func refreshSelectedWalletTransactions(
+        accountEpoch expectedAccountEpoch: UUID,
+        sessionID expectedSessionID: String,
+        userID expectedUserID: String
+    ) async {
+        guard let selectedWalletID = state.selectedWalletId,
+              let selectedWallet = state.wallets.first(where: { $0.id == selectedWalletID })
+        else { return }
+        do {
+            let transactions = CustomerTransactionPresentationPolicy
+                .customerVisibleTransactions(
+                    try await APIClientSessionBinding.$sessionID.withValue(
+                        expectedSessionID
+                    ) {
+                        try await api.transactions(walletId: selectedWalletID).items
+                    },
+                    for: selectedWallet
+                )
+            guard await callHistoryContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                sessionID: expectedSessionID,
+                userID: expectedUserID
+            ) else { return }
+            try await store.update { persisted in
+                guard persisted.profile?.id.caseInsensitiveCompare(expectedUserID)
+                        == .orderedSame,
+                      persisted.selectedWalletId == selectedWalletID
+                else { throw StoreError.accountChanged }
+                persisted.transactions = transactions
+                // The page above is only the latest slice of one wallet, so the starter
+                // checklist's account-wide milestone is remembered the moment a settled
+                // movement is seen in server-confirmed rows — and never recomputed away.
+                // Demo content is projected in memory only and can never reach this write.
+                if persisted.starterFirstTransactionAt == nil,
+                   HomeStarterChecklistPolicy.hasMadeFirstTransaction(
+                       transactions: transactions
+                   ) {
+                    persisted.starterFirstTransactionAt = Date()
+                }
+            }
+            guard await callHistoryContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                sessionID: expectedSessionID,
+                userID: expectedUserID
+            ) else { return }
+            await publishLatestState()
+        } catch {
+            if RefreshCancellationPolicy.shouldSuppress(
+                error,
+                taskIsCancelled: Task.isCancelled
+            ) { return }
+            guard await callHistoryContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                sessionID: expectedSessionID,
+                userID: expectedUserID
+            ) else { return }
+            lastError = error.localizedDescription
         }
     }
 
