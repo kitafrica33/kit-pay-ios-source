@@ -1749,7 +1749,7 @@ struct ConversationView: View {
     private var conversationMessagingAvailable: Bool {
         guard MessagingGroupCapabilityPolicy.allowsConversationMutation(
             isGroup: isGroupConversation,
-            groupCapabilityEnabled: model.messagingGroupsEnabled
+            groupCapabilityEnabled: model.messagingGroupLocalQueueEnabled
         ) else { return false }
         return !isGroupConversation || currentUserIsGroupMember
     }
@@ -2079,7 +2079,7 @@ struct ConversationView: View {
             if !isReadOnlyAppReviewPreview,
                conversationMessagingAvailable,
                message.serverMessageId != nil,
-               model.messagingReactionsEnabled {
+               model.messagingReactionLocalQueueEnabled {
                 ControlGroup {
                     ForEach(
                         MessageReactionAggregationPolicy.quickReactions,
@@ -2309,8 +2309,8 @@ struct ConversationView: View {
         !isReadOnlyAppReviewPreview
             && !isSelectingMessages
             && conversationMessagingAvailable
-            && recipientCommunicationAllowed
-            && model.messagingMessageEditsEnabled
+            && recipientMessageQueueAllowed
+            && model.messagingMessageEditLocalQueueEnabled
             && MessageEditAggregationPolicy.canEdit(message, now: now)
     }
 
@@ -3974,7 +3974,7 @@ struct ConversationView: View {
                 persistDraftImmediately()
             }
         }
-        .onChange(of: model.messagingGroupsEnabled) { _, enabled in
+        .onChange(of: model.messagingGroupLocalQueueEnabled) { _, enabled in
             guard isGroupConversation, !enabled else { return }
             stopReadOnlyGroupInteractions()
         }

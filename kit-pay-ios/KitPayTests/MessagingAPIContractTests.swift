@@ -2014,6 +2014,104 @@ final class MessagingAPIContractTests: XCTestCase {
         ))
     }
 
+    func testDeferredFeaturePolicyAllowsUnknownButDeniesExplicitFalse() {
+        XCTAssertTrue(MessagingDeferredFeaturePolicy.allowsDeferredLocalQueue(
+            advertisedCapability: true
+        ))
+        XCTAssertFalse(MessagingDeferredFeaturePolicy.allowsDeferredLocalQueue(
+            advertisedCapability: false
+        ), "an explicit authenticated withdrawal must win")
+        XCTAssertTrue(MessagingDeferredFeaturePolicy.allowsDeferredLocalQueue(
+            advertisedCapability: nil
+        ), "a discovery failure must not disable the protected local outbox")
+    }
+
+    func testDeferredFeatureSnapshotAllowsNilWithoutPriorDecision() {
+        var snapshot = MessagingDeferredFeatureSnapshot()
+        let scope = MessagingDeferredFeatureScope(
+            accountEpoch: UUID(uuidString: "10000000-0000-4000-8000-000000000001")!,
+            userID: "20000000-0000-4000-8000-000000000001",
+            sessionID: "30000000-0000-4000-8000-000000000001"
+        )
+        snapshot.bind(to: scope)
+
+        for feature in MessagingDeferredFeature.allCases {
+            XCTAssertTrue(snapshot.allowsLocalQueue(
+                feature,
+                advertisedCapability: nil,
+                in: scope
+            ))
+        }
+    }
+
+    func testDeferredFeatureSnapshotRetainsTrueAcrossNil() {
+        var snapshot = MessagingDeferredFeatureSnapshot()
+        let scope = MessagingDeferredFeatureScope(
+            accountEpoch: UUID(uuidString: "10000000-0000-4000-8000-000000000002")!,
+            userID: "20000000-0000-4000-8000-000000000002",
+            sessionID: "30000000-0000-4000-8000-000000000002"
+        )
+        snapshot.confirm(groups: true, reactions: true, messageEdits: true, for: scope)
+
+        for feature in MessagingDeferredFeature.allCases {
+            XCTAssertTrue(snapshot.allowsLocalQueue(
+                feature,
+                advertisedCapability: nil,
+                in: scope
+            ))
+        }
+    }
+
+    func testDeferredFeatureSnapshotRetainsFalseAcrossNil() {
+        var snapshot = MessagingDeferredFeatureSnapshot()
+        let scope = MessagingDeferredFeatureScope(
+            accountEpoch: UUID(uuidString: "10000000-0000-4000-8000-000000000003")!,
+            userID: "20000000-0000-4000-8000-000000000003",
+            sessionID: "30000000-0000-4000-8000-000000000003"
+        )
+        snapshot.confirm(groups: false, reactions: false, messageEdits: false, for: scope)
+
+        for feature in MessagingDeferredFeature.allCases {
+            XCTAssertFalse(snapshot.allowsLocalQueue(
+                feature,
+                advertisedCapability: nil,
+                in: scope
+            ))
+        }
+    }
+
+    func testDeferredFeatureSnapshotDoesNotCrossAccountOrSessionScope() {
+        let original = MessagingDeferredFeatureScope(
+            accountEpoch: UUID(uuidString: "10000000-0000-4000-8000-000000000004")!,
+            userID: "20000000-0000-4000-8000-000000000004",
+            sessionID: "30000000-0000-4000-8000-000000000004"
+        )
+        let replacementAccount = MessagingDeferredFeatureScope(
+            accountEpoch: UUID(uuidString: "10000000-0000-4000-8000-000000000005")!,
+            userID: "20000000-0000-4000-8000-000000000005",
+            sessionID: "30000000-0000-4000-8000-000000000005"
+        )
+        let replacementSession = MessagingDeferredFeatureScope(
+            accountEpoch: original.accountEpoch,
+            userID: original.userID,
+            sessionID: "30000000-0000-4000-8000-000000000006"
+        )
+
+        for replacementScope in [replacementAccount, replacementSession] {
+            var snapshot = MessagingDeferredFeatureSnapshot()
+            snapshot.confirm(groups: false, reactions: false, messageEdits: false, for: original)
+            snapshot.bind(to: replacementScope)
+            XCTAssertEqual(snapshot.scope, replacementScope)
+            for feature in MessagingDeferredFeature.allCases {
+                XCTAssertTrue(snapshot.allowsLocalQueue(
+                    feature,
+                    advertisedCapability: nil,
+                    in: replacementScope
+                ))
+            }
+        }
+    }
+
     func testConversationDecodesWithoutConversationTypeAndFlagsGroups() throws {
         var conversation = Conversation(
             id: "11111111-1111-4111-8111-111111111111",

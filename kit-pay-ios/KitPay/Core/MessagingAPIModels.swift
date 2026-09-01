@@ -1985,6 +1985,108 @@ enum MessagingRichMediaCapabilityPolicy {
     }
 }
 
+/// Distinguishes an unknown capability projection from an explicit authenticated denial for
+/// features whose payload can safely wait in the protected local outbox.
+enum MessagingDeferredFeaturePolicy {
+    /// Capability discovery is a transport boundary, not a local-composition boundary. A
+    /// signed-in device with an available protected outbox may keep an existing conversation
+    /// usable while the authenticated capability request is temporarily unavailable. A present
+    /// authoritative response still wins — in particular, an explicitly withdrawn feature is
+    /// retained for that account/session across a transient refresh failure and is never treated
+    /// as locally queueable. The local flush gate requires an authenticated capability projection,
+    /// the coordinator initializes E2EE and validates every recipient device, and the server then
+    /// atomically rechecks its current feature gate and roster before accepting ciphertext. A stale
+    /// client projection can therefore cause a safe server refusal, never an insecure fallback.
+    static func allowsDeferredLocalQueue(advertisedCapability: Bool?) -> Bool {
+        advertisedCapability != false
+    }
+}
+
+enum MessagingDeferredFeature: CaseIterable, Sendable {
+    case groups
+    case reactions
+    case messageEdits
+}
+
+struct MessagingDeferredFeatureScope: Equatable, Sendable {
+    let accountEpoch: UUID
+    let userID: String
+    let sessionID: String
+
+    init(accountEpoch: UUID, userID: String, sessionID: String) {
+        self.accountEpoch = accountEpoch
+        self.userID = userID.lowercased()
+        self.sessionID = sessionID.lowercased()
+    }
+}
+
+/// Retains the last authenticated feature decision only for the exact account/session that
+/// received it. A transient discovery failure can therefore preserve an explicit denial as well
+/// as an approval, while a replacement login starts from the ordinary unknown/local-only state.
+struct MessagingDeferredFeatureSnapshot: Equatable, Sendable {
+    private struct Confirmed: Equatable, Sendable {
+        let groups: Bool
+        let reactions: Bool
+        let messageEdits: Bool
+
+        func value(for feature: MessagingDeferredFeature) -> Bool {
+            switch feature {
+            case .groups: groups
+            case .reactions: reactions
+            case .messageEdits: messageEdits
+            }
+        }
+    }
+
+    private(set) var scope: MessagingDeferredFeatureScope? = nil
+    private var confirmed: Confirmed? = nil
+
+    init() {}
+
+    mutating func bind(to scope: MessagingDeferredFeatureScope?) {
+        guard self.scope != scope else { return }
+        self.scope = scope
+        confirmed = nil
+    }
+
+    mutating func confirm(
+        groups: Bool,
+        reactions: Bool,
+        messageEdits: Bool,
+        for scope: MessagingDeferredFeatureScope
+    ) {
+        bind(to: scope)
+        confirmed = Confirmed(
+            groups: groups,
+            reactions: reactions,
+            messageEdits: messageEdits
+        )
+    }
+
+    mutating func reset() {
+        scope = nil
+        confirmed = nil
+    }
+
+    func allowsLocalQueue(
+        _ feature: MessagingDeferredFeature,
+        advertisedCapability: Bool?,
+        in currentScope: MessagingDeferredFeatureScope?
+    ) -> Bool {
+        let effectiveCapability: Bool?
+        if let advertisedCapability {
+            effectiveCapability = advertisedCapability
+        } else if currentScope == scope {
+            effectiveCapability = confirmed?.value(for: feature)
+        } else {
+            effectiveCapability = nil
+        }
+        return MessagingDeferredFeaturePolicy.allowsDeferredLocalQueue(
+            advertisedCapability: effectiveCapability
+        )
+    }
+}
+
 /// Fail-closed attestation gate for group conversations. Group ciphertext leaves this device
 /// only when the server capability is advertised (`featureKey`) AND every enrolled device of
 /// every member carries the server-attested per-device capability. A single stale device in the

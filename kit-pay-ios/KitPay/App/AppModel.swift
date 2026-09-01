@@ -1039,6 +1039,8 @@ final class AppModel: ObservableObject {
     private var accountEpoch = UUID()
     private var paymentRequestChatShareLeases: [String: PaymentRequestChatShareLease] = [:]
     private var capabilitiesRequestTracker = CapabilitiesRequestResolutionTracker()
+    private var messagingDeferredFeatureScope: MessagingDeferredFeatureScope?
+    private var messagingDeferredFeatureSnapshot = MessagingDeferredFeatureSnapshot()
     private var kycRequestGeneration: UInt64 = 0
     private var communicationPrivacyRequestGeneration: UInt64 = 0
     private var contactDirectoryRevision: UInt64 = 0
@@ -1652,7 +1654,7 @@ final class AppModel: ObservableObject {
     /// so TestFlight devices can exercise real encrypted delivery and recovery end to end.
     var secureMessagingAvailable: Bool {
         secureMessagingReleasePermitted
-            && state.secureMessaging?.enrollment?.userID == profile?.id
+            && hasCurrentSecureMessagingEnrollment
     }
     /// Local composition does not require a live Signal enrollment. The protected outbox is the
     /// first destination for a send, and `flushOutbox` activates/repairs E2EE before it can create
@@ -1677,11 +1679,15 @@ final class AppModel: ObservableObject {
         }
         // Capabilities are nil while discovery is (re)loading — at session resume, after a
         // failed reload on flaky networks, and offline. An enrolled device may keep composing
-        // and queueing locally through that window regardless of connectivity: nothing leaves
-        // the device without the transport re-verifying server capabilities and the current
-        // roster, so this only prevents the composer flapping to "temporarily unavailable"
-        // every time discovery restarts.
+        // and queueing locally through that window regardless of connectivity. Dispatch requires
+        // a restored authenticated projection and current roster, and the server authoritatively
+        // rechecks both before accepting encrypted envelopes, so this only prevents the composer
+        // flapping to "temporarily unavailable" every time discovery restarts.
         return state.secureMessaging?.enrollment?.userID == profile?.id
+    }
+
+    private var hasCurrentSecureMessagingEnrollment: Bool {
+        state.secureMessaging?.enrollment?.userID == profile?.id
     }
     /// Group mutations stay fail-closed until the server advertises the reviewed protocol and
     /// group feature. Enrollment is recovered later by the same secure flush boundary as direct
@@ -1691,14 +1697,53 @@ final class AppModel: ObservableObject {
         secureMessagingReleasePermitted
             && capabilities?.supportsFeature(MessagingGroupCapabilityPolicy.featureKey) == true
     }
+    /// Existing group messages are safe to commit locally during a capability-discovery gap unless
+    /// this exact account/session last confirmed a withdrawal. The local flush gate requires an
+    /// authenticated capability projection, the coordinator validates the current device roster,
+    /// and the server atomically rechecks its feature gate and roster before accepting ciphertext.
+    var messagingGroupLocalQueueEnabled: Bool {
+        secureMessagingLocalQueueAvailable
+            && messagingDeferredFeatureSnapshot.allowsLocalQueue(
+                .groups,
+                advertisedCapability: capabilities.map { _ in messagingGroupsEnabled },
+                in: messagingDeferredFeatureScope
+            )
+    }
     var messagingReactionsEnabled: Bool {
         secureMessagingReleasePermitted
             && MessagingReactionCapabilityPolicy.isEnabled(features: capabilities?.features)
+    }
+    var messagingReactionLocalQueueEnabled: Bool {
+        secureMessagingLocalQueueAvailable
+            && messagingDeferredFeatureSnapshot.allowsLocalQueue(
+                .reactions,
+                advertisedCapability: capabilities.map { _ in messagingReactionsEnabled },
+                in: messagingDeferredFeatureScope
+            )
     }
     var messagingMessageEditsEnabled: Bool {
         secureMessagingReleasePermitted
             && MessagingMessageEditCapabilityPolicy.isEnabled(features: capabilities?.features)
     }
+    var messagingMessageEditLocalQueueEnabled: Bool {
+        secureMessagingLocalQueueAvailable
+            && messagingDeferredFeatureSnapshot.allowsLocalQueue(
+                .messageEdits,
+                advertisedCapability: capabilities.map { _ in messagingMessageEditsEnabled },
+                in: messagingDeferredFeatureScope
+            )
+    }
+
+    private func bindDeferredMessagingFeatures(to scope: MessagingDeferredFeatureScope) {
+        messagingDeferredFeatureScope = scope
+        messagingDeferredFeatureSnapshot.bind(to: scope)
+    }
+
+    private func resetDeferredMessagingFeatures() {
+        messagingDeferredFeatureScope = nil
+        messagingDeferredFeatureSnapshot.reset()
+    }
+
     var messagingRealtimeConfiguration: KitRealtimeConfiguration? {
         guard appReviewDemoMutationsAllowed, secureMessagingAvailable else { return nil }
         return capabilities?.protocols?.realtime?.validatedConfiguration
@@ -2484,6 +2529,7 @@ final class AppModel: ObservableObject {
         await enterCommunicationPrivacyQuarantine()
         await publishLatestState()
         isSignedIn = false
+        resetDeferredMessagingFeatures()
         acceptedAccountDeletionCleanupBlocked = true
         protectedLocalStateRecoveryBlocked = false
         protectedLocalStateRecoveryRequiresSupport = false
@@ -2498,6 +2544,7 @@ final class AppModel: ObservableObject {
         await enterCommunicationPrivacyQuarantine()
         await publishLatestState()
         isSignedIn = false
+        resetDeferredMessagingFeatures()
         protectedLocalStateRecoveryBlocked = true
         protectedLocalStateRecoveryRequiresSupport = requiresSupport
         unresolvedAccountDeletionAttemptBlocked = false
@@ -2512,6 +2559,7 @@ final class AppModel: ObservableObject {
         await enterCommunicationPrivacyQuarantine()
         await publishLatestState()
         isSignedIn = false
+        resetDeferredMessagingFeatures()
         unresolvedAccountDeletionAttemptBlocked = true
         acceptedAccountDeletionCleanupBlocked = false
         protectedLocalStateRecoveryBlocked = false
@@ -3013,6 +3061,11 @@ final class AppModel: ObservableObject {
             authenticatedAppReviewDemoOwnerID = nil
             await api.setAppReviewDemoReadOnly(true, sessionID: restoredSession.sessionId)
             isSignedIn = true
+            bindDeferredMessagingFeatures(to: MessagingDeferredFeatureScope(
+                accountEpoch: restorationAccountEpoch,
+                userID: restoredUserID,
+                sessionID: restoredSession.sessionId
+            ))
             do {
                 let liveAssurance = try await APIClientSessionBinding.$sessionID.withValue(
                     restoredSession.sessionId
@@ -3179,6 +3232,7 @@ final class AppModel: ObservableObject {
         activeConversationID = nil
         stopVisibleConversationSync()
         isSignedIn = false
+        resetDeferredMessagingFeatures()
         sessionAssurance = nil
         accountSetupStep = nil
         biometricUnlockEnabled = false
@@ -3611,6 +3665,7 @@ final class AppModel: ObservableObject {
         cancelWalletHistoryRefresh()
         pendingDeepLink = nil
         accountEpoch = UUID()
+        resetDeferredMessagingFeatures()
         guard await resetProtectedCallRecoveryCycle(retiringQueuedEvents: true) else {
             throw AuthUIError.staleResponse
         }
@@ -3626,6 +3681,11 @@ final class AppModel: ObservableObject {
         contactDirectoryRevision &+= 1
         await publishLatestState()
         isSignedIn = true
+        bindDeferredMessagingFeatures(to: MessagingDeferredFeatureScope(
+            accountEpoch: accountEpoch,
+            userID: user.id,
+            sessionID: boundSession.sessionId
+        ))
         let authenticatedContext = AuthenticatedSecurityContext(
             accountEpoch: accountEpoch,
             userID: user.id,
@@ -4105,7 +4165,7 @@ final class AppModel: ObservableObject {
                 ) else { return nil }
 
                 if conversation.isGroup {
-                    guard messagingGroupsEnabled else { return nil }
+                    guard messagingGroupLocalQueueEnabled else { return nil }
                     let memberIDs = conversation.participantUserIds.compactMap {
                         SharedInboxPolicy.canonicalAccountID($0)
                     }
@@ -4475,7 +4535,7 @@ final class AppModel: ObservableObject {
               participants.contains(currentAccountID)
         else { return false }
         if conversation.isGroup {
-            return messagingGroupsEnabled && participants.count >= 2
+            return messagingGroupLocalQueueEnabled && participants.count >= 2
         }
         guard participants.count == 2,
               let recipientUserID = participants.first(where: { $0 != currentAccountID })
@@ -4589,6 +4649,7 @@ final class AppModel: ObservableObject {
         // user-initiated and silent avatar work unwind before credentials or encrypted state
         // are cleared.
         accountEpoch = UUID()
+        resetDeferredMessagingFeatures()
         guard await resetProtectedCallRecoveryCycle(retiringQueuedEvents: true) else {
             return .contextChanged
         }
@@ -8839,6 +8900,29 @@ final class AppModel: ObservableObject {
         let expectedAccountEpoch = accountEpoch
         let expectedSession = await sessions.current()
         let expectedSessionID = expectedSession?.sessionId
+        let expectedDeferredFeatureScope: MessagingDeferredFeatureScope?
+        if isSignedIn,
+           let expectedSession,
+           let profileID = profile?.id,
+           SessionAccountBindingPolicy.matches(expectedSession, profile: profile) {
+            expectedDeferredFeatureScope = MessagingDeferredFeatureScope(
+                accountEpoch: expectedAccountEpoch,
+                userID: profileID,
+                sessionID: expectedSession.sessionId
+            )
+        } else {
+            expectedDeferredFeatureScope = nil
+        }
+        // Binding happens before the request suspends. A replacement account/session therefore
+        // loses the previous decision immediately, while a retry for this same scope keeps the
+        // last authenticated true *or false* result until a newer response is accepted.
+        if let expectedDeferredFeatureScope {
+            bindDeferredMessagingFeatures(to: expectedDeferredFeatureScope)
+        } else if !isSignedIn {
+            // Signed-out discovery has no account scope. While signed in, failure to prove a new
+            // scope is not evidence that the current one changed, so retain its explicit denial.
+            resetDeferredMessagingFeatures()
+        }
         do {
             let discovered = try await APIClientSessionBinding.$sessionID.withValue(
                 expectedSessionID
@@ -8900,6 +8984,14 @@ final class AppModel: ObservableObject {
             }
             authenticatedAppReviewDemoOwnerID = demoFence.projectedOwnerID
             capabilities = discovered
+            if let expectedDeferredFeatureScope {
+                messagingDeferredFeatureSnapshot.confirm(
+                    groups: messagingGroupsEnabled,
+                    reactions: messagingReactionsEnabled,
+                    messageEdits: messagingMessageEditsEnabled,
+                    for: expectedDeferredFeatureScope
+                )
+            }
             await publishLatestState()
             if !demoFence.keepsTransportFenceAfterProjection {
                 await api.setAppReviewDemoReadOnly(false, sessionID: expectedSessionID)
@@ -8934,6 +9026,9 @@ final class AppModel: ObservableObject {
             if demoFence.keepsTransportFenceAfterProjection {
                 await api.setAppReviewDemoReadOnly(true, sessionID: expectedSessionID)
             }
+            // `capabilities` intentionally represents only a live response. The separate scoped
+            // messaging snapshot retains the last authenticated allow/deny decisions so a failed
+            // refresh cannot turn an explicit denial into the unknown (locally queueable) state.
             capabilities = nil
             await publishLatestState()
             lastError = error.localizedDescription
@@ -9831,7 +9926,7 @@ final class AppModel: ObservableObject {
         recipientId: String?,
         reaction: KitMessageReaction
     ) async -> Bool {
-        guard messagingReactionsEnabled else {
+        guard messagingReactionLocalQueueEnabled else {
             lastError = messagingSendFailureMessage
             return false
         }
@@ -9868,7 +9963,7 @@ final class AppModel: ObservableObject {
         recipientId: String?,
         edit: KitMessageEdit
     ) async -> Bool {
-        guard messagingMessageEditsEnabled else {
+        guard messagingMessageEditLocalQueueEnabled else {
             lastError = messagingSendFailureMessage
             return false
         }
@@ -9981,7 +10076,7 @@ final class AppModel: ObservableObject {
         })?.isGroup == true
         guard MessagingGroupCapabilityPolicy.allowsConversationMutation(
             isGroup: isGroupTarget,
-            groupCapabilityEnabled: messagingGroupsEnabled
+            groupCapabilityEnabled: messagingGroupLocalQueueEnabled
         ) else {
             lastError = "Group messaging is not available right now. You can still read this conversation."
             return false
@@ -10032,7 +10127,7 @@ final class AppModel: ObservableObject {
         }
         guard MessagingGroupCapabilityPolicy.allowsConversationMutation(
             isGroup: isGroupTarget,
-            groupCapabilityEnabled: messagingGroupsEnabled
+            groupCapabilityEnabled: messagingGroupLocalQueueEnabled
         ) else {
             lastError = "Group messaging is not available right now. You can still read this conversation."
             return false
@@ -10722,7 +10817,7 @@ final class AppModel: ObservableObject {
         })?.isGroup == true
         guard MessagingGroupCapabilityPolicy.allowsConversationMutation(
             isGroup: isGroupTarget,
-            groupCapabilityEnabled: messagingGroupsEnabled
+            groupCapabilityEnabled: messagingGroupLocalQueueEnabled
         ) else {
             lastError = "Group messaging is not available right now. You can still read this conversation."
             return false
@@ -10836,7 +10931,7 @@ final class AppModel: ObservableObject {
         }
         guard MessagingGroupCapabilityPolicy.allowsConversationMutation(
             isGroup: isGroupTarget,
-            groupCapabilityEnabled: messagingGroupsEnabled
+            groupCapabilityEnabled: messagingGroupLocalQueueEnabled
         ) else {
             // The key may have become draft-owned while this task crossed an actor boundary.
             // Leave an uncommitted park to bounded orphan reconciliation rather than deleting
@@ -10974,7 +11069,7 @@ final class AppModel: ObservableObject {
         })?.isGroup == true
         guard MessagingGroupCapabilityPolicy.allowsConversationMutation(
             isGroup: isGroupTarget,
-            groupCapabilityEnabled: messagingGroupsEnabled
+            groupCapabilityEnabled: messagingGroupLocalQueueEnabled
         ) else {
             lastError = "Group messaging is not available right now. You can still read this conversation."
             return false
@@ -11105,7 +11200,7 @@ final class AppModel: ObservableObject {
         }
         guard MessagingGroupCapabilityPolicy.allowsConversationMutation(
             isGroup: isGroupTarget,
-            groupCapabilityEnabled: messagingGroupsEnabled
+            groupCapabilityEnabled: messagingGroupLocalQueueEnabled
         ) else {
             await rollbackParks()
             lastError = "Group messaging is not available right now. You can still read this conversation."
@@ -17446,7 +17541,7 @@ final class AppModel: ObservableObject {
         conversationID rawConversationID: String
     ) -> (userID: String, conversationID: String, recipientUserIDs: [String])? {
         guard appReviewDemoMutationsAllowed,
-              messagingGroupsEnabled,
+              messagingGroupLocalQueueEnabled,
               let rawUserID = profile?.id,
               let userUUID = UUID(
                   uuidString: rawUserID.trimmingCharacters(in: .whitespacesAndNewlines)

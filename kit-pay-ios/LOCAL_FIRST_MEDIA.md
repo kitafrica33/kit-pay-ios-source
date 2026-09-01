@@ -14,8 +14,16 @@ This document is the release contract for the iOS messaging-media pipeline.
 - E2EE is fail-closed. Compression/transcoding, deterministic attachment encryption, upload, and
   Signal fanout happen after the local commit. If secure transmission is unavailable, the message
   and original remain pending; local admission never performs capability discovery, and plaintext
-  is never sent as a fallback. Authenticated service and recipient-device capability checks run at
-  the background dispatch boundary before any ciphertext upload or Signal fanout.
+  is never sent as a fallback. The local flush requires an authenticated service projection;
+  media-specific service checks and recipient-device checks run during background preparation,
+  and the server authoritatively validates the request before accepting encrypted fanout.
+- A temporary authenticated-capability discovery failure does not make existing group composers,
+  reactions, or edits read-only on an already-enrolled device. Those mutations commit to the same
+  protected local outbox and wait, unless this account/session last confirmed that the feature was
+  withdrawn. That denial survives transient refresh failures but never crosses an account or session
+  boundary. The local flush gate requires an authenticated feature projection, the coordinator
+  validates the current recipient roster, and the server atomically rechecks its feature gate and
+  roster before accepting the encrypted request; stale state therefore remains pending for retry.
 - Recipients authenticate and stream-decrypt to an unpublished file, atomically publish the local
   copy, then mark the media `localCached`. Reopening uses that copy without another download.
 - Sent originals are never cache-eviction candidates. Received files use a 512 MiB high-water /
