@@ -24,6 +24,9 @@ API_CLIENT = ROOT / "KitPay/Core/APIClient.swift"
 MESSAGING_API = ROOT / "KitPay/Core/APIClient+Messaging.swift"
 COORDINATOR = ROOT / "KitPay/Core/SecureMessagingCoordinator.swift"
 APP_DELEGATE = ROOT / "KitPay/App/NotificationCoordinator.swift"
+CHAT_MEDIA_VIEWS = ROOT / "KitPay/Features/Messages/ChatMediaViews.swift"
+MEDIA_GALLERY = ROOT / "KitPay/Features/Messages/KitMediaGalleryView.swift"
+VIDEO_PLAYBACK = ROOT / "KitPay/Features/Messages/ChatVideoPictureInPicture.swift"
 V2_TESTS = ROOT / "KitPayTests/MediaMessageV2ContractTests.swift"
 WIRE_GLUE_TESTS = ROOT / "KitPayTests/MediaMessageV2WireGlueTests.swift"
 PBXPROJ = ROOT / "KitPay.xcodeproj/project.pbxproj"
@@ -79,6 +82,32 @@ class MediaMessageV2SourceContract(unittest.TestCase):
         self.assertEqual(loader.count("loadProtectedLocalMediaFile("), 2)
         self.assertNotIn("insertIfAbsent(", loader)
         self.assertNotIn("SecureMediaFileCache.shared.store(", loader)
+
+    def test_received_video_is_probed_and_never_replaces_a_live_player_item(self) -> None:
+        """A malformed or mismatched received container must fail at the local AVAsset boundary.
+        Replacing the item from AVPlayer's stall/failure callback races AVKit observations and was
+        the build-46 one-second freeze/crash path."""
+        views = CHAT_MEDIA_VIEWS.read_text(encoding="utf-8")
+        gallery = MEDIA_GALLERY.read_text(encoding="utf-8")
+        playback = VIDEO_PLAYBACK.read_text(encoding="utf-8")
+        combined = views + gallery
+        self.assertGreaterEqual(combined.count("ChatVideoPlaybackAssetPolicy.prepare("), 2)
+        self.assertNotIn("replaceCurrentItem(with: replacementItem)", combined)
+        self.assertNotIn("requestAutomaticRecovery", combined)
+        self.assertIn("load(.isPlayable)", playback)
+        self.assertIn("loadTracks(withMediaType: .video)", playback)
+        self.assertIn("expectedByteCount", playback)
+        self.assertIn("linkTemporaryFile(", playback)
+        self.assertGreaterEqual(
+            combined.count(
+                "private var protectedOriginalLease: SecureMediaOriginalAccessLease?"
+            ),
+            2,
+        )
+        self.assertGreaterEqual(
+            combined.count("self.protectedOriginalLease = protectedOriginalLease"),
+            2,
+        )
 
     def test_percent_encode_bodies_are_identical(self) -> None:
         """§4: v2 percent-encoding MUST byte-match v1's percentEncode; the body is duplicated

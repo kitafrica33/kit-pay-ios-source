@@ -259,91 +259,21 @@ final class VoiceNotePlaybackTests: XCTestCase {
         )
     }
 
-    // MARK: Video premature-stop recovery
+    // MARK: Video playback failure boundary
 
-    func testVideoRecoveryRestartsAProvablyPrematureTwoSecondStop() {
-        XCTAssertTrue(
-            ChatVideoPlaybackRecoveryPolicy.shouldRecover(
-                currentTime: 2,
-                duration: 120,
-                intendsToPlay: true,
-                attemptCount: 0
-            )
+    func testVideoStallRemainsOwnedByAVFoundationWithoutReplacingTheLiveItem() {
+        XCTAssertEqual(
+            ChatVideoPlaybackFailurePolicy.action(for: .stalled),
+            .letPlayerRecover
         )
+        XCTAssertFalse(ChatVideoPlaybackFailurePolicy.permitsAutomaticPlayerItemReplacement)
     }
 
-    func testVideoRecoveryDoesNotTurnANaturalEndIntoAReplay() {
-        XCTAssertFalse(
-            ChatVideoPlaybackRecoveryPolicy.shouldRecover(
-                currentTime: 59.8,
-                duration: 60,
-                intendsToPlay: true,
-                attemptCount: 0
-            )
+    func testVideoFailureStopsAndReportsWithoutReplacingTheLiveItem() {
+        XCTAssertEqual(
+            ChatVideoPlaybackFailurePolicy.action(for: .failed),
+            .stopAndReport
         )
-    }
-
-    func testVideoRecoveryRequiresKnownFiniteDurationAndPlayIntent() {
-        XCTAssertFalse(
-            ChatVideoPlaybackRecoveryPolicy.shouldRecover(
-                currentTime: 2,
-                duration: .nan,
-                intendsToPlay: true,
-                attemptCount: 0
-            )
-        )
-        XCTAssertFalse(
-            ChatVideoPlaybackRecoveryPolicy.shouldRecover(
-                currentTime: 2,
-                duration: 120,
-                intendsToPlay: false,
-                attemptCount: 0
-            )
-        )
-    }
-
-    func testVideoRecoveryIsBoundedForMalformedFiles() {
-        XCTAssertFalse(
-            ChatVideoPlaybackRecoveryPolicy.shouldRecover(
-                currentTime: 2,
-                duration: 120,
-                intendsToPlay: true,
-                attemptCount: ChatVideoPlaybackRecoveryPolicy.maximumAutomaticAttempts
-            )
-        )
-    }
-
-    func testNativeVideoRecoveryDistinguishesPauseFromStallAndFailure() {
-        XCTAssertFalse(ChatVideoPlaybackRecoveryPolicy.permitsNativeControlsRecovery(
-            interruption: .stalled,
-            playerIsWaitingToPlay: false,
-            itemIsFailed: false,
-            secondsSinceLastProgress: 0.1
-        ), "A native-controls pause must never be restarted")
-        XCTAssertTrue(ChatVideoPlaybackRecoveryPolicy.permitsNativeControlsRecovery(
-            interruption: .stalled,
-            playerIsWaitingToPlay: true,
-            itemIsFailed: false,
-            secondsSinceLastProgress: nil
-        ))
-        XCTAssertTrue(ChatVideoPlaybackRecoveryPolicy.permitsNativeControlsRecovery(
-            interruption: .failed,
-            playerIsWaitingToPlay: false,
-            itemIsFailed: true,
-            secondsSinceLastProgress: 0.25
-        ))
-        XCTAssertFalse(ChatVideoPlaybackRecoveryPolicy.permitsNativeControlsRecovery(
-            interruption: .failed,
-            playerIsWaitingToPlay: false,
-            itemIsFailed: false,
-            secondsSinceLastProgress: 0.25
-        ), "A normal paused item is not a failed playback")
-        XCTAssertFalse(ChatVideoPlaybackRecoveryPolicy.permitsNativeControlsRecovery(
-            interruption: .failed,
-            playerIsWaitingToPlay: false,
-            itemIsFailed: true,
-            secondsSinceLastProgress:
-                ChatVideoPlaybackRecoveryPolicy.recentPlaybackEvidenceWindow + 0.01
-        ), "A stale failure cannot resurrect playback after the user has left it paused")
+        XCTAssertFalse(ChatVideoPlaybackFailurePolicy.permitsAutomaticPlayerItemReplacement)
     }
 }

@@ -1763,61 +1763,88 @@ struct TransactionDetailView: View {
     let transaction: WalletTransaction
 
     var body: some View {
-        ScrollView {
-            VStack(spacing: 18) {
-                // The ledger carries the counterparty's id but not their photo, so the face comes
-                // from the contact directory — which is persisted, so this still resolves offline.
-                RemoteAvatarView(
-                    name: transaction.customerCounterparty?.name ?? "Kit Pay",
-                    avatarURL: model.contactAvatarURL(
-                        forUserID: transaction.customerCounterparty?.id
-                    ),
-                    size: 68
-                )
-                VerifiedAccountNameLabel(
-                    designation: model.contactVerification(
-                        forUserID: transaction.customerCounterparty?.id
-                    )
-                ) {
-                    Text(transaction.customerCounterparty?.name ?? transaction.type.displayLabel)
-                        .font(.title2.bold())
-                        .foregroundStyle(KitColor.primaryText)
-                }
-                Text(transaction.customerImpactLabel)
-                    .font(.caption.bold())
-                    .foregroundStyle(KitColor.secondaryText)
-                Text(transaction.customerImpactDisplayAmount)
-                    .font(.system(size: 38, weight: .heavy, design: .rounded))
-                    .foregroundStyle(transaction.customerDirection == "credit" ? KitColor.green : KitColor.primaryText)
-                Text(transaction.status.capitalized)
-                    .font(.caption.bold())
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 7)
-                    .background(statusColor.opacity(0.16), in: Capsule())
-                    .foregroundStyle(statusColor)
+        Group {
+            if let transaction = customerVisibleTransaction {
+                ScrollView {
+                    VStack(spacing: 18) {
+                        // The ledger carries the counterparty's id but not their photo, so the
+                        // face comes from the persisted contact directory and resolves offline.
+                        RemoteAvatarView(
+                            name: transaction.customerCounterparty?.name ?? "Kit Pay",
+                            avatarURL: model.contactAvatarURL(
+                                forUserID: transaction.customerCounterparty?.id
+                            ),
+                            size: 68
+                        )
+                        VerifiedAccountNameLabel(
+                            designation: model.contactVerification(
+                                forUserID: transaction.customerCounterparty?.id
+                            )
+                        ) {
+                            Text(
+                                transaction.customerCounterparty?.name
+                                    ?? transaction.type.displayLabel
+                            )
+                            .font(.title2.bold())
+                            .foregroundStyle(KitColor.primaryText)
+                        }
+                        Text(transaction.customerImpactLabel)
+                            .font(.caption.bold())
+                            .foregroundStyle(KitColor.secondaryText)
+                        Text(transaction.customerImpactDisplayAmount)
+                            .font(.system(size: 38, weight: .heavy, design: .rounded))
+                            .foregroundStyle(
+                                transaction.customerDirection == "credit"
+                                    ? KitColor.green
+                                    : KitColor.primaryText
+                            )
+                        Text(transaction.status.capitalized)
+                            .font(.caption.bold())
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 7)
+                            .background(statusColor.opacity(0.16), in: Capsule())
+                            .foregroundStyle(statusColor)
 
-                VStack(spacing: 0) {
-                    detailRow("Date", transaction.occurredAt.displayDate)
-                    Divider()
-                    detailRow("Reference", transaction.reference)
-                    Divider()
-                    detailRow("Type", transaction.type.displayLabel)
-                    if let note = transaction.note?.nilIfEmpty {
-                        Divider()
-                        detailRow("Note", note)
+                        VStack(spacing: 0) {
+                            detailRow("Date", transaction.occurredAt.displayDate)
+                            Divider()
+                            detailRow("Reference", transaction.reference)
+                            Divider()
+                            detailRow("Type", transaction.type.displayLabel)
+                            if let note = transaction.note?.nilIfEmpty {
+                                Divider()
+                                detailRow("Note", note)
+                            }
+                        }
+                        .padding(18)
+                        .kitGlass(cornerRadius: 24)
+
+                        ShareReceiptButton(transaction: transaction, senderName: nil)
                     }
+                    .padding(24)
                 }
-                .padding(18)
-                .kitGlass(cornerRadius: 24)
-
-                ShareReceiptButton(transaction: transaction, senderName: nil)
+            } else {
+                ContentUnavailableView(
+                    "Transaction unavailable",
+                    systemImage: "lock.shield",
+                    description: Text(
+                        "Refresh your wallet activity to load a verified transaction record."
+                    )
+                )
+                .padding(24)
             }
-            .padding(24)
         }
         .background(KitColor.canvas.ignoresSafeArea())
         .navigationTitle("Transaction")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar { ToolbarItem(placement: .topBarLeading) { Button("Close") { dismiss() } } }
+    }
+
+    private var customerVisibleTransaction: WalletTransaction? {
+        CustomerTransactionPresentationPolicy.customerVisibleTransaction(
+            transaction,
+            for: model.selectedWallet
+        )
     }
 
     private func detailRow(_ label: String, _ value: String) -> some View {

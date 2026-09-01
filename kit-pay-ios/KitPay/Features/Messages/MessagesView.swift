@@ -3039,7 +3039,12 @@ struct ConversationView: View {
                     }
                 case .video:
                     if let fileURL = presentation.fileURL {
-                        MediaVideoPlayerView(fileURL: fileURL) {
+                        MediaVideoPlayerView(
+                            fileURL: fileURL,
+                            mediaType: presentation.mediaType,
+                            expectedByteCount: presentation.byteCount,
+                            protectedOriginalLease: nil
+                        ) {
                             closeStagedAttachmentPresentation(presentation)
                         }
                     }

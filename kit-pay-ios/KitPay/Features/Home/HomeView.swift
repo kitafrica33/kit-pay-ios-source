@@ -529,7 +529,7 @@ struct HomeView: View {
                 }
                 .buttonStyle(.plain)
             }
-            if model.state.transactions.isEmpty {
+            if recentTransactions.isEmpty {
                 ContentUnavailableView(
                     "No activity yet",
                     systemImage: "clock.arrow.circlepath",
@@ -539,7 +539,7 @@ struct HomeView: View {
                 .padding(.vertical, 28)
                 .kitGlass(cornerRadius: 24)
             } else {
-                ForEach(model.state.transactions.prefix(8)) { transaction in
+                ForEach(recentTransactions.prefix(8)) { transaction in
                     Button {
                         open(
                             .transaction(transaction),
@@ -554,6 +554,14 @@ struct HomeView: View {
                 }
             }
         }
+    }
+
+    private var recentTransactions: [WalletTransaction] {
+        CustomerTransactionPresentationPolicy.customerVisibleTransactions(
+            model.state.transactions,
+            selectedWalletID: model.state.selectedWalletId,
+            wallets: model.state.wallets
+        )
     }
 
     private var lockedRecentActivity: some View {

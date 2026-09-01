@@ -932,40 +932,36 @@ private struct GalleryVideoPage: View {
         .contentShape(Rectangle())
         .onTapGesture { onToggleChrome() }
         .task(id: item.id) {
-            if let localFileURL = loaded.localFileURL {
-                poster = await ChatMediaThumbnailStore.shared.videoThumbnail(
-                    forKey: item.thumbnailKey,
-                    maxPixel: 400,
-                    fromFileURL: localFileURL
-                )
-            } else {
-                poster = await ChatMediaThumbnailStore.shared.videoThumbnail(
-                    forKey: item.thumbnailKey,
-                    maxPixel: 400,
-                    from: loaded.data,
-                    mediaType: loaded.mediaType
-                )
-            }
             // Picture in Picture restores at exact gallery identity: item 3 of a
             // multi-attachment message reopens on item 3, still within its one bubble.
             let identity = ChatVideoGalleryIdentity(
                 messageID: item.messageID,
                 itemIndex: item.itemIndex
             )
+            let didPrepare: Bool
             if let localFileURL = loaded.localFileURL {
-                controller.prepare(
+                didPrepare = await controller.prepare(
                     fileURL: localFileURL,
                     ownsFile: false,
                     protectedOriginalLease: loaded.localFileLease,
+                    mediaType: loaded.mediaType,
+                    expectedByteCount: loaded.byteCount,
                     galleryIdentity: identity,
                     restoreFromPictureInPicture: restoreFromPictureInPicture
                 )
             } else {
-                controller.prepare(
+                didPrepare = await controller.prepare(
                     data: loaded.data,
                     mediaType: loaded.mediaType,
                     galleryIdentity: identity,
                     restoreFromPictureInPicture: restoreFromPictureInPicture
+                )
+            }
+            if didPrepare, let playbackURL = controller.playbackURL {
+                poster = await ChatMediaThumbnailStore.shared.videoThumbnail(
+                    forKey: item.thumbnailKey,
+                    maxPixel: 400,
+                    fromFileURL: playbackURL
                 )
             }
         }
@@ -979,8 +975,23 @@ private struct GalleryVideoPage: View {
 
     @ViewBuilder
     private var controlsOverlay: some View {
-        // The big play/pause control stays visible while paused so playback is always reachable.
-        if chromeVisible || !controller.isPlaying {
+        if controller.isPreparing {
+            ProgressView("Preparing video…")
+                .tint(.white)
+                .foregroundStyle(.white)
+        } else if let errorMessage = controller.errorMessage {
+            VStack(spacing: 12) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 30, weight: .semibold))
+                Text(errorMessage)
+                    .font(.body.weight(.semibold))
+                    .multilineTextAlignment(.center)
+            }
+            .foregroundStyle(.white)
+            .padding(32)
+        } else if controller.player != nil, chromeVisible || !controller.isPlaying {
+            // The big play/pause control stays visible while paused so playback is always
+            // reachable after the file has passed the local playback probe.
             Button {
                 controller.togglePlayback()
             } label: {
@@ -1054,12 +1065,19 @@ private final class GalleryVideoController: ObservableObject {
     @Published private(set) var isPlaying = false
     @Published private(set) var isMuted = false
     @Published private(set) var hasStartedPlayback = false
+    @Published private(set) var isPreparing = false
+    @Published private(set) var errorMessage: String?
     @Published var duration: Double = 0
     @Published var currentTime: Double = 0
 
+    private(set) var playbackURL: URL?
+
     private var isScrubbing = false
-    private var fileURL: URL?
+    private var sourceFileURL: URL?
+    private var temporaryAliasURL: URL?
     private var ownsFileURL = false
+    private var asset: AVURLAsset?
+    private var playerItem: AVPlayerItem?
     /// Retained by the controller, rather than the SwiftUI page value, so a Picture in Picture
     /// handoff continues to exclude this received-cache file from eviction after the gallery is
     /// dismissed. `releaseResources` drops it only when playback ownership truly ends.
@@ -1072,8 +1090,7 @@ private final class GalleryVideoController: ObservableObject {
     private var endObserver: NSObjectProtocol?
     private var stallObserver: NSObjectProtocol?
     private var failureObserver: NSObjectProtocol?
-    private var recoveryTask: Task<Void, Never>?
-    private var automaticRecoveryAttempts = 0
+    private var preparationID: UUID?
     /// The layer this page is drawing into, reported by `PlayerLayerView`. Picture in Picture
     /// hands off a *layer*, so the window can only be armed once one exists.
     private weak var playerLayer: AVPlayerLayer?
@@ -1088,18 +1105,23 @@ private final class GalleryVideoController: ObservableObject {
         mediaType: String,
         galleryIdentity: ChatVideoGalleryIdentity,
         restoreFromPictureInPicture: @escaping (ChatVideoGalleryIdentity) -> Void
-    ) {
+    ) async -> Bool {
         self.galleryIdentity = galleryIdentity
         self.restoreFromPictureInPicture = restoreFromPictureInPicture
-        guard player == nil else { return }
+        guard player == nil, !isPreparing else { return player != nil }
         guard let url = try? ChatMediaTempFiles.writeTemporaryFile(
             data: data,
             mediaType: mediaType
-        ) else { return }
-        prepare(
+        ) else {
+            errorMessage = ChatVideoPlaybackPreparationError.invalidFile.errorDescription
+            return false
+        }
+        return await prepare(
             fileURL: url,
             ownsFile: true,
             protectedOriginalLease: nil,
+            mediaType: mediaType,
+            expectedByteCount: data.count,
             galleryIdentity: galleryIdentity,
             restoreFromPictureInPicture: restoreFromPictureInPicture
         )
@@ -1109,48 +1131,69 @@ private final class GalleryVideoController: ObservableObject {
         fileURL url: URL,
         ownsFile: Bool,
         protectedOriginalLease: SecureMediaOriginalAccessLease?,
+        mediaType: String,
+        expectedByteCount: Int,
         galleryIdentity: ChatVideoGalleryIdentity,
         restoreFromPictureInPicture: @escaping (ChatVideoGalleryIdentity) -> Void
-    ) {
+    ) async -> Bool {
         self.galleryIdentity = galleryIdentity
         self.restoreFromPictureInPicture = restoreFromPictureInPicture
-        guard player == nil else {
+        guard player == nil, !isPreparing else {
             if ownsFile { ChatMediaTempFiles.removeTemporaryFile(url) }
-            return
+            return player != nil
         }
-        guard let fileHandle = try? FileHandle(forReadingFrom: url) else {
-            if ownsFile { ChatMediaTempFiles.removeTemporaryFile(url) }
-            return
-        }
-        fileURL = url
+        let identifier = UUID()
+        preparationID = identifier
+        sourceFileURL = url
         ownsFileURL = ownsFile
         self.protectedOriginalLease = protectedOriginalLease
-        playbackFileHandle = fileHandle
-        let asset = AVURLAsset(url: url)
-        let item = AVPlayerItem(asset: asset)
-        let player = AVPlayer(playerItem: item)
-        player.automaticallyWaitsToMinimizeStalling = true
-        self.player = player
-
-        timeObserver = player.addPeriodicTimeObserver(
-            forInterval: CMTime(seconds: 0.25, preferredTimescale: 600),
-            queue: .main
-        ) { [weak self] time in
-            Task { @MainActor in
-                guard let self, !self.isScrubbing else { return }
-                let seconds = time.seconds
-                if seconds.isFinite { self.currentTime = seconds }
-            }
+        guard let fileHandle = try? FileHandle(forReadingFrom: url) else {
+            if ownsFile { ChatMediaTempFiles.removeTemporaryFile(url) }
+            failPreparation(ChatVideoPlaybackPreparationError.invalidFile)
+            return false
         }
-
-        observePlaybackItem(item)
-
-        Task { [weak self] in
-            let loaded = try? await asset.load(.duration)
-            guard let self, self.fileURL == url else { return }
-            if let seconds = loaded?.seconds, seconds.isFinite {
-                self.duration = seconds
+        playbackFileHandle = fileHandle
+        isPreparing = true
+        errorMessage = nil
+        do {
+            let prepared = try await ChatVideoPlaybackAssetPolicy.prepare(
+                fileURL: url,
+                declaredMediaType: mediaType,
+                expectedByteCount: expectedByteCount
+            )
+            guard !Task.isCancelled,
+                  preparationID == identifier,
+                  sourceFileURL == url
+            else {
+                ChatMediaTempFiles.removeTemporaryFile(prepared.temporaryAliasURL)
+                return false
             }
+            temporaryAliasURL = prepared.temporaryAliasURL
+            playbackURL = prepared.playbackURL
+            asset = prepared.asset
+            duration = prepared.duration
+            let item = AVPlayerItem(asset: prepared.asset)
+            playerItem = item
+            let player = AVPlayer(playerItem: item)
+            player.automaticallyWaitsToMinimizeStalling = true
+            self.player = player
+            timeObserver = player.addPeriodicTimeObserver(
+                forInterval: CMTime(seconds: 0.25, preferredTimescale: 600),
+                queue: .main
+            ) { [weak self] time in
+                Task { @MainActor in
+                    guard let self, !self.isScrubbing else { return }
+                    let seconds = time.seconds
+                    if seconds.isFinite { self.currentTime = seconds }
+                }
+            }
+            observePlaybackItem(item)
+            isPreparing = false
+            return true
+        } catch {
+            guard preparationID == identifier else { return false }
+            failPreparation(error)
+            return false
         }
     }
 
@@ -1172,26 +1215,29 @@ private final class GalleryVideoController: ObservableObject {
     }
 
     private func releaseResources() {
-        recoveryTask?.cancel()
-        recoveryTask = nil
+        preparationID = nil
+        isPreparing = false
         if let timeObserver { player?.removeTimeObserver(timeObserver) }
         timeObserver = nil
         removePlaybackItemObservers()
         player?.pause()
-        player?.replaceCurrentItem(with: nil)
         player = nil
+        playerItem = nil
+        asset = nil
         playerLayer = nil
         isPlaying = false
         hasStartedPlayback = false
         currentTime = 0
         duration = 0
-        automaticRecoveryAttempts = 0
         if let playbackFileHandle {
             try? playbackFileHandle.close()
         }
         playbackFileHandle = nil
-        if ownsFileURL { ChatMediaTempFiles.removeTemporaryFile(fileURL) }
-        fileURL = nil
+        ChatMediaTempFiles.removeTemporaryFile(temporaryAliasURL)
+        temporaryAliasURL = nil
+        playbackURL = nil
+        if ownsFileURL { ChatMediaTempFiles.removeTemporaryFile(sourceFileURL) }
+        sourceFileURL = nil
         ownsFileURL = false
         protectedOriginalLease = nil
         galleryIdentity = nil
@@ -1201,11 +1247,9 @@ private final class GalleryVideoController: ObservableObject {
     func togglePlayback() {
         guard let player else { return }
         if isPlaying {
-            recoveryTask?.cancel()
             player.pause()
             isPlaying = false
         } else {
-            automaticRecoveryAttempts = 0
             player.play()
             isPlaying = true
             hasStartedPlayback = true
@@ -1214,7 +1258,6 @@ private final class GalleryVideoController: ObservableObject {
     }
 
     func pause() {
-        recoveryTask?.cancel()
         player?.pause()
         isPlaying = false
     }
@@ -1273,12 +1316,7 @@ private final class GalleryVideoController: ObservableObject {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
-                // AVPlayer often clears a transient wait itself. Give that path a brief chance,
-                // then rebuild only if this complete local file is still not advancing.
-                self?.requestAutomaticRecovery(
-                    afterNanoseconds: 400_000_000,
-                    onlyIfStillWaiting: true
-                )
+                self?.handleInterruption(.stalled, item: item)
             }
         }
         failureObserver = NotificationCenter.default.addObserver(
@@ -1287,10 +1325,7 @@ private final class GalleryVideoController: ObservableObject {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
-                self?.requestAutomaticRecovery(
-                    afterNanoseconds: 0,
-                    onlyIfStillWaiting: false
-                )
+                self?.handleInterruption(.failed, item: item)
             }
         }
     }
@@ -1304,74 +1339,45 @@ private final class GalleryVideoController: ObservableObject {
         failureObserver = nil
     }
 
-    private func requestAutomaticRecovery(
-        afterNanoseconds delay: UInt64,
-        onlyIfStillWaiting: Bool
+    private func handleInterruption(
+        _ interruption: ChatVideoPlaybackFailurePolicy.Interruption,
+        item: AVPlayerItem
     ) {
-        guard isPlaying,
-              automaticRecoveryAttempts
-                  < ChatVideoPlaybackRecoveryPolicy.maximumAutomaticAttempts,
-              let fileURL
-        else { return }
-        recoveryTask?.cancel()
-        recoveryTask = Task { @MainActor [weak self] in
-            if delay > 0 {
-                try? await Task.sleep(nanoseconds: delay)
-            }
-            guard !Task.isCancelled,
-                  let self,
-                  self.isPlaying,
-                  let player = self.player
-            else { return }
-            if onlyIfStillWaiting, player.timeControlStatus == .playing { return }
-
-            // Re-open the already verified local asset; there is no network fallback here.
-            // Its held read handle keeps the file available through protected-data transitions.
-            let replacementAsset = AVURLAsset(url: fileURL)
-            let loadedDuration = try? await replacementAsset.load(.duration)
-            guard !Task.isCancelled, self.isPlaying else { return }
-            let liveTime = player.currentTime().seconds
-            let resumeTime = liveTime.isFinite ? liveTime : self.currentTime
-            let measuredDuration = loadedDuration?.seconds
-            let provenDuration = if let measuredDuration, measuredDuration.isFinite {
-                measuredDuration
-            } else {
-                self.duration
-            }
-            guard ChatVideoPlaybackRecoveryPolicy.shouldRecover(
-                currentTime: resumeTime,
-                duration: provenDuration,
-                intendsToPlay: self.isPlaying,
-                attemptCount: self.automaticRecoveryAttempts
-            ) else { return }
-
-            self.duration = provenDuration
-            self.automaticRecoveryAttempts += 1
-            let replacementItem = AVPlayerItem(asset: replacementAsset)
-            self.observePlaybackItem(replacementItem)
-            player.replaceCurrentItem(with: replacementItem)
-            player.seek(
-                to: CMTime(seconds: resumeTime, preferredTimescale: 600),
-                toleranceBefore: .zero,
-                toleranceAfter: .zero
-            ) { [weak self, weak player] finished in
-                Task { @MainActor in
-                    guard finished, self?.isPlaying == true else { return }
-                    player?.play()
-                }
-            }
+        guard playerItem === item else { return }
+        switch ChatVideoPlaybackFailurePolicy.action(for: interruption) {
+        case .letPlayerRecover:
+            // A local decoder stall remains AVFoundation-owned. Mutating the current item from
+            // this callback is unsafe because AVKit still has observations attached to it.
+            break
+        case .stopAndReport:
+            isPlaying = false
+            player?.pause()
+            errorMessage = "This video could not be played completely."
         }
     }
 
     private func handlePlaybackEnded() {
-        recoveryTask?.cancel()
         isPlaying = false
         currentTime = 0
-        automaticRecoveryAttempts = 0
         player?.seek(to: .zero)
         // Nothing left to watch: the floating window closes itself rather than sitting on the
         // user's screen showing a frozen last frame.
         ChatVideoPictureInPicture.shared.stopForPlaybackEnd(owner: self)
+    }
+
+    private func failPreparation(_ error: Error) {
+        isPreparing = false
+        errorMessage = (error as? LocalizedError)?.errorDescription
+            ?? "This video could not be played."
+        if let playbackFileHandle { try? playbackFileHandle.close() }
+        playbackFileHandle = nil
+        ChatMediaTempFiles.removeTemporaryFile(temporaryAliasURL)
+        temporaryAliasURL = nil
+        playbackURL = nil
+        if ownsFileURL { ChatMediaTempFiles.removeTemporaryFile(sourceFileURL) }
+        sourceFileURL = nil
+        ownsFileURL = false
+        protectedOriginalLease = nil
     }
 }
 

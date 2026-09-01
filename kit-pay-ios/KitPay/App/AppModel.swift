@@ -2315,7 +2315,9 @@ final class AppModel: ObservableObject {
         var displayedState = appReviewDemoProjectedState(from: projection.state)
         displayedState.transactions =
             CustomerTransactionPresentationPolicy.customerVisibleTransactions(
-                displayedState.transactions
+                displayedState.transactions,
+                selectedWalletID: displayedState.selectedWalletId,
+                wallets: displayedState.wallets
             )
         state = displayedState
         syncAvatarCacheAccount()
@@ -6671,7 +6673,8 @@ final class AppModel: ObservableObject {
             userID: expectedUserID
         ) else { return }
 
-        if let selectedWalletID = state.selectedWalletId {
+        if let selectedWalletID = state.selectedWalletId,
+           let selectedWallet = state.wallets.first(where: { $0.id == selectedWalletID }) {
             do {
                 let transactions = CustomerTransactionPresentationPolicy
                     .customerVisibleTransactions(
@@ -6679,7 +6682,8 @@ final class AppModel: ObservableObject {
                             expectedSessionID
                         ) {
                             try await api.transactions(walletId: selectedWalletID).items
-                        }
+                        },
+                        for: selectedWallet
                     )
                 guard await callHistoryContextIsCurrent(
                     accountEpoch: expectedAccountEpoch,

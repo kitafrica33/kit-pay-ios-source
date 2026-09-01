@@ -1795,6 +1795,113 @@ final class ChatMediaPolicyTests: XCTestCase {
         )
     }
 
+    func testVideoPlaybackInspectionUsesContainerBytesInsteadOfAnIncorrectMIME() throws {
+        let inspected = try ChatVideoPlaybackAssetPolicy.inspect(
+            header: isoBaseMediaHeader(majorBrand: "qt  "),
+            declaredMediaType: "video/mp4",
+            sourcePathExtension: "mp4"
+        )
+
+        XCTAssertEqual(inspected.container, .quickTime)
+        XCTAssertEqual(inspected.playbackMediaType, "video/quicktime")
+        XCTAssertTrue(inspected.requiresCanonicalExtension)
+    }
+
+    func testVideoPlaybackInspectionRecognizesMP4AndWebM() throws {
+        let mp4 = try ChatVideoPlaybackAssetPolicy.inspect(
+            header: isoBaseMediaHeader(majorBrand: "mp42"),
+            declaredMediaType: "video/mp4",
+            sourcePathExtension: "mp4"
+        )
+        XCTAssertEqual(mp4.container, .isoBaseMedia)
+        XCTAssertEqual(mp4.playbackMediaType, "video/mp4")
+        XCTAssertFalse(mp4.requiresCanonicalExtension)
+
+        let webM = try ChatVideoPlaybackAssetPolicy.inspect(
+            header: Data([0x1a, 0x45, 0xdf, 0xa3, 0x01, 0x00]),
+            declaredMediaType: "video/webm",
+            sourcePathExtension: "webm"
+        )
+        XCTAssertEqual(webM.container, .webM)
+        XCTAssertFalse(webM.requiresCanonicalExtension)
+    }
+
+    func testVideoPlaybackInspectionRejectsBytesThatAreNotAVideoContainer() {
+        XCTAssertThrowsError(try ChatVideoPlaybackAssetPolicy.inspect(
+            header: Data("not a video".utf8),
+            declaredMediaType: "video/mp4",
+            sourcePathExtension: "mp4"
+        )) { error in
+            XCTAssertEqual(error as? ChatVideoPlaybackPreparationError, .invalidFile)
+        }
+    }
+
+    func testVideoPlaybackPreparationRejectsAFileWhoseAuthenticatedSizeDoesNotMatch() async throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "kit-video-size-mismatch-\(UUID().uuidString).mp4"
+        )
+        try isoBaseMediaHeader(majorBrand: "mp42").write(to: url, options: .atomic)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        do {
+            _ = try await ChatVideoPlaybackAssetPolicy.prepare(
+                fileURL: url,
+                declaredMediaType: "video/mp4",
+                expectedByteCount: 999
+            )
+            XCTFail("A partial or replaced local file must not reach AVPlayer")
+        } catch {
+            XCTAssertEqual(error as? ChatVideoPlaybackPreparationError, .invalidFile)
+        }
+    }
+
+    func testCompleteMP4PassesThePlaybackProbe() async throws {
+        let url = try await makePlayableVideo(fileType: .mp4, pathExtension: "mp4")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let byteCount = try XCTUnwrap(
+            (try FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?
+                .intValue
+        )
+
+        let prepared = try await ChatVideoPlaybackAssetPolicy.prepare(
+            fileURL: url,
+            declaredMediaType: "video/mp4",
+            expectedByteCount: byteCount
+        )
+        defer { ChatMediaTempFiles.removeTemporaryFile(prepared.temporaryAliasURL) }
+
+        XCTAssertNil(prepared.temporaryAliasURL)
+        XCTAssertGreaterThan(prepared.duration, 0)
+        XCTAssertEqual(prepared.playbackURL, url)
+    }
+
+    func testQuickTimeBytesMislabeledAsMP4GetAPlayableMOVAlias() async throws {
+        let source = try await makePlayableVideo(fileType: .mov, pathExtension: "mov")
+        let mislabeled = try ChatMediaTempFiles.linkTemporaryFile(
+            from: source,
+            mediaType: "video/mp4"
+        )
+        defer {
+            try? FileManager.default.removeItem(at: source)
+            ChatMediaTempFiles.removeTemporaryFile(mislabeled)
+        }
+        let byteCount = try XCTUnwrap(
+            (try FileManager.default.attributesOfItem(atPath: mislabeled.path)[.size] as? NSNumber)?
+                .intValue
+        )
+
+        let prepared = try await ChatVideoPlaybackAssetPolicy.prepare(
+            fileURL: mislabeled,
+            declaredMediaType: "video/mp4",
+            expectedByteCount: byteCount
+        )
+        defer { ChatMediaTempFiles.removeTemporaryFile(prepared.temporaryAliasURL) }
+
+        XCTAssertEqual(prepared.playbackURL.pathExtension, "mov")
+        XCTAssertNotNil(prepared.temporaryAliasURL)
+        XCTAssertGreaterThan(prepared.duration, 0)
+    }
+
     func testConversationOrderingPutsPinnedFirstThenMostRecent() {
         let older = Date(timeIntervalSince1970: 1_000)
         let newer = Date(timeIntervalSince1970: 2_000)
@@ -1940,5 +2047,76 @@ final class ChatMediaPolicyTests: XCTestCase {
             currentDeviceID: currentDeviceID,
             recipientUserID: recipientUserID
         )
+    }
+
+    private func isoBaseMediaHeader(majorBrand: String) -> Data {
+        var bytes = Data([0, 0, 0, 24])
+        bytes.append(Data("ftyp".utf8))
+        bytes.append(Data(majorBrand.utf8))
+        bytes.append(Data([0, 0, 0, 0]))
+        bytes.append(Data("isom".utf8))
+        bytes.append(Data("mp42".utf8))
+        return bytes
+    }
+
+    private func makePlayableVideo(
+        fileType: AVFileType,
+        pathExtension: String
+    ) async throws -> URL {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "kit-playback-probe-\(UUID().uuidString).\(pathExtension)"
+        )
+        let writer = try AVAssetWriter(outputURL: url, fileType: fileType)
+        let input = AVAssetWriterInput(
+            mediaType: .video,
+            outputSettings: [
+                AVVideoCodecKey: AVVideoCodecType.h264,
+                AVVideoWidthKey: 16,
+                AVVideoHeightKey: 16,
+            ]
+        )
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: input,
+            sourcePixelBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
+                kCVPixelBufferWidthKey as String: 16,
+                kCVPixelBufferHeightKey as String: 16,
+            ]
+        )
+        guard writer.canAdd(input) else {
+            throw ChatVideoPlaybackPreparationError.unsupportedVideo
+        }
+        writer.add(input)
+        guard writer.startWriting() else {
+            throw writer.error ?? ChatVideoPlaybackPreparationError.unsupportedVideo
+        }
+        writer.startSession(atSourceTime: .zero)
+        guard let pool = adaptor.pixelBufferPool else {
+            throw ChatVideoPlaybackPreparationError.unsupportedVideo
+        }
+        var buffer: CVPixelBuffer?
+        guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &buffer) == kCVReturnSuccess,
+              let buffer
+        else { throw ChatVideoPlaybackPreparationError.unsupportedVideo }
+        CVPixelBufferLockBaseAddress(buffer, [])
+        if let base = CVPixelBufferGetBaseAddress(buffer) {
+            memset(base, 0, CVPixelBufferGetDataSize(buffer))
+        }
+        CVPixelBufferUnlockBaseAddress(buffer, [])
+        guard input.isReadyForMoreMediaData,
+              adaptor.append(buffer, withPresentationTime: .zero),
+              adaptor.append(
+                  buffer,
+                  withPresentationTime: CMTime(seconds: 1, preferredTimescale: 600)
+              )
+        else { throw writer.error ?? ChatVideoPlaybackPreparationError.unsupportedVideo }
+        input.markAsFinished()
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            writer.finishWriting { continuation.resume() }
+        }
+        guard writer.status == .completed else {
+            throw writer.error ?? ChatVideoPlaybackPreparationError.unsupportedVideo
+        }
+        return url
     }
 }

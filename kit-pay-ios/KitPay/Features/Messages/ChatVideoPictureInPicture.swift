@@ -1,5 +1,6 @@
 import AVFoundation
 import AVKit
+import Foundation
 import UIKit
 
 /// The small state boundary between asking AVKit to start Picture in Picture and AVKit reporting
@@ -15,60 +16,204 @@ struct ChatVideoGalleryIdentity: Equatable {
     let itemIndex: Int?
 }
 
-/// A local AVPlayer may report a stall/failure while it is still well short of the duration that
-/// AVFoundation read from the complete, integrity-verified file. Only that provable early stop is
-/// eligible for automatic recovery; an unknown duration or a stop at the natural tail is never
-/// replayed. The cap also prevents a malformed-but-parseable file from entering a retry loop.
-enum ChatVideoPlaybackRecoveryPolicy {
-    static let maximumAutomaticAttempts = 2
-    static let recentPlaybackEvidenceWindow: TimeInterval = 3
+/// Container facts read from the plaintext itself. A remote descriptor is authenticated, but an
+/// Android content provider can still describe QuickTime bytes as `video/mp4`; AVFoundation then
+/// receives a `.mp4` URL for a `.mov` file. Keep the wire fact for identity checks and use this
+/// independently derived fact only at the local playback boundary.
+enum ChatVideoContainer: Equatable {
+    case isoBaseMedia
+    case quickTime
+    case webM
+    case unknown
 
-    static func shouldRecover(
-        currentTime: Double,
-        duration: Double,
-        intendsToPlay: Bool,
-        attemptCount: Int
-    ) -> Bool {
-        guard intendsToPlay,
-              attemptCount < maximumAutomaticAttempts,
-              currentTime.isFinite,
-              duration.isFinite,
-              currentTime >= 0,
-              duration > 0,
-              currentTime < duration
-        else { return false }
+    var mediaType: String? {
+        switch self {
+        case .isoBaseMedia: "video/mp4"
+        case .quickTime: "video/quicktime"
+        case .webM: "video/webm"
+        case .unknown: nil
+        }
+    }
+}
 
-        // Treat the final sliver as a genuine end. The relative component scales for long clips,
-        // while the floor keeps timestamp rounding from restarting very short videos.
-        let endTolerance = max(0.25, min(1, duration * 0.02))
-        return duration - currentTime > endTolerance
+struct ChatVideoPlaybackFileInspection: Equatable {
+    let container: ChatVideoContainer
+    let playbackMediaType: String
+    let requiresCanonicalExtension: Bool
+}
+
+enum ChatVideoPlaybackPreparationError: LocalizedError, Equatable {
+    case invalidFile
+    case unsupportedVideo
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidFile:
+            "This video is incomplete or damaged."
+        case .unsupportedVideo:
+            "This video's format is not supported on this iPhone."
+        }
+    }
+}
+
+struct ChatVideoPreparedAsset {
+    let asset: AVURLAsset
+    let playbackURL: URL
+    let temporaryAliasURL: URL?
+    let duration: Double
+}
+
+/// Validates the complete local file before AVPlayer owns it. This closes two production faults:
+/// a received file could reach AVPlayer without a playable video track, and a provider-declared
+/// MIME could give valid QuickTime/MP4 bytes the wrong extension. The latter is repaired with a
+/// same-volume hard link, so existing E2EE media remains playable without another download or a
+/// large copy. Unsupported/corrupt bytes fail before player callbacks can enter an unsafe loop.
+enum ChatVideoPlaybackAssetPolicy {
+    private static let supportedDeclaredMediaTypes: Set<String> = [
+        "video/mp4",
+        "video/quicktime",
+        "video/webm",
+    ]
+
+    static func inspect(
+        header: Data,
+        declaredMediaType rawMediaType: String,
+        sourcePathExtension: String
+    ) throws -> ChatVideoPlaybackFileInspection {
+        let declaredMediaType = rawMediaType.lowercased()
+        guard supportedDeclaredMediaTypes.contains(declaredMediaType) else {
+            throw ChatVideoPlaybackPreparationError.unsupportedVideo
+        }
+
+        let container = container(for: header)
+        guard let detectedMediaType = container.mediaType else {
+            throw ChatVideoPlaybackPreparationError.invalidFile
+        }
+        let expectedExtension = SecureMediaLocalFilePolicy.fileExtension(
+            for: detectedMediaType
+        )
+        return ChatVideoPlaybackFileInspection(
+            container: container,
+            playbackMediaType: detectedMediaType,
+            requiresCanonicalExtension:
+                sourcePathExtension.lowercased() != expectedExtension
+                    || declaredMediaType != detectedMediaType
+        )
     }
 
+    static func prepare(
+        fileURL: URL,
+        declaredMediaType: String,
+        expectedByteCount: Int
+    ) async throws -> ChatVideoPreparedAsset {
+        guard expectedByteCount > 0 else {
+            throw ChatVideoPlaybackPreparationError.invalidFile
+        }
+        let values = try fileURL.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+        guard values.isRegularFile == true, values.fileSize == expectedByteCount else {
+            throw ChatVideoPlaybackPreparationError.invalidFile
+        }
+
+        let handle = try FileHandle(forReadingFrom: fileURL)
+        let header: Data
+        do {
+            header = try handle.read(upToCount: 64) ?? Data()
+            try handle.close()
+        } catch {
+            try? handle.close()
+            throw ChatVideoPlaybackPreparationError.invalidFile
+        }
+        let inspection = try inspect(
+            header: header,
+            declaredMediaType: declaredMediaType,
+            sourcePathExtension: fileURL.pathExtension
+        )
+
+        var temporaryAliasURL: URL?
+        let playbackURL: URL
+        if inspection.requiresCanonicalExtension {
+            do {
+                let alias = try ChatMediaTempFiles.linkTemporaryFile(
+                    from: fileURL,
+                    mediaType: inspection.playbackMediaType
+                )
+                temporaryAliasURL = alias
+                playbackURL = alias
+            } catch {
+                throw ChatVideoPlaybackPreparationError.invalidFile
+            }
+        } else {
+            playbackURL = fileURL
+        }
+
+        do {
+            // The canonical local extension already comes from inspected container bytes.
+            // AVURLAssetOutOfBandMIMETypeKey is not available in every supported iOS SDK, so
+            // relying on it would make the compatibility repair itself fail to compile.
+            let asset = AVURLAsset(url: playbackURL)
+            async let playableValue = asset.load(.isPlayable)
+            async let durationValue = asset.load(.duration)
+            async let videoTracksValue = asset.loadTracks(withMediaType: .video)
+            let (isPlayable, loadedDuration, videoTracks) = try await (
+                playableValue,
+                durationValue,
+                videoTracksValue
+            )
+            let seconds = loadedDuration.seconds
+            guard isPlayable,
+                  !videoTracks.isEmpty,
+                  seconds.isFinite,
+                  seconds > 0
+            else { throw ChatVideoPlaybackPreparationError.unsupportedVideo }
+            return ChatVideoPreparedAsset(
+                asset: asset,
+                playbackURL: playbackURL,
+                temporaryAliasURL: temporaryAliasURL,
+                duration: seconds
+            )
+        } catch {
+            ChatMediaTempFiles.removeTemporaryFile(temporaryAliasURL)
+            if error is CancellationError { throw error }
+            if let preparationError = error as? ChatVideoPlaybackPreparationError {
+                throw preparationError
+            }
+            throw ChatVideoPlaybackPreparationError.unsupportedVideo
+        }
+    }
+
+    private static func container(for header: Data) -> ChatVideoContainer {
+        let bytes = [UInt8](header)
+        if bytes.starts(with: [0x1a, 0x45, 0xdf, 0xa3]) {
+            return .webM
+        }
+        guard bytes.count >= 12,
+              Data(bytes[4 ..< 8]) == Data("ftyp".utf8)
+        else { return .unknown }
+        let majorBrand = Data(bytes[8 ..< 12])
+        return majorBrand == Data("qt  ".utf8) ? .quickTime : .isoBaseMedia
+    }
+}
+
+/// A complete local file has no network buffer to repair. AVPlayer already owns its ordinary
+/// decoder recovery; replacing its current item from stall/failure callbacks races AVKit's own
+/// observers and was the crash path seen after the first second of received-video playback.
+enum ChatVideoPlaybackFailurePolicy {
     enum Interruption {
         case stalled
         case failed
     }
 
-    /// SwiftUI's native `VideoPlayer` controls do not expose a play/pause callback. Its recovery
-    /// path therefore requires AVPlayer-owned evidence: an active wait for a stall, or a failed
-    /// item immediately after observed playback progress. An ordinary pause has neither and can
-    /// never be mistaken for a request to resume.
-    static func permitsNativeControlsRecovery(
-        interruption: Interruption,
-        playerIsWaitingToPlay: Bool,
-        itemIsFailed: Bool,
-        secondsSinceLastProgress: TimeInterval?
-    ) -> Bool {
+    enum Action: Equatable {
+        case letPlayerRecover
+        case stopAndReport
+    }
+
+    static let permitsAutomaticPlayerItemReplacement = false
+
+    static func action(for interruption: Interruption) -> Action {
         switch interruption {
-        case .stalled:
-            return playerIsWaitingToPlay
-        case .failed:
-            guard itemIsFailed,
-                  let secondsSinceLastProgress,
-                  secondsSinceLastProgress.isFinite,
-                  secondsSinceLastProgress >= 0
-            else { return false }
-            return secondsSinceLastProgress <= recentPlaybackEvidenceWindow
+        case .stalled: .letPlayerRecover
+        case .failed: .stopAndReport
         }
     }
 }

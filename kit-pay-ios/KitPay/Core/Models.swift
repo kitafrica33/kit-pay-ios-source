@@ -2869,6 +2869,29 @@ enum CustomerTransactionPresentationPolicy {
         }
     }
 
+    /// Resolves the selected wallet before publishing a cached or refreshed page to customer UI.
+    /// A missing/stale selection fails closed instead of briefly showing another wallet's rows.
+    static func customerVisibleTransactions(
+        _ transactions: [WalletTransaction],
+        selectedWalletID: String?,
+        wallets: [Wallet]
+    ) -> [WalletTransaction] {
+        guard let selectedWalletID,
+              let wallet = wallets.first(where: { $0.id == selectedWalletID })
+        else { return [] }
+        return customerVisibleTransactions(transactions, for: wallet)
+    }
+
+    /// Revalidates a transaction carried by navigation state before a detail screen renders it.
+    /// Navigation can outlive a wallet switch or cache migration, so it is not an authority.
+    static func customerVisibleTransaction(
+        _ transaction: WalletTransaction,
+        for wallet: Wallet?
+    ) -> WalletTransaction? {
+        guard let wallet else { return nil }
+        return customerVisibleTransactions([transaction], for: wallet).first
+    }
+
     /// Sums the server-provided combined customer totals for the selected wallet page. Each row
     /// is independently validated and converted through `Decimal`; malformed or over-precision
     /// values fail closed. Addition saturates so an unexpectedly large valid page cannot wrap.

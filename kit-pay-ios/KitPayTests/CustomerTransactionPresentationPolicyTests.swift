@@ -2,6 +2,95 @@ import XCTest
 @testable import KitPay
 
 final class CustomerTransactionPresentationPolicyTests: XCTestCase {
+    func testFilteredProductionHistoryDecodesAsDenseArrayAndRemainsVisible() throws {
+        // The backend may discard an unprovable accounting row before serializing this page.
+        // `items` must still be a dense JSON array (`values()` in Laravel), not an object whose
+        // numeric keys retain the gap left by `filter`; an object cannot decode as this contract.
+        let payload = Data(
+            """
+            {
+              "items": [
+                {
+                  "id": "11111111-1111-4111-8111-111111111111",
+                  "wallet_id": "wallet-1",
+                  "reference": "KDP-0001",
+                  "amount": "200000.00",
+                  "totals": {"added": "200000.00", "deducted": "0.00"},
+                  "currency": {"code": "UGX", "scale": "2"},
+                  "type": "bank_deposit",
+                  "direction": "credit",
+                  "status": "completed",
+                  "counterparty": null,
+                  "note": null,
+                  "claim": null,
+                  "occurred_at": "2026-09-01T08:30:00Z"
+                },
+                {
+                  "id": "22222222-2222-4222-8222-222222222222",
+                  "wallet_id": "wallet-1",
+                  "reference": "KIT-0002",
+                  "amount": "150000.00",
+                  "totals": {"added": "0.00", "deducted": "150000.00"},
+                  "currency": {"code": "UGX", "scale": "2"},
+                  "type": "internal_transfer",
+                  "direction": "debit",
+                  "status": "completed",
+                  "counterparty": null,
+                  "note": null,
+                  "claim": null,
+                  "occurred_at": "2026-09-01T08:25:00Z"
+                }
+              ],
+              "page": {"next_cursor": null, "has_more": false, "limit": 50}
+            }
+            """.utf8
+        )
+
+        let page = try JSONDecoder().decode(TransactionPage.self, from: payload)
+        let visible = CustomerTransactionPresentationPolicy.customerVisibleTransactions(
+            page.items,
+            selectedWalletID: "wallet-1",
+            wallets: [wallet()]
+        )
+
+        XCTAssertEqual(visible.map(\.id), [
+            "11111111-1111-4111-8111-111111111111",
+            "22222222-2222-4222-8222-222222222222",
+        ])
+        XCTAssertEqual(visible.map(\.customerImpactLabel), ["Money Added", "Money Deducted"])
+        XCTAssertEqual(visible.map(\.customerImpactAmount), ["200000.00", "150000.00"])
+        XCTAssertEqual(page.page.limit, 50)
+    }
+
+    func testGappedObjectShapedHistoryItemsFailClosed() {
+        let payload = Data(
+            """
+            {
+              "items": {
+                "0": {
+                  "id": "11111111-1111-4111-8111-111111111111",
+                  "wallet_id": "wallet-1",
+                  "reference": "KDP-0001",
+                  "amount": "200000.00",
+                  "totals": {"added": "200000.00", "deducted": "0.00"},
+                  "currency": {"code": "UGX", "scale": "2"},
+                  "type": "bank_deposit",
+                  "direction": "credit",
+                  "status": "completed",
+                  "counterparty": null,
+                  "note": null,
+                  "claim": null,
+                  "occurred_at": "2026-09-01T08:30:00Z"
+                }
+              },
+              "page": {"next_cursor": null, "has_more": false, "limit": 50}
+            }
+            """.utf8
+        )
+
+        XCTAssertThrowsError(try JSONDecoder().decode(TransactionPage.self, from: payload))
+    }
+
     func testAllowlistExactlyMatchesBackendCustomerHistoryContract() {
         XCTAssertEqual(
             CustomerTransactionPresentationPolicy.supportedTypes,
@@ -223,6 +312,67 @@ final class CustomerTransactionPresentationPolicyTests: XCTestCase {
         XCTAssertEqual(visible.map(\.id), ["selected"])
         XCTAssertEqual(summary.addedMinorUnits, 10_000)
         XCTAssertEqual(summary.deductedMinorUnits, 0)
+    }
+
+    func testSelectedWalletProjectionFailsClosedForMissingOrStaleSelection() {
+        let selectedWallet = wallet()
+        let rows = [
+            transaction(id: "selected"),
+            transaction(id: "other-wallet", walletId: "wallet-2"),
+        ]
+
+        XCTAssertTrue(
+            CustomerTransactionPresentationPolicy.customerVisibleTransactions(
+                rows,
+                selectedWalletID: nil,
+                wallets: [selectedWallet]
+            ).isEmpty
+        )
+        XCTAssertTrue(
+            CustomerTransactionPresentationPolicy.customerVisibleTransactions(
+                rows,
+                selectedWalletID: "stale-wallet",
+                wallets: [selectedWallet]
+            ).isEmpty
+        )
+        XCTAssertEqual(
+            CustomerTransactionPresentationPolicy.customerVisibleTransactions(
+                rows,
+                selectedWalletID: selectedWallet.id,
+                wallets: [selectedWallet]
+            ).map(\.id),
+            ["selected"]
+        )
+    }
+
+    func testDetailProjectionRevalidatesNavigationStateAgainstSelectedWallet() {
+        let selectedWallet = wallet()
+        let valid = transaction(id: "selected")
+        let otherWallet = transaction(id: "other-wallet", walletId: "wallet-2")
+        let internalRow = transaction(id: "internal", type: "institutional_commission")
+
+        XCTAssertEqual(
+            CustomerTransactionPresentationPolicy.customerVisibleTransaction(
+                valid,
+                for: selectedWallet
+            )?.id,
+            valid.id
+        )
+        XCTAssertNil(
+            CustomerTransactionPresentationPolicy.customerVisibleTransaction(valid, for: nil)
+        )
+        XCTAssertNil(
+            CustomerTransactionPresentationPolicy.customerVisibleTransaction(
+                otherWallet,
+                for: selectedWallet
+            )
+        )
+        XCTAssertNil(
+            CustomerTransactionPresentationPolicy.customerVisibleTransaction(
+                internalRow,
+                for: selectedWallet
+            )
+        )
     }
 
     func testAmountsThatCannotBeRepresentedExactlyInMinorUnitsFailClosed() {
