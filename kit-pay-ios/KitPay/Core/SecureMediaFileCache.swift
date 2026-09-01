@@ -347,6 +347,105 @@ actor SecureMediaFileCache {
         }
     }
 
+    /// Moves a legacy plaintext attachment out of the encrypted state projection and into the
+    /// file-backed receiver cache. The caller still owns the authenticated inline bytes until it
+    /// atomically commits the matching `.protectedFile` record and clears `attachmentData`; a
+    /// crash before that commit therefore leaves the original state intact and, at worst, an
+    /// age-swept orphan file. Exact retries reuse only byte-identical output.
+    func promoteInlineDataToProtectedOriginal(
+        _ data: Data,
+        forStorageKey storageKey: String,
+        userID: String,
+        mediaType: String,
+        expectedByteCount: Int
+    ) throws -> SecureMediaOriginalAccessLease? {
+        guard expectedByteCount > 0,
+              data.count == expectedByteCount,
+              SecureMessagingWire.allowedAttachmentMediaTypes.contains(mediaType),
+              KitChatMediaLimits.fits(
+                  expectedByteCount,
+                  kind: KitChatMediaKind(mediaType: mediaType)
+              ),
+              let accountID = canonicalAccountID(userID),
+              let canonicalStorageKey = canonicalStorageKey(storageKey),
+              let destination = originalFileURL(
+                  forStorageKey: canonicalStorageKey,
+                  accountID: accountID,
+                  mediaType: mediaType
+              )
+        else { return nil }
+        let entryKey = cacheEntryKey(
+            storageKey: canonicalStorageKey,
+            accountID: accountID
+        )
+        guard !reservedEvictionKeys.contains(entryKey) else { return nil }
+
+        try ensureDirectory(for: accountID)
+        let staging = accountDirectoryURL(for: accountID).appendingPathComponent(
+            ".\(UUID().uuidString.lowercased()).promoting-inline",
+            isDirectory: false
+        )
+        defer { try? FileManager.default.removeItem(at: staging) }
+        try data.write(to: staging, options: [.atomic, .completeFileProtectionUnlessOpen])
+        try protectOriginal(at: staging)
+        try excludeFromBackup(staging)
+        guard regularFileByteCount(at: staging) == expectedByteCount else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+
+        let existingOriginals = originalFileURLs(
+            forStorageKey: canonicalStorageKey,
+            accountID: accountID
+        ).filter { FileManager.default.fileExists(atPath: $0.path) }
+        let sealedExists = sealedFileURL(
+            forStorageKey: canonicalStorageKey,
+            accountID: accountID
+        ).map { FileManager.default.fileExists(atPath: $0.path) } == true
+        guard !sealedExists else { throw CocoaError(.fileWriteFileExists) }
+
+        if !existingOriginals.isEmpty {
+            guard existingOriginals.count == 1,
+                  existingOriginals[0].standardizedFileURL
+                    == destination.standardizedFileURL,
+                  regularFileByteCount(at: existingOriginals[0]) == expectedByteCount,
+                  filesAreIdentical(existingOriginals[0], staging)
+            else { throw CocoaError(.fileReadCorruptFile) }
+        } else {
+            try FileManager.default.moveItem(at: staging, to: destination)
+            guard regularFileByteCount(at: destination) == expectedByteCount else {
+                try? FileManager.default.removeItem(at: destination)
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            indexOriginalURL(
+                destination,
+                storageKey: canonicalStorageKey,
+                accountID: accountID
+            )
+        }
+
+        let leaseID = UUID()
+        activeOriginalLeases[entryKey, default: []].insert(leaseID)
+        recordAccess(
+            to: destination,
+            storageKey: canonicalStorageKey,
+            accountID: accountID
+        )
+        return SecureMediaOriginalAccessLease(
+            fileURL: destination,
+            id: leaseID,
+            accountID: accountID,
+            storageKey: canonicalStorageKey
+        ) { [weak self] id, releasedAccountID, releasedStorageKey in
+            Task {
+                await self?.releaseOriginalAccessLease(
+                    id: id,
+                    accountID: releasedAccountID,
+                    storageKey: releasedStorageKey
+                )
+            }
+        }
+    }
+
     /// Finalizes the cache half of a legacy-blob promotion after protected state points at the
     /// verified original. This intentionally removes only the sealed representation.
     func removeEncryptedBlobRepresentation(forStorageKey storageKey: String, userID: String) {
@@ -1330,7 +1429,10 @@ actor SecureMediaFileCache {
         var removed = 0
         for url in entries.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
             if removed < maximumRemovals,
-               ["importing", "encrypting", "hydrating", "verifying", "repairing"]
+               [
+                   "importing", "encrypting", "hydrating", "verifying", "repairing",
+                   "promoting", "promoting-inline",
+               ]
                   .contains(url.pathExtension),
                let values = try? url.resourceValues(
                    forKeys: [.contentModificationDateKey, .isRegularFileKey]

@@ -3,6 +3,53 @@ import XCTest
 @testable import KitPay
 
 final class WalletAPIEncodingTests: XCTestCase {
+    func testWalletHistoryRefreshIdentityIncludesAccountSessionAndWallet() {
+        let accountEpoch = UUID()
+        let base = WalletHistoryRefreshKey(
+            accountEpoch: accountEpoch,
+            userID: "user-a",
+            sessionID: "session-a",
+            walletID: "wallet-a"
+        )
+
+        XCTAssertEqual(
+            base,
+            WalletHistoryRefreshKey(
+                accountEpoch: accountEpoch,
+                userID: "user-a",
+                sessionID: "session-a",
+                walletID: "wallet-a"
+            )
+        )
+        XCTAssertNotEqual(
+            base,
+            WalletHistoryRefreshKey(
+                accountEpoch: UUID(),
+                userID: "user-a",
+                sessionID: "session-a",
+                walletID: "wallet-a"
+            )
+        )
+        XCTAssertNotEqual(
+            base,
+            WalletHistoryRefreshKey(
+                accountEpoch: accountEpoch,
+                userID: "user-a",
+                sessionID: "session-b",
+                walletID: "wallet-a"
+            )
+        )
+        XCTAssertNotEqual(
+            base,
+            WalletHistoryRefreshKey(
+                accountEpoch: accountEpoch,
+                userID: "user-a",
+                sessionID: "session-a",
+                walletID: "wallet-b"
+            )
+        )
+    }
+
     func testCapabilitiesUsesTheSignedInCohortWhenSessionIsAvailable() {
         XCTAssertEqual(APIClient.capabilitiesAuthentication, .ifAvailable)
         XCTAssertTrue(APIClient.capabilitiesAuthentication.readsCurrentSession)

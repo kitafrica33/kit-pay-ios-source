@@ -263,6 +263,23 @@ private struct AuthenticatedSecurityContext {
     let sessionID: String
 }
 
+/// Exact ownership boundary for one customer wallet-history refresh. View tasks are deliberately
+/// absent: SwiftUI may cancel `.task` and `.refreshable` work as views move on and off screen, but
+/// an authenticated response must still reach the encrypted local store while this identity is
+/// current. A different account, session, or selected wallet is the only valid replacement.
+struct WalletHistoryRefreshKey: Equatable {
+    let accountEpoch: UUID
+    let userID: String
+    let sessionID: String
+    let walletID: String
+}
+
+private struct WalletHistoryRefreshFlight {
+    let id: UUID
+    let key: WalletHistoryRefreshKey
+    let task: Task<Void, Never>
+}
+
 private enum AccountSignOutResult {
     case completed
     case contextChanged
@@ -1069,6 +1086,10 @@ final class AppModel: ObservableObject {
     private var foregroundAuthoritativeRefreshGate = ForegroundAuthoritativeRefreshGate()
     private var foregroundAuthoritativeRefreshTask: Task<Void, Never>?
     private var foregroundAuthoritativeRefreshTaskID: UUID?
+    /// Model-owned so cancellation of a SwiftUI caller cannot discard a successful transactions
+    /// response before it is durably committed. Concurrent refreshes for the same identity join
+    /// this flight; changing account, session, or selected wallet cancels and replaces it.
+    private var walletHistoryRefreshFlight: WalletHistoryRefreshFlight?
     private var appIsInBackground = false
     /// Mirrors what `ProfileAvatarCache` was last told, so publishing state stays a cheap
     /// comparison instead of an actor hop on every projection.
@@ -1466,6 +1487,7 @@ final class AppModel: ObservableObject {
         callEventDrainTask?.cancel()
         callHistoryRefreshTask?.cancel()
         callHistoryBackfillTask?.cancel()
+        walletHistoryRefreshFlight?.task.cancel()
         callSystemEventDrainTask?.cancel()
         waitingCallMergeTask?.cancel()
         visibleConversationSyncTask?.cancel()
@@ -3586,6 +3608,7 @@ final class AppModel: ObservableObject {
         activeConversationID = nil
         stopVisibleConversationSync()
         resetForegroundAuthoritativeRefresh()
+        cancelWalletHistoryRefresh()
         pendingDeepLink = nil
         accountEpoch = UUID()
         guard await resetProtectedCallRecoveryCycle(retiringQueuedEvents: true) else {
@@ -4536,6 +4559,7 @@ final class AppModel: ObservableObject {
         }
         isSigningOut = true
         resetForegroundAuthoritativeRefresh()
+        cancelWalletHistoryRefresh()
         // Revoke the non-idempotent waiting invitation before sign-out reaches its first await.
         // The normal teardown below still clears the retained waiting presentation and CallKit.
         cancelWaitingCallMergeOperation()
@@ -6694,9 +6718,10 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Refreshes only the currently selected wallet's customer-safe activity projection.
-    /// Keeping this operation separate from communication sync also gives pull-to-refresh a
-    /// deterministic finance completion point even when media upload or E2EE recovery continues.
+    /// Starts or joins the model-owned refresh for the current wallet. The unstructured task is
+    /// intentionally independent from its SwiftUI caller: dismissing a refresh control or
+    /// replacing a view must not cancel an authenticated response between HTTP 200 and the local
+    /// store commit. Exact identity changes still revoke the flight through its context fence.
     private func refreshSelectedWalletTransactions(
         accountEpoch expectedAccountEpoch: UUID,
         sessionID expectedSessionID: String,
@@ -6705,25 +6730,61 @@ final class AppModel: ObservableObject {
         guard let selectedWalletID = state.selectedWalletId,
               let selectedWallet = state.wallets.first(where: { $0.id == selectedWalletID })
         else { return }
+
+        let key = WalletHistoryRefreshKey(
+            accountEpoch: expectedAccountEpoch,
+            userID: expectedUserID,
+            sessionID: expectedSessionID,
+            walletID: selectedWalletID
+        )
+        if let flight = walletHistoryRefreshFlight, flight.key == key {
+            await flight.task.value
+            return
+        }
+
+        walletHistoryRefreshFlight?.task.cancel()
+        let flightID = UUID()
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.performSelectedWalletTransactionsRefresh(
+                key: key,
+                selectedWallet: selectedWallet
+            )
+            self.finishWalletHistoryRefresh(id: flightID)
+        }
+        walletHistoryRefreshFlight = WalletHistoryRefreshFlight(
+            id: flightID,
+            key: key,
+            task: task
+        )
+        await task.value
+    }
+
+    /// Runs exclusively inside the model-owned flight above. `Task.isCancelled` therefore means
+    /// the account/session/wallet owner changed, never merely that a SwiftUI view disappeared.
+    private func performSelectedWalletTransactionsRefresh(
+        key: WalletHistoryRefreshKey,
+        selectedWallet: Wallet
+    ) async {
         do {
             let transactions = CustomerTransactionPresentationPolicy
                 .customerVisibleTransactions(
                     try await APIClientSessionBinding.$sessionID.withValue(
-                        expectedSessionID
+                        key.sessionID
                     ) {
-                        try await api.transactions(walletId: selectedWalletID).items
+                        try await api.transactions(walletId: key.walletID).items
                     },
                     for: selectedWallet
                 )
             guard await callHistoryContextIsCurrent(
-                accountEpoch: expectedAccountEpoch,
-                sessionID: expectedSessionID,
-                userID: expectedUserID
-            ) else { return }
+                accountEpoch: key.accountEpoch,
+                sessionID: key.sessionID,
+                userID: key.userID
+            ), state.selectedWalletId == key.walletID else { return }
             try await store.update { persisted in
-                guard persisted.profile?.id.caseInsensitiveCompare(expectedUserID)
+                guard persisted.profile?.id.caseInsensitiveCompare(key.userID)
                         == .orderedSame,
-                      persisted.selectedWalletId == selectedWalletID
+                      persisted.selectedWalletId == key.walletID
                 else { throw StoreError.accountChanged }
                 persisted.transactions = transactions
                 // The page above is only the latest slice of one wallet, so the starter
@@ -6738,10 +6799,10 @@ final class AppModel: ObservableObject {
                 }
             }
             guard await callHistoryContextIsCurrent(
-                accountEpoch: expectedAccountEpoch,
-                sessionID: expectedSessionID,
-                userID: expectedUserID
-            ) else { return }
+                accountEpoch: key.accountEpoch,
+                sessionID: key.sessionID,
+                userID: key.userID
+            ), state.selectedWalletId == key.walletID else { return }
             await publishLatestState()
         } catch {
             if RefreshCancellationPolicy.shouldSuppress(
@@ -6749,12 +6810,22 @@ final class AppModel: ObservableObject {
                 taskIsCancelled: Task.isCancelled
             ) { return }
             guard await callHistoryContextIsCurrent(
-                accountEpoch: expectedAccountEpoch,
-                sessionID: expectedSessionID,
-                userID: expectedUserID
-            ) else { return }
+                accountEpoch: key.accountEpoch,
+                sessionID: key.sessionID,
+                userID: key.userID
+            ), state.selectedWalletId == key.walletID else { return }
             lastError = error.localizedDescription
         }
+    }
+
+    private func finishWalletHistoryRefresh(id: UUID) {
+        guard walletHistoryRefreshFlight?.id == id else { return }
+        walletHistoryRefreshFlight = nil
+    }
+
+    private func cancelWalletHistoryRefresh() {
+        walletHistoryRefreshFlight?.task.cancel()
+        walletHistoryRefreshFlight = nil
     }
 
     private func loadCompleteCallHistory(
@@ -12514,6 +12585,116 @@ final class AppModel: ObservableObject {
         case .single(let descriptor, let descriptorText, let inlineData):
             // The policy carries inline bytes only at the exact declared size, and they live on
             // the identity-resolved row itself — nothing suspends between resolution and here.
+            if let inlineData,
+               KitChatMediaKind(mediaType: descriptor.mediaType) == .video,
+               let localRecord,
+               localRecord.direction == .received,
+               localRecord.localStorageKind == .encryptedState,
+               localRecord.localStorageKey == nil,
+               localRecord.remoteEncryptedObjectID == descriptor.storageKey,
+               localRecord.availabilityState == .localCached,
+               localRecord.downloadState == .downloaded {
+                // Legacy receivers kept the complete decrypted video inside the encrypted state
+                // row. Returning that Data makes the player retain one whole movie while
+                // AVFoundation allocates its own decoder buffers, and every unrelated state
+                // mutation (including wallet history) must rewrite the movie. Publish the exact
+                // authenticated bytes as a protected file first, then atomically retire only the
+                // still-identical inline row. The attachment id is the permanent local identity;
+                // the remote storage key remains a server reference and never names this file.
+                let localStorageKey = descriptor.attachmentID
+                guard let accessLease = try await SecureMediaFileCache.shared
+                    .promoteInlineDataToProtectedOriginal(
+                        inlineData,
+                        forStorageKey: localStorageKey,
+                        userID: userID,
+                        mediaType: descriptor.mediaType,
+                        expectedByteCount: descriptor.plaintextByteSize
+                    )
+                else { throw SecureMediaAttachmentError.invalidCiphertext }
+                try await store.update { persisted in
+                    guard persisted.profile?.id == userID,
+                          case .single(
+                              let currentDescriptor,
+                              let currentDescriptorText,
+                              let currentInlineData
+                          )? = SecureMediaLoadPolicy.resolve(
+                              messageID: messageID,
+                              conversationId: conversationId,
+                              itemIndex: itemIndex,
+                              in: persisted.messages
+                          ),
+                          currentDescriptor == descriptor,
+                          currentDescriptorText == descriptorText,
+                          currentInlineData == inlineData
+                    else { throw SecureMediaAttachmentError.invalidDescriptor }
+                    let indices = persisted.messages.indices.filter {
+                        persisted.messages[$0].id == messageID
+                            && persisted.messages[$0].conversationId == conversationId
+                    }
+                    guard indices.count == 1, let index = indices.first,
+                          LocalMediaRecordPolicy.record(
+                              messageID: messageID,
+                              conversationID: conversationId,
+                              attachmentID: descriptor.attachmentID,
+                              mediaType: descriptor.mediaType,
+                              fileSize: descriptor.plaintextByteSize,
+                              remoteStorageKey: descriptor.storageKey,
+                              in: persisted.messages
+                          ) == localRecord,
+                          LocalMediaRecordPolicy.promoteInlineReceivedToProtectedFile(
+                              &persisted.messages[index],
+                              attachmentID: descriptor.attachmentID,
+                              remoteStorageKey: descriptor.storageKey,
+                              localStorageKey: localStorageKey,
+                              expectedInlineData: inlineData
+                          )
+                    else { throw SecureMediaAttachmentError.invalidDescriptor }
+                }
+                await publishLatestState()
+                let current = await store.snapshot()
+                guard current.profile?.id == userID,
+                      case .single(
+                          let currentDescriptor,
+                          let currentDescriptorText,
+                          let currentInlineData
+                      )? = SecureMediaLoadPolicy.resolve(
+                          messageID: messageID,
+                          conversationId: conversationId,
+                          itemIndex: itemIndex,
+                          in: current.messages
+                      ),
+                      currentDescriptor == descriptor,
+                      currentDescriptorText == descriptorText,
+                      currentInlineData == nil,
+                      let promotedRecord = LocalMediaRecordPolicy.record(
+                          messageID: messageID,
+                          conversationID: conversationId,
+                          attachmentID: descriptor.attachmentID,
+                          mediaType: descriptor.mediaType,
+                          fileSize: descriptor.plaintextByteSize,
+                          remoteStorageKey: descriptor.storageKey,
+                          in: current.messages
+                      ),
+                      promotedRecord.localStorageKind == .protectedFile,
+                      promotedRecord.localStorageKey == localStorageKey
+                else { throw SecureMediaAttachmentError.invalidDescriptor }
+                if promotedRecord.duration == nil,
+                   let mediaID = UUID(uuidString: descriptor.attachmentID) {
+                    scheduleLocalMediaDuration(
+                        mediaID: mediaID,
+                        fileURL: accessLease.fileURL,
+                        mediaType: descriptor.mediaType
+                    )
+                }
+                return SecureMediaLoadPolicy.LoadedItem(localFile: .init(
+                    url: accessLease.fileURL,
+                    mediaType: descriptor.mediaType,
+                    caption: descriptor.caption,
+                    byteCount: descriptor.plaintextByteSize,
+                    attachmentID: descriptor.attachmentID,
+                    accessLease: accessLease
+                ))
+            }
             if let inlineData {
                 return SecureMediaLoadPolicy.LoadedItem(
                     data: inlineData,

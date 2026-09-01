@@ -4866,6 +4866,63 @@ enum LocalMediaRecordPolicy {
         }
     }
 
+    /// Atomically retires the legacy v1 inline receive after its authenticated plaintext has
+    /// been durably published as a protected file. Every wire and local identity is revalidated
+    /// before the large `attachmentData` value is cleared, so a stale playback task cannot erase
+    /// replacement media that merely has the same byte count.
+    static func promoteInlineReceivedToProtectedFile(
+        _ message: inout LocalMessage,
+        attachmentID: String,
+        remoteStorageKey: String,
+        localStorageKey: String,
+        expectedInlineData: Data,
+        now: Date = Date()
+    ) -> Bool {
+        guard let attachmentID = canonicalUUID(attachmentID),
+              let remoteStorageKey = canonicalUUID(remoteStorageKey),
+              let localStorageKey = canonicalUUID(localStorageKey),
+              !message.isOutgoing,
+              message.pendingAttachment == nil,
+              message.pendingMediaBatch == nil,
+              message.attachmentData == expectedInlineData,
+              !expectedInlineData.isEmpty,
+              let descriptor = KitMediaMessageDescriptor.parse(message.body),
+              descriptor.attachmentID == attachmentID,
+              descriptor.storageKey == remoteStorageKey,
+              localStorageKey == attachmentID,
+              descriptor.plaintextByteSize == expectedInlineData.count,
+              var records = message.localMediaRecords,
+              records.count == 1
+        else { return false }
+        let indices = records.indices.filter { records[$0].id == attachmentID }
+        guard indices.count == 1, let index = indices.first else { return false }
+        var record = records[index]
+        guard record.messageID == message.id,
+              record.conversationID == message.conversationId,
+              record.direction == .received,
+              record.mediaType == descriptor.mediaType,
+              record.fileSize == descriptor.plaintextByteSize,
+              record.remoteEncryptedObjectID == remoteStorageKey,
+              record.localStorageKind == .encryptedState,
+              record.localStorageKey == nil,
+              record.processingState == .ready,
+              record.uploadState == .notRequired,
+              record.downloadState == .downloaded,
+              record.encryptionState == .decrypted,
+              record.availabilityState == .localCached,
+              record.isStructurallyValid
+        else { return false }
+
+        record.localStorageKind = .protectedFile
+        record.localStorageKey = localStorageKey
+        record.updatedAt = now
+        guard record.isStructurallyValid else { return false }
+        records[index] = record
+        message.localMediaRecords = records
+        message.attachmentData = nil
+        return true
+    }
+
     /// A verified small receive may live in the account-bound encrypted state row instead of
     /// the file cache. Keep that storage fact explicit so a relaunch does not pretend the
     /// server object is the only available representation.

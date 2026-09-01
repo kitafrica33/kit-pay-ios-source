@@ -512,6 +512,88 @@ final class ChatMediaPolicyTests: XCTestCase {
         XCTAssertEqual(message.localMediaRecords?.first?.downloadState, .downloaded)
     }
 
+    func testLegacyInlineReceivedVideoPromotionClearsBytesAndKeepsExactIdentity() throws {
+        let bytes = Data(repeating: 0x4e, count: 4_000)
+        let descriptor = try makeDescriptor(
+            mediaType: "video/mp4",
+            plaintextByteSize: bytes.count,
+            caption: "A received clip"
+        )
+        var message = LocalMessage(
+            id: UUID(),
+            conversationId: UUID().uuidString.lowercased(),
+            senderId: UUID().uuidString.lowercased(),
+            body: descriptor.encoded,
+            createdAt: Date(timeIntervalSince1970: 1_700_000_000),
+            sentAt: Date(timeIntervalSince1970: 1_700_000_001),
+            state: .received,
+            failureReason: nil,
+            isOutgoing: false,
+            attachmentData: bytes
+        )
+
+        XCTAssertTrue(LocalMediaRecordPolicy.migrateAndRecover(&message))
+        XCTAssertEqual(message.localMediaRecords?.first?.localStorageKind, .encryptedState)
+        XCTAssertEqual(message.localMediaRecords?.first?.downloadState, .downloaded)
+
+        XCTAssertTrue(LocalMediaRecordPolicy.promoteInlineReceivedToProtectedFile(
+            &message,
+            attachmentID: descriptor.attachmentID,
+            remoteStorageKey: descriptor.storageKey,
+            localStorageKey: descriptor.attachmentID,
+            expectedInlineData: bytes,
+            now: Date(timeIntervalSince1970: 1_700_000_002)
+        ))
+        XCTAssertNil(message.attachmentData)
+        let promoted = try XCTUnwrap(message.localMediaRecords?.first)
+        XCTAssertEqual(promoted.localStorageKind, .protectedFile)
+        XCTAssertEqual(promoted.localStorageKey, descriptor.attachmentID)
+        XCTAssertEqual(promoted.remoteEncryptedObjectID, descriptor.storageKey)
+        XCTAssertEqual(promoted.availabilityState, .localCached)
+        XCTAssertEqual(promoted.downloadState, .downloaded)
+        XCTAssertEqual(promoted.encryptionState, .decrypted)
+        XCTAssertTrue(promoted.isStructurallyValid)
+        XCTAssertFalse(LocalMediaRecordPolicy.promoteInlineReceivedToProtectedFile(
+            &message,
+            attachmentID: descriptor.attachmentID,
+            remoteStorageKey: descriptor.storageKey,
+            localStorageKey: descriptor.attachmentID,
+            expectedInlineData: bytes
+        ))
+    }
+
+    func testLegacyInlineReceivedVideoPromotionRejectsStaleEqualSizedBytesAtomically() throws {
+        let currentBytes = Data(repeating: 0x1a, count: 4_000)
+        let staleBytes = Data(repeating: 0x2b, count: currentBytes.count)
+        let descriptor = try makeDescriptor(
+            mediaType: "video/mp4",
+            plaintextByteSize: currentBytes.count
+        )
+        var message = LocalMessage(
+            id: UUID(),
+            conversationId: UUID().uuidString.lowercased(),
+            senderId: UUID().uuidString.lowercased(),
+            body: descriptor.encoded,
+            createdAt: Date(timeIntervalSince1970: 1_700_000_000),
+            sentAt: Date(timeIntervalSince1970: 1_700_000_001),
+            state: .received,
+            failureReason: nil,
+            isOutgoing: false,
+            attachmentData: currentBytes
+        )
+        XCTAssertTrue(LocalMediaRecordPolicy.migrateAndRecover(&message))
+        let original = message
+
+        XCTAssertFalse(LocalMediaRecordPolicy.promoteInlineReceivedToProtectedFile(
+            &message,
+            attachmentID: descriptor.attachmentID,
+            remoteStorageKey: descriptor.storageKey,
+            localStorageKey: descriptor.attachmentID,
+            expectedInlineData: staleBytes
+        ))
+        XCTAssertEqual(message, original)
+    }
+
     func testRestartRecoveryResetsInterruptedMediaWorkWithoutChangingIdentity() throws {
         let messageID = UUID()
         let conversationID = UUID().uuidString.lowercased()

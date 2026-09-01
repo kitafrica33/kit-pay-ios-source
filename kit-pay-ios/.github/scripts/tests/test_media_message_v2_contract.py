@@ -127,6 +127,25 @@ class MediaMessageV2SourceContract(unittest.TestCase):
         self.assertIn("activeOriginalLeases[entryKey, default: []].insert(leaseID)", cache)
         self.assertIn("filesAreIdentical(existing, staging)", cache)
 
+    def test_legacy_inline_received_video_is_retired_before_player_presentation(self) -> None:
+        """Some older installs retained authenticated v1 video bytes in attachmentData rather
+        than the sealed blob cache. That representation must also migrate to a leased file and
+        atomically leave encrypted state before AVPlayer is created."""
+        app_model = (ROOT / "KitPay/App/AppModel.swift").read_text(encoding="utf-8")
+        cache = (ROOT / "KitPay/Core/SecureMediaFileCache.swift").read_text(encoding="utf-8")
+        models = (ROOT / "KitPay/Core/Models.swift").read_text(encoding="utf-8")
+        load = "\n".join(function_body(app_model, "func loadSecureMediaItem("))
+
+        inline_promotion = load.index("promoteInlineDataToProtectedOriginal(")
+        inline_return = load.index("if let inlineData {", inline_promotion)
+        self.assertLess(inline_promotion, inline_return)
+        self.assertIn("localRecord.localStorageKind == .encryptedState", load)
+        self.assertIn("promoteInlineReceivedToProtectedFile(", load)
+        self.assertIn("currentInlineData == nil", load)
+        self.assertIn("func promoteInlineDataToProtectedOriginal(", cache)
+        self.assertIn("func promoteInlineReceivedToProtectedFile(", models)
+        self.assertIn("message.attachmentData = nil", models)
+
     def test_percent_encode_bodies_are_identical(self) -> None:
         """§4: v2 percent-encoding MUST byte-match v1's percentEncode; the body is duplicated
         so the v2 core stays Foundation-only, so drift here silently forks the wire format."""

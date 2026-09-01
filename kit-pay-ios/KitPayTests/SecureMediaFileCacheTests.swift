@@ -161,6 +161,87 @@ final class SecureMediaFileCacheTests: XCTestCase {
         await cache.releaseProtectedOriginalLease(lease)
     }
 
+    func testLegacyInlineVideoPromotesToProtectedLeaseBeforePlayback() async throws {
+        let storageKey = UUID().uuidString.lowercased()
+        let videoBytes = Data(repeating: 0x3c, count: 8 * 1_024 * 1_024)
+
+        let proposedLease = try await cache.promoteInlineDataToProtectedOriginal(
+            videoBytes,
+            forStorageKey: storageKey,
+            userID: userID,
+            mediaType: "video/mp4",
+            expectedByteCount: videoBytes.count
+        )
+        let lease = try XCTUnwrap(proposedLease)
+        XCTAssertEqual(lease.fileURL.pathExtension, "mp4")
+        XCTAssertEqual(try Data(contentsOf: lease.fileURL), videoBytes)
+        let sealedAfterPromotion = await cache.encryptedBlobData(
+            forStorageKey: storageKey,
+            userID: userID,
+            expectedByteCount: videoBytes.count
+        )
+        XCTAssertNil(
+            sealedAfterPromotion,
+            "inline promotion must not create a second whole-file encrypted-blob allocation"
+        )
+
+        let proposedRetryLease = try await cache.promoteInlineDataToProtectedOriginal(
+            videoBytes,
+            forStorageKey: storageKey,
+            userID: userID,
+            mediaType: "video/mp4",
+            expectedByteCount: videoBytes.count
+        )
+        let retryLease = try XCTUnwrap(proposedRetryLease)
+        XCTAssertEqual(retryLease.fileURL, lease.fileURL)
+        await cache.releaseProtectedOriginalLease(retryLease)
+        await cache.releaseProtectedOriginalLease(lease)
+    }
+
+    func testLegacyInlineVideoPromotionRejectsSizeAndRepresentationConflicts() async throws {
+        let storageKey = UUID().uuidString.lowercased()
+        let videoBytes = Data(repeating: 0x5d, count: 4_096)
+
+        let wrongSize = try await cache.promoteInlineDataToProtectedOriginal(
+            videoBytes,
+            forStorageKey: storageKey,
+            userID: userID,
+            mediaType: "video/mp4",
+            expectedByteCount: videoBytes.count + 1
+        )
+        XCTAssertNil(wrongSize)
+        let missingProtected = await cache.protectedOriginalURL(
+            forStorageKey: storageKey,
+            userID: userID,
+            expectedByteCount: videoBytes.count
+        )
+        XCTAssertNil(missingProtected)
+
+        let sealedInsertion = await cache.insertIfAbsent(
+            videoBytes,
+            forStorageKey: storageKey,
+            userID: userID
+        )
+        XCTAssertEqual(sealedInsertion, .stored)
+        do {
+            _ = try await cache.promoteInlineDataToProtectedOriginal(
+                videoBytes,
+                forStorageKey: storageKey,
+                userID: userID,
+                mediaType: "video/mp4",
+                expectedByteCount: videoBytes.count
+            )
+            XCTFail("an unrelated sealed representation must fail closed")
+        } catch {
+            let retainedSealed = await cache.encryptedBlobData(
+                forStorageKey: storageKey,
+                userID: userID,
+                expectedByteCount: videoBytes.count
+            )
+            XCTAssertEqual(retainedSealed, videoBytes)
+        }
+    }
+
     func testLegacyVideoPromotionRejectsWrongSizeWithoutRemovingSealedSource() async throws {
         let storageKey = UUID().uuidString.lowercased()
         let videoBytes = Data(repeating: 0x4b, count: 4_096)

@@ -47,10 +47,18 @@ class WalletRefreshReliabilitySourceContract(unittest.TestCase):
             "private func refreshSelectedWalletTransactions(",
         )
 
-        self.assertIn("try await api.transactions(walletId: selectedWalletID).items", helper)
-        self.assertGreaterEqual(helper.count("callHistoryContextIsCurrent("), 2)
-        self.assertIn("persisted.selectedWalletId == selectedWalletID", helper)
-        self.assertIn("persisted.transactions = transactions", helper)
+        self.assertIn("if let flight = walletHistoryRefreshFlight, flight.key == key", helper)
+        self.assertIn("let task = Task { @MainActor [weak self] in", helper)
+        self.assertIn("await task.value", helper)
+
+        worker = swift_function(
+            self.source,
+            "private func performSelectedWalletTransactionsRefresh(",
+        )
+        self.assertIn("try await api.transactions(walletId: key.walletID).items", worker)
+        self.assertGreaterEqual(worker.count("callHistoryContextIsCurrent("), 2)
+        self.assertIn("persisted.selectedWalletId == key.walletID", worker)
+        self.assertIn("persisted.transactions = transactions", worker)
 
 
 if __name__ == "__main__":
