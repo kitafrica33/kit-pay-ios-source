@@ -109,6 +109,24 @@ class MediaMessageV2SourceContract(unittest.TestCase):
             2,
         )
 
+    def test_legacy_received_video_is_file_backed_before_player_presentation(self) -> None:
+        """Older installs stored received plaintext as a sealed whole-file blob. Keeping the
+        resulting Data alive beside AVPlayer's decoder buffers can terminate the app for large
+        videos, so current playback promotes that exact authenticated blob to a leased file."""
+        app_model = (ROOT / "KitPay/App/AppModel.swift").read_text(encoding="utf-8")
+        cache = (ROOT / "KitPay/Core/SecureMediaFileCache.swift").read_text(encoding="utf-8")
+        load = "\n".join(function_body(app_model, "func loadSecureMediaItem("))
+        promotion = load.index("promoteEncryptedBlobToProtectedOriginal(")
+        legacy_data = load.index("localRecord.localStorageKind == .encryptedBlob", promotion + 1)
+
+        self.assertLess(promotion, legacy_data)
+        self.assertIn("KitChatMediaKind(mediaType: mediaIdentity.type) == .video", load)
+        self.assertIn("LocalMediaRecordPolicy.markDownloadedProtectedFile(", load)
+        self.assertIn("removeEncryptedBlobRepresentation(", load)
+        self.assertIn("func promoteEncryptedBlobToProtectedOriginal(", cache)
+        self.assertIn("activeOriginalLeases[entryKey, default: []].insert(leaseID)", cache)
+        self.assertIn("filesAreIdentical(existing, staging)", cache)
+
     def test_percent_encode_bodies_are_identical(self) -> None:
         """§4: v2 percent-encoding MUST byte-match v1's percentEncode; the body is duplicated
         so the v2 core stays Foundation-only, so drift here silently forks the wire format."""

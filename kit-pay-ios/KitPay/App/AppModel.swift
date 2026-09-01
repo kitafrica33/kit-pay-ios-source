@@ -12343,6 +12343,89 @@ final class AppModel: ObservableObject {
             return SecureMediaLoadPolicy.LoadedItem(localFile: localFile)
         }
         if let localRecord,
+           localRecord.direction == .received,
+           localRecord.localStorageKind == .encryptedBlob,
+           localRecord.availabilityState == .localCached,
+           localRecord.downloadState == .downloaded,
+           KitChatMediaKind(mediaType: mediaIdentity.type) == .video,
+           let localStorageKey = localRecord.localStorageKey,
+           let remoteStorageKey = mediaIdentity.remoteKey {
+            // Builds before the file-backed receive pipeline retained a complete decrypted video
+            // in `LoadedItem.data` for as long as the bubble/gallery lived. AVPlayer then added
+            // decoder buffers on top of that allocation; large received videos could survive the
+            // first frame and be terminated under memory pressure. Promote the authenticated
+            // legacy blob once and return only a leased protected URL to every playback surface.
+            guard let accessLease = try await SecureMediaFileCache.shared
+                .promoteEncryptedBlobToProtectedOriginal(
+                    forStorageKey: localStorageKey,
+                    userID: userID,
+                    mediaType: mediaIdentity.type,
+                    expectedByteCount: mediaIdentity.size
+                )
+            else { throw SecureMediaAttachmentError.invalidCiphertext }
+            try await store.update { persisted in
+                guard persisted.profile?.id == userID,
+                      SecureMediaLoadPolicy.resolve(
+                          messageID: messageID,
+                          conversationId: conversationId,
+                          itemIndex: itemIndex,
+                          in: persisted.messages
+                      ) == resolved
+                else { throw SecureMediaAttachmentError.invalidDescriptor }
+                let indices = persisted.messages.indices.filter {
+                    persisted.messages[$0].id == messageID
+                        && persisted.messages[$0].conversationId == conversationId
+                }
+                guard indices.count == 1, let index = indices.first,
+                      LocalMediaRecordPolicy.record(
+                          messageID: messageID,
+                          conversationID: conversationId,
+                          attachmentID: mediaIdentity.id,
+                          mediaType: mediaIdentity.type,
+                          fileSize: mediaIdentity.size,
+                          remoteStorageKey: mediaIdentity.remoteKey,
+                          in: persisted.messages
+                      ) == localRecord,
+                      LocalMediaRecordPolicy.markDownloadedProtectedFile(
+                          &persisted.messages[index],
+                          attachmentID: mediaIdentity.id,
+                          remoteStorageKey: remoteStorageKey,
+                          localStorageKey: localStorageKey
+                      )
+                else { throw SecureMediaAttachmentError.invalidDescriptor }
+            }
+            guard await currentResolution() == resolved else {
+                throw SecureMediaAttachmentError.invalidDescriptor
+            }
+            await SecureMediaFileCache.shared.removeEncryptedBlobRepresentation(
+                forStorageKey: localStorageKey,
+                userID: userID
+            )
+            await publishLatestState()
+            if localRecord.duration == nil,
+               let mediaID = UUID(uuidString: mediaIdentity.id) {
+                scheduleLocalMediaDuration(
+                    mediaID: mediaID,
+                    fileURL: accessLease.fileURL,
+                    mediaType: mediaIdentity.type
+                )
+            }
+            return SecureMediaLoadPolicy.LoadedItem(localFile: .init(
+                url: accessLease.fileURL,
+                mediaType: mediaIdentity.type,
+                caption: {
+                    switch resolved {
+                    case .pendingSingle(let pending): return pending.caption
+                    case .single(let descriptor, _, _): return descriptor.caption
+                    case .pendingBatchItem, .sealedBatchItem: return nil
+                    }
+                }(),
+                byteCount: mediaIdentity.size,
+                attachmentID: mediaIdentity.id,
+                accessLease: accessLease
+            ))
+        }
+        if let localRecord,
            localRecord.localStorageKind == .encryptedBlob,
            let localStorageKey = localRecord.localStorageKey,
            let local = await SecureMediaFileCache.shared.data(

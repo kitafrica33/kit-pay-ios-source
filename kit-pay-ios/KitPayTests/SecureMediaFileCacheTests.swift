@@ -99,6 +99,104 @@ final class SecureMediaFileCacheTests: XCTestCase {
         XCTAssertNil(protectedAsSealed)
     }
 
+    func testLegacyEncryptedVideoPromotesToProtectedLeaseBeforePlayback() async throws {
+        let storageKey = UUID().uuidString.lowercased()
+        // Large enough to exercise the file-backed path without making every hosted CI run pay
+        // the 200 MiB production ceiling. The production invariant is structural: playback gets
+        // an empty-Data LocalFileItem regardless of whether the source is 32 MiB or 200 MiB.
+        let videoBytes = Data(repeating: 0x6d, count: 32 * 1_024 * 1_024)
+        let insertion = await cache.insertIfAbsent(
+            videoBytes,
+            forStorageKey: storageKey,
+            userID: userID
+        )
+        XCTAssertEqual(insertion, .stored)
+
+        let proposedLease = try await cache.promoteEncryptedBlobToProtectedOriginal(
+            forStorageKey: storageKey,
+            userID: userID,
+            mediaType: "video/mp4",
+            expectedByteCount: videoBytes.count
+        )
+        let lease = try XCTUnwrap(proposedLease)
+        XCTAssertEqual(lease.fileURL.pathExtension, "mp4")
+        XCTAssertEqual(try Data(contentsOf: lease.fileURL), videoBytes)
+        let retainedSealed = await cache.encryptedBlobData(
+            forStorageKey: storageKey,
+            userID: userID,
+            expectedByteCount: videoBytes.count
+        )
+        XCTAssertEqual(
+            retainedSealed,
+            videoBytes,
+            "the sealed source must survive until protected state commits its new storage kind"
+        )
+
+        let proposedRetryLease = try await cache.promoteEncryptedBlobToProtectedOriginal(
+            forStorageKey: storageKey,
+            userID: userID,
+            mediaType: "video/mp4",
+            expectedByteCount: videoBytes.count
+        )
+        let retryLease = try XCTUnwrap(proposedRetryLease)
+        XCTAssertEqual(retryLease.fileURL, lease.fileURL)
+
+        await cache.removeEncryptedBlobRepresentation(
+            forStorageKey: storageKey,
+            userID: userID
+        )
+        let removedSealed = await cache.encryptedBlobData(
+            forStorageKey: storageKey,
+            userID: userID,
+            expectedByteCount: videoBytes.count
+        )
+        XCTAssertNil(removedSealed)
+        let protectedURL = await cache.protectedOriginalURL(
+            forStorageKey: storageKey,
+            userID: userID,
+            expectedByteCount: videoBytes.count
+        )
+        XCTAssertEqual(protectedURL, lease.fileURL)
+        await cache.releaseProtectedOriginalLease(retryLease)
+        await cache.releaseProtectedOriginalLease(lease)
+    }
+
+    func testLegacyVideoPromotionRejectsWrongSizeWithoutRemovingSealedSource() async throws {
+        let storageKey = UUID().uuidString.lowercased()
+        let videoBytes = Data(repeating: 0x4b, count: 4_096)
+        let insertion = await cache.insertIfAbsent(
+            videoBytes,
+            forStorageKey: storageKey,
+            userID: userID
+        )
+        XCTAssertEqual(insertion, .stored)
+
+        do {
+            _ = try await cache.promoteEncryptedBlobToProtectedOriginal(
+                forStorageKey: storageKey,
+                userID: userID,
+                mediaType: "video/mp4",
+                expectedByteCount: videoBytes.count + 1
+            )
+            XCTFail("a mismatched authenticated size must not publish a playback file")
+        } catch {
+            // Expected: the caller can continue to recover from the untouched sealed source.
+        }
+
+        let protectedURL = await cache.protectedOriginalURL(
+            forStorageKey: storageKey,
+            userID: userID,
+            expectedByteCount: videoBytes.count
+        )
+        XCTAssertNil(protectedURL)
+        let sealed = await cache.encryptedBlobData(
+            forStorageKey: storageKey,
+            userID: userID,
+            expectedByteCount: videoBytes.count
+        )
+        XCTAssertEqual(sealed, videoBytes)
+    }
+
     func testPreprocessingProbeNeverMaterializesASealedCollision() async throws {
         let missingKey = UUID().uuidString.lowercased()
         let missing = await cache.probeProtectedOriginal(

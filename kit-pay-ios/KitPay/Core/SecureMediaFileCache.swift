@@ -276,6 +276,131 @@ actor SecureMediaFileCache {
         return plaintext
     }
 
+    /// Converts one legacy at-rest encrypted receive into the file-backed representation used by
+    /// current builds. Older builds returned the complete decrypted `Data` to SwiftUI; for a large
+    /// video that kept the plaintext allocation alive beside AVPlayer's decoder buffers and could
+    /// terminate the process shortly after playback began. Promotion pays that allocation once,
+    /// writes an authenticated protected file, and gives the caller an eviction lease before the
+    /// bytes leave this actor.
+    ///
+    /// The sealed source is deliberately retained until AppModel commits the matching
+    /// `.protectedFile` record. A crash can therefore leave both verified representations, never
+    /// metadata pointing at bytes that were removed. A retry verifies both files byte-for-byte.
+    func promoteEncryptedBlobToProtectedOriginal(
+        forStorageKey storageKey: String,
+        userID: String,
+        mediaType: String,
+        expectedByteCount: Int
+    ) throws -> SecureMediaOriginalAccessLease? {
+        guard expectedByteCount > 0,
+              let accountID = canonicalAccountID(userID),
+              let canonicalStorageKey = canonicalStorageKey(storageKey),
+              let sealedURL = sealedFileURL(
+                  forStorageKey: canonicalStorageKey,
+                  accountID: accountID
+              ),
+              let destination = originalFileURL(
+                  forStorageKey: canonicalStorageKey,
+                  accountID: accountID,
+                  mediaType: mediaType
+              )
+        else { return nil }
+        let entryKey = cacheEntryKey(
+            storageKey: canonicalStorageKey,
+            accountID: accountID
+        )
+        guard !reservedEvictionKeys.contains(entryKey),
+              FileManager.default.fileExists(atPath: sealedURL.path)
+        else { return nil }
+
+        // Keep the whole-file CryptoKit allocations inside this helper. They are released before
+        // the AVPlayer-facing lease is returned; mapping the sealed input also avoids eagerly
+        // copying another ciphertext-sized buffer into the process.
+        try publishProtectedOriginalFromEncryptedBlob(
+            sealedURL: sealedURL,
+            destination: destination,
+            storageKey: canonicalStorageKey,
+            accountID: accountID,
+            expectedByteCount: expectedByteCount
+        )
+
+        let leaseID = UUID()
+        activeOriginalLeases[entryKey, default: []].insert(leaseID)
+        recordAccess(
+            to: destination,
+            storageKey: canonicalStorageKey,
+            accountID: accountID
+        )
+        return SecureMediaOriginalAccessLease(
+            fileURL: destination,
+            id: leaseID,
+            accountID: accountID,
+            storageKey: canonicalStorageKey
+        ) { [weak self] id, releasedAccountID, releasedStorageKey in
+            Task {
+                await self?.releaseOriginalAccessLease(
+                    id: id,
+                    accountID: releasedAccountID,
+                    storageKey: releasedStorageKey
+                )
+            }
+        }
+    }
+
+    /// Finalizes the cache half of a legacy-blob promotion after protected state points at the
+    /// verified original. This intentionally removes only the sealed representation.
+    func removeEncryptedBlobRepresentation(forStorageKey storageKey: String, userID: String) {
+        guard let accountID = canonicalAccountID(userID),
+              let sealedURL = sealedFileURL(forStorageKey: storageKey, accountID: accountID)
+        else { return }
+        try? FileManager.default.removeItem(at: sealedURL)
+    }
+
+    private func publishProtectedOriginalFromEncryptedBlob(
+        sealedURL: URL,
+        destination: URL,
+        storageKey: String,
+        accountID: String,
+        expectedByteCount: Int
+    ) throws {
+        let plaintext: Data = try {
+            let sealedData = try Data(contentsOf: sealedURL, options: [.mappedIfSafe])
+            let sealed = try ChaChaPoly.SealedBox(combined: sealedData)
+            return try ChaChaPoly.open(sealed, using: encryptionKey(for: accountID))
+        }()
+        guard plaintext.count == expectedByteCount else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+
+        try ensureDirectory(for: accountID)
+        let staging = accountDirectoryURL(for: accountID).appendingPathComponent(
+            ".\(UUID().uuidString.lowercased()).promoting",
+            isDirectory: false
+        )
+        defer { try? FileManager.default.removeItem(at: staging) }
+        try plaintext.write(to: staging, options: [.atomic, .completeFileProtectionUnlessOpen])
+        try protectOriginal(at: staging)
+        try excludeFromBackup(staging)
+        guard regularFileByteCount(at: staging) == expectedByteCount else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+
+        if let existing = originalFileURL(forStorageKey: storageKey, accountID: accountID) {
+            guard existing.standardizedFileURL == destination.standardizedFileURL,
+                  regularFileByteCount(at: existing) == expectedByteCount,
+                  filesAreIdentical(existing, staging)
+            else { throw CocoaError(.fileReadCorruptFile) }
+            return
+        }
+
+        try FileManager.default.moveItem(at: staging, to: destination)
+        guard regularFileByteCount(at: destination) == expectedByteCount else {
+            try? FileManager.default.removeItem(at: destination)
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        indexOriginalURL(destination, storageKey: storageKey, accountID: accountID)
+    }
+
     /// Imports an already-file-backed capture/selection into the permanent local-original area.
     /// `moveSource` is used only for app-owned camera/editor scratch files and is normally a
     /// same-volume atomic rename. Security-scoped document sources are copied without ever being
