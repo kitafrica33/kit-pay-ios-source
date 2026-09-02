@@ -1,5 +1,6 @@
 import AVFoundation
 import AVKit
+import Darwin
 import Foundation
 import UIKit
 
@@ -42,6 +43,177 @@ struct ChatVideoPlaybackFileInspection: Equatable {
     let requiresCanonicalExtension: Bool
 }
 
+/// Immutable filesystem identity captured before AVFoundation sees a received-video artifact.
+/// Size alone is not identity: a stale view can otherwise validate one inode and open a different,
+/// equal-sized replacement after an account/cache transition.
+struct ChatVideoPlaybackFileIdentity: Equatable, Sendable {
+    let deviceID: UInt64
+    let fileID: UInt64
+    let byteCount: Int
+    let modificationSeconds: Int64
+    let modificationNanoseconds: Int64
+}
+
+enum ChatVideoPlaybackArtifactPolicy {
+    struct SourceSnapshot: Equatable, Sendable {
+        let identity: ChatVideoPlaybackFileIdentity
+        let header: Data
+    }
+
+    /// Reads the sniffing header and filesystem identity through the same open descriptor. The
+    /// path is checked again when the private playback link is made, closing path-replacement
+    /// races without hashing a potentially 200 MiB authenticated file on the main actor.
+    static func sourceSnapshot(
+        at fileURL: URL,
+        expectedByteCount: Int
+    ) throws -> SourceSnapshot {
+        guard expectedByteCount > 0 else {
+            throw ChatVideoPlaybackPreparationError.invalidFile
+        }
+        let values = try fileURL.resourceValues(
+            forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+        )
+        guard values.isRegularFile == true, values.isSymbolicLink != true else {
+            throw ChatVideoPlaybackPreparationError.invalidFile
+        }
+        let handle = try FileHandle(forReadingFrom: fileURL)
+        defer { try? handle.close() }
+        let snapshotIdentity = try identity(
+            of: handle,
+            expectedByteCount: expectedByteCount
+        )
+        let header: Data
+        do {
+            header = try handle.read(upToCount: 64) ?? Data()
+        } catch {
+            throw ChatVideoPlaybackPreparationError.invalidFile
+        }
+        guard try identity(of: handle, expectedByteCount: expectedByteCount) == snapshotIdentity else {
+            throw ChatVideoPlaybackPreparationError.invalidFile
+        }
+        return SourceSnapshot(identity: snapshotIdentity, header: header)
+    }
+
+    static func identity(
+        at fileURL: URL,
+        expectedByteCount: Int
+    ) throws -> ChatVideoPlaybackFileIdentity {
+        let values = try fileURL.resourceValues(
+            forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+        )
+        guard values.isRegularFile == true, values.isSymbolicLink != true else {
+            throw ChatVideoPlaybackPreparationError.invalidFile
+        }
+        let handle = try FileHandle(forReadingFrom: fileURL)
+        defer { try? handle.close() }
+        return try identity(of: handle, expectedByteCount: expectedByteCount)
+    }
+
+    static func identity(
+        of handle: FileHandle,
+        expectedByteCount: Int
+    ) throws -> ChatVideoPlaybackFileIdentity {
+        var status = stat()
+        guard expectedByteCount > 0,
+              fstat(handle.fileDescriptor, &status) == 0,
+              (status.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG),
+              status.st_size > 0,
+              Int(status.st_size) == expectedByteCount
+        else { throw ChatVideoPlaybackPreparationError.invalidFile }
+        return ChatVideoPlaybackFileIdentity(
+            deviceID: UInt64(bitPattern: Int64(status.st_dev)),
+            fileID: UInt64(status.st_ino),
+            byteCount: expectedByteCount,
+            modificationSeconds: Int64(status.st_mtimespec.tv_sec),
+            modificationNanoseconds: Int64(status.st_mtimespec.tv_nsec)
+        )
+    }
+
+    static func matches(
+        fileURL: URL,
+        expectedIdentity: ChatVideoPlaybackFileIdentity
+    ) -> Bool {
+        (try? identity(
+            at: fileURL,
+            expectedByteCount: expectedIdentity.byteCount
+        )) == expectedIdentity
+    }
+}
+
+/// The decoder receives only this private, canonical hard link. Its open descriptor and URL stay
+/// alive until the owning controller has detached AVPlayer/AVPlayerItem, so an enclosing SwiftUI
+/// presentation may remove its own temporary source first without invalidating live playback.
+final class ChatVideoPlaybackFileLease: @unchecked Sendable {
+    let fileURL: URL
+    let identity: ChatVideoPlaybackFileIdentity
+
+    private let lock = NSLock()
+    private var fileHandle: FileHandle?
+
+    init(
+        sourceURL: URL,
+        playbackMediaType: String,
+        expectedIdentity: ChatVideoPlaybackFileIdentity
+    ) throws {
+        let aliasURL = try ChatMediaTempFiles.linkTemporaryFile(
+            from: sourceURL,
+            mediaType: playbackMediaType
+        )
+        do {
+            let handle = try FileHandle(forReadingFrom: aliasURL)
+            guard try ChatVideoPlaybackArtifactPolicy.identity(
+                of: handle,
+                expectedByteCount: expectedIdentity.byteCount
+            ) == expectedIdentity,
+                  ChatVideoPlaybackArtifactPolicy.matches(
+                      fileURL: aliasURL,
+                      expectedIdentity: expectedIdentity
+                  )
+            else {
+                try? handle.close()
+                throw ChatVideoPlaybackPreparationError.invalidFile
+            }
+            fileURL = aliasURL
+            identity = expectedIdentity
+            fileHandle = handle
+        } catch {
+            ChatMediaTempFiles.removeTemporaryFile(aliasURL)
+            throw error
+        }
+    }
+
+    func isValid() -> Bool {
+        lock.lock()
+        guard let fileHandle else {
+            lock.unlock()
+            return false
+        }
+        let descriptorIdentity = try? ChatVideoPlaybackArtifactPolicy.identity(
+            of: fileHandle,
+            expectedByteCount: identity.byteCount
+        )
+        lock.unlock()
+        return descriptorIdentity == identity
+            && ChatVideoPlaybackArtifactPolicy.matches(
+                fileURL: fileURL,
+                expectedIdentity: identity
+            )
+    }
+
+    func release() {
+        lock.lock()
+        let handle = fileHandle
+        fileHandle = nil
+        lock.unlock()
+        try? handle?.close()
+        ChatMediaTempFiles.removeTemporaryFile(fileURL)
+    }
+
+    deinit {
+        release()
+    }
+}
+
 enum ChatVideoPlaybackPreparationError: LocalizedError, Equatable {
     case invalidFile
     case unsupportedVideo
@@ -58,9 +230,10 @@ enum ChatVideoPlaybackPreparationError: LocalizedError, Equatable {
 
 struct ChatVideoPreparedAsset {
     let asset: AVURLAsset
-    let playbackURL: URL
-    let temporaryAliasURL: URL?
+    let playbackFileLease: ChatVideoPlaybackFileLease
     let duration: Double
+
+    var playbackURL: URL { playbackFileLease.fileURL }
 }
 
 /// Validates the complete local file before AVPlayer owns it. This closes two production faults:
@@ -106,51 +279,34 @@ enum ChatVideoPlaybackAssetPolicy {
         declaredMediaType: String,
         expectedByteCount: Int
     ) async throws -> ChatVideoPreparedAsset {
-        guard expectedByteCount > 0 else {
-            throw ChatVideoPlaybackPreparationError.invalidFile
-        }
-        let values = try fileURL.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
-        guard values.isRegularFile == true, values.fileSize == expectedByteCount else {
-            throw ChatVideoPlaybackPreparationError.invalidFile
-        }
-
-        let handle = try FileHandle(forReadingFrom: fileURL)
-        let header: Data
-        do {
-            header = try handle.read(upToCount: 64) ?? Data()
-            try handle.close()
-        } catch {
-            try? handle.close()
-            throw ChatVideoPlaybackPreparationError.invalidFile
-        }
+        let source = try ChatVideoPlaybackArtifactPolicy.sourceSnapshot(
+            at: fileURL,
+            expectedByteCount: expectedByteCount
+        )
         let inspection = try inspect(
-            header: header,
+            header: source.header,
             declaredMediaType: declaredMediaType,
             sourcePathExtension: fileURL.pathExtension
         )
-
-        var temporaryAliasURL: URL?
-        let playbackURL: URL
-        if inspection.requiresCanonicalExtension {
-            do {
-                let alias = try ChatMediaTempFiles.linkTemporaryFile(
-                    from: fileURL,
-                    mediaType: inspection.playbackMediaType
-                )
-                temporaryAliasURL = alias
-                playbackURL = alias
-            } catch {
-                throw ChatVideoPlaybackPreparationError.invalidFile
-            }
-        } else {
-            playbackURL = fileURL
+        let playbackFileLease: ChatVideoPlaybackFileLease
+        do {
+            // Always isolate AVFoundation behind a presentation-owned alias, even when the
+            // extension already matches. Parent presentation cleanup can then unlink its own
+            // source before SwiftUI delivers child onDisappear without touching the live item.
+            playbackFileLease = try ChatVideoPlaybackFileLease(
+                sourceURL: fileURL,
+                playbackMediaType: inspection.playbackMediaType,
+                expectedIdentity: source.identity
+            )
+        } catch {
+            throw ChatVideoPlaybackPreparationError.invalidFile
         }
 
         do {
             // The canonical local extension already comes from inspected container bytes.
             // AVURLAssetOutOfBandMIMETypeKey is not available in every supported iOS SDK, so
             // relying on it would make the compatibility repair itself fail to compile.
-            let asset = AVURLAsset(url: playbackURL)
+            let asset = AVURLAsset(url: playbackFileLease.fileURL)
             async let playableValue = asset.load(.isPlayable)
             async let durationValue = asset.load(.duration)
             async let videoTracksValue = asset.loadTracks(withMediaType: .video)
@@ -165,14 +321,16 @@ enum ChatVideoPlaybackAssetPolicy {
                   seconds.isFinite,
                   seconds > 0
             else { throw ChatVideoPlaybackPreparationError.unsupportedVideo }
+            guard playbackFileLease.isValid() else {
+                throw ChatVideoPlaybackPreparationError.invalidFile
+            }
             return ChatVideoPreparedAsset(
                 asset: asset,
-                playbackURL: playbackURL,
-                temporaryAliasURL: temporaryAliasURL,
+                playbackFileLease: playbackFileLease,
                 duration: seconds
             )
         } catch {
-            ChatMediaTempFiles.removeTemporaryFile(temporaryAliasURL)
+            playbackFileLease.release()
             if error is CancellationError { throw error }
             if let preparationError = error as? ChatVideoPlaybackPreparationError {
                 throw preparationError
@@ -214,6 +372,40 @@ enum ChatVideoPlaybackFailurePolicy {
         switch interruption {
         case .stalled: .letPlayerRecover
         case .failed: .stopAndReport
+        }
+    }
+}
+
+/// Reduces AVFoundation diagnostics to fixed categories and bounded numeric facts. In
+/// particular, AVPlayerItemErrorLogEvent URI, server address, playback session ID and free-form
+/// comment are never copied into app state or logs.
+enum ChatVideoPlayerDiagnosticPolicy {
+    static func snapshot(
+        failureSource: LocalMediaPlaybackFailureSource,
+        item: AVPlayerItem?,
+        notificationError: Error? = nil
+    ) -> LocalMediaPlaybackDiagnostic {
+        let rawError: Error? = notificationError ?? item?.error
+        let error = rawError.map { $0 as NSError }
+        let errorEvents = item?.errorLog()?.events ?? []
+        let lastErrorEvent = errorEvents.last
+        return LocalMediaPlaybackDiagnostic.sanitized(
+            failureSource: failureSource,
+            itemStatus: item.map { status($0.status) },
+            errorDomain: error?.domain,
+            errorCode: error?.code,
+            errorLogDomain: lastErrorEvent?.errorDomain,
+            errorLogStatusCode: lastErrorEvent?.errorStatusCode,
+            errorLogEventCount: errorEvents.count
+        )
+    }
+
+    private static func status(_ status: AVPlayerItem.Status) -> LocalMediaPlaybackItemStatus {
+        switch status {
+        case .unknown: .unknown
+        case .readyToPlay: .readyToPlay
+        case .failed: .failed
+        @unknown default: .unknown
         }
     }
 }

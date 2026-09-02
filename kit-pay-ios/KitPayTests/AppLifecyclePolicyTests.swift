@@ -4,6 +4,49 @@ import XCTest
 
 /// Decisions the app makes about network path updates and reconnect work.
 final class AppLifecyclePolicyTests: XCTestCase {
+    // MARK: - Authenticated projection refresh
+
+    func testAuthenticatedProjectionRefreshCanRepairStaleCommunicationAssurance() {
+        // There is intentionally no communication-access argument. Cached assurance may deny
+        // communication while the authoritative bootstrap is the request that restores it.
+        XCTAssertTrue(AuthenticatedProjectionRefreshPolicy.permits(
+            isSigningOut: false,
+            isSignedIn: true,
+            isOnline: true,
+            accountSetupComplete: true,
+            isSubmittingAccountDeletion: false,
+            acceptedAccountDeletionCleanupBlocked: false,
+            protectedLocalStateRecoveryBlocked: false,
+            unresolvedAccountDeletionAttemptBlocked: false
+        ))
+    }
+
+    func testAuthenticatedProjectionRefreshRetainsSessionAndPrivacyFences() {
+        let permits: (
+            Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool
+        ) -> Bool = {
+            AuthenticatedProjectionRefreshPolicy.permits(
+                isSigningOut: $0,
+                isSignedIn: $1,
+                isOnline: $2,
+                accountSetupComplete: $3,
+                isSubmittingAccountDeletion: $4,
+                acceptedAccountDeletionCleanupBlocked: $5,
+                protectedLocalStateRecoveryBlocked: $6,
+                unresolvedAccountDeletionAttemptBlocked: $7
+            )
+        }
+
+        XCTAssertFalse(permits(true, true, true, true, false, false, false, false))
+        XCTAssertFalse(permits(false, false, true, true, false, false, false, false))
+        XCTAssertFalse(permits(false, true, false, true, false, false, false, false))
+        XCTAssertFalse(permits(false, true, true, false, false, false, false, false))
+        XCTAssertFalse(permits(false, true, true, true, true, false, false, false))
+        XCTAssertFalse(permits(false, true, true, true, false, true, false, false))
+        XCTAssertFalse(permits(false, true, true, true, false, false, true, false))
+        XCTAssertFalse(permits(false, true, true, true, false, false, false, true))
+    }
+
     func testFirstSatisfiedPathUpdateIsTreatedAsARecovery() {
         XCTAssertEqual(
             ConnectivityTransitionPolicy.transition(previousOnline: nil, isOnline: true),

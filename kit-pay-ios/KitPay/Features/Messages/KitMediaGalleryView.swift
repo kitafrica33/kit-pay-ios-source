@@ -194,6 +194,7 @@ struct KitMediaGalleryView: View {
                 isActive: isActive,
                 chromeVisible: chromeVisible,
                 onToggleChrome: toggleChrome,
+                onDismiss: dismissGallery,
                 persistDuration: persistVideoDuration,
                 restoreFromPictureInPicture: restoreFromPictureInPicture
             )
@@ -933,6 +934,7 @@ private struct GalleryVideoPage: View {
     let isActive: Bool
     let chromeVisible: Bool
     let onToggleChrome: () -> Void
+    let onDismiss: () -> Void
     let persistDuration: (UUID, TimeInterval) async -> Void
     let restoreFromPictureInPicture: (ChatVideoGalleryIdentity) -> Void
 
@@ -1029,6 +1031,9 @@ private struct GalleryVideoPage: View {
                 Text(errorMessage)
                     .font(.body.weight(.semibold))
                     .multilineTextAlignment(.center)
+                Button("Close", action: onDismiss)
+                    .buttonStyle(.borderedProminent)
+                    .accessibilityLabel("Close media viewer")
             }
             .foregroundStyle(.white)
             .padding(32)
@@ -1117,7 +1122,7 @@ private final class GalleryVideoController: ObservableObject {
 
     private var isScrubbing = false
     private var sourceFileURL: URL?
-    private var temporaryAliasURL: URL?
+    private var playbackFileLease: ChatVideoPlaybackFileLease?
     private var ownsFileURL = false
     private var asset: AVURLAsset?
     private var playerItem: AVPlayerItem?
@@ -1125,14 +1130,11 @@ private final class GalleryVideoController: ObservableObject {
     /// handoff continues to exclude this received-cache file from eviction after the gallery is
     /// dismissed. `releaseResources` drops it only when playback ownership truly ends.
     private var protectedOriginalLease: SecureMediaOriginalAccessLease?
-    /// Keeping the protected file open is what makes `.completeFileProtectionUnlessOpen` useful:
-    /// AVFoundation can continue reading after a lock/background transition, but a new process
-    /// still cannot open the plaintext while protected data is unavailable.
-    private var playbackFileHandle: FileHandle?
     private var timeObserver: Any?
     private var endObserver: NSObjectProtocol?
     private var stallObserver: NSObjectProtocol?
     private var failureObserver: NSObjectProtocol?
+    private var statusObservation: NSKeyValueObservation?
     private var preparationID: UUID?
     private var playbackClaim: ChatVideoPosterGenerator.PlaybackClaim?
     private var diagnosticMediaID: UUID?
@@ -1140,6 +1142,7 @@ private final class GalleryVideoController: ObservableObject {
     private var diagnosticByteCount: Int?
     private let diagnosticProducerScope = LocalMediaPerformanceMonitor.shared.captureProducerScope()
     private var didRecordPlaybackStart = false
+    private var didRecordTerminalFailure = false
     /// The layer this page is drawing into, reported by `PlayerLayerView`. Picture in Picture
     /// hands off a *layer*, so the window can only be armed once one exists.
     private weak var playerLayer: AVPlayerLayer?
@@ -1165,6 +1168,7 @@ private final class GalleryVideoController: ObservableObject {
         diagnosticIsOutgoing = isOutgoing
         diagnosticByteCount = data.count
         didRecordPlaybackStart = false
+        didRecordTerminalFailure = false
         guard let url = try? ChatMediaTempFiles.writeTemporaryFile(
             data: data,
             mediaType: mediaType
@@ -1208,17 +1212,12 @@ private final class GalleryVideoController: ObservableObject {
         diagnosticIsOutgoing = isOutgoing
         diagnosticByteCount = expectedByteCount
         didRecordPlaybackStart = false
+        didRecordTerminalFailure = false
         let identifier = UUID()
         preparationID = identifier
         sourceFileURL = url
         ownsFileURL = ownsFile
         self.protectedOriginalLease = protectedOriginalLease
-        guard let fileHandle = try? FileHandle(forReadingFrom: url) else {
-            if ownsFile { ChatMediaTempFiles.removeTemporaryFile(url) }
-            failPreparation(ChatVideoPlaybackPreparationError.invalidFile)
-            return false
-        }
-        playbackFileHandle = fileHandle
         isPreparing = true
         errorMessage = nil
         guard let claim = await ChatVideoPosterGenerator.acquirePlayback(forKey: contentKey)
@@ -1245,11 +1244,11 @@ private final class GalleryVideoController: ObservableObject {
                   preparationID == identifier,
                   sourceFileURL == url
             else {
-                ChatMediaTempFiles.removeTemporaryFile(prepared.temporaryAliasURL)
+                prepared.playbackFileLease.release()
                 if preparationID == identifier { releaseResources() }
                 return false
             }
-            temporaryAliasURL = prepared.temporaryAliasURL
+            playbackFileLease = prepared.playbackFileLease
             playbackURL = prepared.playbackURL
             asset = prepared.asset
             duration = prepared.duration
@@ -1304,12 +1303,12 @@ private final class GalleryVideoController: ObservableObject {
     private func releaseResources() {
         preparationID = nil
         isPreparing = false
-        ChatVideoPosterGenerator.releasePlayback(playbackClaim)
-        playbackClaim = nil
         if let timeObserver { player?.removeTimeObserver(timeObserver) }
         timeObserver = nil
         removePlaybackItemObservers()
-        player?.pause()
+        let retainedPlayer = player
+        retainedPlayer?.pause()
+        retainedPlayer?.replaceCurrentItem(with: nil)
         player = nil
         playerItem = nil
         asset = nil
@@ -1318,12 +1317,8 @@ private final class GalleryVideoController: ObservableObject {
         hasStartedPlayback = false
         currentTime = 0
         duration = 0
-        if let playbackFileHandle {
-            try? playbackFileHandle.close()
-        }
-        playbackFileHandle = nil
-        ChatMediaTempFiles.removeTemporaryFile(temporaryAliasURL)
-        temporaryAliasURL = nil
+        playbackFileLease?.release()
+        playbackFileLease = nil
         playbackURL = nil
         if ownsFileURL { ChatMediaTempFiles.removeTemporaryFile(sourceFileURL) }
         sourceFileURL = nil
@@ -1334,6 +1329,9 @@ private final class GalleryVideoController: ObservableObject {
         diagnosticMediaID = nil
         diagnosticByteCount = nil
         didRecordPlaybackStart = false
+        didRecordTerminalFailure = false
+        ChatVideoPosterGenerator.releasePlayback(playbackClaim)
+        playbackClaim = nil
     }
 
     func togglePlayback() {
@@ -1415,9 +1413,22 @@ private final class GalleryVideoController: ObservableObject {
             forName: .AVPlayerItemFailedToPlayToEndTime,
             object: item,
             queue: .main
-        ) { [weak self] _ in
+        ) { [weak self] notification in
             Task { @MainActor in
-                self?.handleInterruption(.failed, item: item)
+                self?.handleInterruption(
+                    .failed,
+                    item: item,
+                    notificationError: notification.userInfo?[
+                        AVPlayerItemFailedToPlayToEndTimeErrorKey
+                    ] as? Error
+                )
+            }
+        }
+        statusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
+            guard item.status == .failed else { return }
+            Task { @MainActor in
+                await Task.yield()
+                self?.handleItemStatusFailure(item: item)
             }
         }
     }
@@ -1426,26 +1437,37 @@ private final class GalleryVideoController: ObservableObject {
         if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
         if let stallObserver { NotificationCenter.default.removeObserver(stallObserver) }
         if let failureObserver { NotificationCenter.default.removeObserver(failureObserver) }
+        statusObservation?.invalidate()
         endObserver = nil
         stallObserver = nil
         failureObserver = nil
+        statusObservation = nil
     }
 
     private func handleInterruption(
         _ interruption: ChatVideoPlaybackFailurePolicy.Interruption,
-        item: AVPlayerItem
+        item: AVPlayerItem,
+        notificationError: Error? = nil
     ) {
         guard playerItem === item else { return }
         switch interruption {
         case .stalled:
-            if didRecordPlaybackStart {
-                recordPlayback(.stalled, position: item.currentTime().seconds)
-            }
-        case .failed:
-            recordPlayback(
-                didRecordPlaybackStart ? .failedToEnd : .preparationFailed,
-                position: item.currentTime().seconds
+            let diagnostic = ChatVideoPlayerDiagnosticPolicy.snapshot(
+                failureSource: .stalledNotification,
+                item: item
             )
+            recordPlayback(
+                .stalled,
+                position: item.currentTime().seconds,
+                diagnostic: diagnostic
+            )
+        case .failed:
+            handleTerminalFailure(
+                item: item,
+                source: .failedToEndNotification,
+                notificationError: notificationError
+            )
+            return
         }
         switch ChatVideoPlaybackFailurePolicy.action(for: interruption) {
         case .letPlayerRecover:
@@ -1457,6 +1479,34 @@ private final class GalleryVideoController: ObservableObject {
             player?.pause()
             errorMessage = "This video could not be played completely."
         }
+    }
+
+    private func handleItemStatusFailure(item: AVPlayerItem) {
+        guard playerItem === item, item.status == .failed else { return }
+        handleTerminalFailure(item: item, source: .itemStatus)
+    }
+
+    private func handleTerminalFailure(
+        item: AVPlayerItem,
+        source: LocalMediaPlaybackFailureSource,
+        notificationError: Error? = nil
+    ) {
+        guard !didRecordTerminalFailure, playerItem === item else { return }
+        didRecordTerminalFailure = true
+        let diagnostic = ChatVideoPlayerDiagnosticPolicy.snapshot(
+            failureSource: source,
+            item: item,
+            notificationError: notificationError
+        )
+        recordPlayback(
+            didRecordPlaybackStart ? .failedToEnd : .preparationFailed,
+            position: item.currentTime().seconds,
+            diagnostic: diagnostic
+        )
+        isPlaying = false
+        player?.pause()
+        errorMessage = "This video could not be played completely.\nReference: \(diagnostic.supportReference)"
+        ChatVideoPictureInPicture.shared.stopForPlaybackEnd(owner: self)
     }
 
     private func handlePlaybackEnded() {
@@ -1479,7 +1529,11 @@ private final class GalleryVideoController: ObservableObject {
         recordPlayback(.started, position: position)
     }
 
-    private func recordPlayback(_ outcome: LocalMediaPlaybackOutcome, position: Double?) {
+    private func recordPlayback(
+        _ outcome: LocalMediaPlaybackOutcome,
+        position: Double?,
+        diagnostic: LocalMediaPlaybackDiagnostic? = nil
+    ) {
         guard let mediaID = diagnosticMediaID else { return }
         LocalMediaPerformanceMonitor.shared.recordPlayback(
             outcome: outcome,
@@ -1488,22 +1542,28 @@ private final class GalleryVideoController: ObservableObject {
             byteCount: diagnosticByteCount,
             expectedDuration: duration.isFinite && duration > 0 ? duration : nil,
             position: position.flatMap { $0.isFinite && $0 >= 0 ? $0 : nil },
+            diagnostic: diagnostic,
             producerScope: diagnosticProducerScope
         )
     }
 
     private func failPreparation(_ error: Error) {
-        recordPlayback(.preparationFailed, position: nil)
+        let nsError = error as NSError
+        let diagnostic = LocalMediaPlaybackDiagnostic.sanitized(
+            failureSource: .assetPreparation,
+            errorDomain: nsError.domain,
+            errorCode: nsError.code
+        )
+        recordPlayback(.preparationFailed, position: nil, diagnostic: diagnostic)
         isPreparing = false
         preparationID = nil
         ChatVideoPosterGenerator.releasePlayback(playbackClaim)
         playbackClaim = nil
-        errorMessage = (error as? LocalizedError)?.errorDescription
+        let description = (error as? LocalizedError)?.errorDescription
             ?? "This video could not be played."
-        if let playbackFileHandle { try? playbackFileHandle.close() }
-        playbackFileHandle = nil
-        ChatMediaTempFiles.removeTemporaryFile(temporaryAliasURL)
-        temporaryAliasURL = nil
+        errorMessage = "\(description)\nReference: \(diagnostic.supportReference)"
+        playbackFileLease?.release()
+        playbackFileLease = nil
         playbackURL = nil
         if ownsFileURL { ChatMediaTempFiles.removeTemporaryFile(sourceFileURL) }
         sourceFileURL = nil

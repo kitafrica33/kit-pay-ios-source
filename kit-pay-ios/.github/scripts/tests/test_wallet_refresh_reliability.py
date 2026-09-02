@@ -52,6 +52,21 @@ class WalletRefreshReliabilitySourceContract(unittest.TestCase):
         self.assertIn("return await self.reloadCapabilities()", before_history)
         self.assertNotIn("guard await reloadCapabilities() else { return }", before_history)
 
+    def test_cached_communication_assurance_cannot_block_bootstrap_or_history(self) -> None:
+        bootstrap = self.refresh.index("try await api.bootstrap()")
+        history = self.refresh.index("await refreshSelectedWalletTransactions(")
+        first_communication_gate = self.refresh.index(
+            "guard communicationAccessGranted else { return }"
+        )
+
+        self.assertIn("AuthenticatedProjectionRefreshPolicy.permits(", self.refresh[:bootstrap])
+        self.assertNotIn(
+            "communicationAccessGranted\n        else { return }",
+            self.refresh[:bootstrap],
+        )
+        self.assertLess(bootstrap, history)
+        self.assertLess(history, first_communication_gate)
+
     def test_wallet_history_refresh_is_account_and_session_fenced(self) -> None:
         helper = swift_function(
             self.source,

@@ -567,6 +567,35 @@ enum ConnectivityTransitionPolicy {
     }
 }
 
+/// Admission for the authenticated account projection (profile, wallets and wallet history).
+///
+/// Communication assurance is deliberately not an input. Bootstrap is the authority that can
+/// restore a stale cached assurance projection, so requiring the cached communication decision
+/// before bootstrap creates a deadlock: the request that would repair assurance can never run.
+/// Communication side effects retain their own stricter gates after the financial projection has
+/// committed.
+enum AuthenticatedProjectionRefreshPolicy {
+    static func permits(
+        isSigningOut: Bool,
+        isSignedIn: Bool,
+        isOnline: Bool,
+        accountSetupComplete: Bool,
+        isSubmittingAccountDeletion: Bool,
+        acceptedAccountDeletionCleanupBlocked: Bool,
+        protectedLocalStateRecoveryBlocked: Bool,
+        unresolvedAccountDeletionAttemptBlocked: Bool
+    ) -> Bool {
+        !isSigningOut
+            && isSignedIn
+            && isOnline
+            && accountSetupComplete
+            && !isSubmittingAccountDeletion
+            && !acceptedAccountDeletionCleanupBlocked
+            && !protectedLocalStateRecoveryBlocked
+            && !unresolvedAccountDeletionAttemptBlocked
+    }
+}
+
 /// Admits one authoritative bootstrap after a real background visit.
 ///
 /// SwiftUI reports `.active` again after transient interruptions such as Control Center and
@@ -1431,11 +1460,22 @@ final class AppModel: ObservableObject {
                           !self.unresolvedAccountDeletionAttemptBlocked
                     else { return }
                     self.scheduleEphemeralCallCancellationDrain()
-                    if self.isSignedIn,
-                       self.accountSetupStep == nil,
-                       self.communicationAccessGranted {
+                    if AuthenticatedProjectionRefreshPolicy.permits(
+                        isSigningOut: self.isSigningOut,
+                        isSignedIn: self.isSignedIn,
+                        isOnline: self.isOnline,
+                        accountSetupComplete: self.accountSetupStep == nil,
+                        isSubmittingAccountDeletion: self.isSubmittingAccountDeletion,
+                        acceptedAccountDeletionCleanupBlocked:
+                            self.acceptedAccountDeletionCleanupBlocked,
+                        protectedLocalStateRecoveryBlocked:
+                            self.protectedLocalStateRecoveryBlocked,
+                        unresolvedAccountDeletionAttemptBlocked:
+                            self.unresolvedAccountDeletionAttemptBlocked
+                    ) {
                         await self.refresh()
-                        if self.appReviewDemoMutationsAllowed,
+                        if self.communicationAccessGranted,
+                           self.appReviewDemoMutationsAllowed,
                            self.capabilities != nil {
                             // A launch-time capability failure leaves authenticated session
                             // resume deliberately incomplete. Reconnection may have repaired the
@@ -6147,14 +6187,16 @@ final class AppModel: ObservableObject {
 
     private func drainForegroundAuthoritativeRefresh() async {
         while !Task.isCancelled {
-            let sessionIsEligible = !isSigningOut
-                && isSignedIn
-                && accountSetupStep == nil
-                && communicationAccessGranted
-                && !requiresBiometricSignIn
-                && !acceptedAccountDeletionCleanupBlocked
-                && !protectedLocalStateRecoveryBlocked
-                && !unresolvedAccountDeletionAttemptBlocked
+            let sessionIsEligible = AuthenticatedProjectionRefreshPolicy.permits(
+                isSigningOut: isSigningOut,
+                isSignedIn: isSignedIn,
+                isOnline: isOnline,
+                accountSetupComplete: accountSetupStep == nil,
+                isSubmittingAccountDeletion: isSubmittingAccountDeletion,
+                acceptedAccountDeletionCleanupBlocked: acceptedAccountDeletionCleanupBlocked,
+                protectedLocalStateRecoveryBlocked: protectedLocalStateRecoveryBlocked,
+                unresolvedAccountDeletionAttemptBlocked: unresolvedAccountDeletionAttemptBlocked
+            ) && !requiresBiometricSignIn
             switch foregroundAuthoritativeRefreshGate.admission(
                 at: Date(),
                 appIsActive: !appIsInBackground,
@@ -6174,6 +6216,7 @@ final class AppModel: ObservableObject {
             case .start(let generation):
                 await refresh()
                 if !didResumeAuthenticatedSession,
+                   communicationAccessGranted,
                    appReviewDemoMutationsAllowed,
                    capabilities != nil {
                     // If launch resume stopped at a transient discovery failure, a later
@@ -8077,7 +8120,10 @@ final class AppModel: ObservableObject {
             userID: expectedUserID,
             sessionID: expectedSessionID
         ) else { return }
-        guard appReviewDemoMutationsAllowed, capabilities != nil else {
+        guard communicationAccessGranted,
+              appReviewDemoMutationsAllowed,
+              capabilities != nil
+        else {
             didResumeAuthenticatedSession = false
             isLoading = false
             return
@@ -8203,12 +8249,16 @@ final class AppModel: ObservableObject {
     ///   refreshes — launch, session resume, returning from the biometric prompt — stay silent
     ///   about transient transport failures instead of raising an alert nobody can act on.
     func refresh(userInitiated: Bool = false) async {
-        guard !isSigningOut,
-              isSignedIn,
-              isOnline,
-              accountSetupStep == nil,
-              communicationAccessGranted
-        else { return }
+        guard AuthenticatedProjectionRefreshPolicy.permits(
+            isSigningOut: isSigningOut,
+            isSignedIn: isSignedIn,
+            isOnline: isOnline,
+            accountSetupComplete: accountSetupStep == nil,
+            isSubmittingAccountDeletion: isSubmittingAccountDeletion,
+            acceptedAccountDeletionCleanupBlocked: acceptedAccountDeletionCleanupBlocked,
+            protectedLocalStateRecoveryBlocked: protectedLocalStateRecoveryBlocked,
+            unresolvedAccountDeletionAttemptBlocked: unresolvedAccountDeletionAttemptBlocked
+        ) else { return }
         guard let expectedSessionID = await sessions.current()?.sessionId,
               let expectedUserID = profile?.id
         else { return }
@@ -8257,12 +8307,16 @@ final class AppModel: ObservableObject {
         // Already-confirmed communication state may resume immediately while discovery refreshes.
         // Its own feature and identity fences still fail closed, and the post-discovery wake below
         // catches a feature that becomes available only in the new response.
-        resumeEphemeralOutgoingCallIfPossible()
+        if communicationAccessGranted {
+            resumeEphemeralOutgoingCallIfPossible()
+        }
 
         // Wake durable communication work without putting finance behind it. A resumable media
         // upload or E2EE recovery can legitimately take minutes; bootstrap and wallet history
         // must still refresh immediately and independently on the same foreground visit.
-        scheduleOutboxWake()
+        if communicationAccessGranted {
+            scheduleOutboxWake()
+        }
         guard !Task.isCancelled,
               !isSigningOut,
               isSignedIn,
@@ -8271,7 +8325,9 @@ final class AppModel: ObservableObject {
               profile?.id.caseInsensitiveCompare(expectedUserID) == .orderedSame,
               await sessions.current()?.sessionId == expectedSessionID
         else { return }
-        requestCallMicrophonePermissionInForeground()
+        if communicationAccessGranted {
+            requestCallMicrophonePermissionInForeground()
+        }
         let expectedDeviceManagementGeneration = deviceManagementGeneration
         let expectedDeviceProjectionRevision = state.currentRegisteredDeviceProjectionRevision
         do {
@@ -8369,6 +8425,9 @@ final class AppModel: ObservableObject {
             sessionID: expectedSessionID,
             userID: expectedUserID
         ) else { return }
+        // Bootstrap has now replaced cached assurance with the server-authoritative projection.
+        // Finance is already current; only communication work depends on this separate decision.
+        guard communicationAccessGranted else { return }
         resumeEphemeralOutgoingCallIfPossible()
         scheduleOutboxWake()
 

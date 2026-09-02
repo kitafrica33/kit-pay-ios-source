@@ -108,15 +108,25 @@ final class ChatMediaPolicyTests: XCTestCase {
         defer { ChatMediaTempFiles.removeTemporaryFile(url) }
 
         let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        let directoryAttributes = try FileManager.default.attributesOfItem(
+            atPath: url.deletingLastPathComponent().path
+        )
 #if targetEnvironment(simulator)
         // Simulator files live on the host filesystem, which may omit NSFileProtectionKey.
         // If the runtime does expose it, it must still agree with the production policy above.
         if let protection = attributes[.protectionKey] as? FileProtectionType {
             XCTAssertEqual(protection, .completeUnlessOpen)
         }
+        if let protection = directoryAttributes[.protectionKey] as? FileProtectionType {
+            XCTAssertEqual(protection, .completeUnlessOpen)
+        }
 #else
         XCTAssertEqual(
             attributes[.protectionKey] as? FileProtectionType,
+            .completeUnlessOpen
+        )
+        XCTAssertEqual(
+            directoryAttributes[.protectionKey] as? FileProtectionType,
             .completeUnlessOpen
         )
 #endif
@@ -961,6 +971,63 @@ final class ChatMediaPolicyTests: XCTestCase {
             records.dropFirst().compactMap { $0["playbackOutcome"] as? String },
             ["preparation_failed", "started", "stalled", "failed_to_end", "completed"]
         )
+    }
+
+    @MainActor
+    func testPlaybackFailureDiagnosticsPersistOnlySanitizedAVPlayerFacts() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "kit-video-diagnostics-tests-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        let persistenceURL = directory.appendingPathComponent("report.json")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let secret = "https://media.example/private/customer-video.mp4?token=secret"
+        let diagnostic = LocalMediaPlaybackDiagnostic.sanitized(
+            failureSource: .failedToEndNotification,
+            itemStatus: .failed,
+            errorDomain: "NSURLErrorDomain",
+            errorCode: -1_005,
+            errorLogDomain: secret,
+            errorLogStatusCode: -12_345,
+            errorLogEventCount: 8_000
+        )
+
+        XCTAssertEqual(diagnostic.errorDomain, .urlLoading)
+        XCTAssertEqual(diagnostic.errorLogDomain, .other)
+        XCTAssertEqual(diagnostic.errorLogEventCount, 32)
+        XCTAssertFalse(diagnostic.supportReference.contains(secret))
+
+        let monitor = LocalMediaPerformanceMonitor(persistenceURL: persistenceURL)
+        let mediaID = UUID()
+        monitor.recordPlayback(
+            outcome: .failedToEnd,
+            mediaID: mediaID,
+            isOutgoing: false,
+            byteCount: 8_192,
+            expectedDuration: 9,
+            position: 1.1,
+            diagnostic: diagnostic,
+            producerScope: monitor.captureProducerScope()
+        )
+        monitor.flushPendingPersistence()
+
+        let persisted = try String(contentsOf: persistenceURL, encoding: .utf8)
+        let exported = monitor.exportReport()
+        for text in [persisted, exported] {
+            XCTAssertFalse(text.contains(secret))
+            XCTAssertFalse(text.localizedCaseInsensitiveContains(mediaID.uuidString))
+        }
+        let root = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(exported.utf8)) as? [String: Any]
+        )
+        let record = try XCTUnwrap((root["records"] as? [[String: Any]])?.last)
+        XCTAssertEqual(record["playbackFailureSource"] as? String, "failed_to_end_notification")
+        XCTAssertEqual(record["playbackItemStatus"] as? String, "failed")
+        XCTAssertEqual(record["playbackErrorDomain"] as? String, "url_loading")
+        XCTAssertEqual(record["playbackErrorCode"] as? Int, -1_005)
+        XCTAssertEqual(record["playbackErrorLogDomain"] as? String, "other")
+        XCTAssertEqual(record["playbackErrorLogStatusCode"] as? Int, -12_345)
+        XCTAssertEqual(record["playbackErrorLogEventCount"] as? Int, 32)
     }
 
     @MainActor
@@ -2638,11 +2705,12 @@ final class ChatMediaPolicyTests: XCTestCase {
             declaredMediaType: "video/mp4",
             expectedByteCount: byteCount
         )
-        defer { ChatMediaTempFiles.removeTemporaryFile(prepared.temporaryAliasURL) }
+        defer { prepared.playbackFileLease.release() }
 
-        XCTAssertNil(prepared.temporaryAliasURL)
         XCTAssertGreaterThan(prepared.duration, 0)
-        XCTAssertEqual(prepared.playbackURL, url)
+        XCTAssertNotEqual(prepared.playbackURL, url)
+        XCTAssertEqual(prepared.playbackURL.pathExtension, "mp4")
+        XCTAssertTrue(prepared.playbackFileLease.isValid())
     }
 
     func testQuickTimeBytesMislabeledAsMP4GetAPlayableMOVAlias() async throws {
@@ -2665,13 +2733,79 @@ final class ChatMediaPolicyTests: XCTestCase {
             declaredMediaType: "video/mp4",
             expectedByteCount: byteCount
         )
-        defer { ChatMediaTempFiles.removeTemporaryFile(prepared.temporaryAliasURL) }
+        defer { prepared.playbackFileLease.release() }
 
         XCTAssertEqual(prepared.playbackURL.pathExtension, "mov")
-        XCTAssertNotNil(prepared.temporaryAliasURL)
         XCTAssertEqual(prepared.asset.url, prepared.playbackURL)
         XCTAssertNotEqual(prepared.asset.url, mislabeled)
         XCTAssertGreaterThan(prepared.duration, 0)
+    }
+
+    @MainActor
+    func testPlaybackAliasSurvivesParentCleanupUntilPlayerLeaseReleases() async throws {
+        let generated = try await makePlayableVideo(fileType: .mp4, pathExtension: "mp4")
+        defer { try? FileManager.default.removeItem(at: generated) }
+        let parentURL = try ChatMediaTempFiles.linkTemporaryFile(
+            from: generated,
+            mediaType: "video/mp4"
+        )
+        let byteCount = try fileByteCount(parentURL)
+        let prepared = try await ChatVideoPlaybackAssetPolicy.prepare(
+            fileURL: parentURL,
+            declaredMediaType: "video/mp4",
+            expectedByteCount: byteCount
+        )
+        let playerOwnedURL = prepared.playbackURL
+
+        // This is the real SwiftUI ordering hazard: a cover's parent binding can clean up its
+        // source before the child receives onDisappear and tears down AVPlayer.
+        ChatMediaTempFiles.removeTemporaryFile(parentURL)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: parentURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: playerOwnedURL.path))
+        XCTAssertTrue(prepared.playbackFileLease.isValid())
+        let isPlayable = try await prepared.asset.load(.isPlayable)
+        XCTAssertTrue(isPlayable)
+
+        prepared.playbackFileLease.release()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: playerOwnedURL.path))
+    }
+
+    func testPlaybackArtifactRejectsTruncationAndEqualSizedPathReplacement() throws {
+        let truncatedURL = try ChatMediaTempFiles.writeTemporaryFile(
+            data: Data(repeating: 0x31, count: 4_096),
+            mediaType: "video/mp4"
+        )
+        defer { ChatMediaTempFiles.removeTemporaryFile(truncatedURL) }
+        let truncatedIdentity = try ChatVideoPlaybackArtifactPolicy.identity(
+            at: truncatedURL,
+            expectedByteCount: 4_096
+        )
+        let writer = try FileHandle(forWritingTo: truncatedURL)
+        try writer.truncate(atOffset: 1_024)
+        try writer.close()
+        XCTAssertFalse(ChatVideoPlaybackArtifactPolicy.matches(
+            fileURL: truncatedURL,
+            expectedIdentity: truncatedIdentity
+        ))
+
+        let replacedURL = try ChatMediaTempFiles.writeTemporaryFile(
+            data: Data(repeating: 0x41, count: 4_096),
+            mediaType: "video/mp4"
+        )
+        defer { ChatMediaTempFiles.removeTemporaryFile(replacedURL) }
+        let retainedHandle = try FileHandle(forReadingFrom: replacedURL)
+        defer { try? retainedHandle.close() }
+        let replacedIdentity = try ChatVideoPlaybackArtifactPolicy.identity(
+            at: replacedURL,
+            expectedByteCount: 4_096
+        )
+        try FileManager.default.removeItem(at: replacedURL)
+        try Data(repeating: 0x42, count: 4_096).write(to: replacedURL, options: .atomic)
+        XCTAssertFalse(ChatVideoPlaybackArtifactPolicy.matches(
+            fileURL: replacedURL,
+            expectedIdentity: replacedIdentity
+        ))
     }
 
     @MainActor

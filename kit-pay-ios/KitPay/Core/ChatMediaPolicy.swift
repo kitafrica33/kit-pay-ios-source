@@ -16,6 +16,92 @@ enum LocalMediaPlaybackOutcome: String, Codable, Sendable {
     case completed
 }
 
+enum LocalMediaPlaybackFailureSource: String, Codable, Sendable {
+    case assetPreparation = "asset_preparation"
+    case stalledNotification = "stalled_notification"
+    case failedToEndNotification = "failed_to_end_notification"
+    case itemStatus = "item_status"
+}
+
+enum LocalMediaPlaybackItemStatus: String, Codable, Sendable {
+    case unknown
+    case readyToPlay = "ready_to_play"
+    case failed
+}
+
+/// Fixed buckets for system error domains. Raw domains, comments, URLs, server addresses and
+/// playback-session identifiers are never retained: third-party containers may put sensitive
+/// values in all of those AVPlayer error-log fields.
+enum LocalMediaPlaybackErrorDomain: String, Codable, Sendable {
+    case avFoundation = "avfoundation"
+    case coreMedia = "core_media"
+    case urlLoading = "url_loading"
+    case cocoa
+    case posix
+    case osStatus = "os_status"
+    case other
+}
+
+struct LocalMediaPlaybackDiagnostic: Equatable, Sendable {
+    let failureSource: LocalMediaPlaybackFailureSource
+    let itemStatus: LocalMediaPlaybackItemStatus?
+    let errorDomain: LocalMediaPlaybackErrorDomain?
+    let errorCode: Int?
+    let errorLogDomain: LocalMediaPlaybackErrorDomain?
+    let errorLogStatusCode: Int?
+    let errorLogEventCount: Int?
+
+    static func sanitized(
+        failureSource: LocalMediaPlaybackFailureSource,
+        itemStatus: LocalMediaPlaybackItemStatus? = nil,
+        errorDomain rawErrorDomain: String? = nil,
+        errorCode rawErrorCode: Int? = nil,
+        errorLogDomain rawErrorLogDomain: String? = nil,
+        errorLogStatusCode rawErrorLogStatusCode: Int? = nil,
+        errorLogEventCount rawErrorLogEventCount: Int? = nil
+    ) -> LocalMediaPlaybackDiagnostic {
+        LocalMediaPlaybackDiagnostic(
+            failureSource: failureSource,
+            itemStatus: itemStatus,
+            errorDomain: domainCategory(rawErrorDomain),
+            errorCode: boundedCode(rawErrorCode),
+            errorLogDomain: domainCategory(rawErrorLogDomain),
+            errorLogStatusCode: boundedCode(rawErrorLogStatusCode),
+            errorLogEventCount: rawErrorLogEventCount.map { min(max($0, 0), 32) }
+        )
+    }
+
+    /// Short customer-shareable reference containing only the same allow-listed buckets and
+    /// bounded numbers written to the protected diagnostics report.
+    var supportReference: String {
+        var values = [failureSource.rawValue]
+        if let itemStatus { values.append("item_\(itemStatus.rawValue)") }
+        if let errorDomain { values.append("\(errorDomain.rawValue)_\(errorCode ?? 0)") }
+        if let errorLogDomain {
+            values.append("log_\(errorLogDomain.rawValue)_\(errorLogStatusCode ?? 0)")
+        }
+        return values.joined(separator: ".")
+    }
+
+    private static func boundedCode(_ value: Int?) -> Int? {
+        guard let value, (Int(Int32.min) ... Int(Int32.max)).contains(value) else { return nil }
+        return value
+    }
+
+    private static func domainCategory(_ rawValue: String?) -> LocalMediaPlaybackErrorDomain? {
+        guard let rawValue else { return nil }
+        switch rawValue.lowercased() {
+        case "avfoundationerrordomain": return .avFoundation
+        case "coremediaerrordomain": return .coreMedia
+        case "nsurlerrordomain": return .urlLoading
+        case "nscocoaerrordomain": return .cocoa
+        case "nsposixerrordomain": return .posix
+        case "nsosstatuserrordomain": return .osStatus
+        default: return .other
+        }
+    }
+}
+
 /// Runtime-only authority captured by the producer before asynchronous media work starts.
 /// Rotating it at an account boundary makes late callbacks from the prior account harmless.
 struct LocalMediaDiagnosticProducerScope: Equatable, Sendable {
@@ -48,6 +134,13 @@ private struct LocalMediaStoredDiagnosticRecord: Codable, Sendable {
     var actionToVisibleLocalBubbleMilliseconds: Double?
     var playbackOutcome: LocalMediaPlaybackOutcome?
     var playbackPositionSeconds: Double?
+    var playbackFailureSource: LocalMediaPlaybackFailureSource?
+    var playbackItemStatus: LocalMediaPlaybackItemStatus?
+    var playbackErrorDomain: LocalMediaPlaybackErrorDomain?
+    var playbackErrorCode: Int?
+    var playbackErrorLogDomain: LocalMediaPlaybackErrorDomain?
+    var playbackErrorLogStatusCode: Int?
+    var playbackErrorLogEventCount: Int?
 
     private enum CodingKeys: String, CodingKey {
         case localCorrelationTokenSHA256
@@ -66,6 +159,13 @@ private struct LocalMediaStoredDiagnosticRecord: Codable, Sendable {
         case actionToVisibleLocalBubbleMilliseconds
         case playbackOutcome
         case playbackPositionSeconds
+        case playbackFailureSource
+        case playbackItemStatus
+        case playbackErrorDomain
+        case playbackErrorCode
+        case playbackErrorLogDomain
+        case playbackErrorLogStatusCode
+        case playbackErrorLogEventCount
     }
 }
 
@@ -256,6 +356,13 @@ final class LocalMediaPerformanceMonitor {
         let actionToVisibleLocalBubbleMilliseconds: Double?
         let playbackOutcome: LocalMediaPlaybackOutcome?
         let playbackPositionSeconds: Double?
+        let playbackFailureSource: LocalMediaPlaybackFailureSource?
+        let playbackItemStatus: LocalMediaPlaybackItemStatus?
+        let playbackErrorDomain: LocalMediaPlaybackErrorDomain?
+        let playbackErrorCode: Int?
+        let playbackErrorLogDomain: LocalMediaPlaybackErrorDomain?
+        let playbackErrorLogStatusCode: Int?
+        let playbackErrorLogEventCount: Int?
     }
 
     private struct ExportReport: Encodable {
@@ -549,6 +656,7 @@ final class LocalMediaPerformanceMonitor {
         byteCount: Int?,
         expectedDuration: TimeInterval?,
         position: TimeInterval?,
+        diagnostic: LocalMediaPlaybackDiagnostic? = nil,
         producerScope: LocalMediaDiagnosticProducerScope?
     ) {
         guard accepts(producerScope) else { return }
@@ -577,7 +685,14 @@ final class LocalMediaPerformanceMonitor {
             actionToDurableOutboxCommitMilliseconds: nil,
             actionToVisibleLocalBubbleMilliseconds: nil,
             playbackOutcome: outcome,
-            playbackPositionSeconds: Self.validNonnegative(position)
+            playbackPositionSeconds: Self.validNonnegative(position),
+            playbackFailureSource: diagnostic?.failureSource,
+            playbackItemStatus: diagnostic?.itemStatus,
+            playbackErrorDomain: diagnostic?.errorDomain,
+            playbackErrorCode: diagnostic?.errorCode,
+            playbackErrorLogDomain: diagnostic?.errorLogDomain,
+            playbackErrorLogStatusCode: diagnostic?.errorLogStatusCode,
+            playbackErrorLogEventCount: diagnostic?.errorLogEventCount
         )
         append(record)
     }
@@ -609,7 +724,14 @@ final class LocalMediaPerformanceMonitor {
             actionToDurableOutboxCommitMilliseconds: nil,
             actionToVisibleLocalBubbleMilliseconds: nil,
             playbackOutcome: nil,
-            playbackPositionSeconds: nil
+            playbackPositionSeconds: nil,
+            playbackFailureSource: nil,
+            playbackItemStatus: nil,
+            playbackErrorDomain: nil,
+            playbackErrorCode: nil,
+            playbackErrorLogDomain: nil,
+            playbackErrorLogStatusCode: nil,
+            playbackErrorLogEventCount: nil
         )
         textSendMilestones[messageID] = TextSendMilestones(
             actionStartedAtUptimeNanoseconds: atUptimeNanoseconds,
@@ -709,7 +831,14 @@ final class LocalMediaPerformanceMonitor {
                 actionToVisibleLocalBubbleMilliseconds:
                     record.actionToVisibleLocalBubbleMilliseconds,
                 playbackOutcome: record.playbackOutcome,
-                playbackPositionSeconds: record.playbackPositionSeconds
+                playbackPositionSeconds: record.playbackPositionSeconds,
+                playbackFailureSource: record.playbackFailureSource,
+                playbackItemStatus: record.playbackItemStatus,
+                playbackErrorDomain: record.playbackErrorDomain,
+                playbackErrorCode: record.playbackErrorCode,
+                playbackErrorLogDomain: record.playbackErrorLogDomain,
+                playbackErrorLogStatusCode: record.playbackErrorLogStatusCode,
+                playbackErrorLogEventCount: record.playbackErrorLogEventCount
             )
         }
         let report = ExportReport(
@@ -856,7 +985,14 @@ final class LocalMediaPerformanceMonitor {
             actionToDurableOutboxCommitMilliseconds: nil,
             actionToVisibleLocalBubbleMilliseconds: nil,
             playbackOutcome: nil,
-            playbackPositionSeconds: nil
+            playbackPositionSeconds: nil,
+            playbackFailureSource: nil,
+            playbackItemStatus: nil,
+            playbackErrorDomain: nil,
+            playbackErrorCode: nil,
+            playbackErrorLogDomain: nil,
+            playbackErrorLogStatusCode: nil,
+            playbackErrorLogEventCount: nil
         )
         diagnosticRecordIDs[mediaID] = record.id
         diagnosticRecordGenerations[mediaID] = recordingGeneration

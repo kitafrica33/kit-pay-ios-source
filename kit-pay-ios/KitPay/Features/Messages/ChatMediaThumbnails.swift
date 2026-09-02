@@ -157,7 +157,7 @@ enum ChatVideoPosterGenerator {
             declaredMediaType: declaredMediaType,
             expectedByteCount: expectedByteCount
         ) else { return nil }
-        defer { ChatMediaTempFiles.removeTemporaryFile(prepared.temporaryAliasURL) }
+        defer { prepared.playbackFileLease.release() }
         guard !Task.isCancelled else { return nil }
 
         do {

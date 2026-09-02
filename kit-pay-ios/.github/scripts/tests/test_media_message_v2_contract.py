@@ -101,6 +101,14 @@ class MediaMessageV2SourceContract(unittest.TestCase):
         self.assertIn("loadTracks(withMediaType: .video)", playback)
         self.assertIn("expectedByteCount", playback)
         self.assertIn("linkTemporaryFile(", playback)
+        self.assertIn("ChatVideoPlaybackArtifactPolicy.sourceSnapshot(", playback)
+        self.assertIn("playbackFileLease.isValid()", playback)
+        self.assertGreaterEqual(
+            combined.count("private var playbackFileLease: ChatVideoPlaybackFileLease?"),
+            2,
+        )
+        self.assertEqual(combined.count("private var playbackFileHandle: FileHandle?"), 0)
+        self.assertGreaterEqual(combined.count("replaceCurrentItem(with: nil)"), 2)
         self.assertGreaterEqual(
             combined.count(
                 "private var protectedOriginalLease: SecureMediaOriginalAccessLease?"
@@ -127,7 +135,7 @@ class MediaMessageV2SourceContract(unittest.TestCase):
         self.assertIn("ChatVideoPlaybackAssetPolicy.prepare(", thumbnails)
         self.assertIn("defer { ChatMediaTempFiles.removeTemporaryFile(sourceURL) }", thumbnails)
         self.assertIn(
-            "defer { ChatMediaTempFiles.removeTemporaryFile(prepared.temporaryAliasURL) }",
+            "defer { prepared.playbackFileLease.release() }",
             thumbnails,
         )
         self.assertIn("withExtendedLifetime(protectedOriginalLease)", thumbnails)
@@ -137,6 +145,32 @@ class MediaMessageV2SourceContract(unittest.TestCase):
         for call_site in (views, album, library, gallery):
             self.assertIn("mediaType:", call_site)
             self.assertIn("expectedByteCount:", call_site)
+
+    def test_every_player_serializes_against_posters_and_owns_a_verified_alias(self) -> None:
+        """Both the gallery and standalone viewer must drain same-content poster decoding before
+        allocating a player, then keep their independent hard-link lease through item teardown."""
+        views = CHAT_MEDIA_VIEWS.read_text(encoding="utf-8")
+        gallery = MEDIA_GALLERY.read_text(encoding="utf-8")
+        playback = VIDEO_PLAYBACK.read_text(encoding="utf-8")
+        combined = views + gallery
+
+        self.assertGreaterEqual(
+            combined.count("ChatVideoPosterGenerator.acquirePlayback(forKey: contentKey)"),
+            2,
+        )
+        self.assertGreaterEqual(
+            combined.count("ChatVideoPosterGenerator.releasePlayback(playbackClaim)"),
+            2,
+        )
+        self.assertIn("Always isolate AVFoundation behind a presentation-owned alias", playback)
+        self.assertIn("expectedIdentity: source.identity", playback)
+        self.assertIn("fstat(handle.fileDescriptor, &status)", playback)
+        self.assertIn("deviceID: UInt64(bitPattern: Int64(status.st_dev))", playback)
+        self.assertIn("fileID: UInt64(status.st_ino)", playback)
+        self.assertIn("private static func makeProtectedPreviewDirectory()", views)
+        self.assertIn("directory.lastPathComponent.hasPrefix(previewDirectoryPrefix)", views)
+        self.assertIn("@Environment(\\.dismiss) private var dismiss", views)
+        self.assertIn('Button("Close", action: onDismiss)', gallery)
 
     def test_legacy_received_video_is_file_backed_before_player_presentation(self) -> None:
         """Older installs stored received plaintext as a sealed whole-file blob. Keeping the
@@ -395,8 +429,7 @@ class MediaMessageV2SourceContract(unittest.TestCase):
             "player = nil",
             "playerItem = nil",
             "asset = nil",
-            "playbackFileHandle = nil",
-            "temporaryAliasURL = nil",
+            "playbackFileLease = nil",
             "sourceFileURL = nil",
             "ownsFileURL = false",
             "protectedOriginalLease = nil",

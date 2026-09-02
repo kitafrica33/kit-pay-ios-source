@@ -5,6 +5,10 @@ import unittest
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
+CHAT_MEDIA_POLICY = ROOT / "KitPay/Core/ChatMediaPolicy.swift"
+CHAT_MEDIA_VIEWS = ROOT / "KitPay/Features/Messages/ChatMediaViews.swift"
+MEDIA_GALLERY = ROOT / "KitPay/Features/Messages/KitMediaGalleryView.swift"
+VIDEO_PLAYBACK = ROOT / "KitPay/Features/Messages/ChatVideoPictureInPicture.swift"
 
 
 def declaration_body(path: pathlib.Path, declaration: str) -> str:
@@ -24,6 +28,34 @@ def declaration_body(path: pathlib.Path, declaration: str) -> str:
 
 
 class IOSMediaDiagnosticsSourceContractTests(unittest.TestCase):
+    def test_avplayer_failures_persist_only_allowlisted_error_facts(self) -> None:
+        policy = CHAT_MEDIA_POLICY.read_text(encoding="utf-8")
+        playback = VIDEO_PLAYBACK.read_text(encoding="utf-8")
+        combined_controllers = (
+            CHAT_MEDIA_VIEWS.read_text(encoding="utf-8")
+            + MEDIA_GALLERY.read_text(encoding="utf-8")
+        )
+
+        for field in (
+            "playbackFailureSource",
+            "playbackItemStatus",
+            "playbackErrorDomain",
+            "playbackErrorCode",
+            "playbackErrorLogDomain",
+            "playbackErrorLogStatusCode",
+            "playbackErrorLogEventCount",
+        ):
+            self.assertIn(field, policy)
+        self.assertIn("LocalMediaPlaybackDiagnostic.sanitized(", playback)
+        self.assertIn("item?.errorLog()?.events ?? []", playback)
+        self.assertNotIn("lastErrorEvent?.errorComment", playback)
+        self.assertNotIn("lasterrorevent?.uri", playback.lower())
+        self.assertNotIn("lastErrorEvent?.serverAddress", playback)
+        self.assertNotIn("lastErrorEvent?.playbackSessionID", playback)
+        self.assertGreaterEqual(combined_controllers.count("statusObservation = item.observe"), 2)
+        self.assertGreaterEqual(combined_controllers.count("diagnostic: diagnostic"), 2)
+        self.assertGreaterEqual(combined_controllers.count("Reference: \\(diagnostic.supportReference)"), 2)
+
     def test_accepted_deletion_recovery_clears_diagnostics_before_retiring_markers(self) -> None:
         body = declaration_body(
             ROOT / "KitPay/App/AppModel.swift",

@@ -213,6 +213,8 @@ enum ChatMediaBytes {
 }
 
 enum ChatMediaTempFiles {
+    private static let previewDirectoryPrefix = "kit-preview-"
+
     /// Kept visible to tests so the protection contract can be verified even on Simulator
     /// filesystems, which do not consistently expose `NSFileProtectionKey` attributes.
     static let previewFileWritingOptions: Data.WritingOptions = [
@@ -264,15 +266,16 @@ enum ChatMediaTempFiles {
         let stem = (base?.isEmpty == false ? base! : "kit-media-\(UUID().uuidString)")
         let ext = fileExtension(forMediaType: mediaType)
         let named = stem.lowercased().hasSuffix(".\(ext)") ? stem : "\(stem).\(ext)"
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("kit-preview-\(UUID().uuidString)", isDirectory: true)
+        let directory = try makeProtectedPreviewDirectory()
+        let url = directory
             .appendingPathComponent(named, isDirectory: false)
-        try FileManager.default.createDirectory(
-            at: url.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        try data.write(to: url, options: previewFileWritingOptions)
-        return url
+        do {
+            try data.write(to: url, options: previewFileWritingOptions)
+            return url
+        } catch {
+            try? FileManager.default.removeItem(at: directory)
+            throw error
+        }
     }
 
     /// File-to-file export for a protected local original. This preserves bounded memory while
@@ -289,37 +292,31 @@ enum ChatMediaTempFiles {
         let stem = base?.isEmpty == false ? base! : "kit-media-\(UUID().uuidString)"
         let ext = fileExtension(forMediaType: mediaType)
         let named = stem.lowercased().hasSuffix(".\(ext)") ? stem : "\(stem).\(ext)"
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
-            "kit-preview-\(UUID().uuidString)",
-            isDirectory: true
-        )
+        let directory = try makeProtectedPreviewDirectory()
         let destination = directory.appendingPathComponent(named, isDirectory: false)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        try FileManager.default.copyItem(at: sourceURL, to: destination)
-        try FileManager.default.setAttributes(
-            [.protectionKey: FileProtectionType.completeUnlessOpen],
-            ofItemAtPath: destination.path
-        )
-        return destination
+        do {
+            try FileManager.default.copyItem(at: sourceURL, to: destination)
+            try FileManager.default.setAttributes(
+                [.protectionKey: FileProtectionType.completeUnlessOpen],
+                ofItemAtPath: destination.path
+            )
+            return destination
+        } catch {
+            try? FileManager.default.removeItem(at: directory)
+            throw error
+        }
     }
 
     /// Gives AVFoundation a filename that agrees with the container bytes without copying a
     /// potentially 200 MiB received original. The source lease remains the lifetime authority;
     /// this same-volume hard link is presentation-owned and removed with its private directory.
     static func linkTemporaryFile(from sourceURL: URL, mediaType: String) throws -> URL {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
-            "kit-preview-\(UUID().uuidString)",
-            isDirectory: true
-        )
+        let directory = try makeProtectedPreviewDirectory()
         let destination = directory.appendingPathComponent(
             "kit-video.\(fileExtension(forMediaType: mediaType))",
             isDirectory: false
         )
         do {
-            try FileManager.default.createDirectory(
-                at: directory,
-                withIntermediateDirectories: true
-            )
             try FileManager.default.linkItem(at: sourceURL, to: destination)
             return destination
         } catch {
@@ -330,7 +327,49 @@ enum ChatMediaTempFiles {
 
     static func removeTemporaryFile(_ url: URL?) {
         guard let url else { return }
-        try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
+        let directory = url.deletingLastPathComponent().standardizedFileURL
+        let temporaryDirectory = FileManager.default.temporaryDirectory.standardizedFileURL
+        guard directory.lastPathComponent.hasPrefix(previewDirectoryPrefix),
+              directory.deletingLastPathComponent() == temporaryDirectory
+        else { return }
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    /// Every plaintext preview directory is itself protected and excluded from backup before a
+    /// file is published inside it. A video alias is a hard link, so its inode keeps the source's
+    /// equal-or-stronger file protection while this directory prevents an unprotected path from
+    /// being exposed during creation or cleanup.
+    private static func makeProtectedPreviewDirectory() throws -> URL {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "\(previewDirectoryPrefix)\(UUID().uuidString)",
+            isDirectory: true
+        )
+        do {
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: false
+            )
+#if targetEnvironment(simulator)
+            // Host filesystems do not consistently implement iOS Data Protection attributes.
+            try? FileManager.default.setAttributes(
+                [.protectionKey: FileProtectionType.completeUnlessOpen],
+                ofItemAtPath: directory.path
+            )
+#else
+            try FileManager.default.setAttributes(
+                [.protectionKey: FileProtectionType.completeUnlessOpen],
+                ofItemAtPath: directory.path
+            )
+#endif
+            var values = URLResourceValues()
+            values.isExcludedFromBackup = true
+            var mutableDirectory = directory
+            try? mutableDirectory.setResourceValues(values)
+            return directory
+        } catch {
+            try? FileManager.default.removeItem(at: directory)
+            throw error
+        }
     }
 }
 
@@ -543,6 +582,7 @@ struct PendingSecureMediaMessageView: View {
                                 mediaType: presentation.mediaType,
                                 expectedByteCount: presentation.byteCount,
                                 protectedOriginalLease: presentation.protectedOriginalLease,
+                                contentKey: mediaID.uuidString.lowercased(),
                                 mediaID: mediaID,
                                 isOutgoing: message.isOutgoing
                             ) { closePresentation() }
@@ -828,13 +868,15 @@ struct SecureMediaBatchMessageView: View {
     var body: some View {
         if let batch = message.pendingMediaBatch, batch.isStructurallyValid {
             itemStack(
-                items: batch.items.map { ($0.attachmentID, $0.mediaType, $0.plaintextByteSize) },
+                items: batch.items.map {
+                    ($0.attachmentID, $0.attachmentID, $0.mediaType, $0.plaintextByteSize)
+                },
                 isPending: true
             )
         } else if let descriptor = KitMediaMessageV2Descriptor.parse(message.body) {
             itemStack(
                 items: descriptor.items.map {
-                    ($0.attachmentID, $0.mediaType, $0.plaintextByteSize)
+                    ($0.attachmentID, $0.storageKey, $0.mediaType, $0.plaintextByteSize)
                 },
                 isPending: false
             )
@@ -854,7 +896,12 @@ struct SecureMediaBatchMessageView: View {
     }
 
     private func itemStack(
-        items: [(attachmentID: String, mediaType: String, plaintextByteSize: Int)],
+        items: [(
+            attachmentID: String,
+            contentKey: String,
+            mediaType: String,
+            plaintextByteSize: Int
+        )],
         isPending: Bool
     ) -> some View {
         VStack(alignment: message.isOutgoing ? .trailing : .leading, spacing: 5) {
@@ -864,6 +911,7 @@ struct SecureMediaBatchMessageView: View {
                     itemIndex: index,
                     itemCount: items.count,
                     attachmentID: item.attachmentID,
+                    contentKey: item.contentKey,
                     mediaType: item.mediaType,
                     plaintextByteSize: item.plaintextByteSize,
                     isPending: isPending
@@ -886,6 +934,9 @@ struct SecureMediaBatchItemView: View {
     let itemCount: Int
     /// Queue-minted canonical UUID; doubles as this item's stable playback identity.
     let attachmentID: String
+    /// Matches the poster cache key: local media identity while pending, remote object identity
+    /// after the authenticated batch descriptor has sealed.
+    let contentKey: String
     let mediaType: String
     let plaintextByteSize: Int
     let isPending: Bool
@@ -1059,6 +1110,7 @@ struct SecureMediaBatchItemView: View {
                         expectedByteCount: byteCount,
                         protectedOriginalLease:
                             localPresentation?.accessLease ?? loader.loaded?.localFileLease,
+                        contentKey: contentKey,
                         mediaID: UUID(uuidString: attachmentID) ?? message.id,
                         isOutgoing: message.isOutgoing
                     ) { closePresentation() }
@@ -1764,6 +1816,7 @@ struct VideoMessageBubbleView: View {
                     mediaType: playbackMediaType,
                     expectedByteCount: playbackByteCount,
                     protectedOriginalLease: protectedOriginalLease,
+                    contentKey: descriptor.storageKey,
                     mediaID: UUID(uuidString: descriptor.attachmentID) ?? message.id,
                     isOutgoing: message.isOutgoing
                 ) { closePlayer() }
@@ -1790,12 +1843,6 @@ struct VideoMessageBubbleView: View {
             conversationId: message.conversationId,
             itemIndex: nil
         ) {
-            await makePoster(
-                fileURL: localFile.url,
-                mediaType: localFile.mediaType,
-                expectedByteCount: localFile.byteCount,
-                protectedOriginalLease: localFile.accessLease
-            )
             protectedOriginalLease = localFile.accessLease
             playbackURL = localFile.url
             playbackMediaType = localFile.mediaType
@@ -1815,7 +1862,6 @@ struct VideoMessageBubbleView: View {
             conversationId: message.conversationId,
             itemIndex: nil
         ) else { return }
-        await makePoster(from: fresh)
         present(fresh)
     }
 
@@ -1887,10 +1933,12 @@ struct VideoMessageBubbleView: View {
 }
 
 struct MediaVideoPlayerView: View {
+    @Environment(\.dismiss) private var dismiss
     let fileURL: URL
     let mediaType: String
     let expectedByteCount: Int
     let protectedOriginalLease: SecureMediaOriginalAccessLease?
+    let contentKey: String
     let mediaID: UUID
     let isOutgoing: Bool
     let onClose: () -> Void
@@ -1901,6 +1949,7 @@ struct MediaVideoPlayerView: View {
         mediaType: String,
         expectedByteCount: Int,
         protectedOriginalLease: SecureMediaOriginalAccessLease?,
+        contentKey: String,
         mediaID: UUID,
         isOutgoing: Bool,
         onClose: @escaping () -> Void
@@ -1909,6 +1958,7 @@ struct MediaVideoPlayerView: View {
         self.mediaType = mediaType
         self.expectedByteCount = expectedByteCount
         self.protectedOriginalLease = protectedOriginalLease
+        self.contentKey = contentKey
         self.mediaID = mediaID
         self.isOutgoing = isOutgoing
         self.onClose = onClose
@@ -1938,6 +1988,7 @@ struct MediaVideoPlayerView: View {
             Button {
                 playback.stop()
                 onClose()
+                dismiss()
             } label: {
                 Image(systemName: "xmark")
                     .font(.system(size: 17, weight: .semibold))
@@ -1954,6 +2005,7 @@ struct MediaVideoPlayerView: View {
                 mediaType: mediaType,
                 expectedByteCount: expectedByteCount,
                 protectedOriginalLease: protectedOriginalLease,
+                contentKey: contentKey,
                 mediaID: mediaID,
                 isOutgoing: isOutgoing
             )
@@ -1972,16 +2024,17 @@ private final class MediaVideoPlaybackController: ObservableObject {
     @Published private(set) var errorMessage: String?
 
     private var sourceFileURL: URL?
-    private var temporaryAliasURL: URL?
+    private var playbackFileLease: ChatVideoPlaybackFileLease?
     private var asset: AVURLAsset?
     private var playerItem: AVPlayerItem?
     private var protectedOriginalLease: SecureMediaOriginalAccessLease?
-    private var playbackFileHandle: FileHandle?
+    private var playbackClaim: ChatVideoPosterGenerator.PlaybackClaim?
     private var intendsToPlay = false
     private var timeObserver: Any?
     private var endObserver: NSObjectProtocol?
     private var stallObserver: NSObjectProtocol?
     private var failureObserver: NSObjectProtocol?
+    private var statusObservation: NSKeyValueObservation?
     private var preparationID: UUID?
     private var diagnosticMediaID: UUID?
     private var diagnosticIsOutgoing = false
@@ -1989,16 +2042,21 @@ private final class MediaVideoPlaybackController: ObservableObject {
     private let diagnosticProducerScope = LocalMediaPerformanceMonitor.shared.captureProducerScope()
     private var expectedDuration: Double?
     private var didRecordPlaybackStart = false
+    private var didRecordTerminalFailure = false
 
     func start(
         fileURL: URL,
         mediaType: String,
         expectedByteCount: Int,
         protectedOriginalLease: SecureMediaOriginalAccessLease?,
+        contentKey: String,
         mediaID: UUID,
         isOutgoing: Bool
     ) async {
-        guard player == nil, !isPreparing else { return }
+        if player != nil || isPreparing {
+            guard sourceFileURL != fileURL else { return }
+            stop()
+        }
         let identifier = UUID()
         preparationID = identifier
         sourceFileURL = fileURL
@@ -2008,14 +2066,24 @@ private final class MediaVideoPlaybackController: ObservableObject {
         diagnosticByteCount = expectedByteCount
         expectedDuration = nil
         didRecordPlaybackStart = false
-        guard let fileHandle = try? FileHandle(forReadingFrom: fileURL) else {
-            failPreparation(ChatVideoPlaybackPreparationError.invalidFile)
-            return
-        }
-        playbackFileHandle = fileHandle
+        didRecordTerminalFailure = false
         isPreparing = true
         errorMessage = nil
         intendsToPlay = true
+        guard let claim = await ChatVideoPosterGenerator.acquirePlayback(forKey: contentKey)
+        else {
+            failPreparation(ChatVideoPlaybackPreparationError.invalidFile)
+            return
+        }
+        guard !Task.isCancelled,
+              preparationID == identifier,
+              sourceFileURL == fileURL
+        else {
+            ChatVideoPosterGenerator.releasePlayback(claim)
+            if preparationID == identifier { stop() }
+            return
+        }
+        playbackClaim = claim
         do {
             let prepared = try await ChatVideoPlaybackAssetPolicy.prepare(
                 fileURL: fileURL,
@@ -2026,10 +2094,11 @@ private final class MediaVideoPlaybackController: ObservableObject {
                   preparationID == identifier,
                   sourceFileURL == fileURL
             else {
-                ChatMediaTempFiles.removeTemporaryFile(prepared.temporaryAliasURL)
+                prepared.playbackFileLease.release()
+                if preparationID == identifier { stop() }
                 return
             }
-            temporaryAliasURL = prepared.temporaryAliasURL
+            playbackFileLease = prepared.playbackFileLease
             asset = prepared.asset
             expectedDuration = prepared.duration
             let item = AVPlayerItem(asset: prepared.asset)
@@ -2061,22 +2130,23 @@ private final class MediaVideoPlaybackController: ObservableObject {
         if let timeObserver { player?.removeTimeObserver(timeObserver) }
         timeObserver = nil
         removePlaybackItemObservers()
-        player?.pause()
+        let retainedPlayer = player
+        retainedPlayer?.pause()
+        retainedPlayer?.replaceCurrentItem(with: nil)
         player = nil
         playerItem = nil
         asset = nil
-        if let playbackFileHandle {
-            try? playbackFileHandle.close()
-        }
-        playbackFileHandle = nil
-        ChatMediaTempFiles.removeTemporaryFile(temporaryAliasURL)
-        temporaryAliasURL = nil
+        playbackFileLease?.release()
+        playbackFileLease = nil
         sourceFileURL = nil
         protectedOriginalLease = nil
+        ChatVideoPosterGenerator.releasePlayback(playbackClaim)
+        playbackClaim = nil
         diagnosticMediaID = nil
         diagnosticByteCount = nil
         expectedDuration = nil
         didRecordPlaybackStart = false
+        didRecordTerminalFailure = false
     }
 
     private func observePlaybackItem(_ item: AVPlayerItem) {
@@ -2101,9 +2171,24 @@ private final class MediaVideoPlaybackController: ObservableObject {
             forName: .AVPlayerItemFailedToPlayToEndTime,
             object: item,
             queue: .main
-        ) { [weak self] _ in
+        ) { [weak self] notification in
             Task { @MainActor in
-                self?.handleInterruption(.failed, item: item)
+                self?.handleInterruption(
+                    .failed,
+                    item: item,
+                    notificationError: notification.userInfo?[
+                        AVPlayerItemFailedToPlayToEndTimeErrorKey
+                    ] as? Error
+                )
+            }
+        }
+        statusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
+            guard item.status == .failed else { return }
+            Task { @MainActor in
+                // Prefer the failed-to-end notification when AVFoundation emits both; yielding
+                // gives that callback a chance to include its concrete NSError first.
+                await Task.yield()
+                self?.handleItemStatusFailure(item: item)
             }
         }
     }
@@ -2112,26 +2197,37 @@ private final class MediaVideoPlaybackController: ObservableObject {
         if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
         if let stallObserver { NotificationCenter.default.removeObserver(stallObserver) }
         if let failureObserver { NotificationCenter.default.removeObserver(failureObserver) }
+        statusObservation?.invalidate()
         endObserver = nil
         stallObserver = nil
         failureObserver = nil
+        statusObservation = nil
     }
 
     private func handleInterruption(
         _ interruption: ChatVideoPlaybackFailurePolicy.Interruption,
-        item: AVPlayerItem
+        item: AVPlayerItem,
+        notificationError: Error? = nil
     ) {
         guard intendsToPlay, playerItem === item else { return }
         switch interruption {
         case .stalled:
-            if didRecordPlaybackStart {
-                recordPlayback(.stalled, position: item.currentTime().seconds)
-            }
-        case .failed:
-            recordPlayback(
-                didRecordPlaybackStart ? .failedToEnd : .preparationFailed,
-                position: item.currentTime().seconds
+            let diagnostic = ChatVideoPlayerDiagnosticPolicy.snapshot(
+                failureSource: .stalledNotification,
+                item: item
             )
+            recordPlayback(
+                .stalled,
+                position: item.currentTime().seconds,
+                diagnostic: diagnostic
+            )
+        case .failed:
+            handleTerminalFailure(
+                item: item,
+                source: .failedToEndNotification,
+                notificationError: notificationError
+            )
+            return
         }
         switch ChatVideoPlaybackFailurePolicy.action(for: interruption) {
         case .letPlayerRecover:
@@ -2143,6 +2239,33 @@ private final class MediaVideoPlaybackController: ObservableObject {
             player?.pause()
             errorMessage = "This video could not be played completely."
         }
+    }
+
+    private func handleItemStatusFailure(item: AVPlayerItem) {
+        guard intendsToPlay, playerItem === item, item.status == .failed else { return }
+        handleTerminalFailure(item: item, source: .itemStatus)
+    }
+
+    private func handleTerminalFailure(
+        item: AVPlayerItem,
+        source: LocalMediaPlaybackFailureSource,
+        notificationError: Error? = nil
+    ) {
+        guard !didRecordTerminalFailure, playerItem === item else { return }
+        didRecordTerminalFailure = true
+        let diagnostic = ChatVideoPlayerDiagnosticPolicy.snapshot(
+            failureSource: source,
+            item: item,
+            notificationError: notificationError
+        )
+        recordPlayback(
+            didRecordPlaybackStart ? .failedToEnd : .preparationFailed,
+            position: item.currentTime().seconds,
+            diagnostic: diagnostic
+        )
+        intendsToPlay = false
+        player?.pause()
+        errorMessage = "This video could not be played completely.\nReference: \(diagnostic.supportReference)"
     }
 
     private func handlePlaybackEnded(item: AVPlayerItem) {
@@ -2168,7 +2291,11 @@ private final class MediaVideoPlaybackController: ObservableObject {
         recordPlayback(.started, position: position)
     }
 
-    private func recordPlayback(_ outcome: LocalMediaPlaybackOutcome, position: Double?) {
+    private func recordPlayback(
+        _ outcome: LocalMediaPlaybackOutcome,
+        position: Double?,
+        diagnostic: LocalMediaPlaybackDiagnostic? = nil
+    ) {
         guard let mediaID = diagnosticMediaID else { return }
         LocalMediaPerformanceMonitor.shared.recordPlayback(
             outcome: outcome,
@@ -2177,20 +2304,31 @@ private final class MediaVideoPlaybackController: ObservableObject {
             byteCount: diagnosticByteCount,
             expectedDuration: expectedDuration,
             position: position.flatMap { $0.isFinite && $0 >= 0 ? $0 : nil },
+            diagnostic: diagnostic,
             producerScope: diagnosticProducerScope
         )
     }
 
     private func failPreparation(_ error: Error) {
-        recordPlayback(.preparationFailed, position: nil)
+        let nsError = error as NSError
+        let diagnostic = LocalMediaPlaybackDiagnostic.sanitized(
+            failureSource: .assetPreparation,
+            errorDomain: nsError.domain,
+            errorCode: nsError.code
+        )
+        recordPlayback(.preparationFailed, position: nil, diagnostic: diagnostic)
         isPreparing = false
+        preparationID = nil
         intendsToPlay = false
-        errorMessage = (error as? LocalizedError)?.errorDescription
+        let description = (error as? LocalizedError)?.errorDescription
             ?? "This video could not be played."
-        if let playbackFileHandle { try? playbackFileHandle.close() }
-        playbackFileHandle = nil
+        errorMessage = "\(description)\nReference: \(diagnostic.supportReference)"
+        playbackFileLease?.release()
+        playbackFileLease = nil
         protectedOriginalLease = nil
         sourceFileURL = nil
+        ChatVideoPosterGenerator.releasePlayback(playbackClaim)
+        playbackClaim = nil
     }
 }
 

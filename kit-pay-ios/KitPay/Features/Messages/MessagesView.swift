@@ -3060,6 +3060,7 @@ struct ConversationView: View {
                             mediaType: presentation.mediaType,
                             expectedByteCount: presentation.byteCount,
                             protectedOriginalLease: nil,
+                            contentKey: presentation.mediaID.uuidString.lowercased(),
                             mediaID: presentation.mediaID,
                             isOutgoing: true
                         ) {
