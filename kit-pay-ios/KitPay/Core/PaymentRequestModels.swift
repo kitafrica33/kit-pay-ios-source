@@ -792,6 +792,21 @@ struct KitPaymentMessage: Equatable, Sendable {
         )
     }
 
+    static func outcomeMessageID(
+        paymentRequestID: String,
+        action: KitPaymentMessageAction,
+        actorUserID: String
+    ) -> UUID {
+        KitSystemMessage.deterministicMessageID(
+            namespace: [
+                "payment-request-outcome",
+                paymentRequestID.lowercased(),
+                action.rawValue,
+                actorUserID.lowercased(),
+            ].joined(separator: "|")
+        )
+    }
+
     func matchesAuthoritativeRequest(_ request: PaymentRequestDTO) -> Bool {
         request.type == "payment_request"
             && request.id == paymentRequestId
@@ -956,8 +971,711 @@ struct KitPaymentRequestChatShare: Equatable, Sendable {
     }
 }
 
+// MARK: - Durable payment-request chat recovery
+
+/// A create intent is written before the POST and remains account/chat bound until its exact
+/// `KITPAY1` request card has crossed into the encrypted outbox.
+struct PaymentRequestChatReceiptRecoveryRecord: Codable, Hashable, Identifiable, Sendable {
+    let id: UUID
+    let ownerUserID: String
+    let destinationWalletID: String
+    let recipientUserID: String
+    let recipientName: String
+    let conversationID: String?
+    let amount: String
+    let currencyCode: String
+    let currencyScale: Int
+    let note: String?
+    let expiresAt: String?
+    let idempotencyKey: String
+    let createdAt: Date
+    var phase: FinancialChatReceiptRecoveryPhase
+    var nextRecoveryAt: Date
+    var recoveryAttemptCount: Int
+    var confirmation: PaymentRequestChatReceiptConfirmation?
+
+    init?(
+        id: UUID = UUID(),
+        ownerUserID: String,
+        destinationWalletID: String,
+        recipientUserID: String,
+        recipientName: String,
+        conversationID: String?,
+        amount: String,
+        currency: CurrencyDTO,
+        note: String?,
+        expiresAt: String? = nil,
+        idempotencyKey: String,
+        createdAt: Date = Date()
+    ) {
+        let cleanNote = FinancialRecoveryValidation.canonicalOptionalNote(note)
+        guard (note == nil || cleanNote != nil),
+              let owner = FinancialRecoveryValidation.canonicalUUID(ownerUserID),
+              let destination = FinancialRecoveryValidation.canonicalUUID(destinationWalletID),
+              let recipient = FinancialRecoveryValidation.canonicalUUID(recipientUserID),
+              owner != recipient,
+              let name = FinancialRecoveryValidation.safeName(recipientName),
+              let scale = Int(currency.scale),
+              FinancialRecoveryValidation.isCurrencyCode(currency.code),
+              KitPaymentMessage.minorUnits(for: amount, scale: scale).map({ $0 > 0 }) == true,
+              let key = FinancialRecoveryValidation.idempotencyKey(idempotencyKey),
+              createdAt.timeIntervalSinceReferenceDate.isFinite
+        else { return nil }
+        let conversation: String?
+        if let conversationID {
+            guard let value = FinancialRecoveryValidation.canonicalUUID(conversationID) else {
+                return nil
+            }
+            conversation = value
+        } else {
+            conversation = nil
+        }
+        guard expiresAt.map({ !$0.isEmpty && $0.utf8.count <= 100 }) ?? true else { return nil }
+        self.id = id
+        self.ownerUserID = owner
+        self.destinationWalletID = destination
+        self.recipientUserID = recipient
+        self.recipientName = name
+        self.conversationID = conversation
+        self.amount = amount
+        currencyCode = currency.code
+        currencyScale = scale
+        self.note = cleanNote
+        self.expiresAt = expiresAt
+        self.idempotencyKey = key
+        self.createdAt = createdAt
+        phase = .prepared
+        nextRecoveryAt = createdAt
+        recoveryAttemptCount = 0
+        confirmation = nil
+    }
+
+    var isStructurallyValid: Bool {
+        FinancialRecoveryValidation.canonicalUUID(ownerUserID) == ownerUserID
+            && FinancialRecoveryValidation.canonicalUUID(destinationWalletID)
+                == destinationWalletID
+            && FinancialRecoveryValidation.canonicalUUID(recipientUserID) == recipientUserID
+            && ownerUserID != recipientUserID
+            && (conversationID == nil
+                || FinancialRecoveryValidation.canonicalUUID(conversationID) == conversationID)
+            && FinancialRecoveryValidation.safeName(recipientName) == recipientName
+            && FinancialRecoveryValidation.isCurrencyCode(currencyCode)
+            && (0 ... 6).contains(currencyScale)
+            && KitPaymentMessage.minorUnits(for: amount, scale: currencyScale).map({ $0 > 0 })
+                == true
+            && FinancialRecoveryValidation.canonicalOptionalNote(note) == note
+            && (expiresAt.map({ !$0.isEmpty && $0.utf8.count <= 100 }) ?? true)
+            && FinancialRecoveryValidation.idempotencyKey(idempotencyKey) == idempotencyKey
+            && createdAt.timeIntervalSinceReferenceDate.isFinite
+            && nextRecoveryAt.timeIntervalSinceReferenceDate.isFinite
+            && recoveryAttemptCount >= 0
+            && (phase == .confirmed) == (confirmation != nil)
+            && (confirmation?.isValid(for: self) ?? true)
+    }
+
+    func hasSameIntent(as other: Self) -> Bool {
+        ownerUserID == other.ownerUserID
+            && destinationWalletID == other.destinationWalletID
+            && recipientUserID == other.recipientUserID
+            && conversationID == other.conversationID
+            && amount == other.amount
+            && currencyCode == other.currencyCode
+            && currencyScale == other.currencyScale
+            && note == other.note
+            && expiresAt == other.expiresAt
+    }
+}
+
+struct PaymentRequestChatReceiptConfirmation: Codable, Hashable, Sendable {
+    let requestID: String
+    let messageID: String
+    let encodedDescriptor: String
+
+    var clientMessageID: UUID? { UUID(uuidString: messageID) }
+
+    init?(request: PaymentRequestDTO, recovery: PaymentRequestChatReceiptRecoveryRecord) {
+        guard recovery.isValidWithoutConfirmation,
+              request.type == "payment_request",
+              request.knownStatus == .pending,
+              let requestID = FinancialRecoveryValidation.canonicalUUID(request.id),
+              FinancialRecoveryValidation.canonicalUUID(request.destinationWalletId)
+                == recovery.destinationWalletID,
+              FinancialRecoveryValidation.canonicalUUID(request.requestedFromUserId)
+                == recovery.recipientUserID,
+              request.amount == recovery.amount,
+              request.currency.code == recovery.currencyCode,
+              Int(request.currency.scale) == recovery.currencyScale,
+              request.note == recovery.note,
+              (recovery.expiresAt == nil || request.expiresAt == recovery.expiresAt),
+              let descriptor = KitPaymentMessage(action: .request, paymentRequest: request)
+        else { return nil }
+        self.requestID = requestID
+        messageID = requestID
+        encodedDescriptor = descriptor.encoded
+    }
+
+    func isValid(for recovery: PaymentRequestChatReceiptRecoveryRecord) -> Bool {
+        guard FinancialRecoveryValidation.canonicalUUID(requestID) == requestID,
+              messageID == requestID,
+              let descriptor = KitPaymentMessage.parse(encodedDescriptor),
+              descriptor.action == .request,
+              descriptor.paymentRequestId == requestID,
+              descriptor.amountMinor == KitPaymentMessage.minorUnits(
+                  for: recovery.amount,
+                  scale: recovery.currencyScale
+              ),
+              descriptor.currencyCode == recovery.currencyCode,
+              descriptor.currencyScale == recovery.currencyScale,
+              descriptor.note == recovery.note
+        else { return false }
+        return true
+    }
+}
+
+private extension PaymentRequestChatReceiptRecoveryRecord {
+    var isValidWithoutConfirmation: Bool {
+        var copy = self
+        copy.phase = .submitted
+        copy.confirmation = nil
+        return copy.isStructurallyValid
+    }
+}
+
+enum PaymentRequestChatReceiptRecoveryPolicy {
+    static let maximumRecordsPerRecoveryPass =
+        FinancialChatReceiptRecoveryPolicy.maximumRecordsPerRecoveryPass
+
+    @discardableResult
+    static func sanitize(
+        _ records: inout [PaymentRequestChatReceiptRecoveryRecord],
+        ownerUserID: String? = nil,
+        now: Date = Date()
+    ) -> Int {
+        let originalCount = records.count
+        let owner = ownerUserID.flatMap { FinancialRecoveryValidation.canonicalUUID($0) }
+        var seen: Set<UUID> = []
+        records = records.sorted { left, right in
+            FinancialRecoveryValidation.recoveryComesFirst(
+                leftPhase: left.phase,
+                leftDate: left.createdAt,
+                leftID: left.id,
+                rightPhase: right.phase,
+                rightDate: right.createdAt,
+                rightID: right.id
+            )
+        }.filter { record in
+            let age = now.timeIntervalSince(record.createdAt)
+            return record.isStructurallyValid
+                && (ownerUserID == nil || record.ownerUserID == owner)
+                && age >= -FinancialChatReceiptRecoveryPolicy.clockSkewAllowance
+                && (record.phase != .prepared
+                    || age <= FinancialChatReceiptRecoveryPolicy.preparedRetentionLifetime)
+                && seen.insert(record.id).inserted
+        }
+        return originalCount - records.count
+    }
+
+    static func insertOrReuse(
+        _ candidate: PaymentRequestChatReceiptRecoveryRecord,
+        in records: inout [PaymentRequestChatReceiptRecoveryRecord],
+        now: Date = Date()
+    ) -> PaymentRequestChatReceiptRecoveryRecord? {
+        guard candidate.isStructurallyValid else { return nil }
+        sanitize(&records, ownerUserID: candidate.ownerUserID, now: now)
+        if let existing = records.first(where: { $0.hasSameIntent(as: candidate) }) {
+            return existing
+        }
+        guard records.count < FinancialChatReceiptRecoveryPolicy.maximumPendingRecords else {
+            return nil
+        }
+        records.append(candidate)
+        return candidate
+    }
+
+    @discardableResult
+    static func markSubmitted(
+        recordID: UUID,
+        in records: inout [PaymentRequestChatReceiptRecoveryRecord],
+        now: Date = Date()
+    ) -> Bool {
+        guard let index = records.firstIndex(where: { $0.id == recordID }),
+              records[index].phase == .prepared
+        else { return false }
+        records[index].phase = .submitted
+        records[index].nextRecoveryAt = now
+        return true
+    }
+
+    @discardableResult
+    static func storeConfirmation(
+        _ confirmation: PaymentRequestChatReceiptConfirmation,
+        for recordID: UUID,
+        in records: inout [PaymentRequestChatReceiptRecoveryRecord]
+    ) -> Bool {
+        guard let index = records.firstIndex(where: { $0.id == recordID }),
+              records[index].phase != .prepared,
+              confirmation.isValid(for: records[index]),
+              records[index].confirmation.map({ $0 == confirmation }) ?? true
+        else { return false }
+        records[index].confirmation = confirmation
+        records[index].phase = .confirmed
+        return true
+    }
+
+    @discardableResult
+    static func recordRecoveryFailure(
+        recordID: UUID,
+        in records: inout [PaymentRequestChatReceiptRecoveryRecord],
+        now: Date = Date()
+    ) -> Bool {
+        guard let index = records.firstIndex(where: {
+            $0.id == recordID && $0.phase == .submitted
+        }) else { return false }
+        if records[index].recoveryAttemptCount < Int.max {
+            records[index].recoveryAttemptCount += 1
+        }
+        records[index].nextRecoveryAt = FinancialChatReceiptRecoveryPolicy.nextRecoveryDate(
+            afterAttempt: records[index].recoveryAttemptCount,
+            now: now
+        )
+        return true
+    }
+
+    @discardableResult
+    static func retireNotCommitted(
+        recordID: UUID,
+        in records: inout [PaymentRequestChatReceiptRecoveryRecord]
+    ) -> Bool {
+        guard let index = records.firstIndex(where: {
+            $0.id == recordID && $0.phase == .submitted && $0.confirmation == nil
+        }) else { return false }
+        records.remove(at: index)
+        return true
+    }
+
+    @discardableResult
+    static func acknowledgeDurableMessage(
+        recordID: UUID,
+        messageID: UUID,
+        in records: inout [PaymentRequestChatReceiptRecoveryRecord]
+    ) -> Bool {
+        guard let index = records.firstIndex(where: {
+            $0.id == recordID
+                && $0.phase == .confirmed
+                && $0.confirmation?.clientMessageID == messageID
+                && $0.confirmation?.isValid(for: $0) == true
+        }) else { return false }
+        records.remove(at: index)
+        return true
+    }
+
+    static func recoveryDecision(for error: Error) -> FinancialChatReceiptRecoveryDecision {
+        FinancialChatReceiptRecoveryPolicy.recoveryDecision(
+            for: error,
+            notFoundCode: "PAYMENT_REQUEST_RECOVERY_NOT_FOUND"
+        )
+    }
+}
+
+enum PaymentRequestResolutionRecoveryOperation: String, Codable, Hashable, Sendable {
+    case paid
+    case cancelled
+}
+
+enum PaymentRequestResolutionRecoveryReadDecision: Equatable {
+    case confirm
+    case retain
+    case retireUncommitted
+}
+
+/// Durable authority for the chat outcome of a pay/cancel action. The known request ID is read
+/// exactly after restart; recovery never repeats either mutation.
+struct PaymentRequestResolutionChatReceiptRecoveryRecord:
+    Codable, Hashable, Identifiable, Sendable
+{
+    let id: UUID
+    let ownerUserID: String
+    let conversationID: String
+    let recipientUserID: String
+    let recipientName: String
+    let requestID: String
+    let destinationWalletID: String
+    let sourceWalletID: String?
+    let originalDescriptor: String
+    let operation: PaymentRequestResolutionRecoveryOperation
+    let idempotencyKey: String
+    let createdAt: Date
+    var phase: FinancialChatReceiptRecoveryPhase
+    var nextRecoveryAt: Date
+    var recoveryAttemptCount: Int
+    var confirmation: PaymentRequestResolutionChatReceiptConfirmation?
+
+    init?(
+        id: UUID = UUID(),
+        ownerUserID: String,
+        conversationID: String,
+        recipientUserID: String,
+        recipientName: String,
+        request: PaymentRequestDTO,
+        descriptor: KitPaymentMessage,
+        sourceWalletID: String?,
+        operation: PaymentRequestResolutionRecoveryOperation,
+        idempotencyKey: String,
+        createdAt: Date = Date()
+    ) {
+        guard descriptor.action == .request,
+              descriptor.matchesAuthoritativeRequest(request),
+              request.knownStatus == .pending,
+              let owner = FinancialRecoveryValidation.canonicalUUID(ownerUserID),
+              let conversation = FinancialRecoveryValidation.canonicalUUID(conversationID),
+              let recipient = FinancialRecoveryValidation.canonicalUUID(recipientUserID),
+              let requestID = FinancialRecoveryValidation.canonicalUUID(request.id),
+              let destination = FinancialRecoveryValidation.canonicalUUID(
+                  request.destinationWalletId
+              ),
+              let name = FinancialRecoveryValidation.safeName(recipientName),
+              let key = FinancialRecoveryValidation.idempotencyKey(idempotencyKey),
+              owner != recipient,
+              createdAt.timeIntervalSinceReferenceDate.isFinite
+        else { return nil }
+        let source = sourceWalletID.flatMap { FinancialRecoveryValidation.canonicalUUID($0) }
+        guard (operation == .paid) == (source != nil) else { return nil }
+        self.id = id
+        self.ownerUserID = owner
+        self.conversationID = conversation
+        self.recipientUserID = recipient
+        self.recipientName = name
+        self.requestID = requestID
+        self.destinationWalletID = destination
+        self.sourceWalletID = source
+        originalDescriptor = descriptor.encoded
+        self.operation = operation
+        self.idempotencyKey = key
+        self.createdAt = createdAt
+        phase = .prepared
+        nextRecoveryAt = createdAt
+        recoveryAttemptCount = 0
+        confirmation = nil
+    }
+
+    var isStructurallyValid: Bool {
+        guard FinancialRecoveryValidation.canonicalUUID(ownerUserID) == ownerUserID,
+              FinancialRecoveryValidation.canonicalUUID(conversationID) == conversationID,
+              FinancialRecoveryValidation.canonicalUUID(recipientUserID) == recipientUserID,
+              FinancialRecoveryValidation.canonicalUUID(requestID) == requestID,
+              FinancialRecoveryValidation.canonicalUUID(destinationWalletID)
+                == destinationWalletID,
+              ownerUserID != recipientUserID,
+              (sourceWalletID == nil
+                  || FinancialRecoveryValidation.canonicalUUID(sourceWalletID) == sourceWalletID),
+              (operation == .paid) == (sourceWalletID != nil),
+              FinancialRecoveryValidation.safeName(recipientName) == recipientName,
+              FinancialRecoveryValidation.idempotencyKey(idempotencyKey) == idempotencyKey,
+              let descriptor = KitPaymentMessage.parse(originalDescriptor),
+              descriptor.action == .request,
+              descriptor.paymentRequestId == requestID,
+              createdAt.timeIntervalSinceReferenceDate.isFinite,
+              nextRecoveryAt.timeIntervalSinceReferenceDate.isFinite,
+              recoveryAttemptCount >= 0,
+              (phase == .confirmed) == (confirmation != nil)
+        else { return false }
+        return confirmation?.isValid(for: self) ?? true
+    }
+
+    func hasSameIntent(as other: Self) -> Bool {
+        ownerUserID == other.ownerUserID
+            && conversationID == other.conversationID
+            && recipientUserID == other.recipientUserID
+            && requestID == other.requestID
+            && destinationWalletID == other.destinationWalletID
+            && sourceWalletID == other.sourceWalletID
+            && originalDescriptor == other.originalDescriptor
+            && operation == other.operation
+    }
+
+    func matchesExactRead(_ request: PaymentRequestDTO) -> Bool {
+        guard request.type == "payment_request",
+              FinancialRecoveryValidation.canonicalUUID(request.id) == requestID,
+              FinancialRecoveryValidation.canonicalUUID(request.destinationWalletId)
+                == destinationWalletID,
+              let descriptor = KitPaymentMessage.parse(originalDescriptor),
+              descriptor.matchesAuthoritativeRequest(request),
+              descriptor.note == request.note
+        else { return false }
+        switch operation {
+        case .paid:
+            return FinancialRecoveryValidation.canonicalUUID(request.requestedFromUserId)
+                == ownerUserID
+        case .cancelled:
+            return FinancialRecoveryValidation.canonicalUUID(request.requestedFromUserId)
+                == recipientUserID
+        }
+    }
+}
+
+struct PaymentRequestResolutionChatReceiptConfirmation: Codable, Hashable, Sendable {
+    let messageID: String
+    let encodedDescriptor: String
+
+    var clientMessageID: UUID? { UUID(uuidString: messageID) }
+
+    init?(
+        request: PaymentRequestDTO,
+        recovery: PaymentRequestResolutionChatReceiptRecoveryRecord
+    ) {
+        guard let original = KitPaymentMessage.parse(recovery.originalDescriptor),
+              recovery.matchesExactRead(request)
+        else { return nil }
+        switch recovery.operation {
+        case .paid:
+            guard request.knownStatus == .paid,
+                  FinancialRecoveryValidation.canonicalUUID(request.requestedFromUserId)
+                    == recovery.ownerUserID,
+                  FinancialRecoveryValidation.canonicalUUID(request.walletTransactionId) != nil
+            else { return nil }
+        case .cancelled:
+            guard request.knownStatus == .cancelled,
+                  FinancialRecoveryValidation.canonicalUUID(request.requestedFromUserId)
+                    == recovery.recipientUserID
+            else { return nil }
+        }
+        let action: KitPaymentMessageAction = recovery.operation == .paid ? .paid : .cancelled
+        guard let descriptor = original.changingAction(to: action) else { return nil }
+        let identifier = KitPaymentMessage.outcomeMessageID(
+            paymentRequestID: recovery.requestID,
+            action: action,
+            actorUserID: recovery.ownerUserID
+        )
+        messageID = identifier.uuidString.lowercased()
+        encodedDescriptor = descriptor.encoded
+    }
+
+    func isValid(for recovery: PaymentRequestResolutionChatReceiptRecoveryRecord) -> Bool {
+        let action: KitPaymentMessageAction = recovery.operation == .paid ? .paid : .cancelled
+        guard clientMessageID == KitPaymentMessage.outcomeMessageID(
+            paymentRequestID: recovery.requestID,
+            action: action,
+            actorUserID: recovery.ownerUserID
+        ), let original = KitPaymentMessage.parse(recovery.originalDescriptor),
+           let descriptor = KitPaymentMessage.parse(encodedDescriptor),
+           descriptor == original.changingAction(to: action)
+        else { return false }
+        return true
+    }
+}
+
+enum PaymentRequestResolutionChatReceiptRecoveryPolicy {
+    static let maximumRecordsPerRecoveryPass =
+        FinancialChatReceiptRecoveryPolicy.maximumRecordsPerRecoveryPass
+
+    /// A still-pending exact read can race an in-flight pay/cancel commit, so it is never proof
+    /// that the mutation failed. Only a different terminal state makes the intended transition
+    /// impossible and permits the submitted journal to be retired.
+    static func exactReadDecision(
+        for request: PaymentRequestDTO,
+        recovery: PaymentRequestResolutionChatReceiptRecoveryRecord
+    ) -> PaymentRequestResolutionRecoveryReadDecision {
+        guard recovery.matchesExactRead(request), let status = request.knownStatus else {
+            return .retain
+        }
+        let expected: PaymentRequestStatus = recovery.operation == .paid ? .paid : .cancelled
+        if status == expected { return .confirm }
+        return status == .pending ? .retain : .retireUncommitted
+    }
+
+    @discardableResult
+    static func sanitize(
+        _ records: inout [PaymentRequestResolutionChatReceiptRecoveryRecord],
+        ownerUserID: String? = nil,
+        now: Date = Date()
+    ) -> Int {
+        let originalCount = records.count
+        let owner = ownerUserID.flatMap { FinancialRecoveryValidation.canonicalUUID($0) }
+        var seen: Set<UUID> = []
+        records = records.sorted { left, right in
+            FinancialRecoveryValidation.recoveryComesFirst(
+                leftPhase: left.phase,
+                leftDate: left.createdAt,
+                leftID: left.id,
+                rightPhase: right.phase,
+                rightDate: right.createdAt,
+                rightID: right.id
+            )
+        }.filter { record in
+            let age = now.timeIntervalSince(record.createdAt)
+            return record.isStructurallyValid
+                && (ownerUserID == nil || record.ownerUserID == owner)
+                && age >= -FinancialChatReceiptRecoveryPolicy.clockSkewAllowance
+                && (record.phase != .prepared
+                    || age <= FinancialChatReceiptRecoveryPolicy.preparedRetentionLifetime)
+                && seen.insert(record.id).inserted
+        }
+        return originalCount - records.count
+    }
+
+    static func insertOrReuse(
+        _ candidate: PaymentRequestResolutionChatReceiptRecoveryRecord,
+        in records: inout [PaymentRequestResolutionChatReceiptRecoveryRecord],
+        now: Date = Date()
+    ) -> PaymentRequestResolutionChatReceiptRecoveryRecord? {
+        guard candidate.isStructurallyValid else { return nil }
+        sanitize(&records, ownerUserID: candidate.ownerUserID, now: now)
+        if let existing = records.first(where: { $0.hasSameIntent(as: candidate) }) {
+            return existing
+        }
+        guard records.count < FinancialChatReceiptRecoveryPolicy.maximumPendingRecords else {
+            return nil
+        }
+        records.append(candidate)
+        return candidate
+    }
+
+    @discardableResult
+    static func markSubmitted(
+        recordID: UUID,
+        in records: inout [PaymentRequestResolutionChatReceiptRecoveryRecord],
+        now: Date = Date()
+    ) -> Bool {
+        guard let index = records.firstIndex(where: { $0.id == recordID }),
+              records[index].phase == .prepared
+        else { return false }
+        records[index].phase = .submitted
+        records[index].nextRecoveryAt = now
+        return true
+    }
+
+    @discardableResult
+    static func storeConfirmation(
+        _ confirmation: PaymentRequestResolutionChatReceiptConfirmation,
+        for recordID: UUID,
+        in records: inout [PaymentRequestResolutionChatReceiptRecoveryRecord]
+    ) -> Bool {
+        guard let index = records.firstIndex(where: { $0.id == recordID }),
+              records[index].phase != .prepared,
+              confirmation.isValid(for: records[index]),
+              records[index].confirmation.map({ $0 == confirmation }) ?? true
+        else { return false }
+        records[index].confirmation = confirmation
+        records[index].phase = .confirmed
+        return true
+    }
+
+    @discardableResult
+    static func recordRecoveryFailure(
+        recordID: UUID,
+        in records: inout [PaymentRequestResolutionChatReceiptRecoveryRecord],
+        now: Date = Date()
+    ) -> Bool {
+        guard let index = records.firstIndex(where: {
+            $0.id == recordID && $0.phase == .submitted
+        }) else { return false }
+        if records[index].recoveryAttemptCount < Int.max {
+            records[index].recoveryAttemptCount += 1
+        }
+        records[index].nextRecoveryAt = FinancialChatReceiptRecoveryPolicy.nextRecoveryDate(
+            afterAttempt: records[index].recoveryAttemptCount,
+            now: now
+        )
+        return true
+    }
+
+    @discardableResult
+    static func retireUncommitted(
+        recordID: UUID,
+        in records: inout [PaymentRequestResolutionChatReceiptRecoveryRecord]
+    ) -> Bool {
+        guard let index = records.firstIndex(where: {
+            $0.id == recordID && $0.phase == .submitted && $0.confirmation == nil
+        }) else { return false }
+        records.remove(at: index)
+        return true
+    }
+
+    @discardableResult
+    static func acknowledgeDurableMessage(
+        recordID: UUID,
+        messageID: UUID,
+        in records: inout [PaymentRequestResolutionChatReceiptRecoveryRecord]
+    ) -> Bool {
+        guard let index = records.firstIndex(where: {
+            $0.id == recordID
+                && $0.phase == .confirmed
+                && $0.confirmation?.clientMessageID == messageID
+                && $0.confirmation?.isValid(for: $0) == true
+        }) else { return false }
+        records.remove(at: index)
+        return true
+    }
+}
+
+enum FinancialRecoveryValidation {
+    static func canonicalUUID(_ value: String?) -> String? {
+        guard let value,
+              value == value.trimmingCharacters(in: .whitespacesAndNewlines),
+              let identifier = UUID(uuidString: value)
+        else { return nil }
+        return identifier.uuidString.lowercased()
+    }
+
+    static func idempotencyKey(_ value: String) -> String? {
+        guard value == value.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty,
+              value.utf8.count <= 128,
+              value.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) })
+        else { return nil }
+        return value
+    }
+
+    static func safeName(_ value: String) -> String? {
+        let clean = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty,
+              clean.count <= 100,
+              clean.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) })
+        else { return nil }
+        return clean
+    }
+
+    /// Returns nil for both an absent note and an invalid note, so callers must additionally
+    /// compare a non-nil input with the result when constructing a record.
+    static func canonicalOptionalNote(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let clean = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty,
+              clean == value,
+              clean.utf16.count <= KitPaymentMessage.maximumNoteLength,
+              clean.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) })
+        else { return nil }
+        return clean
+    }
+
+    static func isCurrencyCode(_ value: String) -> Bool {
+        value.range(of: #"^[A-Z]{3}$"#, options: .regularExpression) != nil
+    }
+
+    static func recoveryComesFirst(
+        leftPhase: FinancialChatReceiptRecoveryPhase,
+        leftDate: Date,
+        leftID: UUID,
+        rightPhase: FinancialChatReceiptRecoveryPhase,
+        rightDate: Date,
+        rightID: UUID
+    ) -> Bool {
+        let rank: (FinancialChatReceiptRecoveryPhase) -> Int = {
+            switch $0 {
+            case .confirmed: 0
+            case .submitted: 1
+            case .prepared: 2
+            }
+        }
+        if rank(leftPhase) != rank(rightPhase) { return rank(leftPhase) < rank(rightPhase) }
+        if leftDate != rightDate { return leftDate < rightDate }
+        return leftID.uuidString < rightID.uuidString
+    }
+}
+
 enum PaymentRequestSubmissionError: LocalizedError, Equatable {
     case invalidRecipient
+    case recoveryCapacityReached
     case accountChanged
     case unconfirmedRequest
 
@@ -965,39 +1683,13 @@ enum PaymentRequestSubmissionError: LocalizedError, Equatable {
         switch self {
         case .invalidRecipient:
             "Choose a valid Kit Pay contact."
+        case .recoveryCapacityReached:
+            "Kit is still confirming earlier payment requests. Please try again later."
         case .accountChanged:
             "Your account changed before the request was completed. Please try again."
         case .unconfirmedRequest:
             "The request could not be confirmed. Check your payment requests before trying again."
         }
-    }
-}
-
-/// Process-local authority to finish sharing one just-created request. It is intentionally not
-/// persisted: after a relaunch, only a future backend conversation/message binding can safely
-/// prove where an older financial request belongs.
-struct PaymentRequestChatShareLease: Equatable, Sendable {
-    let accountEpoch: UUID
-    let userID: String
-    let sessionID: String
-    let recipientUserID: String
-    let descriptor: KitPaymentMessage
-
-    func authorizes(_ share: KitPaymentRequestChatShare) -> Bool {
-        recipientUserID.caseInsensitiveCompare(share.recipientUserID) == .orderedSame
-            && descriptor == share.descriptor
-    }
-
-    func matches(
-        accountEpoch: UUID,
-        userID: String,
-        sessionID: String,
-        recipientUserID: String
-    ) -> Bool {
-        self.accountEpoch == accountEpoch
-            && self.userID.caseInsensitiveCompare(userID) == .orderedSame
-            && self.sessionID == sessionID
-            && self.recipientUserID.caseInsensitiveCompare(recipientUserID) == .orderedSame
     }
 }
 

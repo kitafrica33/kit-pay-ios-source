@@ -3,6 +3,13 @@ import XCTest
 @testable import KitPay
 
 final class PaymentRequestTests: XCTestCase {
+    private let recoveryRequesterID = "10000000-0000-4000-8000-000000000001"
+    private let recoveryPayerID = "10000000-0000-4000-8000-000000000002"
+    private let recoveryWalletID = "20000000-0000-4000-8000-000000000001"
+    private let recoverySourceWalletID = "20000000-0000-4000-8000-000000000002"
+    private let recoveryConversationID = "30000000-0000-4000-8000-000000000001"
+    private let recoveryRequestID = "40000000-0000-4000-8000-000000000001"
+
     func testCreateBodyUsesBackendFieldNamesAndOmitsAbsentOptionals() throws {
         let body = CreatePaymentRequestBody(
             destinationWalletId: "destination-wallet",
@@ -56,6 +63,302 @@ final class PaymentRequestTests: XCTestCase {
             ) as? [String: Any]
         )
         XCTAssertTrue(object.isEmpty)
+    }
+
+    // MARK: - Durable financial chat recovery
+
+    func testPaymentRequestCreationJournalRoundTripsAndAcknowledgesOnlyExactMessage() throws {
+        let record = try XCTUnwrap(PaymentRequestChatReceiptRecoveryRecord(
+            id: UUID(uuidString: "50000000-0000-4000-8000-000000000001")!,
+            ownerUserID: recoveryRequesterID,
+            destinationWalletID: recoveryWalletID,
+            recipientUserID: recoveryPayerID,
+            recipientName: "Payer",
+            conversationID: recoveryConversationID,
+            amount: "10.00",
+            currency: CurrencyDTO(code: "UGX", scale: "2"),
+            note: "Lunch",
+            idempotencyKey: "ios-request-create-1",
+            createdAt: Date(timeIntervalSince1970: 1_780_000_000)
+        ))
+        let request = paymentRequest(
+            id: recoveryRequestID,
+            destinationWalletId: recoveryWalletID,
+            requestedFromUserId: recoveryPayerID
+        )
+        let confirmation = try XCTUnwrap(PaymentRequestChatReceiptConfirmation(
+            request: request,
+            recovery: record
+        ))
+        var records = [record]
+
+        XCTAssertTrue(PaymentRequestChatReceiptRecoveryPolicy.markSubmitted(
+            recordID: record.id,
+            in: &records
+        ))
+        XCTAssertTrue(PaymentRequestChatReceiptRecoveryPolicy.storeConfirmation(
+            confirmation,
+            for: record.id,
+            in: &records
+        ))
+        XCTAssertEqual(records[0].phase, .confirmed)
+        XCTAssertEqual(confirmation.clientMessageID, UUID(uuidString: recoveryRequestID))
+        XCTAssertEqual(
+            try JSONDecoder().decode(
+                PaymentRequestChatReceiptRecoveryRecord.self,
+                from: JSONEncoder().encode(records[0])
+            ),
+            records[0]
+        )
+        XCTAssertFalse(PaymentRequestChatReceiptRecoveryPolicy.acknowledgeDurableMessage(
+            recordID: record.id,
+            messageID: UUID(),
+            in: &records
+        ))
+        XCTAssertTrue(PaymentRequestChatReceiptRecoveryPolicy.acknowledgeDurableMessage(
+            recordID: record.id,
+            messageID: try XCTUnwrap(confirmation.clientMessageID),
+            in: &records
+        ))
+        XCTAssertTrue(records.isEmpty)
+    }
+
+    func testPaymentRequestCreationRetryReusesKeyAndOnlyPreparedRecordsExpire() throws {
+        let createdAt = Date(timeIntervalSince1970: 1_780_000_000)
+        let original = try XCTUnwrap(paymentRequestCreationRecovery(
+            id: UUID(uuidString: "50000000-0000-4000-8000-000000000001")!,
+            idempotencyKey: "ios-request-original",
+            createdAt: createdAt
+        ))
+        let retry = try XCTUnwrap(paymentRequestCreationRecovery(
+            id: UUID(uuidString: "50000000-0000-4000-8000-000000000002")!,
+            idempotencyKey: "ios-request-new-key",
+            createdAt: createdAt.addingTimeInterval(30)
+        ))
+        var records: [PaymentRequestChatReceiptRecoveryRecord] = []
+        XCTAssertEqual(
+            PaymentRequestChatReceiptRecoveryPolicy.insertOrReuse(
+                original,
+                in: &records,
+                now: createdAt
+            )?.idempotencyKey,
+            original.idempotencyKey
+        )
+        XCTAssertEqual(
+            PaymentRequestChatReceiptRecoveryPolicy.insertOrReuse(
+                retry,
+                in: &records,
+                now: createdAt.addingTimeInterval(30)
+            )?.idempotencyKey,
+            original.idempotencyKey
+        )
+        XCTAssertEqual(records.count, 1)
+
+        XCTAssertTrue(PaymentRequestChatReceiptRecoveryPolicy.markSubmitted(
+            recordID: original.id,
+            in: &records,
+            now: createdAt
+        ))
+        let stalePrepared = try XCTUnwrap(paymentRequestCreationRecovery(
+            id: UUID(uuidString: "50000000-0000-4000-8000-000000000003")!,
+            idempotencyKey: "ios-request-stale",
+            createdAt: createdAt
+        ))
+        records.append(stalePrepared)
+        PaymentRequestChatReceiptRecoveryPolicy.sanitize(
+            &records,
+            ownerUserID: recoveryRequesterID,
+            now: createdAt.addingTimeInterval(
+                FinancialChatReceiptRecoveryPolicy.preparedRetentionLifetime + 1
+            )
+        )
+        XCTAssertEqual(records.map(\.phase), [.submitted])
+
+        PaymentRequestChatReceiptRecoveryPolicy.sanitize(
+            &records,
+            ownerUserID: recoveryPayerID,
+            now: createdAt.addingTimeInterval(
+                FinancialChatReceiptRecoveryPolicy.preparedRetentionLifetime + 1
+            )
+        )
+        XCTAssertTrue(records.isEmpty, "another account must never inherit the journal")
+    }
+
+    func testPaymentRequestRecoveryRetiresOnlyItsStructuredNotFoundCode() {
+        XCTAssertEqual(
+            PaymentRequestChatReceiptRecoveryPolicy.recoveryDecision(
+                for: APIErrorPayload(
+                    code: "PAYMENT_REQUEST_RECOVERY_NOT_FOUND",
+                    message: "not committed",
+                    httpStatus: 404
+                )
+            ),
+            .notCommitted
+        )
+        let ambiguous: [Error] = [
+            APIErrorPayload(
+                code: "PAYMENT_REQUEST_NOT_FOUND",
+                message: "opaque",
+                httpStatus: 404
+            ),
+            APIErrorPayload(
+                code: "PAYMENT_REQUEST_RECOVERY_NOT_FOUND",
+                message: "wrong status",
+                httpStatus: 409
+            ),
+            APIErrorPayload(
+                code: "IDEMPOTENCY_REQUEST_IN_PROGRESS",
+                message: "in progress",
+                httpStatus: 409
+            ),
+            APIErrorPayload(
+                code: "IDEMPOTENCY_KEY_REUSED",
+                message: "mismatch",
+                httpStatus: 409
+            ),
+            APIErrorPayload(
+                code: "IDEMPOTENCY_REPLAY_UNAVAILABLE",
+                message: "unavailable",
+                httpStatus: 409
+            ),
+            APIErrorPayload(code: "SERVER_ERROR", message: "retry", httpStatus: 503),
+            APIClientError.invalidResponse,
+            CancellationError(),
+        ]
+        for error in ambiguous {
+            XCTAssertEqual(
+                PaymentRequestChatReceiptRecoveryPolicy.recoveryDecision(for: error),
+                .retain
+            )
+        }
+    }
+
+    func testPayAndCancelRecoveryUseExactReadAndDeterministicOutcomeIDs() throws {
+        let pending = paymentRequest(
+            id: recoveryRequestID,
+            destinationWalletId: recoveryWalletID,
+            requestedFromUserId: recoveryPayerID
+        )
+        let descriptor = try XCTUnwrap(
+            KitPaymentMessage(action: .request, paymentRequest: pending)
+        )
+        let pay = try XCTUnwrap(PaymentRequestResolutionChatReceiptRecoveryRecord(
+            ownerUserID: recoveryPayerID,
+            conversationID: recoveryConversationID,
+            recipientUserID: recoveryRequesterID,
+            recipientName: "Requester",
+            request: pending,
+            descriptor: descriptor,
+            sourceWalletID: recoverySourceWalletID,
+            operation: .paid,
+            idempotencyKey: "ios-request-pay-1"
+        ))
+        let cancel = try XCTUnwrap(PaymentRequestResolutionChatReceiptRecoveryRecord(
+            ownerUserID: recoveryRequesterID,
+            conversationID: recoveryConversationID,
+            recipientUserID: recoveryPayerID,
+            recipientName: "Payer",
+            request: pending,
+            descriptor: descriptor,
+            sourceWalletID: nil,
+            operation: .cancelled,
+            idempotencyKey: "ios-request-cancel-1"
+        ))
+        let paid = paymentRequest(
+            id: recoveryRequestID,
+            status: "paid",
+            destinationWalletId: recoveryWalletID,
+            requestedFromUserId: recoveryPayerID,
+            walletTransactionId: "60000000-0000-4000-8000-000000000001"
+        )
+        let cancelled = paymentRequest(
+            id: recoveryRequestID,
+            status: "cancelled",
+            destinationWalletId: recoveryWalletID,
+            requestedFromUserId: recoveryPayerID
+        )
+        let paidConfirmation = try XCTUnwrap(
+            PaymentRequestResolutionChatReceiptConfirmation(request: paid, recovery: pay)
+        )
+        let cancelledConfirmation = try XCTUnwrap(
+            PaymentRequestResolutionChatReceiptConfirmation(request: cancelled, recovery: cancel)
+        )
+
+        XCTAssertEqual(
+            paidConfirmation.clientMessageID,
+            KitPaymentMessage.outcomeMessageID(
+                paymentRequestID: recoveryRequestID,
+                action: .paid,
+                actorUserID: recoveryPayerID
+            )
+        )
+        XCTAssertEqual(
+            cancelledConfirmation.clientMessageID,
+            KitPaymentMessage.outcomeMessageID(
+                paymentRequestID: recoveryRequestID,
+                action: .cancelled,
+                actorUserID: recoveryRequesterID
+            )
+        )
+        XCTAssertNotEqual(paidConfirmation.clientMessageID, cancelledConfirmation.clientMessageID)
+        XCTAssertTrue(pay.matchesExactRead(paid))
+        XCTAssertTrue(cancel.matchesExactRead(cancelled))
+        XCTAssertEqual(
+            PaymentRequestResolutionChatReceiptRecoveryPolicy.exactReadDecision(
+                for: pending,
+                recovery: pay
+            ),
+            .retain,
+            "a pending read may still be racing the submitted mutation"
+        )
+        XCTAssertEqual(
+            PaymentRequestResolutionChatReceiptRecoveryPolicy.exactReadDecision(
+                for: paid,
+                recovery: pay
+            ),
+            .confirm
+        )
+        XCTAssertEqual(
+            PaymentRequestResolutionChatReceiptRecoveryPolicy.exactReadDecision(
+                for: cancelled,
+                recovery: pay
+            ),
+            .retireUncommitted
+        )
+        XCTAssertNil(PaymentRequestResolutionChatReceiptConfirmation(
+            request: paymentRequest(
+                id: recoveryRequestID,
+                status: "paid",
+                destinationWalletId: recoveryWalletID,
+                requestedFromUserId: recoveryRequesterID,
+                walletTransactionId: "60000000-0000-4000-8000-000000000001"
+            ),
+            recovery: pay
+        ))
+
+        var records = [pay]
+        XCTAssertTrue(PaymentRequestResolutionChatReceiptRecoveryPolicy.markSubmitted(
+            recordID: pay.id,
+            in: &records
+        ))
+        XCTAssertTrue(PaymentRequestResolutionChatReceiptRecoveryPolicy.storeConfirmation(
+            paidConfirmation,
+            for: pay.id,
+            in: &records
+        ))
+        XCTAssertEqual(
+            try JSONDecoder().decode(
+                PaymentRequestResolutionChatReceiptRecoveryRecord.self,
+                from: JSONEncoder().encode(records[0])
+            ),
+            records[0]
+        )
+        XCTAssertTrue(PaymentRequestResolutionChatReceiptRecoveryPolicy.acknowledgeDurableMessage(
+            recordID: pay.id,
+            messageID: try XCTUnwrap(paidConfirmation.clientMessageID),
+            in: &records
+        ))
+        XCTAssertTrue(records.isEmpty)
     }
 
     func testPolicySeparatesIncomingAndOutgoingAndAppliesExactActionGates() {
@@ -492,75 +795,6 @@ final class PaymentRequestTests: XCTestCase {
         ))
     }
 
-    func testChatShareLeaseRejectsEveryReplacementAccountBoundary() throws {
-        let epoch = UUID(uuidString: "dddddddd-dddd-4ddd-8ddd-dddddddddddd")!
-        let replacementEpoch = UUID(uuidString: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee")!
-        let recipient = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
-        let confirmedRequest = paymentRequest(
-            id: "ffffffff-ffff-4fff-8fff-ffffffffffff",
-            destinationWalletId: "requester-wallet",
-            requestedFromUserId: recipient,
-            amount: "5.00"
-        )
-        let confirmedShare = try XCTUnwrap(KitPaymentRequestChatShare(
-            paymentRequest: confirmedRequest,
-            recipientUserID: recipient,
-            recipientName: "ExampleContact"
-        ))
-        let lease = PaymentRequestChatShareLease(
-            accountEpoch: epoch,
-            userID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-            sessionID: "session-a",
-            recipientUserID: recipient,
-            descriptor: confirmedShare.descriptor
-        )
-
-        XCTAssertTrue(lease.authorizes(confirmedShare))
-        let alteredRequest = paymentRequest(
-            id: confirmedRequest.id,
-            destinationWalletId: confirmedRequest.destinationWalletId,
-            requestedFromUserId: recipient,
-            amount: "6.00"
-        )
-        let alteredShare = try XCTUnwrap(KitPaymentRequestChatShare(
-            paymentRequest: alteredRequest,
-            recipientUserID: recipient,
-            recipientName: "ExampleContact"
-        ))
-        XCTAssertFalse(lease.authorizes(alteredShare))
-
-        XCTAssertTrue(lease.matches(
-            accountEpoch: epoch,
-            userID: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
-            sessionID: "session-a",
-            recipientUserID: "BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB"
-        ))
-        XCTAssertFalse(lease.matches(
-            accountEpoch: replacementEpoch,
-            userID: lease.userID,
-            sessionID: lease.sessionID,
-            recipientUserID: lease.recipientUserID
-        ))
-        XCTAssertFalse(lease.matches(
-            accountEpoch: epoch,
-            userID: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
-            sessionID: lease.sessionID,
-            recipientUserID: lease.recipientUserID
-        ))
-        XCTAssertFalse(lease.matches(
-            accountEpoch: epoch,
-            userID: lease.userID,
-            sessionID: "session-b",
-            recipientUserID: lease.recipientUserID
-        ))
-        XCTAssertFalse(lease.matches(
-            accountEpoch: epoch,
-            userID: lease.userID,
-            sessionID: lease.sessionID,
-            recipientUserID: "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
-        ))
-    }
-
     @MainActor
     func testSecureShareRetryDoesNotRecreateBackendRequest() async throws {
         let request = paymentRequest(
@@ -920,7 +1154,8 @@ final class PaymentRequestTests: XCTestCase {
         requestedFromUserId: String?,
         amount: String = "10.00",
         currency: CurrencyDTO = CurrencyDTO(code: "UGX", scale: "2"),
-        expiresAt: String? = nil
+        expiresAt: String? = nil,
+        walletTransactionId: String? = nil
     ) -> PaymentRequestDTO {
         PaymentRequestDTO(
             id: id,
@@ -932,9 +1167,29 @@ final class PaymentRequestTests: XCTestCase {
             currency: currency,
             note: "Lunch",
             expiresAt: expiresAt,
-            walletTransactionId: nil,
+            walletTransactionId: walletTransactionId,
             paidAt: nil,
             createdAt: "2026-08-18T00:00:00Z"
+        )
+    }
+
+    private func paymentRequestCreationRecovery(
+        id: UUID,
+        idempotencyKey: String,
+        createdAt: Date
+    ) -> PaymentRequestChatReceiptRecoveryRecord? {
+        PaymentRequestChatReceiptRecoveryRecord(
+            id: id,
+            ownerUserID: recoveryRequesterID,
+            destinationWalletID: recoveryWalletID,
+            recipientUserID: recoveryPayerID,
+            recipientName: "Payer",
+            conversationID: recoveryConversationID,
+            amount: "10.00",
+            currency: CurrencyDTO(code: "UGX", scale: "2"),
+            note: "Lunch",
+            idempotencyKey: idempotencyKey,
+            createdAt: createdAt
         )
     }
 

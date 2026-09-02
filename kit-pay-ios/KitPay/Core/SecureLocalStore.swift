@@ -184,6 +184,21 @@ actor SecureLocalStore {
         let callHistoryBackfillReceipt = preserveCommunicationHistory
             ? state.callHistoryBackfillReceipt
             : nil
+        let pendingTransferChatReceipts = preserveCommunicationHistory
+            ? state.pendingTransferChatReceipts
+            : nil
+        let pendingPaymentRequestChatReceipts = preserveCommunicationHistory
+            ? state.pendingPaymentRequestChatReceipts
+            : nil
+        let pendingPaymentRequestResolutionChatReceipts = preserveCommunicationHistory
+            ? state.pendingPaymentRequestResolutionChatReceipts
+            : nil
+        let pendingGroupPaymentChatReceipts = preserveCommunicationHistory
+            ? state.pendingGroupPaymentChatReceipts
+            : nil
+        let pendingGroupContributionChatReceipts = preserveCommunicationHistory
+            ? state.pendingGroupContributionChatReceipts
+            : nil
         let signedOutAt = Date()
         for index in history.indices
         where history[index].isOutgoing
@@ -205,6 +220,12 @@ actor SecureLocalStore {
         candidate.conversationDrafts = conversationDrafts
         candidate.calls = calls
         candidate.callHistoryBackfillReceipt = callHistoryBackfillReceipt
+        candidate.pendingTransferChatReceipts = pendingTransferChatReceipts
+        candidate.pendingPaymentRequestChatReceipts = pendingPaymentRequestChatReceipts
+        candidate.pendingPaymentRequestResolutionChatReceipts =
+            pendingPaymentRequestResolutionChatReceipts
+        candidate.pendingGroupPaymentChatReceipts = pendingGroupPaymentChatReceipts
+        candidate.pendingGroupContributionChatReceipts = pendingGroupContributionChatReceipts
         if preserveCommunicationHistory {
             // Pins, mutes, and backup schedules describe the preserved chats; losing them on a
             // routine session-expiry sign-out would silently stop scheduled iCloud backups.
@@ -307,6 +328,11 @@ actor SecureLocalStore {
             || !candidate.calls.isEmpty
             || candidate.callHistoryBackfillReceipt != nil
             || !candidate.outbox.isEmpty
+            || candidate.pendingTransferChatReceipts?.isEmpty == false
+            || candidate.pendingPaymentRequestChatReceipts?.isEmpty == false
+            || candidate.pendingPaymentRequestResolutionChatReceipts?.isEmpty == false
+            || candidate.pendingGroupPaymentChatReceipts?.isEmpty == false
+            || candidate.pendingGroupContributionChatReceipts?.isEmpty == false
             || candidate.secureMessaging != nil
     }
 
@@ -329,7 +355,10 @@ actor SecureLocalStore {
     private func persist(_ candidate: PersistedState) throws {
         let key = try encryptionKey()
         let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
+        // The encrypted payload does not need a human-readable date representation. Foundation's
+        // deferred Date encoding preserves the full retry-clock value, whereas ISO-8601 drops
+        // fractional seconds and leaves the live projection different from the durable one.
+        encoder.dateEncodingStrategy = .deferredToDate
         encoder.outputFormatting = [.sortedKeys]
         let clear = try encoder.encode(candidate)
         let sealed = try AES.GCM.seal(clear, using: key)
@@ -386,8 +415,15 @@ actor SecureLocalStore {
             return StateLoadResult(state: .empty, status: .invalidExistingFile)
         }
         let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        guard let decoded = try? decoder.decode(PersistedState.self, from: clear) else {
+        decoder.dateDecodingStrategy = .deferredToDate
+        if let decoded = try? decoder.decode(PersistedState.self, from: clear) {
+            return StateLoadResult(state: decoded, status: .loaded)
+        }
+        // Builds through 52 encoded Date values as whole-second ISO-8601 strings. Retain that
+        // one-way migration path while every new write uses lossless deferred Date encoding.
+        let legacyDecoder = JSONDecoder()
+        legacyDecoder.dateDecodingStrategy = .iso8601
+        guard let decoded = try? legacyDecoder.decode(PersistedState.self, from: clear) else {
             return StateLoadResult(state: .empty, status: .invalidExistingFile)
         }
         return StateLoadResult(state: decoded, status: .loaded)

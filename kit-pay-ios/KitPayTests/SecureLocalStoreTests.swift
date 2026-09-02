@@ -78,6 +78,27 @@ final class SecureLocalStoreTests: XCTestCase {
         XCTAssertEqual(restored.profile, expected.profile)
     }
 
+    func testLegacyISO8601StateStillLoadsAfterLosslessDateMigration() async throws {
+        let url = temporaryDirectory.appendingPathComponent("legacy-iso8601-state.secure")
+        let keyData = Data(repeating: 0xA7, count: 32)
+        let expected = communicationState()
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.sortedKeys]
+        let clear = try encoder.encode(expected)
+        let sealed = try AES.GCM.seal(clear, using: SymmetricKey(data: keyData))
+        let combined = try XCTUnwrap(sealed.combined)
+        try combined.write(to: url, options: .atomic)
+
+        let reopened = SecureLocalStore(stateURL: url, keyData: keyData)
+        let restored = await reopened.snapshot()
+
+        XCTAssertEqual(restored.profile, expected.profile)
+        XCTAssertEqual(restored.messages, expected.messages)
+        XCTAssertEqual(restored.calls, expected.calls)
+        XCTAssertEqual(restored.secureMessaging, expected.secureMessaging)
+    }
+
     func testTamperedCiphertextFailsClosedWithoutReturningPartialHistory() async throws {
         let url = temporaryDirectory.appendingPathComponent("state.secure")
         let key = Data(repeating: 0x3C, count: 32)
@@ -245,6 +266,169 @@ final class SecureLocalStoreTests: XCTestCase {
         )
         XCTAssertTrue(cleared.outbox.isEmpty)
         XCTAssertNil(cleared.secureMessaging)
+    }
+
+    func testFinancialChatRecoveryJournalsStayWithTheirOwnerAcrossSignOut() async throws {
+        let owner = "10000000-0000-4000-8000-000000000001"
+        let peer = "10000000-0000-4000-8000-000000000002"
+        let third = "10000000-0000-4000-8000-000000000003"
+        let wallet = "20000000-0000-4000-8000-000000000001"
+        let destinationWallet = "20000000-0000-4000-8000-000000000002"
+        let conversation = "30000000-0000-4000-8000-000000000001"
+        let requestID = "40000000-0000-4000-8000-000000000001"
+        let currency = CurrencyDTO(code: "UGX", scale: "2")
+        let profile = UserProfile(
+            id: owner,
+            name: "Recovery Owner",
+            email: nil,
+            phone: "+256700000001",
+            tag: "recovery_owner",
+            kycStatus: "verified",
+            paymentPinSet: true,
+            mfaEnabled: false,
+            profileSetupRequired: false
+        )
+        let request = PaymentRequestDTO(
+            id: requestID,
+            type: "payment_request",
+            status: "pending",
+            destinationWalletId: destinationWallet,
+            requestedFromUserId: peer,
+            amount: "10.00",
+            currency: currency,
+            note: "Lunch",
+            expiresAt: nil,
+            walletTransactionId: nil,
+            paidAt: nil,
+            createdAt: "2026-09-01T00:00:00Z"
+        )
+        let descriptor = try XCTUnwrap(KitPaymentMessage(action: .request, paymentRequest: request))
+        let groupBody = CreateGroupPaymentBody(
+            sourceWalletId: wallet,
+            splitMode: GroupPaymentSplitMode.even.rawValue,
+            audience: GroupPaymentAudience.selected.rawValue,
+            totalAmount: "20.00",
+            note: nil,
+            recipients: [peer, third].map {
+                CreateGroupPaymentBody.Recipient(userId: $0, amount: nil)
+            }
+        )
+
+        var original = PersistedState.empty
+        original.bindAuthenticatedProfile(profile)
+        original.pendingTransferChatReceipts = [try XCTUnwrap(
+            TransferChatReceiptRecoveryRecord(
+                ownerUserID: owner,
+                sourceWalletID: wallet,
+                destinationWalletID: destinationWallet,
+                recipientUserID: peer,
+                recipientName: "Peer",
+                conversationID: conversation,
+                amount: "10.00",
+                currency: currency,
+                note: "Lunch"
+            )
+        )]
+        original.pendingPaymentRequestChatReceipts = [try XCTUnwrap(
+            PaymentRequestChatReceiptRecoveryRecord(
+                ownerUserID: owner,
+                destinationWalletID: destinationWallet,
+                recipientUserID: peer,
+                recipientName: "Peer",
+                conversationID: conversation,
+                amount: "10.00",
+                currency: currency,
+                note: "Lunch",
+                idempotencyKey: "ios-request-create-owner-test"
+            )
+        )]
+        original.pendingPaymentRequestResolutionChatReceipts = [try XCTUnwrap(
+            PaymentRequestResolutionChatReceiptRecoveryRecord(
+                ownerUserID: owner,
+                conversationID: conversation,
+                recipientUserID: peer,
+                recipientName: "Peer",
+                request: request,
+                descriptor: descriptor,
+                sourceWalletID: nil,
+                operation: .cancelled,
+                idempotencyKey: "ios-request-cancel-owner-test"
+            )
+        )]
+        original.pendingGroupPaymentChatReceipts = [try XCTUnwrap(
+            GroupPaymentChatReceiptRecoveryRecord(
+                ownerUserID: owner,
+                conversationID: conversation,
+                expectedRecipientUserIDs: [peer, third],
+                currency: currency,
+                body: groupBody,
+                idempotencyKey: "ios-group-payment-owner-test"
+            )
+        )]
+        original.pendingGroupContributionChatReceipts = [try XCTUnwrap(
+            GroupContributionChatReceiptRecoveryRecord(
+                ownerUserID: owner,
+                conversationID: conversation,
+                announcementSenderUserID: peer,
+                requestID: requestID,
+                sourceWalletID: wallet,
+                amount: "5.00",
+                currency: currency,
+                idempotencyKey: "ios-group-contribution-owner-test"
+            )
+        )]
+
+        let url = temporaryDirectory.appendingPathComponent("financial-recovery-state.secure")
+        let key = Data(repeating: 0x4B, count: 32)
+        let store = SecureLocalStore(stateURL: url, keyData: key)
+        try await store.replace(original)
+        try await store.clearFinancialAndSessionProjections(preserveCommunicationHistory: true)
+
+        let reopened = SecureLocalStore(stateURL: url, keyData: key)
+        let signedOut = await reopened.snapshot()
+        XCTAssertEqual(signedOut.pendingTransferChatReceipts, original.pendingTransferChatReceipts)
+        XCTAssertEqual(
+            signedOut.pendingPaymentRequestChatReceipts,
+            original.pendingPaymentRequestChatReceipts
+        )
+        XCTAssertEqual(
+            signedOut.pendingPaymentRequestResolutionChatReceipts,
+            original.pendingPaymentRequestResolutionChatReceipts
+        )
+        XCTAssertEqual(
+            signedOut.pendingGroupPaymentChatReceipts,
+            original.pendingGroupPaymentChatReceipts
+        )
+        XCTAssertEqual(
+            signedOut.pendingGroupContributionChatReceipts,
+            original.pendingGroupContributionChatReceipts
+        )
+
+        try await reopened.update { state in state.bindAuthenticatedProfile(profile) }
+        let rebound = await reopened.snapshot()
+        XCTAssertEqual(
+            rebound.pendingTransferChatReceipts,
+            original.pendingTransferChatReceipts
+        )
+
+        let replacement = UserProfile(
+            id: "10000000-0000-4000-8000-000000000099",
+            name: "Replacement",
+            email: nil,
+            phone: "+256700000099",
+            tag: "replacement",
+            kycStatus: "verified",
+            paymentPinSet: true,
+            mfaEnabled: false,
+            profileSetupRequired: false
+        )
+        try await reopened.update { state in state.bindAuthenticatedProfile(replacement) }
+        let switched = await reopened.snapshot()
+        XCTAssertNil(switched.pendingTransferChatReceipts)
+        XCTAssertNil(switched.pendingPaymentRequestChatReceipts)
+        XCTAssertNil(switched.pendingPaymentRequestResolutionChatReceipts)
+        XCTAssertNil(switched.pendingGroupPaymentChatReceipts)
+        XCTAssertNil(switched.pendingGroupContributionChatReceipts)
     }
 
     func testAcceptedDeletionPurgeDurablyErasesOnlyItsExactOwner() async throws {

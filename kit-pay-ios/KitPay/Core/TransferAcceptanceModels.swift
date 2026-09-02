@@ -182,6 +182,618 @@ struct TransferAcceptanceListDTO: Decodable {
     let page: CursorPage?
 }
 
+// MARK: - Durable transfer chat-receipt recovery
+
+enum FinancialChatReceiptRecoveryPhase: String, Codable, Hashable, Sendable {
+    /// The intent is durable, but no financial request has been allowed to start yet.
+    case prepared
+    /// The intent was made durable immediately before the financial request began. Its outcome
+    /// is unknown until an exact recovery endpoint proves otherwise.
+    case submitted
+    /// The exact server result and deterministic encrypted descriptor are durable locally.
+    case confirmed
+}
+
+enum FinancialChatReceiptRecoveryDecision: Equatable {
+    case notCommitted
+    case retain
+}
+
+/// Shared fail-closed error and retry rules for every financial-to-chat hand-off.
+enum FinancialChatReceiptRecoveryPolicy {
+    static let maximumPendingRecords = 16
+    static let maximumRecordsPerRecoveryPass = 4
+    static let preparedRetentionLifetime: TimeInterval = 7 * 24 * 60 * 60
+    static let clockSkewAllowance: TimeInterval = 10 * 60
+
+    /// Recovery errors are authoritative only when both the status and operation-specific code
+    /// match. In-progress, reused-key, replay-unavailable, opaque, transport, cancellation, and
+    /// every 5xx response retain the journal.
+    static func recoveryDecision(
+        for error: Error,
+        notFoundCode: String
+    ) -> FinancialChatReceiptRecoveryDecision {
+        guard let payload = error as? APIErrorPayload,
+              payload.httpStatus == 404,
+              payload.code == notFoundCode
+        else { return .retain }
+        return .notCommitted
+    }
+
+    /// These codes are explicit pre-commit refusals from mutation endpoints. Everything else is
+    /// ambiguous and keeps its idempotency authority until exact recovery resolves it.
+    static func mutationWasDefinitivelyRejected(_ error: Error) -> Bool {
+        guard let payload = error as? APIErrorPayload,
+              let status = payload.httpStatus
+        else { return false }
+        switch (status, payload.code) {
+        case (400, "VALIDATION_ERROR"),
+             (409, "INSUFFICIENT_FUNDS"),
+             (422, "VALIDATION_ERROR"),
+             (422, "VALIDATION_FAILED"):
+            return true
+        default:
+            return false
+        }
+    }
+
+    static func nextRecoveryDate(afterAttempt attempt: Int, now: Date) -> Date {
+        let exponent = min(max(attempt - 1, 0), 10)
+        let delay = min(TimeInterval(5 * (1 << exponent)), 60 * 60)
+        return now.addingTimeInterval(delay)
+    }
+}
+
+/// The account-bound hand-off between one approved wallet transfer and its encrypted chat card.
+///
+/// This record is committed to `SecureLocalStore` *before* the financial POST. It contains no
+/// step-up bearer token and cannot itself move money. Its stable UUID is also the backend
+/// idempotency key, so an explicit retry of the exact intent can only recover the first result.
+/// A server-confirmed descriptor is persisted here before the normal Signal outbox is touched;
+/// the record is removed only after that deterministic message is durable in the encrypted
+/// messaging store.
+struct TransferChatReceiptRecoveryRecord: Codable, Hashable, Identifiable, Sendable {
+    let id: UUID
+    let ownerUserID: String
+    let sourceWalletID: String
+    let destinationWalletID: String
+    let recipientUserID: String
+    let recipientName: String
+    let conversationID: String?
+    let amount: String
+    let currencyCode: String
+    let currencyScale: Int
+    let note: String?
+    let createdAt: Date
+    var phase: FinancialChatReceiptRecoveryPhase
+    var nextRecoveryAt: Date
+    var recoveryAttemptCount: Int
+    var confirmation: TransferChatReceiptConfirmation?
+
+    var idempotencyKey: String {
+        "ios-transfer-\(id.uuidString.lowercased())"
+    }
+
+    init?(
+        id: UUID = UUID(),
+        ownerUserID: String,
+        sourceWalletID: String,
+        destinationWalletID: String,
+        recipientUserID: String,
+        recipientName: String,
+        conversationID: String?,
+        amount: String,
+        currency: CurrencyDTO,
+        note: String?,
+        createdAt: Date = Date()
+    ) {
+        let canonicalConversationID: String?
+        if let conversationID {
+            guard let value = Self.canonicalUUID(conversationID) else { return nil }
+            canonicalConversationID = value
+        } else {
+            canonicalConversationID = nil
+        }
+        let canonicalNote: String?
+        if let note {
+            guard let value = Self.canonicalNote(note) else { return nil }
+            canonicalNote = value
+        } else {
+            canonicalNote = nil
+        }
+        guard let ownerUserID = Self.canonicalUUID(ownerUserID),
+              let sourceWalletID = Self.canonicalUUID(sourceWalletID),
+              let destinationWalletID = Self.canonicalUUID(destinationWalletID),
+              let recipientUserID = Self.canonicalUUID(recipientUserID),
+              ownerUserID != recipientUserID,
+              let currencyScale = Int(currency.scale),
+              let amountMinor = KitPaymentMessage.minorUnits(
+                  for: amount,
+                  scale: currencyScale
+              ),
+              amountMinor > 0,
+              let recipientName = Self.safeRecipientName(recipientName),
+              Self.isCurrencyCode(currency.code),
+              createdAt.timeIntervalSinceReferenceDate.isFinite
+        else { return nil }
+
+        self.id = id
+        self.ownerUserID = ownerUserID
+        self.sourceWalletID = sourceWalletID
+        self.destinationWalletID = destinationWalletID
+        self.recipientUserID = recipientUserID
+        self.recipientName = recipientName
+        self.conversationID = canonicalConversationID
+        self.amount = amount
+        self.currencyCode = currency.code
+        self.currencyScale = currencyScale
+        self.note = canonicalNote
+        self.createdAt = createdAt
+        phase = .prepared
+        nextRecoveryAt = createdAt
+        recoveryAttemptCount = 0
+        confirmation = nil
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, ownerUserID, sourceWalletID, destinationWalletID, recipientUserID
+        case recipientName, conversationID, amount, currencyCode, currencyScale, note, createdAt
+        case phase, nextRecoveryAt, recoveryAttemptCount, confirmation
+        // Development builds briefly wrote these names before exact recovery replaced history
+        // matching. Decode them fail-closed so no ambiguous transfer loses its authority.
+        case nextLookupAt, lookupAttemptCount
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(UUID.self, forKey: .id)
+        ownerUserID = try values.decode(String.self, forKey: .ownerUserID)
+        sourceWalletID = try values.decode(String.self, forKey: .sourceWalletID)
+        destinationWalletID = try values.decode(String.self, forKey: .destinationWalletID)
+        recipientUserID = try values.decode(String.self, forKey: .recipientUserID)
+        recipientName = try values.decode(String.self, forKey: .recipientName)
+        conversationID = try values.decodeIfPresent(String.self, forKey: .conversationID)
+        amount = try values.decode(String.self, forKey: .amount)
+        currencyCode = try values.decode(String.self, forKey: .currencyCode)
+        currencyScale = try values.decode(Int.self, forKey: .currencyScale)
+        note = try values.decodeIfPresent(String.self, forKey: .note)
+        createdAt = try values.decode(Date.self, forKey: .createdAt)
+        confirmation = try values.decodeIfPresent(
+            TransferChatReceiptConfirmation.self,
+            forKey: .confirmation
+        )
+        phase = try values.decodeIfPresent(
+            FinancialChatReceiptRecoveryPhase.self,
+            forKey: .phase
+        ) ?? (confirmation == nil ? .submitted : .confirmed)
+        nextRecoveryAt = try values.decodeIfPresent(Date.self, forKey: .nextRecoveryAt)
+            ?? values.decodeIfPresent(Date.self, forKey: .nextLookupAt)
+            ?? createdAt
+        recoveryAttemptCount = try values.decodeIfPresent(Int.self, forKey: .recoveryAttemptCount)
+            ?? values.decodeIfPresent(Int.self, forKey: .lookupAttemptCount)
+            ?? 0
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(id, forKey: .id)
+        try values.encode(ownerUserID, forKey: .ownerUserID)
+        try values.encode(sourceWalletID, forKey: .sourceWalletID)
+        try values.encode(destinationWalletID, forKey: .destinationWalletID)
+        try values.encode(recipientUserID, forKey: .recipientUserID)
+        try values.encode(recipientName, forKey: .recipientName)
+        try values.encodeIfPresent(conversationID, forKey: .conversationID)
+        try values.encode(amount, forKey: .amount)
+        try values.encode(currencyCode, forKey: .currencyCode)
+        try values.encode(currencyScale, forKey: .currencyScale)
+        try values.encodeIfPresent(note, forKey: .note)
+        try values.encode(createdAt, forKey: .createdAt)
+        try values.encode(phase, forKey: .phase)
+        try values.encode(nextRecoveryAt, forKey: .nextRecoveryAt)
+        try values.encode(recoveryAttemptCount, forKey: .recoveryAttemptCount)
+        try values.encodeIfPresent(confirmation, forKey: .confirmation)
+    }
+
+    var isStructurallyValid: Bool {
+        baseIsStructurallyValid
+            && (phase == .confirmed) == (confirmation != nil)
+            && (confirmation.map { $0.isValid(for: self) } ?? true)
+    }
+
+    fileprivate var baseIsStructurallyValid: Bool {
+        Self.canonicalUUID(ownerUserID) == ownerUserID
+            && Self.canonicalUUID(sourceWalletID) == sourceWalletID
+            && Self.canonicalUUID(destinationWalletID) == destinationWalletID
+            && Self.canonicalUUID(recipientUserID) == recipientUserID
+            && ownerUserID != recipientUserID
+            && (conversationID == nil || Self.canonicalUUID(conversationID) == conversationID)
+            && Self.safeRecipientName(recipientName) == recipientName
+            && Self.canonicalNote(note) == note
+            && Self.isCurrencyCode(currencyCode)
+            && (0 ... 6).contains(currencyScale)
+            && KitPaymentMessage.minorUnits(for: amount, scale: currencyScale).map { $0 > 0 }
+                == true
+            && createdAt.timeIntervalSinceReferenceDate.isFinite
+            && nextRecoveryAt.timeIntervalSinceReferenceDate.isFinite
+            && recoveryAttemptCount >= 0
+            && idempotencyKey.utf8.count <= 128
+    }
+
+    fileprivate func hasSameFinancialAndChatIntent(
+        as other: TransferChatReceiptRecoveryRecord
+    ) -> Bool {
+        ownerUserID == other.ownerUserID
+            && sourceWalletID == other.sourceWalletID
+            && destinationWalletID == other.destinationWalletID
+            && recipientUserID == other.recipientUserID
+            && conversationID == other.conversationID
+            && amount == other.amount
+            && currencyCode == other.currencyCode
+            && currencyScale == other.currencyScale
+            && note == other.note
+    }
+
+    fileprivate static func canonicalUUID(_ value: String?) -> String? {
+        guard let value,
+              value == value.trimmingCharacters(in: .whitespacesAndNewlines),
+              let identifier = UUID(uuidString: value)
+        else { return nil }
+        return identifier.uuidString.lowercased()
+    }
+
+    private static func safeRecipientName(_ value: String) -> String? {
+        let clean = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty,
+              clean.count <= 100,
+              clean.unicodeScalars.allSatisfy({
+                  !CharacterSet.controlCharacters.contains($0)
+              })
+        else { return nil }
+        return clean
+    }
+
+    private static func canonicalNote(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let clean = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { return nil }
+        guard clean == value,
+              clean.utf16.count <= KitPaymentMessage.maximumNoteLength,
+              clean.unicodeScalars.allSatisfy({
+                  !CharacterSet.controlCharacters.contains($0)
+              })
+        else { return nil }
+        return clean
+    }
+
+    private static func isCurrencyCode(_ value: String) -> Bool {
+        value.range(of: #"^[A-Z]{3}$"#, options: .regularExpression) != nil
+    }
+}
+
+/// The minimum server fact needed to reconstruct the same immutable `KITPAY1` card. The full
+/// wallet transaction is deliberately not retained or copied into messaging state.
+struct TransferChatReceiptConfirmation: Codable, Hashable, Sendable {
+    enum Evidence {
+        /// The exact response to the idempotent POST; a missing counterparty field is acceptable
+        /// because the request itself was bound to the persisted destination wallet.
+        case directResponse
+        /// The exact idempotency-bound recovery response. It has the same authority as the
+        /// original response and never relies on amount/time matching against wallet history.
+        case exactRecovery
+    }
+
+    let transactionID: String
+    let messageID: String
+    let encodedDescriptor: String
+
+    var clientMessageID: UUID? { UUID(uuidString: messageID) }
+
+    init?(
+        transaction: WalletTransaction,
+        recovery: TransferChatReceiptRecoveryRecord,
+        evidence: Evidence
+    ) {
+        guard recovery.baseIsStructurallyValid,
+              CustomerTransactionPresentationPolicy.isCustomerVisible(transaction),
+              let transactionID = Self.canonicalUUID(transaction.id),
+              Self.canonicalUUID(transaction.walletId) == recovery.sourceWalletID,
+              transaction.type.caseInsensitiveCompare("internal_transfer") == .orderedSame,
+              transaction.direction.caseInsensitiveCompare("debit") == .orderedSame,
+              transaction.currency.code == recovery.currencyCode,
+              Int(transaction.currency.scale) == recovery.currencyScale,
+              KitPaymentMessage.minorUnits(
+                  for: transaction.amount,
+                  scale: recovery.currencyScale
+              ) == KitPaymentMessage.minorUnits(
+                  for: recovery.amount,
+                  scale: recovery.currencyScale
+              ),
+              transaction.note == recovery.note
+        else { return nil }
+
+        let action: KitPaymentMessageAction
+        let messageID: String
+        let authoritativeAmount: String
+        let authoritativeCurrency: CurrencyDTO
+        let authoritativeNote: String?
+        if let claim = transaction.claim {
+            guard let claimID = Self.canonicalUUID(claim.id),
+                  claimID != transactionID,
+                  Self.canonicalUUID(claim.transactionId) == transactionID,
+                  Self.canonicalUUID(claim.senderUserId) == recovery.ownerUserID,
+                  Self.canonicalUUID(claim.recipientUserId) == recovery.recipientUserID,
+                  claim.knownStatus != nil
+            else { return nil }
+            action = .transfer
+            messageID = claimID
+            authoritativeAmount = claim.amount
+            authoritativeCurrency = claim.currency
+            authoritativeNote = claim.note
+        } else {
+            let counterpartyID = Self.canonicalUUID(transaction.counterparty?.id)
+            switch evidence {
+            case .directResponse, .exactRecovery:
+                guard transaction.counterparty?.id == nil
+                    || counterpartyID == recovery.recipientUserID
+                else { return nil }
+            }
+            guard transaction.status.caseInsensitiveCompare("completed") == .orderedSame
+                || transaction.status.caseInsensitiveCompare("succeeded") == .orderedSame
+            else { return nil }
+            action = .sent
+            messageID = transactionID
+            authoritativeAmount = transaction.amount
+            authoritativeCurrency = transaction.currency
+            authoritativeNote = transaction.note
+        }
+
+        guard authoritativeCurrency.code == recovery.currencyCode,
+              Int(authoritativeCurrency.scale) == recovery.currencyScale,
+              KitPaymentMessage.minorUnits(
+                  for: authoritativeAmount,
+                  scale: recovery.currencyScale
+              ) == KitPaymentMessage.minorUnits(
+                  for: recovery.amount,
+                  scale: recovery.currencyScale
+              ),
+              authoritativeNote == recovery.note,
+              let amountMinor = KitPaymentMessage.minorUnits(
+                  for: authoritativeAmount,
+                  scale: recovery.currencyScale
+              ),
+              let descriptor = KitPaymentMessage(
+                  action: action,
+                  paymentRequestId: messageID,
+                  amountMinor: amountMinor,
+                  currencyCode: recovery.currencyCode,
+                  currencyScale: recovery.currencyScale,
+                  note: recovery.note
+              )
+        else { return nil }
+
+        self.transactionID = transactionID
+        self.messageID = messageID
+        encodedDescriptor = descriptor.encoded
+    }
+
+    func isValid(for recovery: TransferChatReceiptRecoveryRecord) -> Bool {
+        guard let transactionID = Self.canonicalUUID(transactionID),
+              transactionID == self.transactionID,
+              let messageID = Self.canonicalUUID(messageID),
+              messageID == self.messageID,
+              let descriptor = KitPaymentMessage.parse(encodedDescriptor),
+              descriptor.paymentRequestId == messageID,
+              [.transfer, .sent].contains(descriptor.action),
+              descriptor.currencyCode == recovery.currencyCode,
+              descriptor.currencyScale == recovery.currencyScale,
+              descriptor.amountMinor == KitPaymentMessage.minorUnits(
+                  for: recovery.amount,
+                  scale: recovery.currencyScale
+              ),
+              descriptor.note == recovery.note,
+              descriptor.action == (messageID == transactionID ? .sent : .transfer)
+        else { return false }
+        return true
+    }
+
+    private static func canonicalUUID(_ value: String?) -> String? {
+        TransferChatReceiptRecoveryRecord.canonicalUUID(value)
+    }
+}
+
+/// Pure bounds and state transitions for the protected transfer recovery journal.
+enum TransferChatReceiptRecoveryPolicy {
+    static let maximumPendingRecords = FinancialChatReceiptRecoveryPolicy.maximumPendingRecords
+    static let maximumRecordsPerRecoveryPass =
+        FinancialChatReceiptRecoveryPolicy.maximumRecordsPerRecoveryPass
+
+    @discardableResult
+    static func sanitize(
+        _ records: inout [TransferChatReceiptRecoveryRecord],
+        ownerUserID: String? = nil,
+        now: Date = Date()
+    ) -> Int {
+        let originalCount = records.count
+        let canonicalOwner = ownerUserID.flatMap(
+            TransferChatReceiptRecoveryRecord.canonicalUUID
+        )
+        records = records
+            .sorted { left, right in
+                FinancialRecoveryValidation.recoveryComesFirst(
+                    leftPhase: left.phase,
+                    leftDate: left.createdAt,
+                    leftID: left.id,
+                    rightPhase: right.phase,
+                    rightDate: right.createdAt,
+                    rightID: right.id
+                )
+            }
+        var seen: Set<UUID> = []
+        records = records
+            .filter { record in
+                let age = now.timeIntervalSince(record.createdAt)
+                return record.isStructurallyValid
+                    && (ownerUserID == nil || record.ownerUserID == canonicalOwner)
+                    && age >= -FinancialChatReceiptRecoveryPolicy.clockSkewAllowance
+                    && (record.phase != .prepared
+                        || age <= FinancialChatReceiptRecoveryPolicy.preparedRetentionLifetime)
+                    && seen.insert(record.id).inserted
+            }
+        return originalCount - records.count
+    }
+
+    /// Reuses every exact submitted/confirmed intent, and a still-live prepared intent. This is
+    /// the explicit retry path that prevents a newly minted key from moving the same money twice.
+    static func insertOrReuse(
+        _ candidate: TransferChatReceiptRecoveryRecord,
+        in records: inout [TransferChatReceiptRecoveryRecord],
+        now: Date = Date()
+    ) -> TransferChatReceiptRecoveryRecord? {
+        guard candidate.isStructurallyValid else { return nil }
+        sanitize(&records, ownerUserID: candidate.ownerUserID, now: now)
+        if let existing = records.first(where: { record in
+            record.hasSameFinancialAndChatIntent(as: candidate)
+                && (record.phase != .prepared
+                    || now.timeIntervalSince(record.createdAt)
+                        <= FinancialChatReceiptRecoveryPolicy.preparedRetentionLifetime)
+        }) {
+            return existing
+        }
+        guard records.count < maximumPendingRecords else { return nil }
+        records.append(candidate)
+        return candidate
+    }
+
+    @discardableResult
+    static func markSubmitted(
+        recordID: UUID,
+        in records: inout [TransferChatReceiptRecoveryRecord],
+        now: Date = Date()
+    ) -> Bool {
+        guard let index = records.firstIndex(where: { $0.id == recordID }),
+              records[index].phase == .prepared,
+              records[index].confirmation == nil
+        else { return false }
+        records[index].phase = .submitted
+        records[index].nextRecoveryAt = now
+        return true
+    }
+
+    @discardableResult
+    static func storeConfirmation(
+        _ confirmation: TransferChatReceiptConfirmation,
+        for recordID: UUID,
+        in records: inout [TransferChatReceiptRecoveryRecord]
+    ) -> Bool {
+        guard let index = records.firstIndex(where: { $0.id == recordID }),
+              records[index].phase != .prepared,
+              confirmation.isValid(for: records[index]),
+              records[index].confirmation.map({ $0 == confirmation }) ?? true
+        else { return false }
+        records[index].confirmation = confirmation
+        records[index].phase = .confirmed
+        return true
+    }
+
+    @discardableResult
+    static func recordRecoveryFailure(
+        for recordID: UUID,
+        in records: inout [TransferChatReceiptRecoveryRecord],
+        now: Date = Date()
+    ) -> Bool {
+        guard let index = records.firstIndex(where: { $0.id == recordID }),
+              records[index].phase == .submitted
+        else { return false }
+        if records[index].recoveryAttemptCount < Int.max {
+            records[index].recoveryAttemptCount += 1
+        }
+        records[index].nextRecoveryAt = FinancialChatReceiptRecoveryPolicy.nextRecoveryDate(
+            afterAttempt: records[index].recoveryAttemptCount,
+            now: now
+        )
+        return true
+    }
+
+    static func isDefinitiveRejection(_ error: Error) -> Bool {
+        FinancialChatReceiptRecoveryPolicy.mutationWasDefinitivelyRejected(error)
+    }
+
+    static func recoveryDecision(for error: Error) -> FinancialChatReceiptRecoveryDecision {
+        FinancialChatReceiptRecoveryPolicy.recoveryDecision(
+            for: error,
+            notFoundCode: "TRANSFER_RECOVERY_NOT_FOUND"
+        )
+    }
+
+    @discardableResult
+    static func retireNotCommitted(
+        recordID: UUID,
+        in records: inout [TransferChatReceiptRecoveryRecord]
+    ) -> Bool {
+        guard let index = records.firstIndex(where: {
+            $0.id == recordID && $0.phase == .submitted && $0.confirmation == nil
+        }) else { return false }
+        records.remove(at: index)
+        return true
+    }
+
+    @discardableResult
+    static func acknowledgeDurableMessage(
+        recordID: UUID,
+        messageID: UUID,
+        in records: inout [TransferChatReceiptRecoveryRecord]
+    ) -> Bool {
+        guard let index = records.firstIndex(where: {
+            $0.id == recordID
+                && $0.phase == .confirmed
+                && $0.confirmation?.clientMessageID == messageID
+                && $0.confirmation?.isValid(for: $0) == true
+        }) else { return false }
+        records.remove(at: index)
+        return true
+    }
+}
+
+enum TransferChatReceiptRecoveryError: LocalizedError, Equatable {
+    case invalidIntent
+    case recoveryCapacityReached
+    case accountChanged
+    case unconfirmedTransfer
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidIntent:
+            "Choose a valid Kit Pay recipient before sending money."
+        case .recoveryCapacityReached:
+            "Kit is still confirming earlier payment receipts. Check Wallet activity before trying again."
+        case .accountChanged:
+            "Your account changed before the payment was completed. Please try again."
+        case .unconfirmedTransfer:
+            "Kit Pay did not confirm the exact transfer total. Check your activity before trying again."
+        }
+    }
+}
+
+enum FinancialChatReceiptRecoveryError: LocalizedError, Equatable {
+    case invalidIntent
+    case recoveryCapacityReached
+    case accountChanged
+    case unconfirmedResult
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidIntent:
+            "Kit Pay could not validate this financial chat action."
+        case .recoveryCapacityReached:
+            "Kit is still confirming earlier financial chat receipts. Please try again later."
+        case .accountChanged:
+            "Your account changed before the action completed. Please try again."
+        case .unconfirmedResult:
+            "Kit Pay could not confirm the exact result. Check activity before trying again."
+        }
+    }
+}
+
 // MARK: - Capability gate
 
 /// Accept/Reject/Reverse exists only when the backend advertises it; without the capability,

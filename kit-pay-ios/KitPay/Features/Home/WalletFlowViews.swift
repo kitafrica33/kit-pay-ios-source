@@ -54,8 +54,17 @@ final class WalletFlowModel: ObservableObject {
         to contact: WalletContactDTO,
         enteredAmount: String,
         note: String,
+        conversationID: String?,
         pin: String,
-        authorize: KitFinancialStepUpAuthorization
+        authorize: KitFinancialStepUpAuthorization,
+        submit: (
+            _ wallet: Wallet,
+            _ contact: WalletContactDTO,
+            _ amount: String,
+            _ note: String?,
+            _ conversationID: String?,
+            _ stepUpToken: String
+        ) async throws -> WalletTransaction
     ) async -> Bool {
         guard !isSubmitting else { return false }
         guard let destinationWalletId = contact.receivingWalletId, !destinationWalletId.isEmpty else {
@@ -88,13 +97,13 @@ final class WalletFlowModel: ObservableObject {
                 pin,
                 "Approve sending \(KitMoney.formatted(amount, currency: wallet.currency)) to \(contact.name)"
             )
-            let transaction = try await api.transfer(
-                walletId: wallet.id,
-                destinationWalletId: destinationWalletId,
-                amount: amount,
-                note: cleanNote,
-                idempotencyKey: "ios-transfer-\(UUID().uuidString.lowercased())",
-                stepUpToken: verification.stepUpToken
+            let transaction = try await submit(
+                wallet,
+                contact,
+                amount,
+                cleanNote,
+                conversationID,
+                verification.stepUpToken
             )
             guard CustomerTransactionPresentationPolicy.isCustomerVisible(transaction),
                   transaction.walletId.caseInsensitiveCompare(wallet.id) == .orderedSame,
@@ -379,9 +388,6 @@ struct SendMoneyView: View {
     private let preselectedRecipientUserID: String?
     private let conversationID: String?
     private let locksRecipientSelection: Bool
-    /// Set by chat: after a confirmed transfer, shares the transaction into the conversation as
-    /// an encrypted payment event. Best-effort — a failed share never affects the transfer.
-    private let shareTransferInChat: ((WalletTransaction) async -> Bool)?
     private let scheduledPaymentCreated: ((ScheduledPaymentDTO) -> Void)?
 
     /// Chat opens this flow with the conversation's recipient already chosen, mirroring
@@ -392,7 +398,6 @@ struct SendMoneyView: View {
         preselectedRecipientUserID: String? = nil,
         conversationID: String? = nil,
         locksRecipientSelection: Bool = false,
-        shareTransferInChat: ((WalletTransaction) async -> Bool)? = nil,
         scheduledPaymentCreated: ((ScheduledPaymentDTO) -> Void)? = nil
     ) {
         self.flow = flow
@@ -402,7 +407,6 @@ struct SendMoneyView: View {
             }
         self.conversationID = conversationID
         self.locksRecipientSelection = locksRecipientSelection
-        self.shareTransferInChat = shareTransferInChat
         self.scheduledPaymentCreated = scheduledPaymentCreated
         let initialContact = preselectedContact?.canReceiveTransfer == true
             ? preselectedContact
@@ -872,32 +876,29 @@ struct SendMoneyView: View {
                                 to: selectedContact,
                                 enteredAmount: amount,
                                 note: note,
+                                conversationID: conversationID,
                                 pin: pin,
-                                authorize: model.authorizeFinancialStepUp
+                                authorize: model.authorizeFinancialStepUp,
+                                submit: { wallet, contact, amount, note, conversationID, token in
+                                    try await model.submitTransferWithDurableChatReceipt(
+                                        from: wallet,
+                                        to: contact,
+                                        amount: amount,
+                                        note: note,
+                                        conversationID: conversationID,
+                                        stepUpToken: token
+                                    )
+                                }
                             )
                         }
                         if succeeded {
                             showingConfirmation = false
                             step = .success
-                            // Every Kit Pay → Kit Pay transfer documents itself as an encrypted
-                            // chat event; the transfer's success never depends on it (the event
-                            // queues durably offline-first). Chat-initiated sends share into
-                            // their conversation; standalone sends go as a direct message.
+                            // Scheduled payments publish from their server execution event. An
+                            // immediate transfer's encrypted card is already owned by AppModel's
+                            // durable pre-POST journal and must never be recreated from this view.
                             if let payment = flow.scheduledPayment {
                                 scheduledPaymentCreated?(payment)
-                            } else if let transaction = flow.sentTransaction {
-                                if let shareTransferInChat {
-                                    _ = await shareTransferInChat(transaction)
-                                } else if let recipientUserID = preselectedRecipientUserID
-                                    ?? ContactRecipientDirectory.recipientUserId(
-                                        for: selectedContact
-                                    ) {
-                                    _ = await model.queueTransferChatEvent(
-                                        transaction: transaction,
-                                        recipientId: recipientUserID,
-                                        title: selectedContact.name
-                                    )
-                                }
                             }
                             await model.refresh()
                         } else {
@@ -1056,6 +1057,7 @@ struct RequestMoneyView: View {
     @State private var isPickingScheduledTime = false
     @State private var scheduledFor: Date?
     private let preselectedRecipientUserID: String?
+    private let conversationID: String?
     private let locksRecipientSelection: Bool
     private let shareCreatedRequest: ((PaymentRequestDTO) async -> Bool)?
     /// Provided only where a scheduled request has somewhere to land — today, a chat. Absent, the
@@ -1066,6 +1068,7 @@ struct RequestMoneyView: View {
         flow: WalletFlowModel,
         preselectedContact: WalletContactDTO? = nil,
         preselectedRecipientUserID: String? = nil,
+        conversationID: String? = nil,
         locksRecipientSelection: Bool = false,
         shareCreatedRequest: ((PaymentRequestDTO) async -> Bool)? = nil,
         scheduleRequest: ((PaymentRequestScheduleDraft) async -> Bool)? = nil
@@ -1075,6 +1078,7 @@ struct RequestMoneyView: View {
             ?? preselectedContact.flatMap {
                 ContactRecipientDirectory.recipientUserId(for: $0)
             }
+        self.conversationID = conversationID
         self.locksRecipientSelection = locksRecipientSelection
         self.shareCreatedRequest = shareCreatedRequest
         self.scheduleRequest = scheduleRequest
@@ -1445,10 +1449,6 @@ struct RequestMoneyView: View {
                         flow.errorMessage = "Use a valid amount and a note that fits the secure payment card."
                         return nil
                     }
-                    guard model.secureMessagingAvailable else {
-                        flow.errorMessage = CustomerFacingMessagingCopy.paymentRequestShareFailure
-                        return nil
-                    }
                     guard model.isOnline else {
                         flow.errorMessage = "Connect to the internet to create this payment request."
                         return nil
@@ -1460,9 +1460,11 @@ struct RequestMoneyView: View {
                         enteredAmount: amount,
                         note: note,
                         create: { destinationWalletID, recipientUserID, amount, note, idempotencyKey in
-                            try await model.createPaymentRequest(
+                            try await model.createPaymentRequestWithDurableChatReceipt(
                                 destinationWalletID: destinationWalletID,
                                 requestedFromUserID: recipientUserID,
+                                recipientName: selectedContact.name,
+                                conversationID: conversationID,
                                 amount: amount,
                                 note: note,
                                 idempotencyKey: idempotencyKey

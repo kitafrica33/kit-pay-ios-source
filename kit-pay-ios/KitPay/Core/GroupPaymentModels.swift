@@ -531,7 +531,7 @@ struct KitGroupPaymentMessage: Equatable, Sendable {
 
 // MARK: - Request bodies
 
-struct CreateGroupPaymentBody: Encodable, Sendable {
+struct CreateGroupPaymentBody: Codable, Hashable, Sendable {
     let sourceWalletId: String
     let splitMode: String
     let audience: String
@@ -539,7 +539,7 @@ struct CreateGroupPaymentBody: Encodable, Sendable {
     let note: String?
     let recipients: [Recipient]?
 
-    struct Recipient: Encodable, Equatable, Sendable {
+    struct Recipient: Codable, Hashable, Sendable {
         let userId: String
         let amount: String?
 
@@ -1838,9 +1838,18 @@ struct GroupPaymentRequestContributionResultDTO: Decodable {
     let contribution: GroupPaymentRequestContributionDTO
 
     var isStructurallyValid: Bool {
-        request.isStructurallyValid
-            && contribution.isStructurallyValid(currencyScale: request.currencyScale)
-            && request.contributions.contains(contribution)
+        guard request.isStructurallyValid,
+              contribution.isStructurallyValid(currencyScale: request.currencyScale)
+        else { return false }
+        if let embedded = request.contributions.first(where: {
+            $0.id.caseInsensitiveCompare(contribution.id) == .orderedSame
+        }) {
+            return embedded == contribution
+        }
+        // Exact recovery returns the immutable contribution separately from the request's
+        // newest-50 window. Absence is therefore valid only when that window is explicitly
+        // truncated; an untruncated aggregate must contain the exact row.
+        return request.contributionsHasMore
     }
 }
 
@@ -1858,13 +1867,754 @@ struct CreateGroupPaymentRequestBody: Encodable, Equatable {
     }
 }
 
-struct ContributeGroupPaymentRequestBody: Encodable, Equatable {
+struct ContributeGroupPaymentRequestBody: Codable, Hashable, Sendable {
     let sourceWalletId: String
     let amount: String
 
     enum CodingKeys: String, CodingKey {
         case sourceWalletId = "source_wallet_id"
         case amount
+    }
+}
+
+// MARK: - Durable financial-to-group-chat recovery
+
+struct GroupPaymentChatReceiptRecoveryRecord: Codable, Hashable, Identifiable, Sendable {
+    let id: UUID
+    let ownerUserID: String
+    let conversationID: String
+    let expectedRecipientUserIDs: [String]
+    let currencyCode: String
+    let currencyScale: Int
+    let body: CreateGroupPaymentBody
+    let idempotencyKey: String
+    let createdAt: Date
+    var phase: FinancialChatReceiptRecoveryPhase
+    var nextRecoveryAt: Date
+    var recoveryAttemptCount: Int
+    var confirmation: GroupPaymentChatReceiptConfirmation?
+
+    init?(
+        id: UUID = UUID(),
+        ownerUserID: String,
+        conversationID: String,
+        expectedRecipientUserIDs: [String],
+        currency: CurrencyDTO,
+        body: CreateGroupPaymentBody,
+        idempotencyKey: String,
+        createdAt: Date = Date()
+    ) {
+        guard let owner = FinancialRecoveryValidation.canonicalUUID(ownerUserID),
+              let conversation = FinancialRecoveryValidation.canonicalUUID(conversationID),
+              let sourceWallet = FinancialRecoveryValidation.canonicalUUID(body.sourceWalletId),
+              let splitMode = GroupPaymentSplitMode(rawValue: body.splitMode),
+              let audience = GroupPaymentAudience(rawValue: body.audience),
+              let scale = Int(currency.scale),
+              FinancialRecoveryValidation.isCurrencyCode(currency.code),
+              let key = FinancialRecoveryValidation.idempotencyKey(idempotencyKey),
+              createdAt.timeIntervalSinceReferenceDate.isFinite
+        else { return nil }
+        let recipients = expectedRecipientUserIDs.compactMap {
+            FinancialRecoveryValidation.canonicalUUID($0)
+        }
+        guard recipients.count == expectedRecipientUserIDs.count,
+              !recipients.isEmpty,
+              recipients.count <= KitGroupPaymentMessage.maximumRecipientCount,
+              Set(recipients).count == recipients.count,
+              !recipients.contains(owner),
+              Self.bodyIsValid(
+                  body,
+                  splitMode: splitMode,
+                  audience: audience,
+                  expectedRecipientUserIDs: recipients,
+                  currencyScale: scale
+              )
+        else { return nil }
+        self.id = id
+        self.ownerUserID = owner
+        self.conversationID = conversation
+        self.expectedRecipientUserIDs = recipients
+        currencyCode = currency.code
+        currencyScale = scale
+        self.body = CreateGroupPaymentBody(
+            sourceWalletId: sourceWallet,
+            splitMode: body.splitMode,
+            audience: body.audience,
+            totalAmount: body.totalAmount,
+            note: body.note,
+            recipients: body.recipients
+        )
+        self.idempotencyKey = key
+        self.createdAt = createdAt
+        phase = .prepared
+        nextRecoveryAt = createdAt
+        recoveryAttemptCount = 0
+        confirmation = nil
+    }
+
+    var isStructurallyValid: Bool {
+        guard FinancialRecoveryValidation.canonicalUUID(ownerUserID) == ownerUserID,
+              FinancialRecoveryValidation.canonicalUUID(conversationID) == conversationID,
+              FinancialRecoveryValidation.canonicalUUID(body.sourceWalletId) == body.sourceWalletId,
+              let splitMode = GroupPaymentSplitMode(rawValue: body.splitMode),
+              let audience = GroupPaymentAudience(rawValue: body.audience),
+              expectedRecipientUserIDs.allSatisfy({
+                  FinancialRecoveryValidation.canonicalUUID($0) == $0
+              }),
+              !expectedRecipientUserIDs.isEmpty,
+              expectedRecipientUserIDs.count <= KitGroupPaymentMessage.maximumRecipientCount,
+              Set(expectedRecipientUserIDs).count == expectedRecipientUserIDs.count,
+              !expectedRecipientUserIDs.contains(ownerUserID),
+              FinancialRecoveryValidation.isCurrencyCode(currencyCode),
+              (0 ... 6).contains(currencyScale),
+              Self.bodyIsValid(
+                  body,
+                  splitMode: splitMode,
+                  audience: audience,
+                  expectedRecipientUserIDs: expectedRecipientUserIDs,
+                  currencyScale: currencyScale
+              ),
+              FinancialRecoveryValidation.idempotencyKey(idempotencyKey) == idempotencyKey,
+              createdAt.timeIntervalSinceReferenceDate.isFinite,
+              nextRecoveryAt.timeIntervalSinceReferenceDate.isFinite,
+              recoveryAttemptCount >= 0,
+              (phase == .confirmed) == (confirmation != nil)
+        else { return false }
+        return confirmation?.isValid(for: self) ?? true
+    }
+
+    func hasSameIntent(as other: Self) -> Bool {
+        ownerUserID == other.ownerUserID
+            && conversationID == other.conversationID
+            && expectedRecipientUserIDs == other.expectedRecipientUserIDs
+            && currencyCode == other.currencyCode
+            && currencyScale == other.currencyScale
+            && body == other.body
+    }
+
+    private static func bodyIsValid(
+        _ body: CreateGroupPaymentBody,
+        splitMode: GroupPaymentSplitMode,
+        audience: GroupPaymentAudience,
+        expectedRecipientUserIDs: [String],
+        currencyScale: Int
+    ) -> Bool {
+        guard FinancialRecoveryValidation.canonicalOptionalNote(body.note) == body.note else {
+            return false
+        }
+        switch (splitMode, audience) {
+        case (.even, .all):
+            return body.recipients == nil
+                && body.totalAmount.flatMap({
+                    KitPaymentMessage.minorUnits(for: $0, scale: currencyScale)
+                }).map({ $0 > 0 }) == true
+        case (.even, .selected):
+            guard let recipients = body.recipients,
+                  body.totalAmount.flatMap({
+                      KitPaymentMessage.minorUnits(for: $0, scale: currencyScale)
+                  }).map({ $0 > 0 }) == true
+            else { return false }
+            return recipients.map(\.userId) == expectedRecipientUserIDs
+                && recipients.allSatisfy({ $0.amount == nil })
+        case (.custom, .selected):
+            guard body.totalAmount == nil, let recipients = body.recipients else { return false }
+            return recipients.map(\.userId) == expectedRecipientUserIDs
+                && recipients.allSatisfy({ recipient in
+                    recipient.amount.flatMap({
+                        KitPaymentMessage.minorUnits(for: $0, scale: currencyScale)
+                    }).map({ $0 > 0 }) == true
+                })
+        case (.custom, .all):
+            return false
+        }
+    }
+}
+
+struct GroupPaymentChatReceiptConfirmation: Codable, Hashable, Sendable {
+    let paymentID: String
+    let messageID: String
+    let encodedDescriptor: String
+
+    var clientMessageID: UUID? { UUID(uuidString: messageID) }
+
+    init?(payment: GroupPaymentDTO, recovery: GroupPaymentChatReceiptRecoveryRecord) {
+        guard recovery.isValidWithoutConfirmation,
+              let paymentID = FinancialRecoveryValidation.canonicalUUID(payment.id),
+              GroupPaymentAuthorityPolicy.matchesContext(
+                  payment,
+                  conversationID: recovery.conversationID,
+                  announcementSenderID: recovery.ownerUserID
+              ),
+              payment.splitMode == recovery.body.splitMode,
+              payment.audience == recovery.body.audience,
+              payment.currency.code == recovery.currencyCode,
+              payment.currencyScale == recovery.currencyScale,
+              payment.note == recovery.body.note,
+              payment.recipientCount == recovery.expectedRecipientUserIDs.count,
+              payment.recipients.count == recovery.expectedRecipientUserIDs.count,
+              payment.pendingCount >= 0,
+              payment.pendingCount <= payment.recipientCount,
+              payment.acceptedCount >= 0,
+              payment.acceptedCount <= payment.recipientCount,
+              payment.returnedCount >= 0,
+              payment.returnedCount <= payment.recipientCount,
+              payment.pendingCount + payment.acceptedCount + payment.returnedCount
+                == payment.recipientCount,
+              ["pending", "settled"].contains(payment.status),
+              payment.recipients.allSatisfy({ $0.knownStatus != nil })
+        else { return nil }
+        let responseRecipients = payment.recipients.compactMap {
+            FinancialRecoveryValidation.canonicalUUID($0.userId)
+        }
+        guard responseRecipients.count == payment.recipients.count,
+              Set(responseRecipients).count == responseRecipients.count,
+              Set(responseRecipients) == Set(recovery.expectedRecipientUserIDs)
+        else { return nil }
+        switch GroupPaymentSplitMode(rawValue: recovery.body.splitMode) {
+        case .even:
+            guard let expectedTotal = recovery.body.totalAmount.flatMap({
+                KitPaymentMessage.minorUnits(for: $0, scale: recovery.currencyScale)
+            }), let actualTotal = payment.totalAmount.flatMap({
+                KitPaymentMessage.minorUnits(for: $0, scale: recovery.currencyScale)
+            }), expectedTotal == actualTotal
+            else { return nil }
+            var responseTotal: Int64 = 0
+            let minimumShare = expectedTotal / Int64(payment.recipientCount)
+            let maximumShare = minimumShare
+                + (expectedTotal % Int64(payment.recipientCount) == 0 ? 0 : 1)
+            for recipient in payment.recipients {
+                guard let amount = recipient.amount.flatMap({
+                    KitPaymentMessage.minorUnits(for: $0, scale: recovery.currencyScale)
+                }), (minimumShare ... maximumShare).contains(amount)
+                else { return nil }
+                let (next, overflow) = responseTotal.addingReportingOverflow(amount)
+                guard !overflow else { return nil }
+                responseTotal = next
+            }
+            guard responseTotal == expectedTotal else { return nil }
+        case .custom:
+            let expectedAmounts = Dictionary(uniqueKeysWithValues:
+                (recovery.body.recipients ?? []).compactMap { recipient -> (String, Int64)? in
+                    guard let id = FinancialRecoveryValidation.canonicalUUID(recipient.userId),
+                          let amount = recipient.amount.flatMap({
+                              KitPaymentMessage.minorUnits(
+                                  for: $0,
+                                  scale: recovery.currencyScale
+                              )
+                          })
+                    else { return nil }
+                    return (id, amount)
+                }
+            )
+            guard expectedAmounts.count == recovery.expectedRecipientUserIDs.count,
+                  payment.recipients.allSatisfy({ recipient in
+                      guard let id = FinancialRecoveryValidation.canonicalUUID(recipient.userId),
+                            let amount = recipient.amount.flatMap({
+                                KitPaymentMessage.minorUnits(
+                                    for: $0,
+                                    scale: recovery.currencyScale
+                                )
+                            })
+                      else { return false }
+                      return expectedAmounts[id] == amount
+                  })
+            else { return nil }
+        case nil:
+            return nil
+        }
+        guard let descriptor = KitGroupPaymentMessage(
+            announcing: payment,
+            recipientUserIds: responseRecipients
+        ) else { return nil }
+        self.paymentID = paymentID
+        let identifier = KitGroupPaymentMessage.outcomeMessageID(
+            groupPaymentId: paymentID,
+            action: .sent,
+            actorUserId: recovery.ownerUserID
+        )
+        messageID = identifier.uuidString.lowercased()
+        encodedDescriptor = descriptor.encoded
+    }
+
+    func isValid(for recovery: GroupPaymentChatReceiptRecoveryRecord) -> Bool {
+        guard FinancialRecoveryValidation.canonicalUUID(paymentID) == paymentID,
+              clientMessageID == KitGroupPaymentMessage.outcomeMessageID(
+                  groupPaymentId: paymentID,
+                  action: .sent,
+                  actorUserId: recovery.ownerUserID
+              ), let descriptor = KitGroupPaymentMessage.parse(encodedDescriptor),
+              descriptor.action == .sent,
+              descriptor.groupPaymentId == paymentID,
+              descriptor.splitMode?.rawValue == recovery.body.splitMode,
+              descriptor.audience?.rawValue == recovery.body.audience,
+              descriptor.recipientCount == recovery.expectedRecipientUserIDs.count,
+              descriptor.currencyCode == recovery.currencyCode,
+              descriptor.currencyScale == recovery.currencyScale,
+              descriptor.note == recovery.body.note
+        else { return false }
+        switch GroupPaymentSplitMode(rawValue: recovery.body.splitMode) {
+        case .even:
+            guard descriptor.totalAmountMinor == recovery.body.totalAmount.flatMap({
+                KitPaymentMessage.minorUnits(for: $0, scale: recovery.currencyScale)
+            }) else { return false }
+        case .custom:
+            guard descriptor.totalAmountMinor == nil else { return false }
+        case nil:
+            return false
+        }
+        if recovery.expectedRecipientUserIDs.count <= KitGroupPaymentMessage.maximumInlineRecipients {
+            return Set(descriptor.recipientUserIds) == Set(recovery.expectedRecipientUserIDs)
+        }
+        return descriptor.recipientUserIds.isEmpty
+    }
+}
+
+private extension GroupPaymentChatReceiptRecoveryRecord {
+    var isValidWithoutConfirmation: Bool {
+        var copy = self
+        copy.phase = .submitted
+        copy.confirmation = nil
+        return copy.isStructurallyValid
+    }
+}
+
+enum GroupPaymentChatReceiptRecoveryPolicy {
+    static let maximumRecordsPerRecoveryPass =
+        FinancialChatReceiptRecoveryPolicy.maximumRecordsPerRecoveryPass
+
+    static func recoveryDecision(for error: Error) -> FinancialChatReceiptRecoveryDecision {
+        FinancialChatReceiptRecoveryPolicy.recoveryDecision(
+            for: error,
+            notFoundCode: "GROUP_PAYMENT_RECOVERY_NOT_FOUND"
+        )
+    }
+
+    @discardableResult
+    static func sanitize(
+        _ records: inout [GroupPaymentChatReceiptRecoveryRecord],
+        ownerUserID: String? = nil,
+        now: Date = Date()
+    ) -> Int {
+        let originalCount = records.count
+        let owner = ownerUserID.flatMap { FinancialRecoveryValidation.canonicalUUID($0) }
+        var seen: Set<UUID> = []
+        records = records.sorted { left, right in
+            FinancialRecoveryValidation.recoveryComesFirst(
+                leftPhase: left.phase,
+                leftDate: left.createdAt,
+                leftID: left.id,
+                rightPhase: right.phase,
+                rightDate: right.createdAt,
+                rightID: right.id
+            )
+        }.filter { record in
+            let age = now.timeIntervalSince(record.createdAt)
+            return record.isStructurallyValid
+                && (ownerUserID == nil || record.ownerUserID == owner)
+                && age >= -FinancialChatReceiptRecoveryPolicy.clockSkewAllowance
+                && (record.phase != .prepared
+                    || age <= FinancialChatReceiptRecoveryPolicy.preparedRetentionLifetime)
+                && seen.insert(record.id).inserted
+        }
+        return originalCount - records.count
+    }
+
+    static func insertOrReuse(
+        _ candidate: GroupPaymentChatReceiptRecoveryRecord,
+        in records: inout [GroupPaymentChatReceiptRecoveryRecord],
+        now: Date = Date()
+    ) -> GroupPaymentChatReceiptRecoveryRecord? {
+        guard candidate.isStructurallyValid else { return nil }
+        sanitize(&records, ownerUserID: candidate.ownerUserID, now: now)
+        if let existing = records.first(where: { $0.hasSameIntent(as: candidate) }) {
+            return existing
+        }
+        guard records.count < FinancialChatReceiptRecoveryPolicy.maximumPendingRecords else {
+            return nil
+        }
+        records.append(candidate)
+        return candidate
+    }
+
+    static func markSubmitted(
+        recordID: UUID,
+        in records: inout [GroupPaymentChatReceiptRecoveryRecord],
+        now: Date = Date()
+    ) -> Bool {
+        guard let index = records.firstIndex(where: { $0.id == recordID }),
+              records[index].phase == .prepared
+        else { return false }
+        records[index].phase = .submitted
+        records[index].nextRecoveryAt = now
+        return true
+    }
+
+    static func storeConfirmation(
+        _ confirmation: GroupPaymentChatReceiptConfirmation,
+        for recordID: UUID,
+        in records: inout [GroupPaymentChatReceiptRecoveryRecord]
+    ) -> Bool {
+        guard let index = records.firstIndex(where: { $0.id == recordID }),
+              records[index].phase != .prepared,
+              confirmation.isValid(for: records[index]),
+              records[index].confirmation.map({ $0 == confirmation }) ?? true
+        else { return false }
+        records[index].confirmation = confirmation
+        records[index].phase = .confirmed
+        return true
+    }
+
+    static func recordRecoveryFailure(
+        recordID: UUID,
+        in records: inout [GroupPaymentChatReceiptRecoveryRecord],
+        now: Date = Date()
+    ) -> Bool {
+        guard let index = records.firstIndex(where: {
+            $0.id == recordID && $0.phase == .submitted
+        }) else { return false }
+        if records[index].recoveryAttemptCount < Int.max {
+            records[index].recoveryAttemptCount += 1
+        }
+        records[index].nextRecoveryAt = FinancialChatReceiptRecoveryPolicy.nextRecoveryDate(
+            afterAttempt: records[index].recoveryAttemptCount,
+            now: now
+        )
+        return true
+    }
+
+    static func retireNotCommitted(
+        recordID: UUID,
+        in records: inout [GroupPaymentChatReceiptRecoveryRecord]
+    ) -> Bool {
+        guard let index = records.firstIndex(where: {
+            $0.id == recordID && $0.phase == .submitted && $0.confirmation == nil
+        }) else { return false }
+        records.remove(at: index)
+        return true
+    }
+
+    static func acknowledgeDurableMessage(
+        recordID: UUID,
+        messageID: UUID,
+        in records: inout [GroupPaymentChatReceiptRecoveryRecord]
+    ) -> Bool {
+        guard let index = records.firstIndex(where: {
+            $0.id == recordID
+                && $0.phase == .confirmed
+                && $0.confirmation?.clientMessageID == messageID
+                && $0.confirmation?.isValid(for: $0) == true
+        }) else { return false }
+        records.remove(at: index)
+        return true
+    }
+}
+
+struct GroupContributionChatReceiptRecoveryRecord: Codable, Hashable, Identifiable, Sendable {
+    let id: UUID
+    let ownerUserID: String
+    let conversationID: String
+    let announcementSenderUserID: String
+    let requestID: String
+    let sourceWalletID: String
+    let amount: String
+    let currencyCode: String
+    let currencyScale: Int
+    let idempotencyKey: String
+    let createdAt: Date
+    var phase: FinancialChatReceiptRecoveryPhase
+    var nextRecoveryAt: Date
+    var recoveryAttemptCount: Int
+    var confirmation: GroupContributionChatReceiptConfirmation?
+
+    init?(
+        id: UUID = UUID(),
+        ownerUserID: String,
+        conversationID: String,
+        announcementSenderUserID: String,
+        requestID: String,
+        sourceWalletID: String,
+        amount: String,
+        currency: CurrencyDTO,
+        idempotencyKey: String,
+        createdAt: Date = Date()
+    ) {
+        guard let owner = FinancialRecoveryValidation.canonicalUUID(ownerUserID),
+              let conversation = FinancialRecoveryValidation.canonicalUUID(conversationID),
+              let sender = FinancialRecoveryValidation.canonicalUUID(announcementSenderUserID),
+              let request = FinancialRecoveryValidation.canonicalUUID(requestID),
+              let wallet = FinancialRecoveryValidation.canonicalUUID(sourceWalletID),
+              let scale = Int(currency.scale),
+              FinancialRecoveryValidation.isCurrencyCode(currency.code),
+              KitPaymentMessage.minorUnits(for: amount, scale: scale).map({ $0 > 0 }) == true,
+              let key = FinancialRecoveryValidation.idempotencyKey(idempotencyKey),
+              owner != sender,
+              createdAt.timeIntervalSinceReferenceDate.isFinite
+        else { return nil }
+        self.id = id
+        self.ownerUserID = owner
+        self.conversationID = conversation
+        self.announcementSenderUserID = sender
+        self.requestID = request
+        self.sourceWalletID = wallet
+        self.amount = amount
+        currencyCode = currency.code
+        currencyScale = scale
+        self.idempotencyKey = key
+        self.createdAt = createdAt
+        phase = .prepared
+        nextRecoveryAt = createdAt
+        recoveryAttemptCount = 0
+        confirmation = nil
+    }
+
+    var isStructurallyValid: Bool {
+        guard FinancialRecoveryValidation.canonicalUUID(ownerUserID) == ownerUserID,
+              FinancialRecoveryValidation.canonicalUUID(conversationID) == conversationID,
+              FinancialRecoveryValidation.canonicalUUID(announcementSenderUserID)
+                == announcementSenderUserID,
+              ownerUserID != announcementSenderUserID,
+              FinancialRecoveryValidation.canonicalUUID(requestID) == requestID,
+              FinancialRecoveryValidation.canonicalUUID(sourceWalletID) == sourceWalletID,
+              FinancialRecoveryValidation.isCurrencyCode(currencyCode),
+              (0 ... 6).contains(currencyScale),
+              KitPaymentMessage.minorUnits(for: amount, scale: currencyScale).map({ $0 > 0 })
+                == true,
+              FinancialRecoveryValidation.idempotencyKey(idempotencyKey) == idempotencyKey,
+              createdAt.timeIntervalSinceReferenceDate.isFinite,
+              nextRecoveryAt.timeIntervalSinceReferenceDate.isFinite,
+              recoveryAttemptCount >= 0,
+              (phase == .confirmed) == (confirmation != nil)
+        else { return false }
+        return confirmation?.isValid(for: self) ?? true
+    }
+
+    func hasSameIntent(as other: Self) -> Bool {
+        ownerUserID == other.ownerUserID
+            && conversationID == other.conversationID
+            && announcementSenderUserID == other.announcementSenderUserID
+            && requestID == other.requestID
+            && sourceWalletID == other.sourceWalletID
+            && amount == other.amount
+            && currencyCode == other.currencyCode
+            && currencyScale == other.currencyScale
+    }
+}
+
+struct GroupContributionChatReceiptConfirmation: Codable, Hashable, Sendable {
+    let contributionID: String
+    let messageID: String
+    let encodedDescriptor: String
+
+    var clientMessageID: UUID? { UUID(uuidString: messageID) }
+
+    init?(
+        result: GroupPaymentRequestContributionResultDTO,
+        recovery: GroupContributionChatReceiptRecoveryRecord
+    ) {
+        guard recovery.isValidWithoutConfirmation,
+              result.isStructurallyValid,
+              FinancialRecoveryValidation.canonicalUUID(result.request.id) == recovery.requestID,
+              FinancialRecoveryValidation.canonicalUUID(result.request.conversationId)
+                == recovery.conversationID,
+              FinancialRecoveryValidation.canonicalUUID(result.request.requesterUserId)
+                == recovery.announcementSenderUserID,
+              result.request.currency.code == recovery.currencyCode,
+              result.request.currencyScale == recovery.currencyScale,
+              let contributionID = FinancialRecoveryValidation.canonicalUUID(
+                  result.contribution.id
+              ),
+              FinancialRecoveryValidation.canonicalUUID(result.contribution.contributorUserId)
+                == recovery.ownerUserID,
+              result.contribution.amount == recovery.amount,
+              result.contribution.isYours,
+              FinancialRecoveryValidation.canonicalUUID(
+                  result.contribution.walletTransactionId
+              ) != nil
+        else { return nil }
+        // Recovery presents the request's current state. A later contributor may have completed
+        // it after this exact row committed, so only the final (newest) contribution can author
+        // the terminal event; an older recovered row remains an ordinary contribution event.
+        let completedByThisContribution = result.request.knownStatus == .completed
+            && result.request.contributions.last == result.contribution
+        let descriptor = completedByThisContribution
+            ? KitGroupPaymentRequestMessage(
+                completing: result.contribution,
+                requestID: recovery.requestID
+            )
+            : KitGroupPaymentRequestMessage(
+                contributing: result.contribution,
+                requestID: recovery.requestID
+            )
+        guard let descriptor else { return nil }
+        self.contributionID = contributionID
+        let identifier = KitGroupPaymentRequestMessage.deterministicMessageID(
+            requestID: recovery.requestID,
+            action: descriptor.action,
+            contributionID: contributionID,
+            actorUserID: recovery.ownerUserID
+        )
+        messageID = identifier.uuidString.lowercased()
+        encodedDescriptor = descriptor.encoded
+    }
+
+    func isValid(for recovery: GroupContributionChatReceiptRecoveryRecord) -> Bool {
+        guard FinancialRecoveryValidation.canonicalUUID(contributionID) == contributionID,
+              let descriptor = KitGroupPaymentRequestMessage.parse(encodedDescriptor),
+              [.contributed, .completed].contains(descriptor.action),
+              descriptor.requestID == recovery.requestID,
+              descriptor.contributionID == contributionID,
+              descriptor.amountMinor == KitPaymentMessage.minorUnits(
+                  for: recovery.amount,
+                  scale: recovery.currencyScale
+              ),
+              clientMessageID == KitGroupPaymentRequestMessage.deterministicMessageID(
+                  requestID: recovery.requestID,
+                  action: descriptor.action,
+                  contributionID: contributionID,
+                  actorUserID: recovery.ownerUserID
+              )
+        else { return false }
+        return true
+    }
+}
+
+private extension GroupContributionChatReceiptRecoveryRecord {
+    var isValidWithoutConfirmation: Bool {
+        var copy = self
+        copy.phase = .submitted
+        copy.confirmation = nil
+        return copy.isStructurallyValid
+    }
+}
+
+enum GroupContributionChatReceiptRecoveryPolicy {
+    static let maximumRecordsPerRecoveryPass =
+        FinancialChatReceiptRecoveryPolicy.maximumRecordsPerRecoveryPass
+
+    static func recoveryDecision(for error: Error) -> FinancialChatReceiptRecoveryDecision {
+        FinancialChatReceiptRecoveryPolicy.recoveryDecision(
+            for: error,
+            notFoundCode: "GROUP_PAYMENT_REQUEST_CONTRIBUTION_RECOVERY_NOT_FOUND"
+        )
+    }
+
+    @discardableResult
+    static func sanitize(
+        _ records: inout [GroupContributionChatReceiptRecoveryRecord],
+        ownerUserID: String? = nil,
+        now: Date = Date()
+    ) -> Int {
+        let originalCount = records.count
+        let owner = ownerUserID.flatMap { FinancialRecoveryValidation.canonicalUUID($0) }
+        var seen: Set<UUID> = []
+        records = records.sorted { left, right in
+            FinancialRecoveryValidation.recoveryComesFirst(
+                leftPhase: left.phase,
+                leftDate: left.createdAt,
+                leftID: left.id,
+                rightPhase: right.phase,
+                rightDate: right.createdAt,
+                rightID: right.id
+            )
+        }.filter { record in
+            let age = now.timeIntervalSince(record.createdAt)
+            return record.isStructurallyValid
+                && (ownerUserID == nil || record.ownerUserID == owner)
+                && age >= -FinancialChatReceiptRecoveryPolicy.clockSkewAllowance
+                && (record.phase != .prepared
+                    || age <= FinancialChatReceiptRecoveryPolicy.preparedRetentionLifetime)
+                && seen.insert(record.id).inserted
+        }
+        return originalCount - records.count
+    }
+
+    static func insertOrReuse(
+        _ candidate: GroupContributionChatReceiptRecoveryRecord,
+        in records: inout [GroupContributionChatReceiptRecoveryRecord],
+        now: Date = Date()
+    ) -> GroupContributionChatReceiptRecoveryRecord? {
+        guard candidate.isStructurallyValid else { return nil }
+        sanitize(&records, ownerUserID: candidate.ownerUserID, now: now)
+        if let existing = records.first(where: { $0.hasSameIntent(as: candidate) }) {
+            return existing
+        }
+        guard records.count < FinancialChatReceiptRecoveryPolicy.maximumPendingRecords else {
+            return nil
+        }
+        records.append(candidate)
+        return candidate
+    }
+
+    static func markSubmitted(
+        recordID: UUID,
+        in records: inout [GroupContributionChatReceiptRecoveryRecord],
+        now: Date = Date()
+    ) -> Bool {
+        guard let index = records.firstIndex(where: { $0.id == recordID }),
+              records[index].phase == .prepared
+        else { return false }
+        records[index].phase = .submitted
+        records[index].nextRecoveryAt = now
+        return true
+    }
+
+    static func storeConfirmation(
+        _ confirmation: GroupContributionChatReceiptConfirmation,
+        for recordID: UUID,
+        in records: inout [GroupContributionChatReceiptRecoveryRecord]
+    ) -> Bool {
+        guard let index = records.firstIndex(where: { $0.id == recordID }),
+              records[index].phase != .prepared,
+              confirmation.isValid(for: records[index]),
+              records[index].confirmation.map({ $0 == confirmation }) ?? true
+        else { return false }
+        records[index].confirmation = confirmation
+        records[index].phase = .confirmed
+        return true
+    }
+
+    static func recordRecoveryFailure(
+        recordID: UUID,
+        in records: inout [GroupContributionChatReceiptRecoveryRecord],
+        now: Date = Date()
+    ) -> Bool {
+        guard let index = records.firstIndex(where: {
+            $0.id == recordID && $0.phase == .submitted
+        }) else { return false }
+        if records[index].recoveryAttemptCount < Int.max {
+            records[index].recoveryAttemptCount += 1
+        }
+        records[index].nextRecoveryAt = FinancialChatReceiptRecoveryPolicy.nextRecoveryDate(
+            afterAttempt: records[index].recoveryAttemptCount,
+            now: now
+        )
+        return true
+    }
+
+    static func retireNotCommitted(
+        recordID: UUID,
+        in records: inout [GroupContributionChatReceiptRecoveryRecord]
+    ) -> Bool {
+        guard let index = records.firstIndex(where: {
+            $0.id == recordID && $0.phase == .submitted && $0.confirmation == nil
+        }) else { return false }
+        records.remove(at: index)
+        return true
+    }
+
+    static func acknowledgeDurableMessage(
+        recordID: UUID,
+        messageID: UUID,
+        in records: inout [GroupContributionChatReceiptRecoveryRecord]
+    ) -> Bool {
+        guard let index = records.firstIndex(where: {
+            $0.id == recordID
+                && $0.phase == .confirmed
+                && $0.confirmation?.clientMessageID == messageID
+                && $0.confirmation?.isValid(for: $0) == true
+        }) else { return false }
+        records.remove(at: index)
+        return true
     }
 }
 

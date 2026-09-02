@@ -3103,6 +3103,7 @@ struct ConversationView: View {
                     flow: paymentFlow,
                     preselectedContact: recipientContact,
                     preselectedRecipientUserID: paymentRecipientUserID,
+                    conversationID: conversation.id,
                     locksRecipientSelection: true,
                     shareCreatedRequest: { request in
                         guard let paymentRecipientUserID else { return false }
@@ -3153,15 +3154,6 @@ struct ConversationView: View {
                     preselectedRecipientUserID: paymentRecipientUserID,
                     conversationID: conversation.id,
                     locksRecipientSelection: true,
-                    shareTransferInChat: { transaction in
-                        guard let paymentRecipientUserID else { return false }
-                        return await model.queueTransferChatEvent(
-                            transaction: transaction,
-                            recipientId: paymentRecipientUserID,
-                            title: recipientDisplayName,
-                            conversationId: conversation.id
-                        )
-                    },
                     scheduledPaymentCreated: { payment in
                         chatScheduledPayments.upsert(
                             payment,
@@ -3476,18 +3468,24 @@ struct ConversationView: View {
                     pin: pin,
                     policy: paymentRequestPolicy,
                     isOnline: model.isOnline,
-                    authorize: model.authorizeFinancialStepUp
+                    authorize: model.authorizeFinancialStepUp,
+                    submit: { request, wallet, idempotencyKey, stepUpToken in
+                        guard let paymentRecipientUserID else {
+                            throw FinancialChatReceiptRecoveryError.invalidIntent
+                        }
+                        return try await model.payPaymentRequestWithDurableChatReceipt(
+                            request,
+                            descriptor: approval.descriptor,
+                            from: wallet,
+                            conversationID: conversation.id,
+                            recipientUserID: paymentRecipientUserID,
+                            recipientName: recipientDisplayName,
+                            idempotencyKey: idempotencyKey,
+                            stepUpToken: stepUpToken
+                        )
+                    }
                 )
                 guard paid else { return false }
-                if let paymentRecipientUserID,
-                   let paidDescriptor = approval.descriptor.changingAction(to: .paid) {
-                    _ = await model.queuePaymentEvent(
-                        conversationId: conversation.id,
-                        title: recipientDisplayName,
-                        recipientId: paymentRecipientUserID,
-                        body: paidDescriptor.encoded
-                    )
-                }
                 await model.refresh()
                 await chatPaymentRequests.load(isOnline: model.isOnline)
                 return true
@@ -3562,29 +3560,19 @@ struct ConversationView: View {
                             groupPaymentsEnabled: groupPaymentsEnabled,
                             pin: pin,
                             isOnline: model.isOnline,
-                            authorize: model.authorizeFinancialStepUp
+                            authorize: model.authorizeFinancialStepUp,
+                            submit: { body, idempotencyKey, stepUpToken in
+                                try await model.submitGroupPaymentWithDurableChatReceipt(
+                                    conversationID: conversation.id,
+                                    body: body,
+                                    idempotencyKey: idempotencyKey,
+                                    stepUpToken: stepUpToken
+                                )
+                            }
                         )
                         guard let payment else { return nil }
-                        // The money movement is already confirmed. Hand success back immediately
-                        // so the composer closes once; posting its idempotent chat card and
-                        // refreshing the wallet continue without leaving a live Send button over
-                        // the thread.
                         Task { @MainActor in
-                            var announced = await announceGroupPayment(payment)
-                            // A refresh can repair a transient roster/session race. The
-                            // deterministic client message id makes this one retry safe if the
-                            // first queue actually committed before reporting failure.
                             await model.refresh()
-                            if !announced {
-                                announced = await announceGroupPayment(payment)
-                            }
-                            if !announced {
-                                let message = "The payment was sent, but its chat card could not be "
-                                    + "added after retrying. Do not send it again; check Wallet "
-                                    + "activity and contact Kit Pay support with reference \(payment.id)."
-                                chatGroupPayments.errorMessage = message
-                                model.lastError = message
-                            }
                         }
                         return payment
                     },
@@ -3661,11 +3649,21 @@ struct ConversationView: View {
                         pin: pin,
                         enabled: groupPaymentRequestsEnabled,
                         isOnline: model.isOnline,
-                        authorize: model.authorizeFinancialStepUp
+                        authorize: model.authorizeFinancialStepUp,
+                        submit: { request, amount, idempotencyKey, stepUpToken in
+                            try await model.submitGroupContributionWithDurableChatReceipt(
+                                request: request,
+                                conversationID: conversation.id,
+                                announcementSenderUserID: target.announcementSenderID,
+                                sourceWallet: wallet,
+                                amount: amount,
+                                idempotencyKey: idempotencyKey,
+                                stepUpToken: stepUpToken
+                            )
+                        }
                     )
                     guard let result else { return nil }
                     Task { @MainActor in
-                        await announceGroupPaymentRequestContribution(result)
                         await model.refresh()
                     }
                     return result
@@ -6453,17 +6451,19 @@ struct ConversationView: View {
         let cancelled = await chatPaymentRequests.cancel(
             request,
             policy: paymentRequestPolicy,
-            isOnline: model.isOnline
+            isOnline: model.isOnline,
+            submit: { request, idempotencyKey in
+                try await model.cancelPaymentRequestWithDurableChatReceipt(
+                    request,
+                    descriptor: descriptor,
+                    conversationID: conversation.id,
+                    recipientUserID: paymentRecipientUserID,
+                    recipientName: recipientDisplayName,
+                    idempotencyKey: idempotencyKey
+                )
+            }
         )
-        guard cancelled,
-              let receipt = descriptor.changingAction(to: .cancelled)
-        else { return }
-        _ = await model.queuePaymentEvent(
-            conversationId: conversation.id,
-            title: recipientDisplayName,
-            recipientId: paymentRecipientUserID,
-            body: receipt.encoded
-        )
+        guard cancelled else { return }
     }
 
     @ViewBuilder

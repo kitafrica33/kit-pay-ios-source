@@ -102,11 +102,17 @@ and Apple Liquid Glass.
   while the share extension must not. The sender's device also records expiry once with a
   deterministic encrypted receipt. Without the flag, transfers settle immediately and use
   `sent`; no claim action is exposed.
-  Transfer and response chat cards use deterministic message IDs, so retries cannot duplicate
-  them. The post-transfer share is still best-effort across the narrow interval between the
-  server committing the money movement and iOS durably queuing its encrypted card; a process
-  termination in that interval can omit the card. Durable, bounded receipt recovery is a
-  follow-up and must not be implemented as an unrestricted transaction-history replay.
+  Financial chat cards use deterministic message IDs, so retries cannot duplicate them. Before
+  each immediate transfer, payment-request create/pay/cancel, group-payment create, or group-
+  request contribution POST, iOS durably stores the exact account-bound financial/chat intent
+  and original idempotency key; step-up bearer tokens are never persisted. The exact response is
+  journaled before its canonical card enters the normal E2EE outbox, and the record is
+  acknowledged only after that deterministic message is durable. Relaunch recovery handles at
+  most four due records per operation family and uses only the corresponding read-only recovery
+  route (`POST .../recovery`) or exact payment-request GET. It never scans transaction history or
+  automatically replays a money-moving mutation. Submitted and confirmed authority is retained
+  until exact resolution; only a prepared intent that never crossed the POST boundary expires,
+  after seven days.
 - Group chat creation/timeline work, message reactions, and presence/typing are server-gated:
   `features.messaging_groups` + per-device `messaging_groups_v1` attestation enable groups
   (create via POST messaging/conversations with `member_ids`+`type:"group"`+`title`; membership

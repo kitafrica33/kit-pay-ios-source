@@ -43,6 +43,40 @@ extension APIClient {
         )
     }
 
+    func recoverPaymentRequestCreation(
+        destinationWalletId: String,
+        requestedFromUserId: String?,
+        amount: String,
+        note: String?,
+        expiresAt: String? = nil,
+        idempotencyKey: String
+    ) async throws -> PaymentRequestDTO {
+        let (request, meta): (PaymentRequestDTO, APIMeta?) = try await sendWithMeta(
+            path: "payments/requests/recovery",
+            method: "POST",
+            body: CreatePaymentRequestBody(
+                destinationWalletId: destinationWalletId,
+                requestedFromUserId: requestedFromUserId,
+                amount: amount,
+                note: note,
+                expiresAt: expiresAt
+            ),
+            headers: ["Idempotency-Key": idempotencyKey]
+        )
+        guard meta?.idempotentReplay == true else {
+            throw APIClientError.invalidPayload(status: 200)
+        }
+        return request
+    }
+
+    func paymentRequest(id: String) async throws -> PaymentRequestDTO {
+        try await send(
+            path: "payments/requests/\(id)",
+            method: "GET",
+            body: PaymentRequestEmptyBody()
+        )
+    }
+
     func payPaymentRequest(
         requestId: String,
         sourceWalletId: String,

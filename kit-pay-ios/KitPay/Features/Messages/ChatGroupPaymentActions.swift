@@ -190,7 +190,8 @@ final class ChatGroupPaymentsViewModel: ObservableObject {
         groupPaymentsEnabled: Bool,
         pin: String,
         isOnline: Bool,
-        authorize: KitFinancialStepUpAuthorization
+        authorize: KitFinancialStepUpAuthorization,
+        submit: ((CreateGroupPaymentBody, String, String) async throws -> GroupPaymentDTO)? = nil
     ) async -> GroupPaymentDTO? {
         guard actionPaymentId == nil else { return nil }
         guard groupPaymentsEnabled else {
@@ -211,12 +212,17 @@ final class ChatGroupPaymentsViewModel: ObservableObject {
                 pin,
                 "Approve this group payment"
             )
-            let payment = try await api.createGroupPayment(
-                conversationId: conversationId,
-                body: body,
-                idempotencyKey: idempotencyKey,
-                stepUpToken: verification.stepUpToken
-            )
+            let payment: GroupPaymentDTO
+            if let submit {
+                payment = try await submit(body, idempotencyKey, verification.stepUpToken)
+            } else {
+                payment = try await api.createGroupPayment(
+                    conversationId: conversationId,
+                    body: body,
+                    idempotencyKey: idempotencyKey,
+                    stepUpToken: verification.stepUpToken
+                )
+            }
             store(payment)
             return payment
         } catch {
@@ -954,7 +960,9 @@ final class ChatGroupPaymentRequestsViewModel: ObservableObject {
         pin: String,
         enabled: Bool,
         isOnline: Bool,
-        authorize: KitFinancialStepUpAuthorization
+        authorize: KitFinancialStepUpAuthorization,
+        submit: ((GroupPaymentRequestDTO, String, String, String) async throws
+            -> GroupPaymentRequestContributionResultDTO)? = nil
     ) async -> GroupPaymentRequestContributionResultDTO? {
         guard actionRequestID == nil else { return nil }
         guard enabled else {
@@ -998,13 +1006,23 @@ final class ChatGroupPaymentRequestsViewModel: ObservableObject {
                 pin,
                 "Approve this group contribution"
             )
-            let result = try await api.contributeToGroupPaymentRequest(
-                id: request.id,
-                sourceWalletId: wallet.id,
-                amount: amount,
-                idempotencyKey: idempotencyKey,
-                stepUpToken: verification.stepUpToken
-            )
+            let result: GroupPaymentRequestContributionResultDTO
+            if let submit {
+                result = try await submit(
+                    request,
+                    amount,
+                    idempotencyKey,
+                    verification.stepUpToken
+                )
+            } else {
+                result = try await api.contributeToGroupPaymentRequest(
+                    id: request.id,
+                    sourceWalletId: wallet.id,
+                    amount: amount,
+                    idempotencyKey: idempotencyKey,
+                    stepUpToken: verification.stepUpToken
+                )
+            }
             guard result.isStructurallyValid,
                   result.request.id.caseInsensitiveCompare(request.id) == .orderedSame,
                   result.request.conversationId.caseInsensitiveCompare(conversationID)

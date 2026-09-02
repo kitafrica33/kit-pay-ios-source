@@ -1037,7 +1037,10 @@ final class AppModel: ObservableObject {
     /// its call; anything else ages out of the bounded buffer without ever being applied.
     private var pendingCallAnswers: [(callId: String, signal: CallAnswerSignal?)] = []
     private var accountEpoch = UUID()
-    private var paymentRequestChatShareLeases: [String: PaymentRequestChatShareLease] = [:]
+    /// Financial recovery and encrypted-card draining share one main-actor single flight. A
+    /// replacement account may start a new pass; every write remains fenced by account/session.
+    private var isRecoveringFinancialChatReceipts = false
+    private var financialChatReceiptRecoveryNeedsAnotherPass = false
     private var capabilitiesRequestTracker = CapabilitiesRequestResolutionTracker()
     private var messagingDeferredFeatureScope: MessagingDeferredFeatureScope?
     private var messagingDeferredFeatureSnapshot = MessagingDeferredFeatureSnapshot()
@@ -2813,6 +2816,65 @@ final class AppModel: ObservableObject {
             CustomerTransactionPresentationPolicy.hardenCustomerTransactions(
                 from: &migratedState.transactions
             )
+        let originalTransferChatReceipts = migratedState.pendingTransferChatReceipts ?? []
+        var hardenedTransferChatReceipts = originalTransferChatReceipts
+        TransferChatReceiptRecoveryPolicy.sanitize(
+            &hardenedTransferChatReceipts,
+            ownerUserID: migratedState.communicationOwnerUserID ?? migratedState.profile?.id,
+            now: Date()
+        )
+        migratedState.pendingTransferChatReceipts = hardenedTransferChatReceipts.isEmpty
+            ? nil
+            : hardenedTransferChatReceipts
+        let originalPaymentRequestChatReceipts =
+            migratedState.pendingPaymentRequestChatReceipts ?? []
+        var hardenedPaymentRequestChatReceipts = originalPaymentRequestChatReceipts
+        PaymentRequestChatReceiptRecoveryPolicy.sanitize(
+            &hardenedPaymentRequestChatReceipts,
+            ownerUserID: migratedState.communicationOwnerUserID ?? migratedState.profile?.id,
+            now: Date()
+        )
+        migratedState.pendingPaymentRequestChatReceipts =
+            hardenedPaymentRequestChatReceipts.isEmpty ? nil : hardenedPaymentRequestChatReceipts
+        let originalPaymentRequestResolutionReceipts =
+            migratedState.pendingPaymentRequestResolutionChatReceipts ?? []
+        var hardenedPaymentRequestResolutionReceipts = originalPaymentRequestResolutionReceipts
+        PaymentRequestResolutionChatReceiptRecoveryPolicy.sanitize(
+            &hardenedPaymentRequestResolutionReceipts,
+            ownerUserID: migratedState.communicationOwnerUserID ?? migratedState.profile?.id,
+            now: Date()
+        )
+        migratedState.pendingPaymentRequestResolutionChatReceipts =
+            hardenedPaymentRequestResolutionReceipts.isEmpty
+                ? nil
+                : hardenedPaymentRequestResolutionReceipts
+        let originalGroupPaymentReceipts = migratedState.pendingGroupPaymentChatReceipts ?? []
+        var hardenedGroupPaymentReceipts = originalGroupPaymentReceipts
+        GroupPaymentChatReceiptRecoveryPolicy.sanitize(
+            &hardenedGroupPaymentReceipts,
+            ownerUserID: migratedState.communicationOwnerUserID ?? migratedState.profile?.id,
+            now: Date()
+        )
+        migratedState.pendingGroupPaymentChatReceipts = hardenedGroupPaymentReceipts.isEmpty
+            ? nil
+            : hardenedGroupPaymentReceipts
+        let originalGroupContributionReceipts =
+            migratedState.pendingGroupContributionChatReceipts ?? []
+        var hardenedGroupContributionReceipts = originalGroupContributionReceipts
+        GroupContributionChatReceiptRecoveryPolicy.sanitize(
+            &hardenedGroupContributionReceipts,
+            ownerUserID: migratedState.communicationOwnerUserID ?? migratedState.profile?.id,
+            now: Date()
+        )
+        migratedState.pendingGroupContributionChatReceipts =
+            hardenedGroupContributionReceipts.isEmpty ? nil : hardenedGroupContributionReceipts
+        let hardenedFinancialChatReceiptRecovery =
+            hardenedTransferChatReceipts != originalTransferChatReceipts
+                || hardenedPaymentRequestChatReceipts != originalPaymentRequestChatReceipts
+                || hardenedPaymentRequestResolutionReceipts
+                    != originalPaymentRequestResolutionReceipts
+                || hardenedGroupPaymentReceipts != originalGroupPaymentReceipts
+                || hardenedGroupContributionReceipts != originalGroupContributionReceipts
         let mediaRecoveryDate = Date()
         let recoveredLocalMediaRecords = migratedState.messages.indices.reduce(into: 0) {
             count, index in
@@ -2827,6 +2889,7 @@ final class AppModel: ObservableObject {
             || ownerWasMigrated
             || removedLegacyCallAttempts > 0
             || hardenedCustomerTransactions > 0
+            || hardenedFinancialChatReceiptRecovery
             || recoveredLocalMediaRecords > 0 {
             do {
                 try await store.replace(migratedState)
@@ -3669,7 +3732,6 @@ final class AppModel: ObservableObject {
         guard await resetProtectedCallRecoveryCycle(retiringQueuedEvents: true) else {
             throw AuthUIError.staleResponse
         }
-        paymentRequestChatShareLeases.removeAll()
         resetCommunicationPrivacyState()
         resetSecurityPreferencesState()
         secureMessagingSyncError.reset()
@@ -4670,7 +4732,6 @@ final class AppModel: ObservableObject {
             }
         }
         await cancelAllProfileWorkAndWait()
-        paymentRequestChatShareLeases.removeAll()
         deviceManagementGeneration &+= 1
         isRefreshingRegisteredDevices = false
         revokingRegisteredDeviceID = nil
@@ -5935,9 +5996,458 @@ final class AppModel: ObservableObject {
         return await authenticateBiometrically(for: .paymentRequest)
     }
 
+    /// Commits an exact, account-bound transfer intent before the financial POST and retains it
+    /// until the server-confirmed card is durable in the normal E2EE outbox. The step-up bearer
+    /// token is deliberately never copied into protected state. Retrying an ambiguous result
+    /// obtains a fresh approval but reuses the journal's deterministic idempotency key.
+    func submitTransferWithDurableChatReceipt(
+        from wallet: Wallet,
+        to contact: WalletContactDTO,
+        amount: String,
+        note: String?,
+        conversationID rawConversationID: String?,
+        stepUpToken: String
+    ) async throws -> WalletTransaction {
+        guard appReviewDemoMutationsAllowed,
+              isSignedIn,
+              isOnline,
+              accountSetupStep == nil,
+              !requiresBiometricSignIn,
+              financialAccessGranted,
+              !stepUpToken.isEmpty,
+              let expectedUserID = profile?.id,
+              let expectedSessionID = await sessions.current()?.sessionId,
+              let currentWallet = state.wallets.first(where: {
+                  $0.id.caseInsensitiveCompare(wallet.id) == .orderedSame
+                      && $0.currency == wallet.currency
+              }),
+              let destinationWalletID = contact.receivingWalletId,
+              let recipientUserID = ContactRecipientDirectory.recipientUserId(for: contact)
+        else { throw TransferChatReceiptRecoveryError.invalidIntent }
+
+        let conversationID: String?
+        if let rawConversationID {
+            guard let identifier = UUID(
+                uuidString: rawConversationID.trimmingCharacters(
+                    in: .whitespacesAndNewlines
+                )
+            ) else { throw TransferChatReceiptRecoveryError.invalidIntent }
+            let canonical = identifier.uuidString.lowercased()
+            let owner = UUID(uuidString: expectedUserID)?.uuidString.lowercased()
+            guard let owner,
+                  let conversation = state.conversations.first(where: {
+                      $0.id.caseInsensitiveCompare(canonical) == .orderedSame
+                  }),
+                  !conversation.isGroup,
+                  Set(conversation.participantUserIds.compactMap {
+                      UUID(uuidString: $0)?.uuidString.lowercased()
+                  }) == Set([owner, recipientUserID])
+            else { throw TransferChatReceiptRecoveryError.invalidIntent }
+            conversationID = canonical
+        } else {
+            conversationID = nil
+        }
+
+        guard let candidate = TransferChatReceiptRecoveryRecord(
+            ownerUserID: expectedUserID,
+            sourceWalletID: currentWallet.id,
+            destinationWalletID: destinationWalletID,
+            recipientUserID: recipientUserID,
+            recipientName: contact.name,
+            conversationID: conversationID,
+            amount: amount,
+            currency: currentWallet.currency,
+            note: note
+        ) else { throw TransferChatReceiptRecoveryError.invalidIntent }
+
+        let expectedAccountEpoch = accountEpoch
+        guard await outboxContextIsCurrent(
+            accountEpoch: expectedAccountEpoch,
+            userID: expectedUserID,
+            sessionID: expectedSessionID
+        ) else { throw TransferChatReceiptRecoveryError.accountChanged }
+
+        var recovery: TransferChatReceiptRecoveryRecord?
+        try await store.update { persisted in
+            guard persisted.profile?.id.caseInsensitiveCompare(expectedUserID) == .orderedSame,
+                  persisted.communicationOwnerUserID?.caseInsensitiveCompare(expectedUserID)
+                    == .orderedSame
+            else { throw TransferChatReceiptRecoveryError.accountChanged }
+            var records = persisted.pendingTransferChatReceipts ?? []
+            guard let selected = TransferChatReceiptRecoveryPolicy.insertOrReuse(
+                candidate,
+                in: &records
+            ) else { throw TransferChatReceiptRecoveryError.recoveryCapacityReached }
+            persisted.pendingTransferChatReceipts = records
+            recovery = selected
+        }
+        guard let recovery else { throw TransferChatReceiptRecoveryError.invalidIntent }
+        await publishLatestState()
+
+        guard await outboxContextIsCurrent(
+            accountEpoch: expectedAccountEpoch,
+            userID: expectedUserID,
+            sessionID: expectedSessionID
+        ) else {
+            await discardPreparedTransferChatReceipt(
+                recovery.id,
+                ownerUserID: expectedUserID
+            )
+            throw TransferChatReceiptRecoveryError.accountChanged
+        }
+
+        // A prior attempt crossed the durable submitted boundary. Resolve that exact key and
+        // payload first; only an authoritative not-found response allows this fresh approval to
+        // submit the mutation again.
+        if recovery.phase != .prepared {
+            do {
+                let recovered = try await APIClientSessionBinding.$sessionID.withValue(
+                    expectedSessionID
+                ) {
+                    try await api.recoverTransfer(
+                        walletId: recovery.sourceWalletID,
+                        destinationWalletId: recovery.destinationWalletID,
+                        amount: recovery.amount,
+                        note: recovery.note,
+                        idempotencyKey: recovery.idempotencyKey
+                    )
+                }
+                try await confirmTransferChatReceipt(
+                    recovered,
+                    recovery: recovery,
+                    evidence: .exactRecovery,
+                    accountEpoch: expectedAccountEpoch,
+                    ownerUserID: expectedUserID,
+                    sessionID: expectedSessionID
+                )
+                await recoverAndDrainFinancialChatReceipts()
+                return recovered
+            } catch {
+                guard recovery.phase == .submitted,
+                      TransferChatReceiptRecoveryPolicy.recoveryDecision(for: error)
+                        == .notCommitted
+                else { throw error }
+            }
+        }
+
+        // This durable transition is the point of no return for cleanup. A crash after this write
+        // is recovered by the exact read-only endpoint; no background path repeats the transfer.
+        try await store.update { persisted in
+            guard persisted.profile?.id.caseInsensitiveCompare(expectedUserID) == .orderedSame,
+                  persisted.communicationOwnerUserID?.caseInsensitiveCompare(expectedUserID)
+                    == .orderedSame
+            else { throw TransferChatReceiptRecoveryError.accountChanged }
+            var records = persisted.pendingTransferChatReceipts ?? []
+            if recovery.phase == .prepared {
+                guard TransferChatReceiptRecoveryPolicy.markSubmitted(
+                    recordID: recovery.id,
+                    in: &records
+                ) else { throw TransferChatReceiptRecoveryError.unconfirmedTransfer }
+            } else {
+                guard records.contains(where: {
+                    $0.id == recovery.id && $0.phase == .submitted
+                }) else { throw TransferChatReceiptRecoveryError.unconfirmedTransfer }
+            }
+            persisted.pendingTransferChatReceipts = records
+        }
+        await publishLatestState()
+
+        do {
+            let transaction = try await APIClientSessionBinding.$sessionID.withValue(
+                expectedSessionID
+            ) {
+                try await api.transfer(
+                    walletId: recovery.sourceWalletID,
+                    destinationWalletId: recovery.destinationWalletID,
+                    amount: recovery.amount,
+                    note: recovery.note,
+                    idempotencyKey: recovery.idempotencyKey,
+                    stepUpToken: stepUpToken
+                )
+            }
+            try await confirmTransferChatReceipt(
+                transaction,
+                recovery: recovery,
+                evidence: .directResponse,
+                accountEpoch: expectedAccountEpoch,
+                ownerUserID: expectedUserID,
+                sessionID: expectedSessionID
+            )
+            await recoverAndDrainFinancialChatReceipts()
+            return transaction
+        } catch {
+            if TransferChatReceiptRecoveryPolicy.isDefinitiveRejection(error),
+               await outboxContextIsCurrent(
+                   accountEpoch: expectedAccountEpoch,
+                   userID: expectedUserID,
+                   sessionID: expectedSessionID
+               ) {
+                await retireUncommittedTransferChatReceipt(
+                    recovery.id,
+                    ownerUserID: expectedUserID
+                )
+            }
+            throw error
+        }
+    }
+
+    /// Used only before a POST or after an authoritative server rejection. Every ambiguous result
+    /// keeps its frozen idempotency authority for exact recovery or a verbatim explicit retry.
+    private func confirmTransferChatReceipt(
+        _ transaction: WalletTransaction,
+        recovery: TransferChatReceiptRecoveryRecord,
+        evidence: TransferChatReceiptConfirmation.Evidence,
+        accountEpoch expectedAccountEpoch: UUID,
+        ownerUserID expectedUserID: String,
+        sessionID expectedSessionID: String
+    ) async throws {
+        guard await outboxContextIsCurrent(
+            accountEpoch: expectedAccountEpoch,
+            userID: expectedUserID,
+            sessionID: expectedSessionID
+        ) else { throw TransferChatReceiptRecoveryError.accountChanged }
+        guard let confirmation = TransferChatReceiptConfirmation(
+            transaction: transaction,
+            recovery: recovery,
+            evidence: evidence
+        ) else { throw TransferChatReceiptRecoveryError.unconfirmedTransfer }
+        try await store.update { persisted in
+            guard persisted.profile?.id.caseInsensitiveCompare(expectedUserID) == .orderedSame,
+                  persisted.communicationOwnerUserID?.caseInsensitiveCompare(expectedUserID)
+                    == .orderedSame
+            else { throw TransferChatReceiptRecoveryError.accountChanged }
+            var records = persisted.pendingTransferChatReceipts ?? []
+            guard TransferChatReceiptRecoveryPolicy.storeConfirmation(
+                confirmation,
+                for: recovery.id,
+                in: &records
+            ) else { throw TransferChatReceiptRecoveryError.unconfirmedTransfer }
+            persisted.pendingTransferChatReceipts = records
+        }
+        await publishLatestState()
+    }
+
+    private func discardPreparedTransferChatReceipt(
+        _ recordID: UUID,
+        ownerUserID: String
+    ) async {
+        do {
+            try await store.update { persisted in
+                guard persisted.communicationOwnerUserID?.caseInsensitiveCompare(ownerUserID)
+                        == .orderedSame,
+                      persisted.profile.map({
+                          $0.id.caseInsensitiveCompare(ownerUserID) == .orderedSame
+                      }) ?? true
+                else { return }
+                var records = persisted.pendingTransferChatReceipts ?? []
+                records.removeAll { $0.id == recordID && $0.phase == .prepared }
+                persisted.pendingTransferChatReceipts = records.isEmpty ? nil : records
+            }
+            await publishLatestState()
+        } catch {
+            // A failed cleanup is harmless: prepared records cannot trigger an automatic POST and
+            // are the only phase eligible for age-based pruning.
+        }
+    }
+
+    private func retireUncommittedTransferChatReceipt(
+        _ recordID: UUID,
+        ownerUserID: String
+    ) async {
+        do {
+            try await store.update { persisted in
+                guard persisted.communicationOwnerUserID?.caseInsensitiveCompare(ownerUserID)
+                        == .orderedSame
+                else { return }
+                var records = persisted.pendingTransferChatReceipts ?? []
+                _ = TransferChatReceiptRecoveryPolicy.retireNotCommitted(
+                    recordID: recordID,
+                    in: &records
+                )
+                persisted.pendingTransferChatReceipts = records.isEmpty ? nil : records
+            }
+            await publishLatestState()
+        } catch {
+            // Retaining a proven-uncommitted key is safe and preserves fail-closed behavior.
+        }
+    }
+
+    /// Immediate requests persist their exact financial/chat intent before submission. Scheduled
+    /// requests deliberately continue through the lower-level create method below because their
+    /// existing outbox payload already persists the exact server confirmation before messaging.
+    func createPaymentRequestWithDurableChatReceipt(
+        destinationWalletID: String,
+        requestedFromUserID: String,
+        recipientName: String,
+        conversationID rawConversationID: String?,
+        amount: String,
+        note: String?,
+        idempotencyKey: String
+    ) async throws -> PaymentRequestDTO {
+        guard appReviewDemoMutationsAllowed,
+              isSignedIn,
+              isOnline,
+              accountSetupStep == nil,
+              !requiresBiometricSignIn,
+              financialAccessGranted,
+              let expectedWallet = state.wallets.first(where: {
+                  $0.id.caseInsensitiveCompare(destinationWalletID) == .orderedSame
+              }),
+              let expectedUserID = profile?.id,
+              let expectedSessionID = await sessions.current()?.sessionId,
+              let recipientUUID = UUID(
+                  uuidString: requestedFromUserID.trimmingCharacters(in: .whitespacesAndNewlines)
+              ),
+              recipientUUID.uuidString.caseInsensitiveCompare(expectedUserID) != .orderedSame
+        else { throw PaymentRequestSubmissionError.invalidRecipient }
+        let recipientUserID = recipientUUID.uuidString.lowercased()
+        let conversationID: String?
+        if let rawConversationID {
+            guard let canonical = FinancialRecoveryValidation.canonicalUUID(rawConversationID),
+                  directConversationIsBound(
+                      canonical,
+                      ownerUserID: expectedUserID,
+                      peerUserID: recipientUserID
+                  )
+            else { throw PaymentRequestSubmissionError.invalidRecipient }
+            conversationID = canonical
+        } else {
+            conversationID = nil
+        }
+        guard let candidate = PaymentRequestChatReceiptRecoveryRecord(
+            ownerUserID: expectedUserID,
+            destinationWalletID: expectedWallet.id,
+            recipientUserID: recipientUserID,
+            recipientName: recipientName,
+            conversationID: conversationID,
+            amount: amount,
+            currency: expectedWallet.currency,
+            note: note,
+            idempotencyKey: idempotencyKey
+        ) else { throw PaymentRequestSubmissionError.invalidRecipient }
+
+        let expectedAccountEpoch = accountEpoch
+        guard await outboxContextIsCurrent(
+            accountEpoch: expectedAccountEpoch,
+            userID: expectedUserID,
+            sessionID: expectedSessionID
+        ) else { throw PaymentRequestSubmissionError.accountChanged }
+
+        var recovery: PaymentRequestChatReceiptRecoveryRecord?
+        try await store.update { persisted in
+            guard persisted.profile?.id.caseInsensitiveCompare(expectedUserID) == .orderedSame,
+                  persisted.communicationOwnerUserID?.caseInsensitiveCompare(expectedUserID)
+                    == .orderedSame
+            else { throw PaymentRequestSubmissionError.accountChanged }
+            var records = persisted.pendingPaymentRequestChatReceipts ?? []
+            guard let selected = PaymentRequestChatReceiptRecoveryPolicy.insertOrReuse(
+                candidate,
+                in: &records
+            ) else { throw PaymentRequestSubmissionError.recoveryCapacityReached }
+            persisted.pendingPaymentRequestChatReceipts = records
+            recovery = selected
+        }
+        guard let recovery else { throw PaymentRequestSubmissionError.unconfirmedRequest }
+        await publishLatestState()
+
+        guard await outboxContextIsCurrent(
+            accountEpoch: expectedAccountEpoch,
+            userID: expectedUserID,
+            sessionID: expectedSessionID
+        ) else {
+            await discardPreparedPaymentRequestChatReceipt(
+                recovery.id,
+                ownerUserID: expectedUserID
+            )
+            throw PaymentRequestSubmissionError.accountChanged
+        }
+
+        if recovery.phase != .prepared {
+            do {
+                let request = try await APIClientSessionBinding.$sessionID.withValue(
+                    expectedSessionID
+                ) {
+                    try await api.recoverPaymentRequestCreation(
+                        destinationWalletId: recovery.destinationWalletID,
+                        requestedFromUserId: recovery.recipientUserID,
+                        amount: recovery.amount,
+                        note: recovery.note,
+                        expiresAt: recovery.expiresAt,
+                        idempotencyKey: recovery.idempotencyKey
+                    )
+                }
+                try await confirmPaymentRequestChatReceipt(
+                    request,
+                    recovery: recovery,
+                    accountEpoch: expectedAccountEpoch,
+                    ownerUserID: expectedUserID,
+                    sessionID: expectedSessionID
+                )
+                await recoverAndDrainFinancialChatReceipts()
+                return request
+            } catch {
+                guard recovery.phase == .submitted,
+                      PaymentRequestChatReceiptRecoveryPolicy.recoveryDecision(for: error)
+                        == .notCommitted
+                else { throw error }
+            }
+        }
+
+        try await store.update { persisted in
+            guard persisted.profile?.id.caseInsensitiveCompare(expectedUserID) == .orderedSame,
+                  persisted.communicationOwnerUserID?.caseInsensitiveCompare(expectedUserID)
+                    == .orderedSame
+            else { throw PaymentRequestSubmissionError.accountChanged }
+            var records = persisted.pendingPaymentRequestChatReceipts ?? []
+            if recovery.phase == .prepared {
+                guard PaymentRequestChatReceiptRecoveryPolicy.markSubmitted(
+                    recordID: recovery.id,
+                    in: &records
+                ) else { throw PaymentRequestSubmissionError.unconfirmedRequest }
+            } else {
+                guard records.contains(where: {
+                    $0.id == recovery.id && $0.phase == .submitted
+                }) else { throw PaymentRequestSubmissionError.unconfirmedRequest }
+            }
+            persisted.pendingPaymentRequestChatReceipts = records
+        }
+        await publishLatestState()
+
+        do {
+            let request = try await createPaymentRequest(
+                destinationWalletID: recovery.destinationWalletID,
+                requestedFromUserID: recovery.recipientUserID,
+                amount: recovery.amount,
+                note: recovery.note,
+                idempotencyKey: recovery.idempotencyKey
+            )
+            try await confirmPaymentRequestChatReceipt(
+                request,
+                recovery: recovery,
+                accountEpoch: expectedAccountEpoch,
+                ownerUserID: expectedUserID,
+                sessionID: expectedSessionID
+            )
+            await recoverAndDrainFinancialChatReceipts()
+            return request
+        } catch {
+            if FinancialChatReceiptRecoveryPolicy.mutationWasDefinitivelyRejected(error),
+               await outboxContextIsCurrent(
+                   accountEpoch: expectedAccountEpoch,
+                   userID: expectedUserID,
+                   sessionID: expectedSessionID
+               ) {
+                await retireUncommittedPaymentRequestChatReceipt(
+                    recovery.id,
+                    ownerUserID: expectedUserID
+                )
+            }
+            throw error
+        }
+    }
+
     /// Creates a financial request only for the authenticated account/session captured before the
-    /// network call. The caller separately queues its end-to-end encrypted chat card after the
-    /// exact response is validated; a replacement login can never inherit this operation.
+    /// network call. Scheduled outbox execution uses this lower-level path.
     func createPaymentRequest(
         destinationWalletID: String,
         requestedFromUserID: String,
@@ -5953,7 +6463,9 @@ final class AppModel: ObservableObject {
               accountSetupStep == nil,
               !requiresBiometricSignIn,
               financialAccessGranted,
-              let expectedWallet = state.wallets.first(where: { $0.id == destinationWalletID }),
+              let expectedWallet = state.wallets.first(where: {
+                  $0.id.caseInsensitiveCompare(destinationWalletID) == .orderedSame
+              }),
               let expectedUserID = profile?.id,
               let expectedSessionID = await sessions.current()?.sessionId,
               let recipientUUID = UUID(
@@ -5986,24 +6498,877 @@ final class AppModel: ObservableObject {
         guard UUID(uuidString: request.id) != nil,
               request.type == "payment_request",
               request.knownStatus == .pending,
-              request.destinationWalletId == destinationWalletID,
+              request.destinationWalletId.caseInsensitiveCompare(destinationWalletID)
+                == .orderedSame,
               request.requestedFromUserId?.caseInsensitiveCompare(canonicalRecipient)
                 == .orderedSame,
               request.amount == amount,
               request.currency == expectedWallet.currency,
-              let paymentDescriptor = KitPaymentMessage(
-                  action: .request,
-                  paymentRequest: request
-              )
+              KitPaymentMessage(action: .request, paymentRequest: request) != nil
         else { throw PaymentRequestSubmissionError.unconfirmedRequest }
-        paymentRequestChatShareLeases[request.id.lowercased()] = PaymentRequestChatShareLease(
+        return request
+    }
+
+    private func confirmPaymentRequestChatReceipt(
+        _ request: PaymentRequestDTO,
+        recovery: PaymentRequestChatReceiptRecoveryRecord,
+        accountEpoch expectedAccountEpoch: UUID,
+        ownerUserID expectedUserID: String,
+        sessionID expectedSessionID: String
+    ) async throws {
+        guard await outboxContextIsCurrent(
             accountEpoch: expectedAccountEpoch,
             userID: expectedUserID,
-            sessionID: expectedSessionID,
-            recipientUserID: canonicalRecipient,
-            descriptor: paymentDescriptor
+            sessionID: expectedSessionID
+        ), let confirmation = PaymentRequestChatReceiptConfirmation(
+            request: request,
+            recovery: recovery
+        ) else { throw PaymentRequestSubmissionError.unconfirmedRequest }
+        try await store.update { persisted in
+            guard persisted.profile?.id.caseInsensitiveCompare(expectedUserID) == .orderedSame,
+                  persisted.communicationOwnerUserID?.caseInsensitiveCompare(expectedUserID)
+                    == .orderedSame
+            else { throw PaymentRequestSubmissionError.accountChanged }
+            var records = persisted.pendingPaymentRequestChatReceipts ?? []
+            guard PaymentRequestChatReceiptRecoveryPolicy.storeConfirmation(
+                confirmation,
+                for: recovery.id,
+                in: &records
+            ) else { throw PaymentRequestSubmissionError.unconfirmedRequest }
+            persisted.pendingPaymentRequestChatReceipts = records
+        }
+        await publishLatestState()
+    }
+
+    private func discardPreparedPaymentRequestChatReceipt(
+        _ recordID: UUID,
+        ownerUserID: String
+    ) async {
+        await removePaymentRequestChatReceipt(
+            recordID,
+            ownerUserID: ownerUserID,
+            onlyPrepared: true
         )
-        return request
+    }
+
+    private func retireUncommittedPaymentRequestChatReceipt(
+        _ recordID: UUID,
+        ownerUserID: String
+    ) async {
+        await removePaymentRequestChatReceipt(
+            recordID,
+            ownerUserID: ownerUserID,
+            onlyPrepared: false
+        )
+    }
+
+    private func removePaymentRequestChatReceipt(
+        _ recordID: UUID,
+        ownerUserID: String,
+        onlyPrepared: Bool
+    ) async {
+        do {
+            try await store.update { persisted in
+                guard persisted.communicationOwnerUserID?.caseInsensitiveCompare(ownerUserID)
+                        == .orderedSame
+                else { return }
+                var records = persisted.pendingPaymentRequestChatReceipts ?? []
+                if onlyPrepared {
+                    records.removeAll { $0.id == recordID && $0.phase == .prepared }
+                } else {
+                    _ = PaymentRequestChatReceiptRecoveryPolicy.retireNotCommitted(
+                        recordID: recordID,
+                        in: &records
+                    )
+                }
+                persisted.pendingPaymentRequestChatReceipts = records.isEmpty ? nil : records
+            }
+            await publishLatestState()
+        } catch {
+            // Retention is fail-closed and cannot move money by itself.
+        }
+    }
+
+    private func directConversationIsBound(
+        _ conversationID: String,
+        ownerUserID: String,
+        peerUserID: String
+    ) -> Bool {
+        guard let owner = FinancialRecoveryValidation.canonicalUUID(ownerUserID),
+              let peer = FinancialRecoveryValidation.canonicalUUID(peerUserID),
+              let conversation = state.conversations.first(where: {
+                  $0.id.caseInsensitiveCompare(conversationID) == .orderedSame
+              }),
+              !conversation.isGroup
+        else { return false }
+        return Set(conversation.participantUserIds.compactMap(
+            { FinancialRecoveryValidation.canonicalUUID($0) }
+        )) == Set([owner, peer])
+    }
+
+    func submitGroupPaymentWithDurableChatReceipt(
+        conversationID: String,
+        body: CreateGroupPaymentBody,
+        idempotencyKey: String,
+        stepUpToken: String
+    ) async throws -> GroupPaymentDTO {
+        guard appReviewDemoMutationsAllowed,
+              isSignedIn,
+              isOnline,
+              accountSetupStep == nil,
+              !requiresBiometricSignIn,
+              financialAccessGranted,
+              !stepUpToken.isEmpty,
+              let expectedUserID = profile?.id,
+              let expectedSessionID = await sessions.current()?.sessionId,
+              let conversation = state.conversations.first(where: {
+                  $0.id.caseInsensitiveCompare(conversationID) == .orderedSame
+              }),
+              conversation.isGroup,
+              let wallet = state.wallets.first(where: {
+                  $0.id.caseInsensitiveCompare(body.sourceWalletId) == .orderedSame
+              })
+        else { throw FinancialChatReceiptRecoveryError.invalidIntent }
+        let owner = FinancialRecoveryValidation.canonicalUUID(expectedUserID)
+        let expectedRecipients: [String]
+        if let requested = body.recipients {
+            expectedRecipients = requested.compactMap {
+                FinancialRecoveryValidation.canonicalUUID($0.userId)
+            }
+        } else {
+            expectedRecipients = conversation.participantUserIds.compactMap {
+                FinancialRecoveryValidation.canonicalUUID($0)
+            }.filter { $0 != owner }
+        }
+        guard let candidate = GroupPaymentChatReceiptRecoveryRecord(
+            ownerUserID: expectedUserID,
+            conversationID: conversation.id,
+            expectedRecipientUserIDs: expectedRecipients,
+            currency: wallet.currency,
+            body: body,
+            idempotencyKey: idempotencyKey
+        ) else { throw FinancialChatReceiptRecoveryError.invalidIntent }
+
+        let expectedAccountEpoch = accountEpoch
+        guard await outboxContextIsCurrent(
+            accountEpoch: expectedAccountEpoch,
+            userID: expectedUserID,
+            sessionID: expectedSessionID
+        ) else { throw FinancialChatReceiptRecoveryError.accountChanged }
+        var recovery: GroupPaymentChatReceiptRecoveryRecord?
+        try await store.update { persisted in
+            guard persisted.profile?.id.caseInsensitiveCompare(expectedUserID) == .orderedSame,
+                  persisted.communicationOwnerUserID?.caseInsensitiveCompare(expectedUserID)
+                    == .orderedSame
+            else { throw FinancialChatReceiptRecoveryError.accountChanged }
+            var records = persisted.pendingGroupPaymentChatReceipts ?? []
+            guard let selected = GroupPaymentChatReceiptRecoveryPolicy.insertOrReuse(
+                candidate,
+                in: &records
+            ) else { throw FinancialChatReceiptRecoveryError.recoveryCapacityReached }
+            persisted.pendingGroupPaymentChatReceipts = records
+            recovery = selected
+        }
+        guard let recovery else { throw FinancialChatReceiptRecoveryError.unconfirmedResult }
+        await publishLatestState()
+
+        guard await outboxContextIsCurrent(
+            accountEpoch: expectedAccountEpoch,
+            userID: expectedUserID,
+            sessionID: expectedSessionID
+        ) else {
+            await removePreparedGroupPaymentChatReceipt(recovery.id, ownerUserID: expectedUserID)
+            throw FinancialChatReceiptRecoveryError.accountChanged
+        }
+
+        if recovery.phase != .prepared {
+            do {
+                let payment = try await APIClientSessionBinding.$sessionID.withValue(
+                    expectedSessionID
+                ) {
+                    try await api.recoverGroupPaymentCreation(
+                        conversationId: recovery.conversationID,
+                        body: recovery.body,
+                        idempotencyKey: recovery.idempotencyKey
+                    )
+                }
+                try await confirmGroupPaymentChatReceipt(
+                    payment,
+                    recovery: recovery,
+                    accountEpoch: expectedAccountEpoch,
+                    ownerUserID: expectedUserID,
+                    sessionID: expectedSessionID
+                )
+                await recoverAndDrainFinancialChatReceipts()
+                return payment
+            } catch {
+                guard recovery.phase == .submitted,
+                      GroupPaymentChatReceiptRecoveryPolicy.recoveryDecision(for: error)
+                        == .notCommitted
+                else { throw error }
+            }
+        }
+
+        try await store.update { persisted in
+            guard persisted.profile?.id.caseInsensitiveCompare(expectedUserID) == .orderedSame,
+                  persisted.communicationOwnerUserID?.caseInsensitiveCompare(expectedUserID)
+                    == .orderedSame
+            else { throw FinancialChatReceiptRecoveryError.accountChanged }
+            var records = persisted.pendingGroupPaymentChatReceipts ?? []
+            if recovery.phase == .prepared {
+                guard GroupPaymentChatReceiptRecoveryPolicy.markSubmitted(
+                    recordID: recovery.id,
+                    in: &records
+                ) else { throw FinancialChatReceiptRecoveryError.unconfirmedResult }
+            } else {
+                guard records.contains(where: {
+                    $0.id == recovery.id && $0.phase == .submitted
+                }) else { throw FinancialChatReceiptRecoveryError.unconfirmedResult }
+            }
+            persisted.pendingGroupPaymentChatReceipts = records
+        }
+        await publishLatestState()
+
+        do {
+            let payment = try await APIClientSessionBinding.$sessionID.withValue(
+                expectedSessionID
+            ) {
+                try await api.createGroupPayment(
+                    conversationId: recovery.conversationID,
+                    body: recovery.body,
+                    idempotencyKey: recovery.idempotencyKey,
+                    stepUpToken: stepUpToken
+                )
+            }
+            try await confirmGroupPaymentChatReceipt(
+                payment,
+                recovery: recovery,
+                accountEpoch: expectedAccountEpoch,
+                ownerUserID: expectedUserID,
+                sessionID: expectedSessionID
+            )
+            await recoverAndDrainFinancialChatReceipts()
+            return payment
+        } catch {
+            if FinancialChatReceiptRecoveryPolicy.mutationWasDefinitivelyRejected(error),
+               await outboxContextIsCurrent(
+                   accountEpoch: expectedAccountEpoch,
+                   userID: expectedUserID,
+                   sessionID: expectedSessionID
+               ) {
+                await retireUncommittedGroupPaymentChatReceipt(
+                    recovery.id,
+                    ownerUserID: expectedUserID
+                )
+            }
+            throw error
+        }
+    }
+
+    func submitGroupContributionWithDurableChatReceipt(
+        request: GroupPaymentRequestDTO,
+        conversationID: String,
+        announcementSenderUserID: String,
+        sourceWallet: Wallet,
+        amount: String,
+        idempotencyKey: String,
+        stepUpToken: String
+    ) async throws -> GroupPaymentRequestContributionResultDTO {
+        guard appReviewDemoMutationsAllowed,
+              isSignedIn,
+              isOnline,
+              accountSetupStep == nil,
+              !requiresBiometricSignIn,
+              financialAccessGranted,
+              !stepUpToken.isEmpty,
+              let expectedUserID = profile?.id,
+              let expectedSessionID = await sessions.current()?.sessionId,
+              let conversation = state.conversations.first(where: {
+                  $0.id.caseInsensitiveCompare(conversationID) == .orderedSame
+              }),
+              conversation.isGroup,
+              conversation.participantUserIds.contains(where: {
+                  $0.caseInsensitiveCompare(expectedUserID) == .orderedSame
+              }),
+              request.isStructurallyValid,
+              GroupPaymentRequestAuthorityPolicy.matchesContext(
+                  request,
+                  conversationID: conversation.id,
+                  announcementSenderID: announcementSenderUserID
+              ),
+              request.requesterUserId.caseInsensitiveCompare(expectedUserID) != .orderedSame,
+              state.wallets.contains(where: {
+                  $0.id.caseInsensitiveCompare(sourceWallet.id) == .orderedSame
+                      && $0.currency == sourceWallet.currency
+              }),
+              request.currency == sourceWallet.currency
+        else { throw FinancialChatReceiptRecoveryError.invalidIntent }
+        guard let candidate = GroupContributionChatReceiptRecoveryRecord(
+            ownerUserID: expectedUserID,
+            conversationID: conversation.id,
+            announcementSenderUserID: announcementSenderUserID,
+            requestID: request.id,
+            sourceWalletID: sourceWallet.id,
+            amount: amount,
+            currency: request.currency,
+            idempotencyKey: idempotencyKey
+        ) else { throw FinancialChatReceiptRecoveryError.invalidIntent }
+
+        let expectedAccountEpoch = accountEpoch
+        guard await outboxContextIsCurrent(
+            accountEpoch: expectedAccountEpoch,
+            userID: expectedUserID,
+            sessionID: expectedSessionID
+        ) else { throw FinancialChatReceiptRecoveryError.accountChanged }
+        var recovery: GroupContributionChatReceiptRecoveryRecord?
+        try await store.update { persisted in
+            guard persisted.profile?.id.caseInsensitiveCompare(expectedUserID) == .orderedSame,
+                  persisted.communicationOwnerUserID?.caseInsensitiveCompare(expectedUserID)
+                    == .orderedSame
+            else { throw FinancialChatReceiptRecoveryError.accountChanged }
+            var records = persisted.pendingGroupContributionChatReceipts ?? []
+            guard let selected = GroupContributionChatReceiptRecoveryPolicy.insertOrReuse(
+                candidate,
+                in: &records
+            ) else { throw FinancialChatReceiptRecoveryError.recoveryCapacityReached }
+            persisted.pendingGroupContributionChatReceipts = records
+            recovery = selected
+        }
+        guard let recovery else { throw FinancialChatReceiptRecoveryError.unconfirmedResult }
+        await publishLatestState()
+
+        guard await outboxContextIsCurrent(
+            accountEpoch: expectedAccountEpoch,
+            userID: expectedUserID,
+            sessionID: expectedSessionID
+        ) else {
+            await removePreparedGroupContributionChatReceipt(
+                recovery.id,
+                ownerUserID: expectedUserID
+            )
+            throw FinancialChatReceiptRecoveryError.accountChanged
+        }
+
+        if recovery.phase != .prepared {
+            do {
+                let result = try await APIClientSessionBinding.$sessionID.withValue(
+                    expectedSessionID
+                ) {
+                    try await api.recoverGroupPaymentRequestContribution(
+                        id: recovery.requestID,
+                        sourceWalletId: recovery.sourceWalletID,
+                        amount: recovery.amount,
+                        idempotencyKey: recovery.idempotencyKey
+                    )
+                }
+                try await confirmGroupContributionChatReceipt(
+                    result,
+                    recovery: recovery,
+                    accountEpoch: expectedAccountEpoch,
+                    ownerUserID: expectedUserID,
+                    sessionID: expectedSessionID
+                )
+                await recoverAndDrainFinancialChatReceipts()
+                return result
+            } catch {
+                guard recovery.phase == .submitted,
+                      GroupContributionChatReceiptRecoveryPolicy.recoveryDecision(for: error)
+                        == .notCommitted
+                else { throw error }
+            }
+        }
+
+        try await store.update { persisted in
+            guard persisted.profile?.id.caseInsensitiveCompare(expectedUserID) == .orderedSame,
+                  persisted.communicationOwnerUserID?.caseInsensitiveCompare(expectedUserID)
+                    == .orderedSame
+            else { throw FinancialChatReceiptRecoveryError.accountChanged }
+            var records = persisted.pendingGroupContributionChatReceipts ?? []
+            if recovery.phase == .prepared {
+                guard GroupContributionChatReceiptRecoveryPolicy.markSubmitted(
+                    recordID: recovery.id,
+                    in: &records
+                ) else { throw FinancialChatReceiptRecoveryError.unconfirmedResult }
+            } else {
+                guard records.contains(where: {
+                    $0.id == recovery.id && $0.phase == .submitted
+                }) else { throw FinancialChatReceiptRecoveryError.unconfirmedResult }
+            }
+            persisted.pendingGroupContributionChatReceipts = records
+        }
+        await publishLatestState()
+
+        do {
+            let result = try await APIClientSessionBinding.$sessionID.withValue(
+                expectedSessionID
+            ) {
+                try await api.contributeToGroupPaymentRequest(
+                    id: recovery.requestID,
+                    sourceWalletId: recovery.sourceWalletID,
+                    amount: recovery.amount,
+                    idempotencyKey: recovery.idempotencyKey,
+                    stepUpToken: stepUpToken
+                )
+            }
+            try await confirmGroupContributionChatReceipt(
+                result,
+                recovery: recovery,
+                accountEpoch: expectedAccountEpoch,
+                ownerUserID: expectedUserID,
+                sessionID: expectedSessionID
+            )
+            await recoverAndDrainFinancialChatReceipts()
+            return result
+        } catch {
+            if FinancialChatReceiptRecoveryPolicy.mutationWasDefinitivelyRejected(error),
+               await outboxContextIsCurrent(
+                   accountEpoch: expectedAccountEpoch,
+                   userID: expectedUserID,
+                   sessionID: expectedSessionID
+               ) {
+                await retireUncommittedGroupContributionChatReceipt(
+                    recovery.id,
+                    ownerUserID: expectedUserID
+                )
+            }
+            throw error
+        }
+    }
+
+    private func confirmGroupPaymentChatReceipt(
+        _ payment: GroupPaymentDTO,
+        recovery: GroupPaymentChatReceiptRecoveryRecord,
+        accountEpoch expectedAccountEpoch: UUID,
+        ownerUserID expectedUserID: String,
+        sessionID expectedSessionID: String
+    ) async throws {
+        guard await outboxContextIsCurrent(
+            accountEpoch: expectedAccountEpoch,
+            userID: expectedUserID,
+            sessionID: expectedSessionID
+        ), let confirmation = GroupPaymentChatReceiptConfirmation(
+            payment: payment,
+            recovery: recovery
+        ) else { throw FinancialChatReceiptRecoveryError.unconfirmedResult }
+        try await store.update { persisted in
+            guard persisted.profile?.id.caseInsensitiveCompare(expectedUserID) == .orderedSame,
+                  persisted.communicationOwnerUserID?.caseInsensitiveCompare(expectedUserID)
+                    == .orderedSame
+            else { throw FinancialChatReceiptRecoveryError.accountChanged }
+            var records = persisted.pendingGroupPaymentChatReceipts ?? []
+            guard GroupPaymentChatReceiptRecoveryPolicy.storeConfirmation(
+                confirmation,
+                for: recovery.id,
+                in: &records
+            ) else { throw FinancialChatReceiptRecoveryError.unconfirmedResult }
+            persisted.pendingGroupPaymentChatReceipts = records
+        }
+        await publishLatestState()
+    }
+
+    private func confirmGroupContributionChatReceipt(
+        _ result: GroupPaymentRequestContributionResultDTO,
+        recovery: GroupContributionChatReceiptRecoveryRecord,
+        accountEpoch expectedAccountEpoch: UUID,
+        ownerUserID expectedUserID: String,
+        sessionID expectedSessionID: String
+    ) async throws {
+        guard await outboxContextIsCurrent(
+            accountEpoch: expectedAccountEpoch,
+            userID: expectedUserID,
+            sessionID: expectedSessionID
+        ), let confirmation = GroupContributionChatReceiptConfirmation(
+            result: result,
+            recovery: recovery
+        ) else { throw FinancialChatReceiptRecoveryError.unconfirmedResult }
+        try await store.update { persisted in
+            guard persisted.profile?.id.caseInsensitiveCompare(expectedUserID) == .orderedSame,
+                  persisted.communicationOwnerUserID?.caseInsensitiveCompare(expectedUserID)
+                    == .orderedSame
+            else { throw FinancialChatReceiptRecoveryError.accountChanged }
+            var records = persisted.pendingGroupContributionChatReceipts ?? []
+            guard GroupContributionChatReceiptRecoveryPolicy.storeConfirmation(
+                confirmation,
+                for: recovery.id,
+                in: &records
+            ) else { throw FinancialChatReceiptRecoveryError.unconfirmedResult }
+            persisted.pendingGroupContributionChatReceipts = records
+        }
+        await publishLatestState()
+    }
+
+    private func removePreparedGroupPaymentChatReceipt(
+        _ recordID: UUID,
+        ownerUserID: String
+    ) async {
+        await mutateGroupPaymentChatReceipts(ownerUserID: ownerUserID) { records in
+            records.removeAll { $0.id == recordID && $0.phase == .prepared }
+        }
+    }
+
+    private func retireUncommittedGroupPaymentChatReceipt(
+        _ recordID: UUID,
+        ownerUserID: String
+    ) async {
+        await mutateGroupPaymentChatReceipts(ownerUserID: ownerUserID) { records in
+            _ = GroupPaymentChatReceiptRecoveryPolicy.retireNotCommitted(
+                recordID: recordID,
+                in: &records
+            )
+        }
+    }
+
+    private func mutateGroupPaymentChatReceipts(
+        ownerUserID: String,
+        _ mutation: (inout [GroupPaymentChatReceiptRecoveryRecord]) -> Void
+    ) async {
+        do {
+            try await store.update { persisted in
+                guard persisted.communicationOwnerUserID?.caseInsensitiveCompare(ownerUserID)
+                        == .orderedSame
+                else { return }
+                var records = persisted.pendingGroupPaymentChatReceipts ?? []
+                mutation(&records)
+                persisted.pendingGroupPaymentChatReceipts = records.isEmpty ? nil : records
+            }
+            await publishLatestState()
+        } catch {}
+    }
+
+    private func removePreparedGroupContributionChatReceipt(
+        _ recordID: UUID,
+        ownerUserID: String
+    ) async {
+        await mutateGroupContributionChatReceipts(ownerUserID: ownerUserID) { records in
+            records.removeAll { $0.id == recordID && $0.phase == .prepared }
+        }
+    }
+
+    private func retireUncommittedGroupContributionChatReceipt(
+        _ recordID: UUID,
+        ownerUserID: String
+    ) async {
+        await mutateGroupContributionChatReceipts(ownerUserID: ownerUserID) { records in
+            _ = GroupContributionChatReceiptRecoveryPolicy.retireNotCommitted(
+                recordID: recordID,
+                in: &records
+            )
+        }
+    }
+
+    private func mutateGroupContributionChatReceipts(
+        ownerUserID: String,
+        _ mutation: (inout [GroupContributionChatReceiptRecoveryRecord]) -> Void
+    ) async {
+        do {
+            try await store.update { persisted in
+                guard persisted.communicationOwnerUserID?.caseInsensitiveCompare(ownerUserID)
+                        == .orderedSame
+                else { return }
+                var records = persisted.pendingGroupContributionChatReceipts ?? []
+                mutation(&records)
+                persisted.pendingGroupContributionChatReceipts = records.isEmpty ? nil : records
+            }
+            await publishLatestState()
+        } catch {}
+    }
+
+    func payPaymentRequestWithDurableChatReceipt(
+        _ request: PaymentRequestDTO,
+        descriptor: KitPaymentMessage,
+        from wallet: Wallet,
+        conversationID: String,
+        recipientUserID: String,
+        recipientName: String,
+        idempotencyKey: String,
+        stepUpToken: String
+    ) async throws -> PaymentRequestDTO {
+        try await submitPaymentRequestResolutionWithDurableChatReceipt(
+            request,
+            descriptor: descriptor,
+            sourceWallet: wallet,
+            conversationID: conversationID,
+            recipientUserID: recipientUserID,
+            recipientName: recipientName,
+            operation: .paid,
+            idempotencyKey: idempotencyKey
+        ) { recovery in
+            guard !stepUpToken.isEmpty, let sourceWalletID = recovery.sourceWalletID else {
+                throw FinancialChatReceiptRecoveryError.invalidIntent
+            }
+            return try await self.api.payPaymentRequest(
+                requestId: recovery.requestID,
+                sourceWalletId: sourceWalletID,
+                idempotencyKey: recovery.idempotencyKey,
+                stepUpToken: stepUpToken
+            )
+        }
+    }
+
+    func cancelPaymentRequestWithDurableChatReceipt(
+        _ request: PaymentRequestDTO,
+        descriptor: KitPaymentMessage,
+        conversationID: String,
+        recipientUserID: String,
+        recipientName: String,
+        idempotencyKey: String
+    ) async throws -> PaymentRequestDTO {
+        try await submitPaymentRequestResolutionWithDurableChatReceipt(
+            request,
+            descriptor: descriptor,
+            sourceWallet: nil,
+            conversationID: conversationID,
+            recipientUserID: recipientUserID,
+            recipientName: recipientName,
+            operation: .cancelled,
+            idempotencyKey: idempotencyKey
+        ) { recovery in
+            try await self.api.cancelPaymentRequest(
+                requestId: recovery.requestID,
+                idempotencyKey: recovery.idempotencyKey
+            )
+        }
+    }
+
+    private func submitPaymentRequestResolutionWithDurableChatReceipt(
+        _ request: PaymentRequestDTO,
+        descriptor: KitPaymentMessage,
+        sourceWallet: Wallet?,
+        conversationID: String,
+        recipientUserID: String,
+        recipientName: String,
+        operation: PaymentRequestResolutionRecoveryOperation,
+        idempotencyKey: String,
+        mutation: (PaymentRequestResolutionChatReceiptRecoveryRecord) async throws
+            -> PaymentRequestDTO
+    ) async throws -> PaymentRequestDTO {
+        guard appReviewDemoMutationsAllowed,
+              isSignedIn,
+              isOnline,
+              accountSetupStep == nil,
+              !requiresBiometricSignIn,
+              financialAccessGranted,
+              let expectedUserID = profile?.id,
+              let expectedSessionID = await sessions.current()?.sessionId,
+              directConversationIsBound(
+                  conversationID,
+                  ownerUserID: expectedUserID,
+                  peerUserID: recipientUserID
+              ),
+              request.knownStatus == .pending,
+              descriptor.action == .request,
+              descriptor.matchesAuthoritativeRequest(request)
+        else { throw FinancialChatReceiptRecoveryError.invalidIntent }
+        switch operation {
+        case .paid:
+            guard request.requestedFromUserId?.caseInsensitiveCompare(expectedUserID)
+                    == .orderedSame,
+                  let sourceWallet,
+                  state.wallets.contains(where: {
+                      $0.id.caseInsensitiveCompare(sourceWallet.id) == .orderedSame
+                          && $0.currency == sourceWallet.currency
+                  }),
+                  sourceWallet.currency == request.currency
+            else { throw FinancialChatReceiptRecoveryError.invalidIntent }
+        case .cancelled:
+            guard sourceWallet == nil,
+                  request.requestedFromUserId?.caseInsensitiveCompare(recipientUserID)
+                    == .orderedSame,
+                  state.wallets.contains(where: {
+                      $0.id.caseInsensitiveCompare(request.destinationWalletId) == .orderedSame
+                          && $0.currency == request.currency
+                  })
+            else { throw FinancialChatReceiptRecoveryError.invalidIntent }
+        }
+        guard let candidate = PaymentRequestResolutionChatReceiptRecoveryRecord(
+            ownerUserID: expectedUserID,
+            conversationID: conversationID,
+            recipientUserID: recipientUserID,
+            recipientName: recipientName,
+            request: request,
+            descriptor: descriptor,
+            sourceWalletID: sourceWallet?.id,
+            operation: operation,
+            idempotencyKey: idempotencyKey
+        ) else { throw FinancialChatReceiptRecoveryError.invalidIntent }
+
+        let expectedAccountEpoch = accountEpoch
+        guard await outboxContextIsCurrent(
+            accountEpoch: expectedAccountEpoch,
+            userID: expectedUserID,
+            sessionID: expectedSessionID
+        ) else { throw FinancialChatReceiptRecoveryError.accountChanged }
+        var recovery: PaymentRequestResolutionChatReceiptRecoveryRecord?
+        try await store.update { persisted in
+            guard persisted.profile?.id.caseInsensitiveCompare(expectedUserID) == .orderedSame,
+                  persisted.communicationOwnerUserID?.caseInsensitiveCompare(expectedUserID)
+                    == .orderedSame
+            else { throw FinancialChatReceiptRecoveryError.accountChanged }
+            var records = persisted.pendingPaymentRequestResolutionChatReceipts ?? []
+            guard let selected = PaymentRequestResolutionChatReceiptRecoveryPolicy.insertOrReuse(
+                candidate,
+                in: &records
+            ) else { throw FinancialChatReceiptRecoveryError.recoveryCapacityReached }
+            persisted.pendingPaymentRequestResolutionChatReceipts = records
+            recovery = selected
+        }
+        guard let recovery else { throw FinancialChatReceiptRecoveryError.unconfirmedResult }
+        await publishLatestState()
+
+        guard await outboxContextIsCurrent(
+            accountEpoch: expectedAccountEpoch,
+            userID: expectedUserID,
+            sessionID: expectedSessionID
+        ) else {
+            await removePreparedPaymentRequestResolutionChatReceipt(
+                recovery.id,
+                ownerUserID: expectedUserID
+            )
+            throw FinancialChatReceiptRecoveryError.accountChanged
+        }
+
+        if recovery.phase != .prepared {
+            let latest = try await APIClientSessionBinding.$sessionID.withValue(expectedSessionID) {
+                try await api.paymentRequest(id: recovery.requestID)
+            }
+            if let confirmation = PaymentRequestResolutionChatReceiptConfirmation(
+                request: latest,
+                recovery: recovery
+            ) {
+                try await storePaymentRequestResolutionConfirmation(
+                    confirmation,
+                    recovery: recovery,
+                    accountEpoch: expectedAccountEpoch,
+                    ownerUserID: expectedUserID,
+                    sessionID: expectedSessionID
+                )
+                await recoverAndDrainFinancialChatReceipts()
+                return latest
+            }
+            guard recovery.phase == .submitted, latest.knownStatus == .pending else {
+                throw FinancialChatReceiptRecoveryError.unconfirmedResult
+            }
+        }
+
+        try await store.update { persisted in
+            guard persisted.profile?.id.caseInsensitiveCompare(expectedUserID) == .orderedSame,
+                  persisted.communicationOwnerUserID?.caseInsensitiveCompare(expectedUserID)
+                    == .orderedSame
+            else { throw FinancialChatReceiptRecoveryError.accountChanged }
+            var records = persisted.pendingPaymentRequestResolutionChatReceipts ?? []
+            if recovery.phase == .prepared {
+                guard PaymentRequestResolutionChatReceiptRecoveryPolicy.markSubmitted(
+                    recordID: recovery.id,
+                    in: &records
+                ) else { throw FinancialChatReceiptRecoveryError.unconfirmedResult }
+            } else {
+                guard records.contains(where: {
+                    $0.id == recovery.id && $0.phase == .submitted
+                }) else { throw FinancialChatReceiptRecoveryError.unconfirmedResult }
+            }
+            persisted.pendingPaymentRequestResolutionChatReceipts = records
+        }
+        await publishLatestState()
+
+        do {
+            let result = try await APIClientSessionBinding.$sessionID.withValue(expectedSessionID) {
+                try await mutation(recovery)
+            }
+            guard let confirmation = PaymentRequestResolutionChatReceiptConfirmation(
+                request: result,
+                recovery: recovery
+            ) else { throw FinancialChatReceiptRecoveryError.unconfirmedResult }
+            try await storePaymentRequestResolutionConfirmation(
+                confirmation,
+                recovery: recovery,
+                accountEpoch: expectedAccountEpoch,
+                ownerUserID: expectedUserID,
+                sessionID: expectedSessionID
+            )
+            await recoverAndDrainFinancialChatReceipts()
+            return result
+        } catch {
+            if FinancialChatReceiptRecoveryPolicy.mutationWasDefinitivelyRejected(error),
+               await outboxContextIsCurrent(
+                   accountEpoch: expectedAccountEpoch,
+                   userID: expectedUserID,
+                   sessionID: expectedSessionID
+               ) {
+                await retireUncommittedPaymentRequestResolutionChatReceipt(
+                    recovery.id,
+                    ownerUserID: expectedUserID
+                )
+            }
+            throw error
+        }
+    }
+
+    private func storePaymentRequestResolutionConfirmation(
+        _ confirmation: PaymentRequestResolutionChatReceiptConfirmation,
+        recovery: PaymentRequestResolutionChatReceiptRecoveryRecord,
+        accountEpoch expectedAccountEpoch: UUID,
+        ownerUserID expectedUserID: String,
+        sessionID expectedSessionID: String
+    ) async throws {
+        guard await outboxContextIsCurrent(
+            accountEpoch: expectedAccountEpoch,
+            userID: expectedUserID,
+            sessionID: expectedSessionID
+        ) else { throw FinancialChatReceiptRecoveryError.accountChanged }
+        try await store.update { persisted in
+            guard persisted.profile?.id.caseInsensitiveCompare(expectedUserID) == .orderedSame,
+                  persisted.communicationOwnerUserID?.caseInsensitiveCompare(expectedUserID)
+                    == .orderedSame
+            else { throw FinancialChatReceiptRecoveryError.accountChanged }
+            var records = persisted.pendingPaymentRequestResolutionChatReceipts ?? []
+            guard PaymentRequestResolutionChatReceiptRecoveryPolicy.storeConfirmation(
+                confirmation,
+                for: recovery.id,
+                in: &records
+            ) else { throw FinancialChatReceiptRecoveryError.unconfirmedResult }
+            persisted.pendingPaymentRequestResolutionChatReceipts = records
+        }
+        await publishLatestState()
+    }
+
+    private func removePreparedPaymentRequestResolutionChatReceipt(
+        _ recordID: UUID,
+        ownerUserID: String
+    ) async {
+        await mutatePaymentRequestResolutionChatReceipts(ownerUserID: ownerUserID) { records in
+            records.removeAll { $0.id == recordID && $0.phase == .prepared }
+        }
+    }
+
+    private func retireUncommittedPaymentRequestResolutionChatReceipt(
+        _ recordID: UUID,
+        ownerUserID: String
+    ) async {
+        await mutatePaymentRequestResolutionChatReceipts(ownerUserID: ownerUserID) { records in
+            _ = PaymentRequestResolutionChatReceiptRecoveryPolicy.retireUncommitted(
+                recordID: recordID,
+                in: &records
+            )
+        }
+    }
+
+    private func mutatePaymentRequestResolutionChatReceipts(
+        ownerUserID: String,
+        _ mutation: (inout [PaymentRequestResolutionChatReceiptRecoveryRecord]) -> Void
+    ) async {
+        do {
+            try await store.update { persisted in
+                guard persisted.communicationOwnerUserID?.caseInsensitiveCompare(ownerUserID)
+                        == .orderedSame
+                else { return }
+                var records = persisted.pendingPaymentRequestResolutionChatReceipts ?? []
+                mutation(&records)
+                persisted.pendingPaymentRequestResolutionChatReceipts = records.isEmpty
+                    ? nil
+                    : records
+            }
+            await publishLatestState()
+        } catch {}
     }
 
     func authorizeFinancialStepUp(
@@ -6828,13 +8193,14 @@ final class AppModel: ObservableObject {
         selectedWallet: Wallet
     ) async {
         do {
+            let firstPage = try await APIClientSessionBinding.$sessionID.withValue(
+                key.sessionID
+            ) {
+                try await api.transactions(walletId: key.walletID).items
+            }
             let transactions = CustomerTransactionPresentationPolicy
                 .customerVisibleTransactions(
-                    try await APIClientSessionBinding.$sessionID.withValue(
-                        key.sessionID
-                    ) {
-                        try await api.transactions(walletId: key.walletID).items
-                    },
+                    firstPage,
                     for: selectedWallet
                 )
             guard await callHistoryContextIsCurrent(
@@ -7066,6 +8432,10 @@ final class AppModel: ObservableObject {
                 return .noData
             }
             await publishLatestState()
+            // A read-only recovery endpoint may have recovered a server-confirmed financial
+            // result whose chat card was interrupted by process death. Cross it into the same
+            // encrypted outbox only after this account's Signal state has activated and synced.
+            await recoverAndDrainFinancialChatReceipts()
             await enforceReceivedMediaCacheBudget()
             schedulePendingMediaHydration()
             lastError = secureMessagingSyncError.resolve(
@@ -10180,49 +11550,108 @@ final class AppModel: ObservableObject {
             lastError = "This App Review preview is read-only."
             return false
         }
-        let leaseKey = request.id.lowercased()
-        guard let lease = paymentRequestChatShareLeases[leaseKey],
-              await outboxContextIsCurrent(
-                  accountEpoch: lease.accountEpoch,
-                  userID: lease.userID,
-                  sessionID: lease.sessionID
-              )
+        guard let expectedUserID = profile?.id,
+              let expectedSessionID = await sessions.current()?.sessionId
         else { return false }
-        guard let share = KitPaymentRequestChatShare(
-            paymentRequest: request,
-            recipientUserID: recipientId,
-            recipientName: title
-        ) else {
+        let expectedAccountEpoch = accountEpoch
+        let snapshot = await store.snapshot()
+        let canonicalConversationID = conversationId.flatMap {
+            FinancialRecoveryValidation.canonicalUUID($0)
+        }
+        guard conversationId == nil || canonicalConversationID != nil else {
             lastError = "Kit Pay could not confirm who should receive this request. Nothing was sent in chat."
             return false
         }
-        guard lease.authorizes(share) else { return false }
+        let recovery = (snapshot.pendingPaymentRequestChatReceipts ?? []).first(where: {
+            $0.ownerUserID.caseInsensitiveCompare(expectedUserID) == .orderedSame
+                && $0.recipientUserID.caseInsensitiveCompare(recipientId) == .orderedSame
+                && $0.conversationID == canonicalConversationID
+                && $0.confirmation?.requestID.caseInsensitiveCompare(request.id) == .orderedSame
+                && $0.phase == .confirmed
+        })
+        let ownsDestinationWallet = state.wallets.contains {
+            $0.id.caseInsensitiveCompare(request.destinationWalletId) == .orderedSame
+                && $0.currency == request.currency
+        }
+        let targetRecipientID: String
+        let targetRecipientName: String
+        let targetConversationID: String?
+        let encodedDescriptor: String
+        let messageID: UUID
+        if let recovery,
+           let confirmation = recovery.confirmation,
+           confirmation.isValid(for: recovery),
+           let confirmedMessageID = confirmation.clientMessageID {
+            targetRecipientID = recovery.recipientUserID
+            targetRecipientName = recovery.recipientName
+            targetConversationID = recovery.conversationID
+            encodedDescriptor = confirmation.encodedDescriptor
+            messageID = confirmedMessageID
+        } else if ownsDestinationWallet, let share = KitPaymentRequestChatShare(
+            paymentRequest: request,
+            recipientUserID: recipientId,
+            recipientName: title
+        ) {
+            // The single-flight recovery task may have queued and acknowledged this exact card
+            // while the creating view was suspended. Requeueing the same deterministic UUID is
+            // an idempotent proof that the protected projection is already durable.
+            targetRecipientID = share.recipientUserID
+            targetRecipientName = share.recipientName
+            targetConversationID = canonicalConversationID
+            encodedDescriptor = share.descriptor.encoded
+            messageID = share.clientMessageID
+        } else {
+            lastError = "Kit Pay could not confirm who should receive this request. Nothing was sent in chat."
+            return false
+        }
+        guard await outboxContextIsCurrent(
+            accountEpoch: expectedAccountEpoch,
+            userID: expectedUserID,
+            sessionID: expectedSessionID
+        ) else { return false }
         let queued: Bool
-        if let conversationId {
+        if let conversationID = targetConversationID {
             queued = await queuePaymentEvent(
-                conversationId: conversationId,
-                title: share.recipientName,
-                recipientId: share.recipientUserID,
-                body: share.descriptor.encoded,
-                clientMessageID: share.clientMessageID
+                conversationId: conversationID,
+                title: targetRecipientName,
+                recipientId: targetRecipientID,
+                body: encodedDescriptor,
+                clientMessageID: messageID
             )
         } else {
             queued = await queueDirectPaymentEvent(
-                recipientId: share.recipientUserID,
-                title: share.recipientName,
-                body: share.descriptor.encoded,
-                clientMessageID: share.clientMessageID
+                recipientId: targetRecipientID,
+                title: targetRecipientName,
+                body: encodedDescriptor,
+                clientMessageID: messageID
             )
         }
         guard queued,
               await outboxContextIsCurrent(
-                  accountEpoch: lease.accountEpoch,
-                  userID: lease.userID,
-                  sessionID: lease.sessionID
+                  accountEpoch: expectedAccountEpoch,
+                  userID: expectedUserID,
+                  sessionID: expectedSessionID
               )
         else { return false }
-        if paymentRequestChatShareLeases[leaseKey] == lease {
-            paymentRequestChatShareLeases.removeValue(forKey: leaseKey)
+        guard let recovery else { return true }
+        do {
+            try await store.update { persisted in
+                guard persisted.profile?.id.caseInsensitiveCompare(expectedUserID) == .orderedSame,
+                      persisted.communicationOwnerUserID?.caseInsensitiveCompare(expectedUserID)
+                        == .orderedSame
+                else { throw PaymentRequestSubmissionError.accountChanged }
+                var records = persisted.pendingPaymentRequestChatReceipts ?? []
+                guard PaymentRequestChatReceiptRecoveryPolicy.acknowledgeDurableMessage(
+                    recordID: recovery.id,
+                    messageID: messageID,
+                    in: &records
+                ) else { throw PaymentRequestSubmissionError.unconfirmedRequest }
+                persisted.pendingPaymentRequestChatReceipts = records.isEmpty ? nil : records
+            }
+            await publishLatestState()
+        } catch {
+            // The deterministic card is durable. Retaining the journal can only replay the same
+            // local message ID and is safer than losing acknowledgement state.
         }
         return true
     }
@@ -10539,68 +11968,656 @@ final class AppModel: ObservableObject {
         return true
     }
 
-    /// Shares a just-completed Kit Pay → Kit Pay transfer into the conversation as an encrypted
-    /// `KITPAY1` transfer event. A held transfer is keyed by the server's claim id; an immediate
-    /// transfer uses the transaction id and the distinct `sent` action. The chosen reference also
-    /// doubles as the client message id so a retry cannot produce a duplicate chat event.
-    @discardableResult
-    func queueTransferChatEvent(
-        transaction: WalletTransaction,
-        recipientId: String,
-        title: String,
-        conversationId: String? = nil
-    ) async -> Bool {
-        if let conversationId,
-           isReadOnlyAppReviewDemoConversation(conversationId) {
-            lastError = "This App Review preview is read-only."
-            return false
+    /// Resolves submitted financial operations only through exact read-only endpoints, then moves
+    /// confirmed descriptors into the ordinary Signal-backed outbox. No automatic path invokes a
+    /// money-moving mutation.
+    private func recoverAndDrainFinancialChatReceipts() async {
+        financialChatReceiptRecoveryNeedsAnotherPass = true
+        guard !isRecoveringFinancialChatReceipts else { return }
+        isRecoveringFinancialChatReceipts = true
+        defer {
+            isRecoveringFinancialChatReceipts = false
+            financialChatReceiptRecoveryNeedsAnotherPass = false
         }
-        let claim = transaction.claim
-        let referenceID = claim?.id ?? transaction.id
-        let currency = claim?.currency ?? transaction.currency
-        let rawAmount = claim?.amount ?? transaction.amount
-        let positiveAmount = rawAmount.hasPrefix("-") ? String(rawAmount.dropFirst()) : rawAmount
-        let note = claim?.note ?? transaction.note
-        guard let referenceUUID = UUID(uuidString: referenceID),
-              let scale = Int(currency.scale),
-              let amountMinor = KitPaymentMessage.minorUnits(
-                  for: positiveAmount,
-                  scale: scale
-              )
-        else { return false }
-        // The note is optional garnish; a note the wire cannot carry must not block the event.
-        let descriptor = KitPaymentMessage(
-            action: claim == nil ? .sent : .transfer,
-            paymentRequestId: referenceUUID.uuidString.lowercased(),
-            amountMinor: amountMinor,
-            currencyCode: currency.code,
-            currencyScale: scale,
-            note: note
-        ) ?? KitPaymentMessage(
-            action: claim == nil ? .sent : .transfer,
-            paymentRequestId: referenceUUID.uuidString.lowercased(),
-            amountMinor: amountMinor,
-            currencyCode: currency.code,
-            currencyScale: scale,
-            note: nil
-        )
-        guard let descriptor else { return false }
-        if let conversationId {
-            return await queuePaymentEvent(
-                conversationId: conversationId,
-                title: title,
-                recipientId: recipientId,
-                body: descriptor.encoded,
-                clientMessageID: referenceUUID
+
+        repeat {
+            financialChatReceiptRecoveryNeedsAnotherPass = false
+            guard appReviewDemoMutationsAllowed,
+                  isSignedIn,
+                  let expectedUserID = profile?.id,
+                  let expectedSessionID = await sessions.current()?.sessionId
+            else { return }
+            let expectedAccountEpoch = accountEpoch
+            if isOnline, financialAccessGranted {
+                await recoverSubmittedTransferChatReceipts(
+                    accountEpoch: expectedAccountEpoch,
+                    ownerUserID: expectedUserID,
+                    sessionID: expectedSessionID
+                )
+                await recoverSubmittedPaymentRequestChatReceipts(
+                    accountEpoch: expectedAccountEpoch,
+                    ownerUserID: expectedUserID,
+                    sessionID: expectedSessionID
+                )
+                await recoverSubmittedPaymentRequestResolutionChatReceipts(
+                    accountEpoch: expectedAccountEpoch,
+                    ownerUserID: expectedUserID,
+                    sessionID: expectedSessionID
+                )
+                await recoverSubmittedGroupPaymentChatReceipts(
+                    accountEpoch: expectedAccountEpoch,
+                    ownerUserID: expectedUserID,
+                    sessionID: expectedSessionID
+                )
+                await recoverSubmittedGroupContributionChatReceipts(
+                    accountEpoch: expectedAccountEpoch,
+                    ownerUserID: expectedUserID,
+                    sessionID: expectedSessionID
+                )
+            }
+            guard communicationAccessGranted else { return }
+            await drainConfirmedFinancialChatReceipts(
+                accountEpoch: expectedAccountEpoch,
+                ownerUserID: expectedUserID,
+                sessionID: expectedSessionID
             )
-        }
-        return await queueDirectPaymentEvent(
-            recipientId: recipientId,
-            title: title,
-            body: descriptor.encoded,
-            clientMessageID: referenceUUID
-        )
+        } while financialChatReceiptRecoveryNeedsAnotherPass
     }
+
+    private func recoverSubmittedTransferChatReceipts(
+        accountEpoch expectedAccountEpoch: UUID,
+        ownerUserID expectedUserID: String,
+        sessionID expectedSessionID: String
+    ) async {
+        let now = Date()
+        let recoveries = ((await store.snapshot()).pendingTransferChatReceipts ?? []).filter {
+            $0.ownerUserID.caseInsensitiveCompare(expectedUserID) == .orderedSame
+                && $0.phase == .submitted
+                && $0.nextRecoveryAt <= now
+        }.prefix(TransferChatReceiptRecoveryPolicy.maximumRecordsPerRecoveryPass)
+        for recovery in recoveries {
+            guard await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            ) else { return }
+            do {
+                let transaction = try await APIClientSessionBinding.$sessionID.withValue(
+                    expectedSessionID
+                ) {
+                    try await api.recoverTransfer(
+                        walletId: recovery.sourceWalletID,
+                        destinationWalletId: recovery.destinationWalletID,
+                        amount: recovery.amount,
+                        note: recovery.note,
+                        idempotencyKey: recovery.idempotencyKey
+                    )
+                }
+                try await confirmTransferChatReceipt(
+                    transaction,
+                    recovery: recovery,
+                    evidence: .exactRecovery,
+                    accountEpoch: expectedAccountEpoch,
+                    ownerUserID: expectedUserID,
+                    sessionID: expectedSessionID
+                )
+            } catch {
+                if TransferChatReceiptRecoveryPolicy.recoveryDecision(for: error)
+                    == .notCommitted,
+                   await outboxContextIsCurrent(
+                       accountEpoch: expectedAccountEpoch,
+                       userID: expectedUserID,
+                       sessionID: expectedSessionID
+                   ) {
+                    await retireUncommittedTransferChatReceipt(
+                        recovery.id,
+                        ownerUserID: expectedUserID
+                    )
+                } else {
+                    do {
+                        try await store.update { persisted in
+                            guard persisted.communicationOwnerUserID?
+                                .caseInsensitiveCompare(expectedUserID) == .orderedSame
+                            else { return }
+                            var records = persisted.pendingTransferChatReceipts ?? []
+                            _ = TransferChatReceiptRecoveryPolicy.recordRecoveryFailure(
+                                for: recovery.id,
+                                in: &records,
+                                now: now
+                            )
+                            persisted.pendingTransferChatReceipts = records.isEmpty ? nil : records
+                        }
+                        await publishLatestState()
+                    } catch {}
+                }
+            }
+        }
+    }
+
+    private func recoverSubmittedPaymentRequestChatReceipts(
+        accountEpoch expectedAccountEpoch: UUID,
+        ownerUserID expectedUserID: String,
+        sessionID expectedSessionID: String
+    ) async {
+        let now = Date()
+        let recoveries = ((await store.snapshot()).pendingPaymentRequestChatReceipts ?? []).filter {
+            $0.ownerUserID.caseInsensitiveCompare(expectedUserID) == .orderedSame
+                && $0.phase == .submitted
+                && $0.nextRecoveryAt <= now
+        }.prefix(PaymentRequestChatReceiptRecoveryPolicy.maximumRecordsPerRecoveryPass)
+        for recovery in recoveries {
+            guard await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            ) else { return }
+            do {
+                let request = try await APIClientSessionBinding.$sessionID.withValue(
+                    expectedSessionID
+                ) {
+                    try await api.recoverPaymentRequestCreation(
+                        destinationWalletId: recovery.destinationWalletID,
+                        requestedFromUserId: recovery.recipientUserID,
+                        amount: recovery.amount,
+                        note: recovery.note,
+                        expiresAt: recovery.expiresAt,
+                        idempotencyKey: recovery.idempotencyKey
+                    )
+                }
+                try await confirmPaymentRequestChatReceipt(
+                    request,
+                    recovery: recovery,
+                    accountEpoch: expectedAccountEpoch,
+                    ownerUserID: expectedUserID,
+                    sessionID: expectedSessionID
+                )
+            } catch {
+                if PaymentRequestChatReceiptRecoveryPolicy.recoveryDecision(for: error)
+                    == .notCommitted,
+                   await outboxContextIsCurrent(
+                       accountEpoch: expectedAccountEpoch,
+                       userID: expectedUserID,
+                       sessionID: expectedSessionID
+                   ) {
+                    await retireUncommittedPaymentRequestChatReceipt(
+                        recovery.id,
+                        ownerUserID: expectedUserID
+                    )
+                } else {
+                    do {
+                        try await store.update { persisted in
+                            guard persisted.communicationOwnerUserID?
+                                .caseInsensitiveCompare(expectedUserID) == .orderedSame
+                            else { return }
+                            var records = persisted.pendingPaymentRequestChatReceipts ?? []
+                            _ = PaymentRequestChatReceiptRecoveryPolicy.recordRecoveryFailure(
+                                recordID: recovery.id,
+                                in: &records,
+                                now: now
+                            )
+                            persisted.pendingPaymentRequestChatReceipts = records.isEmpty
+                                ? nil
+                                : records
+                        }
+                        await publishLatestState()
+                    } catch {}
+                }
+            }
+        }
+    }
+
+    private func recoverSubmittedPaymentRequestResolutionChatReceipts(
+        accountEpoch expectedAccountEpoch: UUID,
+        ownerUserID expectedUserID: String,
+        sessionID expectedSessionID: String
+    ) async {
+        let now = Date()
+        let recoveries = ((await store.snapshot())
+            .pendingPaymentRequestResolutionChatReceipts ?? []).filter {
+                $0.ownerUserID.caseInsensitiveCompare(expectedUserID) == .orderedSame
+                    && $0.phase == .submitted
+                    && $0.nextRecoveryAt <= now
+            }.prefix(
+                PaymentRequestResolutionChatReceiptRecoveryPolicy.maximumRecordsPerRecoveryPass
+            )
+        for recovery in recoveries {
+            guard await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            ) else { return }
+            do {
+                let request = try await APIClientSessionBinding.$sessionID.withValue(
+                    expectedSessionID
+                ) {
+                    try await api.paymentRequest(id: recovery.requestID)
+                }
+                guard await outboxContextIsCurrent(
+                    accountEpoch: expectedAccountEpoch,
+                    userID: expectedUserID,
+                    sessionID: expectedSessionID
+                ) else { return }
+                guard recovery.matchesExactRead(request) else {
+                    throw FinancialChatReceiptRecoveryError.unconfirmedResult
+                }
+                switch PaymentRequestResolutionChatReceiptRecoveryPolicy.exactReadDecision(
+                    for: request,
+                    recovery: recovery
+                ) {
+                case .confirm:
+                    guard let confirmation = PaymentRequestResolutionChatReceiptConfirmation(
+                        request: request,
+                        recovery: recovery
+                    ) else { throw FinancialChatReceiptRecoveryError.unconfirmedResult }
+                    try await storePaymentRequestResolutionConfirmation(
+                        confirmation,
+                        recovery: recovery,
+                        accountEpoch: expectedAccountEpoch,
+                        ownerUserID: expectedUserID,
+                        sessionID: expectedSessionID
+                    )
+                case .retireUncommitted:
+                    await retireUncommittedPaymentRequestResolutionChatReceipt(
+                        recovery.id,
+                        ownerUserID: expectedUserID
+                    )
+                case .retain:
+                    throw FinancialChatReceiptRecoveryError.unconfirmedResult
+                }
+            } catch {
+                do {
+                    try await store.update { persisted in
+                        guard persisted.communicationOwnerUserID?
+                            .caseInsensitiveCompare(expectedUserID) == .orderedSame
+                        else { return }
+                        var records = persisted.pendingPaymentRequestResolutionChatReceipts ?? []
+                        _ = PaymentRequestResolutionChatReceiptRecoveryPolicy
+                            .recordRecoveryFailure(
+                                recordID: recovery.id,
+                                in: &records,
+                                now: now
+                            )
+                        persisted.pendingPaymentRequestResolutionChatReceipts = records.isEmpty
+                            ? nil
+                            : records
+                    }
+                    await publishLatestState()
+                } catch {}
+            }
+        }
+    }
+
+    private func recoverSubmittedGroupPaymentChatReceipts(
+        accountEpoch expectedAccountEpoch: UUID,
+        ownerUserID expectedUserID: String,
+        sessionID expectedSessionID: String
+    ) async {
+        let now = Date()
+        let recoveries = ((await store.snapshot()).pendingGroupPaymentChatReceipts ?? []).filter {
+            $0.ownerUserID.caseInsensitiveCompare(expectedUserID) == .orderedSame
+                && $0.phase == .submitted
+                && $0.nextRecoveryAt <= now
+        }.prefix(GroupPaymentChatReceiptRecoveryPolicy.maximumRecordsPerRecoveryPass)
+        for recovery in recoveries {
+            guard await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            ) else { return }
+            do {
+                let payment = try await APIClientSessionBinding.$sessionID.withValue(
+                    expectedSessionID
+                ) {
+                    try await api.recoverGroupPaymentCreation(
+                        conversationId: recovery.conversationID,
+                        body: recovery.body,
+                        idempotencyKey: recovery.idempotencyKey
+                    )
+                }
+                try await confirmGroupPaymentChatReceipt(
+                    payment,
+                    recovery: recovery,
+                    accountEpoch: expectedAccountEpoch,
+                    ownerUserID: expectedUserID,
+                    sessionID: expectedSessionID
+                )
+            } catch {
+                if GroupPaymentChatReceiptRecoveryPolicy.recoveryDecision(for: error)
+                    == .notCommitted,
+                   await outboxContextIsCurrent(
+                       accountEpoch: expectedAccountEpoch,
+                       userID: expectedUserID,
+                       sessionID: expectedSessionID
+                   ) {
+                    await retireUncommittedGroupPaymentChatReceipt(
+                        recovery.id,
+                        ownerUserID: expectedUserID
+                    )
+                } else {
+                    do {
+                        try await store.update { persisted in
+                            guard persisted.communicationOwnerUserID?
+                                .caseInsensitiveCompare(expectedUserID) == .orderedSame
+                            else { return }
+                            var records = persisted.pendingGroupPaymentChatReceipts ?? []
+                            _ = GroupPaymentChatReceiptRecoveryPolicy.recordRecoveryFailure(
+                                recordID: recovery.id,
+                                in: &records,
+                                now: now
+                            )
+                            persisted.pendingGroupPaymentChatReceipts = records.isEmpty
+                                ? nil
+                                : records
+                        }
+                        await publishLatestState()
+                    } catch {}
+                }
+            }
+        }
+    }
+
+    private func recoverSubmittedGroupContributionChatReceipts(
+        accountEpoch expectedAccountEpoch: UUID,
+        ownerUserID expectedUserID: String,
+        sessionID expectedSessionID: String
+    ) async {
+        let now = Date()
+        let recoveries = ((await store.snapshot()).pendingGroupContributionChatReceipts ?? [])
+            .filter {
+                $0.ownerUserID.caseInsensitiveCompare(expectedUserID) == .orderedSame
+                    && $0.phase == .submitted
+                    && $0.nextRecoveryAt <= now
+            }.prefix(GroupContributionChatReceiptRecoveryPolicy.maximumRecordsPerRecoveryPass)
+        for recovery in recoveries {
+            guard await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            ) else { return }
+            do {
+                let result = try await APIClientSessionBinding.$sessionID.withValue(
+                    expectedSessionID
+                ) {
+                    try await api.recoverGroupPaymentRequestContribution(
+                        id: recovery.requestID,
+                        sourceWalletId: recovery.sourceWalletID,
+                        amount: recovery.amount,
+                        idempotencyKey: recovery.idempotencyKey
+                    )
+                }
+                try await confirmGroupContributionChatReceipt(
+                    result,
+                    recovery: recovery,
+                    accountEpoch: expectedAccountEpoch,
+                    ownerUserID: expectedUserID,
+                    sessionID: expectedSessionID
+                )
+            } catch {
+                if GroupContributionChatReceiptRecoveryPolicy.recoveryDecision(for: error)
+                    == .notCommitted,
+                   await outboxContextIsCurrent(
+                       accountEpoch: expectedAccountEpoch,
+                       userID: expectedUserID,
+                       sessionID: expectedSessionID
+                   ) {
+                    await retireUncommittedGroupContributionChatReceipt(
+                        recovery.id,
+                        ownerUserID: expectedUserID
+                    )
+                } else {
+                    do {
+                        try await store.update { persisted in
+                            guard persisted.communicationOwnerUserID?
+                                .caseInsensitiveCompare(expectedUserID) == .orderedSame
+                            else { return }
+                            var records = persisted.pendingGroupContributionChatReceipts ?? []
+                            _ = GroupContributionChatReceiptRecoveryPolicy.recordRecoveryFailure(
+                                recordID: recovery.id,
+                                in: &records,
+                                now: now
+                            )
+                            persisted.pendingGroupContributionChatReceipts = records.isEmpty
+                                ? nil
+                                : records
+                        }
+                        await publishLatestState()
+                    } catch {}
+                }
+            }
+        }
+    }
+
+    private func drainConfirmedFinancialChatReceipts(
+        accountEpoch expectedAccountEpoch: UUID,
+        ownerUserID expectedUserID: String,
+        sessionID expectedSessionID: String
+    ) async {
+        var snapshot = await store.snapshot()
+        for recovery in (snapshot.pendingTransferChatReceipts ?? []).filter({
+            $0.ownerUserID.caseInsensitiveCompare(expectedUserID) == .orderedSame
+                && $0.phase == .confirmed
+                && $0.confirmation?.isValid(for: $0) == true
+        }).prefix(TransferChatReceiptRecoveryPolicy.maximumRecordsPerRecoveryPass) {
+            guard await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            ), let confirmation = recovery.confirmation,
+               let messageID = confirmation.clientMessageID
+            else { return }
+            let queued: Bool
+            if let conversationID = recovery.conversationID {
+                queued = await queuePaymentEvent(
+                    conversationId: conversationID,
+                    title: recovery.recipientName,
+                    recipientId: recovery.recipientUserID,
+                    body: confirmation.encodedDescriptor,
+                    clientMessageID: messageID
+                )
+            } else {
+                queued = await queueDirectPaymentEvent(
+                    recipientId: recovery.recipientUserID,
+                    title: recovery.recipientName,
+                    body: confirmation.encodedDescriptor,
+                    clientMessageID: messageID
+                )
+            }
+            guard queued else { continue }
+            do {
+                try await store.update { persisted in
+                    guard persisted.communicationOwnerUserID?
+                        .caseInsensitiveCompare(expectedUserID) == .orderedSame
+                    else { throw FinancialChatReceiptRecoveryError.accountChanged }
+                    var records = persisted.pendingTransferChatReceipts ?? []
+                    guard TransferChatReceiptRecoveryPolicy.acknowledgeDurableMessage(
+                        recordID: recovery.id,
+                        messageID: messageID,
+                        in: &records
+                    ) else { throw FinancialChatReceiptRecoveryError.unconfirmedResult }
+                    persisted.pendingTransferChatReceipts = records.isEmpty ? nil : records
+                }
+                await publishLatestState()
+            } catch {}
+        }
+
+        snapshot = await store.snapshot()
+        for recovery in (snapshot.pendingPaymentRequestChatReceipts ?? []).filter({
+            $0.ownerUserID.caseInsensitiveCompare(expectedUserID) == .orderedSame
+                && $0.phase == .confirmed
+                && $0.confirmation?.isValid(for: $0) == true
+        }).prefix(PaymentRequestChatReceiptRecoveryPolicy.maximumRecordsPerRecoveryPass) {
+            guard await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            ), let confirmation = recovery.confirmation,
+               let messageID = confirmation.clientMessageID
+            else { return }
+            let queued: Bool
+            if let conversationID = recovery.conversationID {
+                queued = await queuePaymentEvent(
+                    conversationId: conversationID,
+                    title: recovery.recipientName,
+                    recipientId: recovery.recipientUserID,
+                    body: confirmation.encodedDescriptor,
+                    clientMessageID: messageID
+                )
+            } else {
+                queued = await queueDirectPaymentEvent(
+                    recipientId: recovery.recipientUserID,
+                    title: recovery.recipientName,
+                    body: confirmation.encodedDescriptor,
+                    clientMessageID: messageID
+                )
+            }
+            guard queued else { continue }
+            do {
+                try await store.update { persisted in
+                    guard persisted.communicationOwnerUserID?
+                        .caseInsensitiveCompare(expectedUserID) == .orderedSame
+                    else { throw FinancialChatReceiptRecoveryError.accountChanged }
+                    var records = persisted.pendingPaymentRequestChatReceipts ?? []
+                    guard PaymentRequestChatReceiptRecoveryPolicy.acknowledgeDurableMessage(
+                        recordID: recovery.id,
+                        messageID: messageID,
+                        in: &records
+                    ) else { throw FinancialChatReceiptRecoveryError.unconfirmedResult }
+                    persisted.pendingPaymentRequestChatReceipts = records.isEmpty ? nil : records
+                }
+                await publishLatestState()
+            } catch {}
+        }
+
+        snapshot = await store.snapshot()
+        for recovery in (snapshot.pendingPaymentRequestResolutionChatReceipts ?? []).filter({
+            $0.ownerUserID.caseInsensitiveCompare(expectedUserID) == .orderedSame
+                && $0.phase == .confirmed
+                && $0.confirmation?.isValid(for: $0) == true
+        }).prefix(
+            PaymentRequestResolutionChatReceiptRecoveryPolicy.maximumRecordsPerRecoveryPass
+        ) {
+            guard await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            ), let confirmation = recovery.confirmation,
+               let messageID = confirmation.clientMessageID
+            else { return }
+            let queued = await queuePaymentEvent(
+                conversationId: recovery.conversationID,
+                title: recovery.recipientName,
+                recipientId: recovery.recipientUserID,
+                body: confirmation.encodedDescriptor,
+                clientMessageID: messageID
+            )
+            guard queued else { continue }
+            do {
+                try await store.update { persisted in
+                    guard persisted.communicationOwnerUserID?
+                        .caseInsensitiveCompare(expectedUserID) == .orderedSame
+                    else { throw FinancialChatReceiptRecoveryError.accountChanged }
+                    var records = persisted.pendingPaymentRequestResolutionChatReceipts ?? []
+                    guard PaymentRequestResolutionChatReceiptRecoveryPolicy
+                        .acknowledgeDurableMessage(
+                            recordID: recovery.id,
+                            messageID: messageID,
+                            in: &records
+                        )
+                    else { throw FinancialChatReceiptRecoveryError.unconfirmedResult }
+                    persisted.pendingPaymentRequestResolutionChatReceipts = records.isEmpty
+                        ? nil
+                        : records
+                }
+                await publishLatestState()
+            } catch {}
+        }
+
+        snapshot = await store.snapshot()
+        for recovery in (snapshot.pendingGroupPaymentChatReceipts ?? []).filter({
+            $0.ownerUserID.caseInsensitiveCompare(expectedUserID) == .orderedSame
+                && $0.phase == .confirmed
+                && $0.confirmation?.isValid(for: $0) == true
+        }).prefix(GroupPaymentChatReceiptRecoveryPolicy.maximumRecordsPerRecoveryPass) {
+            guard await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            ), let confirmation = recovery.confirmation,
+               let messageID = confirmation.clientMessageID
+            else { return }
+            guard let title = state.conversations.first(where: {
+                $0.id.caseInsensitiveCompare(recovery.conversationID) == .orderedSame
+            })?.title else { continue }
+            let queued = await queueGroupPaymentEvent(
+                conversationId: recovery.conversationID,
+                title: title,
+                body: confirmation.encodedDescriptor,
+                clientMessageID: messageID
+            )
+            guard queued else { continue }
+            do {
+                try await store.update { persisted in
+                    guard persisted.communicationOwnerUserID?
+                        .caseInsensitiveCompare(expectedUserID) == .orderedSame
+                    else { throw FinancialChatReceiptRecoveryError.accountChanged }
+                    var records = persisted.pendingGroupPaymentChatReceipts ?? []
+                    guard GroupPaymentChatReceiptRecoveryPolicy.acknowledgeDurableMessage(
+                        recordID: recovery.id,
+                        messageID: messageID,
+                        in: &records
+                    ) else { throw FinancialChatReceiptRecoveryError.unconfirmedResult }
+                    persisted.pendingGroupPaymentChatReceipts = records.isEmpty ? nil : records
+                }
+                await publishLatestState()
+            } catch {}
+        }
+
+        snapshot = await store.snapshot()
+        for recovery in (snapshot.pendingGroupContributionChatReceipts ?? []).filter({
+            $0.ownerUserID.caseInsensitiveCompare(expectedUserID) == .orderedSame
+                && $0.phase == .confirmed
+                && $0.confirmation?.isValid(for: $0) == true
+        }).prefix(GroupContributionChatReceiptRecoveryPolicy.maximumRecordsPerRecoveryPass) {
+            guard await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: expectedUserID,
+                sessionID: expectedSessionID
+            ), let confirmation = recovery.confirmation,
+               let messageID = confirmation.clientMessageID,
+               let descriptor = KitGroupPaymentRequestMessage.parse(
+                   confirmation.encodedDescriptor
+               )
+            else { return }
+            guard let title = state.conversations.first(where: {
+                $0.id.caseInsensitiveCompare(recovery.conversationID) == .orderedSame
+            })?.title else { continue }
+            let queued = await queueGroupPaymentRequestEvent(
+                conversationId: recovery.conversationID,
+                title: title,
+                descriptor: descriptor,
+                clientMessageID: messageID
+            )
+            guard queued else { continue }
+            do {
+                try await store.update { persisted in
+                    guard persisted.communicationOwnerUserID?
+                        .caseInsensitiveCompare(expectedUserID) == .orderedSame
+                    else { throw FinancialChatReceiptRecoveryError.accountChanged }
+                    var records = persisted.pendingGroupContributionChatReceipts ?? []
+                    guard GroupContributionChatReceiptRecoveryPolicy.acknowledgeDurableMessage(
+                        recordID: recovery.id,
+                        messageID: messageID,
+                        in: &records
+                    ) else { throw FinancialChatReceiptRecoveryError.unconfirmedResult }
+                    persisted.pendingGroupContributionChatReceipts = records.isEmpty
+                        ? nil
+                        : records
+                }
+                await publishLatestState()
+            } catch {}
+        }
+    }
+
 
     /// Starts protected local persistence as soon as a picker/editor accepts an attachment.
     /// The composer keeps rendering its in-memory original immediately while this work runs;
@@ -15661,10 +17678,6 @@ final class AppModel: ObservableObject {
                     persisted.outbox[index].scheduledPaymentRequest = storedPayload
                 }
                 payload.confirmedRequest = confirmed
-                if paymentRequestChatShareLeases[request.id.lowercased()]?.descriptor.encoded
-                    == confirmed.encodedDescriptor {
-                    paymentRequestChatShareLeases.removeValue(forKey: request.id.lowercased())
-                }
             }
 
             guard confirmation.isValid(for: payload),
@@ -15934,7 +17947,10 @@ final class AppModel: ObservableObject {
         scheduleAutomaticMessageBackupRefresh()
         Task { @MainActor [weak self] in
             guard let self else { return }
-            if self.isOnline { await self.flushOutbox() }
+            if self.isOnline {
+                await self.recoverAndDrainFinancialChatReceipts()
+                await self.flushOutbox()
+            }
             _ = await self.runAutomaticMessageBackupIfDue()
         }
         // Returning to the foreground is the first moment after a crash at which the app can see

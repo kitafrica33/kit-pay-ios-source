@@ -27,6 +27,23 @@ extension APIClient {
         )
     }
 
+    func recoverGroupPaymentCreation(
+        conversationId: String,
+        body: CreateGroupPaymentBody,
+        idempotencyKey: String
+    ) async throws -> GroupPaymentDTO {
+        let (payment, meta): (GroupPaymentDTO, APIMeta?) = try await sendWithMeta(
+            path: "conversations/\(conversationId)/group-payments/recovery",
+            method: "POST",
+            body: body,
+            headers: ["Idempotency-Key": idempotencyKey]
+        )
+        guard meta?.idempotentReplay == true else {
+            throw APIClientError.invalidPayload(status: 200)
+        }
+        return payment
+    }
+
     /// Reads the payment as the server scopes it for this account: a recipient of a custom split
     /// is told their own amount and nobody else's.
     func groupPayment(id: String) async throws -> GroupPaymentDTO {
@@ -155,6 +172,28 @@ extension APIClient {
                 "X-Kit-Wallet-Step-Up": stepUpToken,
             ]
         )
+    }
+
+    func recoverGroupPaymentRequestContribution(
+        id: String,
+        sourceWalletId: String,
+        amount: String,
+        idempotencyKey: String
+    ) async throws -> GroupPaymentRequestContributionResultDTO {
+        let (result, meta): (GroupPaymentRequestContributionResultDTO, APIMeta?) =
+            try await sendWithMeta(
+                path: "group-payment-requests/\(id)/contributions/recovery",
+                method: "POST",
+                body: ContributeGroupPaymentRequestBody(
+                    sourceWalletId: sourceWalletId,
+                    amount: amount
+                ),
+                headers: ["Idempotency-Key": idempotencyKey]
+            )
+        guard meta?.idempotentReplay == true else {
+            throw APIClientError.invalidPayload(status: 200)
+        }
+        return result
     }
 
     func cancelGroupPaymentRequest(

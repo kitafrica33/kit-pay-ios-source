@@ -73,7 +73,9 @@ final class PaymentRequestsViewModel: ObservableObject {
         pin: String,
         policy: PaymentRequestPolicy,
         isOnline: Bool,
-        authorize: KitFinancialStepUpAuthorization
+        authorize: KitFinancialStepUpAuthorization,
+        submit: ((PaymentRequestDTO, Wallet, String, String) async throws
+            -> PaymentRequestDTO)? = nil
     ) async -> Bool {
         guard actionRequestId == nil else { return false }
         guard isOnline else {
@@ -100,12 +102,17 @@ final class PaymentRequestsViewModel: ObservableObject {
                 pin,
                 "Approve paying this request"
             )
-            let paid = try await api.payPaymentRequest(
-                requestId: request.id,
-                sourceWalletId: wallet.id,
-                idempotencyKey: key,
-                stepUpToken: verification.stepUpToken
-            )
+            let paid: PaymentRequestDTO
+            if let submit {
+                paid = try await submit(request, wallet, key, verification.stepUpToken)
+            } else {
+                paid = try await api.payPaymentRequest(
+                    requestId: request.id,
+                    sourceWalletId: wallet.id,
+                    idempotencyKey: key,
+                    stepUpToken: verification.stepUpToken
+                )
+            }
             guard paid.id == request.id,
                   paid.knownStatus == .paid,
                   paid.walletTransactionId?.isEmpty == false
@@ -123,7 +130,8 @@ final class PaymentRequestsViewModel: ObservableObject {
     func cancel(
         _ request: PaymentRequestDTO,
         policy: PaymentRequestPolicy,
-        isOnline: Bool
+        isOnline: Bool,
+        submit: ((PaymentRequestDTO, String) async throws -> PaymentRequestDTO)? = nil
     ) async -> Bool {
         guard actionRequestId == nil else { return false }
         guard isOnline else {
@@ -143,7 +151,15 @@ final class PaymentRequestsViewModel: ObservableObject {
         cancelIdempotencyKeys[request.id] = key
 
         do {
-            let cancelled = try await api.cancelPaymentRequest(requestId: request.id, idempotencyKey: key)
+            let cancelled: PaymentRequestDTO
+            if let submit {
+                cancelled = try await submit(request, key)
+            } else {
+                cancelled = try await api.cancelPaymentRequest(
+                    requestId: request.id,
+                    idempotencyKey: key
+                )
+            }
             guard cancelled.id == request.id, cancelled.knownStatus == .cancelled else {
                 throw PaymentRequestFlowError.unconfirmedCancellation
             }

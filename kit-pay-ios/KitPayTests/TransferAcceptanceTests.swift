@@ -6,6 +6,9 @@ final class TransferAcceptanceTests: XCTestCase {
     private let senderUserID = "10000000-0000-0000-0000-000000000001"
     private let recipientUserID = "10000000-0000-0000-0000-000000000002"
     private let outsiderUserID = "10000000-0000-0000-0000-000000000003"
+    private let sourceWalletID = "20000000-0000-0000-0000-000000000001"
+    private let destinationWalletID = "20000000-0000-0000-0000-000000000002"
+    private let conversationID = "30000000-0000-0000-0000-000000000001"
 
     /// The signed-in user is the transfer's recipient talking to its sender.
     private var recipientBinding: KitTransferPartyBinding {
@@ -44,6 +47,7 @@ final class TransferAcceptanceTests: XCTestCase {
         status: String = "pending",
         amount: String = "2500.00",
         id: String? = nil,
+        transactionId: String = "20000000-0000-0000-0000-000000000001",
         senderUserId: String? = nil,
         recipientUserId: String? = nil,
         canAccept: Bool = true,
@@ -54,7 +58,7 @@ final class TransferAcceptanceTests: XCTestCase {
             TransferAcceptanceDTO.self,
             from: JSONSerialization.data(withJSONObject: [
                 "id": id ?? transferID,
-                "transaction_id": "20000000-0000-0000-0000-000000000001",
+                "transaction_id": transactionId,
                 "status": status,
                 "amount": amount,
                 "currency": ["code": "UGX", "scale": "2"],
@@ -81,6 +85,409 @@ final class TransferAcceptanceTests: XCTestCase {
             isOutgoing: isOutgoing,
             attachmentData: nil,
             pendingAttachment: nil
+        )
+    }
+
+    private func recovery(
+        id: UUID = UUID(),
+        amount: String = "2500.00",
+        note: String? = "Lunch",
+        createdAt: Date = Date(timeIntervalSince1970: 1_780_000_000)
+    ) -> TransferChatReceiptRecoveryRecord {
+        TransferChatReceiptRecoveryRecord(
+            id: id,
+            ownerUserID: senderUserID,
+            sourceWalletID: sourceWalletID,
+            destinationWalletID: destinationWalletID,
+            recipientUserID: recipientUserID,
+            recipientName: "Waswa Titus Zera",
+            conversationID: conversationID,
+            amount: amount,
+            currency: CurrencyDTO(code: "UGX", scale: "2"),
+            note: note,
+            createdAt: createdAt
+        )!
+    }
+
+    private func walletTransaction(
+        id: String = "40000000-0000-0000-0000-000000000001",
+        counterpartyUserID: String? = nil,
+        amount: String = "2500.00",
+        note: String? = "Lunch",
+        status: String = "completed",
+        claim: TransferAcceptanceDTO? = nil,
+        occurredAt: Date = Date(timeIntervalSince1970: 1_780_000_030)
+    ) -> WalletTransaction {
+        WalletTransaction(
+            id: id,
+            walletId: sourceWalletID,
+            reference: "TRF-RECOVERY",
+            amount: amount,
+            totals: CustomerTransactionTotals(added: "0", deducted: amount),
+            currency: CurrencyDTO(code: "UGX", scale: "2"),
+            type: "internal_transfer",
+            direction: "debit",
+            status: status,
+            counterparty: counterpartyUserID.map {
+                Counterparty(id: $0, name: "Waswa Titus Zera", phone: nil, accountNumber: nil)
+            },
+            note: note,
+            claim: claim,
+            occurredAt: ISO8601DateFormatter().string(from: occurredAt)
+        )
+    }
+
+    // MARK: Durable transfer chat-receipt recovery
+
+    func testRecoveryRecordRoundTripsAndLegacyStateWithoutJournalStillDecodes() throws {
+        let original = recovery(
+            id: UUID(uuidString: "50000000-0000-0000-0000-000000000001")!
+        )
+        let confirmation = try XCTUnwrap(
+            TransferChatReceiptConfirmation(
+                transaction: walletTransaction(),
+                recovery: original,
+                evidence: .directResponse
+            )
+        )
+        var records = [original]
+        XCTAssertTrue(
+            TransferChatReceiptRecoveryPolicy.markSubmitted(
+                recordID: original.id,
+                in: &records
+            )
+        )
+        XCTAssertTrue(
+            TransferChatReceiptRecoveryPolicy.storeConfirmation(
+                confirmation,
+                for: original.id,
+                in: &records
+            )
+        )
+        let encoded = try JSONEncoder().encode(records[0])
+        XCTAssertEqual(
+            try JSONDecoder().decode(TransferChatReceiptRecoveryRecord.self, from: encoded),
+            records[0]
+        )
+
+        let legacy = Data(
+            #"{"wallets":[],"transactions":[],"conversations":[],"messages":[],"calls":[],"outbox":[]}"#.utf8
+        )
+        XCTAssertNil(
+            try JSONDecoder().decode(PersistedState.self, from: legacy)
+                .pendingTransferChatReceipts
+        )
+        let decoded = try JSONDecoder().decode(PersistedState.self, from: legacy)
+        XCTAssertNil(decoded.pendingPaymentRequestChatReceipts)
+        XCTAssertNil(decoded.pendingPaymentRequestResolutionChatReceipts)
+        XCTAssertNil(decoded.pendingGroupPaymentChatReceipts)
+        XCTAssertNil(decoded.pendingGroupContributionChatReceipts)
+    }
+
+    func testIdenticalAmbiguousRetryReusesTheOriginalIdempotencyAuthority() throws {
+        let now = Date(timeIntervalSince1970: 1_780_000_100)
+        let original = recovery(
+            id: UUID(uuidString: "50000000-0000-0000-0000-000000000001")!,
+            createdAt: now.addingTimeInterval(-30)
+        )
+        let retry = recovery(
+            id: UUID(uuidString: "50000000-0000-0000-0000-000000000002")!,
+            createdAt: now
+        )
+        var records: [TransferChatReceiptRecoveryRecord] = []
+
+        let first = try XCTUnwrap(
+            TransferChatReceiptRecoveryPolicy.insertOrReuse(original, in: &records, now: now)
+        )
+        let reused = try XCTUnwrap(
+            TransferChatReceiptRecoveryPolicy.insertOrReuse(retry, in: &records, now: now)
+        )
+
+        XCTAssertEqual(records.count, 1)
+        XCTAssertEqual(reused.id, first.id)
+        XCTAssertEqual(reused.idempotencyKey, first.idempotencyKey)
+        XCTAssertEqual(
+            reused.idempotencyKey,
+            "ios-transfer-50000000-0000-0000-0000-000000000001"
+        )
+    }
+
+    func testLegacyTransferJournalDecodesAsSubmittedWithItsOriginalRetryClock() throws {
+        let original = recovery(
+            id: UUID(uuidString: "50000000-0000-0000-0000-000000000004")!
+        )
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(original)) as? [String: Any]
+        )
+        object.removeValue(forKey: "phase")
+        object["nextLookupAt"] = object.removeValue(forKey: "nextRecoveryAt")
+        XCTAssertNotNil(object.removeValue(forKey: "recoveryAttemptCount"))
+        object["lookupAttemptCount"] = 3
+        let decoded = try JSONDecoder().decode(
+            TransferChatReceiptRecoveryRecord.self,
+            from: JSONSerialization.data(withJSONObject: object)
+        )
+
+        XCTAssertEqual(decoded.phase, .submitted)
+        XCTAssertEqual(decoded.nextRecoveryAt, original.nextRecoveryAt)
+        XCTAssertEqual(decoded.recoveryAttemptCount, 3)
+        XCTAssertNil(decoded.confirmation)
+        XCTAssertTrue(decoded.isStructurallyValid)
+    }
+
+    func testExactPostResponseProducesTheDeterministicCanonicalSentCard() throws {
+        let record = recovery()
+        let transaction = walletTransaction(counterpartyUserID: nil)
+        let confirmation = try XCTUnwrap(
+            TransferChatReceiptConfirmation(
+                transaction: transaction,
+                recovery: record,
+                evidence: .directResponse
+            )
+        )
+        let descriptor = try XCTUnwrap(
+            KitPaymentMessage.parse(confirmation.encodedDescriptor)
+        )
+
+        XCTAssertEqual(confirmation.transactionID, transaction.id)
+        XCTAssertEqual(confirmation.messageID, transaction.id)
+        XCTAssertEqual(confirmation.clientMessageID, UUID(uuidString: transaction.id))
+        XCTAssertEqual(descriptor.action, .sent)
+        XCTAssertEqual(descriptor.amountMinor, 250_000)
+        XCTAssertEqual(descriptor.note, "Lunch")
+        XCTAssertTrue(confirmation.isValid(for: record))
+        let recovered = TransferChatReceiptConfirmation(
+            transaction: transaction,
+            recovery: record,
+            evidence: .exactRecovery
+        )
+        XCTAssertEqual(recovered, confirmation)
+    }
+
+    func testClaimableResponseUsesTheClaimUUIDForItsDeterministicTransferCard() throws {
+        let record = recovery()
+        let transactionID = "40000000-0000-0000-0000-000000000003"
+        let transaction = walletTransaction(
+            id: transactionID,
+            status: "pending",
+            claim: transfer(
+                transactionId: transactionID,
+                senderUserId: senderUserID,
+                recipientUserId: recipientUserID
+            )
+        )
+        let confirmation = try XCTUnwrap(
+            TransferChatReceiptConfirmation(
+                transaction: transaction,
+                recovery: record,
+                evidence: .directResponse
+            )
+        )
+        let descriptor = try XCTUnwrap(
+            KitPaymentMessage.parse(confirmation.encodedDescriptor)
+        )
+
+        XCTAssertEqual(confirmation.transactionID, transactionID)
+        XCTAssertEqual(confirmation.messageID, transferID)
+        XCTAssertEqual(descriptor.action, .transfer)
+        XCTAssertEqual(descriptor.paymentRequestId, transferID)
+    }
+
+    func testOnlyPreparedRecordsExpireAndSubmittedOrConfirmedRemainPending() throws {
+        let createdAt = Date(timeIntervalSince1970: 1_780_000_000)
+        let now = createdAt.addingTimeInterval(
+            FinancialChatReceiptRecoveryPolicy.preparedRetentionLifetime + 1
+        )
+        var prepared = recovery(createdAt: createdAt)
+        var submitted = recovery(createdAt: createdAt)
+        var confirmed = recovery(createdAt: createdAt)
+        var submittedRecords = [submitted]
+        XCTAssertTrue(
+            TransferChatReceiptRecoveryPolicy.markSubmitted(
+                recordID: submitted.id,
+                in: &submittedRecords,
+                now: createdAt
+            )
+        )
+        submitted = submittedRecords[0]
+        var confirmedRecords = [confirmed]
+        XCTAssertTrue(
+            TransferChatReceiptRecoveryPolicy.markSubmitted(
+                recordID: confirmed.id,
+                in: &confirmedRecords,
+                now: createdAt
+            )
+        )
+        let confirmation = try XCTUnwrap(
+            TransferChatReceiptConfirmation(
+                transaction: walletTransaction(),
+                recovery: confirmed,
+                evidence: .exactRecovery
+            )
+        )
+        XCTAssertTrue(
+            TransferChatReceiptRecoveryPolicy.storeConfirmation(
+                confirmation,
+                for: confirmed.id,
+                in: &confirmedRecords
+            )
+        )
+        confirmed = confirmedRecords[0]
+        var records = [prepared, submitted, confirmed]
+
+        TransferChatReceiptRecoveryPolicy.sanitize(
+            &records,
+            ownerUserID: senderUserID,
+            now: now
+        )
+
+        XCTAssertEqual(Set(records.map(\.phase)), Set([.submitted, .confirmed]))
+    }
+
+    func testRecoveryFailureBacksOffWithoutDroppingSubmittedAuthority() {
+        let now = Date(timeIntervalSince1970: 1_780_000_100)
+        let record = recovery(createdAt: now)
+        var records = [record]
+        XCTAssertTrue(
+            TransferChatReceiptRecoveryPolicy.markSubmitted(
+                recordID: record.id,
+                in: &records,
+                now: now
+            )
+        )
+        XCTAssertTrue(
+            TransferChatReceiptRecoveryPolicy.recordRecoveryFailure(
+                for: record.id,
+                in: &records,
+                now: now
+            )
+        )
+        XCTAssertEqual(records[0].phase, .submitted)
+        XCTAssertEqual(records[0].recoveryAttemptCount, 1)
+        XCTAssertGreaterThan(records[0].nextRecoveryAt, now)
+    }
+
+    func testJournalIsAcknowledgedOnlyByItsExactDurableMessageID() throws {
+        let record = recovery()
+        let confirmation = try XCTUnwrap(
+            TransferChatReceiptConfirmation(
+                transaction: walletTransaction(),
+                recovery: record,
+                evidence: .directResponse
+            )
+        )
+        var records = [record]
+        XCTAssertTrue(
+            TransferChatReceiptRecoveryPolicy.markSubmitted(
+                recordID: record.id,
+                in: &records
+            )
+        )
+        XCTAssertTrue(
+            TransferChatReceiptRecoveryPolicy.storeConfirmation(
+                confirmation,
+                for: record.id,
+                in: &records
+            )
+        )
+        XCTAssertFalse(
+            TransferChatReceiptRecoveryPolicy.acknowledgeDurableMessage(
+                recordID: record.id,
+                messageID: UUID(),
+                in: &records
+            )
+        )
+        XCTAssertEqual(records.count, 1)
+        XCTAssertTrue(
+            TransferChatReceiptRecoveryPolicy.acknowledgeDurableMessage(
+                recordID: record.id,
+                messageID: try XCTUnwrap(confirmation.clientMessageID),
+                in: &records
+            )
+        )
+        XCTAssertTrue(records.isEmpty)
+    }
+
+    func testOnlyStructuredDefinitiveTransferRejectionsDiscardTheJournal() {
+        XCTAssertTrue(
+            TransferChatReceiptRecoveryPolicy.isDefinitiveRejection(
+                APIErrorPayload(
+                    code: "VALIDATION_FAILED",
+                    message: "Invalid transfer",
+                    httpStatus: 422
+                )
+            )
+        )
+        XCTAssertFalse(
+            TransferChatReceiptRecoveryPolicy.isDefinitiveRejection(
+                APIClientError.httpResponse(status: 422, retryAfter: nil)
+            )
+        )
+        for code in [
+            "IDEMPOTENCY_REQUEST_IN_PROGRESS",
+            "IDEMPOTENCY_KEY_REUSED",
+            "IDEMPOTENCY_REPLAY_UNAVAILABLE",
+        ] {
+            XCTAssertFalse(
+                TransferChatReceiptRecoveryPolicy.isDefinitiveRejection(
+                    APIErrorPayload(code: code, message: "retain", httpStatus: 409)
+                )
+            )
+        }
+        for status in 500 ... 599 {
+            XCTAssertFalse(
+                TransferChatReceiptRecoveryPolicy.isDefinitiveRejection(
+                    APIErrorPayload(code: "SERVER_ERROR", message: "retain", httpStatus: status)
+                )
+            )
+        }
+        XCTAssertFalse(
+            TransferChatReceiptRecoveryPolicy.isDefinitiveRejection(CancellationError())
+        )
+        XCTAssertEqual(
+            TransferChatReceiptRecoveryPolicy.recoveryDecision(
+                for: APIErrorPayload(
+                    code: "TRANSFER_RECOVERY_NOT_FOUND",
+                    message: "not committed",
+                    httpStatus: 404
+                )
+            ),
+            .notCommitted
+        )
+        XCTAssertEqual(
+            TransferChatReceiptRecoveryPolicy.recoveryDecision(
+                for: APIErrorPayload(
+                    code: "IDEMPOTENCY_REQUEST_IN_PROGRESS",
+                    message: "wait",
+                    httpStatus: 409
+                )
+            ),
+            .retain
+        )
+        XCTAssertEqual(
+            TransferChatReceiptRecoveryPolicy.recoveryDecision(
+                for: APIErrorPayload(
+                    code: "TRANSFER_NOT_FOUND",
+                    message: "opaque",
+                    httpStatus: 404
+                )
+            ),
+            .retain
+        )
+        XCTAssertEqual(
+            TransferChatReceiptRecoveryPolicy.recoveryDecision(
+                for: APIClientError.invalidResponse
+            ),
+            .retain
+        )
+        XCTAssertFalse(
+            TransferChatReceiptRecoveryPolicy.isDefinitiveRejection(
+                APIErrorPayload(
+                    code: "TEMPORARY_FAILURE",
+                    message: "Try again",
+                    httpStatus: 503
+                )
+            )
         )
     }
 

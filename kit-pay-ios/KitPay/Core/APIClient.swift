@@ -675,6 +675,32 @@ actor APIClient {
         )
     }
 
+    /// Retrieves only the result previously bound to this exact transfer idempotency key and
+    /// payload. This endpoint never creates or replays a transfer and therefore carries no
+    /// step-up material.
+    func recoverTransfer(
+        walletId: String,
+        destinationWalletId: String,
+        amount: String,
+        note: String?,
+        idempotencyKey: String
+    ) async throws -> WalletTransaction {
+        let (transaction, meta): (WalletTransaction, APIMeta?) = try await sendWithMeta(
+            path: "wallets/\(walletId)/transfers/recovery",
+            method: "POST",
+            body: WalletTransferRequest(
+                destinationWalletId: destinationWalletId,
+                amount: amount,
+                note: note
+            ),
+            headers: ["Idempotency-Key": idempotencyKey]
+        )
+        guard meta?.idempotentReplay == true else {
+            throw APIClientError.invalidPayload(status: 200)
+        }
+        return transaction
+    }
+
     func calls(cursor: String? = nil, limit: Int = 50) async throws -> CallPage {
         guard (1 ... 100).contains(limit),
               cursor.map({

@@ -34,6 +34,426 @@ final class GroupPaymentTests: XCTestCase {
     private let cara = "10000000-0000-4000-8000-000000000004"
     private let paymentID = "60000000-0000-4000-8000-000000000001"
     private let conversationID = "20000000-0000-4000-8000-000000000001"
+    private let sourceWalletID = "80000000-0000-4000-8000-000000000001"
+
+    // MARK: - Durable financial chat recovery
+
+    func testGroupPaymentJournalRoundTripsAndAcknowledgesOnlyItsDeterministicCard() throws {
+        let body = CreateGroupPaymentBody(
+            sourceWalletId: sourceWalletID,
+            splitMode: GroupPaymentSplitMode.even.rawValue,
+            audience: GroupPaymentAudience.selected.rawValue,
+            totalAmount: "30000",
+            note: "Team lunch",
+            recipients: [ama, ben, cara].map {
+                CreateGroupPaymentBody.Recipient(userId: $0, amount: nil)
+            }
+        )
+        let record = try XCTUnwrap(GroupPaymentChatReceiptRecoveryRecord(
+            id: UUID(uuidString: "50000000-0000-4000-8000-000000000001")!,
+            ownerUserID: sender,
+            conversationID: conversationID,
+            expectedRecipientUserIDs: [ama, ben, cara],
+            currency: CurrencyDTO(code: "UGX", scale: "0"),
+            body: body,
+            idempotencyKey: "ios-group-payment-1",
+            createdAt: Date(timeIntervalSince1970: 1_780_000_000)
+        ))
+        let confirmedPayment = try payment(
+            splitMode: "even",
+            audience: "selected",
+            totalAmount: "30000",
+            note: "Team lunch",
+            recipientAmounts: ["10000", "10000", "10000"]
+        )
+        let confirmation = try XCTUnwrap(GroupPaymentChatReceiptConfirmation(
+            payment: confirmedPayment,
+            recovery: record
+        ))
+        var records = [record]
+
+        XCTAssertTrue(GroupPaymentChatReceiptRecoveryPolicy.markSubmitted(
+            recordID: record.id,
+            in: &records
+        ))
+        XCTAssertTrue(GroupPaymentChatReceiptRecoveryPolicy.storeConfirmation(
+            confirmation,
+            for: record.id,
+            in: &records
+        ))
+        XCTAssertEqual(
+            confirmation.clientMessageID,
+            KitGroupPaymentMessage.outcomeMessageID(
+                groupPaymentId: paymentID,
+                action: .sent,
+                actorUserId: sender
+            )
+        )
+        XCTAssertEqual(
+            try JSONDecoder().decode(
+                GroupPaymentChatReceiptRecoveryRecord.self,
+                from: JSONEncoder().encode(records[0])
+            ),
+            records[0]
+        )
+        XCTAssertFalse(GroupPaymentChatReceiptRecoveryPolicy.acknowledgeDurableMessage(
+            recordID: record.id,
+            messageID: UUID(),
+            in: &records
+        ))
+        XCTAssertTrue(GroupPaymentChatReceiptRecoveryPolicy.acknowledgeDurableMessage(
+            recordID: record.id,
+            messageID: try XCTUnwrap(confirmation.clientMessageID),
+            in: &records
+        ))
+        XCTAssertTrue(records.isEmpty)
+
+        let unevenResponse = try payment(
+            splitMode: "even",
+            audience: "selected",
+            totalAmount: "30000",
+            note: "Team lunch",
+            recipientAmounts: ["1", "1", "29998"]
+        )
+        XCTAssertNil(GroupPaymentChatReceiptConfirmation(
+            payment: unevenResponse,
+            recovery: record
+        ))
+    }
+
+    func testGroupPaymentJournalReusesTheOriginalKeyAndRetainsSubmittedRecords() throws {
+        let createdAt = Date(timeIntervalSince1970: 1_780_000_000)
+        let body = CreateGroupPaymentBody(
+            sourceWalletId: sourceWalletID,
+            splitMode: GroupPaymentSplitMode.even.rawValue,
+            audience: GroupPaymentAudience.selected.rawValue,
+            totalAmount: "30000",
+            note: nil,
+            recipients: [ama, ben, cara].map {
+                CreateGroupPaymentBody.Recipient(userId: $0, amount: nil)
+            }
+        )
+        func record(id: String, key: String) throws -> GroupPaymentChatReceiptRecoveryRecord {
+            try XCTUnwrap(GroupPaymentChatReceiptRecoveryRecord(
+                id: UUID(uuidString: id)!,
+                ownerUserID: sender,
+                conversationID: conversationID,
+                expectedRecipientUserIDs: [ama, ben, cara],
+                currency: CurrencyDTO(code: "UGX", scale: "0"),
+                body: body,
+                idempotencyKey: key,
+                createdAt: createdAt
+            ))
+        }
+        let original = try record(
+            id: "50000000-0000-4000-8000-000000000001",
+            key: "ios-group-original"
+        )
+        let retry = try record(
+            id: "50000000-0000-4000-8000-000000000002",
+            key: "ios-group-new"
+        )
+        var records: [GroupPaymentChatReceiptRecoveryRecord] = []
+        XCTAssertEqual(
+            GroupPaymentChatReceiptRecoveryPolicy.insertOrReuse(
+                original,
+                in: &records,
+                now: createdAt
+            )?.idempotencyKey,
+            original.idempotencyKey
+        )
+        XCTAssertEqual(
+            GroupPaymentChatReceiptRecoveryPolicy.insertOrReuse(
+                retry,
+                in: &records,
+                now: createdAt
+            )?.idempotencyKey,
+            original.idempotencyKey
+        )
+        XCTAssertTrue(GroupPaymentChatReceiptRecoveryPolicy.markSubmitted(
+            recordID: original.id,
+            in: &records,
+            now: createdAt
+        ))
+        records.append(try record(
+            id: "50000000-0000-4000-8000-000000000003",
+            key: "ios-group-stale"
+        ))
+        GroupPaymentChatReceiptRecoveryPolicy.sanitize(
+            &records,
+            ownerUserID: sender,
+            now: createdAt.addingTimeInterval(
+                FinancialChatReceiptRecoveryPolicy.preparedRetentionLifetime + 1
+            )
+        )
+        XCTAssertEqual(records.map(\.phase), [.submitted])
+
+        GroupPaymentChatReceiptRecoveryPolicy.sanitize(
+            &records,
+            ownerUserID: ama,
+            now: createdAt.addingTimeInterval(
+                FinancialChatReceiptRecoveryPolicy.preparedRetentionLifetime + 1
+            )
+        )
+        XCTAssertTrue(records.isEmpty)
+    }
+
+    func testGroupContributionJournalRoundTripsAndRejectsWrongContributor() throws {
+        let request = try groupRequest(
+            contributed: 250_000,
+            contributionWalletTransactionID: "90000000-0000-4000-8000-000000000001"
+        )
+        let contribution = try XCTUnwrap(request.contributions.first)
+        let result = GroupPaymentRequestContributionResultDTO(
+            request: request,
+            contribution: contribution
+        )
+        XCTAssertTrue(result.isStructurallyValid)
+        let record = try XCTUnwrap(GroupContributionChatReceiptRecoveryRecord(
+            id: UUID(uuidString: "50000000-0000-4000-8000-000000000004")!,
+            ownerUserID: ama,
+            conversationID: conversationID,
+            announcementSenderUserID: sender,
+            requestID: request.id,
+            sourceWalletID: sourceWalletID,
+            amount: contribution.amount,
+            currency: request.currency,
+            idempotencyKey: "ios-group-contribution-1"
+        ))
+        let confirmation = try XCTUnwrap(GroupContributionChatReceiptConfirmation(
+            result: result,
+            recovery: record
+        ))
+        var records = [record]
+
+        XCTAssertTrue(GroupContributionChatReceiptRecoveryPolicy.markSubmitted(
+            recordID: record.id,
+            in: &records
+        ))
+        XCTAssertTrue(GroupContributionChatReceiptRecoveryPolicy.storeConfirmation(
+            confirmation,
+            for: record.id,
+            in: &records
+        ))
+        let descriptor = try XCTUnwrap(
+            KitGroupPaymentRequestMessage.parse(confirmation.encodedDescriptor)
+        )
+        XCTAssertEqual(
+            confirmation.clientMessageID,
+            KitGroupPaymentRequestMessage.deterministicMessageID(
+                requestID: request.id,
+                action: descriptor.action,
+                contributionID: contribution.id,
+                actorUserID: ama
+            )
+        )
+        XCTAssertEqual(
+            try JSONDecoder().decode(
+                GroupContributionChatReceiptRecoveryRecord.self,
+                from: JSONEncoder().encode(records[0])
+            ),
+            records[0]
+        )
+        XCTAssertTrue(GroupContributionChatReceiptRecoveryPolicy.acknowledgeDurableMessage(
+            recordID: record.id,
+            messageID: try XCTUnwrap(confirmation.clientMessageID),
+            in: &records
+        ))
+        XCTAssertTrue(records.isEmpty)
+
+        let wrongContributor = try XCTUnwrap(GroupContributionChatReceiptRecoveryRecord(
+            ownerUserID: ben,
+            conversationID: conversationID,
+            announcementSenderUserID: sender,
+            requestID: request.id,
+            sourceWalletID: sourceWalletID,
+            amount: contribution.amount,
+            currency: request.currency,
+            idempotencyKey: "ios-group-contribution-2"
+        ))
+        XCTAssertNil(GroupContributionChatReceiptConfirmation(
+            result: result,
+            recovery: wrongContributor
+        ))
+    }
+
+    func testRecoveredOlderContributionDoesNotClaimALaterCompletion() throws {
+        let completedRequest = try groupRequest(
+            status: "completed",
+            contributed: 1_000_000,
+            contributionWalletTransactionID: "90000000-0000-4000-8000-000000000001",
+            secondContributionIsYours: true
+        )
+        let firstContribution = try XCTUnwrap(completedRequest.contributions.first)
+        let finalContribution = try XCTUnwrap(completedRequest.contributions.last)
+        let firstRecovery = try XCTUnwrap(GroupContributionChatReceiptRecoveryRecord(
+            ownerUserID: ama,
+            conversationID: conversationID,
+            announcementSenderUserID: sender,
+            requestID: completedRequest.id,
+            sourceWalletID: sourceWalletID,
+            amount: firstContribution.amount,
+            currency: completedRequest.currency,
+            idempotencyKey: "ios-group-contribution-first"
+        ))
+        let finalRecovery = try XCTUnwrap(GroupContributionChatReceiptRecoveryRecord(
+            ownerUserID: ben,
+            conversationID: conversationID,
+            announcementSenderUserID: sender,
+            requestID: completedRequest.id,
+            sourceWalletID: sourceWalletID,
+            amount: finalContribution.amount,
+            currency: completedRequest.currency,
+            idempotencyKey: "ios-group-contribution-final"
+        ))
+
+        let firstConfirmation = try XCTUnwrap(GroupContributionChatReceiptConfirmation(
+            result: GroupPaymentRequestContributionResultDTO(
+                request: completedRequest,
+                contribution: firstContribution
+            ),
+            recovery: firstRecovery
+        ))
+        let finalConfirmation = try XCTUnwrap(GroupContributionChatReceiptConfirmation(
+            result: GroupPaymentRequestContributionResultDTO(
+                request: completedRequest,
+                contribution: finalContribution
+            ),
+            recovery: finalRecovery
+        ))
+
+        XCTAssertEqual(
+            KitGroupPaymentRequestMessage.parse(firstConfirmation.encodedDescriptor)?.action,
+            .contributed
+        )
+        XCTAssertEqual(
+            KitGroupPaymentRequestMessage.parse(finalConfirmation.encodedDescriptor)?.action,
+            .completed
+        )
+    }
+
+    func testRecoveredContributionMayPrecedeTheNewestEmbeddedWindow() throws {
+        let exactContribution = try XCTUnwrap(groupRequest(
+            contributed: 250_000,
+            contributionWalletTransactionID: "90000000-0000-4000-8000-000000000001"
+        ).contributions.first)
+        let recentRows = (1 ... GroupPaymentRequestValidation.embeddedContributionLimit).map {
+            index in
+            let digits = String(index)
+            let suffix = String(repeating: "0", count: 12 - digits.count) + digits
+            let contributionID = "71000000-0000-4000-8000-\(suffix)"
+            let transactionID = "91000000-0000-4000-8000-\(suffix)"
+            return """
+            {
+              "id": "\(contributionID)",
+              "contributor_user_id": "\(ben)",
+              "amount": "15000",
+              "amount_minor": "15000",
+              "wallet_transaction_id": "\(transactionID)",
+              "created_at": "2026-08-29T12:10:00Z",
+              "is_yours": false
+            }
+            """
+        }.joined(separator: ",")
+        let firstRecentID = "71000000-0000-4000-8000-000000000001"
+        let requestJSON = groupRequestJSON(
+            status: "completed",
+            contributed: 1_000_000,
+            contributionRows: recentRows,
+            contributorCount: 2,
+            contributionCount: 51,
+            contributionsHasMore: true,
+            contributionsNextBefore: firstRecentID
+        )
+        let request = try JSONDecoder().decode(
+            GroupPaymentRequestDTO.self,
+            from: Data(requestJSON.utf8)
+        )
+        let result = GroupPaymentRequestContributionResultDTO(
+            request: request,
+            contribution: exactContribution
+        )
+        let recovery = try XCTUnwrap(GroupContributionChatReceiptRecoveryRecord(
+            ownerUserID: ama,
+            conversationID: conversationID,
+            announcementSenderUserID: sender,
+            requestID: request.id,
+            sourceWalletID: sourceWalletID,
+            amount: exactContribution.amount,
+            currency: request.currency,
+            idempotencyKey: "ios-group-contribution-outside-window"
+        ))
+
+        XCTAssertTrue(result.isStructurallyValid)
+        let confirmation = try XCTUnwrap(GroupContributionChatReceiptConfirmation(
+            result: result,
+            recovery: recovery
+        ))
+        XCTAssertEqual(
+            KitGroupPaymentRequestMessage.parse(confirmation.encodedDescriptor)?.action,
+            .contributed
+        )
+    }
+
+    func testGroupRecoveryRetiresOnlyOperationSpecificStructuredNotFound() {
+        let cases: [(Error, FinancialChatReceiptRecoveryDecision)] = [
+            (
+                APIErrorPayload(
+                    code: "GROUP_PAYMENT_RECOVERY_NOT_FOUND",
+                    message: "not committed",
+                    httpStatus: 404
+                ),
+                .notCommitted
+            ),
+            (
+                APIErrorPayload(
+                    code: "GROUP_PAYMENT_REQUEST_CONTRIBUTION_RECOVERY_NOT_FOUND",
+                    message: "not committed",
+                    httpStatus: 404
+                ),
+                .notCommitted
+            ),
+        ]
+        XCTAssertEqual(
+            GroupPaymentChatReceiptRecoveryPolicy.recoveryDecision(for: cases[0].0),
+            cases[0].1
+        )
+        XCTAssertEqual(
+            GroupContributionChatReceiptRecoveryPolicy.recoveryDecision(for: cases[1].0),
+            cases[1].1
+        )
+        let ambiguous: [Error] = [
+            APIErrorPayload(code: "GROUP_PAYMENT_NOT_FOUND", message: "opaque", httpStatus: 404),
+            APIErrorPayload(
+                code: "IDEMPOTENCY_REQUEST_IN_PROGRESS",
+                message: "in progress",
+                httpStatus: 409
+            ),
+            APIErrorPayload(
+                code: "IDEMPOTENCY_KEY_REUSED",
+                message: "mismatch",
+                httpStatus: 409
+            ),
+            APIErrorPayload(
+                code: "IDEMPOTENCY_REPLAY_UNAVAILABLE",
+                message: "unavailable",
+                httpStatus: 409
+            ),
+            APIErrorPayload(code: "SERVER_ERROR", message: "retry", httpStatus: 500),
+            APIClientError.invalidResponse,
+            CancellationError(),
+        ]
+        for error in ambiguous {
+            XCTAssertEqual(
+                GroupPaymentChatReceiptRecoveryPolicy.recoveryDecision(for: error),
+                .retain
+            )
+            XCTAssertEqual(
+                GroupContributionChatReceiptRecoveryPolicy.recoveryDecision(for: error),
+                .retain
+            )
+        }
+    }
 
     // MARK: - Wire descriptor
 
@@ -1439,8 +1859,12 @@ final class GroupPaymentTests: XCTestCase {
 
     private func groupRequest(
         status: String = "open",
-        contributed: Int64 = 250_000
+        contributed: Int64 = 250_000,
+        contributionWalletTransactionID: String? = nil,
+        secondContributionIsYours: Bool = false
     ) throws -> GroupPaymentRequestDTO {
+        let walletTransaction = contributionWalletTransactionID.map { "\"\($0)\"" } ?? "null"
+        let secondIsYours = secondContributionIsYours ? "true" : "false"
         let rows: String
         let contributorCount: Int
         switch contributed {
@@ -1454,7 +1878,7 @@ final class GroupPaymentTests: XCTestCase {
               "contributor_user_id": "\(ama)",
               "amount": "250000",
               "amount_minor": "250000",
-              "wallet_transaction_id": null,
+              "wallet_transaction_id": \(walletTransaction),
               "created_at": "2026-08-29T12:05:00Z",
               "is_yours": true
             }
@@ -1467,7 +1891,7 @@ final class GroupPaymentTests: XCTestCase {
               "contributor_user_id": "\(ama)",
               "amount": "250000",
               "amount_minor": "250000",
-              "wallet_transaction_id": null,
+              "wallet_transaction_id": \(walletTransaction),
               "created_at": "2026-08-29T12:05:00Z",
               "is_yours": true
             },
@@ -1476,9 +1900,9 @@ final class GroupPaymentTests: XCTestCase {
               "contributor_user_id": "\(ben)",
               "amount": "750000",
               "amount_minor": "750000",
-              "wallet_transaction_id": null,
+              "wallet_transaction_id": \(walletTransaction),
               "created_at": "2026-08-29T12:10:00Z",
-              "is_yours": false
+              "is_yours": \(secondIsYours)
             }
             """
             contributorCount = 2
@@ -1775,10 +2199,15 @@ final class GroupPaymentTests: XCTestCase {
         note: String? = nil,
         pendingCount: Int = 3,
         acceptedCount: Int = 0,
-        returnedCount: Int = 0
+        returnedCount: Int = 0,
+        recipientAmounts: [String?] = [nil, nil, nil]
     ) throws -> GroupPaymentDTO {
+        precondition(recipientAmounts.count == 3)
         let total = totalAmount.map { "\"total_amount\":\"\($0)\"," } ?? ""
         let noteField = note.map { "\"note\":\"\($0)\"," } ?? ""
+        func amountField(_ index: Int) -> String {
+            recipientAmounts[index].map { ", \"amount\": \"\($0)\"" } ?? ""
+        }
         let json = """
         {
           "id": "\(paymentID)",
@@ -1796,9 +2225,9 @@ final class GroupPaymentTests: XCTestCase {
           "returned_count": \(returnedCount),
           "can_reverse_unclaimed": true,
           "recipients": [
-            {"user_id": "\(ama)", "name": "Ama", "status": "pending"},
-            {"user_id": "\(ben)", "name": "Ben", "status": "pending"},
-            {"user_id": "\(cara)", "name": "Cara", "status": "pending"}
+            {"user_id": "\(ama)", "name": "Ama", "status": "pending"\(amountField(0))},
+            {"user_id": "\(ben)", "name": "Ben", "status": "pending"\(amountField(1))},
+            {"user_id": "\(cara)", "name": "Cara", "status": "pending"\(amountField(2))}
           ]
         }
         """

@@ -6274,6 +6274,18 @@ struct PersistedState: Codable {
     /// Optional keeps encrypted state written before paginated call backfills decodable.
     var callHistoryBackfillReceipt: CallHistoryBackfillReceipt?
     var outbox: [OfflineCommand] = []
+    /// Exact, account-bound intents whose server-confirmed transfer card has not yet crossed into
+    /// the ordinary E2EE outbox. Optional keeps protected state from earlier builds decodable.
+    var pendingTransferChatReceipts: [TransferChatReceiptRecoveryRecord]? = nil
+    /// Immediate payment-request creates awaiting exact recovery or their encrypted request card.
+    var pendingPaymentRequestChatReceipts: [PaymentRequestChatReceiptRecoveryRecord]? = nil
+    /// Chat pay/cancel outcomes recover by the request's known UUID and never replay a mutation.
+    var pendingPaymentRequestResolutionChatReceipts:
+        [PaymentRequestResolutionChatReceiptRecoveryRecord]? = nil
+    /// Group payment creates awaiting exact idempotency-bound recovery or E2EE announcement.
+    var pendingGroupPaymentChatReceipts: [GroupPaymentChatReceiptRecoveryRecord]? = nil
+    /// Group-request contributions awaiting exact recovery or their deterministic group event.
+    var pendingGroupContributionChatReceipts: [GroupContributionChatReceiptRecoveryRecord]? = nil
     /// Account-bound Signal identities, prekeys, sessions, replay markers, and sync cursor.
     /// Optional keeps state written by pre-messaging builds decodable.
     var secureMessaging: SecureMessagingPersistentState?
@@ -6327,6 +6339,11 @@ struct PersistedState: Codable {
             || !calls.isEmpty
             || callHistoryBackfillReceipt != nil
             || !outbox.isEmpty
+            || pendingTransferChatReceipts?.isEmpty == false
+            || pendingPaymentRequestChatReceipts?.isEmpty == false
+            || pendingPaymentRequestResolutionChatReceipts?.isEmpty == false
+            || pendingGroupPaymentChatReceipts?.isEmpty == false
+            || pendingGroupContributionChatReceipts?.isEmpty == false
             || secureMessaging != nil
             || pendingProfileAvatarAttachment != nil
             || pinnedConversationIds?.isEmpty == false
