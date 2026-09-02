@@ -2854,7 +2854,8 @@ actor SecureMessagingExchangeCoordinator {
         submittedDraftMediaAttachments: [ConversationDraftMediaAttachment]? = nil,
         draftClearVersion: ConversationDraftWriteVersion? = nil,
         deliverAt: Date? = nil,
-        replyToServerMessageID: String? = nil
+        replyToServerMessageID: String? = nil,
+        commitAdmission: ProtectedCommunicationAdmissionLease? = nil
     ) async throws -> SecureMessagingQueueResult {
         guard (submittedDraftBody == nil) == (draftClearVersion == nil),
               draftClearVersion != nil || submittedDraftMediaAttachments == nil,
@@ -2864,6 +2865,10 @@ actor SecureMessagingExchangeCoordinator {
         }
         let replyTarget = replyToServerMessageID?.lowercased()
         let local = try canonicalUUID(userID, error: .invalidAccount)
+        let queueIdentity = try authenticatedQueueIdentity(
+            forUserID: local,
+            commitAdmission: commitAdmission
+        )
         let conversationID = try canonicalUUID(conversationID, error: .invalidConversation)
         let recipient = try expectedRecipientUserID.map {
             try canonicalUUID($0, error: .invalidRecipient)
@@ -2939,6 +2944,11 @@ actor SecureMessagingExchangeCoordinator {
             ) else { throw SecureMessagingCryptoError.invalidContent }
         }
         let snapshot = await store.snapshot()
+        try requireAuthenticatedQueueIdentity(
+            queueIdentity,
+            forUserID: local,
+            commitAdmission: commitAdmission
+        )
         guard Self.permitsLocalQueueState(snapshot, userID: local),
               let conversation = snapshot.conversations.first(where: {
                   $0.id == conversationID
@@ -2989,6 +2999,11 @@ actor SecureMessagingExchangeCoordinator {
                replyToServerMessageID: replyTarget,
                scheduledAt: requestedMinute
            ) {
+            try requireAuthenticatedQueueIdentity(
+                queueIdentity,
+                forUserID: local,
+                commitAdmission: commitAdmission
+            )
             try await clearDraftAfterIdempotentQueueIfNeeded(
                 clientMessageID: clientMessageID,
                 conversationID: conversation.id,
@@ -2996,7 +3011,12 @@ actor SecureMessagingExchangeCoordinator {
                 submittedDraftBody: submittedDraftBody,
                 submittedDraftMediaAttachments: submittedDraftMediaAttachments,
                 draftClearVersion: draftClearVersion,
-                commitAdmission: nil
+                commitAdmission: commitAdmission
+            )
+            try requireAuthenticatedQueueIdentity(
+                queueIdentity,
+                forUserID: local,
+                commitAdmission: commitAdmission
             )
             return existing
         }
@@ -3073,7 +3093,7 @@ actor SecureMessagingExchangeCoordinator {
             updatedConversation.updatedAt = createdAt
         }
         let queuedConversation = updatedConversation
-        try await store.update { state in
+        let commitMutation: (inout PersistedState) throws -> Void = { state in
             guard Self.permitsLocalQueueState(state, userID: local),
                   !state.messages.contains(where: { $0.id == messageID }),
                   !state.outbox.contains(where: { $0.id == commandID }),
@@ -3103,6 +3123,16 @@ actor SecureMessagingExchangeCoordinator {
                     in: &state
                 )
             }
+        }
+        try requireAuthenticatedQueueIdentity(
+            queueIdentity,
+            forUserID: local,
+            commitAdmission: commitAdmission
+        )
+        if let commitAdmission {
+            try await store.update(admission: commitAdmission, commitMutation)
+        } else {
+            try await store.update(commitMutation)
         }
         return SecureMessagingQueueResult(
             conversation: queuedConversation,
@@ -3429,7 +3459,8 @@ actor SecureMessagingExchangeCoordinator {
         submittedDraftMediaAttachments: [ConversationDraftMediaAttachment]? = nil,
         draftClearVersion: ConversationDraftWriteVersion? = nil,
         deliverAt: Date? = nil,
-        replyToServerMessageID: String? = nil
+        replyToServerMessageID: String? = nil,
+        commitAdmission: ProtectedCommunicationAdmissionLease? = nil
     ) async throws -> SecureMessagingQueueResult {
         guard (submittedDraftBody == nil) == (draftClearVersion == nil),
               draftClearVersion != nil || submittedDraftMediaAttachments == nil,
@@ -3439,6 +3470,10 @@ actor SecureMessagingExchangeCoordinator {
         }
         let replyTarget = replyToServerMessageID?.lowercased()
         let local = try canonicalUUID(userID, error: .invalidAccount)
+        let queueIdentity = try authenticatedQueueIdentity(
+            forUserID: local,
+            commitAdmission: commitAdmission
+        )
         let conversationID = try canonicalUUID(conversationID, error: .invalidConversation)
         let recipient = try expectedRecipientUserID.map {
             try canonicalUUID($0, error: .invalidRecipient)
@@ -3475,6 +3510,11 @@ actor SecureMessagingExchangeCoordinator {
             preprocessingJobs: preprocessingJobs
         ) else { throw SecureMediaAttachmentError.invalidMedia }
         let snapshot = await store.snapshot()
+        try requireAuthenticatedQueueIdentity(
+            queueIdentity,
+            forUserID: local,
+            commitAdmission: commitAdmission
+        )
         guard Self.permitsLocalQueueState(snapshot, userID: local),
               let conversation = snapshot.conversations.first(where: {
                   $0.id == conversationID
@@ -3519,6 +3559,11 @@ actor SecureMessagingExchangeCoordinator {
                 else { throw SecureMediaAttachmentError.invalidMedia }
             }
         }
+        try requireAuthenticatedQueueIdentity(
+            queueIdentity,
+            forUserID: local,
+            commitAdmission: commitAdmission
+        )
 
         let createdAt = Date()
         // Idempotent recognition compares the canonical requested minute, deliberately without
@@ -3554,11 +3599,16 @@ actor SecureMessagingExchangeCoordinator {
                replyTarget: replyTarget,
                offeredScheduledAt: requestedMinute
            ) {
+            try requireAuthenticatedQueueIdentity(
+                queueIdentity,
+                forUserID: local,
+                commitAdmission: commitAdmission
+            )
             // The byte reads above suspend the actor, so state may have moved. Success is
             // claimed only against the exact captured projection — whole message and command
             // values — with offered park keys disjoint from every other message's media keys,
             // and the requested draft clear rides inside the same mutation.
-            try await store.update { state in
+            let replayMutation: (inout PersistedState) throws -> Void = { state in
                 guard Self.permitsLocalQueueState(state, userID: local),
                       state.messages.filter({ $0.id == clientMessageID })
                           == [match.message],
@@ -3588,6 +3638,11 @@ actor SecureMessagingExchangeCoordinator {
                         in: &state
                     )
                 }
+            }
+            if let commitAdmission {
+                try await store.update(admission: commitAdmission, replayMutation)
+            } else {
+                try await store.update(replayMutation)
             }
             // Do not delete alternate retry parks inline. State ownership can change between a
             // snapshot and an awaited file operation; the bounded cache sweeper is the only safe
@@ -3655,7 +3710,7 @@ actor SecureMessagingExchangeCoordinator {
         // state — account owner, current conversation membership and recipients, the reply
         // target, and park keys unclaimed by any other message — and never upserts the
         // snapshot's conversation back over a newer one.
-        try await store.update { state in
+        let commitMutation: (inout PersistedState) throws -> Void = { state in
             guard Self.permitsLocalQueueState(state, userID: local),
                   !state.messages.contains(where: { $0.id == messageID }),
                   !state.outbox.contains(where: { $0.id == commandID }),
@@ -3712,6 +3767,16 @@ actor SecureMessagingExchangeCoordinator {
                     in: &state
                 )
             }
+        }
+        try requireAuthenticatedQueueIdentity(
+            queueIdentity,
+            forUserID: local,
+            commitAdmission: commitAdmission
+        )
+        if let commitAdmission {
+            try await store.update(admission: commitAdmission, commitMutation)
+        } else {
+            try await store.update(commitMutation)
         }
         let latest = await store.snapshot()
         let committedConversation: Conversation

@@ -1061,6 +1061,24 @@ struct RestoredConversationDraftMediaAttachment {
     let localFileURL: URL?
 }
 
+/// Revalidates main-actor account ownership after crossing the SessionStore actor boundary.
+/// Returning session data is insufficient by itself: sign-out or a same-user replacement login
+/// can rotate the local account lifetime while the lookup is suspended.
+@MainActor
+enum OutboxContextRevalidator {
+    static func validate(
+        localContextIsCurrent: () -> Bool,
+        loadCurrentSession: () async -> SessionTokens?,
+        sessionIsCurrent: (SessionTokens) -> Bool
+    ) async -> Bool {
+        guard localContextIsCurrent(),
+              let currentSession = await loadCurrentSession(),
+              localContextIsCurrent()
+        else { return false }
+        return sessionIsCurrent(currentSession)
+    }
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     @Published private(set) var state: PersistedState = .empty
@@ -4649,17 +4667,17 @@ final class AppModel: ObservableObject {
               canDeliverSharedContent,
               isOnline,
               secureMessagingAvailable,
-              let currentUserID = profile?.id,
-              let expectedSessionID = await sessions.current()?.sessionId,
-              let commitAdmission = ProtectedCommunicationAdmissionGate.shared.lease(
-                  forAccountID: currentUserID
-              )
+              let currentUserID = profile?.id
         else { return }
         let expectedAccountEpoch = accountEpoch
-        guard await outboxContextIsCurrent(
+        guard let commitAdmission = ProtectedCommunicationAdmissionGate.shared.lease(
+            forAccountID: currentUserID
+        ), let expectedSessionID = await sessions.current()?.sessionId,
+              await outboxContextIsCurrent(
             accountEpoch: expectedAccountEpoch,
             userID: currentUserID,
-            sessionID: expectedSessionID
+            sessionID: expectedSessionID,
+            commitAdmission: commitAdmission
         ) else { return }
 
         do {
@@ -9111,17 +9129,17 @@ final class AppModel: ObservableObject {
               communicationPrivacyDenialMessage(
                 for: target.recipientUserID,
                 blockedMessage: "Unblock this account before starting a chat."
-              ) == nil,
-              let expectedSessionID = await sessions.current()?.sessionId,
-              let commitAdmission = ProtectedCommunicationAdmissionGate.shared.lease(
-                forAccountID: currentUserID
-              )
+              ) == nil
         else { return false }
         let expectedAccountEpoch = accountEpoch
-        guard await outboxContextIsCurrent(
+        guard let commitAdmission = ProtectedCommunicationAdmissionGate.shared.lease(
+            forAccountID: currentUserID
+        ), let expectedSessionID = await sessions.current()?.sessionId,
+              await outboxContextIsCurrent(
             accountEpoch: expectedAccountEpoch,
             userID: currentUserID,
-            sessionID: expectedSessionID
+            sessionID: expectedSessionID,
+            commitAdmission: commitAdmission
         ) else { return false }
 
         do {
@@ -9397,6 +9415,7 @@ final class AppModel: ObservableObject {
         _ text: String,
         action: MessageNotificationAction
     ) async -> Bool {
+        let expectedAccountEpoch = accountEpoch
         guard appReviewDemoMutationsAllowed,
               !isSigningOut,
               !isSubmittingAccountDeletion,
@@ -9413,7 +9432,6 @@ final class AppModel: ObservableObject {
             }
             return false
         }
-        let expectedAccountEpoch = accountEpoch
         let snapshot = await store.snapshot()
         guard let currentUserID = snapshot.profile?.id,
               MessageNotificationContract.accountFingerprint(for: currentUserID)
@@ -9450,12 +9468,13 @@ final class AppModel: ObservableObject {
             // Queue from the protected local projection without waiting for restore's live HTTP
             // calls. UNTextInputNotificationAction already requires device authentication; fresh
             // capabilities, roster and session checks still run before any ciphertext is sent.
-            guard await outboxContextIsCurrent(
+            guard let commitAdmission = ProtectedCommunicationAdmissionGate.shared.lease(
+                forAccountID: currentUserID
+            ), await outboxContextIsCurrent(
                 accountEpoch: expectedAccountEpoch,
                 userID: currentUserID,
-                sessionID: currentSession.sessionId
-            ), let commitAdmission = ProtectedCommunicationAdmissionGate.shared.lease(
-                forAccountID: currentUserID
+                sessionID: currentSession.sessionId,
+                commitAdmission: commitAdmission
             ) else { return false }
             _ = try await SecureMessagingActivationBinding.withAuthenticatedScope(
                 accountGeneration: expectedAccountEpoch,
@@ -11805,19 +11824,23 @@ final class AppModel: ObservableObject {
             }
             recipientUserID = recipientUUID.uuidString.lowercased()
         }
-        guard let userID = profile?.id,
-              let expectedSessionID = await sessions.current()?.sessionId
-        else {
+        guard let userID = profile?.id else {
             lastError = "Choose one valid Kit Pay recipient."
             return false
         }
+        // Capture every piece of account-lifetime authority before the first suspension. A
+        // same-user sign-out/re-login may replace the protected store while SessionStore is being
+        // consulted; acquiring a lease afterwards would accidentally bless the old composer work
+        // with the replacement login's authority.
         let expectedAccountEpoch = accountEpoch
-        guard await outboxContextIsCurrent(
+        guard let commitAdmission = ProtectedCommunicationAdmissionGate.shared.lease(
+            forAccountID: userID
+        ), let expectedSessionID = await sessions.current()?.sessionId,
+              await outboxContextIsCurrent(
             accountEpoch: expectedAccountEpoch,
             userID: userID,
-            sessionID: expectedSessionID
-        ), let commitAdmission = ProtectedCommunicationAdmissionGate.shared.lease(
-            forAccountID: userID
+            sessionID: expectedSessionID,
+            commitAdmission: commitAdmission
         ) else { return false }
         if let recipientUserID,
            !communicationPrivacyAllowsLocalQueue(to: recipientUserID) {
@@ -13224,17 +13247,23 @@ final class AppModel: ObservableObject {
             }
             recipientUserID = recipientUUID.uuidString.lowercased()
         }
-        guard let userID = profile?.id,
-              let expectedSessionID = await sessions.current()?.sessionId
-        else {
+        guard let userID = profile?.id else {
             lastError = "Choose one valid Kit Pay recipient."
             return false
         }
+        // Capture every piece of account-lifetime authority before the first suspension. A
+        // same-user sign-out/re-login may replace the protected store while SessionStore is being
+        // consulted; acquiring a lease afterwards would accidentally bless the old composer work
+        // with the replacement login's authority.
         let expectedAccountEpoch = accountEpoch
-        guard await outboxContextIsCurrent(
+        guard let commitAdmission = ProtectedCommunicationAdmissionGate.shared.lease(
+            forAccountID: userID
+        ), let expectedSessionID = await sessions.current()?.sessionId,
+              await outboxContextIsCurrent(
             accountEpoch: expectedAccountEpoch,
             userID: userID,
-            sessionID: expectedSessionID
+            sessionID: expectedSessionID,
+            commitAdmission: commitAdmission
         ) else { return false }
         if let recipientUserID,
            !communicationPrivacyAllowsLocalQueue(to: recipientUserID) {
@@ -13314,27 +13343,34 @@ final class AppModel: ObservableObject {
             return false
         }
         do {
-            _ = try await SecureMessagingExchangeCoordinator.shared.queueDeferredImage(
-                forUserID: userID,
-                conversationID: cleanConversationId,
-                expectedRecipientUserID: recipientUserID,
-                title: title,
-                mediaData: mediaData,
-                mediaType: mediaType,
-                caption: caption,
-                localStorageKey: parkedLocalKey,
-                localMediaID: stableMediaID,
-                plaintextByteSize: mediaByteCount,
-                localStorageKind: localStorageKind,
-                duration: duration,
-                preprocessingJob: preprocessingJob,
-                clientMessageID: clientMessageID,
-                submittedDraftBody: submittedDraftBody,
-                submittedDraftMediaAttachments: submittedDraftMediaAttachments,
-                draftClearVersion: draftClearVersion,
-                deliverAt: deliverAt,
-                replyToServerMessageID: replyTarget
-            )
+            _ = try await SecureMessagingActivationBinding.withAuthenticatedScope(
+                accountGeneration: expectedAccountEpoch,
+                sessionID: expectedSessionID,
+                commitAdmission: commitAdmission
+            ) {
+                try await SecureMessagingExchangeCoordinator.shared.queueDeferredImage(
+                    forUserID: userID,
+                    conversationID: cleanConversationId,
+                    expectedRecipientUserID: recipientUserID,
+                    title: title,
+                    mediaData: mediaData,
+                    mediaType: mediaType,
+                    caption: caption,
+                    localStorageKey: parkedLocalKey,
+                    localMediaID: stableMediaID,
+                    plaintextByteSize: mediaByteCount,
+                    localStorageKind: localStorageKind,
+                    duration: duration,
+                    preprocessingJob: preprocessingJob,
+                    clientMessageID: clientMessageID,
+                    submittedDraftBody: submittedDraftBody,
+                    submittedDraftMediaAttachments: submittedDraftMediaAttachments,
+                    draftClearVersion: draftClearVersion,
+                    deliverAt: deliverAt,
+                    replyToServerMessageID: replyTarget,
+                    commitAdmission: commitAdmission
+                )
+            }
             let reloaded = await reloadOutboxStateIfCurrent(
                 accountEpoch: expectedAccountEpoch,
                 userID: userID,
@@ -13468,17 +13504,23 @@ final class AppModel: ObservableObject {
             }
             recipientUserID = recipientUUID.uuidString.lowercased()
         }
-        guard let userID = profile?.id,
-              let expectedSessionID = await sessions.current()?.sessionId
-        else {
+        guard let userID = profile?.id else {
             lastError = "Choose one valid Kit Pay recipient."
             return false
         }
+        // Bind a batch to the account lifetime that accepted the tap, before SessionStore can
+        // suspend. The lease survives local file preparation and is revalidated by the
+        // coordinator at its atomic protected-store commit, so a replacement login cannot inherit
+        // the durable batch.
         let expectedAccountEpoch = accountEpoch
-        guard await outboxContextIsCurrent(
+        guard let commitAdmission = ProtectedCommunicationAdmissionGate.shared.lease(
+            forAccountID: userID
+        ), let expectedSessionID = await sessions.current()?.sessionId,
+              await outboxContextIsCurrent(
             accountEpoch: expectedAccountEpoch,
             userID: userID,
-            sessionID: expectedSessionID
+            sessionID: expectedSessionID,
+            commitAdmission: commitAdmission
         ) else { return false }
         if let recipientUserID,
            !communicationPrivacyAllowsLocalQueue(to: recipientUserID) {
@@ -13586,21 +13628,28 @@ final class AppModel: ObservableObject {
                 rawCaption: rawCaption,
                 keyMaterialFactory: { try SecureMediaAttachmentCipher.randomKeyMaterial() }
             )
-            _ = try await SecureMessagingExchangeCoordinator.shared.queueDeferredMediaBatch(
-                forUserID: userID,
-                conversationID: cleanConversationId,
-                expectedRecipientUserID: recipientUserID,
-                title: title,
-                batch: batch,
-                localStorageKinds: storageKinds,
-                preprocessingJobs: preprocessingJobs,
-                clientMessageID: clientMessageID,
-                submittedDraftBody: submittedDraftBody,
-                submittedDraftMediaAttachments: submittedDraftMediaAttachments,
-                draftClearVersion: draftClearVersion,
-                deliverAt: deliverAt,
-                replyToServerMessageID: replyTarget
-            )
+            _ = try await SecureMessagingActivationBinding.withAuthenticatedScope(
+                accountGeneration: expectedAccountEpoch,
+                sessionID: expectedSessionID,
+                commitAdmission: commitAdmission
+            ) {
+                try await SecureMessagingExchangeCoordinator.shared.queueDeferredMediaBatch(
+                    forUserID: userID,
+                    conversationID: cleanConversationId,
+                    expectedRecipientUserID: recipientUserID,
+                    title: title,
+                    batch: batch,
+                    localStorageKinds: storageKinds,
+                    preprocessingJobs: preprocessingJobs,
+                    clientMessageID: clientMessageID,
+                    submittedDraftBody: submittedDraftBody,
+                    submittedDraftMediaAttachments: submittedDraftMediaAttachments,
+                    draftClearVersion: draftClearVersion,
+                    deliverAt: deliverAt,
+                    replyToServerMessageID: replyTarget,
+                    commitAdmission: commitAdmission
+                )
+            }
             // An idempotent replay leaves redundant scratch parks for bounded cache maintenance;
             // deleting them inline could race a composer draft that just acquired the same key.
             guard await reloadOutboxStateIfCurrent(
@@ -15403,20 +15452,21 @@ final class AppModel: ObservableObject {
         let cleanRecipientID = recipientUUID.uuidString.lowercased()
         guard secureMessagingLocalQueueAvailable,
               let rawUserID = profile?.id,
-              let userUUID = UUID(uuidString: rawUserID),
-              let expectedSessionID = await sessions.current()?.sessionId
+              let userUUID = UUID(uuidString: rawUserID)
         else {
             lastError = messagingSendFailureMessage
             return nil
         }
         let userID = userUUID.uuidString.lowercased()
         let expectedAccountEpoch = accountEpoch
-        guard await outboxContextIsCurrent(
+        guard let commitAdmission = ProtectedCommunicationAdmissionGate.shared.lease(
+            forAccountID: userID
+        ), let expectedSessionID = await sessions.current()?.sessionId,
+              await outboxContextIsCurrent(
             accountEpoch: expectedAccountEpoch,
             userID: userID,
-            sessionID: expectedSessionID
-        ), let commitAdmission = ProtectedCommunicationAdmissionGate.shared.lease(
-            forAccountID: userID
+            sessionID: expectedSessionID,
+            commitAdmission: commitAdmission
         ) else { return nil }
         let existingConversation: Conversation?
         switch NewMessageComposerPolicy.directRoute(
@@ -18298,8 +18348,31 @@ final class AppModel: ObservableObject {
     private func outboxContextIsCurrent(
         accountEpoch expectedAccountEpoch: UUID,
         userID expectedUserID: String,
-        sessionID expectedSessionID: String
+        sessionID expectedSessionID: String,
+        commitAdmission: ProtectedCommunicationAdmissionLease? = nil
     ) async -> Bool {
+        await OutboxContextRevalidator.validate(
+            localContextIsCurrent: { [self] in
+                localOutboxContextIsCurrent(
+                    accountEpoch: expectedAccountEpoch,
+                    userID: expectedUserID,
+                    commitAdmission: commitAdmission
+                )
+            },
+            loadCurrentSession: { [sessions] in await sessions.current() },
+            sessionIsCurrent: { currentSession in
+                currentSession.sessionId.caseInsensitiveCompare(expectedSessionID) == .orderedSame
+                    && currentSession.accountId?.caseInsensitiveCompare(expectedUserID)
+                        == .orderedSame
+            }
+        )
+    }
+
+    private func localOutboxContextIsCurrent(
+        accountEpoch expectedAccountEpoch: UUID,
+        userID expectedUserID: String,
+        commitAdmission: ProtectedCommunicationAdmissionLease?
+    ) -> Bool {
         guard !Task.isCancelled,
               !isSigningOut,
               !isSubmittingAccountDeletion,
@@ -18310,9 +18383,8 @@ final class AppModel: ObservableObject {
               accountEpoch == expectedAccountEpoch,
               profile?.id.caseInsensitiveCompare(expectedUserID) == .orderedSame
         else { return false }
-        guard let currentSession = await sessions.current() else { return false }
-        return currentSession.sessionId.caseInsensitiveCompare(expectedSessionID) == .orderedSame
-            && currentSession.accountId?.caseInsensitiveCompare(expectedUserID) == .orderedSame
+        guard let commitAdmission else { return true }
+        return ProtectedCommunicationAdmissionGate.shared.permits(commitAdmission)
     }
 
     /// Commits a replay mutation only into the same encrypted account that issued the network
@@ -20105,14 +20177,14 @@ final class AppModel: ObservableObject {
         context: (userID: String, conversationID: String, recipientUserIDs: [String])
     ) async {
         let expectedAccountEpoch = accountEpoch
-        guard let expectedSessionID = await sessions.current()?.sessionId,
+        guard let commitAdmission = ProtectedCommunicationAdmissionGate.shared.lease(
+            forAccountID: context.userID
+        ), let expectedSessionID = await sessions.current()?.sessionId,
               await outboxContextIsCurrent(
                   accountEpoch: expectedAccountEpoch,
                   userID: context.userID,
-                  sessionID: expectedSessionID
-              ),
-              let commitAdmission = ProtectedCommunicationAdmissionGate.shared.lease(
-                  forAccountID: context.userID
+                  sessionID: expectedSessionID,
+                  commitAdmission: commitAdmission
               )
         else { return }
         do {
@@ -20221,14 +20293,14 @@ final class AppModel: ObservableObject {
             recipientUserID: context.recipientUserID
         ) else { return }
         let expectedAccountEpoch = accountEpoch
-        guard let expectedSessionID = await sessions.current()?.sessionId,
+        guard let commitAdmission = ProtectedCommunicationAdmissionGate.shared.lease(
+            forAccountID: context.userID
+        ), let expectedSessionID = await sessions.current()?.sessionId,
               await outboxContextIsCurrent(
                   accountEpoch: expectedAccountEpoch,
                   userID: context.userID,
-                  sessionID: expectedSessionID
-              ),
-              let commitAdmission = ProtectedCommunicationAdmissionGate.shared.lease(
-                  forAccountID: context.userID
+                  sessionID: expectedSessionID,
+                  commitAdmission: commitAdmission
               )
         else { return }
 

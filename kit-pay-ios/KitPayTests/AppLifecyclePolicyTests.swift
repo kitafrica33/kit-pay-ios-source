@@ -50,6 +50,94 @@ final class AppLifecyclePolicyTests: XCTestCase {
         )
     }
 
+    func testSingleMediaOutboxFenceRejectsSignOutDuringSessionLookup() async throws {
+        let userID = "10000000-0000-4000-8000-000000000201"
+        let sessionID = "20000000-0000-4000-8000-000000000201"
+        let expectedEpoch = UUID(uuidString: "30000000-0000-4000-8000-000000000201")!
+        let lifetime = LockedOutboxLifetime(epoch: expectedEpoch)
+        let lookup = SuspendedOutboxSessionLookup(
+            session: testSession(userID: userID, sessionID: sessionID)
+        )
+
+        let validation = Task { @MainActor in
+            await OutboxContextRevalidator.validate(
+                localContextIsCurrent: { lifetime.matches(expectedEpoch) },
+                loadCurrentSession: { await lookup.load() },
+                sessionIsCurrent: {
+                    $0.sessionId == sessionID && $0.accountId == userID
+                }
+            )
+        }
+        try await lookup.waitUntilStarted()
+
+        // performSignOut rotates AppModel.accountEpoch before its first awaited cleanup and only
+        // quarantines the protected-store gate later. A matching old SessionStore result must not
+        // revive the send during that window.
+        lifetime.rotate()
+        await lookup.release()
+
+        let accepted = await validation.value
+        XCTAssertFalse(accepted)
+    }
+
+    func testMediaBatchOutboxFenceRejectsSameUserReplacementLeaseDuringSessionLookup() async throws {
+        let userID = "10000000-0000-4000-8000-000000000202"
+        let sessionID = "20000000-0000-4000-8000-000000000202"
+        let gate = ProtectedCommunicationAdmissionGate()
+        gate.restore(forAccountID: userID)
+        let staleLease = try XCTUnwrap(gate.lease(forAccountID: userID))
+        defer { gate.quarantine() }
+        let lookup = SuspendedOutboxSessionLookup(
+            session: testSession(userID: userID, sessionID: sessionID)
+        )
+
+        let validation = Task { @MainActor in
+            await OutboxContextRevalidator.validate(
+                localContextIsCurrent: { gate.permits(staleLease) },
+                loadCurrentSession: { await lookup.load() },
+                sessionIsCurrent: {
+                    $0.sessionId == sessionID && $0.accountId == userID
+                }
+            )
+        }
+        try await lookup.waitUntilStarted()
+
+        gate.quarantine()
+        gate.restore(forAccountID: userID)
+        let replacementLease = try XCTUnwrap(gate.lease(forAccountID: userID))
+        XCTAssertNotEqual(staleLease, replacementLease)
+        await lookup.release()
+
+        let accepted = await validation.value
+        XCTAssertFalse(accepted)
+    }
+
+    func testOutboxFenceAcceptsOnlyAnUnchangedLifetimeAndMatchingSession() async {
+        let userID = "10000000-0000-4000-8000-000000000203"
+        let sessionID = "20000000-0000-4000-8000-000000000203"
+        let session = testSession(userID: userID, sessionID: sessionID)
+
+        let accepted = await Task { @MainActor in
+            await OutboxContextRevalidator.validate(
+                localContextIsCurrent: { true },
+                loadCurrentSession: { session },
+                sessionIsCurrent: {
+                    $0.sessionId == sessionID && $0.accountId == userID
+                }
+            )
+        }.value
+        XCTAssertTrue(accepted)
+
+        let mismatchedSessionRejected = await Task { @MainActor in
+            await OutboxContextRevalidator.validate(
+                localContextIsCurrent: { true },
+                loadCurrentSession: { session },
+                sessionIsCurrent: { $0.sessionId == "replacement-session" }
+            )
+        }.value
+        XCTAssertFalse(mismatchedSessionRejected)
+    }
+
     // MARK: - Foreground authoritative refresh
 
     func testOnlyARealBackgroundVisitRequestsForegroundRefresh() {
@@ -221,6 +309,18 @@ final class AppLifecyclePolicyTests: XCTestCase {
         return KitDeepLink.parse(url)
     }
 
+    private func testSession(userID: String, sessionID: String) -> SessionTokens {
+        SessionTokens(
+            accessToken: "access",
+            refreshToken: "refresh",
+            tokenType: "Bearer",
+            accessExpiresAt: nil,
+            refreshExpiresAt: nil,
+            sessionId: sessionID,
+            accountId: userID
+        )
+    }
+
     func testVerificationLinkOpensTheVerificationScreenWithItsToken() {
         XCTAssertEqual(
             link("kitwallet://verify-email?token=\(validToken)"),
@@ -283,5 +383,65 @@ final class AppLifecyclePolicyTests: XCTestCase {
             )
             XCTAssertNil(url.flatMap(KitDeepLink.parse), "accepted \(suspect.debugDescription)")
         }
+    }
+}
+
+private final class LockedOutboxLifetime: @unchecked Sendable {
+    private let lock = NSLock()
+    private var epoch: UUID
+
+    init(epoch: UUID) {
+        self.epoch = epoch
+    }
+
+    func matches(_ expectedEpoch: UUID) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return epoch == expectedEpoch
+    }
+
+    func rotate() {
+        lock.lock()
+        epoch = UUID()
+        lock.unlock()
+    }
+}
+
+private actor SuspendedOutboxSessionLookup {
+    enum Failure: Error {
+        case lookupDidNotStart
+    }
+
+    private let session: SessionTokens
+    private var started = false
+    private var released = false
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    init(session: SessionTokens) {
+        self.session = session
+    }
+
+    func load() async -> SessionTokens? {
+        started = true
+        guard !released else { return session }
+        await withCheckedContinuation { continuation in
+            releaseWaiters.append(continuation)
+        }
+        return session
+    }
+
+    func waitUntilStarted() async throws {
+        for _ in 0..<500 {
+            if started { return }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        throw Failure.lookupDidNotStart
+    }
+
+    func release() {
+        released = true
+        let waiters = releaseWaiters
+        releaseWaiters.removeAll()
+        waiters.forEach { $0.resume() }
     }
 }

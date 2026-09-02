@@ -931,6 +931,194 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
         XCTAssertTrue(snapshot.outbox.isEmpty)
     }
 
+    func testDeferredImageRejectsSameUserLoginReplacementDuringLocalValidation() async throws {
+        let userID = "10000000-0000-4000-8000-000000000101"
+        let peerID = "10000000-0000-4000-8000-000000000102"
+        let conversationID = "30000000-0000-4000-8000-000000000101"
+        let mediaID = UUID(uuidString: "70000000-0000-4000-8000-000000000101")!
+        let clientMessageID = UUID(uuidString: "80000000-0000-4000-8000-000000000101")!
+        let oldAccountGeneration = UUID(
+            uuidString: "60000000-0000-4000-8000-000000000101"
+        )!
+        let oldSessionID = "90000000-0000-4000-8000-000000000101"
+        let mediaBytes = Data("protected media original".utf8)
+        let storageKey = mediaID.uuidString.lowercased()
+        let originalURL = temporaryDirectory.appendingPathComponent("stale-media-original.pdf")
+        try mediaBytes.write(to: originalURL, options: .atomic)
+
+        let store = try await makeStore(userID: userID)
+        try await store.update { state in
+            state.communicationOwnerUserID = userID
+            state.conversations = [Conversation(
+                id: conversationID,
+                title: "ExampleContact",
+                participantUserIds: [userID, peerID],
+                unreadCount: 0,
+                updatedAt: Date(timeIntervalSince1970: 1_756_800_000)
+            )]
+        }
+        let blobs = SuspendedMediaValidationBlobStore(
+            userID: userID,
+            seed: [storageKey: mediaBytes],
+            protectedOriginalURLs: [storageKey: originalURL]
+        )
+        let coordinator = SecureMessagingExchangeCoordinator(
+            transport: OfflineExchangeTransport(),
+            store: store,
+            engine: SecureMessagingCryptoEngine(),
+            provisioningPreKeyCount: 1,
+            mediaBlobs: blobs.access(),
+            requiresAuthenticatedActivationScope: true
+        )
+        let gate = ProtectedCommunicationAdmissionGate.shared
+        gate.quarantine()
+        gate.restore(forAccountID: userID)
+        let staleLease = try XCTUnwrap(gate.lease(forAccountID: userID))
+        defer { gate.quarantine() }
+
+        let queued = Task {
+            try await SecureMessagingActivationBinding.withAuthenticatedScope(
+                accountGeneration: oldAccountGeneration,
+                sessionID: oldSessionID,
+                commitAdmission: staleLease
+            ) {
+                try await coordinator.queueDeferredImage(
+                    forUserID: userID,
+                    conversationID: conversationID,
+                    expectedRecipientUserID: peerID,
+                    title: "ExampleContact",
+                    mediaData: nil,
+                    mediaType: "application/pdf",
+                    caption: nil,
+                    localStorageKey: storageKey,
+                    localMediaID: mediaID,
+                    plaintextByteSize: mediaBytes.count,
+                    localStorageKind: .protectedFile,
+                    clientMessageID: clientMessageID,
+                    commitAdmission: staleLease
+                )
+            }
+        }
+        try await blobs.waitUntilValidationStarted()
+
+        gate.quarantine()
+        gate.restore(forAccountID: userID)
+        let replacementLease = try XCTUnwrap(gate.lease(forAccountID: userID))
+        XCTAssertNotEqual(staleLease, replacementLease)
+        await blobs.releaseValidation()
+
+        do {
+            _ = try await queued.value
+            XCTFail("A suspended media queue must not commit into a replacement login lifetime")
+        } catch is CancellationError {
+            // Expected: validation resumed only after the exact store lease was invalidated.
+        }
+        let snapshot = await store.snapshot()
+        XCTAssertTrue(snapshot.messages.isEmpty)
+        XCTAssertTrue(snapshot.outbox.isEmpty)
+        XCTAssertEqual(snapshot.conversations.map(\.id), [conversationID])
+    }
+
+    func testDeferredMediaBatchRejectsSameUserLoginReplacementDuringLocalValidation() async throws {
+        let userID = "10000000-0000-4000-8000-000000000103"
+        let peerID = "10000000-0000-4000-8000-000000000104"
+        let conversationID = "30000000-0000-4000-8000-000000000103"
+        let firstID = "70000000-0000-4000-8000-000000000103"
+        let secondID = "70000000-0000-4000-8000-000000000104"
+        let clientMessageID = UUID(uuidString: "80000000-0000-4000-8000-000000000103")!
+        let oldAccountGeneration = UUID(
+            uuidString: "60000000-0000-4000-8000-000000000103"
+        )!
+        let oldSessionID = "90000000-0000-4000-8000-000000000103"
+        let firstBytes = Data(repeating: 0x61, count: 257)
+        let secondBytes = Data(repeating: 0x62, count: 513)
+        let batch = try KitMediaMessageV2OutboundBatch.queued(
+            attachments: [
+                .init(
+                    attachmentID: firstID,
+                    mediaType: "image/jpeg",
+                    plaintextByteSize: firstBytes.count,
+                    localStorageKey: firstID
+                ),
+                .init(
+                    attachmentID: secondID,
+                    mediaType: "video/mp4",
+                    plaintextByteSize: secondBytes.count,
+                    localStorageKey: secondID
+                ),
+            ],
+            rawCaption: "Must stay in the original account lifetime",
+            keyMaterialFactory: {
+                Data(repeating: 0x63, count: SecureMediaAttachmentCipher.keyMaterialBytes)
+            }
+        )
+
+        let store = try await makeStore(userID: userID)
+        try await store.update { state in
+            state.communicationOwnerUserID = userID
+            state.conversations = [Conversation(
+                id: conversationID,
+                title: "ExampleContact",
+                participantUserIds: [userID, peerID],
+                unreadCount: 0,
+                updatedAt: Date(timeIntervalSince1970: 1_756_800_000)
+            )]
+        }
+        let blobs = SuspendedMediaValidationBlobStore(
+            userID: userID,
+            seed: [firstID: firstBytes, secondID: secondBytes]
+        )
+        let coordinator = SecureMessagingExchangeCoordinator(
+            transport: OfflineExchangeTransport(),
+            store: store,
+            engine: SecureMessagingCryptoEngine(),
+            provisioningPreKeyCount: 1,
+            mediaBlobs: blobs.access(),
+            requiresAuthenticatedActivationScope: true
+        )
+        let gate = ProtectedCommunicationAdmissionGate.shared
+        gate.quarantine()
+        gate.restore(forAccountID: userID)
+        let staleLease = try XCTUnwrap(gate.lease(forAccountID: userID))
+        defer { gate.quarantine() }
+
+        let queued = Task {
+            try await SecureMessagingActivationBinding.withAuthenticatedScope(
+                accountGeneration: oldAccountGeneration,
+                sessionID: oldSessionID,
+                commitAdmission: staleLease
+            ) {
+                try await coordinator.queueDeferredMediaBatch(
+                    forUserID: userID,
+                    conversationID: conversationID,
+                    expectedRecipientUserID: peerID,
+                    title: "ExampleContact",
+                    batch: batch,
+                    clientMessageID: clientMessageID,
+                    commitAdmission: staleLease
+                )
+            }
+        }
+        try await blobs.waitUntilValidationStarted()
+
+        gate.quarantine()
+        gate.restore(forAccountID: userID)
+        let replacementLease = try XCTUnwrap(gate.lease(forAccountID: userID))
+        XCTAssertNotEqual(staleLease, replacementLease)
+        await blobs.releaseValidation()
+
+        do {
+            _ = try await queued.value
+            XCTFail("A suspended media batch must not commit into a replacement login lifetime")
+        } catch is CancellationError {
+            // Expected: validation resumed only after the exact store lease was invalidated.
+        }
+        let snapshot = await store.snapshot()
+        XCTAssertTrue(snapshot.messages.isEmpty)
+        XCTAssertTrue(snapshot.outbox.isEmpty)
+        XCTAssertEqual(snapshot.conversations.map(\.id), [conversationID])
+    }
+
     func testEnsureDirectConversationRejectsUnexpectedBoundConversationIDWithoutPersisting() async throws {
         let userID = "10000000-0000-4000-8000-000000000073"
         let peerID = "10000000-0000-4000-8000-000000000074"
@@ -8897,6 +9085,98 @@ private struct MediaBatchRecordedUpload: Equatable, Sendable {
     let storageKey: String
     let byteSize: Int64
     let ciphertextSha256: String
+}
+
+/// Suspends the first metadata read so tests can rotate the authenticated store lease after a
+/// media queue operation has started but before its durable projection is committed.
+private actor SuspendedMediaValidationBlobStore {
+    enum Failure: Error {
+        case expectedValidationDidNotStart
+    }
+
+    private let userID: String
+    private let blobs: [String: Data]
+    private let protectedOriginalURLs: [String: URL]
+    private var validationStarted = false
+    private var validationReleased = false
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    init(
+        userID: String,
+        seed: [String: Data],
+        protectedOriginalURLs: [String: URL] = [:]
+    ) {
+        self.userID = userID
+        blobs = seed
+        self.protectedOriginalURLs = protectedOriginalURLs
+    }
+
+    func waitUntilValidationStarted() async throws {
+        for _ in 0..<500 {
+            if validationStarted { return }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        throw Failure.expectedValidationDidNotStart
+    }
+
+    func releaseValidation() {
+        validationReleased = true
+        let waiters = releaseWaiters
+        releaseWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
+    private func suspendFirstValidationIfNeeded() async {
+        guard !validationStarted else { return }
+        validationStarted = true
+        if validationReleased { return }
+        await withCheckedContinuation { continuation in
+            releaseWaiters.append(continuation)
+        }
+    }
+
+    private func read(_ storageKey: String, for requestedUserID: String) -> Data? {
+        guard requestedUserID == userID else { return nil }
+        return blobs[storageKey]
+    }
+
+    private func byteCount(_ storageKey: String, for requestedUserID: String) async -> Int? {
+        guard requestedUserID == userID else { return nil }
+        await suspendFirstValidationIfNeeded()
+        return blobs[storageKey]?.count
+    }
+
+    private func protectedOriginalURL(
+        _ storageKey: String,
+        for requestedUserID: String,
+        expectedByteCount: Int
+    ) -> URL? {
+        guard requestedUserID == userID,
+              blobs[storageKey]?.count == expectedByteCount
+        else { return nil }
+        return protectedOriginalURLs[storageKey]
+    }
+
+    nonisolated func access() -> SecureMediaBlobStoreAccess {
+        SecureMediaBlobStoreAccess(
+            read: { storageKey, userID in
+                await self.read(storageKey, for: userID)
+            },
+            byteCount: { storageKey, userID in
+                await self.byteCount(storageKey, for: userID)
+            },
+            protectedOriginalURL: { storageKey, userID, expectedByteCount in
+                await self.protectedOriginalURL(
+                    storageKey,
+                    for: userID,
+                    expectedByteCount: expectedByteCount
+                )
+            },
+            duplicateIfAbsent: { _, _, _ in .sourceMissing },
+            removeDuplicate: { _, _, _ in false },
+            remove: { _, _ in }
+        )
+    }
 }
 
 /// Dict-backed stand-in for `SecureMediaFileCache` behind `SecureMediaBlobStoreAccess`,
