@@ -280,10 +280,26 @@ private struct WalletHistoryRefreshFlight {
     let task: Task<Void, Never>
 }
 
-private enum AccountSignOutResult {
+enum AccountSignOutResult: Equatable {
     case completed
     case contextChanged
     case localCleanupFailed
+
+    static func cleanupResult(
+        sessionCleanupSucceeded: Bool,
+        projectionCleanupSucceeded: Bool,
+        mediaCacheCleanupSucceeded: Bool,
+        diagnosticsCleanupSucceeded: Bool,
+        acceptedDeletionCleanupSucceeded: Bool
+    ) -> Self {
+        sessionCleanupSucceeded
+            && projectionCleanupSucceeded
+            && mediaCacheCleanupSucceeded
+            && diagnosticsCleanupSucceeded
+            && acceptedDeletionCleanupSucceeded
+            ? .completed
+            : .localCleanupFailed
+    }
 }
 
 enum ProfileEmailOperation: Equatable {
@@ -2219,6 +2235,15 @@ final class AppModel: ObservableObject {
                     + "Retry secure account-deletion cleanup before signing in again."
                 return false
             }
+            guard LocalMediaPerformanceMonitor.shared.suspendRecordingAndClearReport() else {
+                await concealUnresolvedAcceptedAccountDeletionProjection()
+                acceptedAccountDeletionCleanupBlocked = true
+                lastError =
+                    "This device could not clear protected media diagnostics for the deleted account. "
+                    + "Retry secure account-deletion cleanup before signing in again."
+                isLoading = true
+                return false
+            }
         }
 
         switch await store.prepareForRestore() {
@@ -2333,6 +2358,17 @@ final class AppModel: ObservableObject {
         await NotificationCoordinator.shared.clearMessageNotifications(
             accountFingerprint: targetFingerprint
         )
+        // Keep the accepted marker authoritative until the suspended diagnostics writer has
+        // serialized a final clear. A relaunch can then safely repeat the whole exact-target purge.
+        guard LocalMediaPerformanceMonitor.shared.clearReport() else {
+            await concealUnresolvedAcceptedAccountDeletionProjection()
+            acceptedAccountDeletionCleanupBlocked = true
+            lastError =
+                "This device could not clear protected media diagnostics for the deleted account. "
+                + "Retry secure account-deletion cleanup before signing in again."
+            isLoading = true
+            return false
+        }
         // Retire the ambiguity fence first. If the process dies before the accepted marker is
         // removed, the accepted marker remains sufficient authority to repeat exact-target cleanup.
         if let deletionAttempt {
@@ -3700,6 +3736,9 @@ final class AppModel: ObservableObject {
               let boundSession = session.bound(to: user.id)
         else { throw AuthUIError.invalidResponse }
         guard authenticationAttempt == attempt else { return }
+        guard LocalMediaPerformanceMonitor.shared.suspendRecordingAndClearReport() else {
+            throw AuthUIError.localDiagnosticsCleanupFailed
+        }
         do {
             guard try await sessions.saveIfEmpty(boundSession) else {
                 throw AuthUIError.staleResponse
@@ -3743,6 +3782,7 @@ final class AppModel: ObservableObject {
         contactDirectoryRevision &+= 1
         await publishLatestState()
         isSignedIn = true
+        LocalMediaPerformanceMonitor.shared.resumeRecordingForFreshAccount()
         bindDeferredMessagingFeatures(to: MessagingDeferredFeatureScope(
             accountEpoch: accountEpoch,
             userID: user.id,
@@ -4680,6 +4720,10 @@ final class AppModel: ObservableObject {
             else { return .contextChanged }
         }
         isSigningOut = true
+        // Diagnostics have no account identifiers, but their exact event times and media sizes
+        // still belong only to the account that produced them. A filesystem failure is retried
+        // and blocks any later account adoption in `adoptAuthenticatedResult`.
+        _ = LocalMediaPerformanceMonitor.shared.suspendRecordingAndClearReport()
         resetForegroundAuthoritativeRefresh()
         cancelWalletHistoryRefresh()
         // Revoke the non-idempotent waiting invitation before sign-out reaches its first await.
@@ -4722,8 +4766,9 @@ final class AppModel: ObservableObject {
         resetSecurityPreferencesState()
         var acceptedDeletionLocalCleanupSucceeded = true
         if let acceptedDeletion {
-            acceptedDeletionLocalCleanupSucceeded = await
+            let accountDataCleanupSucceeded = await
                 finishAcceptedAccountDeletionLocalPurge(acceptedDeletion)
+            acceptedDeletionLocalCleanupSucceeded = accountDataCleanupSucceeded
             // Publish only the post-cleanup projection; an exact-target write failure is already
             // concealed by SecureLocalStore, while an ownership conflict remains marker-blocked.
             await publishLatestState()
@@ -4919,6 +4964,12 @@ final class AppModel: ObservableObject {
         await NotificationCoordinator.shared.clearMessageNotifications(
             accountFingerprint: deletedAccountFingerprint
         )
+        // The monitor was suspended before teardown. This final serialized clear runs after media
+        // producers have been cancelled, and is the authoritative account-boundary result.
+        let diagnosticsCleanupSucceeded = LocalMediaPerformanceMonitor.shared.clearReport()
+        if isAcceptedDeletion, !diagnosticsCleanupSucceeded {
+            acceptedDeletionLocalCleanupSucceeded = false
+        }
         if let acceptedDeletion, acceptedDeletionLocalCleanupSucceeded {
             if let acceptedDeletionAttempt {
                 do {
@@ -4963,17 +5014,21 @@ final class AppModel: ObservableObject {
         acceptedAccountDeletionCleanupBlocked = isAcceptedDeletion
             && !acceptedDeletionLocalCleanupSucceeded
         isLoading = acceptedAccountDeletionCleanupBlocked
-        let completed = sessionCleanupSucceeded
-            && projectionCleanupSucceeded
-            && mediaCacheCleanupSucceeded
-            && (!isAcceptedDeletion || acceptedDeletionLocalCleanupSucceeded)
-        if completed {
+        let result = AccountSignOutResult.cleanupResult(
+            sessionCleanupSucceeded: sessionCleanupSucceeded,
+            projectionCleanupSucceeded: projectionCleanupSucceeded,
+            mediaCacheCleanupSucceeded: mediaCacheCleanupSucceeded,
+            diagnosticsCleanupSucceeded: diagnosticsCleanupSucceeded,
+            acceptedDeletionCleanupSucceeded: !isAcceptedDeletion
+                || acceptedDeletionLocalCleanupSucceeded
+        )
+        if result == .completed {
             // The signed-in projection was cleared before credentials. Repopulate only the public
             // sign-in capabilities after teardown, so onboarding never reuses the departed
             // account's cohort response and does not remain disabled until another path change.
             _ = await reloadCapabilities()
         }
-        return completed ? .completed : .localCleanupFailed
+        return result
     }
 
     func refreshRegisteredDevices() async {
@@ -12624,6 +12679,7 @@ final class AppModel: ObservableObject {
     /// Send reuses and byte-verifies the same permanent client-keyed entry before committing the
     /// durable message, so a failed or interrupted prewrite never becomes a false local record.
     func persistStagedMediaOriginal(mediaID: UUID, data: Data) async -> Bool {
+        let mediaDiagnosticsScope = LocalMediaPerformanceMonitor.shared.captureProducerScope()
         guard !data.isEmpty else { return false }
         let expectedAccountEpoch = accountEpoch
         let snapshot = await store.snapshot()
@@ -12652,7 +12708,10 @@ final class AppModel: ObservableObject {
             }
             return false
         }
-        LocalMediaPerformanceMonitor.shared.markPlayable(mediaID: mediaID)
+        LocalMediaPerformanceMonitor.shared.markPlayable(
+            mediaID: mediaID,
+            producerScope: mediaDiagnosticsScope
+        )
         return true
     }
 
@@ -12668,6 +12727,7 @@ final class AppModel: ObservableObject {
         moveSource: Bool,
         requiresConstantTimeClone: Bool = false
     ) async -> URL? {
+        let mediaDiagnosticsScope = LocalMediaPerformanceMonitor.shared.captureProducerScope()
         guard KitChatMediaLimits.fitsLocalOriginal(
             byteCount: byteCount,
             mediaType: mediaType
@@ -12695,7 +12755,10 @@ final class AppModel: ObservableObject {
             await SecureMediaFileCache.shared.remove(forStorageKey: key, userID: userID)
             return nil
         }
-        LocalMediaPerformanceMonitor.shared.markPlayable(mediaID: mediaID)
+        LocalMediaPerformanceMonitor.shared.markPlayable(
+            mediaID: mediaID,
+            producerScope: mediaDiagnosticsScope
+        )
         return destination
     }
 
@@ -12768,11 +12831,18 @@ final class AppModel: ObservableObject {
     ) {
         let normalized = mediaType.lowercased()
         guard normalized.hasPrefix("video/") || normalized.hasPrefix("audio/") else { return }
+        let mediaDiagnosticsScope = LocalMediaPerformanceMonitor.shared.captureProducerScope()
         Task { [weak self] in
             guard let duration = await Self.localMediaDuration(
                 fileURL: fileURL,
                 mediaType: mediaType
             ) else { return }
+            LocalMediaPerformanceMonitor.shared.updateMetadata(
+                mediaID: mediaID,
+                kind: KitChatMediaKind(mediaType: mediaType),
+                duration: duration,
+                producerScope: mediaDiagnosticsScope
+            )
             await self?.persistLocalMediaDuration(mediaID: mediaID, duration: duration)
         }
     }
@@ -13866,6 +13936,7 @@ final class AppModel: ObservableObject {
         conversationId: String,
         itemIndex: Int?
     ) async -> SecureMediaLoadPolicy.LocalFileItem? {
+        let mediaDiagnosticsScope = LocalMediaPerformanceMonitor.shared.captureProducerScope()
         let snapshot = await store.snapshot()
         guard let userID = snapshot.profile?.id,
               let resolved = SecureMediaLoadPolicy.resolve(
@@ -13959,7 +14030,11 @@ final class AppModel: ObservableObject {
         if let mediaID = UUID(uuidString: identity.id) {
             LocalMediaPerformanceMonitor.shared.beginRecipientHydration(
                 mediaID: mediaID,
-                descriptorObservedAt: record.createdAt
+                descriptorObservedAt: record.createdAt,
+                kind: KitChatMediaKind(mediaType: identity.type),
+                byteCount: identity.size,
+                duration: record.duration,
+                producerScope: mediaDiagnosticsScope
             )
         }
         let expectedAccountEpoch = accountEpoch
@@ -14027,7 +14102,10 @@ final class AppModel: ObservableObject {
             }
             await publishLatestState()
             if let mediaID = UUID(uuidString: hydrated.attachmentID) {
-                LocalMediaPerformanceMonitor.shared.markRecipientHydrated(mediaID: mediaID)
+                LocalMediaPerformanceMonitor.shared.markRecipientHydrated(
+                    mediaID: mediaID,
+                    producerScope: mediaDiagnosticsScope
+                )
             }
             guard let accessLease = await SecureMediaFileCache.shared.protectedOriginalLease(
                 forStorageKey: hydrated.attachmentID,
@@ -20240,6 +20318,7 @@ private func emailAccountValidationMessage(
 
 enum AuthUIError: LocalizedError {
     case missingChallenge, missingSession, missingUser, invalidResponse, staleResponse
+    case localDiagnosticsCleanupFailed
     var errorDescription: String? {
         switch self {
         case .missingChallenge: "Kit did not return an OTP challenge."
@@ -20247,6 +20326,8 @@ enum AuthUIError: LocalizedError {
         case .missingUser: "Sign-in completed without a usable profile."
         case .invalidResponse: "Kit returned an invalid authentication response. Start again."
         case .staleResponse: "That sign-in request is no longer active. Start again."
+        case .localDiagnosticsCleanupFailed:
+            "Protected data from the prior session could not be cleared. Restart and try again."
         }
     }
 }

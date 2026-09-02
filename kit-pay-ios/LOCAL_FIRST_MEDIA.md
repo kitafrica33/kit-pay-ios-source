@@ -87,7 +87,16 @@ substitute. Feature and server capability gates remain unchanged by this work.
 
 Privacy-safe signposts/logs separately measure capture-to-visible, capture-to-locally-playable,
 capture-to-encrypted, capture-to-server-accepted, and recipient-descriptor-to-local. The first two
-must remain independent of network latency.
+must remain independent of network latency. Testers can open **Profile > Media diagnostics**, clear
+the prior run, and export a bounded JSON report after the scenario (including after force-quit and
+relaunch). The protected report records report/event times, app/iOS versions, direction, coarse
+media kind, byte count, duration, those latency milestones, and video playback
+start/stall/failure/completion outcomes. It never exports message/caption content, contacts,
+conversations, identifiers, filenames, URLs, MIME payloads, or media content. The local report is
+cleared at sign-out and before a newly authenticated account is adopted. To reconnect a pending
+upload after process termination, the protected on-device store keeps only a SHA-256 token derived
+from its app-random media UUID. The raw UUID is never stored in this report, and the one-way token
+is omitted from every tester export.
 
 Hosted source/unit tests are necessary but not sufficient. Before enabling a broader rollout, run
 on physical supported iPhones with a 10-second, 2-minute, and 10-minute video; large photos; long

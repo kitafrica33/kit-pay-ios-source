@@ -6,6 +6,29 @@ final class AccountDeletionContractTests: XCTestCase {
     private let accountID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
     private let receiptID = "22222222-2222-4222-8222-222222222222"
 
+    func testSignOutCompletionRequiresDiagnosticsCleanup() {
+        XCTAssertEqual(
+            AccountSignOutResult.cleanupResult(
+                sessionCleanupSucceeded: true,
+                projectionCleanupSucceeded: true,
+                mediaCacheCleanupSucceeded: true,
+                diagnosticsCleanupSucceeded: true,
+                acceptedDeletionCleanupSucceeded: true
+            ),
+            .completed
+        )
+        XCTAssertEqual(
+            AccountSignOutResult.cleanupResult(
+                sessionCleanupSucceeded: true,
+                projectionCleanupSucceeded: true,
+                mediaCacheCleanupSucceeded: true,
+                diagnosticsCleanupSucceeded: false,
+                acceptedDeletionCleanupSucceeded: true
+            ),
+            .localCleanupFailed
+        )
+    }
+
     func testProtectedPreflightDecodesOnlyTheExactAndroidParityContract() throws {
         let preflight = try decode(
             AccountDeletionPreflightDTO.self,

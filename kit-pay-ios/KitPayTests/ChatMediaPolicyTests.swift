@@ -659,10 +659,18 @@ final class ChatMediaPolicyTests: XCTestCase {
         let monitor = LocalMediaPerformanceMonitor()
         let mediaID = UUID()
         let captured = Date(timeIntervalSince1970: 100)
-        monitor.begin(mediaID: mediaID, at: captured)
+        monitor.begin(
+            mediaID: mediaID,
+            at: captured,
+            producerScope: monitor.captureProducerScope()
+        )
 
         let visible = try XCTUnwrap(
-            monitor.markVisible(mediaID: mediaID, at: captured.addingTimeInterval(0.010))
+            monitor.markVisible(
+                mediaID: mediaID,
+                at: captured.addingTimeInterval(0.010),
+                producerScope: monitor.captureProducerScope()
+            )
         )
         XCTAssertEqual(
             try XCTUnwrap(visible.captureToVisibleMilliseconds),
@@ -672,7 +680,11 @@ final class ChatMediaPolicyTests: XCTestCase {
         XCTAssertNil(visible.captureToPlayableMilliseconds)
 
         let playable = try XCTUnwrap(
-            monitor.markPlayable(mediaID: mediaID, at: captured.addingTimeInterval(0.014))
+            monitor.markPlayable(
+                mediaID: mediaID,
+                at: captured.addingTimeInterval(0.014),
+                producerScope: monitor.captureProducerScope()
+            )
         )
         XCTAssertEqual(
             try XCTUnwrap(playable.captureToVisibleMilliseconds),
@@ -687,7 +699,11 @@ final class ChatMediaPolicyTests: XCTestCase {
 
         // A later view/tap cannot inflate the local-availability measurement.
         let repeated = try XCTUnwrap(
-            monitor.markPlayable(mediaID: mediaID, at: captured.addingTimeInterval(5))
+            monitor.markPlayable(
+                mediaID: mediaID,
+                at: captured.addingTimeInterval(5),
+                producerScope: monitor.captureProducerScope()
+            )
         )
         XCTAssertEqual(
             try XCTUnwrap(repeated.captureToPlayableMilliseconds),
@@ -696,7 +712,11 @@ final class ChatMediaPolicyTests: XCTestCase {
         )
 
         let encrypted = try XCTUnwrap(
-            monitor.markEncrypted(mediaID: mediaID, at: captured.addingTimeInterval(1))
+            monitor.markEncrypted(
+                mediaID: mediaID,
+                at: captured.addingTimeInterval(1),
+                producerScope: monitor.captureProducerScope()
+            )
         )
         XCTAssertEqual(
             try XCTUnwrap(encrypted.captureToEncryptedMilliseconds),
@@ -704,14 +724,22 @@ final class ChatMediaPolicyTests: XCTestCase {
             accuracy: 0.001
         )
         let accepted = try XCTUnwrap(
-            monitor.markServerAccepted(mediaID: mediaID, at: captured.addingTimeInterval(2))
+            monitor.markServerAccepted(
+                mediaID: mediaID,
+                at: captured.addingTimeInterval(2),
+                producerScope: monitor.captureProducerScope()
+            )
         )
         XCTAssertEqual(
             try XCTUnwrap(accepted.captureToServerAcceptedMilliseconds),
             2_000,
             accuracy: 0.001
         )
-        XCTAssertNil(monitor.markVisible(mediaID: mediaID, at: captured.addingTimeInterval(3)))
+        XCTAssertNil(monitor.markVisible(
+            mediaID: mediaID,
+            at: captured.addingTimeInterval(3),
+            producerScope: monitor.captureProducerScope()
+        ))
     }
 
     @MainActor
@@ -719,20 +747,32 @@ final class ChatMediaPolicyTests: XCTestCase {
         let monitor = LocalMediaPerformanceMonitor()
         let mediaID = UUID()
         let first = Date(timeIntervalSince1970: 200)
-        monitor.beginRecipientHydration(mediaID: mediaID, descriptorObservedAt: first)
         monitor.beginRecipientHydration(
             mediaID: mediaID,
-            descriptorObservedAt: first.addingTimeInterval(1)
+            descriptorObservedAt: first,
+            producerScope: monitor.captureProducerScope()
+        )
+        monitor.beginRecipientHydration(
+            mediaID: mediaID,
+            descriptorObservedAt: first.addingTimeInterval(1),
+            producerScope: monitor.captureProducerScope()
         )
         let hydrated = try XCTUnwrap(
-            monitor.markRecipientHydrated(mediaID: mediaID, at: first.addingTimeInterval(2.5))
+            monitor.markRecipientHydrated(
+                mediaID: mediaID,
+                at: first.addingTimeInterval(2.5),
+                producerScope: monitor.captureProducerScope()
+            )
         )
         XCTAssertEqual(
             try XCTUnwrap(hydrated.recipientDescriptorToLocalMilliseconds),
             2_500,
             accuracy: 0.001
         )
-        XCTAssertNil(monitor.markRecipientHydrated(mediaID: mediaID))
+        XCTAssertNil(monitor.markRecipientHydrated(
+            mediaID: mediaID,
+            producerScope: monitor.captureProducerScope()
+        ))
     }
 
     @MainActor
@@ -740,10 +780,18 @@ final class ChatMediaPolicyTests: XCTestCase {
         let monitor = LocalMediaPerformanceMonitor()
         let mediaID = UUID()
         let captured = Date(timeIntervalSince1970: 300)
-        monitor.begin(mediaID: mediaID, at: captured)
+        monitor.begin(
+            mediaID: mediaID,
+            at: captured,
+            producerScope: monitor.captureProducerScope()
+        )
 
         let accepted = try XCTUnwrap(
-            monitor.markServerAccepted(mediaID: mediaID, at: captured.addingTimeInterval(0.004))
+            monitor.markServerAccepted(
+                mediaID: mediaID,
+                at: captured.addingTimeInterval(0.004),
+                producerScope: monitor.captureProducerScope()
+            )
         )
         XCTAssertEqual(
             try XCTUnwrap(accepted.captureToServerAcceptedMilliseconds),
@@ -751,7 +799,11 @@ final class ChatMediaPolicyTests: XCTestCase {
             accuracy: 0.001
         )
         let visible = try XCTUnwrap(
-            monitor.markVisible(mediaID: mediaID, at: captured.addingTimeInterval(0.009))
+            monitor.markVisible(
+                mediaID: mediaID,
+                at: captured.addingTimeInterval(0.009),
+                producerScope: monitor.captureProducerScope()
+            )
         )
         XCTAssertEqual(
             try XCTUnwrap(visible.captureToVisibleMilliseconds),
@@ -759,14 +811,442 @@ final class ChatMediaPolicyTests: XCTestCase {
             accuracy: 0.001
         )
         let playable = try XCTUnwrap(
-            monitor.markPlayable(mediaID: mediaID, at: captured.addingTimeInterval(0.011))
+            monitor.markPlayable(
+                mediaID: mediaID,
+                at: captured.addingTimeInterval(0.011),
+                producerScope: monitor.captureProducerScope()
+            )
         )
         XCTAssertEqual(
             try XCTUnwrap(playable.captureToPlayableMilliseconds),
             11,
             accuracy: 0.001
         )
-        XCTAssertNil(monitor.markVisible(mediaID: mediaID, at: captured.addingTimeInterval(1)))
+        XCTAssertNil(monitor.markVisible(
+            mediaID: mediaID,
+            at: captured.addingTimeInterval(1),
+            producerScope: monitor.captureProducerScope()
+        ))
+    }
+
+    @MainActor
+    func testMediaDiagnosticExportContainsMeasurementsButNoMediaIdentifier() throws {
+        let monitor = LocalMediaPerformanceMonitor()
+        let mediaID = UUID()
+        let captured = Date(timeIntervalSince1970: 500)
+        monitor.begin(
+            mediaID: mediaID,
+            at: captured,
+            producerScope: monitor.captureProducerScope()
+        )
+        monitor.begin(
+            mediaID: mediaID,
+            at: captured.addingTimeInterval(1),
+            kind: .video,
+            byteCount: 4_096,
+            duration: 12.5,
+            producerScope: monitor.captureProducerScope()
+        )
+        monitor.markVisible(
+            mediaID: mediaID,
+            at: captured.addingTimeInterval(0.010),
+            producerScope: monitor.captureProducerScope()
+        )
+        monitor.markPlayable(
+            mediaID: mediaID,
+            at: captured.addingTimeInterval(0.020),
+            producerScope: monitor.captureProducerScope()
+        )
+        monitor.markEncrypted(
+            mediaID: mediaID,
+            at: captured.addingTimeInterval(1),
+            producerScope: monitor.captureProducerScope()
+        )
+        monitor.markServerAccepted(
+            mediaID: mediaID,
+            at: captured.addingTimeInterval(2),
+            producerScope: monitor.captureProducerScope()
+        )
+        let playbackOutcomes: [(LocalMediaPlaybackOutcome, Double?)] = [
+            (.preparationFailed, nil),
+            (.started, 0.25),
+            (.stalled, 3),
+            (.failedToEnd, 8),
+            (.completed, 12.5)
+        ]
+        for (outcome, position) in playbackOutcomes {
+            monitor.recordPlayback(
+                outcome: outcome,
+                mediaID: mediaID,
+                isOutgoing: true,
+                byteCount: 4_096,
+                expectedDuration: 12.5,
+                position: position,
+                producerScope: monitor.captureProducerScope()
+            )
+        }
+
+        let report = monitor.exportReport()
+        XCTAssertFalse(report.localizedCaseInsensitiveContains(mediaID.uuidString))
+        let root = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(report.utf8)) as? [String: Any]
+        )
+        XCTAssertEqual(root["schemaVersion"] as? Int, 1)
+        XCTAssertEqual(root["recordCount"] as? Int, 6)
+        let records = try XCTUnwrap(root["records"] as? [[String: Any]])
+        let timing = try XCTUnwrap(records.first)
+        XCTAssertEqual(timing["event"] as? String, "media_timing")
+        XCTAssertEqual(timing["direction"] as? String, "outgoing")
+        XCTAssertEqual(timing["kind"] as? String, "video")
+        XCTAssertEqual(timing["byteCount"] as? Int, 4_096)
+        XCTAssertEqual(timing["durationSeconds"] as? Double, 12.5)
+        XCTAssertEqual(
+            try XCTUnwrap(timing["captureToVisibleMilliseconds"] as? Double),
+            10,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(timing["captureToPlayableMilliseconds"] as? Double),
+            20,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(timing["captureToEncryptedMilliseconds"] as? Double),
+            1_000,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(timing["captureToServerAcceptedMilliseconds"] as? Double),
+            2_000,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            records.dropFirst().compactMap { $0["playbackOutcome"] as? String },
+            ["preparation_failed", "started", "stalled", "failed_to_end", "completed"]
+        )
+    }
+
+    @MainActor
+    func testMediaDiagnosticsPersistAcrossMonitorRecreationAndCanBeCleared() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "kit-media-diagnostics-tests-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        let persistenceURL = directory.appendingPathComponent("report.json")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let mediaID = UUID()
+
+        let first = LocalMediaPerformanceMonitor(persistenceURL: persistenceURL)
+        first.beginRecipientHydration(
+            mediaID: mediaID,
+            descriptorObservedAt: Date(timeIntervalSince1970: 700),
+            kind: .voice,
+            byteCount: 8_192,
+            duration: 4,
+            producerScope: first.captureProducerScope()
+        )
+        first.markRecipientHydrated(
+            mediaID: mediaID,
+            at: Date(timeIntervalSince1970: 701.5),
+            producerScope: first.captureProducerScope()
+        )
+        first.flushPendingPersistence()
+        let persistedText = try String(contentsOf: persistenceURL, encoding: .utf8)
+        XCTAssertFalse(persistedText.localizedCaseInsensitiveContains(mediaID.uuidString))
+        let attributes = try FileManager.default.attributesOfItem(atPath: persistenceURL.path)
+#if targetEnvironment(simulator)
+        if let protection = attributes[.protectionKey] as? FileProtectionType {
+            XCTAssertEqual(protection, .completeUntilFirstUserAuthentication)
+        }
+#else
+        XCTAssertEqual(
+            attributes[.protectionKey] as? FileProtectionType,
+            .completeUntilFirstUserAuthentication
+        )
+#endif
+        let persistedRoot = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(persistedText.utf8)) as? [String: Any]
+        )
+        let persistedRecords = try XCTUnwrap(
+            persistedRoot["records"] as? [[String: Any]]
+        )
+        XCTAssertNil(persistedRecords.first?["id"])
+        let correlationToken = try XCTUnwrap(
+            persistedRecords.first?["localCorrelationTokenSHA256"] as? String
+        )
+        XCTAssertEqual(correlationToken.count, 64)
+        XCTAssertTrue(correlationToken.allSatisfy { $0.isHexDigit })
+
+        let relaunched = LocalMediaPerformanceMonitor(persistenceURL: persistenceURL)
+        XCTAssertEqual(relaunched.reportRecordCount, 1)
+        // The raw media ID is never persisted. Playback supplies its own coarse metadata, and the
+        // protected one-way correlation token is still omitted from the exported report.
+        relaunched.recordPlayback(
+            outcome: .started,
+            mediaID: mediaID,
+            isOutgoing: false,
+            byteCount: 8_192,
+            expectedDuration: 4,
+            position: 0.25,
+            producerScope: relaunched.captureProducerScope()
+        )
+        let report = relaunched.exportReport()
+        XCTAssertFalse(report.localizedCaseInsensitiveContains(mediaID.uuidString))
+        XCTAssertTrue(report.contains("recipientDescriptorToLocalMilliseconds"))
+        XCTAssertTrue(report.contains("1500"))
+        let reportRoot = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(report.utf8)) as? [String: Any]
+        )
+        let reportRecords = try XCTUnwrap(reportRoot["records"] as? [[String: Any]])
+        XCTAssertEqual(reportRecords.last?["byteCount"] as? Int, 8_192)
+        XCTAssertEqual(reportRecords.last?["direction"] as? String, "incoming")
+
+        XCTAssertTrue(relaunched.clearReport())
+        XCTAssertEqual(relaunched.reportRecordCount, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: persistenceURL.path))
+        XCTAssertEqual(
+            LocalMediaPerformanceMonitor(persistenceURL: persistenceURL).reportRecordCount,
+            0
+        )
+    }
+
+    @MainActor
+    func testMediaDiagnosticsCompleteOutgoingTimingAfterMonitorRecreation() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "kit-media-diagnostics-relaunch-tests-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        let persistenceURL = directory.appendingPathComponent("report.json")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let mediaID = UUID()
+        let captured = Date(timeIntervalSince1970: 900)
+
+        let first = LocalMediaPerformanceMonitor(persistenceURL: persistenceURL)
+        first.begin(
+            mediaID: mediaID,
+            at: captured,
+            kind: .video,
+            byteCount: 16_384,
+            duration: 20,
+            producerScope: first.captureProducerScope()
+        )
+        first.markVisible(
+            mediaID: mediaID,
+            at: captured.addingTimeInterval(0.010),
+            producerScope: first.captureProducerScope()
+        )
+        first.markPlayable(
+            mediaID: mediaID,
+            at: captured.addingTimeInterval(0.020),
+            producerScope: first.captureProducerScope()
+        )
+        first.flushPendingPersistence()
+
+        let relaunched = LocalMediaPerformanceMonitor(persistenceURL: persistenceURL)
+        let encrypted = try XCTUnwrap(
+            relaunched.markEncrypted(
+                mediaID: mediaID,
+                at: captured.addingTimeInterval(5),
+                producerScope: relaunched.captureProducerScope()
+            )
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(encrypted.captureToEncryptedMilliseconds),
+            5_000,
+            accuracy: 0.001
+        )
+        let accepted = try XCTUnwrap(
+            relaunched.markServerAccepted(
+                mediaID: mediaID,
+                at: captured.addingTimeInterval(8),
+                producerScope: relaunched.captureProducerScope()
+            )
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(accepted.captureToServerAcceptedMilliseconds),
+            8_000,
+            accuracy: 0.001
+        )
+
+        relaunched.flushPendingPersistence()
+        let report = relaunched.exportReport()
+        XCTAssertFalse(report.localizedCaseInsensitiveContains(mediaID.uuidString))
+        XCTAssertFalse(report.contains("localCorrelationTokenSHA256"))
+        let reportRoot = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(report.utf8)) as? [String: Any]
+        )
+        let records = try XCTUnwrap(reportRoot["records"] as? [[String: Any]])
+        let timing = try XCTUnwrap(records.first)
+        XCTAssertEqual(
+            try XCTUnwrap(timing["captureToVisibleMilliseconds"] as? Double),
+            10,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(timing["captureToPlayableMilliseconds"] as? Double),
+            20,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(timing["captureToEncryptedMilliseconds"] as? Double),
+            5_000,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(timing["captureToServerAcceptedMilliseconds"] as? Double),
+            8_000,
+            accuracy: 0.001
+        )
+    }
+
+    @MainActor
+    func testMediaDiagnosticsSuspendAcrossAccountBoundaryUntilFreshGenerationBegins() throws {
+        let monitor = LocalMediaPerformanceMonitor()
+        let mediaID = UUID()
+        let freshCaptured = Date(timeIntervalSince1970: 900)
+        let staleScope = monitor.captureProducerScope()
+        monitor.begin(
+            mediaID: mediaID,
+            kind: .image,
+            byteCount: 1_024,
+            producerScope: staleScope
+        )
+        XCTAssertEqual(monitor.reportRecordCount, 1)
+
+        XCTAssertTrue(monitor.suspendRecordingAndClearReport())
+        monitor.begin(
+            mediaID: mediaID,
+            kind: .video,
+            byteCount: 2_048,
+            producerScope: staleScope
+        )
+        XCTAssertEqual(monitor.reportRecordCount, 0)
+
+        monitor.resumeRecordingForFreshAccount()
+        let freshScope = monitor.captureProducerScope()
+        monitor.begin(
+            mediaID: mediaID,
+            at: freshCaptured,
+            kind: .document,
+            byteCount: 4_096,
+            duration: 12,
+            producerScope: freshScope
+        )
+
+        // An attachment UUID can legitimately recur under a different account. Every mutation
+        // must reject the prior producer generation even when a fresh row has the same UUID.
+        monitor.begin(
+            mediaID: mediaID,
+            at: freshCaptured.addingTimeInterval(-100),
+            direction: .incoming,
+            kind: .video,
+            byteCount: 2_048,
+            duration: 3,
+            producerScope: staleScope
+        )
+        monitor.updateMetadata(
+            mediaID: mediaID,
+            direction: .incoming,
+            kind: .voice,
+            byteCount: 8_192,
+            duration: 4,
+            producerScope: staleScope
+        )
+        XCTAssertNil(monitor.markVisible(
+            mediaID: mediaID,
+            at: freshCaptured.addingTimeInterval(1),
+            producerScope: staleScope
+        ))
+        XCTAssertNil(monitor.markPlayable(
+            mediaID: mediaID,
+            at: freshCaptured.addingTimeInterval(2),
+            producerScope: staleScope
+        ))
+        XCTAssertNil(monitor.markEncrypted(
+            mediaID: mediaID,
+            at: freshCaptured.addingTimeInterval(3),
+            producerScope: staleScope
+        ))
+        XCTAssertNil(monitor.markServerAccepted(
+            mediaID: mediaID,
+            at: freshCaptured.addingTimeInterval(4),
+            producerScope: staleScope
+        ))
+        monitor.beginRecipientHydration(
+            mediaID: mediaID,
+            descriptorObservedAt: freshCaptured.addingTimeInterval(5),
+            kind: .audio,
+            byteCount: 16_384,
+            duration: 5,
+            producerScope: staleScope
+        )
+        XCTAssertNil(monitor.markRecipientHydrated(
+            mediaID: mediaID,
+            at: freshCaptured.addingTimeInterval(6),
+            producerScope: staleScope
+        ))
+        monitor.recordPlayback(
+            outcome: .started,
+            mediaID: mediaID,
+            isOutgoing: true,
+            byteCount: 2_048,
+            expectedDuration: 3,
+            position: 0.25,
+            producerScope: staleScope
+        )
+
+        let freshVisible = try XCTUnwrap(monitor.markVisible(
+            mediaID: mediaID,
+            at: freshCaptured.addingTimeInterval(0.010),
+            producerScope: freshScope
+        ))
+        XCTAssertEqual(
+            try XCTUnwrap(freshVisible.captureToVisibleMilliseconds),
+            10,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(monitor.reportRecordCount, 1)
+
+        let root = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(monitor.exportReport().utf8))
+                as? [String: Any]
+        )
+        let records = try XCTUnwrap(root["records"] as? [[String: Any]])
+        let timing = try XCTUnwrap(records.first)
+        XCTAssertEqual(timing["direction"] as? String, "outgoing")
+        XCTAssertEqual(timing["kind"] as? String, "document")
+        XCTAssertEqual(timing["byteCount"] as? Int, 4_096)
+        XCTAssertEqual(timing["durationSeconds"] as? Double, 12)
+        XCTAssertNil(timing["captureToPlayableMilliseconds"])
+        XCTAssertNil(timing["captureToEncryptedMilliseconds"])
+        XCTAssertNil(timing["captureToServerAcceptedMilliseconds"])
+        XCTAssertNil(timing["recipientDescriptorToLocalMilliseconds"])
+    }
+
+    @MainActor
+    func testMediaDiagnosticsKeepOnlyNewestBoundedRecords() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "kit-media-diagnostics-bound-tests-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        let persistenceURL = directory.appendingPathComponent("report.json")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let monitor = LocalMediaPerformanceMonitor(persistenceURL: persistenceURL)
+        for index in 0..<300 {
+            monitor.begin(
+                mediaID: UUID(),
+                at: Date(timeIntervalSince1970: TimeInterval(index)),
+                kind: .image,
+                byteCount: index + 1,
+                producerScope: monitor.captureProducerScope()
+            )
+        }
+        XCTAssertEqual(monitor.reportRecordCount, 256)
+        monitor.flushPendingPersistence()
+        XCTAssertEqual(
+            LocalMediaPerformanceMonitor(persistenceURL: persistenceURL).reportRecordCount,
+            256
+        )
     }
 
     func testHydrationPassAdmitsCompleteEightItemMessagesWithBoundedConcurrency() {

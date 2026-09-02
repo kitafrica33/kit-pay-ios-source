@@ -1471,6 +1471,7 @@ struct ConversationView: View {
     @StateObject private var callMedia = CallMediaCoordinator.shared
     @ObservedObject private var callTransport = CallMediaCoordinator.shared.media
     let conversation: Conversation
+    private let mediaDiagnosticsProducerScope: LocalMediaDiagnosticProducerScope?
     @State private var draft = ""
     @State private var showPhotoPicker = false
     @State private var selectedPhotoItems: [PhotosPickerItem] = []
@@ -1578,6 +1579,7 @@ struct ConversationView: View {
 
     init(conversation: Conversation) {
         self.conversation = conversation
+        mediaDiagnosticsProducerScope = LocalMediaPerformanceMonitor.shared.captureProducerScope()
         _incomingSoundPolicy = State(
             initialValue: VisibleConversationSoundPolicy(conversationID: conversation.id)
         )
@@ -3043,7 +3045,9 @@ struct ConversationView: View {
                             fileURL: fileURL,
                             mediaType: presentation.mediaType,
                             expectedByteCount: presentation.byteCount,
-                            protectedOriginalLease: nil
+                            protectedOriginalLease: nil,
+                            mediaID: presentation.mediaID,
+                            isOutgoing: true
                         ) {
                             closeStagedAttachmentPresentation(presentation)
                         }
@@ -4632,7 +4636,10 @@ struct ConversationView: View {
                 .allowsHitTesting(false)
         }
         .onAppear {
-            LocalMediaPerformanceMonitor.shared.markVisible(mediaID: attachment.id)
+            LocalMediaPerformanceMonitor.shared.markVisible(
+                mediaID: attachment.id,
+                producerScope: mediaDiagnosticsProducerScope
+            )
         }
     }
 
@@ -4684,7 +4691,10 @@ struct ConversationView: View {
                         }
                     }
                     .onAppear {
-                        LocalMediaPerformanceMonitor.shared.markVisible(mediaID: attachment.id)
+                        LocalMediaPerformanceMonitor.shared.markVisible(
+                            mediaID: attachment.id,
+                            producerScope: mediaDiagnosticsProducerScope
+                        )
                     }
                     .accessibilityElement(children: .contain)
                     .accessibilityLabel(attachment.displayName)
@@ -4788,7 +4798,10 @@ struct ConversationView: View {
                 ownsTemporaryFile: ownsTemporaryFile
             )
         }
-        LocalMediaPerformanceMonitor.shared.markPlayable(mediaID: attachment.id)
+        LocalMediaPerformanceMonitor.shared.markPlayable(
+            mediaID: attachment.id,
+            producerScope: mediaDiagnosticsProducerScope
+        )
     }
 
     private func closeStagedAttachmentPresentation(
@@ -5273,6 +5286,7 @@ struct ConversationView: View {
                 else { return [] }
                 return [KitGalleryItem(
                     messageID: message.id,
+                    mediaID: UUID(uuidString: record.id) ?? message.id,
                     itemIndex: nil,
                     conversationID: conversation.id,
                     mediaType: pending.mediaType,
@@ -5289,6 +5303,7 @@ struct ConversationView: View {
                     guard kind == .image || kind == .video else { return nil }
                     return KitGalleryItem(
                         messageID: message.id,
+                        mediaID: UUID(uuidString: item.attachmentID) ?? message.id,
                         itemIndex: index,
                         conversationID: conversation.id,
                         mediaType: item.mediaType,
@@ -5305,6 +5320,7 @@ struct ConversationView: View {
                 guard kind == .image || kind == .video else { return [] }
                 return [KitGalleryItem(
                     messageID: message.id,
+                    mediaID: UUID(uuidString: descriptor.attachmentID) ?? message.id,
                     itemIndex: nil,
                     conversationID: conversation.id,
                     mediaType: descriptor.mediaType,
@@ -5321,6 +5337,7 @@ struct ConversationView: View {
                 guard kind == .image || kind == .video else { return nil }
                 return KitGalleryItem(
                     messageID: message.id,
+                    mediaID: UUID(uuidString: item.attachmentID) ?? message.id,
                     itemIndex: index,
                     conversationID: conversation.id,
                     mediaType: item.mediaType,
@@ -7038,7 +7055,13 @@ struct ConversationView: View {
             }
             VoiceNoteDraftRegistry.shared.release(conversation.id)
             let mediaID = UUID()
-            LocalMediaPerformanceMonitor.shared.begin(mediaID: mediaID)
+            LocalMediaPerformanceMonitor.shared.begin(
+                mediaID: mediaID,
+                kind: .voice,
+                byteCount: recording.segments.reduce(0) { $0 + $1.byteCount },
+                duration: recording.duration,
+                producerScope: mediaDiagnosticsProducerScope
+            )
             var sources: [LocalMediaOriginalSource] = []
             var playableURLs: [URL] = []
             var importedIDs: [UUID] = []
@@ -7121,7 +7144,10 @@ struct ConversationView: View {
             return
         }
         let retryMediaID = UUID()
-        LocalMediaPerformanceMonitor.shared.begin(mediaID: retryMediaID)
+        LocalMediaPerformanceMonitor.shared.begin(
+            mediaID: retryMediaID,
+            producerScope: mediaDiagnosticsProducerScope
+        )
         guard let permanentURL = await model.persistStagedMediaOriginal(
             mediaID: retryMediaID,
             sourceURL: retryURL,
@@ -7366,7 +7392,11 @@ struct ConversationView: View {
         }
         LocalMediaPerformanceMonitor.shared.begin(
             mediaID: attachment.id,
-            at: attachment.acceptedAt
+            at: attachment.acceptedAt,
+            kind: attachment.kind,
+            byteCount: attachment.byteCount,
+            duration: attachment.duration,
+            producerScope: mediaDiagnosticsProducerScope
         )
         stagedAttachments.append(attachment)
         persistDraftImmediately()
@@ -7428,7 +7458,8 @@ struct ConversationView: View {
                     let mediaType = libraryVideoMediaType(for: item)
                     LocalMediaPerformanceMonitor.shared.begin(
                         mediaID: mediaID,
-                        at: acceptedAt
+                        at: acceptedAt,
+                        producerScope: mediaDiagnosticsProducerScope
                     )
                     guard let permanentURL = await model.persistStagedMediaOriginal(
                         mediaID: mediaID,
@@ -7474,7 +7505,8 @@ struct ConversationView: View {
                     let sourceMediaType = libraryImageMediaType(for: item, url: picked.url)
                     LocalMediaPerformanceMonitor.shared.begin(
                         mediaID: mediaID,
-                        at: acceptedAt
+                        at: acceptedAt,
+                        producerScope: mediaDiagnosticsProducerScope
                     )
                     guard let permanentURL = await model.persistStagedMediaOriginal(
                         mediaID: mediaID,
@@ -7578,6 +7610,12 @@ struct ConversationView: View {
                 fileURL: fileURL,
                 mediaType: mediaType
             ) else { return }
+            LocalMediaPerformanceMonitor.shared.updateMetadata(
+                mediaID: mediaID,
+                kind: KitChatMediaKind(mediaType: mediaType),
+                duration: duration,
+                producerScope: mediaDiagnosticsProducerScope
+            )
             if let index = stagedAttachments.firstIndex(where: { $0.id == mediaID }) {
                 stagedAttachments[index] = stagedAttachments[index]
                     .replacingDuration(duration)
@@ -7599,7 +7637,11 @@ struct ConversationView: View {
         acceptedAt: Date,
         opensEditorAfterStaging: Bool
     ) {
-        LocalMediaPerformanceMonitor.shared.begin(mediaID: mediaID, at: acceptedAt)
+        LocalMediaPerformanceMonitor.shared.begin(
+            mediaID: mediaID,
+            at: acceptedAt,
+            producerScope: mediaDiagnosticsProducerScope
+        )
         stageAttachment(ChatStagedAttachment(
             preparingImage: mediaID,
             previewImage: preview,
@@ -7772,7 +7814,8 @@ struct ConversationView: View {
             let editedMediaID = UUID()
             LocalMediaPerformanceMonitor.shared.begin(
                 mediaID: editedMediaID,
-                at: existing.acceptedAt
+                at: existing.acceptedAt,
+                producerScope: mediaDiagnosticsProducerScope
             )
             guard await model.persistStagedMediaOriginal(
                 mediaID: editedMediaID,
@@ -7808,7 +7851,11 @@ struct ConversationView: View {
         acceptedAt: Date,
         opensEditorAfterStaging: Bool = false
     ) {
-        LocalMediaPerformanceMonitor.shared.begin(mediaID: mediaID, at: acceptedAt)
+        LocalMediaPerformanceMonitor.shared.begin(
+            mediaID: mediaID,
+            at: acceptedAt,
+            producerScope: mediaDiagnosticsProducerScope
+        )
         attachmentLoadGeneration &+= 1
         let generation = attachmentLoadGeneration
         isLoadingAttachment = true
@@ -7905,7 +7952,11 @@ struct ConversationView: View {
             }
             let mediaType = libraryVideoMediaType(for: item)
             let mediaID = UUID()
-            LocalMediaPerformanceMonitor.shared.begin(mediaID: mediaID, at: acceptedAt)
+            LocalMediaPerformanceMonitor.shared.begin(
+                mediaID: mediaID,
+                at: acceptedAt,
+                producerScope: mediaDiagnosticsProducerScope
+            )
             guard let permanentURL = await model.persistStagedMediaOriginal(
                 mediaID: mediaID,
                 sourceURL: picked.url,
@@ -8025,7 +8076,8 @@ struct ConversationView: View {
                 let editedMediaID = UUID()
                 LocalMediaPerformanceMonitor.shared.begin(
                     mediaID: editedMediaID,
-                    at: existing.acceptedAt
+                    at: existing.acceptedAt,
+                    producerScope: mediaDiagnosticsProducerScope
                 )
                 guard let permanentURL = await model.persistStagedMediaOriginal(
                     mediaID: editedMediaID,
@@ -8117,7 +8169,8 @@ struct ConversationView: View {
         for item in batch.items {
             LocalMediaPerformanceMonitor.shared.begin(
                 mediaID: item.id,
-                at: batch.receivedAt
+                at: batch.receivedAt,
+                producerScope: mediaDiagnosticsProducerScope
             )
             guard generation == attachmentLoadGeneration else {
                 await discardPreparedOriginals()

@@ -13,6 +13,8 @@ import UIKit
 /// attachment key material, so loaders re-read the persisted row by identity instead.
 struct KitGalleryItem: Identifiable, Equatable {
     let messageID: UUID
+    /// Runtime-only attachment identity used to correlate local diagnostics; never exported.
+    let mediaID: UUID
     /// Index into the KITMEDIA2 descriptor's display-ordered items; nil for KITMEDIA1.
     let itemIndex: Int?
     let conversationID: String
@@ -946,6 +948,8 @@ private struct GalleryVideoPage: View {
                     protectedOriginalLease: loaded.localFileLease,
                     mediaType: loaded.mediaType,
                     expectedByteCount: loaded.byteCount,
+                    mediaID: item.mediaID,
+                    isOutgoing: item.isOutgoing,
                     galleryIdentity: identity,
                     restoreFromPictureInPicture: restoreFromPictureInPicture
                 )
@@ -953,6 +957,8 @@ private struct GalleryVideoPage: View {
                 didPrepare = await controller.prepare(
                     data: loaded.data,
                     mediaType: loaded.mediaType,
+                    mediaID: item.mediaID,
+                    isOutgoing: item.isOutgoing,
                     galleryIdentity: identity,
                     restoreFromPictureInPicture: restoreFromPictureInPicture
                 )
@@ -1091,6 +1097,11 @@ private final class GalleryVideoController: ObservableObject {
     private var stallObserver: NSObjectProtocol?
     private var failureObserver: NSObjectProtocol?
     private var preparationID: UUID?
+    private var diagnosticMediaID: UUID?
+    private var diagnosticIsOutgoing = false
+    private var diagnosticByteCount: Int?
+    private let diagnosticProducerScope = LocalMediaPerformanceMonitor.shared.captureProducerScope()
+    private var didRecordPlaybackStart = false
     /// The layer this page is drawing into, reported by `PlayerLayerView`. Picture in Picture
     /// hands off a *layer*, so the window can only be armed once one exists.
     private weak var playerLayer: AVPlayerLayer?
@@ -1103,17 +1114,23 @@ private final class GalleryVideoController: ObservableObject {
     func prepare(
         data: Data,
         mediaType: String,
+        mediaID: UUID,
+        isOutgoing: Bool,
         galleryIdentity: ChatVideoGalleryIdentity,
         restoreFromPictureInPicture: @escaping (ChatVideoGalleryIdentity) -> Void
     ) async -> Bool {
         self.galleryIdentity = galleryIdentity
         self.restoreFromPictureInPicture = restoreFromPictureInPicture
         guard player == nil, !isPreparing else { return player != nil }
+        diagnosticMediaID = mediaID
+        diagnosticIsOutgoing = isOutgoing
+        diagnosticByteCount = data.count
+        didRecordPlaybackStart = false
         guard let url = try? ChatMediaTempFiles.writeTemporaryFile(
             data: data,
             mediaType: mediaType
         ) else {
-            errorMessage = ChatVideoPlaybackPreparationError.invalidFile.errorDescription
+            failPreparation(ChatVideoPlaybackPreparationError.invalidFile)
             return false
         }
         return await prepare(
@@ -1122,6 +1139,8 @@ private final class GalleryVideoController: ObservableObject {
             protectedOriginalLease: nil,
             mediaType: mediaType,
             expectedByteCount: data.count,
+            mediaID: mediaID,
+            isOutgoing: isOutgoing,
             galleryIdentity: galleryIdentity,
             restoreFromPictureInPicture: restoreFromPictureInPicture
         )
@@ -1133,6 +1152,8 @@ private final class GalleryVideoController: ObservableObject {
         protectedOriginalLease: SecureMediaOriginalAccessLease?,
         mediaType: String,
         expectedByteCount: Int,
+        mediaID: UUID,
+        isOutgoing: Bool,
         galleryIdentity: ChatVideoGalleryIdentity,
         restoreFromPictureInPicture: @escaping (ChatVideoGalleryIdentity) -> Void
     ) async -> Bool {
@@ -1142,6 +1163,10 @@ private final class GalleryVideoController: ObservableObject {
             if ownsFile { ChatMediaTempFiles.removeTemporaryFile(url) }
             return player != nil
         }
+        diagnosticMediaID = mediaID
+        diagnosticIsOutgoing = isOutgoing
+        diagnosticByteCount = expectedByteCount
+        didRecordPlaybackStart = false
         let identifier = UUID()
         preparationID = identifier
         sourceFileURL = url
@@ -1184,7 +1209,10 @@ private final class GalleryVideoController: ObservableObject {
                 Task { @MainActor in
                     guard let self, !self.isScrubbing else { return }
                     let seconds = time.seconds
-                    if seconds.isFinite { self.currentTime = seconds }
+                    if seconds.isFinite {
+                        self.currentTime = seconds
+                        self.recordPlaybackStartedIfNeeded(position: seconds)
+                    }
                 }
             }
             observePlaybackItem(item)
@@ -1242,6 +1270,9 @@ private final class GalleryVideoController: ObservableObject {
         protectedOriginalLease = nil
         galleryIdentity = nil
         restoreFromPictureInPicture = nil
+        diagnosticMediaID = nil
+        diagnosticByteCount = nil
+        didRecordPlaybackStart = false
     }
 
     func togglePlayback() {
@@ -1344,6 +1375,17 @@ private final class GalleryVideoController: ObservableObject {
         item: AVPlayerItem
     ) {
         guard playerItem === item else { return }
+        switch interruption {
+        case .stalled:
+            if didRecordPlaybackStart {
+                recordPlayback(.stalled, position: item.currentTime().seconds)
+            }
+        case .failed:
+            recordPlayback(
+                didRecordPlaybackStart ? .failedToEnd : .preparationFailed,
+                position: item.currentTime().seconds
+            )
+        }
         switch ChatVideoPlaybackFailurePolicy.action(for: interruption) {
         case .letPlayerRecover:
             // A local decoder stall remains AVFoundation-owned. Mutating the current item from
@@ -1357,7 +1399,12 @@ private final class GalleryVideoController: ObservableObject {
     }
 
     private func handlePlaybackEnded() {
+        guard isPlaying else { return }
+        let position = playerItem?.currentTime().seconds ?? currentTime
+        recordPlaybackStartedIfNeeded(position: position)
+        recordPlayback(.completed, position: position)
         isPlaying = false
+        didRecordPlaybackStart = false
         currentTime = 0
         player?.seek(to: .zero)
         // Nothing left to watch: the floating window closes itself rather than sitting on the
@@ -1365,7 +1412,27 @@ private final class GalleryVideoController: ObservableObject {
         ChatVideoPictureInPicture.shared.stopForPlaybackEnd(owner: self)
     }
 
+    private func recordPlaybackStartedIfNeeded(position: Double) {
+        guard isPlaying, !didRecordPlaybackStart, position.isFinite, position > 0 else { return }
+        didRecordPlaybackStart = true
+        recordPlayback(.started, position: position)
+    }
+
+    private func recordPlayback(_ outcome: LocalMediaPlaybackOutcome, position: Double?) {
+        guard let mediaID = diagnosticMediaID else { return }
+        LocalMediaPerformanceMonitor.shared.recordPlayback(
+            outcome: outcome,
+            mediaID: mediaID,
+            isOutgoing: diagnosticIsOutgoing,
+            byteCount: diagnosticByteCount,
+            expectedDuration: duration.isFinite && duration > 0 ? duration : nil,
+            position: position.flatMap { $0.isFinite && $0 >= 0 ? $0 : nil },
+            producerScope: diagnosticProducerScope
+        )
+    }
+
     private func failPreparation(_ error: Error) {
+        recordPlayback(.preparationFailed, position: nil)
         isPreparing = false
         errorMessage = (error as? LocalizedError)?.errorDescription
             ?? "This video could not be played."

@@ -3499,6 +3499,8 @@ actor SecureMessagingExchangeCoordinator {
         forUserID userID: String
     ) async throws -> SecureMessagingQueueResult {
         let local = try canonicalUUID(userID, error: .invalidAccount)
+        let mediaDiagnosticsProducerScope = await LocalMediaPerformanceMonitor.shared
+            .captureProducerScope()
         let snapshot = await store.snapshot()
         guard snapshot.profile?.id == local,
               let command = snapshot.outbox.first(where: {
@@ -3722,7 +3724,8 @@ actor SecureMessagingExchangeCoordinator {
                     keyMaterial: keyMaterial,
                     capabilities: nil,
                     command: command,
-                    message: uploadingMessage
+                    message: uploadingMessage,
+                    mediaDiagnosticsProducerScope: mediaDiagnosticsProducerScope
                 )
                 uploadingMessage = uploaded.message
                 ownedMessage = uploadingMessage
@@ -3872,7 +3875,8 @@ actor SecureMessagingExchangeCoordinator {
                             keyMaterial: keyMaterial,
                             capabilities: capabilities,
                             command: command,
-                            message: currentMessage
+                            message: currentMessage,
+                            mediaDiagnosticsProducerScope: mediaDiagnosticsProducerScope
                         )
                         currentMessage = uploaded.message
                         ownedMessage = currentMessage
@@ -4372,7 +4376,8 @@ actor SecureMessagingExchangeCoordinator {
         keyMaterial: Data,
         capabilities suppliedCapabilities: CapabilitiesDTO?,
         command: OfflineCommand,
-        message: LocalMessage
+        message: LocalMessage,
+        mediaDiagnosticsProducerScope: LocalMediaDiagnosticProducerScope?
     ) async throws -> (descriptor: KitMediaMessageDescriptor, message: LocalMessage) {
         guard SecureMessagingWirePolicy.isCanonicalUUID(sourceStorageKey),
               SecureMessagingWirePolicy.isCanonicalUUID(attachmentID),
@@ -4447,7 +4452,10 @@ actor SecureMessagingExchangeCoordinator {
                     forUserID: userID
                 )
                 if let mediaID = UUID(uuidString: attachmentID) {
-                    await LocalMediaPerformanceMonitor.shared.markEncrypted(mediaID: mediaID)
+                    await LocalMediaPerformanceMonitor.shared.markEncrypted(
+                        mediaID: mediaID,
+                        producerScope: mediaDiagnosticsProducerScope
+                    )
                 }
             }
         }
@@ -4717,7 +4725,10 @@ actor SecureMessagingExchangeCoordinator {
                 )
             }.value
             if let mediaID = UUID(uuidString: attachmentID) {
-                await LocalMediaPerformanceMonitor.shared.markEncrypted(mediaID: mediaID)
+                await LocalMediaPerformanceMonitor.shared.markEncrypted(
+                    mediaID: mediaID,
+                    producerScope: mediaDiagnosticsProducerScope
+                )
             }
             if requiresAdvertisedRichMediaCapability {
                 let capabilities: CapabilitiesDTO
@@ -4749,7 +4760,10 @@ actor SecureMessagingExchangeCoordinator {
         )
         else { throw SecureMediaAttachmentError.serverMetadataMismatch }
         if let mediaID = UUID(uuidString: attachmentID) {
-            await LocalMediaPerformanceMonitor.shared.markServerAccepted(mediaID: mediaID)
+            await LocalMediaPerformanceMonitor.shared.markServerAccepted(
+                mediaID: mediaID,
+                producerScope: mediaDiagnosticsProducerScope
+            )
         }
         return (
             try KitMediaMessageDescriptor(

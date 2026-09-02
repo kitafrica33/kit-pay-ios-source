@@ -130,6 +130,9 @@ struct KitPayApp: App {
                             .startPictureInPictureForBackgroundingIfNeeded()
                     } else if phase == .background {
                         model.applicationDidEnterBackgroundSecurely()
+                        // Finish the coalesced diagnostic snapshot before iOS suspends the app so
+                        // a force-quit/relaunch test can export the events observed so far.
+                        LocalMediaPerformanceMonitor.shared.flushPendingPersistence()
                         ContactBackgroundRefreshScheduler.shared.schedule()
                         model.scheduleAutomaticMessageBackupRefresh()
                     }

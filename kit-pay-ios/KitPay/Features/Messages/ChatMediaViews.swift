@@ -469,6 +469,8 @@ struct PendingSecureMediaMessageView: View {
     @ObservedObject private var player = VoiceNotePlayer.shared
     let message: LocalMessage
     let attachment: LocalPendingAttachment
+    let mediaDiagnosticsProducerScope = LocalMediaPerformanceMonitor.shared
+        .captureProducerScope()
     /// Bytes plus the MIME facts of the same authoritative identity resolution. Loaded by
     /// message identity — never from this view's captured row snapshot — so the preview and
     /// the facts shown with it can only ever be the current persisted pending attachment's.
@@ -514,7 +516,10 @@ struct PendingSecureMediaMessageView: View {
                 await loadLocalOriginal(markPlayableWhenLoaded: true)
             }
             .onAppear {
-                LocalMediaPerformanceMonitor.shared.markVisible(mediaID: mediaID)
+                LocalMediaPerformanceMonitor.shared.markVisible(
+                    mediaID: mediaID,
+                    producerScope: mediaDiagnosticsProducerScope
+                )
                 if kind == .voice || kind == .audio {
                     player.noteSourceVisibility(true, for: mediaID)
                 }
@@ -537,7 +542,9 @@ struct PendingSecureMediaMessageView: View {
                                 fileURL: fileURL,
                                 mediaType: presentation.mediaType,
                                 expectedByteCount: presentation.byteCount,
-                                protectedOriginalLease: presentation.protectedOriginalLease
+                                protectedOriginalLease: presentation.protectedOriginalLease,
+                                mediaID: mediaID,
+                                isOutgoing: message.isOutgoing
                             ) { closePresentation() }
                         }
                     case .document:
@@ -568,7 +575,10 @@ struct PendingSecureMediaMessageView: View {
            KitChatMediaKind(mediaType: loaded.mediaType) == .image,
            let image = loaded.downsampledImage(maximumPixelSize: 2_048) {
             Button {
-                LocalMediaPerformanceMonitor.shared.markPlayable(mediaID: mediaID)
+                LocalMediaPerformanceMonitor.shared.markPlayable(
+                    mediaID: mediaID,
+                    producerScope: mediaDiagnosticsProducerScope
+                )
                 presentedMedia = PendingMediaPresentation(
                     kind: .image,
                     image: image,
@@ -668,7 +678,10 @@ struct PendingSecureMediaMessageView: View {
         if markPlayableWhenLoaded,
            KitChatMediaKind(mediaType: fresh.mediaType) == .image,
            fresh.downsampledImage(maximumPixelSize: 256) != nil {
-            LocalMediaPerformanceMonitor.shared.markPlayable(mediaID: mediaID)
+            LocalMediaPerformanceMonitor.shared.markPlayable(
+                mediaID: mediaID,
+                producerScope: mediaDiagnosticsProducerScope
+            )
         }
     }
 
@@ -688,7 +701,10 @@ struct PendingSecureMediaMessageView: View {
                 errorMessage = "Voice note unavailable"
                 return
             }
-            LocalMediaPerformanceMonitor.shared.markPlayable(mediaID: mediaID)
+            LocalMediaPerformanceMonitor.shared.markPlayable(
+                mediaID: mediaID,
+                producerScope: mediaDiagnosticsProducerScope
+            )
             return
         }
         if kind == .video || kind == .document || kind == .voice || kind == .audio,
@@ -720,7 +736,10 @@ struct PendingSecureMediaMessageView: View {
                     protectedOriginalLease: localFile.accessLease
                 )
             }
-            LocalMediaPerformanceMonitor.shared.markPlayable(mediaID: mediaID)
+            LocalMediaPerformanceMonitor.shared.markPlayable(
+                mediaID: mediaID,
+                producerScope: mediaDiagnosticsProducerScope
+            )
             return
         }
         await loadLocalOriginal()
@@ -782,7 +801,10 @@ struct PendingSecureMediaMessageView: View {
                 protectedOriginalLease: loaded.localFileLease
             )
         }
-        LocalMediaPerformanceMonitor.shared.markPlayable(mediaID: mediaID)
+        LocalMediaPerformanceMonitor.shared.markPlayable(
+            mediaID: mediaID,
+            producerScope: mediaDiagnosticsProducerScope
+        )
     }
 
     private func closePresentation() {
@@ -867,6 +889,8 @@ struct SecureMediaBatchItemView: View {
     let mediaType: String
     let plaintextByteSize: Int
     let isPending: Bool
+    let mediaDiagnosticsProducerScope = LocalMediaPerformanceMonitor.shared
+        .captureProducerScope()
 
     @StateObject private var loader = SecureMediaLoader()
     @State private var retryGeneration = 0
@@ -897,7 +921,10 @@ struct SecureMediaBatchItemView: View {
         itemContent
             .onAppear {
                 if let id = UUID(uuidString: attachmentID) {
-                    LocalMediaPerformanceMonitor.shared.markVisible(mediaID: id)
+                    LocalMediaPerformanceMonitor.shared.markVisible(
+                        mediaID: id,
+                        producerScope: mediaDiagnosticsProducerScope
+                    )
                 }
             }
             .task(
@@ -913,7 +940,10 @@ struct SecureMediaBatchItemView: View {
                 if kind == .image,
                    loader.loaded?.downsampledImage(maximumPixelSize: 256) != nil,
                    let id = UUID(uuidString: attachmentID) {
-                    LocalMediaPerformanceMonitor.shared.markPlayable(mediaID: id)
+                    LocalMediaPerformanceMonitor.shared.markPlayable(
+                        mediaID: id,
+                        producerScope: mediaDiagnosticsProducerScope
+                    )
                 }
             }
     }
@@ -1028,7 +1058,9 @@ struct SecureMediaBatchItemView: View {
                         mediaType: mediaType,
                         expectedByteCount: byteCount,
                         protectedOriginalLease:
-                            localPresentation?.accessLease ?? loader.loaded?.localFileLease
+                            localPresentation?.accessLease ?? loader.loaded?.localFileLease,
+                        mediaID: UUID(uuidString: attachmentID) ?? message.id,
+                        isOutgoing: message.isOutgoing
                     ) { closePresentation() }
                 }
             } else if let documentURL {
@@ -1114,7 +1146,10 @@ struct SecureMediaBatchItemView: View {
                 protectedOriginalLease: localFile.accessLease
             )
             if player.playingID == voiceNoteID {
-                LocalMediaPerformanceMonitor.shared.markPlayable(mediaID: voiceNoteID)
+                LocalMediaPerformanceMonitor.shared.markPlayable(
+                    mediaID: voiceNoteID,
+                    producerScope: mediaDiagnosticsProducerScope
+                )
             }
             return
         }
@@ -1142,7 +1177,10 @@ struct SecureMediaBatchItemView: View {
             )
         }
         if player.playingID == voiceNoteID {
-            LocalMediaPerformanceMonitor.shared.markPlayable(mediaID: voiceNoteID)
+            LocalMediaPerformanceMonitor.shared.markPlayable(
+                mediaID: voiceNoteID,
+                producerScope: mediaDiagnosticsProducerScope
+            )
         }
     }
 
@@ -1161,7 +1199,10 @@ struct SecureMediaBatchItemView: View {
             }
             ownsPresentationURL = false
             if let id = UUID(uuidString: localFile.attachmentID) {
-                LocalMediaPerformanceMonitor.shared.markPlayable(mediaID: id)
+                LocalMediaPerformanceMonitor.shared.markPlayable(
+                    mediaID: id,
+                    producerScope: mediaDiagnosticsProducerScope
+                )
             }
             return
         }
@@ -1193,7 +1234,10 @@ struct SecureMediaBatchItemView: View {
         }
         ownsPresentationURL = url != nil && item.localFileURL == nil
         if url != nil, let id = UUID(uuidString: attachmentID) {
-            LocalMediaPerformanceMonitor.shared.markPlayable(mediaID: id)
+            LocalMediaPerformanceMonitor.shared.markPlayable(
+                mediaID: id,
+                producerScope: mediaDiagnosticsProducerScope
+            )
         }
     }
 
@@ -1215,6 +1259,8 @@ struct SecureImageMessageView: View {
     let message: LocalMessage
     let descriptor: KitMediaMessageDescriptor
     var openGallery: ((UUID) -> Void)? = nil
+    let mediaDiagnosticsProducerScope = LocalMediaPerformanceMonitor.shared
+        .captureProducerScope()
     @StateObject private var loader = SecureMediaLoader()
     @State private var retryGeneration = 0
     @State private var showsViewer = false
@@ -1285,7 +1331,10 @@ struct SecureImageMessageView: View {
         .accessibilityLabel("End-to-end encrypted photo")
         .onAppear {
             if let id = UUID(uuidString: descriptor.attachmentID) {
-                LocalMediaPerformanceMonitor.shared.markVisible(mediaID: id)
+                LocalMediaPerformanceMonitor.shared.markVisible(
+                    mediaID: id,
+                    producerScope: mediaDiagnosticsProducerScope
+                )
             }
         }
         .task(id: "\(descriptor.storageKey):\(model.isOnline):\(retryGeneration)") {
@@ -1297,7 +1346,10 @@ struct SecureImageMessageView: View {
                 itemIndex: nil
             )
             if image != nil, let id = UUID(uuidString: descriptor.attachmentID) {
-                LocalMediaPerformanceMonitor.shared.markPlayable(mediaID: id)
+                LocalMediaPerformanceMonitor.shared.markPlayable(
+                    mediaID: id,
+                    producerScope: mediaDiagnosticsProducerScope
+                )
             }
         }
         .fullScreenCover(isPresented: $showsViewer) {
@@ -1361,6 +1413,8 @@ struct VoiceNoteBubbleView: View {
     let message: LocalMessage
     let descriptor: KitMediaMessageDescriptor
     let displayKind: KitChatMediaKind
+    let mediaDiagnosticsProducerScope = LocalMediaPerformanceMonitor.shared
+        .captureProducerScope()
     @StateObject private var loader = SecureMediaLoader()
     /// Fraction playback was at when the current slide began, so a slide moves the note relative
     /// to where the finger went down instead of jumping to it.
@@ -1517,7 +1571,10 @@ struct VoiceNoteBubbleView: View {
             )
             if player.playingID == message.id,
                let id = UUID(uuidString: localFile.attachmentID) {
-                LocalMediaPerformanceMonitor.shared.markPlayable(mediaID: id)
+                LocalMediaPerformanceMonitor.shared.markPlayable(
+                    mediaID: id,
+                    producerScope: mediaDiagnosticsProducerScope
+                )
             }
             return
         }
@@ -1542,7 +1599,10 @@ struct VoiceNoteBubbleView: View {
         }
         if player.playingID == message.id,
            let id = UUID(uuidString: descriptor.attachmentID) {
-            LocalMediaPerformanceMonitor.shared.markPlayable(mediaID: id)
+            LocalMediaPerformanceMonitor.shared.markPlayable(
+                mediaID: id,
+                producerScope: mediaDiagnosticsProducerScope
+            )
         }
     }
 
@@ -1602,6 +1662,8 @@ struct VideoMessageBubbleView: View {
     let message: LocalMessage
     let descriptor: KitMediaMessageDescriptor
     var openGallery: ((UUID) -> Void)? = nil
+    let mediaDiagnosticsProducerScope = LocalMediaPerformanceMonitor.shared
+        .captureProducerScope()
     @StateObject private var loader = SecureMediaLoader()
     @State private var poster: UIImage?
     @State private var playbackURL: URL?
@@ -1696,7 +1758,9 @@ struct VideoMessageBubbleView: View {
                     fileURL: playbackURL,
                     mediaType: playbackMediaType,
                     expectedByteCount: playbackByteCount,
-                    protectedOriginalLease: protectedOriginalLease
+                    protectedOriginalLease: protectedOriginalLease,
+                    mediaID: UUID(uuidString: descriptor.attachmentID) ?? message.id,
+                    isOutgoing: message.isOutgoing
                 ) { closePlayer() }
             }
         }
@@ -1728,7 +1792,10 @@ struct VideoMessageBubbleView: View {
             playbackByteCount = localFile.byteCount
             ownsPlaybackURL = false
             if let id = UUID(uuidString: localFile.attachmentID) {
-                LocalMediaPerformanceMonitor.shared.markPlayable(mediaID: id)
+                LocalMediaPerformanceMonitor.shared.markPlayable(
+                    mediaID: id,
+                    producerScope: mediaDiagnosticsProducerScope
+                )
             }
             return
         }
@@ -1755,7 +1822,10 @@ struct VideoMessageBubbleView: View {
         playbackByteCount = item.byteCount
         ownsPlaybackURL = playbackURL != nil && item.localFileURL == nil
         if playbackURL != nil, let id = UUID(uuidString: descriptor.attachmentID) {
-            LocalMediaPerformanceMonitor.shared.markPlayable(mediaID: id)
+            LocalMediaPerformanceMonitor.shared.markPlayable(
+                mediaID: id,
+                producerScope: mediaDiagnosticsProducerScope
+            )
         }
     }
 
@@ -1797,8 +1867,28 @@ struct MediaVideoPlayerView: View {
     let mediaType: String
     let expectedByteCount: Int
     let protectedOriginalLease: SecureMediaOriginalAccessLease?
+    let mediaID: UUID
+    let isOutgoing: Bool
     let onClose: () -> Void
     @StateObject private var playback = MediaVideoPlaybackController()
+
+    init(
+        fileURL: URL,
+        mediaType: String,
+        expectedByteCount: Int,
+        protectedOriginalLease: SecureMediaOriginalAccessLease?,
+        mediaID: UUID,
+        isOutgoing: Bool,
+        onClose: @escaping () -> Void
+    ) {
+        self.fileURL = fileURL
+        self.mediaType = mediaType
+        self.expectedByteCount = expectedByteCount
+        self.protectedOriginalLease = protectedOriginalLease
+        self.mediaID = mediaID
+        self.isOutgoing = isOutgoing
+        self.onClose = onClose
+    }
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
@@ -1839,7 +1929,9 @@ struct MediaVideoPlayerView: View {
                 fileURL: fileURL,
                 mediaType: mediaType,
                 expectedByteCount: expectedByteCount,
-                protectedOriginalLease: protectedOriginalLease
+                protectedOriginalLease: protectedOriginalLease,
+                mediaID: mediaID,
+                isOutgoing: isOutgoing
             )
         }
         .onDisappear { playback.stop() }
@@ -1862,22 +1954,36 @@ private final class MediaVideoPlaybackController: ObservableObject {
     private var protectedOriginalLease: SecureMediaOriginalAccessLease?
     private var playbackFileHandle: FileHandle?
     private var intendsToPlay = false
+    private var timeObserver: Any?
     private var endObserver: NSObjectProtocol?
     private var stallObserver: NSObjectProtocol?
     private var failureObserver: NSObjectProtocol?
     private var preparationID: UUID?
+    private var diagnosticMediaID: UUID?
+    private var diagnosticIsOutgoing = false
+    private var diagnosticByteCount: Int?
+    private let diagnosticProducerScope = LocalMediaPerformanceMonitor.shared.captureProducerScope()
+    private var expectedDuration: Double?
+    private var didRecordPlaybackStart = false
 
     func start(
         fileURL: URL,
         mediaType: String,
         expectedByteCount: Int,
-        protectedOriginalLease: SecureMediaOriginalAccessLease?
+        protectedOriginalLease: SecureMediaOriginalAccessLease?,
+        mediaID: UUID,
+        isOutgoing: Bool
     ) async {
         guard player == nil, !isPreparing else { return }
         let identifier = UUID()
         preparationID = identifier
         sourceFileURL = fileURL
         self.protectedOriginalLease = protectedOriginalLease
+        diagnosticMediaID = mediaID
+        diagnosticIsOutgoing = isOutgoing
+        diagnosticByteCount = expectedByteCount
+        expectedDuration = nil
+        didRecordPlaybackStart = false
         guard let fileHandle = try? FileHandle(forReadingFrom: fileURL) else {
             failPreparation(ChatVideoPlaybackPreparationError.invalidFile)
             return
@@ -1901,11 +2007,20 @@ private final class MediaVideoPlaybackController: ObservableObject {
             }
             temporaryAliasURL = prepared.temporaryAliasURL
             asset = prepared.asset
+            expectedDuration = prepared.duration
             let item = AVPlayerItem(asset: prepared.asset)
             playerItem = item
             let player = AVPlayer(playerItem: item)
             player.automaticallyWaitsToMinimizeStalling = true
             self.player = player
+            timeObserver = player.addPeriodicTimeObserver(
+                forInterval: CMTime(seconds: 0.25, preferredTimescale: 600),
+                queue: .main
+            ) { [weak self] time in
+                Task { @MainActor in
+                    self?.recordPlaybackStartedIfNeeded(position: time.seconds)
+                }
+            }
             observePlaybackItem(item)
             isPreparing = false
             player.play()
@@ -1919,6 +2034,8 @@ private final class MediaVideoPlaybackController: ObservableObject {
         preparationID = nil
         isPreparing = false
         intendsToPlay = false
+        if let timeObserver { player?.removeTimeObserver(timeObserver) }
+        timeObserver = nil
         removePlaybackItemObservers()
         player?.pause()
         player = nil
@@ -1932,6 +2049,10 @@ private final class MediaVideoPlaybackController: ObservableObject {
         temporaryAliasURL = nil
         sourceFileURL = nil
         protectedOriginalLease = nil
+        diagnosticMediaID = nil
+        diagnosticByteCount = nil
+        expectedDuration = nil
+        didRecordPlaybackStart = false
     }
 
     private func observePlaybackItem(_ item: AVPlayerItem) {
@@ -1941,7 +2062,7 @@ private final class MediaVideoPlaybackController: ObservableObject {
             object: item,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor in self?.intendsToPlay = false }
+            Task { @MainActor in self?.handlePlaybackEnded(item: item) }
         }
         stallObserver = NotificationCenter.default.addObserver(
             forName: .AVPlayerItemPlaybackStalled,
@@ -1977,6 +2098,17 @@ private final class MediaVideoPlaybackController: ObservableObject {
         item: AVPlayerItem
     ) {
         guard intendsToPlay, playerItem === item else { return }
+        switch interruption {
+        case .stalled:
+            if didRecordPlaybackStart {
+                recordPlayback(.stalled, position: item.currentTime().seconds)
+            }
+        case .failed:
+            recordPlayback(
+                didRecordPlaybackStart ? .failedToEnd : .preparationFailed,
+                position: item.currentTime().seconds
+            )
+        }
         switch ChatVideoPlaybackFailurePolicy.action(for: interruption) {
         case .letPlayerRecover:
             // AVFoundation may resume an ordinary decoder stall itself. The controller never
@@ -1989,7 +2121,44 @@ private final class MediaVideoPlaybackController: ObservableObject {
         }
     }
 
+    private func handlePlaybackEnded(item: AVPlayerItem) {
+        guard playerItem === item, intendsToPlay else { return }
+        let position = item.currentTime().seconds
+        recordPlaybackStartedIfNeeded(position: position, requiresActivePlayer: false)
+        recordPlayback(.completed, position: position)
+        intendsToPlay = false
+        didRecordPlaybackStart = false
+    }
+
+    private func recordPlaybackStartedIfNeeded(
+        position: Double,
+        requiresActivePlayer: Bool = true
+    ) {
+        guard !didRecordPlaybackStart,
+              position.isFinite,
+              position > 0,
+              !requiresActivePlayer || (player?.rate ?? 0) > 0
+        else { return }
+        intendsToPlay = true
+        didRecordPlaybackStart = true
+        recordPlayback(.started, position: position)
+    }
+
+    private func recordPlayback(_ outcome: LocalMediaPlaybackOutcome, position: Double?) {
+        guard let mediaID = diagnosticMediaID else { return }
+        LocalMediaPerformanceMonitor.shared.recordPlayback(
+            outcome: outcome,
+            mediaID: mediaID,
+            isOutgoing: diagnosticIsOutgoing,
+            byteCount: diagnosticByteCount,
+            expectedDuration: expectedDuration,
+            position: position.flatMap { $0.isFinite && $0 >= 0 ? $0 : nil },
+            producerScope: diagnosticProducerScope
+        )
+    }
+
     private func failPreparation(_ error: Error) {
+        recordPlayback(.preparationFailed, position: nil)
         isPreparing = false
         intendsToPlay = false
         errorMessage = (error as? LocalizedError)?.errorDescription
@@ -2007,6 +2176,8 @@ struct DocumentMessageBubbleView: View {
     @EnvironmentObject private var model: AppModel
     let message: LocalMessage
     let descriptor: KitMediaMessageDescriptor
+    let mediaDiagnosticsProducerScope = LocalMediaPerformanceMonitor.shared
+        .captureProducerScope()
     @StateObject private var loader = SecureMediaLoader()
     @State private var previewURL: URL?
     @State private var localPresentation: SecureMediaLoadPolicy.LocalFileItem?
@@ -2123,7 +2294,10 @@ struct DocumentMessageBubbleView: View {
             previewURL = localFile.url
             ownsPreviewURL = false
             if let id = UUID(uuidString: localFile.attachmentID) {
-                LocalMediaPerformanceMonitor.shared.markPlayable(mediaID: id)
+                LocalMediaPerformanceMonitor.shared.markPlayable(
+                    mediaID: id,
+                    producerScope: mediaDiagnosticsProducerScope
+                )
             }
             return
         }
@@ -2147,7 +2321,10 @@ struct DocumentMessageBubbleView: View {
         ))
         ownsPreviewURL = previewURL != nil && item.localFileURL == nil
         if previewURL != nil, let id = UUID(uuidString: descriptor.attachmentID) {
-            LocalMediaPerformanceMonitor.shared.markPlayable(mediaID: id)
+            LocalMediaPerformanceMonitor.shared.markPlayable(
+                mediaID: id,
+                producerScope: mediaDiagnosticsProducerScope
+            )
         }
     }
 

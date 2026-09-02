@@ -10,6 +10,7 @@ enum ProfileDetailDestination: Hashable {
     case identityVerification
     case security
     case chatBackup
+    case mediaDiagnostics
     case inviteFriends
     case helpSupport
     case legalPrivacy
@@ -88,6 +89,7 @@ struct ProfileView: View {
         case .identityVerification: KYCView()
         case .security: SecurityView()
         case .chatBackup: ChatBackupSettingsView()
+        case .mediaDiagnostics: MediaDiagnosticsView()
         case .inviteFriends: ReferralView()
         case .helpSupport: SupportView()
         case .legalPrivacy: LegalPrivacyView()
@@ -171,6 +173,8 @@ struct ProfileView: View {
             NavigationLink(value: ProfileDetailDestination.security) { settingsRow(row) }
         case .chatBackup:
             NavigationLink(value: ProfileDetailDestination.chatBackup) { settingsRow(row) }
+        case .mediaDiagnostics:
+            NavigationLink(value: ProfileDetailDestination.mediaDiagnostics) { settingsRow(row) }
         case .referrals:
             // The row itself only exists while the capability is advertised (see
             // `secondaryRows`), so this is plain navigation; the screen re-checks the gate too.
@@ -335,6 +339,12 @@ struct ProfileView: View {
             )
         }
         rows.append(contentsOf: [
+            .init(
+                title: "Media diagnostics",
+                subtitle: "Export privacy-safe playback and performance evidence",
+                icon: "chart.bar.doc.horizontal",
+                destination: .mediaDiagnostics
+            ),
             .init(
                 title: "Help & support",
                 subtitle: helpSupportSubtitle,
@@ -712,8 +722,207 @@ private enum ProfileRowDestination {
     case identityVerification
     case security
     case chatBackup
+    case mediaDiagnostics
     case referrals
     case helpSupport
     case legalPrivacy
     case accountDeletion
+}
+
+private struct MediaDiagnosticsView: View {
+    @State private var reportFileURL: URL?
+    @State private var recordCount = 0
+    @State private var errorMessage: String?
+    @State private var confirmationMessage: String?
+    @State private var showClearConfirmation = false
+    @State private var showShareSheet = false
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 18) {
+                privacyCard
+                reportCard
+            }
+            .padding(18)
+        }
+        .background(KitColor.canvas.ignoresSafeArea())
+        .navigationTitle("Media diagnostics")
+        .navigationBarTitleDisplayMode(.inline)
+        .onAppear {
+            recordCount = LocalMediaPerformanceMonitor.shared.reportRecordCount
+        }
+        .onDisappear(perform: removePreparedReport)
+        .sheet(isPresented: $showShareSheet, onDismiss: removePreparedReport) {
+            if let reportFileURL {
+                MediaDiagnosticsShareSheet(fileURL: reportFileURL)
+            }
+        }
+        .confirmationDialog(
+            "Clear media diagnostics?",
+            isPresented: $showClearConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Clear report", role: .destructive, action: clearReport)
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This permanently removes the diagnostic records stored on this device.")
+        }
+    }
+
+    private var privacyCard: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Label("Privacy-safe by design", systemImage: "hand.raised.fill")
+                .font(.headline)
+                .foregroundStyle(KitColor.primaryText)
+
+            Text(
+                "The report contains report and event times, app and iOS versions, media "
+                    + "direction and type, byte count and duration, performance timings, and "
+                    + "video playback outcomes."
+            )
+            .font(.subheadline)
+            .foregroundStyle(KitColor.secondaryText)
+
+            Text(
+                "Protected storage keeps a one-way SHA-256 correlation token so pending timing "
+                    + "can continue after relaunch. The token is never included in an export."
+            )
+            .font(.footnote)
+            .foregroundStyle(KitColor.secondaryText)
+
+            Divider()
+
+            Text("Never included")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(KitColor.primaryText)
+
+            Text(
+                "Message text or media content; names, contacts, or conversations; message or "
+                    + "media identifiers; filenames, URLs, or MIME payloads."
+            )
+            .font(.footnote)
+            .foregroundStyle(KitColor.secondaryText)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(18)
+        .kitGlass(cornerRadius: 26, shadow: false)
+    }
+
+    private var reportCard: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Saved evidence")
+                        .font(.headline)
+                        .foregroundStyle(KitColor.primaryText)
+                    Text("\(recordCount) diagnostic record\(recordCount == 1 ? "" : "s")")
+                        .font(.subheadline)
+                        .foregroundStyle(KitColor.secondaryText)
+                }
+                Spacer()
+                Image(systemName: "waveform.path.ecg")
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(KitColor.green)
+            }
+
+            Button(action: prepareAndPresentReport) {
+                Label("Export privacy-safe report", systemImage: "square.and.arrow.up")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(KitPrimaryButtonStyle())
+            .accessibilityHint(
+                "Opens the system share sheet with a fresh JSON report that excludes messages and identifiers."
+            )
+
+            Text("Exporting creates a copy in the destination you choose.")
+                .font(.caption)
+                .foregroundStyle(KitColor.secondaryText)
+
+            Text("The newest 256 records are retained on this device.")
+                .font(.caption)
+                .foregroundStyle(KitColor.secondaryText)
+
+            Button(role: .destructive) {
+                showClearConfirmation = true
+            } label: {
+                Label("Clear report", systemImage: "trash")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .buttonBorderShape(.roundedRectangle(radius: 16))
+
+            if let confirmationMessage {
+                Label(confirmationMessage, systemImage: "checkmark.circle.fill")
+                    .font(.footnote)
+                    .foregroundStyle(KitColor.green)
+            }
+
+            if let errorMessage {
+                Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
+                    .font(.footnote)
+                    .foregroundStyle(.red)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(18)
+        .kitGlass(cornerRadius: 26, shadow: false)
+    }
+
+    @MainActor
+    private func prepareAndPresentReport() {
+        let monitor = LocalMediaPerformanceMonitor.shared
+        recordCount = monitor.reportRecordCount
+        confirmationMessage = nil
+
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kit-pay-media-diagnostics.json", isDirectory: false)
+        do {
+            try Data(monitor.exportReport().utf8).write(
+                to: url,
+                options: [.atomic, .completeFileProtection]
+            )
+            reportFileURL = url
+            showShareSheet = true
+            errorMessage = nil
+        } catch {
+            try? FileManager.default.removeItem(at: url)
+            reportFileURL = nil
+            errorMessage = "The report could not be prepared. Try again."
+        }
+    }
+
+    @MainActor
+    private func clearReport() {
+        let monitor = LocalMediaPerformanceMonitor.shared
+        let persistenceWasCleared = monitor.clearReport()
+        removePreparedReport()
+        recordCount = monitor.reportRecordCount
+        if persistenceWasCleared {
+            errorMessage = nil
+            confirmationMessage = "Report cleared. The next test run will start clean."
+        } else {
+            confirmationMessage = nil
+            errorMessage = "The stored report could not be removed. Try again before testing."
+        }
+    }
+
+    private func removePreparedReport() {
+        if let reportFileURL {
+            try? FileManager.default.removeItem(at: reportFileURL)
+        }
+        reportFileURL = nil
+    }
+}
+
+private struct MediaDiagnosticsShareSheet: UIViewControllerRepresentable {
+    let fileURL: URL
+
+    func makeUIViewController(context _: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: [fileURL], applicationActivities: nil)
+    }
+
+    func updateUIViewController(
+        _ uiViewController: UIActivityViewController,
+        context _: Context
+    ) {}
 }
