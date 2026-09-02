@@ -10,6 +10,11 @@ import UIKit
 enum ChatVideoPosterGenerator {
     typealias ImageGeneration = (AVURLAsset, CGSize) async throws -> CGImage
 
+    struct PlaybackClaim: Equatable, Sendable {
+        fileprivate let id: UUID
+        fileprivate let contentKey: String
+    }
+
     private struct RequestKey: Hashable {
         let contentKey: String
         let declaredMediaType: String
@@ -24,6 +29,40 @@ enum ChatVideoPosterGenerator {
     }
 
     private static var inFlight: [RequestKey: InFlightRequest] = [:]
+    private static var playbackClaims: [String: Set<UUID>] = [:]
+
+    /// Playback and passive poster decoding for the same bytes never overlap. Registering the
+    /// claim first closes the race while cancelled poster work drains; callers retain the token
+    /// until AVPlayer and all of its file-backed resources have been released.
+    static func acquirePlayback(forKey contentKey: String) async -> PlaybackClaim? {
+        guard !contentKey.isEmpty else { return nil }
+        let claim = PlaybackClaim(id: UUID(), contentKey: contentKey)
+        playbackClaims[contentKey, default: []].insert(claim.id)
+        let posterTasks = inFlight.compactMap { key, request in
+            key.contentKey == contentKey ? request.task : nil
+        }
+        posterTasks.forEach { $0.cancel() }
+        for task in posterTasks { _ = await task.value }
+        return claim
+    }
+
+    static func releasePlayback(_ claim: PlaybackClaim?) {
+        guard let claim else { return }
+        playbackClaims[claim.contentKey]?.remove(claim.id)
+        if playbackClaims[claim.contentKey]?.isEmpty == true {
+            playbackClaims.removeValue(forKey: claim.contentKey)
+        }
+    }
+
+    static func hasInFlightPoster(forKey contentKey: String) -> Bool {
+        inFlight.keys.contains { $0.contentKey == contentKey }
+    }
+
+    static func cancelPosters(forKey contentKey: String) {
+        inFlight.forEach { key, request in
+            if key.contentKey == contentKey { request.task.cancel() }
+        }
+    }
 
     static func thumbnail(
         forKey contentKey: String,
@@ -87,6 +126,7 @@ enum ChatVideoPosterGenerator {
         maximumSize: CGSize,
         generateImage: ImageGeneration?
     ) async -> UIImage? {
+        guard !Task.isCancelled else { return nil }
         guard let data, data.count == expectedByteCount,
               let sourceURL = try? ChatMediaTempFiles.writeTemporaryFile(
                   data: data,
@@ -110,6 +150,7 @@ enum ChatVideoPosterGenerator {
         maximumSize: CGSize,
         generateImage: ImageGeneration? = nil
     ) async -> UIImage? {
+        guard !Task.isCancelled else { return nil }
         guard maximumSize.width > 0, maximumSize.height > 0 else { return nil }
         guard let prepared = try? await ChatVideoPlaybackAssetPolicy.prepare(
             fileURL: fileURL,
@@ -117,6 +158,7 @@ enum ChatVideoPosterGenerator {
             expectedByteCount: expectedByteCount
         ) else { return nil }
         defer { ChatMediaTempFiles.removeTemporaryFile(prepared.temporaryAliasURL) }
+        guard !Task.isCancelled else { return nil }
 
         do {
             let cgImage: CGImage
@@ -165,6 +207,7 @@ enum ChatVideoPosterGenerator {
         key: RequestKey,
         operation: @escaping () async -> UIImage?
     ) async -> UIImage? {
+        guard playbackClaims[key.contentKey]?.isEmpty != false else { return nil }
         if let request = inFlight[key] {
             return await request.task.value
         }

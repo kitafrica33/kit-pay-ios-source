@@ -238,6 +238,43 @@ final class ChatMediaPolicyTests: XCTestCase {
         XCTAssertFalse(KitChatMediaLimits.shouldCacheInline(byteCount: 0))
     }
 
+    func testLegacyReceivedVideoMigrationStreamsLargeFilesAndBoundsOfflineFallback() {
+        let large = KitChatMediaLimits.maximumInlineCacheBytes + 1
+        XCTAssertEqual(
+            LegacyReceivedVideoMigrationPolicy.source(
+                plaintextByteCount: large,
+                allowsDownload: true,
+                isOnline: true,
+                secureMessagingAvailable: true,
+                hasRemoteStorageKey: true,
+                hasAuthenticatedSession: true
+            ),
+            .streamedRemote
+        )
+        XCTAssertEqual(
+            LegacyReceivedVideoMigrationPolicy.source(
+                plaintextByteCount: large,
+                allowsDownload: true,
+                isOnline: false,
+                secureMessagingAvailable: true,
+                hasRemoteStorageKey: true,
+                hasAuthenticatedSession: true
+            ),
+            .unavailable
+        )
+        XCTAssertEqual(
+            LegacyReceivedVideoMigrationPolicy.source(
+                plaintextByteCount: KitChatMediaLimits.maximumInlineCacheBytes,
+                allowsDownload: false,
+                isOnline: false,
+                secureMessagingAvailable: false,
+                hasRemoteStorageKey: true,
+                hasAuthenticatedSession: false
+            ),
+            .smallLocalBlob
+        )
+    }
+
     func testNewMediaTypesAreAllowedOnTheWire() {
         for mediaType in [
             "audio/mp4", "video/mp4", "video/quicktime",
@@ -1097,6 +1134,177 @@ final class ChatMediaPolicyTests: XCTestCase {
             8_000,
             accuracy: 0.001
         )
+    }
+
+    @MainActor
+    func testTextSendDiagnosticsUseMonotonicOrderedMilestonesAndDoNotRestartOnRetry() throws {
+        let monitor = LocalMediaPerformanceMonitor()
+        let messageID = UUID()
+        let scope = monitor.captureProducerScope()
+        let start: UInt64 = 1_000_000_000
+        monitor.beginTextSend(
+            messageID: messageID,
+            atUptimeNanoseconds: start,
+            recordedAt: Date(timeIntervalSince1970: 1_000),
+            producerScope: scope
+        )
+
+        // A retry with the same idempotency UUID must retain the original action timestamp.
+        monitor.beginTextSend(
+            messageID: messageID,
+            atUptimeNanoseconds: start + 9_000_000,
+            recordedAt: Date(timeIntervalSince1970: 2_000),
+            producerScope: scope
+        )
+        XCTAssertEqual(monitor.reportRecordCount, 1)
+        XCTAssertNil(monitor.markTextBubbleVisible(
+            messageID: messageID,
+            atUptimeNanoseconds: start + 10_000_000,
+            producerScope: scope
+        ))
+
+        let committed = try XCTUnwrap(monitor.markTextOutboxCommitted(
+            messageID: messageID,
+            atUptimeNanoseconds: start + 12_400_000,
+            producerScope: scope
+        ))
+        XCTAssertEqual(committed.actionToDurableOutboxCommitMilliseconds, 12)
+        XCTAssertNil(committed.actionToVisibleLocalBubbleMilliseconds)
+
+        let visible = try XCTUnwrap(monitor.markTextBubbleVisible(
+            messageID: messageID,
+            atUptimeNanoseconds: start + 18_600_000,
+            producerScope: scope
+        ))
+        XCTAssertEqual(visible.actionToDurableOutboxCommitMilliseconds, 12)
+        XCTAssertEqual(visible.actionToVisibleLocalBubbleMilliseconds, 19)
+
+        // Re-renders and idempotent queue replays keep the first two observations.
+        let repeatedCommit = try XCTUnwrap(monitor.markTextOutboxCommitted(
+            messageID: messageID,
+            atUptimeNanoseconds: start + 200_000_000,
+            producerScope: scope
+        ))
+        let repeatedVisible = try XCTUnwrap(monitor.markTextBubbleVisible(
+            messageID: messageID,
+            atUptimeNanoseconds: start + 300_000_000,
+            producerScope: scope
+        ))
+        XCTAssertEqual(repeatedCommit, visible)
+        XCTAssertEqual(repeatedVisible, visible)
+        XCTAssertEqual(monitor.reportRecordCount, 1)
+    }
+
+    @MainActor
+    func testTextSendDiagnosticSerializationIsBoundedAndContainsNoMessageIdentity() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "kit-text-send-diagnostics-tests-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        let persistenceURL = directory.appendingPathComponent("report.json")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let monitor = LocalMediaPerformanceMonitor(persistenceURL: persistenceURL)
+        let scope = monitor.captureProducerScope()
+        var messageIDs: [UUID] = []
+
+        for index in 0..<300 {
+            let messageID = UUID()
+            messageIDs.append(messageID)
+            let start = UInt64(index + 1) * 1_000_000_000
+            monitor.beginTextSend(
+                messageID: messageID,
+                atUptimeNanoseconds: start,
+                recordedAt: Date(timeIntervalSince1970: TimeInterval(index)),
+                producerScope: scope
+            )
+            monitor.markTextOutboxCommitted(
+                messageID: messageID,
+                atUptimeNanoseconds: start + 7_400_000,
+                producerScope: scope
+            )
+            monitor.markTextBubbleVisible(
+                messageID: messageID,
+                atUptimeNanoseconds: start + 11_600_000,
+                producerScope: scope
+            )
+        }
+
+        XCTAssertEqual(monitor.reportRecordCount, 256)
+        monitor.flushPendingPersistence()
+        let persisted = try String(contentsOf: persistenceURL, encoding: .utf8)
+        let exported = monitor.exportReport()
+        for messageID in messageIDs {
+            XCTAssertFalse(persisted.localizedCaseInsensitiveContains(messageID.uuidString))
+            XCTAssertFalse(exported.localizedCaseInsensitiveContains(messageID.uuidString))
+        }
+        XCTAssertFalse(persisted.contains("localCorrelationTokenSHA256"))
+        XCTAssertFalse(exported.contains("localCorrelationTokenSHA256"))
+
+        let root = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(exported.utf8)) as? [String: Any]
+        )
+        let records = try XCTUnwrap(root["records"] as? [[String: Any]])
+        XCTAssertEqual(records.count, 256)
+        XCTAssertTrue(records.allSatisfy { $0["event"] as? String == "text_send_timing" })
+        XCTAssertTrue(records.allSatisfy {
+            $0["actionToDurableOutboxCommitMilliseconds"] as? Double == 7
+                && $0["actionToVisibleLocalBubbleMilliseconds"] as? Double == 12
+                && $0["kind"] == nil
+                && $0["byteCount"] == nil
+                && $0["durationSeconds"] == nil
+        })
+    }
+
+    @MainActor
+    func testTextSendDiagnosticsAreClearedAndFencedAcrossAccounts() throws {
+        let monitor = LocalMediaPerformanceMonitor()
+        let messageID = UUID()
+        let staleScope = monitor.captureProducerScope()
+        monitor.beginTextSend(
+            messageID: messageID,
+            atUptimeNanoseconds: 1_000_000_000,
+            producerScope: staleScope
+        )
+        monitor.markTextOutboxCommitted(
+            messageID: messageID,
+            atUptimeNanoseconds: 1_010_000_000,
+            producerScope: staleScope
+        )
+        XCTAssertEqual(monitor.reportRecordCount, 1)
+
+        XCTAssertTrue(monitor.suspendRecordingAndClearReport())
+        XCTAssertEqual(monitor.reportRecordCount, 0)
+        monitor.resumeRecordingForFreshAccount()
+        let freshScope = monitor.captureProducerScope()
+        monitor.beginTextSend(
+            messageID: messageID,
+            atUptimeNanoseconds: 2_000_000_000,
+            producerScope: freshScope
+        )
+        XCTAssertNil(monitor.markTextOutboxCommitted(
+            messageID: messageID,
+            atUptimeNanoseconds: 2_010_000_000,
+            producerScope: staleScope
+        ))
+        XCTAssertNil(monitor.markTextBubbleVisible(
+            messageID: messageID,
+            atUptimeNanoseconds: 2_020_000_000,
+            producerScope: staleScope
+        ))
+
+        let committed = try XCTUnwrap(monitor.markTextOutboxCommitted(
+            messageID: messageID,
+            atUptimeNanoseconds: 2_015_000_000,
+            producerScope: freshScope
+        ))
+        XCTAssertEqual(committed.actionToDurableOutboxCommitMilliseconds, 15)
+        let visible = try XCTUnwrap(monitor.markTextBubbleVisible(
+            messageID: messageID,
+            atUptimeNanoseconds: 2_025_000_000,
+            producerScope: freshScope
+        ))
+        XCTAssertEqual(visible.actionToVisibleLocalBubbleMilliseconds, 25)
+        XCTAssertEqual(monitor.reportRecordCount, 1)
     }
 
     @MainActor
@@ -2646,6 +2854,102 @@ final class ChatMediaPolicyTests: XCTestCase {
         XCTAssertNotNil(results.0)
         XCTAssertNotNil(results.1)
         XCTAssertEqual(generationCount, 1)
+    }
+
+    func testGalleryVideoPreparationIsAdmittedOnlyForTheActivePage() {
+        XCTAssertTrue(GalleryVideoActivationPolicy.permitsPreparation(isActive: true))
+        XCTAssertFalse(GalleryVideoActivationPolicy.permitsPreparation(isActive: false))
+    }
+
+    @MainActor
+    func testGalleryVideoActivationUsesOnlyAnAlreadyCachedPoster() throws {
+        let contentKey = UUID().uuidString
+        XCTAssertNil(GalleryVideoActivationPolicy.cachedPoster(forKey: contentKey))
+        XCTAssertFalse(ChatVideoPosterGenerator.hasInFlightPoster(forKey: contentKey))
+
+        let bubblePoster = UIImage(cgImage: try onePixelCGImage())
+        ChatMediaThumbnailStore.shared.store(
+            bubblePoster,
+            forKey: contentKey,
+            maxPixel: GalleryVideoActivationPolicy.conversationPosterMaxPixel
+        )
+
+        XCTAssertTrue(
+            GalleryVideoActivationPolicy.cachedPoster(forKey: contentKey) === bubblePoster
+        )
+        XCTAssertFalse(ChatVideoPosterGenerator.hasInFlightPoster(forKey: contentKey))
+    }
+
+    @MainActor
+    func testPlaybackClaimCancelsAndDrainsPosterThenSuppressesNewDecodes() async throws {
+        let source = try await makePlayableVideo(fileType: .mp4, pathExtension: "mp4")
+        defer { try? FileManager.default.removeItem(at: source) }
+        let byteCount = try fileByteCount(source)
+        let probeImage = try onePixelCGImage()
+        let contentKey = UUID().uuidString
+        var generationCount = 0
+        var firstGenerationFinished = false
+        let generationStarted = AsyncStream.makeStream(
+            of: Void.self,
+            bufferingPolicy: .bufferingNewest(1)
+        )
+
+        let posterTask = Task { @MainActor in
+            await ChatVideoPosterGenerator.thumbnail(
+                forKey: contentKey,
+                fileURL: source,
+                declaredMediaType: "video/mp4",
+                expectedByteCount: byteCount,
+                protectedOriginalLease: nil,
+                maximumSize: CGSize(width: 32, height: 32)
+            ) { _, _ in
+                generationCount += 1
+                generationStarted.continuation.yield(())
+                defer { firstGenerationFinished = true }
+                try await Task.sleep(nanoseconds: 5_000_000_000)
+                return probeImage
+            }
+        }
+        var generationIterator = generationStarted.stream.makeAsyncIterator()
+        _ = await generationIterator.next()
+        generationStarted.continuation.finish()
+        XCTAssertTrue(ChatVideoPosterGenerator.hasInFlightPoster(forKey: contentKey))
+
+        let acquiredClaim = await ChatVideoPosterGenerator.acquirePlayback(forKey: contentKey)
+        let claim = try XCTUnwrap(acquiredClaim)
+        defer { ChatVideoPosterGenerator.releasePlayback(claim) }
+        let cancelledPoster = await posterTask.value
+        XCTAssertNil(cancelledPoster)
+        XCTAssertTrue(firstGenerationFinished)
+
+        let suppressed = await ChatVideoPosterGenerator.thumbnail(
+            forKey: contentKey,
+            fileURL: source,
+            declaredMediaType: "video/mp4",
+            expectedByteCount: byteCount,
+            protectedOriginalLease: nil,
+            maximumSize: CGSize(width: 32, height: 32)
+        ) { _, _ in
+            generationCount += 1
+            return probeImage
+        }
+        XCTAssertNil(suppressed)
+        XCTAssertEqual(generationCount, 1)
+
+        ChatVideoPosterGenerator.releasePlayback(claim)
+        let resumed = await ChatVideoPosterGenerator.thumbnail(
+            forKey: contentKey,
+            fileURL: source,
+            declaredMediaType: "video/mp4",
+            expectedByteCount: byteCount,
+            protectedOriginalLease: nil,
+            maximumSize: CGSize(width: 32, height: 32)
+        ) { _, _ in
+            generationCount += 1
+            return probeImage
+        }
+        XCTAssertNotNil(resumed)
+        XCTAssertEqual(generationCount, 2)
     }
 
     func testConversationOrderingPutsPinnedFirstThenMostRecent() {

@@ -243,8 +243,12 @@ struct ForwardMessagesView: View {
                     .foregroundStyle(KitColor.secondaryText)
                     .transition(.opacity)
             }
-            if !model.secureMessagingAvailable {
-                Text("Secure messaging is unavailable right now.")
+            if !model.secureMessagingLocalQueueAvailable {
+                Text("Messaging is unavailable for this session.")
+                    .font(.footnote)
+                    .foregroundStyle(KitColor.secondaryText)
+            } else if !model.secureMessagingAvailable {
+                Text("Forwarded messages will stay Pending and send automatically when secure messaging is ready.")
                     .font(.footnote)
                     .foregroundStyle(KitColor.secondaryText)
             }
@@ -260,7 +264,7 @@ struct ForwardMessagesView: View {
             .disabled(
                 selectedRowIDs.isEmpty
                     || items.isEmpty
-                    || !model.secureMessagingAvailable
+                    || !model.secureMessagingLocalQueueAvailable
             )
             .accessibilityLabel(forwardButtonTitle)
         }

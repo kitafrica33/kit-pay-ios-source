@@ -373,6 +373,13 @@ struct WalletHistoryRefreshKey: Equatable {
     let userID: String
     let sessionID: String
     let walletID: String
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.accountEpoch == rhs.accountEpoch
+            && lhs.userID == rhs.userID
+            && lhs.sessionID == rhs.sessionID
+            && WalletIdentityResolver.identifiersMatch(lhs.walletID, rhs.walletID)
+    }
 }
 
 private struct WalletHistoryRefreshFlight {
@@ -1412,6 +1419,17 @@ final class AppModel: ObservableObject {
                         await self.refresh()
                         if self.appReviewDemoMutationsAllowed,
                            self.capabilities != nil {
+                            // A launch-time capability failure leaves authenticated session
+                            // resume deliberately incomplete. Reconnection may have repaired the
+                            // projection above; finish the same fenced resume now so APNs/VoIP,
+                            // outbox replay and call recovery do not remain dormant forever.
+                            if !self.didResumeAuthenticatedSession {
+                                await self.resumeAuthenticatedSessionIfNeeded()
+                            }
+                            guard self.didResumeAuthenticatedSession,
+                                  self.appReviewDemoMutationsAllowed,
+                                  self.capabilities != nil
+                            else { return }
                             NotificationCoordinator.shared.retryRemoteRegistrationIfNeeded()
                             NotificationCoordinator.shared.replayCurrentPushTokens()
                             self.resumeEphemeralOutgoingCallIfPossible()
@@ -1690,7 +1708,10 @@ final class AppModel: ObservableObject {
         )
     }
     var selectedWallet: Wallet? {
-        if let id = state.selectedWalletId, let selected = state.wallets.first(where: { $0.id == id }) {
+        if let selected = WalletIdentityResolver.wallet(
+            matching: state.selectedWalletId,
+            in: state.wallets
+        ) {
             return selected
         }
         return state.wallets.first(where: { $0.isPrimary == true }) ?? state.wallets.first
@@ -1890,6 +1911,37 @@ final class AppModel: ObservableObject {
     }
     var messagingSendFailureMessage: String { CustomerFacingMessagingCopy.sendFailure }
     var callsFeatureEnabled: Bool { CallLifecyclePolicy.featureEnabled(capabilities) }
+    /// The picker is a read/recovery surface, so a missing capability response must not make its
+    /// own retry action unreachable. Known demo ownership and an explicit Calls withdrawal remain
+    /// fail-closed, and `queueCall` revalidates all mutation authority before it creates anything.
+    var callReadinessPickerAvailable: Bool {
+        CallReadinessSurfacePolicy.permitsPicker(
+            signedIn: isSignedIn,
+            signingOut: isSigningOut,
+            accountSetupComplete: accountSetupStep == nil,
+            communicationAccessGranted: communicationAccessGranted,
+            communicationSurfacesConcealed: communicationSurfacesConcealed,
+            isDemoActive: appReviewDemoIsActive,
+            callsExplicitlyWithdrawn: capabilities?.featureIsWithdrawn("calls") == true
+        )
+    }
+
+    func callReadinessAllowsRecipientAction(_ rawUserID: String?) -> Bool {
+        guard let recipientUserID = CommunicationPrivacyIdentifier.canonicalUUID(rawUserID),
+              recipientUserID != CommunicationPrivacyIdentifier.canonicalUUID(profile?.id)
+        else { return false }
+        let privacyDecision = CommunicationPrivacyAccessPolicy.decision(
+            ownerUserID: profile?.id,
+            recipientUserID: recipientUserID,
+            hasLoadedCompleteProjection: hasUsableCommunicationPrivacyProjection,
+            blocks: communicationBlocks
+        )
+        return CallReadinessSurfacePolicy.permitsRecipientAction(
+            pickerPermitted: callReadinessPickerAvailable,
+            privacyDecision: privacyDecision
+        )
+    }
+
     var mayCreateCall: Bool {
         appReviewDemoMutationsAllowed && CallLifecyclePolicy.mayCreateCall(
             signedIn: isSignedIn,
@@ -3092,9 +3144,10 @@ final class AppModel: ObservableObject {
                     try await sessions.replaceIfCurrent(session, with: boundSession)
                 else { throw StoreError.accountChanged }
 
-                let selectedID = bootstrap.selectedWalletId
-                    ?? bootstrap.wallets.first(where: { $0.isPrimary == true })?.id
-                    ?? bootstrap.wallets.first?.id
+                let selectedID = WalletIdentityResolver.authoritativeSelectionID(
+                    preferred: bootstrap.selectedWalletId,
+                    in: bootstrap.wallets
+                )
                 guard await restoredSessionContextIsCurrent(
                     accountEpoch: restorationAccountEpoch,
                     session: boundSession
@@ -3107,8 +3160,10 @@ final class AppModel: ObservableObject {
                     ) else { throw StoreError.accountChanged }
                     persisted.bindAuthenticatedProfile(bootstrap.user)
                     persisted.sessionAssurance = bootstrap.resolvedSessionAssurance
-                    persisted.wallets = bootstrap.wallets
-                    persisted.selectedWalletId = selectedID
+                    persisted.replaceAuthoritativeWalletProjection(
+                        bootstrap.wallets,
+                        selectedWalletID: selectedID
+                    )
                 }
                 guard await restoredSessionContextIsCurrent(
                     accountEpoch: restorationAccountEpoch,
@@ -3159,9 +3214,10 @@ final class AppModel: ObservableObject {
                       currentSession.accountId?.caseInsensitiveCompare(expectedAccountID)
                         == .orderedSame
                 else { throw StoreError.accountChanged }
-                let selectedID = bootstrap.selectedWalletId
-                    ?? bootstrap.wallets.first(where: { $0.isPrimary == true })?.id
-                    ?? bootstrap.wallets.first?.id
+                let selectedID = WalletIdentityResolver.authoritativeSelectionID(
+                    preferred: bootstrap.selectedWalletId,
+                    in: bootstrap.wallets
+                )
                 guard await restoredSessionContextIsCurrent(
                     accountEpoch: restorationAccountEpoch,
                     session: currentSession
@@ -3174,8 +3230,10 @@ final class AppModel: ObservableObject {
                     ) else { throw StoreError.accountChanged }
                     persisted.bindAuthenticatedProfile(bootstrap.user)
                     persisted.sessionAssurance = bootstrap.resolvedSessionAssurance
-                    persisted.wallets = bootstrap.wallets
-                    persisted.selectedWalletId = selectedID
+                    persisted.replaceAuthoritativeWalletProjection(
+                        bootstrap.wallets,
+                        selectedWalletID: selectedID
+                    )
                 }
                 guard await restoredSessionContextIsCurrent(
                     accountEpoch: restorationAccountEpoch,
@@ -6097,6 +6155,14 @@ final class AppModel: ObservableObject {
                 }
             case .start(let generation):
                 await refresh()
+                if !didResumeAuthenticatedSession,
+                   appReviewDemoMutationsAllowed,
+                   capabilities != nil {
+                    // If launch resume stopped at a transient discovery failure, a later
+                    // foreground refresh must complete registration and communication recovery
+                    // rather than merely repopulating the capability value.
+                    await resumeAuthenticatedSessionIfNeeded()
+                }
                 let committed = foregroundAuthoritativeRefreshGate.hasCompleted(
                     generation: generation
                 )
@@ -8196,9 +8262,10 @@ final class AppModel: ObservableObject {
             ) {
                 try await api.bootstrap()
             }
-            let selectedId = bootstrap.selectedWalletId
-                ?? bootstrap.wallets.first(where: { $0.isPrimary == true })?.id
-                ?? bootstrap.wallets.first?.id
+            let selectedId = WalletIdentityResolver.authoritativeSelectionID(
+                preferred: bootstrap.selectedWalletId,
+                in: bootstrap.wallets
+            )
             let verifiedDevices = RegisteredDevicePolicy.validated(bootstrap.devices)
             try Task.checkCancellation()
             guard isSignedIn,
@@ -8320,6 +8387,33 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Explicit recovery for a call surface whose capability or privacy projection is missing.
+    /// Nothing is made permissive: capabilities are fetched under the current authenticated
+    /// session, privacy remains authoritative, and `resumeAuthenticatedSessionIfNeeded` retains
+    /// the App Review transport fence before it restores push/call/outbox work.
+    func retryCommunicationReadiness() async {
+        guard !isSigningOut,
+              isSignedIn,
+              accountSetupStep == nil,
+              communicationAccessGranted
+        else {
+            lastError = "Sign in again to restore calls and messages."
+            return
+        }
+        guard isOnline else {
+            lastError = "Connect to the internet to restore calling."
+            return
+        }
+
+        lastError = nil
+        let capabilitiesRecovered = await reloadCapabilities()
+        await loadCommunicationPrivacy()
+        guard capabilitiesRecovered, capabilities != nil else { return }
+        if !didResumeAuthenticatedSession {
+            await resumeAuthenticatedSessionIfNeeded()
+        }
+    }
+
     /// Starts or joins the model-owned refresh for the current wallet. The unstructured task is
     /// intentionally independent from its SwiftUI caller: dismissing a refresh control or
     /// replacing a view must not cancel an authenticated response between HTTP 200 and the local
@@ -8330,14 +8424,17 @@ final class AppModel: ObservableObject {
         userID expectedUserID: String
     ) async {
         guard let selectedWalletID = state.selectedWalletId,
-              let selectedWallet = state.wallets.first(where: { $0.id == selectedWalletID })
+              let selectedWallet = WalletIdentityResolver.wallet(
+                  matching: selectedWalletID,
+                  in: state.wallets
+              )
         else { return }
 
         let key = WalletHistoryRefreshKey(
             accountEpoch: expectedAccountEpoch,
             userID: expectedUserID,
             sessionID: expectedSessionID,
-            walletID: selectedWalletID
+            walletID: selectedWallet.id
         )
         if let flight = walletHistoryRefreshFlight, flight.key == key {
             await flight.task.value
@@ -8374,20 +8471,24 @@ final class AppModel: ObservableObject {
             ) {
                 try await api.transactions(walletId: key.walletID).items
             }
-            let transactions = CustomerTransactionPresentationPolicy
-                .customerVisibleTransactions(
-                    firstPage,
-                    for: selectedWallet
-                )
+            guard case .replace(let transactions) = CustomerTransactionPresentationPolicy
+                .pageReplacement(for: firstPage, wallet: selectedWallet)
+            else { return }
             guard await callHistoryContextIsCurrent(
                 accountEpoch: key.accountEpoch,
                 sessionID: key.sessionID,
                 userID: key.userID
-            ), state.selectedWalletId == key.walletID else { return }
+            ), WalletIdentityResolver.identifiersMatch(
+                state.selectedWalletId,
+                key.walletID
+            ) else { return }
             try await store.update { persisted in
                 guard persisted.profile?.id.caseInsensitiveCompare(key.userID)
                         == .orderedSame,
-                      persisted.selectedWalletId == key.walletID
+                      WalletIdentityResolver.identifiersMatch(
+                          persisted.selectedWalletId,
+                          key.walletID
+                      )
                 else { throw StoreError.accountChanged }
                 persisted.transactions = transactions
                 // The page above is only the latest slice of one wallet, so the starter
@@ -8405,7 +8506,10 @@ final class AppModel: ObservableObject {
                 accountEpoch: key.accountEpoch,
                 sessionID: key.sessionID,
                 userID: key.userID
-            ), state.selectedWalletId == key.walletID else { return }
+            ), WalletIdentityResolver.identifiersMatch(
+                state.selectedWalletId,
+                key.walletID
+            ) else { return }
             await publishLatestState()
         } catch {
             if RefreshCancellationPolicy.shouldSuppress(
@@ -8416,7 +8520,10 @@ final class AppModel: ObservableObject {
                 accountEpoch: key.accountEpoch,
                 sessionID: key.sessionID,
                 userID: key.userID
-            ), state.selectedWalletId == key.walletID else { return }
+            ), WalletIdentityResolver.identifiersMatch(
+                state.selectedWalletId,
+                key.walletID
+            ) else { return }
             lastError = error.localizedDescription
         }
     }
@@ -8635,6 +8742,10 @@ final class AppModel: ObservableObject {
                 return .noData
             }
             await publishLatestState()
+            // A verified remote-identity lifecycle event can atomically release commands that
+            // were waiting for that exact recipient. Re-arm replay from the newly published
+            // projection; many sync entry points are polling/UI paths with no later outbox drain.
+            scheduleOutboxWake()
             // A read-only recovery endpoint may have recovered a server-confirmed financial
             // result whose chat card was interrupted by process death. Cross it into the same
             // encrypted outbox only after this account's Signal state has activated and synced.
@@ -9586,9 +9697,11 @@ final class AppModel: ObservableObject {
     /// A server call-history refresh is the remote lifecycle signal for calls that ended without a
     /// local CallKit action. Retire only the matching waiting presentation, and also dismiss the
     /// waiter when the primary media call itself became terminal.
-    private func reconcileCallWaitingAfterHistoryRefresh(now: Date = Date()) {
+    private func reconcileCallWaitingAfterHistoryRefresh(
+        monotonicNow: TimeInterval = CallMonotonicClock.now()
+    ) {
         guard let waiting = callWaitingState.waitingCall else { return }
-        if waiting.ringExpiryDate <= now {
+        if waiting.ringDeadline.isExpired(at: monotonicNow) {
             _ = clearWaitingCallForLifecycle(callID: waiting.callID)
             NotificationCoordinator.shared.reportCallEnded(waiting.callUUID, reason: .unanswered)
             return
@@ -11404,7 +11517,8 @@ final class AppModel: ObservableObject {
         draftClearVersion: ConversationDraftWriteVersion? = nil,
         submittedDraftMediaAttachments: [ConversationDraftMediaAttachment]? = nil,
         deliverAt: Date? = nil,
-        replyToServerMessageID: String? = nil
+        replyToServerMessageID: String? = nil,
+        textDiagnosticsProducerScope: LocalMediaDiagnosticProducerScope? = nil
     ) async -> Bool {
         guard !isReadOnlyAppReviewDemoConversation(conversationId) else {
             lastError = "This App Review preview is read-only."
@@ -11420,7 +11534,8 @@ final class AppModel: ObservableObject {
             submittedDraftMediaAttachments: submittedDraftMediaAttachments,
             submissionKind: .userText,
             deliverAt: deliverAt,
-            replyToServerMessageID: replyToServerMessageID
+            replyToServerMessageID: replyToServerMessageID,
+            textDiagnosticsProducerScope: textDiagnosticsProducerScope
         )
     }
 
@@ -11585,7 +11700,8 @@ final class AppModel: ObservableObject {
         submittedDraftMediaAttachments: [ConversationDraftMediaAttachment]? = nil,
         submissionKind: SecureMessageSubmissionKind,
         deliverAt: Date? = nil,
-        replyToServerMessageID: String? = nil
+        replyToServerMessageID: String? = nil,
+        textDiagnosticsProducerScope: LocalMediaDiagnosticProducerScope? = nil
     ) async -> Bool {
         let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
@@ -11716,7 +11832,7 @@ final class AppModel: ObservableObject {
             return false
         }
         do {
-            _ = try await SecureMessagingActivationBinding.withAuthenticatedScope(
+            let result = try await SecureMessagingActivationBinding.withAuthenticatedScope(
                 accountGeneration: expectedAccountEpoch,
                 sessionID: expectedSessionID,
                 commitAdmission: commitAdmission
@@ -11734,6 +11850,12 @@ final class AppModel: ObservableObject {
                     deliverAt: deliverAt,
                     replyToServerMessageID: replyTarget,
                     commitAdmission: commitAdmission
+                )
+            }
+            if submissionKind == .userText {
+                LocalMediaPerformanceMonitor.shared.markTextOutboxCommitted(
+                    messageID: result.clientMessageID,
+                    producerScope: textDiagnosticsProducerScope
                 )
             }
             guard await reloadOutboxStateIfCurrent(
@@ -14277,7 +14399,8 @@ final class AppModel: ObservableObject {
                 userID: userID,
                 expectedByteCount: hydrated.plaintextByteSize
             ) else { throw SecureMediaAttachmentError.invalidCiphertext }
-            if let mediaID = UUID(uuidString: hydrated.attachmentID) {
+            if KitChatMediaKind(mediaType: hydrated.mediaType) != .video,
+               let mediaID = UUID(uuidString: hydrated.attachmentID) {
                 scheduleLocalMediaDuration(
                     mediaID: mediaID,
                     fileURL: accessLease.fileURL,
@@ -14741,6 +14864,8 @@ final class AppModel: ObservableObject {
            ),
            await currentResolution() == resolved {
             if localRecord.duration == nil,
+               !(localRecord.direction == .received
+                   && KitChatMediaKind(mediaType: mediaIdentity.type) == .video),
                let mediaID = UUID(uuidString: mediaIdentity.id) {
                 scheduleLocalMediaDuration(
                     mediaID: mediaID,
@@ -14776,11 +14901,123 @@ final class AppModel: ObservableObject {
            KitChatMediaKind(mediaType: mediaIdentity.type) == .video,
            let localStorageKey = localRecord.localStorageKey,
            let remoteStorageKey = mediaIdentity.remoteKey {
-            // Builds before the file-backed receive pipeline retained a complete decrypted video
-            // in `LoadedItem.data` for as long as the bubble/gallery lived. AVPlayer then added
-            // decoder buffers on top of that allocation; large received videos could survive the
-            // first frame and be terminated under memory pressure. Promote the authenticated
-            // legacy blob once and return only a leased protected URL to every playback surface.
+            let sessionID = await sessions.current()?.sessionId
+            let migrationSource = LegacyReceivedVideoMigrationPolicy.source(
+                plaintextByteCount: mediaIdentity.size,
+                allowsDownload: allowsDownload,
+                isOnline: isOnline,
+                secureMessagingAvailable: secureMessagingAvailable,
+                hasRemoteStorageKey: true,
+                hasAuthenticatedSession: sessionID != nil
+            )
+
+            if migrationSource == .streamedRemote, let sessionID {
+                var streamedStateCommitted = false
+                do {
+                    guard let capacityReservation = reserveReceivedMediaHydrationCapacity(
+                        plaintextByteCount: mediaIdentity.size
+                    ) else { throw SecureMediaAttachmentError.invalidCiphertext }
+                    defer { receivedMediaHydrationReservations[capacityReservation] = nil }
+                    let expectedAccountEpoch = accountEpoch
+                    let hydrated = try await APIClientSessionBinding.$sessionID.withValue(
+                        sessionID
+                    ) {
+                        try await SecureMessagingExchangeCoordinator.shared.hydrateMediaFile(
+                            forUserID: userID,
+                            conversationID: conversationId,
+                            messageID: messageID,
+                            itemIndex: itemIndex
+                        )
+                    }
+                    guard expectedAccountEpoch == accountEpoch,
+                          await outboxContextIsCurrent(
+                              accountEpoch: expectedAccountEpoch,
+                              userID: userID,
+                              sessionID: sessionID
+                          ),
+                          hydrated.attachmentID == mediaIdentity.id,
+                          hydrated.storageKey == remoteStorageKey,
+                          hydrated.mediaType == mediaIdentity.type,
+                          hydrated.plaintextByteSize == mediaIdentity.size
+                    else { throw CancellationError() }
+                    try await store.update { persisted in
+                        guard persisted.profile?.id == userID,
+                              SecureMediaLoadPolicy.resolve(
+                                  messageID: messageID,
+                                  conversationId: conversationId,
+                                  itemIndex: itemIndex,
+                                  in: persisted.messages
+                              ) == resolved
+                        else { throw SecureMediaAttachmentError.invalidDescriptor }
+                        let indices = persisted.messages.indices.filter {
+                            persisted.messages[$0].id == messageID
+                                && persisted.messages[$0].conversationId == conversationId
+                        }
+                        guard indices.count == 1, let index = indices.first,
+                              LocalMediaRecordPolicy.record(
+                                  messageID: messageID,
+                                  conversationID: conversationId,
+                                  attachmentID: mediaIdentity.id,
+                                  mediaType: mediaIdentity.type,
+                                  fileSize: mediaIdentity.size,
+                                  remoteStorageKey: mediaIdentity.remoteKey,
+                                  in: persisted.messages
+                              ) == localRecord,
+                              LocalMediaRecordPolicy.markDownloadedProtectedFile(
+                                  &persisted.messages[index],
+                                  attachmentID: mediaIdentity.id,
+                                  remoteStorageKey: remoteStorageKey,
+                                  localStorageKey: hydrated.attachmentID
+                              )
+                        else { throw SecureMediaAttachmentError.invalidDescriptor }
+                    }
+                    streamedStateCommitted = true
+                    guard await currentResolution() == resolved,
+                          let accessLease = await SecureMediaFileCache.shared
+                              .protectedOriginalLease(
+                                  forStorageKey: hydrated.attachmentID,
+                                  userID: userID,
+                                  expectedByteCount: hydrated.plaintextByteSize
+                              )
+                    else { throw SecureMediaAttachmentError.invalidCiphertext }
+                    await SecureMediaFileCache.shared.removeEncryptedBlobRepresentation(
+                        forStorageKey: localStorageKey,
+                        userID: userID
+                    )
+                    await publishLatestState()
+                    await enforceReceivedMediaCacheBudget()
+                    return SecureMediaLoadPolicy.LoadedItem(localFile: .init(
+                        url: accessLease.fileURL,
+                        mediaType: hydrated.mediaType,
+                        caption: {
+                            switch resolved {
+                            case .pendingSingle(let pending): return pending.caption
+                            case .single(let descriptor, _, _): return descriptor.caption
+                            case .pendingBatchItem, .sealedBatchItem: return nil
+                            }
+                        }(),
+                        byteCount: hydrated.plaintextByteSize,
+                        attachmentID: hydrated.attachmentID,
+                        accessLease: accessLease
+                    ))
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    // A small legacy blob remains a bounded offline fallback. Large videos never
+                    // fall back to whole-file ChaChaPoly decryption after a streamed attempt.
+                    guard !streamedStateCommitted,
+                          KitChatMediaLimits.shouldCacheInline(
+                        byteCount: mediaIdentity.size
+                    ) else { throw error }
+                }
+            }
+
+            guard KitChatMediaLimits.shouldCacheInline(byteCount: mediaIdentity.size) else {
+                if !isOnline || !allowsDownload { throw URLError(.notConnectedToInternet) }
+                throw SecureMediaAttachmentError.invalidCiphertext
+            }
+            // The bounded fallback exists only for old offline blobs small enough for the normal
+            // inline cache policy. Larger videos must use authenticated streamed rehydration.
             guard let accessLease = try await SecureMediaFileCache.shared
                 .promoteEncryptedBlobToProtectedOriginal(
                     forStorageKey: localStorageKey,
@@ -14828,14 +15065,6 @@ final class AppModel: ObservableObject {
                 userID: userID
             )
             await publishLatestState()
-            if localRecord.duration == nil,
-               let mediaID = UUID(uuidString: mediaIdentity.id) {
-                scheduleLocalMediaDuration(
-                    mediaID: mediaID,
-                    fileURL: accessLease.fileURL,
-                    mediaType: mediaIdentity.type
-                )
-            }
             return SecureMediaLoadPolicy.LoadedItem(localFile: .init(
                 url: accessLease.fileURL,
                 mediaType: mediaIdentity.type,
@@ -15033,14 +15262,6 @@ final class AppModel: ObservableObject {
                       promotedRecord.localStorageKind == .protectedFile,
                       promotedRecord.localStorageKey == localStorageKey
                 else { throw SecureMediaAttachmentError.invalidDescriptor }
-                if promotedRecord.duration == nil,
-                   let mediaID = UUID(uuidString: descriptor.attachmentID) {
-                    scheduleLocalMediaDuration(
-                        mediaID: mediaID,
-                        fileURL: accessLease.fileURL,
-                        mediaType: descriptor.mediaType
-                    )
-                }
                 return SecureMediaLoadPolicy.LoadedItem(localFile: .init(
                     url: accessLease.fileURL,
                     mediaType: descriptor.mediaType,
@@ -15117,14 +15338,16 @@ final class AppModel: ObservableObject {
         recipientId: String,
         title: String,
         body: String,
-        clientMessageID: UUID? = nil
+        clientMessageID: UUID? = nil,
+        textDiagnosticsProducerScope: LocalMediaDiagnosticProducerScope? = nil
     ) async -> SecureMessagingQueueResult? {
         await queueValidatedDirectMessageResult(
             recipientId: recipientId,
             title: title,
             body: body,
             clientMessageID: clientMessageID,
-            trustedPaymentEvent: false
+            trustedPaymentEvent: false,
+            textDiagnosticsProducerScope: textDiagnosticsProducerScope
         )
     }
 
@@ -15148,7 +15371,8 @@ final class AppModel: ObservableObject {
         title: String,
         body: String,
         clientMessageID: UUID?,
-        trustedPaymentEvent: Bool
+        trustedPaymentEvent: Bool,
+        textDiagnosticsProducerScope: LocalMediaDiagnosticProducerScope? = nil
     ) async -> SecureMessagingQueueResult? {
         let rawRecipientID = recipientId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !AppReviewDemoMutationPolicy.peerIsReadOnly(
@@ -15256,6 +15480,12 @@ final class AppModel: ObservableObject {
                     text: trimmed,
                     clientMessageID: clientMessageID,
                     commitAdmission: commitAdmission
+                )
+            }
+            if !trustedPaymentEvent {
+                LocalMediaPerformanceMonitor.shared.markTextOutboxCommitted(
+                    messageID: result.clientMessageID,
+                    producerScope: textDiagnosticsProducerScope
                 )
             }
             guard await reloadOutboxStateIfCurrent(
@@ -16198,6 +16428,13 @@ final class AppModel: ObservableObject {
             return
         }
         let cleanRecipientId = recipientUUID.uuidString.lowercased()
+        let callCapabilityNeedsRecovery = capabilities == nil
+            || (!callsFeatureEnabled
+                && capabilities?.featureIsWithdrawn("calls") != true)
+        if isOnline,
+           (callCapabilityNeedsRecovery || !hasUsableCommunicationPrivacyProjection) {
+            await retryCommunicationReadiness()
+        }
         if let denial = communicationPrivacyDenialMessage(
             for: cleanRecipientId,
             blockedMessage: "Unblock this account before starting a call."
@@ -16472,7 +16709,7 @@ final class AppModel: ObservableObject {
     private func resumeWaitingToneIfRetained(callID: String? = nil) {
         guard !callWaitingState.isMerging,
               let waiting = callWaitingState.waitingCall,
-              waiting.ringExpiryDate > Date(),
+              !waiting.ringDeadline.isExpired(),
               callID.map({ canonicalCallID($0) == waiting.callID }) ?? true
         else { return }
         CallProgressSoundPlayer.shared.beginAuthenticatedCallWaiting(callID: waiting.callID)
@@ -17202,7 +17439,7 @@ final class AppModel: ObservableObject {
                     }
                 case .unchanged:
                     return
-                case .awaitSession, .permanent:
+                case .awaitSession, .awaitIdentityRefresh, .permanent:
                     pendingEphemeralCallCancellations.removeValue(forKey: identifier)
                 }
             }
@@ -17307,7 +17544,7 @@ final class AppModel: ObservableObject {
                     } catch {
                         return
                     }
-                case .awaitSession, .unchanged:
+                case .awaitSession, .awaitIdentityRefresh, .unchanged:
                     ephemeralOutgoingCallGate.suspendSubmission()
                     return
                 case .permanent:
@@ -18910,7 +19147,7 @@ final class AppModel: ObservableObject {
         }
         guard !isSigningOut,
               isSignedIn,
-              incoming.ringExpiryDate > Date(),
+              !incoming.ringDeadline.isExpired(),
               let expectedUserID = profile?.id,
               let expectedLease = callMediaAccountLease
         else { return }
@@ -20112,6 +20349,27 @@ final class AppModel: ObservableObject {
                 ) { persisted in
                     let now = Date()
                     OutboxPolicy.markAwaitingSession(
+                        for: command,
+                        reason: reason,
+                        in: &persisted
+                    )
+                    if let messageID = command.messageId,
+                       let index = persisted.messages.firstIndex(where: { $0.id == messageID }) {
+                        LocalMediaRecordPolicy.markRetryPending(
+                            &persisted.messages[index],
+                            now: now
+                        )
+                    }
+                }
+            case .awaitIdentityRefresh:
+                state = try await commitOutboxMutation(
+                    accountEpoch: expectedAccountEpoch,
+                    userID: expectedUserID,
+                    sessionID: expectedSessionID,
+                    command: command
+                ) { persisted in
+                    let now = Date()
+                    OutboxPolicy.markAwaitingIdentityRefresh(
                         for: command,
                         reason: reason,
                         in: &persisted

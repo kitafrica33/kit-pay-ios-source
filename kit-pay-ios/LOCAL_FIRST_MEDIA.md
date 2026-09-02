@@ -87,10 +87,13 @@ substitute. Feature and server capability gates remain unchanged by this work.
 
 Privacy-safe signposts/logs separately measure capture-to-visible, capture-to-locally-playable,
 capture-to-encrypted, capture-to-server-accepted, and recipient-descriptor-to-local. The first two
-must remain independent of network latency. Testers can open **Profile > Media diagnostics**, clear
+must remain independent of network latency. Text-only composer sends also measure the monotonic,
+millisecond-bucketed action-to-durable-outbox-commit and action-to-first-visible-local-bubble
+milestones; retries retain the original sample, and neither identity nor content enters the report.
+Testers can open **Profile > Media diagnostics**, clear
 the prior run, and export a bounded JSON report after the scenario (including after force-quit and
 relaunch). The protected report records report/event times, app/iOS versions, direction, coarse
-media kind, byte count, duration, those latency milestones, and video playback
+media kind, byte count, duration, those media and text-send latency milestones, and video playback
 start/stall/failure/completion outcomes. It never exports message/caption content, contacts,
 conversations, identifiers, filenames, URLs, MIME payloads, or media content. The local report is
 cleared at sign-out and before a newly authenticated account is adopted. To reconnect a pending

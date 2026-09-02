@@ -2899,7 +2899,7 @@ actor SecureMessagingExchangeCoordinator {
             }
         }
         if mediaData == nil {
-            guard (clientMessageID == nil || preprocessingJob != nil),
+            guard localStorageKind == .protectedFile,
                   localMediaID?.uuidString.lowercased() == canonicalLocalStorageKey,
                   let canonicalLocalStorageKey,
                   await mediaBlobs.byteCount(canonicalLocalStorageKey, local) == mediaByteCount,
@@ -2961,13 +2961,15 @@ actor SecureMessagingExchangeCoordinator {
             localUserID: local,
             expectedRecipientUserID: recipient
         )
+        let suppliedStableMediaID = localMediaID?.uuidString.lowercased()
+            ?? canonicalLocalStorageKey
         // Match the original minute before validating a fresh schedule: an exact retry can arrive
         // after that minute and must resolve to the existing idempotent message, not send another.
         let requestedMinute = deliverAt.map { ScheduledSendPolicy.canonicalMinute($0) }
         // No network at queue time: the offline path must succeed in airplane mode. The rich-media
         // recipient-capability gate still runs authoritatively at flush (prepareDeferredMessage)
         // and again per-encrypt in queueText before any bytes leave the device.
-        if let clientMessageID, let mediaData,
+        if let clientMessageID,
            let existing = try await existingDeferredMediaResult(
                in: snapshot,
                clientMessageID: clientMessageID,
@@ -2975,8 +2977,16 @@ actor SecureMessagingExchangeCoordinator {
                recipientUserIDs: commandRecipients,
                conversation: conversation,
                mediaData: mediaData,
+               mediaByteCount: mediaByteCount,
                mediaType: mediaType,
                caption: normalizedCaption,
+               localStorageKey: canonicalLocalStorageKey,
+               stableMediaID: suppliedStableMediaID,
+               storesInline: storesInline,
+               localStorageKind: localStorageKind,
+               duration: duration,
+               preprocessingJob: preprocessingJob,
+               replyToServerMessageID: replyTarget,
                scheduledAt: requestedMinute
            ) {
             try await clearDraftAfterIdempotentQueueIfNeeded(
@@ -2994,9 +3004,7 @@ actor SecureMessagingExchangeCoordinator {
         let messageID = clientMessageID ?? UUID()
         let commandID = UUID()
         let createdAt = Date()
-        let stableMediaID = localMediaID?.uuidString.lowercased()
-            ?? canonicalLocalStorageKey
-            ?? UUID().uuidString.lowercased()
+        let stableMediaID = suppliedStableMediaID ?? UUID().uuidString.lowercased()
         let proposedOwnershipKeys = proposedStorageKeys.union([stableMediaID])
         let outboundKeyMaterial = try SecureMediaAttachmentCipher.randomKeyMaterial()
         guard let localMediaRecord = LocalMediaRecordPolicy.queuedOutgoing(
@@ -3112,9 +3120,17 @@ actor SecureMessagingExchangeCoordinator {
         localUserID: String,
         recipientUserIDs: [String],
         conversation: Conversation,
-        mediaData: Data,
+        mediaData: Data?,
+        mediaByteCount: Int,
         mediaType: String,
         caption: String?,
+        localStorageKey: String?,
+        stableMediaID: String?,
+        storesInline: Bool,
+        localStorageKind: LocalMediaRecord.LocalStorageKind?,
+        duration: TimeInterval?,
+        preprocessingJob: LocalMediaPreprocessingJob?,
+        replyToServerMessageID: String?,
         scheduledAt: Date?
     ) async throws -> SecureMessagingQueueResult? {
         let messages = state.messages.filter { $0.id == clientMessageID }
@@ -3132,40 +3148,91 @@ actor SecureMessagingExchangeCoordinator {
               message.senderId == localUserID,
               message.isOutgoing,
               message.scheduledAt == scheduledAt,
+              message.replyToServerMessageID == replyToServerMessageID,
               message.pendingMediaBatch == nil
+        else { throw SecureMessagingExchangeError.invalidConversation }
+
+        let expectedStorageKind: LocalMediaRecord.LocalStorageKind = storesInline
+            ? .encryptedState
+            : localStorageKind ?? .encryptedBlob
+        guard let records = message.localMediaRecords,
+              records.count == 1,
+              let record = records.first,
+              stableMediaID.map({ record.id == $0 }) ?? true,
+              record.messageID == clientMessageID,
+              record.conversationID == conversation.id,
+              record.direction == .sent,
+              record.mediaType == mediaType,
+              record.fileSize == mediaByteCount,
+              record.duration == duration,
+              record.localStorageKind == expectedStorageKind,
+              record.localStorageKey == (storesInline ? nil : localStorageKey),
+              record.originalSources == preprocessingJob?.sources,
+              record.preprocessingJob == preprocessingJob
         else { throw SecureMessagingExchangeError.invalidConversation }
 
         if let pending = message.pendingAttachment {
             guard pending.mediaType == mediaType,
                   pending.caption == caption,
-                  pending.byteCount == mediaData.count
+                  pending.byteCount == mediaByteCount,
+                  pending.localStorageKey == (storesInline ? nil : localStorageKey),
+                  message.body == (caption ?? KitChatMediaKind(mediaType: mediaType).previewLabel)
             else { throw SecureMessagingExchangeError.invalidConversation }
-            if let inline = message.attachmentData {
-                guard pending.localStorageKey == nil, inline == mediaData else {
-                    throw SecureMessagingExchangeError.invalidConversation
+            if let mediaData {
+                if let inline = message.attachmentData {
+                    guard storesInline, inline == mediaData else {
+                        throw SecureMessagingExchangeError.invalidConversation
+                    }
+                } else {
+                    guard !storesInline,
+                          let localStorageKey,
+                          let parked = await mediaBlobs.read(localStorageKey, localUserID),
+                          parked == mediaData
+                    else { throw SecureMessagingExchangeError.invalidConversation }
                 }
             } else {
-                guard let localStorageKey = pending.localStorageKey,
-                      let parked = await mediaBlobs.read(localStorageKey, localUserID),
-                      parked == mediaData
-                else { throw SecureMessagingExchangeError.invalidConversation }
+                guard message.attachmentData == nil,
+                      expectedStorageKind == .protectedFile,
+                      let localStorageKey,
+                      await mediaBlobs.byteCount(localStorageKey, localUserID) == mediaByteCount,
+                      await mediaBlobs.protectedOriginalURL(
+                          localStorageKey,
+                          localUserID,
+                          mediaByteCount
+                      ) != nil
+                else {
+                    throw SecureMessagingExchangeError.invalidConversation
+                }
             }
         } else if let descriptor = KitMediaMessageDescriptor.parse(message.body) {
             guard descriptor.mediaType == mediaType,
                   descriptor.caption == caption,
-                  descriptor.plaintextByteSize == mediaData.count
+                  descriptor.plaintextByteSize == mediaByteCount,
+                  stableMediaID.map({ descriptor.attachmentID == $0 }) ?? true
             else { throw SecureMessagingExchangeError.invalidConversation }
-            if let inline = message.attachmentData {
-                guard inline == mediaData else {
-                    throw SecureMessagingExchangeError.invalidConversation
+            if let mediaData {
+                if let inline = message.attachmentData {
+                    guard storesInline, inline == mediaData else {
+                        throw SecureMessagingExchangeError.invalidConversation
+                    }
+                } else {
+                    guard !storesInline,
+                          let retained = await mediaBlobs.read(
+                        record.localStorageKey ?? descriptor.storageKey,
+                        localUserID
+                    ), retained == mediaData
+                    else { throw SecureMessagingExchangeError.invalidConversation }
                 }
-            } else if let retained = await mediaBlobs.read(
-                descriptor.storageKey,
-                localUserID
-            ) {
-                guard retained == mediaData else {
-                    throw SecureMessagingExchangeError.invalidConversation
-                }
+            } else {
+                guard expectedStorageKind == .protectedFile,
+                      let localStorageKey,
+                      await mediaBlobs.byteCount(localStorageKey, localUserID) == mediaByteCount,
+                      await mediaBlobs.protectedOriginalURL(
+                          localStorageKey,
+                          localUserID,
+                          mediaByteCount
+                      ) != nil
+                else { throw SecureMessagingExchangeError.invalidConversation }
             }
         } else {
             throw SecureMessagingExchangeError.invalidConversation
@@ -6493,8 +6560,9 @@ actor SecureMessagingExchangeCoordinator {
     private func performSync(forUserID userID: String) async throws -> SecureMessagingSyncResult {
         _ = try await activateMessagingState(forUserID: userID)
         var pageCount = 0
-        var receivedCount = 0
-        var transitionCount = 0
+        let recovered = try await retryQuarantinedSyncEvents(forUserID: userID)
+        var receivedCount = recovered.receivedMessages
+        var transitionCount = recovered.appliedTransitions
 
         while pageCount < 100 {
             try Task.checkCancellation()
@@ -6507,6 +6575,7 @@ actor SecureMessagingExchangeCoordinator {
 
             let applied = try await applySyncPage(
                 page.events,
+                sourceCursor: cursor,
                 nextCursor: page.nextCursor,
                 forUserID: userID
             )
@@ -8046,11 +8115,222 @@ actor SecureMessagingExchangeCoordinator {
         return (rawEvents.compactMap { $0 }, nextCursor, hasMore)
     }
 
-    private func applySyncPage(
-        _ events: [MessagingSyncEventDTO],
-        nextCursor: String,
+    /// Retries already-preserved ciphertext without consulting or moving the ordinary sync
+    /// cursor. Every attempt still runs under the caller's exact account/session scope and the
+    /// protected-store admission lease inherited by `sync(forUserID:)`.
+    private func retryQuarantinedSyncEvents(
         forUserID userID: String
     ) async throws -> SecureMessagingSyncResult {
+        let identity = try messagingWorkIdentity(forUserID: userID)
+        var attemptedEventIDs: Set<String> = []
+        var receivedMessages = 0
+        var appliedTransitions = 0
+
+        for _ in 0..<SecureMessagingSyncQuarantinePolicy.maximumAttemptsPerDrain {
+            try Task.checkCancellation()
+            guard try messagingWorkIdentity(forUserID: userID) == identity else {
+                throw CancellationError()
+            }
+            let snapshot = await store.snapshot()
+            guard snapshot.profile?.id == userID,
+                  let crypto = snapshot.secureMessaging,
+                  let enrollment = crypto.enrollment,
+                  enrollment.userID == userID
+            else { throw SecureMessagingExchangeError.invalidAccount }
+            guard SecureMessagingSyncQuarantinePolicy.canPersist(
+                crypto.quarantinedSyncEvents
+            ) else { throw SecureMessagingCryptoError.recordLimitExceeded }
+            let now = Date()
+            guard let retained = crypto.quarantinedSyncEvents
+                .filter({ record in
+                    record.ownerUserID == userID
+                        && record.localDeviceID == enrollment.serverDeviceID
+                        && record.localEnrollmentEpoch == enrollment.enrollmentEpoch
+                        && record.sourceCursor != crypto.syncCursor
+                        && record.attemptCount
+                            >= SecureMessagingSyncQuarantinePolicy.attemptsBeforeCursorRelease
+                        && record.nextAttemptAt <= now
+                        && !attemptedEventIDs.contains(record.eventID)
+                })
+                .sorted(by: {
+                    if $0.nextAttemptAt != $1.nextAttemptAt {
+                        return $0.nextAttemptAt < $1.nextAttemptAt
+                    }
+                    return $0.eventID < $1.eventID
+                })
+                .first
+            else { break }
+            attemptedEventIDs.insert(retained.eventID)
+
+            do {
+                let applied = try await applySyncPage(
+                    [retained.event],
+                    sourceCursor: retained.sourceCursor,
+                    nextCursor: crypto.syncCursor ?? "quarantine-retry",
+                    forUserID: userID,
+                    quarantinedEventID: retained.eventID
+                )
+                receivedMessages += applied.receivedMessages
+                appliedTransitions += applied.appliedTransitions
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch let error as SecureMessagingActivationError {
+                throw error
+            } catch StoreError.accountChanged {
+                throw StoreError.accountChanged
+            } catch {
+                // The exact event remains durable. A retry-lane storage race or transient service
+                // error must not regain ownership of the unrelated ordinary server cursor.
+                break
+            }
+        }
+
+        return SecureMessagingSyncResult(
+            pages: 0,
+            receivedMessages: receivedMessages,
+            appliedTransitions: appliedTransitions
+        )
+    }
+
+    private func persistQuarantinedSyncFailure(
+        _ event: MessagingSyncEventDTO,
+        sourceCursor: String?,
+        category: SecureMessagingSyncFailureCategory,
+        error: Error,
+        forUserID userID: String
+    ) async throws {
+        guard Self.shouldQuarantineEncryptedSyncEvent(event, after: error),
+              let eventID = event.id
+        else { throw error }
+
+        for _ in 0..<3 {
+            try Task.checkCancellation()
+            let snapshot = await store.snapshot()
+            guard snapshot.profile?.id == userID,
+                  let initialCrypto = snapshot.secureMessaging,
+                  let enrollment = initialCrypto.enrollment,
+                  enrollment.userID == userID
+            else { throw SecureMessagingExchangeError.invalidAccount }
+
+            var nextCrypto = initialCrypto
+            let now = Date()
+            if let index = nextCrypto.quarantinedSyncEvents.firstIndex(where: {
+                $0.eventID == eventID
+            }) {
+                let retained = nextCrypto.quarantinedSyncEvents[index]
+                guard retained.event == event,
+                      retained.ownerUserID == userID,
+                      retained.localDeviceID == enrollment.serverDeviceID,
+                      retained.localEnrollmentEpoch == enrollment.enrollmentEpoch,
+                      retained.sourceCursor == sourceCursor
+                else { throw SecureMessagingExchangeError.invalidServerResponse }
+                let attemptCount = min(
+                    retained.attemptCount + 1,
+                    SecureMessagingSyncQuarantinePolicy.maximumRecordedAttempts
+                )
+                nextCrypto.quarantinedSyncEvents[index].attemptCount = attemptCount
+                nextCrypto.quarantinedSyncEvents[index].failureCategory = category
+                nextCrypto.quarantinedSyncEvents[index].lastFailedAt = max(
+                    now,
+                    retained.firstFailedAt
+                )
+                nextCrypto.quarantinedSyncEvents[index].nextAttemptAt = max(
+                    now,
+                    retained.firstFailedAt
+                ).addingTimeInterval(
+                    SecureMessagingSyncQuarantinePolicy.retryDelay(
+                        afterAttempt: attemptCount
+                    )
+                )
+            } else {
+                let record = SecureMessagingQuarantinedSyncEvent(
+                    eventID: eventID,
+                    ownerUserID: userID,
+                    localDeviceID: enrollment.serverDeviceID,
+                    localEnrollmentEpoch: enrollment.enrollmentEpoch,
+                    sourceCursor: sourceCursor,
+                    event: event,
+                    firstFailedAt: now,
+                    lastFailedAt: now,
+                    nextAttemptAt: now.addingTimeInterval(
+                        SecureMessagingSyncQuarantinePolicy.retryDelay(afterAttempt: 1)
+                    ),
+                    attemptCount: 1,
+                    failureCategory: category
+                )
+                nextCrypto.quarantinedSyncEvents.append(record)
+            }
+            guard SecureMessagingSyncQuarantinePolicy.canPersist(
+                nextCrypto.quarantinedSyncEvents
+            ) else { throw SecureMessagingCryptoError.recordLimitExceeded }
+
+            do {
+                try await store.commitSecureMessaging(
+                    forUserID: userID,
+                    expectedState: initialCrypto,
+                    nextState: nextCrypto,
+                    admission: try messagingCommitAdmission(forUserID: userID)
+                )
+                return
+            } catch SecureMessagingCryptoError.staleState {
+                continue
+            }
+        }
+        throw SecureMessagingExchangeError.retryLimitExceeded
+    }
+
+    private nonisolated static func shouldQuarantineEncryptedSyncEvent(
+        _ event: MessagingSyncEventDTO,
+        after error: Error
+    ) -> Bool {
+        guard event.type == "message.created",
+              let eventID = event.id,
+              SecureMessagingValidation.isCanonicalPositiveDecimalID(eventID),
+              event.data?.envelope?.ciphertext?.isEmpty == false,
+              !Task.isCancelled,
+              !(error is CancellationError),
+              !(error is StoreError),
+              !(error is SecureMessagingActivationError)
+        else { return false }
+        if let apiError = error as? APIClientError {
+            switch apiError {
+            case .signedOut:
+                return false
+            case .invalidPayload(let status), .httpStatus(let status):
+                if status == 401 { return false }
+            case .httpResponse(let status, _):
+                if status == 401 { return false }
+            case .invalidResponse, .invalidURL:
+                break
+            }
+        }
+        if let payload = error as? APIErrorPayload, payload.httpStatus == 401 { return false }
+        if let exchangeError = error as? SecureMessagingExchangeError {
+            if case .invalidAccount = exchangeError { return false }
+        }
+        if let cryptoError = error as? SecureMessagingCryptoError {
+            switch cryptoError {
+            case .notProvisioned, .staleState:
+                return false
+            default:
+                break
+            }
+        }
+        return true
+    }
+
+    private func applySyncPage(
+        _ events: [MessagingSyncEventDTO],
+        sourceCursor: String?,
+        nextCursor: String,
+        forUserID userID: String,
+        quarantinedEventID: String? = nil
+    ) async throws -> SecureMessagingSyncResult {
+        if let quarantinedEventID {
+            guard events.count == 1, events.first?.id == quarantinedEventID else {
+                throw SecureMessagingExchangeError.invalidServerResponse
+            }
+        }
         for _ in 0..<3 {
             let snapshot = await store.snapshot()
             guard snapshot.profile?.id == userID,
@@ -8058,6 +8338,9 @@ actor SecureMessagingExchangeCoordinator {
                   let enrollment = initialCrypto.enrollment,
                   enrollment.userID == userID
             else { throw SecureMessagingExchangeError.invalidAccount }
+            guard SecureMessagingSyncQuarantinePolicy.canPersist(
+                initialCrypto.quarantinedSyncEvents
+            ) else { throw SecureMessagingCryptoError.recordLimitExceeded }
 
             var crypto = initialCrypto
             var conversations: [Conversation] = []
@@ -8080,10 +8363,41 @@ actor SecureMessagingExchangeCoordinator {
             var transitionCount = 0
             var shouldReconcileHistoryTargets = false
             var originalHistoryRosters: [String: SecureMessagingRosterSnapshot] = [:]
+            var identityRefreshedUserIDs: Set<String> = []
 
             for event in events {
-                let type = try validateEvent(event)
-                switch type {
+                if let eventID = event.id,
+                   let retained = crypto.quarantinedSyncEvents.first(where: {
+                       $0.eventID == eventID
+                   }) {
+                    guard retained.event == event,
+                          retained.ownerUserID == userID,
+                          retained.localDeviceID == enrollment.serverDeviceID,
+                          retained.localEnrollmentEpoch == enrollment.enrollmentEpoch,
+                          retained.sourceCursor == sourceCursor
+                    else { throw SecureMessagingExchangeError.invalidServerResponse }
+                    if quarantinedEventID == nil,
+                       retained.attemptCount
+                        >= SecureMessagingSyncQuarantinePolicy.attemptsBeforeCursorRelease {
+                        // The exact ciphertext is already durable. Let the ordinary cursor move;
+                        // only the independent retry lane may touch this event from here on.
+                        continue
+                    }
+                } else if quarantinedEventID != nil {
+                    throw SecureMessagingExchangeError.invalidServerResponse
+                }
+
+                let cryptoBeforeEvent = crypto
+                let conversationsBeforeEvent = conversations
+                let incomingMessagesBeforeEvent = incomingMessages
+                let recoveredHistoryMessagesBeforeEvent = recoveredHistoryMessages
+                let outboundEchoesBeforeEvent = outboundEchoes
+                let acknowledgementIDsBeforeEvent = acknowledgementIDs
+                let originalHistoryRostersBeforeEvent = originalHistoryRosters
+                var failureCategory = SecureMessagingSyncFailureCategory.eventValidation
+                do {
+                    let type = try validateEvent(event)
+                    switch type {
                 case "conversation.created", "conversation.updated":
                     guard let conversationID = event.conversationId,
                           event.resourceType == "conversation",
@@ -8149,10 +8463,16 @@ actor SecureMessagingExchangeCoordinator {
                     guard let conversationID = dto.conversationId,
                           event.conversationId == conversationID
                     else { throw SecureMessagingExchangeError.invalidServerResponse }
+                    failureCategory = .conversation
                     guard let conversation = try await loadSyncConversationIfAvailable(
                         id: conversationID,
                         currentUserID: userID
-                    ) else { continue }
+                    ) else {
+                        if let eventID = event.id {
+                            crypto.quarantinedSyncEvents.removeAll { $0.eventID == eventID }
+                        }
+                        continue
+                    }
                     conversations.append(conversation.localProjection)
                     if dto.envelope?.isHistoryBackfill == true {
                         guard dto.kind.flatMap(SecureMessagingMessageKind.init(rawValue:)) != nil,
@@ -8160,6 +8480,7 @@ actor SecureMessagingExchangeCoordinator {
                               let transferRevision = dto.envelope?.transferRosterRevision,
                               let originalRevision = dto.rosterRevision
                         else { throw SecureMessagingCryptoError.invalidContent }
+                        failureCategory = .roster
                         let rosterDTO = try await transport.historicalMessagingDeviceRoster(
                             conversationId: conversation.id,
                             rosterRevision: transferRevision
@@ -8191,6 +8512,7 @@ actor SecureMessagingExchangeCoordinator {
                                 originalRoster = loaded
                             }
                         }
+                        failureCategory = .envelope
                         let historyEnvelope = try SecureMessagingMapper.historyInboundEnvelope(
                             from: dto,
                             localRecipient: enrollment.address,
@@ -8198,6 +8520,7 @@ actor SecureMessagingExchangeCoordinator {
                             transferRoster: transferRoster,
                             originalMessageRoster: originalRoster
                         )
+                        failureCategory = .decryption
                         let decrypted = try await engine.decryptText(
                             currentState: crypto,
                             incoming: historyEnvelope.cryptoEnvelope,
@@ -8206,6 +8529,7 @@ actor SecureMessagingExchangeCoordinator {
                         )
                         crypto = decrypted.state
                         crypto.cachedRosters[transferRoster.rosterRevision] = transferRoster
+                        failureCategory = .projection
                         let authenticated: SecureMessagingAuthenticatedHistory
                         switch try Self.historyDescriptorDisposition(
                             decrypted.text,
@@ -8218,6 +8542,9 @@ actor SecureMessagingExchangeCoordinator {
                             // server event even when the donor's inner descriptor is malformed. A
                             // message-local donor bug must not pin the ordinary sync cursor forever.
                             acknowledgementIDs.append(acknowledgementMessageID)
+                            if let eventID = event.id {
+                                crypto.quarantinedSyncEvents.removeAll { $0.eventID == eventID }
+                            }
                             continue
                         }
                         let original = authenticated.original
@@ -8245,6 +8572,7 @@ actor SecureMessagingExchangeCoordinator {
                         recoveredHistoryMessages.append(recoveredMessage)
                         acknowledgementIDs.append(original.messageID)
                     } else if dto.senderDeviceId == enrollment.serverDeviceID {
+                        failureCategory = .projection
                         let clientID = dto.clientMessageId
                         let localMessage = clientID.flatMap { clientID in
                             snapshot.messages.first(where: {
@@ -8285,6 +8613,7 @@ actor SecureMessagingExchangeCoordinator {
                               dto.revokedAt == nil,
                               let revision = dto.rosterRevision
                         else { throw SecureMessagingCryptoError.invalidContent }
+                        failureCategory = .roster
                         let rosterDTO = try await transport.historicalMessagingDeviceRoster(
                             conversationId: conversation.id,
                             rosterRevision: revision
@@ -8298,12 +8627,14 @@ actor SecureMessagingExchangeCoordinator {
                             expectedMemberUserIDs: conversation.memberUserIDs,
                             allowHistoricalGroupMembershipChurn: conversation.isGroup
                         )
+                        failureCategory = .envelope
                         let envelope = try SecureMessagingMapper.inboundEnvelope(
                             from: dto,
                             localRecipient: enrollment.address,
                             localEnrollment: enrollment,
                             roster: roster
                         )
+                        failureCategory = .decryption
                         let decrypted = try await engine.decryptText(
                             currentState: crypto,
                             incoming: envelope
@@ -8314,6 +8645,7 @@ actor SecureMessagingExchangeCoordinator {
                         // cannot pin this conversation's append-only sync cursor forever.
                         crypto = decrypted.state
                         crypto.cachedRosters[roster.rosterRevision] = roster
+                        failureCategory = .projection
                         let sentAt = try parseServerDate(dto.sentAt)
                         guard let projected = try Self.projectedInboundMessage(
                             dto: dto,
@@ -8323,6 +8655,9 @@ actor SecureMessagingExchangeCoordinator {
                             currentUserID: userID
                         ) else {
                             acknowledgementIDs.append(envelope.messageID)
+                            if let eventID = event.id {
+                                crypto.quarantinedSyncEvents.removeAll { $0.eventID == eventID }
+                            }
                             continue
                         }
                         incomingMessages.append(projected)
@@ -8416,6 +8751,7 @@ actor SecureMessagingExchangeCoordinator {
                             outbound.targetDeviceID != lifecycle.deviceID
                         }
                     crypto.cachedRosters.removeAll()
+                    identityRefreshedUserIDs.insert(lifecycle.userID)
                     transitionCount += 1
 
                 case "devices.revoked":
@@ -8428,6 +8764,7 @@ actor SecureMessagingExchangeCoordinator {
                         userID: revokedUserID
                     )
                     crypto.cachedRosters.removeAll()
+                    identityRefreshedUserIDs.insert(revokedUserID)
                     transitionCount += 1
 
                 case "group_payment_request.created",
@@ -8644,6 +8981,37 @@ actor SecureMessagingExchangeCoordinator {
 
                 default:
                     throw SecureMessagingExchangeError.unsupportedEvent(type)
+                    }
+
+                    if event.type == "message.created", let eventID = event.id {
+                        crypto.quarantinedSyncEvents.removeAll { $0.eventID == eventID }
+                    }
+                } catch {
+                    crypto = cryptoBeforeEvent
+                    conversations = conversationsBeforeEvent
+                    incomingMessages = incomingMessagesBeforeEvent
+                    recoveredHistoryMessages = recoveredHistoryMessagesBeforeEvent
+                    outboundEchoes = outboundEchoesBeforeEvent
+                    acknowledgementIDs = acknowledgementIDsBeforeEvent
+                    originalHistoryRosters = originalHistoryRostersBeforeEvent
+                    guard Self.shouldQuarantineEncryptedSyncEvent(event, after: error) else {
+                        throw error
+                    }
+                    try await persistQuarantinedSyncFailure(
+                        event,
+                        sourceCursor: sourceCursor,
+                        category: failureCategory,
+                        error: error,
+                        forUserID: userID
+                    )
+                    if quarantinedEventID != nil {
+                        return SecureMessagingSyncResult(
+                            pages: 0,
+                            receivedMessages: 0,
+                            appliedTransitions: 0
+                        )
+                    }
+                    throw error
                 }
             }
 
@@ -8655,7 +9023,9 @@ actor SecureMessagingExchangeCoordinator {
                 where !crypto.pendingDeliveryAcknowledgementIDs.contains(id) {
                 crypto.pendingDeliveryAcknowledgementIDs.append(id)
             }
-            crypto.syncCursor = nextCursor
+            if quarantinedEventID == nil {
+                crypto.syncCursor = nextCursor
+            }
 
             // Reactions are metadata for an ordinary message, never independent timeline rows.
             // Authenticate/decrypt first so their server events can be acknowledged, then retain
@@ -8945,6 +9315,14 @@ actor SecureMessagingExchangeCoordinator {
                         Self.abandonSecureGroupOutbox(
                             conversationID: conversationID,
                             in: &state
+                        )
+                    }
+                    let identityRefreshDate = Date()
+                    for refreshedUserID in identityRefreshedUserIDs {
+                        OutboxPolicy.resumeIdentityDeferredCommands(
+                            forRecipientUserID: refreshedUserID,
+                            in: &state,
+                            at: identityRefreshDate
                         )
                     }
                 }

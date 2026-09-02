@@ -89,6 +89,48 @@ final class VoiceNoteDraftPolicyTests: XCTestCase {
         XCTAssertEqual(VoiceNoteDraftPolicy.phaseAfterInterruption(.idle), .idle)
     }
 
+    func testFinalizedSingleSegmentSkipsVoiceAssembly() {
+        let source = LocalMediaOriginalSource(
+            storageKey: UUID().uuidString.lowercased(),
+            mediaType: "audio/mp4",
+            fileSize: 4_096,
+            duration: 120
+        )
+
+        XCTAssertNil(VoiceNoteSendPreparationPolicy.preprocessingJob(
+            for: [source],
+            outputStorageKey: UUID().uuidString.lowercased()
+        ))
+    }
+
+    func testPausedAndResumedVoiceNoteKeepsOrderedPassthroughAssembly() throws {
+        let sources = [
+            LocalMediaOriginalSource(
+                storageKey: UUID().uuidString.lowercased(),
+                mediaType: "audio/mp4",
+                fileSize: 2_048,
+                duration: 30
+            ),
+            LocalMediaOriginalSource(
+                storageKey: UUID().uuidString.lowercased(),
+                mediaType: "audio/mp4",
+                fileSize: 3_072,
+                duration: 45
+            ),
+        ]
+        let outputStorageKey = UUID().uuidString.lowercased()
+
+        let job = try XCTUnwrap(VoiceNoteSendPreparationPolicy.preprocessingJob(
+            for: sources,
+            outputStorageKey: outputStorageKey
+        ))
+        XCTAssertEqual(job.kind, .voiceAssembly)
+        XCTAssertEqual(job.sources, sources)
+        XCTAssertEqual(job.outputStorageKey, outputStorageKey)
+        XCTAssertEqual(job.outputMediaType, "audio/mp4")
+        XCTAssertTrue(job.isStructurallyValid)
+    }
+
     func testEveryPhaseAcceptsExactlyTheTransitionsTheTablePromises() {
         // The exhaustive sweep: a phase added later without a decision fails here.
         XCTAssertEqual(

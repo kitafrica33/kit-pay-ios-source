@@ -12,7 +12,7 @@ on:
       build_number:
         description: Monotonically increasing integer CFBundleVersion
         required: true
-        default: "55"
+        default: "56"
         type: string
       confirmation:
         description: Type ARCHIVE_KIT_PAY_APP_STORE
@@ -21,7 +21,7 @@ on:
       corresponding_source_url:
         description: >-
           Exact public AGPL corresponding-source release URL for this build, for example
-          https://github.com/kitafrica33/kit-pay-ios-source/releases/tag/v1.0.16-build55 .
+          https://github.com/kitafrica33/kit-pay-ios-source/releases/tag/v1.0.16-build56 .
           The archive is rejected unless this tagged release is already publicly available.
         required: true
         type: string

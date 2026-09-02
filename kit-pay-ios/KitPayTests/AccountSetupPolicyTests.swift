@@ -1990,38 +1990,49 @@ final class HomeStarterChecklistPolicyTests: XCTestCase {
         XCTAssertEqual(
             HomeStarterStepRoutePolicy.presentation(
                 for: .verifyIdentity,
-                secureMessagingAvailable: false
+                secureMessagingLocalQueueAvailable: false
             ),
             .fullScreen
         )
         XCTAssertEqual(
             HomeStarterStepRoutePolicy.presentation(
                 for: .sendFirstMessage,
-                secureMessagingAvailable: true
+                secureMessagingLocalQueueAvailable: true
             ),
             .tabSwitch
         )
         XCTAssertEqual(
             HomeStarterStepRoutePolicy.presentation(
                 for: .makeFirstTransaction,
-                secureMessagingAvailable: false
+                secureMessagingLocalQueueAvailable: false
             ),
             .walletSheet
         )
     }
 
-    /// "Send first message" must never open a composer that cannot compose. When secure
-    /// messaging is not set up on this device the route explains the real next step instead,
-    /// and no other step is affected by messaging availability.
-    func testSendFirstMessageRouteGatesOnSecureMessagingAvailability() {
+    /// Active E2EE enrollment is deliberately absent from this policy. When the protected local
+    /// outbox is available, the first message can appear immediately as Pending while activation
+    /// recovers in the background; genuine session/privacy unavailability still fails closed.
+    func testSendFirstMessageRouteGatesOnProtectedLocalQueueAvailability() {
         XCTAssertEqual(
             HomeStarterStepRoutePolicy.presentation(
                 for: .sendFirstMessage,
-                secureMessagingAvailable: false
+                secureMessagingLocalQueueAvailable: true
+            ),
+            .tabSwitch
+        )
+        XCTAssertEqual(
+            HomeStarterStepRoutePolicy.presentation(
+                for: .sendFirstMessage,
+                secureMessagingLocalQueueAvailable: false
             ),
             .unavailable(message: HomeStarterStepRoutePolicy.messagingUnavailableMessage)
         )
         XCTAssertFalse(HomeStarterStepRoutePolicy.messagingUnavailableMessage.isEmpty)
+        XCTAssertFalse(
+            HomeStarterStepRoutePolicy.messagingUnavailableMessage
+                .localizedCaseInsensitiveContains("secure messaging")
+        )
     }
 
     /// The optional server milestone contract only ever adds confirmation, and it is judged

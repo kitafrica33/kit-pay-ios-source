@@ -345,6 +345,103 @@ final class CustomerTransactionPresentationPolicyTests: XCTestCase {
         )
     }
 
+    func testSelectedWalletProjectionUsesAuthoritativeCasingForValidBankDeposit() {
+        let authoritativeWallet = wallet(id: "Wallet-Primary")
+        let deposit = transaction(
+            id: "bank-deposit",
+            type: "bank_deposit",
+            walletId: "WALLET-PRIMARY"
+        )
+
+        XCTAssertEqual(
+            WalletIdentityResolver.authoritativeSelectionID(
+                preferred: "wallet-primary",
+                in: [authoritativeWallet]
+            ),
+            authoritativeWallet.id
+        )
+        XCTAssertEqual(
+            CustomerTransactionPresentationPolicy.customerVisibleTransactions(
+                [deposit],
+                selectedWalletID: "wallet-primary",
+                wallets: [authoritativeWallet]
+            ).map(\.id),
+            [deposit.id]
+        )
+    }
+
+    func testAuthoritativeWalletCaseChangePreservesLastGoodHistory() {
+        let cached = wallet(id: "wallet-primary")
+        let authoritative = wallet(id: "WALLET-PRIMARY")
+        let lastGood = transaction(
+            id: "bank-deposit",
+            type: "bank_deposit",
+            walletId: cached.id
+        )
+        var state = PersistedState.empty
+        state.wallets = [cached]
+        state.selectedWalletId = cached.id
+        state.transactions = [lastGood]
+
+        state.replaceAuthoritativeWalletProjection(
+            [authoritative],
+            selectedWalletID: cached.id
+        )
+
+        XCTAssertEqual(state.selectedWalletId, authoritative.id)
+        XCTAssertEqual(state.transactions, [lastGood])
+
+        state.replaceAuthoritativeWalletProjection(
+            [wallet(id: "different-wallet")],
+            selectedWalletID: "different-wallet"
+        )
+        XCTAssertTrue(state.transactions.isEmpty)
+    }
+
+    func testNonemptyIncompatiblePagePreservesLastGoodButEmptyPageMayClear() {
+        let selectedWallet = wallet()
+        let validDeposit = transaction(id: "valid", type: "bank_deposit")
+        let wrongWallet = transaction(
+            id: "wrong-wallet",
+            type: "bank_deposit",
+            walletId: "wallet-2"
+        )
+        let invalidTotals = transaction(
+            id: "invalid-totals",
+            type: "bank_deposit",
+            totals: CustomerTransactionTotals(added: "0", deducted: "100")
+        )
+
+        XCTAssertEqual(
+            CustomerTransactionPresentationPolicy.pageReplacement(
+                for: [validDeposit],
+                wallet: selectedWallet
+            ),
+            .replace([validDeposit])
+        )
+        XCTAssertEqual(
+            CustomerTransactionPresentationPolicy.pageReplacement(
+                for: [validDeposit, wrongWallet],
+                wallet: selectedWallet
+            ),
+            .preserveLastGood
+        )
+        XCTAssertEqual(
+            CustomerTransactionPresentationPolicy.pageReplacement(
+                for: [invalidTotals],
+                wallet: selectedWallet
+            ),
+            .preserveLastGood
+        )
+        XCTAssertEqual(
+            CustomerTransactionPresentationPolicy.pageReplacement(
+                for: [],
+                wallet: selectedWallet
+            ),
+            .replace([])
+        )
+    }
+
     func testDetailProjectionRevalidatesNavigationStateAgainstSelectedWallet() {
         let selectedWallet = wallet()
         let valid = transaction(id: "selected")
@@ -562,9 +659,9 @@ final class CustomerTransactionPresentationPolicyTests: XCTestCase {
         )
     }
 
-    private func wallet() -> Wallet {
+    private func wallet(id: String = "wallet-1") -> Wallet {
         Wallet(
-            id: "wallet-1",
+            id: id,
             name: "Primary wallet",
             accountNumber: "KIT-1000",
             accountType: "personal",

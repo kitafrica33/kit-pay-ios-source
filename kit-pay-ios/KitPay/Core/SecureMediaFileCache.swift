@@ -917,7 +917,19 @@ actor SecureMediaFileCache {
                 insertion: .stored
             )
         }
-        guard !hasAnyRepresentation(storageKey: storageKey, accountID: accountID) else {
+        // A legacy receiver may still own the old sealed representation while a freshly
+        // authenticated network copy is streamed into the protected-file format. Permit that one
+        // coexistence window; other protected originals and outgoing ciphertext spools remain
+        // collisions. AppModel removes only the sealed file after its record CAS succeeds.
+        let hasAnotherOriginal = originalFileURLs(
+            forStorageKey: storageKey,
+            accountID: accountID
+        ).contains { FileManager.default.fileExists(atPath: $0.path) }
+        let hasCiphertextSpool = ciphertextFileURL(
+            forStorageKey: storageKey,
+            accountID: accountID
+        ).map { FileManager.default.fileExists(atPath: $0.path) } == true
+        guard !hasAnotherOriginal, !hasCiphertextSpool else {
             throw SecureMediaAttachmentError.invalidCiphertext
         }
         try FileManager.default.moveItem(at: staging, to: destination)

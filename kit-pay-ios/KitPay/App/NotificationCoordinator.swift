@@ -1743,15 +1743,49 @@ struct RemoteWakePayload: @unchecked Sendable {
     let values: [AnyHashable: Any]
 }
 
+private extension IncomingCallPublicationRetirement {
+    init(callKitReason: CXCallEndedReason) {
+        switch callKitReason {
+        case .unanswered:
+            self = .naturallyExpired
+        case .remoteEnded:
+            self = .terminal(.remoteEnded)
+        case .answeredElsewhere:
+            self = .terminal(.answeredElsewhere)
+        case .declinedElsewhere:
+            self = .terminal(.declinedElsewhere)
+        case .failed:
+            self = .terminal(.failed)
+        @unknown default:
+            self = .terminal(.failed)
+        }
+    }
+
+    var callKitReason: CXCallEndedReason {
+        switch self {
+        case .naturallyExpired:
+            return .unanswered
+        case .terminal(.remoteEnded):
+            return .remoteEnded
+        case .terminal(.answeredElsewhere):
+            return .answeredElsewhere
+        case .terminal(.declinedElsewhere):
+            return .declinedElsewhere
+        case .terminal(.failed):
+            return .failed
+        }
+    }
+}
+
 final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate, PKPushRegistryDelegate {
     static let shared = NotificationCoordinator()
 
     private struct QuarantinedIncomingCall {
         let push: IncomingCallPush
-        let expiresAt: Date
+        let deadline: CallRingDeadline
         var verificationEventID: UUID?
         var verificationFailureCount: Int
-        var verificationRetryNotBefore: Date?
+        var verificationRetryNotBefore: TimeInterval?
     }
 
     private let callProvider: CXProvider
@@ -1802,6 +1836,10 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
     /// Caller identity, media credentials, and backend authority remain absent until promotion.
     private var deferredPrimaryAnswerGate = DeferredCallKitAnswerGate()
     private var deferredPrimaryAnswerActions: [UUID: CXAnswerCallAction] = [:]
+    /// Owns the asynchronous gap between PushKit delivery and CallKit's report completion. A
+    /// terminal signal revokes that exact publication synchronously, and its bounded tombstone
+    /// prevents a duplicate VoIP push from recreating an already-finished ring.
+    private var incomingCallPublicationGate = IncomingCallPublicationGate()
     /// Binds CallKit's UUID-less audio callbacks to the exact primary Answer/Start action and
     /// fences callbacks queued before a deactivate, reset, or account transition.
     private var callKitAudioSessionGate = CallKitAudioSessionGate()
@@ -2028,6 +2066,10 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
         pushTokens.remove(provider: "apns")
         pushTokens.remove(provider: "apns_voip")
         discardQuarantinedIncomingCalls()
+        for callUUID in incomingCallPublicationGate.pendingCallUUIDs {
+            clearCall(callUUID)
+            callProvider.reportCall(with: callUUID, endedAt: Date(), reason: .failed)
+        }
         callKitAudioSessionGate.reset()
     }
 
@@ -2043,10 +2085,15 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
         callRegistryGeneration &+= 1
         invalidateCallKitAudio(resetSounds: true)
         let activeCalls = backendCallIds
+        let pendingIncomingCallUUIDs = incomingCallPublicationGate.pendingCallUUIDs
         ringExpiryTasks.values.forEach { $0.cancel() }
         ringExpiryTasks.removeAll()
         discardQuarantinedIncomingCalls()
         for (callUUID, _) in activeCalls {
+            clearCall(callUUID)
+            callProvider.reportCall(with: callUUID, endedAt: Date(), reason: .failed)
+        }
+        for callUUID in pendingIncomingCallUUIDs where activeCalls[callUUID] == nil {
             clearCall(callUUID)
             callProvider.reportCall(with: callUUID, endedAt: Date(), reason: .failed)
         }
@@ -2088,7 +2135,9 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
         let targetsCurrentOwner = targetFingerprint != nil
             && targetFingerprint == communicationOwnerFingerprint
         if ownerIsUnproven || targetsCurrentOwner {
-            let visibleCallUUIDs = Set(backendCallIds.keys).union(quarantinedIncomingCalls.keys)
+            let visibleCallUUIDs = Set(backendCallIds.keys)
+                .union(quarantinedIncomingCalls.keys)
+                .union(incomingCallPublicationGate.pendingCallUUIDs)
             for callUUID in visibleCallUUIDs {
                 clearCall(callUUID)
                 callProvider.reportCall(with: callUUID, endedAt: Date(), reason: .failed)
@@ -2143,7 +2192,10 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
 
     @MainActor
     func reportCallEnded(_ callUUID: UUID, reason: CXCallEndedReason) {
-        clearCall(callUUID)
+        clearCall(
+            callUUID,
+            publicationRetirement: IncomingCallPublicationRetirement(callKitReason: reason)
+        )
         callProvider.reportCall(with: callUUID, endedAt: Date(), reason: reason)
     }
 
@@ -2269,7 +2321,7 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
               !outgoingCalls.contains(callUUID),
               incoming.record.state == .ringing,
               incoming.record.direction.caseInsensitiveCompare("incoming") == .orderedSame,
-              !requiresUnexpiredRing || incoming.ringExpiryDate > Date()
+              !requiresUnexpiredRing || !incoming.ringDeadline.isExpired()
         else { return nil }
         return incoming
     }
@@ -2453,7 +2505,10 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
                       coordinator.incomingCalls[callUUID] != nil,
                       !coordinator.answeredCalls.contains(callUUID)
                 else { return }
-                coordinator.clearCall(callUUID)
+                coordinator.clearCall(
+                    callUUID,
+                    publicationRetirement: .terminal(.declinedElsewhere)
+                )
                 coordinator.callProvider.reportCall(
                     with: callUUID,
                     endedAt: Date(),
@@ -2478,7 +2533,7 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
         guard let callUUID = UUID(uuidString: callId),
               backendCallIds[callUUID]?.caseInsensitiveCompare(callId) == .orderedSame
         else { return }
-        clearCall(callUUID)
+        clearCall(callUUID, publicationRetirement: .terminal(.declinedElsewhere))
         callProvider.reportCall(with: callUUID, endedAt: Date(), reason: .declinedElsewhere)
     }
 
@@ -2537,7 +2592,7 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
     @MainActor
     func reportRemoteCallEnded(callId: String) {
         guard let callUUID = UUID(uuidString: callId) else { return }
-        clearCall(callUUID)
+        clearCall(callUUID, publicationRetirement: .terminal(.remoteEnded))
         callProvider.reportCall(with: callUUID, endedAt: Date(), reason: .remoteEnded)
     }
 
@@ -2561,19 +2616,35 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
     @MainActor
     func reportCallAnsweredElsewhere(callId: String) {
         guard let callUUID = UUID(uuidString: callId) else { return }
-        let offersQuarantinedRing = quarantinedIncomingCalls[callUUID] != nil
-        let offersRevealedRing =
+        let hasMatchingRevealedCall =
             backendCallIds[callUUID]?.caseInsensitiveCompare(callId) == .orderedSame
-                && !answeredCalls.contains(callUUID)
-                && !outgoingCalls.contains(callUUID)
-        guard offersQuarantinedRing || offersRevealedRing else { return }
-        clearCall(callUUID)
-        callProvider.reportCall(with: callUUID, endedAt: Date(), reason: .answeredElsewhere)
+        switch CallAnsweredElsewherePolicy.disposition(
+            hasPendingPublication: incomingCallPublicationGate.isPending(callUUID),
+            hasQuarantinedIncomingCall: quarantinedIncomingCalls[callUUID] != nil,
+            hasMatchingRevealedCall: hasMatchingRevealedCall,
+            isLocallyAnswered: answeredCalls.contains(callUUID),
+            isOutgoing: outgoingCalls.contains(callUUID)
+        ) {
+        case .ignore:
+            return
+        case .rememberTerminal:
+            incomingCallPublicationGate.retire(
+                callUUID: callUUID,
+                as: .terminal(.answeredElsewhere)
+            )
+        case .retireOfferedCall:
+            clearCall(callUUID, publicationRetirement: .terminal(.answeredElsewhere))
+            callProvider.reportCall(with: callUUID, endedAt: Date(), reason: .answeredElsewhere)
+        }
     }
 
     @MainActor
-    private func clearCall(_ callUUID: UUID) {
+    private func clearCall(
+        _ callUUID: UUID,
+        publicationRetirement: IncomingCallPublicationRetirement = .terminal(.failed)
+    ) {
         let callID = backendCallIds[callUUID] ?? callUUID.uuidString.lowercased()
+        incomingCallPublicationGate.retire(callUUID: callUUID, as: publicationRetirement)
         callSounds.callEnded(callID: callID)
         failDeferredPrimaryAnswer(for: callUUID)
         explicitlyRequestedEndCallUUIDs.remove(callUUID)
@@ -2626,10 +2697,10 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
         explicitlyRequestedEndCallUUIDs.remove(callUUID)
         waitingCallMergeUUIDs.remove(callUUID)
         callKitAnswerMergeOwners.removeValue(forKey: callUUID)
-        let receivedAt = Date()
-        let expiry = IncomingCallQuarantinePolicy.expiry(
-            pushExpiry: incoming.ringExpiryDate,
-            receivedAt: receivedAt
+        let monotonicNow = CallMonotonicClock.now()
+        let deadline = IncomingCallQuarantinePolicy.deadline(
+            for: incoming,
+            monotonicNow: monotonicNow
         )
         if let staleEventID = quarantinedIncomingCalls[callUUID]?.verificationEventID {
             pendingCallEvents.acknowledge(staleEventID)
@@ -2637,14 +2708,14 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
         verificationRetryTasks.removeValue(forKey: callUUID)?.cancel()
         quarantinedIncomingCalls[callUUID] = QuarantinedIncomingCall(
             push: incoming,
-            expiresAt: expiry,
+            deadline: deadline,
             verificationEventID: nil,
             verificationFailureCount: 0,
             verificationRetryNotBefore: nil
         )
         callAdmissionGenerations[callUUID] = callRegistryGeneration
         quarantineExpiryTasks.removeValue(forKey: callUUID)?.cancel()
-        let seconds = max(0, expiry.timeIntervalSinceNow)
+        let seconds = deadline.remaining(at: monotonicNow)
         quarantineExpiryTasks[callUUID] = Task { @MainActor [weak self] in
             do {
                 try await Task.sleep(for: .seconds(seconds))
@@ -2652,7 +2723,7 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
                 return
             }
             guard let self, self.quarantinedIncomingCalls[callUUID] != nil else { return }
-            self.clearCall(callUUID)
+            self.clearCall(callUUID, publicationRetirement: .naturallyExpired)
             self.callProvider.reportCall(
                 with: callUUID,
                 endedAt: Date(),
@@ -2667,9 +2738,9 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
         for callUUID in Array(quarantinedIncomingCalls.keys) {
             guard var pending = quarantinedIncomingCalls[callUUID] else { continue }
             let incoming = pending.push
-            let now = Date()
-            guard pending.expiresAt > now else {
-                clearCall(callUUID)
+            let monotonicNow = CallMonotonicClock.now()
+            guard !pending.deadline.isExpired(at: monotonicNow) else {
+                clearCall(callUUID, publicationRetirement: .naturallyExpired)
                 callProvider.reportCall(
                     with: callUUID,
                     endedAt: Date(),
@@ -2679,11 +2750,11 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
             }
             guard pending.verificationEventID == nil else { continue }
             if let retryNotBefore = pending.verificationRetryNotBefore {
-                guard retryNotBefore < pending.expiresAt else { continue }
-                if retryNotBefore > now {
+                guard retryNotBefore < pending.deadline.monotonicTime else { continue }
+                if retryNotBefore > monotonicNow {
                     scheduleIncomingCallVerificationRetry(
                         callUUID: callUUID,
-                        after: retryNotBefore.timeIntervalSince(now),
+                        after: retryNotBefore - monotonicNow,
                         admissionGeneration: callRegistryGeneration
                     )
                     continue
@@ -2727,7 +2798,7 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
         guard isAwaitingIncomingCallVerification(request),
               incoming.callUUID == request.push.callUUID,
               incoming.record.id == request.push.callId,
-              incoming.ringExpiryDate > Date()
+              !incoming.ringDeadline.isExpired()
         else { return false }
         let deferredAnswer: CXAnswerCallAction?
         if deferredPrimaryAnswerActions[incoming.callUUID] != nil,
@@ -2760,12 +2831,17 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
     func rejectIncomingCallVerification(
         _ request: IncomingCallVerificationRequest
     ) {
-        guard isAwaitingIncomingCallVerification(request) else { return }
-        clearCall(request.push.callUUID)
+        guard isAwaitingIncomingCallVerification(request),
+              let pending = quarantinedIncomingCalls[request.push.callUUID]
+        else { return }
+        let retirement: IncomingCallPublicationRetirement = pending.deadline.isExpired()
+            ? .naturallyExpired
+            : .terminal(.failed)
+        clearCall(request.push.callUUID, publicationRetirement: retirement)
         callProvider.reportCall(
             with: request.push.callUUID,
             endedAt: Date(),
-            reason: .failed
+            reason: retirement.callKitReason
         )
     }
 
@@ -2784,11 +2860,14 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
         pending.verificationEventID = nil
         pending.verificationFailureCount = min(pending.verificationFailureCount, 1_000) + 1
 
-        let now = Date()
-        let remaining = pending.expiresAt.timeIntervalSince(now)
+        let monotonicNow = CallMonotonicClock.now()
+        let remaining = pending.deadline.remaining(at: monotonicNow)
         guard remaining > 0 else {
             quarantinedIncomingCalls[request.push.callUUID] = pending
-            clearCall(request.push.callUUID)
+            clearCall(
+                request.push.callUUID,
+                publicationRetirement: .naturallyExpired
+            )
             callProvider.reportCall(
                 with: request.push.callUUID,
                 endedAt: Date(),
@@ -2804,11 +2883,11 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
         ) else {
             // The existing quarantine-expiry task will retire the generic CallKit surface. Do not
             // violate Retry-After merely to squeeze in one final request before that deadline.
-            pending.verificationRetryNotBefore = pending.expiresAt
+            pending.verificationRetryNotBefore = pending.deadline.monotonicTime
             quarantinedIncomingCalls[request.push.callUUID] = pending
             return
         }
-        pending.verificationRetryNotBefore = now.addingTimeInterval(retryDelay)
+        pending.verificationRetryNotBefore = monotonicNow + retryDelay
         quarantinedIncomingCalls[request.push.callUUID] = pending
         scheduleIncomingCallVerificationRetry(
             callUUID: request.push.callUUID,
@@ -2854,7 +2933,8 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
     @MainActor
     private func admit(_ incoming: AuthenticatedIncomingCall) {
         let uuid = incoming.callUUID
-        guard incoming.ringExpiryDate > Date() else {
+        guard !incoming.ringDeadline.isExpired() else {
+            clearCall(uuid, publicationRetirement: .naturallyExpired)
             callProvider.reportCall(with: uuid, endedAt: Date(), reason: .unanswered)
             return
         }
@@ -2931,11 +3011,10 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
 
     @MainActor
     private func scheduleRingExpiry(for incoming: AuthenticatedIncomingCall) {
-        let expiry = incoming.ringExpiryDate
         let callUUID = incoming.callUUID
         let callID = incoming.record.id
         ringExpiryTasks.removeValue(forKey: callUUID)?.cancel()
-        let seconds = max(0, expiry.timeIntervalSinceNow)
+        let seconds = incoming.ringDeadline.remaining()
         let maximumSeconds = Double(UInt64.max / 1_000_000_000)
         let nanoseconds = UInt64(min(seconds, maximumSeconds) * 1_000_000_000)
         ringExpiryTasks[callUUID] = Task { @MainActor [weak self] in
@@ -2954,7 +3033,7 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
                 self.ringExpiryTasks.removeValue(forKey: callUUID)
                 return
             }
-            self.clearCall(callUUID)
+            self.clearCall(callUUID, publicationRetirement: .naturallyExpired)
             self.callProvider.reportCall(with: callUUID, endedAt: Date(), reason: .unanswered)
             self.recordAndPublishCallEvent(
                 .systemAction(CallSystemAction(
@@ -3156,13 +3235,41 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
         }
         let uuid = incoming.callUUID
         let receivedGeneration = callRegistryGeneration
+        let alreadyTracked = callAdmissionGenerations[uuid] != nil
+            || backendCallIds[uuid] != nil
+            || quarantinedIncomingCalls[uuid] != nil
+            || incomingCalls[uuid] != nil
+        let publicationDisposition = incomingCallPublicationGate.begin(
+            callUUID: uuid,
+            generation: receivedGeneration,
+            alreadyTracked: alreadyTracked,
+            leaseExpired: incoming.callKitDisposition() == .reportAsUnanswered
+        )
+        if publicationDisposition == .authorized {
+            // Claim this CallKit report before its asynchronous completion. End/answer-elsewhere
+            // can now revoke the same generation even while the system call is being published.
+            callAdmissionGenerations[uuid] = receivedGeneration
+        }
         // PushKit identifies only an app-level token, not the currently recovered account. Report
         // promptly with generic metadata, then reveal/admit only after an authenticated lookup.
         let update = genericIncomingCallUpdate()
         callProvider.reportNewIncomingCall(with: uuid, update: update) { error in
             Task { @MainActor in
                 let coordinator = NotificationCoordinator.shared
-                if error == nil, coordinator.callRegistryGeneration == receivedGeneration {
+                let duplicateStillOwnsCallState = publicationDisposition == .duplicate
+                    && !coordinator.incomingCallPublicationGate.isRetired(uuid)
+                    && (coordinator.callAdmissionGenerations[uuid] != nil
+                        || coordinator.backendCallIds[uuid] != nil
+                        || coordinator.quarantinedIncomingCalls[uuid] != nil
+                        || coordinator.incomingCalls[uuid] != nil)
+                if error == nil,
+                   publicationDisposition == .authorized,
+                   coordinator.callRegistryGeneration == receivedGeneration,
+                   coordinator.callAdmissionGenerations[uuid] == receivedGeneration,
+                   coordinator.incomingCallPublicationGate.complete(
+                       callUUID: uuid,
+                       generation: receivedGeneration
+                   ) {
                     // The phone is now ringing. Resolving the media host during the ring removes
                     // that handshake from the gap between answering and hearing the caller.
                     CallMediaPrewarmer.shared.prewarm()
@@ -3170,12 +3277,30 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
                     if coordinator.registrationEnabled, !coordinator.privacyQuarantineActive {
                         coordinator.requestVerificationForQuarantinedIncomingCalls()
                     }
-                } else if error == nil {
+                } else if error == nil,
+                          !duplicateStillOwnsCallState {
+                    // Still report every VoIP push to satisfy PushKit, but retire a stale/duplicate
+                    // system surface immediately and never recreate app-owned ringing state.
+                    let retirement = coordinator.incomingCallPublicationGate.retirement(for: uuid)
+                        ?? .terminal(.failed)
+                    coordinator.clearCall(uuid, publicationRetirement: retirement)
                     coordinator.callProvider.reportCall(
                         with: uuid,
                         endedAt: Date(),
-                        reason: .failed
+                        reason: retirement.callKitReason
                     )
+                } else if error != nil, publicationDisposition == .authorized {
+                    coordinator.incomingCallPublicationGate.abandon(
+                        callUUID: uuid,
+                        generation: receivedGeneration
+                    )
+                    coordinator.failDeferredPrimaryAnswer(for: uuid)
+                    if coordinator.callAdmissionGenerations[uuid] == receivedGeneration,
+                       coordinator.backendCallIds[uuid] == nil,
+                       coordinator.quarantinedIncomingCalls[uuid] == nil,
+                       coordinator.incomingCalls[uuid] == nil {
+                        coordinator.callAdmissionGenerations.removeValue(forKey: uuid)
+                    }
                 }
                 NotificationCenter.default.post(
                     name: .kitRemoteWakeReceived,
@@ -3193,6 +3318,12 @@ extension NotificationCoordinator: CXProviderDelegate {
         invalidateCallActionOwnership()
         invalidateCallKitAudio(resetSounds: true)
         let calls = backendCallIds
+        let callUUIDsToRetire = Set(calls.keys)
+            .union(quarantinedIncomingCalls.keys)
+            .union(incomingCallPublicationGate.pendingCallUUIDs)
+        for callUUID in callUUIDsToRetire {
+            incomingCallPublicationGate.retire(callUUID: callUUID)
+        }
         if registrationEnabled, !privacyQuarantineActive {
             for (callUUID, callId) in calls {
                 let kind: CallSystemActionKind = answeredCalls.contains(callUUID)
@@ -3307,7 +3438,8 @@ extension NotificationCoordinator: CXProviderDelegate {
 
     @MainActor
     private func performAnswerCallAction(_ action: CXAnswerCallAction) {
-        if quarantinedIncomingCalls[action.callUUID] != nil,
+        if (quarantinedIncomingCalls[action.callUUID] != nil
+                || incomingCallPublicationGate.isPending(action.callUUID)),
            callAdmissionGenerations[action.callUUID] == callRegistryGeneration,
            connectedActiveMediaCallUUID() == nil {
             guard deferredPrimaryAnswerGate.retain(

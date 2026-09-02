@@ -18,7 +18,7 @@ final class WalletAPIEncodingTests: XCTestCase {
                 accountEpoch: accountEpoch,
                 userID: "user-a",
                 sessionID: "session-a",
-                walletID: "wallet-a"
+                walletID: "WALLET-A"
             )
         )
         XCTAssertNotEqual(

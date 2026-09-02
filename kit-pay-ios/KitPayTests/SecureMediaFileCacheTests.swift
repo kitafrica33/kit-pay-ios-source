@@ -161,6 +161,81 @@ final class SecureMediaFileCacheTests: XCTestCase {
         await cache.releaseProtectedOriginalLease(lease)
     }
 
+    func testStreamedLegacyVideoMayCoexistWithSealedBlobUntilStateCommit() async throws {
+        let storageKey = UUID().uuidString.lowercased()
+        let videoBytes = Data((0 ..< 64 * 1_024).map { UInt8($0 % 251) })
+        let plaintextURL = temporaryDirectory.appendingPathComponent("legacy-video.mp4")
+        let ciphertextURL = temporaryDirectory.appendingPathComponent("legacy-video.ciphertext")
+        let keyMaterial = Data(
+            (0 ..< SecureMediaAttachmentCipher.keyMaterialBytes).map(UInt8.init)
+        )
+        try videoBytes.write(to: plaintextURL, options: .atomic)
+        let encrypted = try SecureMediaAttachmentCipher.encryptFile(
+            plaintextURL: plaintextURL,
+            ciphertextURL: ciphertextURL,
+            expectedPlaintextByteSize: videoBytes.count,
+            keyMaterial: keyMaterial,
+            attachmentID: storageKey,
+            chunkBytes: 4_093
+        )
+        let sealedInsertion = await cache.insertIfAbsent(
+            videoBytes,
+            forStorageKey: storageKey,
+            userID: userID
+        )
+        XCTAssertEqual(sealedInsertion, .stored)
+
+        let streamed = try await cache.storeVerifiedReceivedOriginal(
+            ciphertextURL: ciphertextURL,
+            forStorageKey: storageKey,
+            userID: userID,
+            mediaType: "video/mp4",
+            ciphertextByteCount: encrypted.ciphertextByteSize,
+            ciphertextSHA256: encrypted.ciphertextSHA256,
+            plaintextByteCount: encrypted.plaintextByteSize,
+            keyMaterial: keyMaterial
+        )
+        XCTAssertEqual(streamed.insertion, .stored)
+        XCTAssertEqual(try Data(contentsOf: streamed.fileURL), videoBytes)
+        let retainedSealed = await cache.encryptedBlobData(
+            forStorageKey: storageKey,
+            userID: userID,
+            expectedByteCount: videoBytes.count
+        )
+        XCTAssertEqual(
+            retainedSealed,
+            videoBytes,
+            "the old representation must remain available until the state CAS succeeds"
+        )
+
+        let proposedLease = await cache.protectedOriginalLease(
+            forStorageKey: storageKey,
+            userID: userID,
+            expectedByteCount: videoBytes.count
+        )
+        let lease = try XCTUnwrap(proposedLease)
+        await cache.removeEncryptedBlobRepresentation(
+            forStorageKey: storageKey,
+            userID: userID
+        )
+        let removedSealed = await cache.encryptedBlobData(
+            forStorageKey: storageKey,
+            userID: userID,
+            expectedByteCount: videoBytes.count
+        )
+        XCTAssertNil(removedSealed)
+        let retainedProtected = await cache.protectedOriginalURL(
+            forStorageKey: storageKey,
+            userID: userID,
+            expectedByteCount: videoBytes.count
+        )
+        XCTAssertEqual(
+            retainedProtected,
+            lease.fileURL
+        )
+        await cache.releaseProtectedOriginalLease(lease)
+    }
+
     func testLegacyInlineVideoPromotesToProtectedLeaseBeforePlayback() async throws {
         let storageKey = UUID().uuidString.lowercased()
         let videoBytes = Data(repeating: 0x3c, count: 8 * 1_024 * 1_024)

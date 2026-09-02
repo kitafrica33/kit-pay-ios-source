@@ -10,6 +10,7 @@ enum OutboxPolicy {
     enum FailureDecision: Equatable {
         case retry(after: TimeInterval?)
         case awaitSession
+        case awaitIdentityRefresh
         case unchanged
         case permanent
     }
@@ -227,6 +228,60 @@ enum OutboxPolicy {
         guard let index = state.outbox.firstIndex(where: { $0.id == command.id }) else { return }
         state.outbox[index].failureDisposition = .awaitingSession
         state.outbox[index].lastFailureReason = reason
+    }
+
+    static func markAwaitingIdentityRefresh(
+        for command: OfflineCommand,
+        reason: String,
+        in state: inout PersistedState
+    ) {
+        guard command.kind == .secureMessage,
+              let index = state.outbox.firstIndex(where: { $0.id == command.id })
+        else { return }
+        state.outbox[index].failureDisposition = .awaitingIdentityRefresh
+        state.outbox[index].lastFailureReason = reason
+        // Ciphertext committed before the lifecycle transition is bound to the old device
+        // identity. Preserve the message id but force fresh roster/session preparation later.
+        state.outbox[index].secureMessageFanout = nil
+        if let messageID = state.outbox[index].messageId,
+           let messageIndex = state.messages.firstIndex(where: { $0.id == messageID }) {
+            // Identity recovery is automatic and must remain visibly Pending. Presenting a
+            // retry affordance here invites a duplicate manual resend while lifecycle sync is
+            // already responsible for rebuilding the recipient sessions.
+            state.messages[messageIndex].state = .queued
+            state.messages[messageIndex].failureReason = nil
+        }
+    }
+
+    @discardableResult
+    static func resumeIdentityDeferredCommands(
+        forRecipientUserID recipientUserID: String,
+        in state: inout PersistedState,
+        at now: Date
+    ) -> Int {
+        guard SecureMessagingValidation.isCanonicalUUID(recipientUserID) else { return 0 }
+        var resumed = 0
+        for index in state.outbox.indices
+            where state.outbox[index].kind == .secureMessage
+                && state.outbox[index].failureDisposition == .awaitingIdentityRefresh
+                && (state.outbox[index].recipientUserIds?.contains(recipientUserID) == true) {
+            state.outbox[index].failureDisposition = nil
+            state.outbox[index].lastFailureReason = nil
+            state.outbox[index].secureMessageFanout = nil
+            state.outbox[index].attemptCount = 0
+            state.outbox[index].nextAttemptAt = now
+            if let messageID = state.outbox[index].messageId,
+               let messageIndex = state.messages.firstIndex(where: { $0.id == messageID }) {
+                state.messages[messageIndex].state = .queued
+                state.messages[messageIndex].failureReason = nil
+                LocalMediaRecordPolicy.markRetryPending(
+                    &state.messages[messageIndex],
+                    now: now
+                )
+            }
+            resumed += 1
+        }
+        return resumed
     }
 
     @discardableResult
@@ -490,8 +545,10 @@ enum OutboxPolicy {
                 return .retry(after: nil)
             case .notProvisioned:
                 return .permanent
+            case .identityChanged:
+                return .awaitIdentityRefresh
             case .invalidAddress, .invalidRegistrationID, .invalidPreKeyID,
-                    .recordLimitExceeded, .missingRecord, .identityChanged,
+                    .recordLimitExceeded, .missingRecord,
                     .invalidSignature, .invalidContent, .unsupportedEnvelope,
                     .replayedKyberBaseKey:
                 return .permanent

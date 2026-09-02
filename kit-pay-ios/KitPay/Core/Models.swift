@@ -2707,6 +2707,39 @@ struct Wallet: Codable, Hashable, Identifiable {
     }
 }
 
+/// Resolves wallet references without letting transport casing become a second identity. Values
+/// persisted or sent back to the API always use the spelling from the authoritative wallet list.
+enum WalletIdentityResolver {
+    static func wallet(matching walletID: String?, in wallets: [Wallet]) -> Wallet? {
+        guard let walletID else { return nil }
+        let matches = wallets.filter {
+            $0.id.caseInsensitiveCompare(walletID) == .orderedSame
+        }
+        guard matches.count == 1 else { return nil }
+        return matches[0]
+    }
+
+    static func authoritativeSelectionID(
+        preferred walletID: String?,
+        in wallets: [Wallet]
+    ) -> String? {
+        wallet(matching: walletID, in: wallets)?.id
+            ?? wallets.first(where: { $0.isPrimary == true })?.id
+            ?? wallets.first?.id
+    }
+
+    static func identifiersMatch(_ lhs: String?, _ rhs: String?) -> Bool {
+        switch (lhs, rhs) {
+        case (nil, nil):
+            true
+        case let (lhs?, rhs?):
+            lhs.caseInsensitiveCompare(rhs) == .orderedSame
+        default:
+            false
+        }
+    }
+}
+
 struct Counterparty: Codable, Hashable {
     let id: String?
     let name: String?
@@ -2805,6 +2838,11 @@ extension WalletTransaction {
 /// or newly introduced ledger type visible. Adding a new customer transaction therefore requires
 /// an explicit client contract update instead of becoming visible by accident.
 enum CustomerTransactionPresentationPolicy {
+    enum PageReplacement: Equatable {
+        case replace([WalletTransaction])
+        case preserveLastGood
+    }
+
     /// Exact public types emitted by the backend customer-history projection. Legacy aliases and
     /// internal fee, commission, settlement, rounding, and float types are deliberately absent.
     static let supportedTypes: Set<String> = [
@@ -2877,9 +2915,25 @@ enum CustomerTransactionPresentationPolicy {
         wallets: [Wallet]
     ) -> [WalletTransaction] {
         guard let selectedWalletID,
-              let wallet = wallets.first(where: { $0.id == selectedWalletID })
+              let wallet = WalletIdentityResolver.wallet(
+                  matching: selectedWalletID,
+                  in: wallets
+              )
         else { return [] }
         return customerVisibleTransactions(transactions, for: wallet)
+    }
+
+    /// A nonempty authoritative page is atomic: every row must satisfy the selected-wallet public
+    /// contract before any of it may replace the last known-good encrypted projection. An empty
+    /// page is a valid authoritative result and intentionally clears that projection.
+    static func pageReplacement(
+        for transactions: [WalletTransaction],
+        wallet: Wallet
+    ) -> PageReplacement {
+        guard !transactions.isEmpty else { return .replace([]) }
+        let presented = customerVisibleTransactions(transactions, for: wallet)
+        guard presented.count == transactions.count else { return .preserveLastGood }
+        return .replace(presented)
     }
 
     /// Revalidates a transaction carried by navigation state before a detail screen renders it.
@@ -3159,18 +3213,20 @@ enum HomeStarterStepRoutePolicy {
     }
 
     static let messagingUnavailableMessage =
-        "Secure messaging is still being set up for this device. Connect to the internet, then try again from the Messages tab."
+        "Messaging is unavailable for this session. Refresh or sign in again, then try from the Messages tab."
 
     static func presentation(
         for step: HomeStarterStep,
-        secureMessagingAvailable: Bool
+        secureMessagingLocalQueueAvailable: Bool
     ) -> Presentation {
         switch step {
         case .verifyIdentity: .fullScreen
         case .sendFirstMessage:
-            // Switching tabs into a composer that cannot compose would read as broken and
-            // could never complete the step; say what is actually missing instead.
-            secureMessagingAvailable
+            // The protected outbox, not live E2EE enrollment, is the composition boundary.
+            // A temporarily missing enrollment therefore opens Messages and the queued bubble
+            // remains pending until the secure flush path repairs it. Session/privacy denial
+            // still fails closed before any local communication state can be written.
+            secureMessagingLocalQueueAvailable
                 ? .tabSwitch
                 : .unavailable(message: messagingUnavailableMessage)
         case .makeFirstTransaction: .walletSheet
@@ -3953,6 +4009,24 @@ struct LocalMediaPreprocessingJob: Codable, Hashable, Sendable {
             return sources.allSatisfy { $0.mediaType == "audio/mp4" }
                 && outputMediaType == "audio/mp4"
         }
+    }
+}
+
+/// Selects the one voice-note path that actually needs local preprocessing. A normal recording
+/// is already one finalized `audio/mp4` file and can move directly from its protected original
+/// into encryption/upload; only pause-and-resume recordings need their ordered segments joined.
+enum VoiceNoteSendPreparationPolicy {
+    static func preprocessingJob(
+        for sources: [LocalMediaOriginalSource],
+        outputStorageKey: String
+    ) -> LocalMediaPreprocessingJob? {
+        guard sources.count > 1 else { return nil }
+        return LocalMediaPreprocessingJob(
+            kind: .voiceAssembly,
+            sources: sources,
+            outputStorageKey: outputStorageKey,
+            outputMediaType: "audio/mp4"
+        )
     }
 }
 
@@ -5939,6 +6013,7 @@ struct CallDTO: Decodable {
     let answeredAt: String?
     let endedAt: String?
     let ringExpiresAt: String?
+    let serverTime: String?
     let participants: [CallParticipantDTO]?
 
     enum CodingKeys: String, CodingKey {
@@ -5949,6 +6024,7 @@ struct CallDTO: Decodable {
         case answeredAt = "answered_at"
         case endedAt = "ended_at"
         case ringExpiresAt = "ring_expires_at"
+        case serverTime = "server_time"
         case participants
     }
 
@@ -5965,6 +6041,7 @@ struct CallDTO: Decodable {
         answeredAt: String?,
         endedAt: String?,
         ringExpiresAt: String?,
+        serverTime: String? = nil,
         participants: [CallParticipantDTO]? = nil
     ) {
         self.id = id
@@ -5979,6 +6056,7 @@ struct CallDTO: Decodable {
         self.answeredAt = answeredAt
         self.endedAt = endedAt
         self.ringExpiresAt = ringExpiresAt
+        self.serverTime = serverTime
         self.participants = participants
     }
 
@@ -5996,6 +6074,7 @@ struct CallDTO: Decodable {
         answeredAt = try values.decodeIfPresent(String.self, forKey: .answeredAt)
         endedAt = try values.decodeIfPresent(String.self, forKey: .endedAt)
         ringExpiresAt = try values.decodeIfPresent(String.self, forKey: .ringExpiresAt)
+        serverTime = try values.decodeIfPresent(String.self, forKey: .serverTime)
         // This is additive presentation metadata. A malformed optional projection must not hide
         // an otherwise valid call; validation below simply declines to grant it identity data.
         participants = try? values.decode([CallParticipantDTO].self, forKey: .participants)
@@ -6173,6 +6252,9 @@ enum OfflineCommandFailureDisposition: String, Codable, Hashable {
     /// The authenticated session disappeared while transport was active. Replay resumes only
     /// after a later authenticated-session restoration, never on a background timer loop.
     case awaitingSession
+    /// Signal rejected a newly observed remote identity. Replay resumes only after an
+    /// authenticated lifecycle event invalidates that recipient's pinned sessions and identity.
+    case awaitingIdentityRefresh
 }
 
 struct OfflineCommand: Codable, Hashable, Identifiable {
@@ -6309,9 +6391,16 @@ struct PersistedState: Codable {
         selectedWalletID: String?
     ) {
         let previousSelectedWalletID = selectedWalletId
+        let resolvedSelectedWalletID = WalletIdentityResolver.wallet(
+            matching: selectedWalletID,
+            in: authoritativeWallets
+        )?.id
         wallets = authoritativeWallets
-        selectedWalletId = selectedWalletID
-        if previousSelectedWalletID != selectedWalletID {
+        selectedWalletId = resolvedSelectedWalletID
+        if !WalletIdentityResolver.identifiersMatch(
+            previousSelectedWalletID,
+            resolvedSelectedWalletID
+        ) {
             transactions = []
         }
     }

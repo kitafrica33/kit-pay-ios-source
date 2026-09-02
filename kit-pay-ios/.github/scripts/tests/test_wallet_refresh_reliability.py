@@ -67,8 +67,17 @@ class WalletRefreshReliabilitySourceContract(unittest.TestCase):
             "private func performSelectedWalletTransactionsRefresh(",
         )
         self.assertIn("try await api.transactions(walletId: key.walletID).items", worker)
+        self.assertIn(
+            "CustomerTransactionPresentationPolicy\n"
+            "                .pageReplacement(for: firstPage, wallet: selectedWallet)",
+            worker,
+        )
         self.assertGreaterEqual(worker.count("callHistoryContextIsCurrent("), 2)
-        self.assertIn("persisted.selectedWalletId == key.walletID", worker)
+        self.assertGreaterEqual(
+            worker.count("WalletIdentityResolver.identifiersMatch("),
+            3,
+        )
+        self.assertIn("persisted.selectedWalletId,", worker)
         self.assertIn("persisted.transactions = transactions", worker)
 
 

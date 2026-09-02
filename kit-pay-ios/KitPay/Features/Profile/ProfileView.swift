@@ -777,8 +777,8 @@ private struct MediaDiagnosticsView: View {
 
             Text(
                 "The report contains report and event times, app and iOS versions, media "
-                    + "direction and type, byte count and duration, performance timings, and "
-                    + "video playback outcomes."
+                    + "direction and type, byte count and duration, local text-send timings, "
+                    + "media performance timings, and video playback outcomes."
             )
             .font(.subheadline)
             .foregroundStyle(KitColor.secondaryText)

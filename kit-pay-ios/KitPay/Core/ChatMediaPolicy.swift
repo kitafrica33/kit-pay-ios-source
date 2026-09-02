@@ -1,4 +1,5 @@
 import CryptoKit
+import Dispatch
 import Foundation
 import OSLog
 
@@ -23,6 +24,7 @@ struct LocalMediaDiagnosticProducerScope: Equatable, Sendable {
 
 private enum LocalMediaDiagnosticEvent: String, Codable, Sendable {
     case mediaTiming = "media_timing"
+    case textSendTiming = "text_send_timing"
     case videoPlayback = "video_playback"
 }
 
@@ -42,6 +44,8 @@ private struct LocalMediaStoredDiagnosticRecord: Codable, Sendable {
     var captureToEncryptedMilliseconds: Double?
     var captureToServerAcceptedMilliseconds: Double?
     var recipientDescriptorToLocalMilliseconds: Double?
+    var actionToDurableOutboxCommitMilliseconds: Double?
+    var actionToVisibleLocalBubbleMilliseconds: Double?
     var playbackOutcome: LocalMediaPlaybackOutcome?
     var playbackPositionSeconds: Double?
 
@@ -58,6 +62,8 @@ private struct LocalMediaStoredDiagnosticRecord: Codable, Sendable {
         case captureToEncryptedMilliseconds
         case captureToServerAcceptedMilliseconds
         case recipientDescriptorToLocalMilliseconds
+        case actionToDurableOutboxCommitMilliseconds
+        case actionToVisibleLocalBubbleMilliseconds
         case playbackOutcome
         case playbackPositionSeconds
     }
@@ -206,6 +212,11 @@ struct LocalMediaLatencyMeasurement: Equatable, Sendable {
     }
 }
 
+struct LocalTextSendLatencyMeasurement: Equatable, Sendable {
+    let actionToDurableOutboxCommitMilliseconds: Double?
+    let actionToVisibleLocalBubbleMilliseconds: Double?
+}
+
 /// Lightweight, privacy-safe timing for local availability and the independent background
 /// encryption/upload/recipient-hydration milestones. Media IDs index in-memory state only; the
 /// bounded protected store contains only a one-way correlation digest, measurements, and coarse
@@ -241,6 +252,8 @@ final class LocalMediaPerformanceMonitor {
         let captureToEncryptedMilliseconds: Double?
         let captureToServerAcceptedMilliseconds: Double?
         let recipientDescriptorToLocalMilliseconds: Double?
+        let actionToDurableOutboxCommitMilliseconds: Double?
+        let actionToVisibleLocalBubbleMilliseconds: Double?
         let playbackOutcome: LocalMediaPlaybackOutcome?
         let playbackPositionSeconds: Double?
     }
@@ -263,6 +276,13 @@ final class LocalMediaPerformanceMonitor {
         var serverAcceptedAt: Date? = nil
     }
 
+    private struct TextSendMilestones {
+        let actionStartedAtUptimeNanoseconds: UInt64
+        let recordID: UUID
+        var durableCommitAtUptimeNanoseconds: UInt64?
+        var visibleBubbleAtUptimeNanoseconds: UInt64?
+    }
+
     private let logger = Logger(subsystem: "africa.kit.pay.ios", category: "LocalFirstMedia")
     private let persistenceWriter: LocalMediaDiagnosticsPersistenceWriter?
     private var recordingGeneration: UInt64 = 0
@@ -272,6 +292,7 @@ final class LocalMediaPerformanceMonitor {
     private var recipientDescriptorDates: [UUID: Date] = [:]
     private var diagnosticRecordIDs: [UUID: UUID] = [:]
     private var diagnosticRecordGenerations: [UUID: UInt64] = [:]
+    private var textSendMilestones: [UUID: TextSendMilestones] = [:]
     private var diagnosticRecords: [LocalMediaStoredDiagnosticRecord]
 
     init(persistenceURL: URL? = nil) {
@@ -553,10 +574,119 @@ final class LocalMediaPerformanceMonitor {
             captureToEncryptedMilliseconds: nil,
             captureToServerAcceptedMilliseconds: nil,
             recipientDescriptorToLocalMilliseconds: nil,
+            actionToDurableOutboxCommitMilliseconds: nil,
+            actionToVisibleLocalBubbleMilliseconds: nil,
             playbackOutcome: outcome,
             playbackPositionSeconds: Self.validNonnegative(position)
         )
         append(record)
+    }
+
+    /// Begins one text-composer timing sample. The message UUID exists only in this process so UI,
+    /// durable-store and render callbacks can meet; neither it nor a derivative is persisted or
+    /// exported. Re-entering with the same UUID is an idempotent retry and keeps the original
+    /// monotonic start rather than manufacturing a faster second sample.
+    func beginTextSend(
+        messageID: UUID,
+        atUptimeNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds,
+        recordedAt: Date = Date(),
+        producerScope: LocalMediaDiagnosticProducerScope?
+    ) {
+        guard accepts(producerScope), textSendMilestones[messageID] == nil else { return }
+        let record = LocalMediaStoredDiagnosticRecord(
+            localCorrelationTokenSHA256: nil,
+            recordedAt: recordedAt,
+            event: .textSendTiming,
+            direction: .outgoing,
+            kind: nil,
+            byteCount: nil,
+            durationSeconds: nil,
+            captureToVisibleMilliseconds: nil,
+            captureToPlayableMilliseconds: nil,
+            captureToEncryptedMilliseconds: nil,
+            captureToServerAcceptedMilliseconds: nil,
+            recipientDescriptorToLocalMilliseconds: nil,
+            actionToDurableOutboxCommitMilliseconds: nil,
+            actionToVisibleLocalBubbleMilliseconds: nil,
+            playbackOutcome: nil,
+            playbackPositionSeconds: nil
+        )
+        textSendMilestones[messageID] = TextSendMilestones(
+            actionStartedAtUptimeNanoseconds: atUptimeNanoseconds,
+            recordID: record.id,
+            durableCommitAtUptimeNanoseconds: nil,
+            visibleBubbleAtUptimeNanoseconds: nil
+        )
+        append(record)
+    }
+
+    /// Marks the point at which the owner-bound message and outbox row have committed together.
+    /// This hook deliberately precedes state reload, scheduling and every network operation.
+    @discardableResult
+    func markTextOutboxCommitted(
+        messageID: UUID,
+        atUptimeNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds,
+        producerScope: LocalMediaDiagnosticProducerScope?
+    ) -> LocalTextSendLatencyMeasurement? {
+        guard accepts(producerScope), var value = textSendMilestones[messageID] else { return nil }
+        if value.durableCommitAtUptimeNanoseconds == nil {
+            guard atUptimeNanoseconds >= value.actionStartedAtUptimeNanoseconds else { return nil }
+            value.durableCommitAtUptimeNanoseconds = atUptimeNanoseconds
+            textSendMilestones[messageID] = value
+            if let milliseconds = Self.monotonicMilliseconds(
+                from: value.actionStartedAtUptimeNanoseconds,
+                to: atUptimeNanoseconds
+            ) {
+                logger.info("text_action_to_durable_outbox_commit_ms=\(milliseconds, privacy: .public)")
+                updateTextSendTimingRecord(recordID: value.recordID) {
+                    $0.actionToDurableOutboxCommitMilliseconds = milliseconds
+                }
+            }
+        }
+        return textSendMeasurement(value)
+    }
+
+    /// Records the first actual SwiftUI publication of the local bubble. A render callback cannot
+    /// create a sample and cannot precede the durable commit milestone.
+    @discardableResult
+    func markTextBubbleVisible(
+        messageID: UUID,
+        atUptimeNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds,
+        producerScope: LocalMediaDiagnosticProducerScope?
+    ) -> LocalTextSendLatencyMeasurement? {
+        guard accepts(producerScope), var value = textSendMilestones[messageID],
+              let durableAt = value.durableCommitAtUptimeNanoseconds
+        else { return nil }
+        if value.visibleBubbleAtUptimeNanoseconds == nil {
+            guard atUptimeNanoseconds >= durableAt else { return nil }
+            value.visibleBubbleAtUptimeNanoseconds = atUptimeNanoseconds
+            textSendMilestones[messageID] = value
+            if let milliseconds = Self.monotonicMilliseconds(
+                from: value.actionStartedAtUptimeNanoseconds,
+                to: atUptimeNanoseconds
+            ) {
+                logger.info("text_action_to_visible_local_bubble_ms=\(milliseconds, privacy: .public)")
+                updateTextSendTimingRecord(recordID: value.recordID) {
+                    $0.actionToVisibleLocalBubbleMilliseconds = milliseconds
+                }
+            }
+        }
+        return textSendMeasurement(value)
+    }
+
+    /// Removes only a never-committed attempt when the composer contents change. A durable row is
+    /// retained even if navigation is interrupted, because it remains valid local-queue evidence.
+    func abandonUncommittedTextSend(
+        messageID: UUID,
+        producerScope: LocalMediaDiagnosticProducerScope?
+    ) {
+        guard accepts(producerScope),
+              let value = textSendMilestones[messageID],
+              value.durableCommitAtUptimeNanoseconds == nil
+        else { return }
+        textSendMilestones.removeValue(forKey: messageID)
+        diagnosticRecords.removeAll { $0.id == value.recordID }
+        persistRecords()
     }
 
     func exportReport() -> String {
@@ -574,6 +704,10 @@ final class LocalMediaPerformanceMonitor {
                 captureToEncryptedMilliseconds: record.captureToEncryptedMilliseconds,
                 captureToServerAcceptedMilliseconds: record.captureToServerAcceptedMilliseconds,
                 recipientDescriptorToLocalMilliseconds: record.recipientDescriptorToLocalMilliseconds,
+                actionToDurableOutboxCommitMilliseconds:
+                    record.actionToDurableOutboxCommitMilliseconds,
+                actionToVisibleLocalBubbleMilliseconds:
+                    record.actionToVisibleLocalBubbleMilliseconds,
                 playbackOutcome: record.playbackOutcome,
                 playbackPositionSeconds: record.playbackPositionSeconds
             )
@@ -587,7 +721,7 @@ final class LocalMediaPerformanceMonitor {
                 operatingSystem: ProcessInfo.processInfo.operatingSystemVersionString
             ),
             privacy: ExportPrivacy(
-                notice: "This report contains only bounded event times, media performance measurements and coarse media metadata.",
+                notice: "This report contains only bounded event times, local text-send performance measurements, media performance measurements and coarse media metadata.",
                 excludedData: [
                     "message and caption content",
                     "conversation and contact identifiers",
@@ -617,6 +751,7 @@ final class LocalMediaPerformanceMonitor {
         recipientDescriptorDates.removeAll()
         diagnosticRecordIDs.removeAll()
         diagnosticRecordGenerations.removeAll()
+        textSendMilestones.removeAll()
         diagnosticRecords.removeAll()
         return persistenceWasCleared
     }
@@ -663,6 +798,27 @@ final class LocalMediaPerformanceMonitor {
         )
     }
 
+    private func textSendMeasurement(
+        _ value: TextSendMilestones
+    ) -> LocalTextSendLatencyMeasurement {
+        LocalTextSendLatencyMeasurement(
+            actionToDurableOutboxCommitMilliseconds:
+                value.durableCommitAtUptimeNanoseconds.flatMap {
+                    Self.monotonicMilliseconds(
+                        from: value.actionStartedAtUptimeNanoseconds,
+                        to: $0
+                    )
+                },
+            actionToVisibleLocalBubbleMilliseconds:
+                value.visibleBubbleAtUptimeNanoseconds.flatMap {
+                    Self.monotonicMilliseconds(
+                        from: value.actionStartedAtUptimeNanoseconds,
+                        to: $0
+                    )
+                }
+        )
+    }
+
     private func upsertDiagnosticRecord(
         mediaID: UUID,
         recordedAt: Date,
@@ -697,6 +853,8 @@ final class LocalMediaPerformanceMonitor {
             captureToEncryptedMilliseconds: nil,
             captureToServerAcceptedMilliseconds: nil,
             recipientDescriptorToLocalMilliseconds: nil,
+            actionToDurableOutboxCommitMilliseconds: nil,
+            actionToVisibleLocalBubbleMilliseconds: nil,
             playbackOutcome: nil,
             playbackPositionSeconds: nil
         )
@@ -770,6 +928,17 @@ final class LocalMediaPerformanceMonitor {
         persistRecords()
     }
 
+    private func updateTextSendTimingRecord(
+        recordID: UUID,
+        update: (inout LocalMediaStoredDiagnosticRecord) -> Void
+    ) {
+        guard let index = recordIndex(id: recordID),
+              diagnosticRecords[index].event == .textSendTiming
+        else { return }
+        update(&diagnosticRecords[index])
+        persistRecords()
+    }
+
     private func recordIndex(id: UUID) -> Int? {
         diagnosticRecords.firstIndex { $0.id == id }
     }
@@ -783,6 +952,9 @@ final class LocalMediaPerformanceMonitor {
             let retainedMediaIDs = Set(diagnosticRecordIDs.keys)
             diagnosticRecordGenerations = diagnosticRecordGenerations.filter {
                 retainedMediaIDs.contains($0.key)
+            }
+            textSendMilestones = textSendMilestones.filter {
+                retainedIDs.contains($0.value.recordID)
             }
         }
         persistRecords()
@@ -826,6 +998,14 @@ final class LocalMediaPerformanceMonitor {
     private static func validNonnegative(_ value: Double?) -> Double? {
         guard let value, value.isFinite, value >= 0 else { return nil }
         return value
+    }
+
+    /// Diagnostics retain millisecond buckets rather than raw clocks, and cap anomalous samples
+    /// at ten minutes. Neither uptime nor the cap reveals account or message identity.
+    private static func monotonicMilliseconds(from start: UInt64, to end: UInt64) -> Double? {
+        guard end >= start else { return nil }
+        let elapsed = min(end - start, 600_000_000_000)
+        return (Double(elapsed) / 1_000_000).rounded()
     }
 
     private static func correlationToken(for mediaID: UUID) -> String {
@@ -923,6 +1103,34 @@ enum KitChatMediaLimits {
 
     static func shouldCacheInline(byteCount: Int) -> Bool {
         byteCount > 0 && byteCount <= maximumInlineCacheBytes
+    }
+}
+
+enum LegacyReceivedVideoMigrationPolicy {
+    enum Source: Equatable {
+        case streamedRemote
+        case smallLocalBlob
+        case unavailable
+    }
+
+    static func source(
+        plaintextByteCount: Int,
+        allowsDownload: Bool,
+        isOnline: Bool,
+        secureMessagingAvailable: Bool,
+        hasRemoteStorageKey: Bool,
+        hasAuthenticatedSession: Bool
+    ) -> Source {
+        if allowsDownload,
+           isOnline,
+           secureMessagingAvailable,
+           hasRemoteStorageKey,
+           hasAuthenticatedSession {
+            return .streamedRemote
+        }
+        return KitChatMediaLimits.shouldCacheInline(byteCount: plaintextByteCount)
+            ? .smallLocalBlob
+            : .unavailable
     }
 }
 

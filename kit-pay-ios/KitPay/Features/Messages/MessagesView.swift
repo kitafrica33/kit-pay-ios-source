@@ -1,6 +1,7 @@
 import Contacts
 import ContactsUI
 import CoreTransferable
+import Dispatch
 import ImageIO
 import PhotosUI
 import SwiftUI
@@ -1432,6 +1433,12 @@ private struct ConversationDraftPersistenceTaskKey: Hashable {
     let isSending: Bool
 }
 
+private struct ConversationTextSubmissionAttempt {
+    let clientMessageID: UUID
+    let body: String
+    let replyToServerMessageID: String?
+}
+
 /// What the schedule sheet is being opened for. `existingItem` is nil when the composer is
 /// arranging a new send and set when an already-scheduled item is being moved.
 private struct ChatScheduleRequest: Identifiable {
@@ -1480,6 +1487,7 @@ struct ConversationView: View {
     @State private var attachmentLoadGeneration = 0
     @State private var isSending = false
     @State private var scheduleRequest: ChatScheduleRequest?
+    @State private var textSubmissionAttempt: ConversationTextSubmissionAttempt?
     @State private var retryingMessageIDs: Set<UUID> = []
     @State private var didRestoreDraft = false
     @State private var draftRestoreStarted = false
@@ -2680,6 +2688,12 @@ struct ConversationView: View {
                                         showsSenderName: namedSenderMessageIDs.contains(message.id),
                                         editedAt: correctionDates[message.id]
                                     )
+                                    .onAppear {
+                                        LocalMediaPerformanceMonitor.shared.markTextBubbleVisible(
+                                            messageID: message.id,
+                                            producerScope: mediaDiagnosticsProducerScope
+                                        )
+                                    }
                                 }
                             case .payment(let message, let descriptor):
                                 paymentBubble(message, descriptor: descriptor)
@@ -3350,6 +3364,12 @@ struct ConversationView: View {
                         messageID: item.messageID,
                         conversationId: item.conversationID,
                         itemIndex: item.itemIndex
+                    )
+                },
+                persistVideoDuration: { mediaID, duration in
+                    await model.persistLocalMediaDuration(
+                        mediaID: mediaID,
+                        duration: duration
                     )
                 },
                 showInChat: { item in
@@ -6725,7 +6745,8 @@ struct ConversationView: View {
     }
 
     private func chatCallToolbarButton(video: Bool) -> some View {
-        Button { queueCall(video: video) } label: {
+        let callReadinessAllowed = model.callReadinessAllowsRecipientAction(recipientUserID)
+        return Button { queueCall(video: video) } label: {
             Image(systemName: video ? "video" : "phone")
                 .font(.system(size: 18, weight: .semibold))
                 .foregroundStyle(KitColor.green)
@@ -6734,8 +6755,10 @@ struct ConversationView: View {
                 )
         }
         .buttonStyle(.plain)
-        .disabled(isReadOnlyAppReviewPreview || !recipientCommunicationAllowed)
-        .opacity(isReadOnlyAppReviewPreview || !recipientCommunicationAllowed ? 0.48 : 1)
+        // Unknown privacy/capability state is recoverable on tap; a known block still disables
+        // the action, and AppModel re-fetches authoritative privacy before creating a call.
+        .disabled(isReadOnlyAppReviewPreview || !callReadinessAllowed)
+        .opacity(isReadOnlyAppReviewPreview || !callReadinessAllowed ? 0.48 : 1)
         .accessibilityLabel(video ? "Video call" : "Audio call")
     }
 
@@ -6776,6 +6799,8 @@ struct ConversationView: View {
     private func sendDraft(deliverAt: Date? = nil) {
         guard didRestoreDraft, !isReadOnlyAppReviewPreview else { return }
         guard canSendMessage else { return }
+        let sendActionUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
+        let sendActionDate = Date()
         let submittedDraft = draft
         let submittedText = submittedDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         // Typed text must never impersonate a payment event: the KITPAY1 wire is written only
@@ -6815,6 +6840,54 @@ struct ConversationView: View {
         // client identity for the send. The share extension can then hand the same batch
         // over twice without the conversation ever queueing it twice.
         let sharedBatchClientMessageID = submittedSharedDelivery?.batch.id
+        let textDiagnosticsMessageID: UUID?
+        if submittedAttachments.isEmpty, deliverAt == nil {
+            if let sharedBatchClientMessageID {
+                if let abandoned = textSubmissionAttempt {
+                    LocalMediaPerformanceMonitor.shared.abandonUncommittedTextSend(
+                        messageID: abandoned.clientMessageID,
+                        producerScope: mediaDiagnosticsProducerScope
+                    )
+                    textSubmissionAttempt = nil
+                }
+                textDiagnosticsMessageID = sharedBatchClientMessageID
+            } else if let retained = textSubmissionAttempt,
+                      retained.body == submittedText,
+                      retained.replyToServerMessageID == answering {
+                textDiagnosticsMessageID = retained.clientMessageID
+            } else {
+                if let abandoned = textSubmissionAttempt {
+                    LocalMediaPerformanceMonitor.shared.abandonUncommittedTextSend(
+                        messageID: abandoned.clientMessageID,
+                        producerScope: mediaDiagnosticsProducerScope
+                    )
+                }
+                let clientMessageID = UUID()
+                textSubmissionAttempt = ConversationTextSubmissionAttempt(
+                    clientMessageID: clientMessageID,
+                    body: submittedText,
+                    replyToServerMessageID: answering
+                )
+                textDiagnosticsMessageID = clientMessageID
+            }
+            if let textDiagnosticsMessageID {
+                LocalMediaPerformanceMonitor.shared.beginTextSend(
+                    messageID: textDiagnosticsMessageID,
+                    atUptimeNanoseconds: sendActionUptimeNanoseconds,
+                    recordedAt: sendActionDate,
+                    producerScope: mediaDiagnosticsProducerScope
+                )
+            }
+        } else {
+            if let abandoned = textSubmissionAttempt {
+                LocalMediaPerformanceMonitor.shared.abandonUncommittedTextSend(
+                    messageID: abandoned.clientMessageID,
+                    producerScope: mediaDiagnosticsProducerScope
+                )
+            }
+            textSubmissionAttempt = nil
+            textDiagnosticsMessageID = nil
+        }
         let persistenceVersion = model.nextConversationDraftWriteVersion()
         immediateDraftPersistenceTask?.cancel()
         immediateDraftPersistenceTask = nil
@@ -6845,11 +6918,12 @@ struct ConversationView: View {
                     title: recipientDisplayName,
                     recipientId: recipientUserID,
                     body: submittedDraft,
-                    clientMessageID: sharedBatchClientMessageID,
+                    clientMessageID: textDiagnosticsMessageID ?? sharedBatchClientMessageID,
                     draftClearVersion: clearVersion,
                     submittedDraftMediaAttachments: submittedDraftMediaAttachments,
                     deliverAt: deliverAt,
-                    replyToServerMessageID: answering
+                    replyToServerMessageID: answering,
+                    textDiagnosticsProducerScope: mediaDiagnosticsProducerScope
                 )
             } else {
                 allQueued = await sendStagedAttachments(
@@ -6864,6 +6938,9 @@ struct ConversationView: View {
                 )
             }
             if allQueued {
+                if textSubmissionAttempt?.clientMessageID == textDiagnosticsMessageID {
+                    textSubmissionAttempt = nil
+                }
                 draftWriteVersion = clearVersion
                 if draft == submittedDraft { draft = "" }
                 cancelReply()
@@ -7046,8 +7123,9 @@ struct ConversationView: View {
         isSending = true
         Task {
             // Finalized segments are adopted individually and the visible bubble is committed
-            // before assembly. The sender can play those originals immediately; a durable job
-            // assembles the wire's single audio/mp4 representation after this method returns.
+            // before any required assembly. The ordinary unpaused recording is already one
+            // finalized audio/mp4 file, so it can begin encryption/upload without another copy;
+            // paused-and-resumed notes retain a durable background assembly job.
             guard let recording = await voiceRecorder.finish() else {
                 VoiceNoteDraftRegistry.shared.release(conversation.id)
                 isSending = false
@@ -7093,11 +7171,9 @@ struct ConversationView: View {
                     duration: segment.duration
                 ))
             }
-            let job = LocalMediaPreprocessingJob(
-                kind: .voiceAssembly,
-                sources: sources,
-                outputStorageKey: UUID().uuidString.lowercased(),
-                outputMediaType: VoiceNoteRecorder.Recording.mediaType
+            let job = VoiceNoteSendPreparationPolicy.preprocessingJob(
+                for: sources,
+                outputStorageKey: UUID().uuidString.lowercased()
             )
             let queued = await model.queueMediaMessage(
                 conversationId: conversation.id,
@@ -7107,8 +7183,9 @@ struct ConversationView: View {
                 mediaType: VoiceNoteRecorder.Recording.mediaType,
                 caption: nil,
                 localMediaID: mediaID,
-                // Until assembly finishes, the authoritative playable representation is the
-                // first source plus the ordered source manifest retained on the record.
+                // For a multi-segment note, the first source plus the ordered source manifest is
+                // authoritative until assembly finishes. A single segment is already the wire
+                // representation and is immediately ready for encryption/upload.
                 plaintextByteSize: sources[0].fileSize,
                 localStorageKind: .protectedFile,
                 duration: recording.duration,
@@ -9903,6 +9980,7 @@ private struct NewMessageSheet: View {
     @State private var directorySearchID: UUID?
     @State private var directorySearchQuery: String?
     @State private var submissionGate = NewMessageSubmissionGate()
+    private let textDiagnosticsProducerScope: LocalMediaDiagnosticProducerScope?
 
     let onQueued: (Conversation) -> Void
 
@@ -9911,6 +9989,7 @@ private struct NewMessageSheet: View {
         onQueued: @escaping (Conversation) -> Void
     ) {
         _selectedContact = State(initialValue: initialContact)
+        textDiagnosticsProducerScope = LocalMediaPerformanceMonitor.shared.captureProducerScope()
         self.onQueued = onQueued
     }
 
@@ -9977,7 +10056,7 @@ private struct NewMessageSheet: View {
                         Section("On Kit Pay") {
                             ForEach(sections.kitPay) { contact in
                                 Button {
-                                    submissionGate.reset()
+                                    resetSubmissionGate()
                                     selectedContact = contact
                                 } label: {
                                     contactLabel(contact, trailingText: contact.tag?.nilIfEmpty)
@@ -10012,7 +10091,7 @@ private struct NewMessageSheet: View {
                         if selectedContact == nil {
                             dismiss()
                         } else {
-                            submissionGate.reset()
+                            resetSubmissionGate()
                             selectedContact = nil
                             message = ""
                         }
@@ -10052,10 +10131,13 @@ private struct NewMessageSheet: View {
 
     @MainActor
     private func submit(to contact: WalletContactDTO) {
+        let sendActionUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
+        let sendActionDate = Date()
         guard model.appReviewDemoMutationsAllowed else {
             model.lastError = AppReviewDemoMutationPolicy.readOnlyMessage
             return
         }
+        let previouslyRetainedMessageID = submissionGate.retainedClientMessageID
         guard let key = NewMessageSubmissionKey(
             recipientUserID: contact.id,
             body: message
@@ -10063,13 +10145,27 @@ private struct NewMessageSheet: View {
               let clientMessageID = submissionGate.begin(key: key)
         else { return }
         let submittedBody = message
+        if let previouslyRetainedMessageID,
+           previouslyRetainedMessageID != clientMessageID {
+            LocalMediaPerformanceMonitor.shared.abandonUncommittedTextSend(
+                messageID: previouslyRetainedMessageID,
+                producerScope: textDiagnosticsProducerScope
+            )
+        }
+        LocalMediaPerformanceMonitor.shared.beginTextSend(
+            messageID: clientMessageID,
+            atUptimeNanoseconds: sendActionUptimeNanoseconds,
+            recordedAt: sendActionDate,
+            producerScope: textDiagnosticsProducerScope
+        )
 
         Task { @MainActor in
             let result = await model.queueDirectMessageResult(
                 recipientId: contact.id,
                 title: contact.name,
                 body: submittedBody,
-                clientMessageID: clientMessageID
+                clientMessageID: clientMessageID,
+                textDiagnosticsProducerScope: textDiagnosticsProducerScope
             )
             submissionGate.finish(
                 clientMessageID: clientMessageID,
@@ -10081,6 +10177,17 @@ private struct NewMessageSheet: View {
             message = ""
             onQueued(conversation)
         }
+    }
+
+    @MainActor
+    private func resetSubmissionGate() {
+        if let clientMessageID = submissionGate.retainedClientMessageID {
+            LocalMediaPerformanceMonitor.shared.abandonUncommittedTextSend(
+                messageID: clientMessageID,
+                producerScope: textDiagnosticsProducerScope
+            )
+        }
+        submissionGate.reset()
     }
 
     private func contactLabel(_ contact: WalletContactDTO, trailingText: String?) -> some View {

@@ -5,11 +5,9 @@ struct CallsView: View {
     @State private var showNewCall = false
     @State private var missedOnly = false
 
-    private var canStartNewCall: Bool {
-        model.appReviewDemoMutationsAllowed
-            && model.mayCreateCall
-            && model.hasUsableCommunicationPrivacyProjection
-    }
+    /// Opening the picker is itself the recovery route for a missing capability/privacy
+    /// projection. Individual call submission remains authoritatively gated in AppModel.
+    private var canOpenNewCallPicker: Bool { model.callReadinessPickerAvailable }
 
     private var allCalls: [CallRecord] {
         model.state.calls
@@ -35,7 +33,7 @@ struct CallsView: View {
                     } actions: {
                         Button("New call") { showNewCall = true }
                             .buttonStyle(.borderedProminent)
-                            .disabled(!canStartNewCall)
+                            .disabled(!canOpenNewCallPicker)
                     }
                 } else {
                     ScrollView {
@@ -79,7 +77,7 @@ struct CallsView: View {
                     GlassIconButton(systemName: "phone.badge.plus", inBar: true) {
                         showNewCall = true
                     }
-                        .disabled(!canStartNewCall)
+                        .disabled(!canOpenNewCallPicker)
                         .accessibilityLabel("New call")
                         .accessibilityHint("Choose a Kit Pay contact for an audio or video call")
                 }
@@ -98,12 +96,10 @@ struct CallsView: View {
         let recipientUserID = call.participantUserIds.first(where: {
             $0.caseInsensitiveCompare(model.profile?.id ?? "") != .orderedSame
         })
-        let recipientCommunicationAllowed = model.communicationPrivacyAllowsOutbound(
-            to: recipientUserID
-        )
         let canRedial = !isReadOnlyPreview
-            && model.mayCreateCall
-            && recipientCommunicationAllowed
+            // Unknown privacy/capability state is recoverable when the user taps. A known block
+            // remains disabled, and AppModel re-fetches authority before creating any call.
+            && model.callReadinessAllowsRecipientAction(recipientUserID)
         return HStack(spacing: 13) {
             RemoteAvatarView(
                 name: call.name,
@@ -174,6 +170,7 @@ private struct NewCallSheet: View {
     @State private var directoryResultQuery: String?
     @State private var directorySearchID: UUID?
     @State private var directorySearchQuery: String?
+    @State private var isRecoveringReadiness = false
 
     var body: some View {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -262,12 +259,30 @@ private struct NewCallSheet: View {
                     }
                 }
                 Section {
-                    Text(!model.mayCreateCall
-                         ? "Calls are not currently available for this account."
+                    Text(!model.hasUsableCommunicationPrivacyProjection
+                         ? "Call privacy is still loading. Retry setup before placing a call."
+                         : !model.mayCreateCall
+                            ? "Calls are not currently available for this account."
                          : model.isOnline
                             ? "Choose voice or video beside a Kit Pay contact."
                             : "Keep Kit Pay running. It will retry when you return to the app and internet access is restored. Quitting Kit Pay discards the pending attempt.")
                         .font(.footnote)
+                    if !model.hasUsableCommunicationPrivacyProjection || !model.mayCreateCall {
+                        Button {
+                            Task {
+                                isRecoveringReadiness = true
+                                await model.retryCommunicationReadiness()
+                                isRecoveringReadiness = false
+                            }
+                        } label: {
+                            if isRecoveringReadiness {
+                                ProgressView()
+                            } else {
+                                Label("Retry call setup", systemImage: "arrow.clockwise")
+                            }
+                        }
+                        .disabled(isRecoveringReadiness || !model.isOnline)
+                    }
                 }
             }
             .navigationTitle("New call")
@@ -322,11 +337,7 @@ private struct NewCallSheet: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.borderless)
-        .disabled(
-            !model.appReviewDemoMutationsAllowed
-                || !model.mayCreateCall
-                || !model.communicationPrivacyAllowsOutbound(to: contact.id)
-        )
+        .disabled(!model.callReadinessAllowsRecipientAction(contact.id))
         .accessibilityLabel("\(video ? "Video" : "Voice") call \(contact.name)")
     }
 

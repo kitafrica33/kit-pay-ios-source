@@ -22,6 +22,84 @@ struct SecureMessagingHistoryOutboundEnvelope: Codable, Equatable {
     let fanout: SecureMessagingCommittedFanout
 }
 
+enum SecureMessagingSyncFailureCategory: String, Codable, Equatable, Sendable {
+    case eventValidation
+    case conversation
+    case roster
+    case envelope
+    case decryption
+    case projection
+}
+
+/// An exact encrypted sync event retained after it repeatedly fails ahead of authenticated
+/// projection. This value lives inside `SecureLocalStore`, so ciphertext and diagnostics remain
+/// encrypted at rest and account-bound while the ordinary server cursor is allowed to progress.
+struct SecureMessagingQuarantinedSyncEvent: Codable, Equatable, Sendable {
+    let eventID: String
+    let ownerUserID: String
+    let localDeviceID: String
+    let localEnrollmentEpoch: Int64
+    let sourceCursor: String?
+    let event: MessagingSyncEventDTO
+    let firstFailedAt: Date
+    var lastFailedAt: Date
+    var nextAttemptAt: Date
+    var attemptCount: Int
+    var failureCategory: SecureMessagingSyncFailureCategory
+
+    var isStructurallyValid: Bool {
+        SecureMessagingValidation.isCanonicalPositiveDecimalID(eventID)
+            && event.id == eventID
+            && event.type == "message.created"
+            && event.data?.envelope?.ciphertext?.isEmpty == false
+            && SecureMessagingValidation.isCanonicalUUID(ownerUserID)
+            && SecureMessagingValidation.isCanonicalUUID(localDeviceID)
+            && localEnrollmentEpoch > 0
+            && sourceCursor.map({ !$0.isEmpty && $0.utf8.count <= 2_048 }) ?? true
+            && firstFailedAt.timeIntervalSinceReferenceDate.isFinite
+            && lastFailedAt.timeIntervalSinceReferenceDate.isFinite
+            && nextAttemptAt.timeIntervalSinceReferenceDate.isFinite
+            && lastFailedAt >= firstFailedAt
+            && attemptCount > 0
+            && attemptCount <= SecureMessagingSyncQuarantinePolicy.maximumRecordedAttempts
+    }
+}
+
+enum SecureMessagingSyncQuarantinePolicy {
+    /// The server cursor gets three normal opportunities to apply an encrypted event. On the next
+    /// replay the exact event is already durable, so normal sync may step over it and the separate
+    /// retry lane owns recovery.
+    static let attemptsBeforeCursorRelease = 3
+    static let maximumRecords = 32
+    static let maximumRecordedAttempts = 1_000_000
+    static let maximumEncodedEventBytes = 2 * 1_024 * 1_024
+    static let maximumEncodedCollectionBytes = 8 * 1_024 * 1_024
+    static let maximumAttemptsPerDrain = 4
+    static let maximumRetryDelay: TimeInterval = 6 * 60 * 60
+
+    static func retryDelay(afterAttempt attemptCount: Int) -> TimeInterval {
+        let exponent = min(max(0, attemptCount - attemptsBeforeCursorRelease), 10)
+        return min(30 * pow(2, Double(exponent)), maximumRetryDelay)
+    }
+
+    static func canPersist(_ records: [SecureMessagingQuarantinedSyncEvent]) -> Bool {
+        guard records.count <= maximumRecords,
+              Set(records.map(\.eventID)).count == records.count,
+              records.allSatisfy(\.isStructurallyValid)
+        else { return false }
+        let encoder = JSONEncoder()
+        var aggregateBytes = 0
+        for record in records {
+            guard let encoded = try? encoder.encode(record),
+                  encoded.count <= maximumEncodedEventBytes,
+                  aggregateBytes <= maximumEncodedCollectionBytes - encoded.count
+            else { return false }
+            aggregateBytes += encoded.count
+        }
+        return true
+    }
+}
+
 /// Codable libsignal state. `SecureLocalStore` encrypts this value with the same atomic AES-GCM
 /// transaction as the visible message projection and ciphertext outbox.
 struct SecureMessagingPersistentState: Codable, Equatable {
@@ -42,6 +120,9 @@ struct SecureMessagingPersistentState: Codable, Equatable {
     var remoteServerDeviceBindings: [String: String] = [:]
     var cachedRosters: [String: SecureMessagingRosterSnapshot] = [:]
     var syncCursor: String? = nil
+    /// Poisoned encrypted message events are retried independently after their exact bytes and
+    /// failure metadata have been durably preserved. This collection is bounded before commit.
+    var quarantinedSyncEvents: [SecureMessagingQuarantinedSyncEvent] = []
     /// Delivery acknowledgement is attempted only after ciphertext, ratchet state and the visible
     /// projection commit atomically. Failed/replayed HTTP attempts remain safe and durable here.
     var pendingDeliveryAcknowledgementIDs: [String] = []
@@ -70,6 +151,7 @@ struct SecureMessagingPersistentState: Codable, Equatable {
         case remoteServerDeviceBindings
         case cachedRosters
         case syncCursor
+        case quarantinedSyncEvents
         case pendingDeliveryAcknowledgementIDs
         case historyBackfillTasks
         case historyOutboundEnvelopes
@@ -122,6 +204,10 @@ struct SecureMessagingPersistentState: Codable, Equatable {
             cachedRosters = [:]
         }
         syncCursor = try container.decodeIfPresent(String.self, forKey: .syncCursor)
+        quarantinedSyncEvents = try container.decodeIfPresent(
+            [SecureMessagingQuarantinedSyncEvent].self,
+            forKey: .quarantinedSyncEvents
+        ) ?? []
         pendingDeliveryAcknowledgementIDs = try container.decodeIfPresent(
             [String].self,
             forKey: .pendingDeliveryAcknowledgementIDs
@@ -153,6 +239,7 @@ struct SecureMessagingPersistentState: Codable, Equatable {
         try container.encode(remoteServerDeviceBindings, forKey: .remoteServerDeviceBindings)
         try container.encode(cachedRosters, forKey: .cachedRosters)
         try container.encodeIfPresent(syncCursor, forKey: .syncCursor)
+        try container.encode(quarantinedSyncEvents, forKey: .quarantinedSyncEvents)
         try container.encode(
             pendingDeliveryAcknowledgementIDs,
             forKey: .pendingDeliveryAcknowledgementIDs

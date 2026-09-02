@@ -142,6 +142,46 @@ struct CallableContact: Identifiable, Hashable {
     let source: WalletContactDTO?
 }
 
+/// A server-issued ring lifetime anchored to the process monotonic clock. The backend supplies
+/// both timestamps in the same response, so device wall-clock skew can never lengthen or shorten
+/// an invitation. The cap also prevents a malformed or hostile response from retaining CallKit
+/// state indefinitely.
+struct CallRingDeadline: Equatable, Sendable {
+    static let maximumLifetime: TimeInterval = 60
+
+    let monotonicTime: TimeInterval
+
+    init(monotonicTime: TimeInterval) {
+        self.monotonicTime = monotonicTime
+    }
+
+    init?(
+        ringExpiresAt: String?,
+        serverTime: String?,
+        monotonicNow: TimeInterval = CallMonotonicClock.now(),
+        requirePositiveLifetime: Bool = false
+    ) {
+        guard monotonicNow.isFinite,
+              let expiry = CallLifecyclePolicy.serverTimestamp(ringExpiresAt),
+              let serverNow = CallLifecyclePolicy.serverTimestamp(serverTime)
+        else { return nil }
+        let serverLifetime = expiry.timeIntervalSince(serverNow)
+        guard serverLifetime.isFinite else { return nil }
+        let remaining = min(Self.maximumLifetime, max(0, serverLifetime))
+        guard !requirePositiveLifetime || remaining > 0 else { return nil }
+        monotonicTime = monotonicNow + remaining
+    }
+
+    func remaining(at monotonicNow: TimeInterval = CallMonotonicClock.now()) -> TimeInterval {
+        guard monotonicNow.isFinite else { return 0 }
+        return max(0, monotonicTime - monotonicNow)
+    }
+
+    func isExpired(at monotonicNow: TimeInterval = CallMonotonicClock.now()) -> Bool {
+        remaining(at: monotonicNow) <= 0
+    }
+}
+
 struct IncomingCallPush: Equatable, Sendable {
     static let pushType = "call.ringing"
 
@@ -150,6 +190,7 @@ struct IncomingCallPush: Equatable, Sendable {
     let callerUserId: String?
     let video: Bool
     let ringExpiresAt: String?
+    let serverTime: String?
 
     var callUUID: UUID { UUID(uuidString: callId)! }
 
@@ -161,17 +202,29 @@ struct IncomingCallPush: Equatable, Sendable {
         return standard.date(from: ringExpiresAt)
     }
 
+    func ringDeadline(
+        monotonicNow: TimeInterval = CallMonotonicClock.now()
+    ) -> CallRingDeadline? {
+        CallRingDeadline(
+            ringExpiresAt: ringExpiresAt,
+            serverTime: serverTime,
+            monotonicNow: monotonicNow
+        )
+    }
+
     enum CallKitDisposition: Equatable {
         case ringing
         case reportAsUnanswered
     }
 
-    func callKitDisposition(at now: Date = Date()) -> CallKitDisposition {
-        isExpired(at: now) ? .reportAsUnanswered : .ringing
+    func callKitDisposition(
+        monotonicNow: TimeInterval = CallMonotonicClock.now()
+    ) -> CallKitDisposition {
+        isExpired(monotonicNow: monotonicNow) ? .reportAsUnanswered : .ringing
     }
 
-    func isExpired(at now: Date = Date()) -> Bool {
-        ringExpiryDate.map { $0 <= now } ?? false
+    func isExpired(monotonicNow: TimeInterval = CallMonotonicClock.now()) -> Bool {
+        ringDeadline(monotonicNow: monotonicNow)?.isExpired(at: monotonicNow) ?? false
     }
 
     init?(payload: [AnyHashable: Any]) {
@@ -186,6 +239,7 @@ struct IncomingCallPush: Equatable, Sendable {
         video = Self.string(payload["call_type"])?.lowercased() == "video"
             || Self.bool(payload["video"])
         ringExpiresAt = Self.string(payload["ring_expires_at"])
+        serverTime = Self.string(payload["server_time"])
     }
 
     private static func string(_ value: Any?) -> String? {
@@ -239,6 +293,7 @@ struct AuthenticatedIncomingCall: Equatable, Sendable {
     let record: CallRecord
     let callUUID: UUID
     let ringExpiryDate: Date
+    let ringDeadline: CallRingDeadline
     let initiatorUserID: String?
 }
 
@@ -251,7 +306,7 @@ enum IncomingCallAuthenticationPolicy {
         response: CallDTO,
         matching push: IncomingCallPush,
         currentUserID: String,
-        now: Date = Date()
+        monotonicNow: TimeInterval = CallMonotonicClock.now()
     ) -> AuthenticatedIncomingCall? {
         guard let callID = canonicalUUID(response.id),
               response.id == callID,
@@ -259,8 +314,12 @@ enum IncomingCallAuthenticationPolicy {
               canonicalContractValue(response.direction) == "incoming",
               isRingingInvitationState(response.state),
               let expiry = CallLifecyclePolicy.serverTimestamp(response.ringExpiresAt),
-              expiry > now,
-              push.ringExpiryDate.map({ $0 > now }) ?? true,
+              let ringDeadline = CallRingDeadline(
+                  ringExpiresAt: response.ringExpiresAt,
+                  serverTime: response.serverTime,
+                  monotonicNow: monotonicNow,
+                  requirePositiveLifetime: true
+              ),
               let startedAt = CallLifecyclePolicy.serverTimestamp(response.startedAt),
               startedAt <= expiry,
               let currentUserID = canonicalUUID(currentUserID),
@@ -315,6 +374,7 @@ enum IncomingCallAuthenticationPolicy {
             record: record,
             callUUID: push.callUUID,
             ringExpiryDate: expiry,
+            ringDeadline: ringDeadline,
             initiatorUserID: push.callerUserId
         )
     }
@@ -379,6 +439,7 @@ struct AuthenticatedWaitingCall: Equatable, Sendable {
     var name: String { incoming.record.name }
     var video: Bool { incoming.record.isVideoCall }
     var ringExpiryDate: Date { incoming.ringExpiryDate }
+    var ringDeadline: CallRingDeadline { incoming.ringDeadline }
 
     fileprivate init(
         incoming: AuthenticatedIncomingCall,
@@ -410,7 +471,7 @@ enum CallWaitingRoutingPolicy {
         incoming: AuthenticatedIncomingCall,
         activeCallID: String?,
         mediaState: CallWaitingMediaState,
-        now: Date = Date()
+        monotonicNow: TimeInterval = CallMonotonicClock.now()
     ) -> CallWaitingRoute {
         guard mediaState.permitsWaitingCall else { return .primary }
         guard let activeCallID = CallWaitingCanonicalIdentity.uuid(activeCallID) else {
@@ -420,7 +481,7 @@ enum CallWaitingRoutingPolicy {
               incoming.callUUID.uuidString.lowercased() == incomingCallID
         else { return .decline }
         guard activeCallID != incomingCallID else { return .currentCall }
-        guard incoming.ringExpiryDate > now,
+        guard !incoming.ringDeadline.isExpired(at: monotonicNow),
               incoming.record.state == .ringing,
               incoming.record.direction.caseInsensitiveCompare("incoming") == .orderedSame,
               let initiatorUserID = CallWaitingCanonicalIdentity.uuid(incoming.initiatorUserID),
@@ -478,10 +539,10 @@ enum CallWaitingMergePolicy {
         calls: [CallRecord],
         currentUserID: String?,
         participantLimit: Int = CallWaitingMergePolicy.maximumParticipantCount,
-        now: Date = Date()
+        monotonicNow: TimeInterval = CallMonotonicClock.now()
     ) -> CallWaitingMergeEligibility {
         guard mediaState.permitsWaitingCall else { return .denied(.mediaUnavailable) }
-        guard waitingCall.ringExpiryDate > now else {
+        guard !waitingCall.ringDeadline.isExpired(at: monotonicNow) else {
             return .denied(.waitingCallExpired)
         }
         guard let activeCallID = CallWaitingCanonicalIdentity.uuid(activeCallID) else {
@@ -587,7 +648,7 @@ struct CallWaitingState: Equatable, Sendable {
         calls: [CallRecord],
         currentUserID: String?,
         participantLimit: Int = CallWaitingMergePolicy.maximumParticipantCount,
-        now: Date = Date()
+        monotonicNow: TimeInterval = CallMonotonicClock.now()
     ) -> CallWaitingMergeDecision {
         guard mergeAttempt == nil else { return .denied(.mergeInProgress) }
         guard let waitingCall else { return .denied(.noWaitingCall) }
@@ -598,7 +659,7 @@ struct CallWaitingState: Equatable, Sendable {
             calls: calls,
             currentUserID: currentUserID,
             participantLimit: participantLimit,
-            now: now
+            monotonicNow: monotonicNow
         ) {
         case .denied(let reason):
             return .denied(reason)
@@ -642,8 +703,12 @@ struct CallWaitingState: Equatable, Sendable {
 
     /// Clears the waiting presentation exactly at its authenticated server deadline.
     @discardableResult
-    mutating func expire(at now: Date = Date()) -> AuthenticatedWaitingCall? {
-        guard let waitingCall, waitingCall.ringExpiryDate <= now else { return nil }
+    mutating func expire(
+        monotonicNow: TimeInterval = CallMonotonicClock.now()
+    ) -> AuthenticatedWaitingCall? {
+        guard let waitingCall,
+              waitingCall.ringDeadline.isExpired(at: monotonicNow)
+        else { return nil }
         return clearWaitingCall()
     }
 
@@ -763,14 +828,27 @@ enum IncomingCallQuarantinePolicy {
     static let defaultLifetime: TimeInterval = 10
     static let maximumLifetime: TimeInterval = 60
 
-    static func expiry(pushExpiry: Date?, receivedAt: Date) -> Date {
-        guard let pushExpiry else {
-            return receivedAt.addingTimeInterval(defaultLifetime)
-        }
-        return min(
-            pushExpiry,
-            receivedAt.addingTimeInterval(maximumLifetime)
+    static func deadline(
+        for push: IncomingCallPush,
+        monotonicNow: TimeInterval = CallMonotonicClock.now()
+    ) -> CallRingDeadline {
+        push.ringDeadline(monotonicNow: monotonicNow)
+            ?? CallRingDeadline(
+                monotonicTime: monotonicNow + defaultLifetime
+            )
+    }
+
+    static func deadline(
+        ringExpiresAt: String?,
+        serverTime: String?,
+        monotonicNow: TimeInterval
+    ) -> CallRingDeadline {
+        CallRingDeadline(
+            ringExpiresAt: ringExpiresAt,
+            serverTime: serverTime,
+            monotonicNow: monotonicNow
         )
+            ?? CallRingDeadline(monotonicTime: monotonicNow + defaultLifetime)
     }
 }
 
@@ -1202,6 +1280,143 @@ final class PendingCallEventCache: @unchecked Sendable {
     }
 }
 
+enum IncomingCallPublicationEndDisposition: Equatable, Sendable {
+    case failed
+    case remoteEnded
+    case answeredElsewhere
+    case declinedElsewhere
+}
+
+enum IncomingCallPublicationRetirement: Equatable, Sendable {
+    case terminal(IncomingCallPublicationEndDisposition)
+    case naturallyExpired
+}
+
+enum IncomingCallPublicationDisposition: Equatable, Sendable {
+    case authorized
+    case duplicate
+    case terminalTombstoned(IncomingCallPublicationEndDisposition)
+    case naturallyExpired
+}
+
+/// Fences the asynchronous `reportNewIncomingCall` completion against lifecycle cleanup.
+///
+/// CallKit requires the VoIP push to be reported before the app can authenticate its owner. A
+/// sibling answer, terminal event, or natural lease expiry can arrive while that report is in
+/// flight, though. Retiring the UUID synchronously prevents the late completion (or a later
+/// duplicate push) from creating a fresh quarantine/ring after the call has already ended. The
+/// retained disposition also preserves missed-call semantics across delayed cleanup. Tombstones
+/// are process-local, contain no account data, and are bounded because call UUIDs are unique and
+/// pushes have short lifetimes.
+struct IncomingCallPublicationGate: Sendable {
+    private let retiredCapacity: Int
+    private var pendingGenerations: [UUID: UInt64] = [:]
+    private var retiredOrder: [UUID] = []
+    private var retirements: [UUID: IncomingCallPublicationRetirement] = [:]
+
+    init(retiredCapacity: Int = 128) {
+        self.retiredCapacity = max(1, retiredCapacity)
+    }
+
+    mutating func begin(
+        callUUID: UUID,
+        generation: UInt64,
+        alreadyTracked: Bool,
+        leaseExpired: Bool = false
+    ) -> IncomingCallPublicationDisposition {
+        if let retirement = retirements[callUUID] {
+            switch retirement {
+            case .terminal(let disposition):
+                return .terminalTombstoned(disposition)
+            case .naturallyExpired:
+                return .naturallyExpired
+            }
+        }
+        guard !alreadyTracked, pendingGenerations[callUUID] == nil else {
+            return .duplicate
+        }
+        if leaseExpired {
+            retire(callUUID: callUUID, as: .naturallyExpired)
+            return .naturallyExpired
+        }
+        pendingGenerations[callUUID] = generation
+        return .authorized
+    }
+
+    /// Consumes only the exact publication that is still pending and has not been retired.
+    mutating func complete(callUUID: UUID, generation: UInt64) -> Bool {
+        guard retirements[callUUID] == nil,
+              pendingGenerations[callUUID] == generation
+        else { return false }
+        pendingGenerations.removeValue(forKey: callUUID)
+        return true
+    }
+
+    mutating func abandon(callUUID: UUID, generation: UInt64) {
+        guard pendingGenerations[callUUID] == generation else { return }
+        pendingGenerations.removeValue(forKey: callUUID)
+    }
+
+    /// The first observed end state wins. In particular, natural expiry must remain `.unanswered`
+    /// even if a delayed publication callback or duplicate push is cleaned up afterward.
+    mutating func retire(
+        callUUID: UUID,
+        as retirement: IncomingCallPublicationRetirement = .terminal(.failed)
+    ) {
+        pendingGenerations.removeValue(forKey: callUUID)
+        guard retirements[callUUID] == nil else { return }
+        retiredOrder.append(callUUID)
+        retirements[callUUID] = retirement
+        while retiredOrder.count > retiredCapacity {
+            retirements.removeValue(forKey: retiredOrder.removeFirst())
+        }
+    }
+
+    func isPending(_ callUUID: UUID) -> Bool {
+        pendingGenerations[callUUID] != nil
+    }
+
+    var pendingCallUUIDs: Set<UUID> {
+        Set(pendingGenerations.keys)
+    }
+
+    func isRetired(_ callUUID: UUID) -> Bool {
+        retirements[callUUID] != nil
+    }
+
+    func retirement(for callUUID: UUID) -> IncomingCallPublicationRetirement? {
+        retirements[callUUID]
+    }
+}
+
+enum CallAnsweredElsewhereDisposition: Equatable, Sendable {
+    case ignore
+    case retireOfferedCall
+    case rememberTerminal
+}
+
+/// A backend Answer broadcast reaches every device, including the device that just accepted it.
+/// That local echo must not be mistaken for a sibling-device answer and tear down its own CallKit
+/// call. A sibling answer received before the ring push is remembered so reordered delivery cannot
+/// publish the already-answered call later.
+enum CallAnsweredElsewherePolicy {
+    static func disposition(
+        hasPendingPublication: Bool,
+        hasQuarantinedIncomingCall: Bool,
+        hasMatchingRevealedCall: Bool,
+        isLocallyAnswered: Bool,
+        isOutgoing: Bool
+    ) -> CallAnsweredElsewhereDisposition {
+        guard !isLocallyAnswered, !isOutgoing else { return .ignore }
+        if hasPendingPublication
+            || hasQuarantinedIncomingCall
+            || hasMatchingRevealedCall {
+            return .retireOfferedCall
+        }
+        return .rememberTerminal
+    }
+}
+
 /// Retires call records that still claim to be live but that this device can no longer act on.
 ///
 /// `queued`, `ringing`, and `active` are process truths as much as server truths: the outgoing
@@ -1265,6 +1480,36 @@ enum AbandonedCallRecordPolicy {
             [.ringing, .active].contains(call.state)
                 && !isAbandoned(call, hostedCallIDs: hostedCallIDs, now: now)
         }
+    }
+}
+
+/// Keeps the non-mutating call picker available while capability/privacy discovery is recovering,
+/// without making a known App Review session or an explicitly withdrawn Calls feature writable.
+/// The actual call mutation remains gated independently by `CallLifecyclePolicy.mayCreateCall`.
+enum CallReadinessSurfacePolicy {
+    static func permitsPicker(
+        signedIn: Bool,
+        signingOut: Bool,
+        accountSetupComplete: Bool,
+        communicationAccessGranted: Bool,
+        communicationSurfacesConcealed: Bool,
+        isDemoActive: Bool,
+        callsExplicitlyWithdrawn: Bool
+    ) -> Bool {
+        signedIn
+            && !signingOut
+            && accountSetupComplete
+            && communicationAccessGranted
+            && !communicationSurfacesConcealed
+            && !isDemoActive
+            && !callsExplicitlyWithdrawn
+    }
+
+    static func permitsRecipientAction(
+        pickerPermitted: Bool,
+        privacyDecision: CommunicationPrivacyAccessDecision
+    ) -> Bool {
+        pickerPermitted && privacyDecision != .blocked
     }
 }
 

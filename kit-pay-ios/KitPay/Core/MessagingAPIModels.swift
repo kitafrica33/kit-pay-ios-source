@@ -2466,12 +2466,12 @@ struct SendEncryptedMessageRequest: Encodable, Equatable, Sendable {
     }
 }
 
-struct EncryptedMessageSenderDTO: Decodable, Equatable, Sendable {
+struct EncryptedMessageSenderDTO: Codable, Equatable, Sendable {
     let id: String?
     let name: String?
 }
 
-struct EncryptedMessageCryptoSenderDTO: Decodable, Equatable, Sendable {
+struct EncryptedMessageCryptoSenderDTO: Codable, Equatable, Sendable {
     let userId: String?
     let deviceId: String?
     let enrollmentEpoch: Int64?
@@ -2493,7 +2493,7 @@ struct EncryptedMessageCryptoSenderDTO: Decodable, Equatable, Sendable {
     }
 }
 
-struct EncryptedMessageEnvelopeDTO: Decodable, Equatable, Sendable {
+struct EncryptedMessageEnvelopeDTO: Codable, Equatable, Sendable {
     let recipientDeviceId: String?
     let recipientEnrollmentEpoch: Int64?
     let envelopeType: String?
@@ -2517,7 +2517,7 @@ struct EncryptedMessageEnvelopeDTO: Decodable, Equatable, Sendable {
     }
 }
 
-struct EncryptedAttachmentDTO: Decodable, Equatable, Sendable {
+struct EncryptedAttachmentDTO: Codable, Equatable, Sendable {
     let id: String?
     let storageKey: String?
     let mediaType: String?
@@ -2535,7 +2535,7 @@ struct EncryptedAttachmentDTO: Decodable, Equatable, Sendable {
     }
 }
 
-struct EncryptedMessageReactionDTO: Decodable, Equatable, Sendable {
+struct EncryptedMessageReactionDTO: Codable, Equatable, Sendable {
     let userId: String?
     let reaction: String?
     let reactedAt: String?
@@ -2547,7 +2547,7 @@ struct EncryptedMessageReactionDTO: Decodable, Equatable, Sendable {
     }
 }
 
-struct EncryptedMessageDTO: Decodable, Equatable, Sendable {
+struct EncryptedMessageDTO: Codable, Equatable, Sendable {
     let id: String?
     let conversationId: String?
     let clientMessageId: String?
@@ -2586,7 +2586,7 @@ struct EncryptedMessageDTO: Decodable, Equatable, Sendable {
     }
 }
 
-struct MessagingSyncEventDataDTO: Decodable, Equatable, Sendable {
+struct MessagingSyncEventDataDTO: Codable, Equatable, Sendable {
     let id: String?
     let conversationId: String?
     let clientMessageId: String?
@@ -2725,7 +2725,7 @@ struct MessagingSyncEventDataDTO: Decodable, Equatable, Sendable {
     }
 }
 
-struct MessagingSyncEventDTO: Decodable, Equatable, Sendable {
+struct MessagingSyncEventDTO: Codable, Equatable, Sendable {
     let id: String?
     let type: String?
     let conversationId: String?

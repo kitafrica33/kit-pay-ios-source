@@ -360,6 +360,58 @@ final class OutboxPolicyTests: XCTestCase {
         )
     }
 
+    func testIdentityFailuresResumeOnlyAfterThatRecipientsLifecycleEvent() {
+        let changedRecipient = "10000000-0000-4000-8000-000000000001"
+        let otherRecipient = "10000000-0000-4000-8000-000000000002"
+        var affected = command(
+            id: "34000000-0000-0000-0000-000000000011",
+            kind: .secureMessage,
+            createdAt: now,
+            nextAttemptAt: now,
+            recipientUserIds: [changedRecipient]
+        )
+        affected.conversationId = "550e8400-e29b-41d4-a716-446655440011"
+        var unrelated = command(
+            id: "34000000-0000-0000-0000-000000000012",
+            kind: .secureMessage,
+            createdAt: now,
+            nextAttemptAt: now,
+            recipientUserIds: [otherRecipient]
+        )
+        unrelated.conversationId = "550e8400-e29b-41d4-a716-446655440012"
+        var state = PersistedState.empty
+        state.outbox = [affected, unrelated]
+        state.messages = [
+            message(for: affected, conversationId: affected.conversationId!),
+            message(for: unrelated, conversationId: unrelated.conversationId!),
+        ]
+        let reason = SecureMessagingCryptoError.identityChanged.localizedDescription
+        OutboxPolicy.markAwaitingIdentityRefresh(for: affected, reason: reason, in: &state)
+        OutboxPolicy.markAwaitingIdentityRefresh(for: unrelated, reason: reason, in: &state)
+
+        XCTAssertEqual(
+            OutboxPolicy.failureDecision(for: SecureMessagingCryptoError.identityChanged),
+            .awaitIdentityRefresh
+        )
+        XCTAssertEqual(
+            OutboxPolicy.resumeIdentityDeferredCommands(
+                forRecipientUserID: changedRecipient,
+                in: &state,
+                at: now.addingTimeInterval(2)
+            ),
+            1
+        )
+        XCTAssertNil(state.outbox[0].failureDisposition)
+        XCTAssertEqual(state.messages[0].state, .queued)
+        XCTAssertEqual(state.outbox[1].failureDisposition, .awaitingIdentityRefresh)
+        XCTAssertEqual(state.messages[1].state, .queued)
+        XCTAssertNil(state.messages[1].failureReason)
+        XCTAssertEqual(
+            OutboxPolicy.readyCommands(state.outbox, at: now.addingTimeInterval(2)).map(\.id),
+            [affected.id]
+        )
+    }
+
     func testFailureClassificationRetriesOnlyTransientConditions() {
         XCTAssertEqual(
             OutboxPolicy.failureDecision(

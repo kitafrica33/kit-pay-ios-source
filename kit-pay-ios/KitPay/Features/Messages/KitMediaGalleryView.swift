@@ -50,6 +50,9 @@ struct KitMediaGalleryView: View {
     /// share decisions must use those returned facts, never the constructed item's captured
     /// fields. Throws on failure.
     let loadData: (KitGalleryItem) async throws -> SecureMediaLoadPolicy.LoadedItem
+    /// Reuses the duration already loaded by playback preparation instead of starting a second
+    /// AVURLAsset metadata probe for a received video.
+    let persistVideoDuration: (UUID, TimeInterval) async -> Void
     /// Optional 'Show in chat' action; gallery dismisses itself first, then calls this.
     let showInChat: ((KitGalleryItem) -> Void)?
     /// Reopens the conversation gallery at the handed-off video — the exact (message, item)
@@ -75,6 +78,7 @@ struct KitMediaGalleryView: View {
         initialItemID: UUID,
         initialItemIndex: Int? = nil,
         loadData: @escaping (KitGalleryItem) async throws -> SecureMediaLoadPolicy.LoadedItem,
+        persistVideoDuration: @escaping (UUID, TimeInterval) async -> Void,
         showInChat: ((KitGalleryItem) -> Void)?,
         restoreFromPictureInPicture: @escaping (ChatVideoGalleryIdentity) -> Void,
         onDismiss: @escaping () -> Void
@@ -83,6 +87,7 @@ struct KitMediaGalleryView: View {
         self.initialItemID = initialItemID
         self.initialItemIndex = initialItemIndex
         self.loadData = loadData
+        self.persistVideoDuration = persistVideoDuration
         self.showInChat = showInChat
         self.restoreFromPictureInPicture = restoreFromPictureInPicture
         self.onDismiss = onDismiss
@@ -189,6 +194,7 @@ struct KitMediaGalleryView: View {
                 isActive: isActive,
                 chromeVisible: chromeVisible,
                 onToggleChrome: toggleChrome,
+                persistDuration: persistVideoDuration,
                 restoreFromPictureInPicture: restoreFromPictureInPicture
             )
         default:
@@ -900,6 +906,25 @@ final class ZoomableImageScrollView: UIScrollView, UIScrollViewDelegate {
 
 // MARK: - Video page
 
+enum GalleryVideoActivationPolicy {
+    static let galleryPosterMaxPixel: CGFloat = 400
+    static let conversationPosterMaxPixel: CGFloat = 248
+
+    static func permitsPreparation(isActive: Bool) -> Bool { isActive }
+
+    /// The active video page must never put optional frame extraction in front of playback.
+    /// Reuse a poster another surface has already decoded, preferring the gallery-sized entry;
+    /// a cache miss deliberately returns nil so AVPlayer preparation can begin immediately.
+    @MainActor
+    static func cachedPoster(
+        forKey contentKey: String,
+        in store: ChatMediaThumbnailStore = .shared
+    ) -> UIImage? {
+        store.cachedThumbnail(forKey: contentKey, maxPixel: galleryPosterMaxPixel)
+            ?? store.cachedThumbnail(forKey: contentKey, maxPixel: conversationPosterMaxPixel)
+    }
+}
+
 private struct GalleryVideoPage: View {
     let item: KitGalleryItem
     /// Bytes plus the facts of the same resolution; playback and poster use these, never the
@@ -908,6 +933,7 @@ private struct GalleryVideoPage: View {
     let isActive: Bool
     let chromeVisible: Bool
     let onToggleChrome: () -> Void
+    let persistDuration: (UUID, TimeInterval) async -> Void
     let restoreFromPictureInPicture: (ChatVideoGalleryIdentity) -> Void
 
     @StateObject private var controller = GalleryVideoController()
@@ -933,13 +959,22 @@ private struct GalleryVideoPage: View {
         }
         .contentShape(Rectangle())
         .onTapGesture { onToggleChrome() }
-        .task(id: item.id) {
+        .task(id: isActive) {
+            guard GalleryVideoActivationPolicy.permitsPreparation(isActive: isActive) else {
+                controller.teardown(allowsPictureInPictureRetention: false)
+                return
+            }
             // Picture in Picture restores at exact gallery identity: item 3 of a
             // multi-attachment message reopens on item 3, still within its one bubble.
             let identity = ChatVideoGalleryIdentity(
                 messageID: item.messageID,
                 itemIndex: item.itemIndex
             )
+            // Poster extraction performs its own AVAsset preparation and frame decode. Never
+            // serialize that optional work ahead of the active player's preparation; a bubble or
+            // prior gallery visit may still provide a cached frame at zero decoding cost.
+            poster = GalleryVideoActivationPolicy.cachedPoster(forKey: item.thumbnailKey)
+
             let didPrepare: Bool
             if let localFileURL = loaded.localFileURL {
                 didPrepare = await controller.prepare(
@@ -948,6 +983,7 @@ private struct GalleryVideoPage: View {
                     protectedOriginalLease: loaded.localFileLease,
                     mediaType: loaded.mediaType,
                     expectedByteCount: loaded.byteCount,
+                    contentKey: item.thumbnailKey,
                     mediaID: item.mediaID,
                     isOutgoing: item.isOutgoing,
                     galleryIdentity: identity,
@@ -957,27 +993,25 @@ private struct GalleryVideoPage: View {
                 didPrepare = await controller.prepare(
                     data: loaded.data,
                     mediaType: loaded.mediaType,
+                    contentKey: item.thumbnailKey,
                     mediaID: item.mediaID,
                     isOutgoing: item.isOutgoing,
                     galleryIdentity: identity,
                     restoreFromPictureInPicture: restoreFromPictureInPicture
                 )
             }
-            if didPrepare, let playbackURL = controller.playbackURL {
-                poster = await ChatMediaThumbnailStore.shared.videoThumbnail(
-                    forKey: item.thumbnailKey,
-                    maxPixel: 400,
-                    fromFileURL: playbackURL,
-                    mediaType: loaded.mediaType,
-                    expectedByteCount: loaded.byteCount,
-                    protectedOriginalLease: loaded.localFileLease
-                )
+            if didPrepare, !Task.isCancelled {
+                await persistDuration(item.mediaID, controller.duration)
             }
         }
         .onChange(of: isActive) { _, nowActive in
-            if !nowActive { controller.pause() }
+            if !nowActive {
+                ChatVideoPosterGenerator.cancelPosters(forKey: item.thumbnailKey)
+                controller.teardown(allowsPictureInPictureRetention: false)
+            }
         }
         .onDisappear {
+            ChatVideoPosterGenerator.cancelPosters(forKey: item.thumbnailKey)
             controller.teardown()
         }
     }
@@ -1100,6 +1134,7 @@ private final class GalleryVideoController: ObservableObject {
     private var stallObserver: NSObjectProtocol?
     private var failureObserver: NSObjectProtocol?
     private var preparationID: UUID?
+    private var playbackClaim: ChatVideoPosterGenerator.PlaybackClaim?
     private var diagnosticMediaID: UUID?
     private var diagnosticIsOutgoing = false
     private var diagnosticByteCount: Int?
@@ -1117,6 +1152,7 @@ private final class GalleryVideoController: ObservableObject {
     func prepare(
         data: Data,
         mediaType: String,
+        contentKey: String,
         mediaID: UUID,
         isOutgoing: Bool,
         galleryIdentity: ChatVideoGalleryIdentity,
@@ -1142,6 +1178,7 @@ private final class GalleryVideoController: ObservableObject {
             protectedOriginalLease: nil,
             mediaType: mediaType,
             expectedByteCount: data.count,
+            contentKey: contentKey,
             mediaID: mediaID,
             isOutgoing: isOutgoing,
             galleryIdentity: galleryIdentity,
@@ -1155,6 +1192,7 @@ private final class GalleryVideoController: ObservableObject {
         protectedOriginalLease: SecureMediaOriginalAccessLease?,
         mediaType: String,
         expectedByteCount: Int,
+        contentKey: String,
         mediaID: UUID,
         isOutgoing: Bool,
         galleryIdentity: ChatVideoGalleryIdentity,
@@ -1183,6 +1221,20 @@ private final class GalleryVideoController: ObservableObject {
         playbackFileHandle = fileHandle
         isPreparing = true
         errorMessage = nil
+        guard let claim = await ChatVideoPosterGenerator.acquirePlayback(forKey: contentKey)
+        else {
+            failPreparation(ChatVideoPlaybackPreparationError.invalidFile)
+            return false
+        }
+        guard !Task.isCancelled,
+              preparationID == identifier,
+              sourceFileURL == url
+        else {
+            ChatVideoPosterGenerator.releasePlayback(claim)
+            if preparationID == identifier { releaseResources() }
+            return false
+        }
+        playbackClaim = claim
         do {
             let prepared = try await ChatVideoPlaybackAssetPolicy.prepare(
                 fileURL: url,
@@ -1194,6 +1246,7 @@ private final class GalleryVideoController: ObservableObject {
                   sourceFileURL == url
             else {
                 ChatMediaTempFiles.removeTemporaryFile(prepared.temporaryAliasURL)
+                if preparationID == identifier { releaseResources() }
                 return false
             }
             temporaryAliasURL = prepared.temporaryAliasURL
@@ -1237,10 +1290,13 @@ private final class GalleryVideoController: ObservableObject {
     /// Leaves the page. A video that is still playing keeps going in the system's floating window,
     /// and the plaintext it is playing from stays on disk until that window closes — hence the
     /// deferral rather than an unconditional teardown.
-    func teardown() {
-        guard !ChatVideoPictureInPicture.shared.retainTeardown(owner: self, { [self] in
-            releaseResources()
-        }) else { return }
+    func teardown(allowsPictureInPictureRetention: Bool = true) {
+        if allowsPictureInPictureRetention,
+           ChatVideoPictureInPicture.shared.retainTeardown(owner: self, { [self] in
+               releaseResources()
+           }) {
+            return
+        }
         ChatVideoPictureInPicture.shared.detach(owner: self)
         releaseResources()
     }
@@ -1248,6 +1304,8 @@ private final class GalleryVideoController: ObservableObject {
     private func releaseResources() {
         preparationID = nil
         isPreparing = false
+        ChatVideoPosterGenerator.releasePlayback(playbackClaim)
+        playbackClaim = nil
         if let timeObserver { player?.removeTimeObserver(timeObserver) }
         timeObserver = nil
         removePlaybackItemObservers()
@@ -1437,6 +1495,9 @@ private final class GalleryVideoController: ObservableObject {
     private func failPreparation(_ error: Error) {
         recordPlayback(.preparationFailed, position: nil)
         isPreparing = false
+        preparationID = nil
+        ChatVideoPosterGenerator.releasePlayback(playbackClaim)
+        playbackClaim = nil
         errorMessage = (error as? LocalizedError)?.errorDescription
             ?? "This video could not be played."
         if let playbackFileHandle { try? playbackFileHandle.close() }

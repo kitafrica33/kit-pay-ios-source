@@ -1193,6 +1193,7 @@ final class CallLifecycleTests: XCTestCase {
             ),
             callUUID: push.callUUID,
             ringExpiryDate: Date(timeIntervalSince1970: 100),
+            ringDeadline: CallRingDeadline(monotonicTime: 100),
             initiatorUserID: nil
         )
         let incoming = CallLifecycleEvent.incoming(
@@ -1223,6 +1224,184 @@ final class CallLifecycleTests: XCTestCase {
         XCTAssertEqual(cache.pendingEvents(), [answer])
         cache.acknowledge(answer.id)
         XCTAssertTrue(cache.pendingEvents().isEmpty)
+    }
+
+    func testIncomingCallPublicationGateRejectsTerminalCompletionAndLateDuplicate() {
+        let callUUID = UUID(uuidString: "550e8400-e29b-41d4-a716-446655440020")!
+        var gate = IncomingCallPublicationGate()
+
+        XCTAssertEqual(
+            gate.begin(callUUID: callUUID, generation: 7, alreadyTracked: false),
+            .authorized
+        )
+        XCTAssertTrue(gate.isPending(callUUID))
+
+        // A sibling answer or local End wins while CallKit's report completion is suspended.
+        gate.retire(callUUID: callUUID, as: .terminal(.answeredElsewhere))
+        XCTAssertFalse(gate.isPending(callUUID))
+        XCTAssertFalse(gate.complete(callUUID: callUUID, generation: 7))
+        XCTAssertEqual(gate.retirement(for: callUUID), .terminal(.answeredElsewhere))
+
+        // A repeated VoIP push for the same finished call may be reported to CallKit for platform
+        // compliance, but it can never recreate app-owned quarantine or ringing state.
+        XCTAssertEqual(
+            gate.begin(callUUID: callUUID, generation: 7, alreadyTracked: false),
+            .terminalTombstoned(.answeredElsewhere)
+        )
+    }
+
+    func testIncomingCallPublicationGateRejectsPureNaturalExpiryAsUnanswered() {
+        let callUUID = UUID(uuidString: "550e8400-e29b-41d4-a716-446655440024")!
+        var gate = IncomingCallPublicationGate()
+
+        XCTAssertEqual(
+            gate.begin(
+                callUUID: callUUID,
+                generation: 3,
+                alreadyTracked: false,
+                leaseExpired: true
+            ),
+            .naturallyExpired
+        )
+        XCTAssertFalse(gate.isPending(callUUID))
+        XCTAssertFalse(gate.complete(callUUID: callUUID, generation: 3))
+        XCTAssertEqual(gate.retirement(for: callUUID), .naturallyExpired)
+        XCTAssertEqual(
+            gate.begin(callUUID: callUUID, generation: 3, alreadyTracked: false),
+            .naturallyExpired,
+            "A late duplicate must preserve the missed-call outcome"
+        )
+    }
+
+    func testIncomingCallPublicationGatePreservesFirstTerminalAndExpiryOrdering() {
+        let terminalFirst = UUID(uuidString: "550e8400-e29b-41d4-a716-446655440025")!
+        let expiryFirst = UUID(uuidString: "550e8400-e29b-41d4-a716-446655440026")!
+        let trackedDuplicate = UUID(uuidString: "550e8400-e29b-41d4-a716-446655440027")!
+        var gate = IncomingCallPublicationGate()
+
+        XCTAssertEqual(
+            gate.begin(callUUID: terminalFirst, generation: 4, alreadyTracked: false),
+            .authorized
+        )
+        gate.retire(callUUID: terminalFirst, as: .terminal(.answeredElsewhere))
+        gate.retire(callUUID: terminalFirst, as: .naturallyExpired)
+        XCTAssertEqual(
+            gate.begin(
+                callUUID: terminalFirst,
+                generation: 4,
+                alreadyTracked: false,
+                leaseExpired: true
+            ),
+            .terminalTombstoned(.answeredElsewhere),
+            "Natural expiry must not overwrite an earlier sibling-answer tombstone"
+        )
+
+        XCTAssertEqual(
+            gate.begin(
+                callUUID: expiryFirst,
+                generation: 4,
+                alreadyTracked: false,
+                leaseExpired: true
+            ),
+            .naturallyExpired
+        )
+        gate.retire(callUUID: expiryFirst, as: .terminal(.failed))
+        XCTAssertEqual(
+            gate.retirement(for: expiryFirst),
+            .naturallyExpired,
+            "Delayed generic cleanup must not turn a missed call into a failure"
+        )
+
+        XCTAssertEqual(
+            gate.begin(
+                callUUID: trackedDuplicate,
+                generation: 4,
+                alreadyTracked: true,
+                leaseExpired: true
+            ),
+            .duplicate,
+            "A stale duplicate payload must not expire an already-owned CallKit call"
+        )
+        XCTAssertNil(gate.retirement(for: trackedDuplicate))
+    }
+
+    func testIncomingCallPublicationGateDeduplicatesAndBoundsTerminalTombstones() {
+        let first = UUID(uuidString: "550e8400-e29b-41d4-a716-446655440021")!
+        let second = UUID(uuidString: "550e8400-e29b-41d4-a716-446655440022")!
+        let third = UUID(uuidString: "550e8400-e29b-41d4-a716-446655440023")!
+        var gate = IncomingCallPublicationGate(retiredCapacity: 2)
+
+        XCTAssertEqual(
+            gate.begin(callUUID: first, generation: 2, alreadyTracked: false),
+            .authorized
+        )
+        XCTAssertEqual(gate.begin(callUUID: first, generation: 2, alreadyTracked: false), .duplicate)
+        XCTAssertTrue(gate.complete(callUUID: first, generation: 2))
+        XCTAssertFalse(gate.complete(callUUID: first, generation: 2))
+
+        gate.retire(callUUID: first)
+        gate.retire(callUUID: second)
+        gate.retire(callUUID: third)
+        XCTAssertFalse(gate.isRetired(first), "The bounded fence must evict its oldest UUID")
+        XCTAssertNil(gate.retirement(for: first))
+        XCTAssertTrue(gate.isRetired(second))
+        XCTAssertTrue(gate.isRetired(third))
+    }
+
+    func testAnsweredElsewherePolicyPreservesSameDeviceAnswerEcho() {
+        XCTAssertEqual(
+            CallAnsweredElsewherePolicy.disposition(
+                hasPendingPublication: false,
+                hasQuarantinedIncomingCall: false,
+                hasMatchingRevealedCall: true,
+                isLocallyAnswered: true,
+                isOutgoing: false
+            ),
+            .ignore,
+            "The answering device must keep its own CallKit call when the backend echoes Answer"
+        )
+        XCTAssertEqual(
+            CallAnsweredElsewherePolicy.disposition(
+                hasPendingPublication: false,
+                hasQuarantinedIncomingCall: false,
+                hasMatchingRevealedCall: true,
+                isLocallyAnswered: false,
+                isOutgoing: true
+            ),
+            .ignore
+        )
+        XCTAssertEqual(
+            CallAnsweredElsewherePolicy.disposition(
+                hasPendingPublication: true,
+                hasQuarantinedIncomingCall: false,
+                hasMatchingRevealedCall: false,
+                isLocallyAnswered: false,
+                isOutgoing: false
+            ),
+            .retireOfferedCall,
+            "A sibling Answer must revoke an in-flight CallKit publication"
+        )
+        XCTAssertEqual(
+            CallAnsweredElsewherePolicy.disposition(
+                hasPendingPublication: false,
+                hasQuarantinedIncomingCall: true,
+                hasMatchingRevealedCall: false,
+                isLocallyAnswered: false,
+                isOutgoing: false
+            ),
+            .retireOfferedCall
+        )
+        XCTAssertEqual(
+            CallAnsweredElsewherePolicy.disposition(
+                hasPendingPublication: false,
+                hasQuarantinedIncomingCall: false,
+                hasMatchingRevealedCall: false,
+                isLocallyAnswered: false,
+                isOutgoing: false
+            ),
+            .rememberTerminal,
+            "A reordered sibling Answer must tombstone the call before its ring push arrives"
+        )
     }
 
     func testCallKitAnswerRoutesDifferentAuthenticatedCallToMergeOnlyDuringLiveMedia() {
@@ -1369,6 +1548,7 @@ final class CallLifecycleTests: XCTestCase {
                 "initiator_user_id": "550e8400-e29b-41d4-a716-446655440001",
                 "call_type": "video",
                 "ring_expires_at": "2026-08-18T12:00:45Z",
+                "server_time": "2026-08-18T12:00:10Z",
             ])
         )
 
@@ -1378,46 +1558,90 @@ final class CallLifecycleTests: XCTestCase {
         XCTAssertEqual(push.callerUserId, "550e8400-e29b-41d4-a716-446655440001")
         XCTAssertTrue(push.video)
         XCTAssertEqual(push.ringExpiresAt, "2026-08-18T12:00:45Z")
+        XCTAssertEqual(push.serverTime, "2026-08-18T12:00:10Z")
 
         XCTAssertNil(IncomingCallPush(payload: ["type": "message.created", "call_id": callId]))
         XCTAssertNil(IncomingCallPush(payload: ["type": "call.ringing", "call_id": "not-a-uuid"]))
     }
 
     func testIncomingPushExpiryReportsKnownStaleDeadlinesAsUnanswered() throws {
-        let now = Date(timeIntervalSince1970: 1_787_011_200) // 2026-08-18T00:00:00Z
         let callId = "550e8400-e29b-41d4-a716-446655440000"
 
-        func push(expiry: String?) throws -> IncomingCallPush {
+        func push(expiry: String?, serverTime: String? = "2026-08-18T00:00:00Z") throws -> IncomingCallPush {
             var payload: [AnyHashable: Any] = [
                 "type": "call.ringing",
                 "call_id": callId,
             ]
             payload["ring_expires_at"] = expiry
+            payload["server_time"] = serverTime
             return try XCTUnwrap(IncomingCallPush(payload: payload))
         }
 
-        XCTAssertTrue(try push(expiry: "2026-08-17T23:59:59Z").isExpired(at: now))
-        XCTAssertFalse(try push(expiry: "2026-08-18T00:00:01.250Z").isExpired(at: now))
+        XCTAssertTrue(
+            try push(expiry: "2026-08-17T23:59:59Z").isExpired(monotonicNow: 100)
+        )
+        XCTAssertFalse(
+            try push(expiry: "2026-08-18T00:00:01.250Z").isExpired(monotonicNow: 100)
+        )
         XCTAssertEqual(
             try push(expiry: "2026-08-18T00:00:01.250Z").ringExpiryDate,
             Date(timeIntervalSince1970: 1_787_011_201.25)
         )
-        XCTAssertFalse(try push(expiry: "not-a-date").isExpired(at: now))
-        XCTAssertFalse(try push(expiry: nil).isExpired(at: now))
+        XCTAssertFalse(try push(expiry: "not-a-date").isExpired(monotonicNow: 100))
+        XCTAssertFalse(try push(expiry: nil).isExpired(monotonicNow: 100))
         XCTAssertEqual(
-            try push(expiry: "2026-08-17T23:59:59Z").callKitDisposition(at: now),
+            try push(expiry: "2026-08-17T23:59:59Z")
+                .callKitDisposition(monotonicNow: 100),
             .reportAsUnanswered
         )
         XCTAssertEqual(
-            try push(expiry: "not-a-date").callKitDisposition(at: now),
+            try push(expiry: "not-a-date").callKitDisposition(monotonicNow: 100),
             .ringing
+        )
+        XCTAssertEqual(
+            IncomingCallQuarantinePolicy.deadline(
+                ringExpiresAt: nil,
+                serverTime: nil,
+                monotonicNow: 100
+            ).monotonicTime,
+            100 + IncomingCallQuarantinePolicy.defaultLifetime
+        )
+        XCTAssertEqual(
+            IncomingCallQuarantinePolicy.deadline(
+                ringExpiresAt: "2026-08-18T00:05:00Z",
+                serverTime: "2026-08-18T00:00:00Z",
+                monotonicNow: 100
+            ).monotonicTime,
+            100 + CallRingDeadline.maximumLifetime
         )
     }
 
+    func testCallRingDeadlineUsesOnlyServerDeltaDespiteExtremeDeviceClockSkew() throws {
+        func deadline(deviceWallClock _: Date) throws -> CallRingDeadline {
+            try XCTUnwrap(CallRingDeadline(
+                ringExpiresAt: "2026-08-18T12:00:45Z",
+                serverTime: "2026-08-18T12:00:10Z",
+                monotonicNow: 500,
+                requirePositiveLifetime: true
+            ))
+        }
+
+        let farPast = try deadline(deviceWallClock: Date(timeIntervalSince1970: -2_208_988_800))
+        let farFuture = try deadline(deviceWallClock: Date(timeIntervalSince1970: 7_258_118_400))
+        XCTAssertEqual(farPast, farFuture)
+        XCTAssertEqual(farPast.monotonicTime, 535)
+        XCTAssertEqual(farPast.remaining(at: 534.5), 0.5)
+        XCTAssertTrue(farPast.isExpired(at: 535))
+
+        XCTAssertNil(CallRingDeadline(
+            ringExpiresAt: "2026-08-18T12:00:09Z",
+            serverTime: "2026-08-18T12:00:10Z",
+            monotonicNow: 500,
+            requirePositiveLifetime: true
+        ))
+    }
+
     func testAuthenticatedIncomingCallRequiresExactAccountScopedInvitationContract() throws {
-        let now = try XCTUnwrap(
-            CallLifecyclePolicy.serverTimestamp("2026-08-18T12:00:10Z")
-        )
         let callID = "550e8400-e29b-41d4-a716-446655440000"
         let callerID = "550e8400-e29b-41d4-a716-446655440001"
         let currentUserID = "550e8400-e29b-41d4-a716-446655440002"
@@ -1428,6 +1652,7 @@ final class CallLifecycleTests: XCTestCase {
             "initiator_user_id": callerID,
             "call_type": "voice",
             "ring_expires_at": "2026-08-18T12:00:45Z",
+            "server_time": "2026-08-18T12:00:10Z",
         ]))
         let response = callDTO(
             id: callID,
@@ -1446,7 +1671,7 @@ final class CallLifecycleTests: XCTestCase {
                 response: response,
                 matching: push,
                 currentUserID: currentUserID,
-                now: now
+                monotonicNow: 100
             )
         )
 
@@ -1473,7 +1698,7 @@ final class CallLifecycleTests: XCTestCase {
                 response: activeGroupInvite,
                 matching: push,
                 currentUserID: currentUserID,
-                now: now
+                monotonicNow: 100
             )?.record.state,
             .ringing
         )
@@ -1495,7 +1720,7 @@ final class CallLifecycleTests: XCTestCase {
                 incoming: incoming,
                 activeCallID: activeCallID,
                 mediaState: mediaState,
-                now: now
+                monotonicNow: now.timeIntervalSince1970
             ) else {
                 XCTFail("Expected call waiting while media is \(mediaState)")
                 continue
@@ -1516,7 +1741,7 @@ final class CallLifecycleTests: XCTestCase {
                     incoming: incoming,
                     activeCallID: activeCallID,
                     mediaState: mediaState,
-                    now: now
+                    monotonicNow: now.timeIntervalSince1970
                 ),
                 .primary
             )
@@ -1526,7 +1751,7 @@ final class CallLifecycleTests: XCTestCase {
                 incoming: incoming,
                 activeCallID: waitingCallID.uppercased(),
                 mediaState: .connected,
-                now: now
+                monotonicNow: now.timeIntervalSince1970
             ),
             .currentCall
         )
@@ -1535,7 +1760,7 @@ final class CallLifecycleTests: XCTestCase {
                 incoming: incoming,
                 activeCallID: nil,
                 mediaState: .connected,
-                now: now
+                monotonicNow: now.timeIntervalSince1970
             ),
             .decline
         )
@@ -1544,7 +1769,7 @@ final class CallLifecycleTests: XCTestCase {
                 incoming: incoming,
                 activeCallID: "not-a-call-id",
                 mediaState: .reconnecting,
-                now: now
+                monotonicNow: now.timeIntervalSince1970
             ),
             .decline
         )
@@ -1568,7 +1793,7 @@ final class CallLifecycleTests: XCTestCase {
                 incoming: missingInitiator,
                 activeCallID: activeCallID,
                 mediaState: .connected,
-                now: now
+                monotonicNow: now.timeIntervalSince1970
             ),
             .decline
         )
@@ -1584,7 +1809,7 @@ final class CallLifecycleTests: XCTestCase {
                 incoming: contradictoryInitiator,
                 activeCallID: activeCallID,
                 mediaState: .reconnecting,
-                now: now
+                monotonicNow: now.timeIntervalSince1970
             ),
             .decline
         )
@@ -1599,7 +1824,7 @@ final class CallLifecycleTests: XCTestCase {
                 incoming: expired,
                 activeCallID: activeCallID,
                 mediaState: .connected,
-                now: now
+                monotonicNow: now.timeIntervalSince1970
             ),
             .decline
         )
@@ -1661,7 +1886,7 @@ final class CallLifecycleTests: XCTestCase {
             mediaState: .connected,
             calls: [active],
             currentUserID: currentUserID,
-            now: now
+            monotonicNow: now.timeIntervalSince1970
         ) else {
             return XCTFail("Expected an eligible merge")
         }
@@ -1677,7 +1902,7 @@ final class CallLifecycleTests: XCTestCase {
                 mediaState: .connected,
                 calls: [active],
                 currentUserID: currentUserID,
-                now: now
+                monotonicNow: now.timeIntervalSince1970
             ),
             .denied(.mergeInProgress)
         )
@@ -1694,7 +1919,7 @@ final class CallLifecycleTests: XCTestCase {
             mediaState: .reconnecting,
             calls: [active],
             currentUserID: currentUserID,
-            now: now
+            monotonicNow: now.timeIntervalSince1970
         ) else {
             return XCTFail("Expected the failed merge to remain retryable")
         }
@@ -1733,7 +1958,7 @@ final class CallLifecycleTests: XCTestCase {
                 calls: [call],
                 currentUserID: currentUserID,
                 participantLimit: participantLimit,
-                now: date ?? now
+                monotonicNow: (date ?? now).timeIntervalSince1970
             )
         }
 
@@ -1819,7 +2044,7 @@ final class CallLifecycleTests: XCTestCase {
             mediaState: .connected,
             calls: [active],
             currentUserID: currentUserID,
-            now: now
+            monotonicNow: now.timeIntervalSince1970
         ) else {
             return XCTFail("Expected merge attempt")
         }
@@ -1829,8 +2054,8 @@ final class CallLifecycleTests: XCTestCase {
         XCTAssertEqual(state.completeMerge(attempt, result: .success), .stale)
 
         XCTAssertEqual(state.retain(waiting), .retained)
-        XCTAssertNil(state.expire(at: now.addingTimeInterval(9)))
-        XCTAssertEqual(state.expire(at: waiting.ringExpiryDate), waiting)
+        XCTAssertNil(state.expire(monotonicNow: now.timeIntervalSince1970 + 9))
+        XCTAssertEqual(state.expire(monotonicNow: waiting.ringDeadline.monotonicTime), waiting)
         XCTAssertNil(state.waitingCall)
 
         XCTAssertEqual(state.retain(waiting), .retained)
@@ -1843,9 +2068,6 @@ final class CallLifecycleTests: XCTestCase {
     }
 
     func testAuthenticatedIncomingCallRejectsWrongOwnerIdentityAndStaleContracts() throws {
-        let now = try XCTUnwrap(
-            CallLifecyclePolicy.serverTimestamp("2026-08-18T12:00:10Z")
-        )
         let callID = "550e8400-e29b-41d4-a716-446655440000"
         let callerID = "550e8400-e29b-41d4-a716-446655440001"
         let currentUserID = "550e8400-e29b-41d4-a716-446655440002"
@@ -1855,6 +2077,7 @@ final class CallLifecycleTests: XCTestCase {
             "call_id": callID,
             "initiator_user_id": callerID,
             "ring_expires_at": "2026-08-18T12:00:45Z",
+            "server_time": "2026-08-18T12:00:10Z",
         ]))
         let validParticipants = [callerID]
         let tooManyRemoteParticipants = [callerID] + (1 ... 20).map {
@@ -1931,6 +2154,22 @@ final class CallLifecycleTests: XCTestCase {
                 state: "ringing",
                 ringExpiresAt: nil
             ),
+            callDTO(
+                id: callID,
+                participantUserIds: validParticipants,
+                direction: "incoming",
+                state: "ringing",
+                ringExpiresAt: "2026-08-18T12:00:45Z",
+                serverTime: nil
+            ),
+            callDTO(
+                id: callID,
+                participantUserIds: validParticipants,
+                direction: "incoming",
+                state: "ringing",
+                ringExpiresAt: "2026-08-18T12:00:45Z",
+                serverTime: "not-a-time"
+            ),
         ]
 
         for response in rejectedResponses {
@@ -1939,7 +2178,7 @@ final class CallLifecycleTests: XCTestCase {
                     response: response,
                     matching: push,
                     currentUserID: currentUserID,
-                    now: now
+                    monotonicNow: 100
                 )
             )
         }
@@ -2469,31 +2708,38 @@ final class CallLifecycleTests: XCTestCase {
     }
 
     func testIncomingCallQuarantineBoundsUntrustedPushLifetime() {
-        let receivedAt = Date(timeIntervalSince1970: 1_000)
+        let monotonicNow: TimeInterval = 1_000
         XCTAssertEqual(
-            IncomingCallQuarantinePolicy.expiry(pushExpiry: nil, receivedAt: receivedAt),
-            receivedAt.addingTimeInterval(IncomingCallQuarantinePolicy.defaultLifetime)
+            IncomingCallQuarantinePolicy.deadline(
+                ringExpiresAt: nil,
+                serverTime: nil,
+                monotonicNow: monotonicNow
+            ).monotonicTime,
+            monotonicNow + IncomingCallQuarantinePolicy.defaultLifetime
         )
         XCTAssertEqual(
-            IncomingCallQuarantinePolicy.expiry(
-                pushExpiry: receivedAt.addingTimeInterval(30),
-                receivedAt: receivedAt
-            ),
-            receivedAt.addingTimeInterval(30)
+            IncomingCallQuarantinePolicy.deadline(
+                ringExpiresAt: "2026-08-18T12:00:30Z",
+                serverTime: "2026-08-18T12:00:00Z",
+                monotonicNow: monotonicNow
+            ).monotonicTime,
+            monotonicNow + 30
         )
         XCTAssertEqual(
-            IncomingCallQuarantinePolicy.expiry(
-                pushExpiry: receivedAt.addingTimeInterval(24 * 60 * 60),
-                receivedAt: receivedAt
-            ),
-            receivedAt.addingTimeInterval(IncomingCallQuarantinePolicy.maximumLifetime)
+            IncomingCallQuarantinePolicy.deadline(
+                ringExpiresAt: "2026-08-19T12:00:00Z",
+                serverTime: "2026-08-18T12:00:00Z",
+                monotonicNow: monotonicNow
+            ).monotonicTime,
+            monotonicNow + IncomingCallQuarantinePolicy.maximumLifetime
         )
         XCTAssertEqual(
-            IncomingCallQuarantinePolicy.expiry(
-                pushExpiry: receivedAt.addingTimeInterval(-1),
-                receivedAt: receivedAt
-            ),
-            receivedAt.addingTimeInterval(-1)
+            IncomingCallQuarantinePolicy.deadline(
+                ringExpiresAt: "2026-08-18T11:59:59Z",
+                serverTime: "2026-08-18T12:00:00Z",
+                monotonicNow: monotonicNow
+            ).monotonicTime,
+            monotonicNow
         )
     }
 
@@ -2508,6 +2754,64 @@ final class CallLifecycleTests: XCTestCase {
         XCTAssertTrue(CallLifecyclePolicy.mayCreateCall(signedIn: true, online: false, capabilities: nil))
         XCTAssertFalse(CallLifecyclePolicy.mayCreateCall(signedIn: true, online: false, capabilities: disabled))
         XCTAssertFalse(CallLifecyclePolicy.mayCreateCall(signedIn: false, online: false, capabilities: enabled))
+    }
+
+    func testCallReadinessPickerRemainsReachableWhileCapabilitiesRecover() {
+        func permits(
+            signedIn: Bool = true,
+            signingOut: Bool = false,
+            accountSetupComplete: Bool = true,
+            communicationAccessGranted: Bool = true,
+            communicationSurfacesConcealed: Bool = false,
+            isDemoActive: Bool = false,
+            callsExplicitlyWithdrawn: Bool = false
+        ) -> Bool {
+            CallReadinessSurfacePolicy.permitsPicker(
+                signedIn: signedIn,
+                signingOut: signingOut,
+                accountSetupComplete: accountSetupComplete,
+                communicationAccessGranted: communicationAccessGranted,
+                communicationSurfacesConcealed: communicationSurfacesConcealed,
+                isDemoActive: isDemoActive,
+                callsExplicitlyWithdrawn: callsExplicitlyWithdrawn
+            )
+        }
+
+        XCTAssertTrue(permits(), "Missing capabilities must leave the recovery picker reachable")
+        XCTAssertFalse(permits(isDemoActive: true))
+        XCTAssertFalse(permits(callsExplicitlyWithdrawn: true))
+        XCTAssertFalse(permits(signedIn: false))
+        XCTAssertFalse(permits(signingOut: true))
+        XCTAssertFalse(permits(accountSetupComplete: false))
+        XCTAssertFalse(permits(communicationAccessGranted: false))
+        XCTAssertFalse(permits(communicationSurfacesConcealed: true))
+    }
+
+    func testCallReadinessRecipientActionAllowsUnknownPrivacyButNotKnownBlock() {
+        XCTAssertTrue(
+            CallReadinessSurfacePolicy.permitsRecipientAction(
+                pickerPermitted: true,
+                privacyDecision: .unavailable
+            )
+        )
+        XCTAssertTrue(
+            CallReadinessSurfacePolicy.permitsRecipientAction(
+                pickerPermitted: true,
+                privacyDecision: .allowed
+            )
+        )
+        XCTAssertFalse(
+            CallReadinessSurfacePolicy.permitsRecipientAction(
+                pickerPermitted: true,
+                privacyDecision: .blocked
+            )
+        )
+        XCTAssertFalse(
+            CallReadinessSurfacePolicy.permitsRecipientAction(
+                pickerPermitted: false,
+                privacyDecision: .unavailable
+            )
+        )
     }
 
     func testServerStatesAndHistoryMergeKeepDurableLocalRecords() {
@@ -3896,7 +4200,8 @@ final class CallLifecycleTests: XCTestCase {
             "video": false,
             "state": "ringing",
             "started_at": "2026-08-18T12:00:00Z",
-            "ring_expires_at": "2026-08-18T12:00:45Z"
+            "ring_expires_at": "2026-08-18T12:00:45Z",
+            "server_time": "2026-08-18T12:00:10Z"
           },
           "rtc": {
             "provider": "livekit",
@@ -3919,6 +4224,7 @@ final class CallLifecycleTests: XCTestCase {
         let presentation = ActiveCallPresentation(handoff)
 
         XCTAssertEqual(session.call.ringExpiresAt, "2026-08-18T12:00:45Z")
+        XCTAssertEqual(session.call.serverTime, "2026-08-18T12:00:10Z")
         XCTAssertTrue(session.call.isVideoCall)
         XCTAssertEqual(session.rtc.iceServers?.first?.credentialType, "password")
         XCTAssertEqual(handoff.callId, session.call.id)
@@ -4909,6 +5215,9 @@ final class CallLifecycleTests: XCTestCase {
             ),
             callUUID: UUID(uuidString: id)!,
             ringExpiryDate: ringExpiryDate,
+            ringDeadline: CallRingDeadline(
+                monotonicTime: ringExpiryDate.timeIntervalSince1970
+            ),
             initiatorUserID: initiatorUserID
         )
     }
@@ -4928,7 +5237,7 @@ final class CallLifecycleTests: XCTestCase {
             incoming: incoming,
             activeCallID: "49000000-0000-4000-8000-000000000001",
             mediaState: .connected,
-            now: routeAt
+            monotonicNow: routeAt.timeIntervalSince1970
         )
         let waiting: AuthenticatedWaitingCall?
         if case .waiting(let value) = route {
@@ -4949,7 +5258,8 @@ final class CallLifecycleTests: XCTestCase {
         video: Bool = false,
         state: String = "ended",
         startedAt: String = "2026-08-18T12:00:00Z",
-        ringExpiresAt: String? = nil
+        ringExpiresAt: String? = nil,
+        serverTime: String? = "2026-08-18T12:00:10Z"
     ) -> CallDTO {
         CallDTO(
             id: id,
@@ -4965,7 +5275,8 @@ final class CallLifecycleTests: XCTestCase {
             endedAt: ["ringing", "active"].contains(state.lowercased())
                 ? nil
                 : "2026-08-18T12:01:00Z",
-            ringExpiresAt: ringExpiresAt
+            ringExpiresAt: ringExpiresAt,
+            serverTime: serverTime
         )
     }
 

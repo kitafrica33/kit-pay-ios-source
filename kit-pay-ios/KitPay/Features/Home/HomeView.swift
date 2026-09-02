@@ -500,7 +500,7 @@ struct HomeView: View {
     private func openStarterStep(_ step: HomeStarterStep) {
         switch HomeStarterStepRoutePolicy.presentation(
             for: step,
-            secureMessagingAvailable: model.secureMessagingAvailable
+            secureMessagingLocalQueueAvailable: model.secureMessagingLocalQueueAvailable
         ) {
         case .fullScreen:
             cover = .identityVerification

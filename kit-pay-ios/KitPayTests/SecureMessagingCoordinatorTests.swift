@@ -1166,6 +1166,52 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
         XCTAssertNil(snapshot.secureMessaging?.syncCursor)
     }
 
+    func testEncryptedMessageFailureIsDurablyQuarantinedBeforeCursorAdvances() async throws {
+        let fixture = try await makeSyncConversationLoadFixture(
+            event: encryptedMessageCreatedSyncEventForQuarantine(),
+            conversationBehavior: .temporaryUnavailable
+        )
+
+        for expectedAttempt in 1...SecureMessagingSyncQuarantinePolicy.attemptsBeforeCursorRelease {
+            do {
+                _ = try await fixture.coordinator.sync(forUserID: fixture.userID)
+                XCTFail("the bounded ordinary-cursor attempt must surface its transport failure")
+            } catch let error as APIErrorPayload {
+                XCTAssertEqual(error.httpStatus, 503)
+            }
+            let attempted = await fixture.store.snapshot()
+            XCTAssertNil(attempted.secureMessaging?.syncCursor)
+            let retained = try XCTUnwrap(
+                attempted.secureMessaging?.quarantinedSyncEvents.first
+            )
+            XCTAssertEqual(retained.eventID, "106")
+            XCTAssertEqual(retained.attemptCount, expectedAttempt)
+            XCTAssertEqual(retained.failureCategory, .conversation)
+            XCTAssertEqual(retained.event.data?.envelope?.ciphertext, "AA==")
+        }
+
+        let reopened = SecureLocalStore(
+            stateURL: temporaryDirectory.appendingPathComponent("state.secure"),
+            keyData: Data(repeating: 0x91, count: 32)
+        )
+        let restored = await reopened.snapshot()
+        XCTAssertEqual(restored.secureMessaging?.quarantinedSyncEvents.count, 1)
+        XCTAssertEqual(
+            restored.secureMessaging?.quarantinedSyncEvents.first?.event.data?
+                .envelope?.ciphertext,
+            "AA=="
+        )
+
+        let advanced = try await fixture.coordinator.sync(forUserID: fixture.userID)
+        XCTAssertEqual(advanced.pages, 1)
+        XCTAssertEqual(advanced.receivedMessages, 0)
+        let final = await fixture.store.snapshot()
+        XCTAssertEqual(final.secureMessaging?.syncCursor, fixture.nextCursor)
+        XCTAssertEqual(final.secureMessaging?.quarantinedSyncEvents.count, 1)
+        let conversationRequests = await fixture.transport.conversationRequestCount()
+        XCTAssertEqual(conversationRequests, 3)
+    }
+
     func testSyncUnstructuredConversation404PropagatesWithoutAdvancingCursor() async throws {
         let fixture = try await makeSyncConversationLoadFixture(
             event: conversationUpdatedSyncEvent(),
@@ -3220,6 +3266,110 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
         )
     }
 
+    func testProtectedFileSingleMediaStableIDReplaysExactlyAndRejectsCollision() async throws {
+        let localUserID = "10000000-0000-4000-8000-000000000073"
+        let recipientUserID = "10000000-0000-4000-8000-000000000074"
+        let conversationID = "30000000-0000-4000-8000-000000000073"
+        let clientMessageID = UUID(uuidString: "60000000-0000-4000-8000-000000000073")!
+        let mediaID = UUID(uuidString: "70000000-0000-4000-8000-000000000073")!
+        let collisionMediaID = UUID(uuidString: "70000000-0000-4000-8000-000000000074")!
+        let pdf = Data("%PDF-1.7\nprotected original".utf8)
+        let collisionPDF = Data("%PDF-1.7\ndifferent original".utf8)
+        let originalURL = temporaryDirectory.appendingPathComponent("original.pdf")
+        let collisionURL = temporaryDirectory.appendingPathComponent("collision.pdf")
+        try pdf.write(to: originalURL, options: .atomic)
+        try collisionPDF.write(to: collisionURL, options: .atomic)
+
+        let store = try await makeStore(userID: localUserID)
+        var crypto = SecureMessagingPersistentState.empty
+        crypto.enrollment = raceEnrollment(userID: localUserID)
+        try await store.update { state in
+            state.communicationOwnerUserID = localUserID
+            state.secureMessaging = crypto
+            state.conversations = [Conversation(
+                id: conversationID,
+                title: "Peer",
+                participantUserIds: [localUserID, recipientUserID],
+                unreadCount: 0,
+                updatedAt: Date(timeIntervalSince1970: 1_755_604_800)
+            )]
+        }
+        let blobs = InMemoryMediaBlobStore(
+            seed: [:],
+            protectedFiles: [
+                mediaID.uuidString.lowercased(): originalURL,
+                collisionMediaID.uuidString.lowercased(): collisionURL,
+            ]
+        )
+        let coordinator = SecureMessagingExchangeCoordinator(
+            transport: OfflineExchangeTransport(),
+            store: store,
+            engine: SecureMessagingCryptoEngine(),
+            provisioningPreKeyCount: 1,
+            mediaBlobs: blobs.access(forUserID: localUserID)
+        )
+
+        let queued = try await coordinator.queueDeferredImage(
+            forUserID: localUserID,
+            conversationID: conversationID,
+            expectedRecipientUserID: recipientUserID,
+            title: "Peer",
+            mediaData: nil,
+            mediaType: "application/pdf",
+            caption: "Statement",
+            localStorageKey: mediaID.uuidString.lowercased(),
+            localMediaID: mediaID,
+            plaintextByteSize: pdf.count,
+            localStorageKind: .protectedFile,
+            clientMessageID: clientMessageID
+        )
+        let replay = try await coordinator.queueDeferredImage(
+            forUserID: localUserID,
+            conversationID: conversationID,
+            expectedRecipientUserID: recipientUserID,
+            title: "Peer",
+            mediaData: nil,
+            mediaType: "application/pdf",
+            caption: "Statement",
+            localStorageKey: mediaID.uuidString.lowercased(),
+            localMediaID: mediaID,
+            plaintextByteSize: pdf.count,
+            localStorageKind: .protectedFile,
+            clientMessageID: clientMessageID
+        )
+
+        XCTAssertEqual(replay.clientMessageID, queued.clientMessageID)
+        var snapshot = await store.snapshot()
+        XCTAssertEqual(snapshot.messages.count, 1)
+        XCTAssertEqual(snapshot.outbox.count, 1)
+        XCTAssertEqual(snapshot.messages.first?.localMediaRecords?.first?.id, mediaID.uuidString.lowercased())
+
+        do {
+            _ = try await coordinator.queueDeferredImage(
+                forUserID: localUserID,
+                conversationID: conversationID,
+                expectedRecipientUserID: recipientUserID,
+                title: "Peer",
+                mediaData: nil,
+                mediaType: "application/pdf",
+                caption: "Statement",
+                localStorageKey: collisionMediaID.uuidString.lowercased(),
+                localMediaID: collisionMediaID,
+                plaintextByteSize: collisionPDF.count,
+                localStorageKind: .protectedFile,
+                clientMessageID: clientMessageID
+            )
+            XCTFail("a stable message id must not alias a different protected file")
+        } catch SecureMessagingExchangeError.invalidConversation {
+            // Expected: the existing message identity is bound to the original protected file.
+        }
+
+        snapshot = await store.snapshot()
+        XCTAssertEqual(snapshot.messages.count, 1)
+        XCTAssertEqual(snapshot.outbox.count, 1)
+        XCTAssertEqual(snapshot.messages.first?.localMediaRecords?.first?.id, mediaID.uuidString.lowercased())
+    }
+
     func testSingleMediaQueueRejectsAnotherDraftOutputButConsumesItsExactDraft() async throws {
         let localUserID = "10000000-0000-4000-8000-000000000071"
         let recipientUserID = "10000000-0000-4000-8000-000000000072"
@@ -4256,6 +4406,134 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
                 nextCursor: nil
             ),
         ])
+    }
+
+    func testRemoteIdentityLifecycleResumesOnlyAffectedPendingSend() async throws {
+        let userID = "10000000-0000-4000-8000-000000000001"
+        let peerUserID = "10000000-0000-4000-8000-000000000002"
+        let otherUserID = "10000000-0000-4000-8000-000000000003"
+        let conversationID = "30000000-0000-4000-8000-000000000042"
+        let peerDeviceID = "20000000-0000-4000-8000-000000000042"
+        let nextCursor = "cursor-after-identity-change"
+        let store = try await makeStore(userID: userID)
+        let engine = SecureMessagingCryptoEngine()
+        let provisioned = try await engine.provision(from: .empty, preKeyCount: 1)
+        let status = enrolledStatus(bundle: provisioned.bundle)
+        let messageID = UUID(uuidString: "40000000-0000-4000-8000-000000000042")!
+        let otherMessageID = UUID(uuidString: "40000000-0000-4000-8000-000000000043")!
+        let createdAt = Date(timeIntervalSince1970: 1_755_604_800)
+        var affected = OfflineCommand(
+            id: UUID(uuidString: "50000000-0000-4000-8000-000000000042")!,
+            kind: .secureMessage,
+            createdAt: createdAt,
+            nextAttemptAt: createdAt,
+            attemptCount: 0,
+            conversationId: conversationID,
+            messageId: messageID,
+            recipientUserIds: [peerUserID],
+            recipientName: "Peer",
+            video: nil,
+            expiresAt: nil
+        )
+        var unaffected = OfflineCommand(
+            id: UUID(uuidString: "50000000-0000-4000-8000-000000000043")!,
+            kind: .secureMessage,
+            createdAt: createdAt,
+            nextAttemptAt: createdAt,
+            attemptCount: 0,
+            conversationId: "30000000-0000-4000-8000-000000000043",
+            messageId: otherMessageID,
+            recipientUserIds: [otherUserID],
+            recipientName: "Other peer",
+            video: nil,
+            expiresAt: nil
+        )
+        affected.failureDisposition = .awaitingIdentityRefresh
+        affected.lastFailureReason = SecureMessagingCryptoError.identityChanged.localizedDescription
+        unaffected.failureDisposition = .awaitingIdentityRefresh
+        unaffected.lastFailureReason = SecureMessagingCryptoError.identityChanged.localizedDescription
+        try await store.update { state in
+            state.secureMessaging = provisioned.state
+            state.outbox = [affected, unaffected]
+            state.messages = [
+                LocalMessage(
+                    id: messageID,
+                    conversationId: conversationID,
+                    senderId: userID,
+                    body: "Pending for changed identity",
+                    createdAt: createdAt,
+                    sentAt: nil,
+                    state: .queued,
+                    failureReason: nil,
+                    isOutgoing: true
+                ),
+                LocalMessage(
+                    id: otherMessageID,
+                    conversationId: unaffected.conversationId!,
+                    senderId: userID,
+                    body: "Pending for another identity",
+                    createdAt: createdAt,
+                    sentAt: nil,
+                    state: .queued,
+                    failureReason: nil,
+                    isOutgoing: true
+                ),
+            ]
+        }
+        let responseObject: [String: Any] = [
+            "events": [[
+                "id": "42",
+                "type": "identity.changed",
+                "resource_type": "messaging_device",
+                "resource_id": peerDeviceID,
+                "occurred_at": "2026-08-20T13:00:00Z",
+                "data": [
+                    "device_id": peerDeviceID,
+                    "user_id": peerUserID,
+                    "enrollment_epoch": 2,
+                    "signal_device_id": 2,
+                    "registration_id": 1_002,
+                    "protocol_version": SecureMessagingWire.protocolVersion,
+                    "bundle_version": 2,
+                    "identity_key_sha256": String(repeating: "d", count: 64),
+                    "previous_identity_key_sha256": String(repeating: "c", count: 64),
+                    "roster_refresh_required": true,
+                    "transitioned_at": "2026-08-20T13:00:00Z",
+                    "transition_hash": String(repeating: "e", count: 64),
+                ],
+            ]],
+            "page": [
+                "next_cursor": nextCursor,
+                "has_more": false,
+                "limit": SecureMessagingWire.maximumSyncPage,
+            ],
+        ]
+        let response = try JSONDecoder().decode(
+            MessagingSyncDTO.self,
+            from: JSONSerialization.data(withJSONObject: responseObject)
+        )
+        let conversation = syncConversationDTO(type: SecureMessagingWire.directConversationType)
+        let transport = DetachedEchoTransport(
+            status: status,
+            conversation: conversation,
+            response: response
+        )
+        let coordinator = SecureMessagingExchangeCoordinator(
+            transport: transport,
+            store: store,
+            engine: engine,
+            provisioningPreKeyCount: 1
+        )
+
+        let beforeSync = Date()
+        _ = try await coordinator.sync(forUserID: userID)
+
+        let snapshot = await store.snapshot()
+        XCTAssertEqual(snapshot.secureMessaging?.syncCursor, nextCursor)
+        XCTAssertNil(snapshot.outbox[0].failureDisposition)
+        XCTAssertGreaterThanOrEqual(snapshot.outbox[0].nextAttemptAt, beforeSync)
+        XCTAssertEqual(snapshot.messages[0].state, .queued)
+        XCTAssertEqual(snapshot.outbox[1].failureDisposition, .awaitingIdentityRefresh)
     }
 
     func testHistoryCiphertextSurvivesCrashReplayUntilCursorAdvancesAtomically() throws {
@@ -5325,6 +5603,23 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
                 "conversation_id": syncConversationID,
             ],
             "occurred_at": "2026-08-24T12:00:01Z",
+        ]
+    }
+
+    private func encryptedMessageCreatedSyncEventForQuarantine() -> [String: Any] {
+        let messageID = "70000000-0000-4000-8000-000000000106"
+        return [
+            "id": "106",
+            "type": "message.created",
+            "conversation_id": syncConversationID,
+            "resource_type": "message",
+            "resource_id": messageID,
+            "data": [
+                "id": messageID,
+                "conversation_id": syncConversationID,
+                "envelope": ["ciphertext": "AA=="],
+            ],
+            "occurred_at": "2026-08-24T12:00:06Z",
         ]
     }
 
