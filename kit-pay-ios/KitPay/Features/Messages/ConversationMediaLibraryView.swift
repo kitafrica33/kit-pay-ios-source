@@ -157,35 +157,40 @@ private enum ConversationMediaThumbnailFactory {
         return UIImage(cgImage: cgImage)
     }
 
-    /// Poster frame from locally available plaintext only. The bytes are staged in a
-    /// file-protected temp file for the duration of the generation and removed immediately.
+    /// Poster frame from locally available plaintext only. The shared generator validates the
+    /// complete file and repairs a provider/container extension mismatch before AVFoundation.
     static func videoThumbnail(
+        forKey key: String,
         data: Data,
         mediaType: String,
+        expectedByteCount: Int,
         maxPixel: CGFloat
     ) async -> UIImage? {
-        guard let url = try? ChatMediaTempFiles.writeTemporaryFile(
+        await ChatVideoPosterGenerator.thumbnail(
+            forKey: key,
             data: data,
-            mediaType: mediaType
-        ) else { return nil }
-        defer { ChatMediaTempFiles.removeTemporaryFile(url) }
-        let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
-        generator.appliesPreferredTrackTransform = true
-        generator.maximumSize = CGSize(width: maxPixel, height: maxPixel)
-        guard let cgImage = try? await generator.image(
-            at: .init(seconds: 0.1, preferredTimescale: 600)
-        ).image else { return nil }
-        return UIImage(cgImage: cgImage)
+            declaredMediaType: mediaType,
+            expectedByteCount: expectedByteCount,
+            maximumSize: CGSize(width: maxPixel, height: maxPixel)
+        )
     }
 
-    static func videoThumbnail(fileURL: URL, maxPixel: CGFloat) async -> UIImage? {
-        let generator = AVAssetImageGenerator(asset: AVURLAsset(url: fileURL))
-        generator.appliesPreferredTrackTransform = true
-        generator.maximumSize = CGSize(width: maxPixel, height: maxPixel)
-        guard let cgImage = try? await generator.image(
-            at: .init(seconds: 0.1, preferredTimescale: 600)
-        ).image else { return nil }
-        return UIImage(cgImage: cgImage)
+    static func videoThumbnail(
+        forKey key: String,
+        fileURL: URL,
+        mediaType: String,
+        expectedByteCount: Int,
+        protectedOriginalLease: SecureMediaOriginalAccessLease?,
+        maxPixel: CGFloat
+    ) async -> UIImage? {
+        await ChatVideoPosterGenerator.thumbnail(
+            forKey: key,
+            fileURL: fileURL,
+            declaredMediaType: mediaType,
+            expectedByteCount: expectedByteCount,
+            protectedOriginalLease: protectedOriginalLease,
+            maximumSize: CGSize(width: maxPixel, height: maxPixel)
+        )
     }
 }
 
@@ -653,7 +658,11 @@ private struct MediaLibraryGridCell: View {
                 return
             }
             if let image = await ConversationMediaThumbnailFactory.videoThumbnail(
+                forKey: item.storageKey,
                 fileURL: localFile.url,
+                mediaType: localFile.mediaType,
+                expectedByteCount: localFile.byteCount,
+                protectedOriginalLease: localFile.accessLease,
                 maxPixel: maxPixel
             ) {
                 ConversationMediaThumbnailCache.shared.insert(image, forKey: cacheKey)
@@ -699,13 +708,19 @@ private struct MediaLibraryGridCell: View {
         if KitChatMediaKind(mediaType: loaded.mediaType) == .video {
             if let localFileURL = loaded.localFileURL {
                 image = await ConversationMediaThumbnailFactory.videoThumbnail(
+                    forKey: item.storageKey,
                     fileURL: localFileURL,
+                    mediaType: loaded.mediaType,
+                    expectedByteCount: loaded.byteCount,
+                    protectedOriginalLease: loaded.localFileLease,
                     maxPixel: pixel
                 )
             } else {
                 image = await ConversationMediaThumbnailFactory.videoThumbnail(
+                    forKey: item.storageKey,
                     data: loaded.data,
                     mediaType: loaded.mediaType,
+                    expectedByteCount: loaded.byteCount,
                     maxPixel: pixel
                 )
             }

@@ -451,6 +451,19 @@ enum OutboxPolicy {
                 : .permanent
         }
 
+        if let activationError = error as? SecureMessagingActivationError {
+            switch activationError {
+            case .incompleteServerStatus, .replenishmentRejected, .accountChanged:
+                // Account replacement can race an older process-wide activation or encrypted-
+                // store read. The active AppModel context still fences the eventual retry to its
+                // exact account/session; parking it for a *future* login can strand an already-
+                // authenticated replacement account forever.
+                return .retry(after: nil)
+            case .invalidUser, .missingLocalEnrollment, .serverEnrollmentChanged:
+                return .awaitSession
+            }
+        }
+
         if let exchangeError = error as? SecureMessagingExchangeError {
             switch exchangeError {
             case .retryLimitExceeded, .groupCapabilityUnavailable,

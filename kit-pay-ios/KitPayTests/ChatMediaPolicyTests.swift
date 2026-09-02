@@ -2461,7 +2461,191 @@ final class ChatMediaPolicyTests: XCTestCase {
 
         XCTAssertEqual(prepared.playbackURL.pathExtension, "mov")
         XCTAssertNotNil(prepared.temporaryAliasURL)
+        XCTAssertEqual(prepared.asset.url, prepared.playbackURL)
+        XCTAssertNotEqual(prepared.asset.url, mislabeled)
         XCTAssertGreaterThan(prepared.duration, 0)
+    }
+
+    @MainActor
+    func testFileBackedPosterNeverGivesMislabeledQuickTimeURLToGenerator() async throws {
+        let source = try await makePlayableVideo(fileType: .mov, pathExtension: "mov")
+        let mislabeled = try ChatMediaTempFiles.linkTemporaryFile(
+            from: source,
+            mediaType: "video/mp4"
+        )
+        defer {
+            try? FileManager.default.removeItem(at: source)
+            ChatMediaTempFiles.removeTemporaryFile(mislabeled)
+        }
+        let byteCount = try fileByteCount(mislabeled)
+        let probeImage = try onePixelCGImage()
+        var generatorURL: URL?
+
+        let thumbnail = await ChatVideoPosterGenerator.thumbnail(
+            forKey: UUID().uuidString,
+            fileURL: mislabeled,
+            declaredMediaType: "video/mp4",
+            expectedByteCount: byteCount,
+            protectedOriginalLease: nil,
+            maximumSize: CGSize(width: 32, height: 32)
+        ) { asset, _ in
+            generatorURL = asset.url
+            return probeImage
+        }
+
+        XCTAssertNotNil(thumbnail)
+        let canonicalURL = try XCTUnwrap(generatorURL)
+        XCTAssertEqual(canonicalURL.pathExtension, "mov")
+        XCTAssertNotEqual(canonicalURL, mislabeled)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: canonicalURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: mislabeled.path))
+    }
+
+    @MainActor
+    func testDataBackedPosterCanonicalizesQuickTimeAndRemovesAllTemporaryFiles() async throws {
+        let source = try await makePlayableVideo(fileType: .mov, pathExtension: "mov")
+        defer { try? FileManager.default.removeItem(at: source) }
+        let data = try Data(contentsOf: source)
+        let directoriesBefore = try previewTemporaryDirectories()
+        let probeImage = try onePixelCGImage()
+        var generatorURL: URL?
+
+        let thumbnail = await ChatVideoPosterGenerator.thumbnail(
+            forKey: UUID().uuidString,
+            data: data,
+            declaredMediaType: "video/mp4",
+            expectedByteCount: data.count,
+            maximumSize: CGSize(width: 32, height: 32)
+        ) { asset, _ in
+            generatorURL = asset.url
+            return probeImage
+        }
+
+        XCTAssertNotNil(thumbnail)
+        let canonicalURL = try XCTUnwrap(generatorURL)
+        XCTAssertEqual(canonicalURL.pathExtension, "mov")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: canonicalURL.path))
+        XCTAssertEqual(try previewTemporaryDirectories(), directoriesBefore)
+    }
+
+    @MainActor
+    func testPosterRejectsWrongSizeAndTruncatedVideoBeforeStartingGenerator() async throws {
+        let source = try await makePlayableVideo(fileType: .mov, pathExtension: "mov")
+        defer { try? FileManager.default.removeItem(at: source) }
+        let data = try Data(contentsOf: source)
+        let probeImage = try onePixelCGImage()
+        var generationCount = 0
+        let generation: ChatVideoPosterGenerator.ImageGeneration = { _, _ in
+            generationCount += 1
+            return probeImage
+        }
+
+        let wrongSize = await ChatVideoPosterGenerator.thumbnail(
+            forKey: UUID().uuidString,
+            data: data,
+            declaredMediaType: "video/mp4",
+            expectedByteCount: data.count + 1,
+            maximumSize: CGSize(width: 32, height: 32),
+            generateImage: generation
+        )
+        let truncated = Data(data.prefix(24))
+        let truncatedResult = await ChatVideoPosterGenerator.thumbnail(
+            forKey: UUID().uuidString,
+            data: truncated,
+            declaredMediaType: "video/mp4",
+            expectedByteCount: truncated.count,
+            maximumSize: CGSize(width: 32, height: 32),
+            generateImage: generation
+        )
+
+        XCTAssertNil(wrongSize)
+        XCTAssertNil(truncatedResult)
+        XCTAssertEqual(generationCount, 0)
+    }
+
+    @MainActor
+    func testPosterRemovesCanonicalAliasAfterFailureAndCancellation() async throws {
+        let source = try await makePlayableVideo(fileType: .mov, pathExtension: "mov")
+        let mislabeled = try ChatMediaTempFiles.linkTemporaryFile(
+            from: source,
+            mediaType: "video/mp4"
+        )
+        defer {
+            try? FileManager.default.removeItem(at: source)
+            ChatMediaTempFiles.removeTemporaryFile(mislabeled)
+        }
+        let byteCount = try fileByteCount(mislabeled)
+        var generatorURLs: [URL] = []
+
+        let failed = await ChatVideoPosterGenerator.thumbnail(
+            forKey: UUID().uuidString,
+            fileURL: mislabeled,
+            declaredMediaType: "video/mp4",
+            expectedByteCount: byteCount,
+            protectedOriginalLease: nil,
+            maximumSize: CGSize(width: 32, height: 32)
+        ) { asset, _ in
+            generatorURLs.append(asset.url)
+            throw PosterProbeError.expectedFailure
+        }
+        let cancelled = await ChatVideoPosterGenerator.thumbnail(
+            forKey: UUID().uuidString,
+            fileURL: mislabeled,
+            declaredMediaType: "video/mp4",
+            expectedByteCount: byteCount,
+            protectedOriginalLease: nil,
+            maximumSize: CGSize(width: 32, height: 32)
+        ) { asset, _ in
+            generatorURLs.append(asset.url)
+            throw CancellationError()
+        }
+
+        XCTAssertNil(failed)
+        XCTAssertNil(cancelled)
+        XCTAssertEqual(generatorURLs.count, 2)
+        XCTAssertTrue(generatorURLs.allSatisfy { $0.pathExtension == "mov" })
+        XCTAssertTrue(generatorURLs.allSatisfy {
+            !FileManager.default.fileExists(atPath: $0.path)
+        })
+    }
+
+    @MainActor
+    func testConcurrentPosterRequestsShareOneGeneratorProbe() async throws {
+        let source = try await makePlayableVideo(fileType: .mp4, pathExtension: "mp4")
+        defer { try? FileManager.default.removeItem(at: source) }
+        let byteCount = try fileByteCount(source)
+        let probeImage = try onePixelCGImage()
+        let contentKey = UUID().uuidString
+        var generationCount = 0
+        let generation: ChatVideoPosterGenerator.ImageGeneration = { _, _ in
+            generationCount += 1
+            try await Task.sleep(nanoseconds: 20_000_000)
+            return probeImage
+        }
+
+        async let first = ChatVideoPosterGenerator.thumbnail(
+            forKey: contentKey,
+            fileURL: source,
+            declaredMediaType: "video/mp4",
+            expectedByteCount: byteCount,
+            protectedOriginalLease: nil,
+            maximumSize: CGSize(width: 32, height: 32),
+            generateImage: generation
+        )
+        async let second = ChatVideoPosterGenerator.thumbnail(
+            forKey: contentKey,
+            fileURL: source,
+            declaredMediaType: "video/mp4",
+            expectedByteCount: byteCount,
+            protectedOriginalLease: nil,
+            maximumSize: CGSize(width: 32, height: 32),
+            generateImage: generation
+        )
+        let results = await (first, second)
+
+        XCTAssertNotNil(results.0)
+        XCTAssertNotNil(results.1)
+        XCTAssertEqual(generationCount, 1)
     }
 
     func testConversationOrderingPutsPinnedFirstThenMostRecent() {
@@ -2619,6 +2803,38 @@ final class ChatMediaPolicyTests: XCTestCase {
         bytes.append(Data("isom".utf8))
         bytes.append(Data("mp42".utf8))
         return bytes
+    }
+
+    private enum PosterProbeError: Error {
+        case expectedFailure
+    }
+
+    private func fileByteCount(_ url: URL) throws -> Int {
+        try XCTUnwrap(
+            (try FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?
+                .intValue
+        )
+    }
+
+    @MainActor
+    private func onePixelCGImage() throws -> CGImage {
+        try XCTUnwrap(
+            UIGraphicsImageRenderer(size: CGSize(width: 1, height: 1))
+                .image { context in
+                    UIColor.black.setFill()
+                    context.fill(CGRect(x: 0, y: 0, width: 1, height: 1))
+                }
+                .cgImage
+        )
+    }
+
+    private func previewTemporaryDirectories() throws -> Set<String> {
+        Set(try FileManager.default.contentsOfDirectory(
+            at: FileManager.default.temporaryDirectory,
+            includingPropertiesForKeys: nil
+        ).filter {
+            $0.lastPathComponent.hasPrefix("kit-preview-")
+        }.map(\.path))
     }
 
     private func makePlayableVideo(

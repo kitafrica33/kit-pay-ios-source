@@ -283,14 +283,18 @@ private struct ChatMediaAlbumGridCell: View {
                     videoPoster = await ChatMediaThumbnailStore.shared.videoThumbnail(
                         forKey: item.thumbnailKey,
                         maxPixel: maxPixel,
-                        fromFileURL: localFileURL
+                        fromFileURL: localFileURL,
+                        mediaType: loaded.mediaType,
+                        expectedByteCount: loaded.byteCount,
+                        protectedOriginalLease: loaded.localFileLease
                     )
                 } else {
                     videoPoster = await ChatMediaThumbnailStore.shared.videoThumbnail(
                         forKey: item.thumbnailKey,
                         maxPixel: maxPixel,
                         from: loaded.data,
-                        mediaType: loaded.mediaType
+                        mediaType: loaded.mediaType,
+                        expectedByteCount: loaded.byteCount
                     )
                 }
             case .image:

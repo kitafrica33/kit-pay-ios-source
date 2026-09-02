@@ -2,6 +2,183 @@ import AVFoundation
 import ImageIO
 import UIKit
 
+/// The only boundary that creates video poster frames. Poster extraction has the same container
+/// and completeness requirements as playback: in particular, Android providers can supply
+/// QuickTime bytes while declaring `video/mp4`. Preparing first gives AVFoundation a canonical
+/// `.mov` hard link and keeps that alias alive until generation has completely finished.
+@MainActor
+enum ChatVideoPosterGenerator {
+    typealias ImageGeneration = (AVURLAsset, CGSize) async throws -> CGImage
+
+    private struct RequestKey: Hashable {
+        let contentKey: String
+        let declaredMediaType: String
+        let expectedByteCount: Int
+        let pixelWidth: Int
+        let pixelHeight: Int
+    }
+
+    private struct InFlightRequest {
+        let id: UUID
+        let task: Task<UIImage?, Never>
+    }
+
+    private static var inFlight: [RequestKey: InFlightRequest] = [:]
+
+    static func thumbnail(
+        forKey contentKey: String,
+        data: Data?,
+        declaredMediaType: String,
+        expectedByteCount: Int,
+        maximumSize: CGSize,
+        generateImage: ImageGeneration? = nil
+    ) async -> UIImage? {
+        guard let key = requestKey(
+            contentKey: contentKey,
+            declaredMediaType: declaredMediaType,
+            expectedByteCount: expectedByteCount,
+            maximumSize: maximumSize
+        ) else { return nil }
+        return await resolve(key: key) {
+            await generateThumbnail(
+                data: data,
+                declaredMediaType: declaredMediaType,
+                expectedByteCount: expectedByteCount,
+                maximumSize: maximumSize,
+                generateImage: generateImage
+            )
+        }
+    }
+
+    static func thumbnail(
+        forKey contentKey: String,
+        fileURL: URL,
+        declaredMediaType: String,
+        expectedByteCount: Int,
+        protectedOriginalLease: SecureMediaOriginalAccessLease?,
+        maximumSize: CGSize,
+        generateImage: ImageGeneration? = nil
+    ) async -> UIImage? {
+        guard let key = requestKey(
+            contentKey: contentKey,
+            declaredMediaType: declaredMediaType,
+            expectedByteCount: expectedByteCount,
+            maximumSize: maximumSize
+        ) else { return nil }
+        return await resolve(key: key) {
+            let image = await generateThumbnail(
+                fileURL: fileURL,
+                declaredMediaType: declaredMediaType,
+                expectedByteCount: expectedByteCount,
+                maximumSize: maximumSize,
+                generateImage: generateImage
+            )
+            // A protected receiver-cache source must remain outside eviction until preparation
+            // has created its hard-link alias and AVFoundation has finished reading that alias.
+            withExtendedLifetime(protectedOriginalLease) {}
+            return image
+        }
+    }
+
+    private static func generateThumbnail(
+        data: Data?,
+        declaredMediaType: String,
+        expectedByteCount: Int,
+        maximumSize: CGSize,
+        generateImage: ImageGeneration?
+    ) async -> UIImage? {
+        guard let data, data.count == expectedByteCount,
+              let sourceURL = try? ChatMediaTempFiles.writeTemporaryFile(
+                  data: data,
+                  mediaType: declaredMediaType
+              )
+        else { return nil }
+        defer { ChatMediaTempFiles.removeTemporaryFile(sourceURL) }
+        return await generateThumbnail(
+            fileURL: sourceURL,
+            declaredMediaType: declaredMediaType,
+            expectedByteCount: expectedByteCount,
+            maximumSize: maximumSize,
+            generateImage: generateImage
+        )
+    }
+
+    private static func generateThumbnail(
+        fileURL: URL,
+        declaredMediaType: String,
+        expectedByteCount: Int,
+        maximumSize: CGSize,
+        generateImage: ImageGeneration? = nil
+    ) async -> UIImage? {
+        guard maximumSize.width > 0, maximumSize.height > 0 else { return nil }
+        guard let prepared = try? await ChatVideoPlaybackAssetPolicy.prepare(
+            fileURL: fileURL,
+            declaredMediaType: declaredMediaType,
+            expectedByteCount: expectedByteCount
+        ) else { return nil }
+        defer { ChatMediaTempFiles.removeTemporaryFile(prepared.temporaryAliasURL) }
+
+        do {
+            let cgImage: CGImage
+            if let generateImage {
+                cgImage = try await generateImage(prepared.asset, maximumSize)
+            } else {
+                let generator = AVAssetImageGenerator(asset: prepared.asset)
+                generator.appliesPreferredTrackTransform = true
+                generator.maximumSize = maximumSize
+                cgImage = try await generator.image(
+                    at: CMTime(seconds: 0.1, preferredTimescale: 600)
+                ).image
+            }
+            return UIImage(cgImage: cgImage)
+        } catch {
+            return nil
+        }
+    }
+
+    private static func requestKey(
+        contentKey: String,
+        declaredMediaType: String,
+        expectedByteCount: Int,
+        maximumSize: CGSize
+    ) -> RequestKey? {
+        guard !contentKey.isEmpty,
+              expectedByteCount > 0,
+              maximumSize.width.isFinite,
+              maximumSize.height.isFinite,
+              maximumSize.width > 0,
+              maximumSize.height > 0
+        else { return nil }
+        return RequestKey(
+            contentKey: contentKey,
+            declaredMediaType: declaredMediaType.lowercased(),
+            expectedByteCount: expectedByteCount,
+            pixelWidth: Int(maximumSize.width.rounded(.up)),
+            pixelHeight: Int(maximumSize.height.rounded(.up))
+        )
+    }
+
+    /// SwiftUI appearance and tap tasks can overlap for the same received item. Share one
+    /// decoder probe for an identical content/size request instead of doubling AVFoundation's
+    /// transient buffers at the moment playback is being opened.
+    private static func resolve(
+        key: RequestKey,
+        operation: @escaping () async -> UIImage?
+    ) async -> UIImage? {
+        if let request = inFlight[key] {
+            return await request.task.value
+        }
+        let id = UUID()
+        let task = Task { await operation() }
+        inFlight[key] = InFlightRequest(id: id, task: task)
+        let image = await task.value
+        if inFlight[key]?.id == id {
+            inFlight.removeValue(forKey: key)
+        }
+        return image
+    }
+}
+
 /// Bounded ImageIO decode shared by bubbles and the full-screen gallery. Compressed attachment
 /// bytes may be close to the wire ceiling; `UIImage(data:)` can inflate an adversarially large
 /// pixel surface even when the compressed file itself is modest. Every passive render therefore
@@ -146,56 +323,52 @@ final class ChatMediaThumbnailStore: ObservableObject {
 
     // MARK: Video poster thumbnails
 
-    /// Poster frame from locally available plaintext only. The bytes are staged in a
-    /// file-protected temp file for the duration of the generation and removed immediately.
-    /// The `mediaType` default keeps the documented three-argument call shape usable; pass the
-    /// descriptor's media type when it is not MP4 so the temp file gets a decodable extension.
+    /// Poster frame from locally available plaintext only. The shared generator validates the
+    /// exact bytes and gives AVFoundation a container-canonical URL before extracting a frame.
     func videoThumbnail(
         forKey key: String,
         maxPixel: CGFloat,
         from data: Data?,
-        mediaType: String = "video/mp4"
+        mediaType: String,
+        expectedByteCount: Int
     ) async -> UIImage? {
         if let cached = cachedThumbnail(forKey: key, maxPixel: maxPixel) {
             return cached
         }
-        guard let data,
-              let url = try? ChatMediaTempFiles.writeTemporaryFile(
-                  data: data,
-                  mediaType: mediaType
-              )
-        else { return nil }
-        defer { ChatMediaTempFiles.removeTemporaryFile(url) }
         let pixelEdge = Self.pixelSize(forMaxPixel: maxPixel)
-        let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
-        generator.appliesPreferredTrackTransform = true
-        generator.maximumSize = CGSize(width: pixelEdge, height: pixelEdge)
-        guard let cgImage = try? await generator.image(
-            at: CMTime(seconds: 0.1, preferredTimescale: 600)
-        ).image else { return nil }
-        let image = UIImage(cgImage: cgImage)
+        guard let image = await ChatVideoPosterGenerator.thumbnail(
+            forKey: key,
+            data: data,
+            declaredMediaType: mediaType,
+            expectedByteCount: expectedByteCount,
+            maximumSize: CGSize(width: pixelEdge, height: pixelEdge)
+        ) else { return nil }
         store(image, forKey: key, maxPixel: maxPixel)
         return image
     }
 
-    /// File-backed sender-original variant. AVFoundation reads the protected original directly;
-    /// no duplicate temp file or whole-file `Data` is created.
+    /// File-backed sender-original/receiver-cache variant. The authoritative MIME and byte count
+    /// come from the same freshly resolved item as the URL; no whole-file `Data` is created.
     func videoThumbnail(
         forKey key: String,
         maxPixel: CGFloat,
-        fromFileURL url: URL
+        fromFileURL url: URL,
+        mediaType: String,
+        expectedByteCount: Int,
+        protectedOriginalLease: SecureMediaOriginalAccessLease?
     ) async -> UIImage? {
         if let cached = cachedThumbnail(forKey: key, maxPixel: maxPixel) {
             return cached
         }
         let pixelEdge = Self.pixelSize(forMaxPixel: maxPixel)
-        let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
-        generator.appliesPreferredTrackTransform = true
-        generator.maximumSize = CGSize(width: pixelEdge, height: pixelEdge)
-        guard let cgImage = try? await generator.image(
-            at: CMTime(seconds: 0.1, preferredTimescale: 600)
-        ).image else { return nil }
-        let image = UIImage(cgImage: cgImage)
+        guard let image = await ChatVideoPosterGenerator.thumbnail(
+            forKey: key,
+            fileURL: url,
+            declaredMediaType: mediaType,
+            expectedByteCount: expectedByteCount,
+            protectedOriginalLease: protectedOriginalLease,
+            maximumSize: CGSize(width: pixelEdge, height: pixelEdge)
+        ) else { return nil }
         store(image, forKey: key, maxPixel: maxPixel)
         return image
     }

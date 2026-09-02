@@ -418,6 +418,35 @@ final class OutboxPolicyTests: XCTestCase {
         )
         XCTAssertEqual(
             OutboxPolicy.failureDecision(
+                for: SecureMessagingActivationError.incompleteServerStatus
+            ),
+            .retry(after: nil)
+        )
+        XCTAssertEqual(
+            OutboxPolicy.failureDecision(
+                for: SecureMessagingActivationError.replenishmentRejected
+            ),
+            .retry(after: nil)
+        )
+        XCTAssertEqual(
+            OutboxPolicy.failureDecision(
+                for: SecureMessagingActivationError.accountChanged
+            ),
+            .retry(after: nil),
+            "A replacement account is already authenticated, so waiting for another login would strand its command."
+        )
+        for activationError in [
+            SecureMessagingActivationError.invalidUser,
+            .missingLocalEnrollment,
+            .serverEnrollmentChanged,
+        ] {
+            XCTAssertEqual(
+                OutboxPolicy.failureDecision(for: activationError),
+                .awaitSession
+            )
+        }
+        XCTAssertEqual(
+            OutboxPolicy.failureDecision(
                 for: SecureMessagingExchangeError.groupCapabilityUnavailable
             ),
             .retry(after: nil)

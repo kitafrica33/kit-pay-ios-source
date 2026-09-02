@@ -41,6 +41,17 @@ class WalletRefreshReliabilitySourceContract(unittest.TestCase):
         self.assertLess(history, messaging)
         self.assertNotIn("await flushOutbox()", self.refresh[:history])
 
+    def test_capability_discovery_failure_does_not_abort_wallet_refresh(self) -> None:
+        history = self.refresh.index("await refreshSelectedWalletTransactions(")
+        capability_start = self.refresh.index("let capabilityRefreshTask = Task")
+        capability_join = self.refresh.index("await capabilityRefreshTask.value")
+        before_history = self.refresh[:history]
+
+        self.assertLess(capability_start, history)
+        self.assertLess(history, capability_join)
+        self.assertIn("return await self.reloadCapabilities()", before_history)
+        self.assertNotIn("guard await reloadCapabilities() else { return }", before_history)
+
     def test_wallet_history_refresh_is_account_and_session_fenced(self) -> None:
         helper = swift_function(
             self.source,

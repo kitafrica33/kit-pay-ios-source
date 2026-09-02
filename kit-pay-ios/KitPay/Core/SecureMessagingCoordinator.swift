@@ -117,6 +117,118 @@ enum SecureMessagingActivationError: LocalizedError, Equatable {
     }
 }
 
+/// Carries the exact AppModel account lifetime, authenticated server session, and protected-store
+/// admission. The scope is task-local so nested exchange operations and child retries retain the
+/// ownership context that created them without widening every public messaging API.
+struct SecureMessagingActivationScope: Equatable, Sendable {
+    let accountGeneration: UUID
+    let sessionID: String
+    let commitAdmission: ProtectedCommunicationAdmissionLease?
+}
+
+enum SecureMessagingActivationBinding {
+    @TaskLocal static var scope: SecureMessagingActivationScope?
+    /// Injected coordinators have no process session to bind. Give one top-level test operation
+    /// a stable lifetime which its child activation and delayed history work inherit, while two
+    /// independently-started unbound operations still never coalesce by user id alone.
+    @TaskLocal static var unboundOperationGeneration: UUID?
+
+    static func withAuthenticatedScope<T>(
+        accountGeneration: UUID,
+        sessionID: String,
+        commitAdmission: ProtectedCommunicationAdmissionLease? = nil,
+        operation: () async throws -> T
+    ) async rethrows -> T {
+        let scope = SecureMessagingActivationScope(
+            accountGeneration: accountGeneration,
+            sessionID: sessionID,
+            commitAdmission: commitAdmission
+        )
+        return try await $scope.withValue(scope) {
+            try await APIClientSessionBinding.$sessionID.withValue(sessionID) {
+                try await operation()
+            }
+        }
+    }
+
+    static func withIsolatedUnboundScopeIfNeeded<T>(
+        requiresAuthenticatedScope: Bool,
+        operation: () async throws -> T
+    ) async rethrows -> T {
+        guard !requiresAuthenticatedScope,
+              scope == nil,
+              unboundOperationGeneration == nil
+        else { return try await operation() }
+        return try await $unboundOperationGeneration.withValue(UUID()) {
+            try await operation()
+        }
+    }
+}
+
+struct SecureMessagingActivationIdentity: Equatable, Sendable {
+    let userID: String
+    let accountGeneration: UUID
+    let sessionID: String?
+    let admissionGeneration: UInt64?
+
+    static func current(
+        userID: String,
+        requiresAuthenticatedScope: Bool
+    ) throws -> Self {
+        if let scope = SecureMessagingActivationBinding.scope {
+            guard SessionRefreshPolicy.isValidSessionID(scope.sessionID),
+                  let boundSessionID = APIClientSessionBinding.sessionID,
+                  SessionRefreshPolicy.matchesSessionID(
+                      scope.sessionID,
+                      current: boundSessionID
+                  ),
+                  !requiresAuthenticatedScope || scope.commitAdmission != nil
+            else { throw SecureMessagingActivationError.accountChanged }
+            if let admission = scope.commitAdmission {
+                guard admission.accountID == userID,
+                      ProtectedCommunicationAdmissionGate.shared.permits(admission)
+                else { throw SecureMessagingActivationError.accountChanged }
+            }
+            return Self(
+                userID: userID,
+                accountGeneration: scope.accountGeneration,
+                sessionID: UUID(uuidString: scope.sessionID)?.uuidString.lowercased(),
+                admissionGeneration: scope.commitAdmission?.generation
+            )
+        }
+
+        // Unit coordinators use injected transports and no app/session singleton. Isolate every
+        // unbound call instead of ever treating a shared user id as proof that two calls own the
+        // same authenticated account lifetime. Process-wide coordinators reject this path.
+        guard !requiresAuthenticatedScope,
+              APIClientSessionBinding.sessionID == nil
+        else { throw SecureMessagingActivationError.accountChanged }
+        return Self(
+            userID: userID,
+            accountGeneration: SecureMessagingActivationBinding.unboundOperationGeneration
+                ?? UUID(),
+            sessionID: nil,
+            admissionGeneration: nil
+        )
+    }
+}
+
+enum SecureMessagingScopedWorkFence {
+    static func accepts(
+        expectedIdentity: SecureMessagingActivationIdentity,
+        expectedGeneration: UInt64,
+        currentIdentity: SecureMessagingActivationIdentity?,
+        currentGeneration: UInt64
+    ) -> Bool {
+        expectedGeneration == currentGeneration && expectedIdentity == currentIdentity
+    }
+}
+
+private struct SecureMessagingActivationInvocation: Sendable {
+    let identity: SecureMessagingActivationIdentity
+    let commitAdmission: ProtectedCommunicationAdmissionLease?
+}
+
 /// Reconciles one authenticated account with its server enrollment. A single-flight task prevents
 /// duplicate activation inside this process; SecureLocalStore's complete-state CAS remains the
 /// authority across actor reentrancy, logout, restoration, and future messaging workers.
@@ -124,63 +236,156 @@ actor SecureMessagingCoordinator {
     static let shared = SecureMessagingCoordinator(
         transport: APIClient.shared,
         store: SecureLocalStore.shared,
-        engine: SecureMessagingCryptoEngine.shared
+        engine: SecureMessagingCryptoEngine.shared,
+        requiresAuthenticatedActivationScope: true
     )
 
     private let transport: any SecureMessagingActivationTransport
     private let store: SecureLocalStore
     private let engine: SecureMessagingCryptoEngine
     private let provisioningPreKeyCount: Int
+    private let requiresAuthenticatedActivationScope: Bool
     private var activationTask: Task<SecureMessagingPersistentState, Error>?
-    private var activationUserID: String?
+    private var activationIdentity: SecureMessagingActivationIdentity?
+    /// Identifies the task which currently owns the single-flight slot. Account replacement can
+    /// cancel an old flight and install a new one before the old transport unwinds; generation-
+    /// guarded cleanup prevents that obsolete caller from clearing the replacement flight.
+    private var activationGeneration: UInt64 = 0
 
     init(
         transport: any SecureMessagingActivationTransport,
         store: SecureLocalStore,
         engine: SecureMessagingCryptoEngine,
-        provisioningPreKeyCount: Int = SecureMessagingCryptoEngine.uploadPreKeyCount
+        provisioningPreKeyCount: Int = SecureMessagingCryptoEngine.uploadPreKeyCount,
+        requiresAuthenticatedActivationScope: Bool = false
     ) {
         self.transport = transport
         self.store = store
         self.engine = engine
         self.provisioningPreKeyCount = provisioningPreKeyCount
+        self.requiresAuthenticatedActivationScope = requiresAuthenticatedActivationScope
     }
 
     func activate(forUserID userID: String) async throws -> SecureMessagingPersistentState {
         guard SecureMessagingValidation.isCanonicalUUID(userID) else {
             throw SecureMessagingActivationError.invalidUser
         }
+        let invocation = try activationInvocation(forUserID: userID)
         if let activationTask {
-            guard activationUserID == userID else {
-                throw SecureMessagingActivationError.accountChanged
+            if activationIdentity == invocation.identity {
+                let generation = activationGeneration
+                do {
+                    let result = try await activationTask.value
+                    guard activationGeneration == generation else {
+                        throw CancellationError()
+                    }
+                    return result
+                } catch {
+                    guard activationGeneration == generation else {
+                        throw CancellationError()
+                    }
+                    throw error
+                }
             }
-            return try await activationTask.value
+
+            // AppModel deliberately allows a replacement account to start its own outbox drain
+            // while the former account's request unwinds. Treat that as supersession, not an
+            // authentication failure for the already-valid replacement session: returning
+            // `.accountChanged` here makes OutboxPolicy park its command in `.awaitingSession`,
+            // but no future sign-in edge exists to resume it. The old task retains its own
+            // account/store CAS fences and is cancelled before the new flight is installed.
+            activationTask.cancel()
         }
 
+        activationGeneration &+= 1
+        let generation = activationGeneration
         let task = Task { [weak self] in
             guard let self else { throw CancellationError() }
-            return try await self.reconcileWithCAS(forUserID: userID)
+            return try await self.reconcileWithCAS(
+                forUserID: userID,
+                commitAdmission: invocation.commitAdmission
+            )
         }
-        activationUserID = userID
+        activationIdentity = invocation.identity
         activationTask = task
         do {
             let result = try await task.value
-            activationTask = nil
-            activationUserID = nil
+            guard SecureMessagingScopedWorkFence.accepts(
+                expectedIdentity: invocation.identity,
+                expectedGeneration: generation,
+                currentIdentity: activationIdentity,
+                currentGeneration: activationGeneration
+            ) else {
+                throw CancellationError()
+            }
+            clearActivationIfCurrent(invocation.identity, generation: generation)
             return result
         } catch {
-            activationTask = nil
-            activationUserID = nil
+            guard SecureMessagingScopedWorkFence.accepts(
+                expectedIdentity: invocation.identity,
+                expectedGeneration: generation,
+                currentIdentity: activationIdentity,
+                currentGeneration: activationGeneration
+            ) else {
+                throw CancellationError()
+            }
+            clearActivationIfCurrent(invocation.identity, generation: generation)
             throw error
         }
     }
 
-    private func reconcileWithCAS(
+    private func clearActivationIfCurrent(
+        _ identity: SecureMessagingActivationIdentity,
+        generation: UInt64
+    ) {
+        guard SecureMessagingScopedWorkFence.accepts(
+            expectedIdentity: identity,
+            expectedGeneration: generation,
+            currentIdentity: activationIdentity,
+            currentGeneration: activationGeneration
+        ) else { return }
+        activationTask = nil
+        activationIdentity = nil
+    }
+
+    private func activationInvocation(
         forUserID userID: String
+    ) throws -> SecureMessagingActivationInvocation {
+        if let scope = SecureMessagingActivationBinding.scope {
+            guard SessionRefreshPolicy.isValidSessionID(scope.sessionID),
+                  let boundSessionID = APIClientSessionBinding.sessionID,
+                  SessionRefreshPolicy.matchesSessionID(
+                      scope.sessionID,
+                      current: boundSessionID
+                  )
+            else { throw SecureMessagingActivationError.accountChanged }
+            return SecureMessagingActivationInvocation(
+                identity: try SecureMessagingActivationIdentity.current(
+                    userID: userID,
+                    requiresAuthenticatedScope: requiresAuthenticatedActivationScope
+                ),
+                commitAdmission: scope.commitAdmission
+            )
+        }
+        return SecureMessagingActivationInvocation(
+            identity: try SecureMessagingActivationIdentity.current(
+                userID: userID,
+                requiresAuthenticatedScope: requiresAuthenticatedActivationScope
+            ),
+            commitAdmission: nil
+        )
+    }
+
+    private func reconcileWithCAS(
+        forUserID userID: String,
+        commitAdmission: ProtectedCommunicationAdmissionLease?
     ) async throws -> SecureMessagingPersistentState {
         for _ in 0..<3 {
             do {
-                return try await reconcileOnce(forUserID: userID)
+                return try await reconcileOnce(
+                    forUserID: userID,
+                    commitAdmission: commitAdmission
+                )
             } catch SecureMessagingCryptoError.staleState {
                 try Task.checkCancellation()
                 continue
@@ -190,9 +395,13 @@ actor SecureMessagingCoordinator {
     }
 
     private func reconcileOnce(
-        forUserID userID: String
+        forUserID userID: String,
+        commitAdmission: ProtectedCommunicationAdmissionLease?
     ) async throws -> SecureMessagingPersistentState {
         let remote = try await transport.messagingKeyStatus()
+        // A replacement-account activation may supersede this flight while the status request is
+        // suspended. Do not let the obsolete account proceed to reset, publish, or local commit.
+        try Task.checkCancellation()
         guard let serverEnrolled = remote.enrolled else {
             throw SecureMessagingActivationError.incompleteServerStatus
         }
@@ -212,7 +421,8 @@ actor SecureMessagingCoordinator {
             return try await provisionPublishAndBind(
                 forUserID: userID,
                 expectedState: nil,
-                baseState: .empty
+                baseState: .empty,
+                commitAdmission: commitAdmission
             )
         }
 
@@ -226,12 +436,14 @@ actor SecureMessagingCoordinator {
                     let committed = try await commit(
                         userID: userID,
                         expected: local,
-                        next: bound
+                        next: bound,
+                        commitAdmission: commitAdmission
                     )
                     return try await replenishIfRequired(
                         remote: remote,
                         local: committed,
-                        userID: userID
+                        userID: userID,
+                        commitAdmission: commitAdmission
                     )
                 }
                 guard local.enrollment == remoteBinding else {
@@ -243,7 +455,11 @@ actor SecureMessagingCoordinator {
                     throw SecureMessagingActivationError.serverEnrollmentChanged
                 }
             }
-            return try await publishPending(local, forUserID: userID)
+            return try await publishPending(
+                local,
+                forUserID: userID,
+                commitAdmission: commitAdmission
+            )
         }
 
         if serverEnrolled {
@@ -255,7 +471,8 @@ actor SecureMessagingCoordinator {
             return try await replenishIfRequired(
                 remote: remote,
                 local: local,
-                userID: userID
+                userID: userID,
+                commitAdmission: commitAdmission
             )
         }
 
@@ -268,11 +485,13 @@ actor SecureMessagingCoordinator {
         return try await provisionPublishAndBind(
             forUserID: userID,
             expectedState: local,
-            baseState: local
+            baseState: local,
+            commitAdmission: commitAdmission
         )
     }
 
     private func resetLostLocalEnrollment(_ remote: MessagingKeyStatusDTO) async throws {
+        try Task.checkCancellation()
         guard let epoch = remote.enrollmentEpoch,
               let registrationID = remote.registrationId,
               let identityHash = remote.identityKeySha256?.lowercased(),
@@ -285,6 +504,7 @@ actor SecureMessagingCoordinator {
             expectedBundleVersion: bundleVersion
         )
         let reset = try await transport.resetMessagingEnrollment(request)
+        try Task.checkCancellation()
         guard reset.resetApplied == true,
               reset.enrolled == false,
               reset.previousEnrollmentEpoch == epoch,
@@ -296,8 +516,10 @@ actor SecureMessagingCoordinator {
     private func replenishIfRequired(
         remote: MessagingKeyStatusDTO,
         local: SecureMessagingPersistentState,
-        userID: String
+        userID: String,
+        commitAdmission: ProtectedCommunicationAdmissionLease?
     ) async throws -> SecureMessagingPersistentState {
+        try Task.checkCancellation()
         guard let needsReplenishment = remote.needsReplenishment else {
             throw SecureMessagingActivationError.incompleteServerStatus
         }
@@ -305,36 +527,48 @@ actor SecureMessagingCoordinator {
         return try await provisionPublishAndBind(
             forUserID: userID,
             expectedState: local,
-            baseState: local
+            baseState: local,
+            commitAdmission: commitAdmission
         )
     }
 
     private func provisionPublishAndBind(
         forUserID userID: String,
         expectedState: SecureMessagingPersistentState?,
-        baseState: SecureMessagingPersistentState
+        baseState: SecureMessagingPersistentState,
+        commitAdmission: ProtectedCommunicationAdmissionLease?
     ) async throws -> SecureMessagingPersistentState {
+        try Task.checkCancellation()
         let provisioned = try await engine.provision(
             from: baseState,
             preKeyCount: provisioningPreKeyCount
         )
+        try Task.checkCancellation()
         let committed = try await commit(
             userID: userID,
             expected: expectedState,
-            next: provisioned.state
+            next: provisioned.state,
+            commitAdmission: commitAdmission
         )
-        return try await publishPending(committed, forUserID: userID)
+        return try await publishPending(
+            committed,
+            forUserID: userID,
+            commitAdmission: commitAdmission
+        )
     }
 
     private func publishPending(
         _ local: SecureMessagingPersistentState,
-        forUserID userID: String
+        forUserID userID: String,
+        commitAdmission: ProtectedCommunicationAdmissionLease?
     ) async throws -> SecureMessagingPersistentState {
+        try Task.checkCancellation()
         guard let pending = local.pendingPublication else {
             throw SecureMessagingCryptoError.staleState
         }
         let request = try SecureMessagingMapper.publicationRequest(from: pending)
         let published = try await transport.publishMessagingKeyBundle(request)
+        try Task.checkCancellation()
         guard published.needsReplenishment == false else {
             throw SecureMessagingActivationError.replenishmentRejected
         }
@@ -343,24 +577,34 @@ actor SecureMessagingCoordinator {
             userID: userID
         )
         let bound = try await engine.bindEnrollment(binding, to: local)
-        return try await commit(userID: userID, expected: local, next: bound)
+        return try await commit(
+            userID: userID,
+            expected: local,
+            next: bound,
+            commitAdmission: commitAdmission
+        )
     }
 
     private func commit(
         userID: String,
         expected: SecureMessagingPersistentState?,
-        next: SecureMessagingPersistentState
+        next: SecureMessagingPersistentState,
+        commitAdmission: ProtectedCommunicationAdmissionLease?
     ) async throws -> SecureMessagingPersistentState {
+        try Task.checkCancellation()
         do {
             try await store.commitSecureMessaging(
                 forUserID: userID,
                 expectedState: expected,
-                nextState: next
+                nextState: next,
+                admission: commitAdmission
             )
         } catch StoreError.accountChanged {
             throw SecureMessagingActivationError.accountChanged
         }
+        try Task.checkCancellation()
         let committed = await store.snapshot()
+        try Task.checkCancellation()
         guard committed.profile?.id == userID,
               let state = committed.secureMessaging
         else { throw SecureMessagingActivationError.accountChanged }
@@ -1087,7 +1331,8 @@ actor SecureMessagingExchangeCoordinator {
     static let shared = SecureMessagingExchangeCoordinator(
         transport: APIClient.shared,
         store: SecureLocalStore.shared,
-        engine: SecureMessagingCryptoEngine.shared
+        engine: SecureMessagingCryptoEngine.shared,
+        requiresAuthenticatedActivationScope: true
     )
 
     private let transport: any SecureMessagingExchangeTransport
@@ -1095,42 +1340,61 @@ actor SecureMessagingExchangeCoordinator {
     private let engine: SecureMessagingCryptoEngine
     private let activation: SecureMessagingCoordinator
     private let mediaBlobs: SecureMediaBlobStoreAccess
+    private let requiresAuthenticatedActivationScope: Bool
     private var syncTask: Task<SecureMessagingSyncResult, Error>?
-    private var syncUserID: String?
-    private var isFlushingHistory = false
+    private var syncIdentity: SecureMessagingActivationIdentity?
+    private var syncGeneration: UInt64 = 0
+    private var historyFlushIdentity: SecureMessagingActivationIdentity?
+    private var historyFlushGeneration: UInt64 = 0
     private var historyReconciledEnrollment: SecureMessagingEnrollmentBinding?
+    private var historyReconciledIdentity: SecureMessagingActivationIdentity?
     private var historyContinuationTask: Task<Void, Never>?
-    private var historyContinuationUserID: String?
+    private var historyContinuationIdentity: SecureMessagingActivationIdentity?
     private var historyContinuationDelayNanoseconds: UInt64?
     private var historyContinuationGeneration: UInt64 = 0
+    private var runningHistoryContinuationTask: Task<Void, Never>?
+    private var runningHistoryContinuationIdentity: SecureMessagingActivationIdentity?
+    private var runningHistoryContinuationGeneration: UInt64?
 
     init(
         transport: any SecureMessagingExchangeTransport,
         store: SecureLocalStore,
         engine: SecureMessagingCryptoEngine,
         provisioningPreKeyCount: Int = SecureMessagingCryptoEngine.uploadPreKeyCount,
-        mediaBlobs: SecureMediaBlobStoreAccess = .fileCache
+        mediaBlobs: SecureMediaBlobStoreAccess = .fileCache,
+        requiresAuthenticatedActivationScope: Bool = false
     ) {
         self.transport = transport
         self.store = store
         self.engine = engine
         self.mediaBlobs = mediaBlobs
+        self.requiresAuthenticatedActivationScope = requiresAuthenticatedActivationScope
         activation = SecureMessagingCoordinator(
             transport: transport,
             store: store,
             engine: engine,
-            provisioningPreKeyCount: provisioningPreKeyCount
+            provisioningPreKeyCount: provisioningPreKeyCount,
+            requiresAuthenticatedActivationScope: requiresAuthenticatedActivationScope
         )
     }
 
     func activate(forUserID userID: String) async throws {
-        _ = try await activation.activate(forUserID: userID)
+        let userID = try canonicalUUID(userID, error: .invalidAccount)
+        _ = try await activateMessagingState(forUserID: userID)
         try await flushDeliveryAcknowledgements(forUserID: userID)
     }
 
+    private func activateMessagingState(
+        forUserID userID: String
+    ) async throws -> SecureMessagingPersistentState {
+        _ = try claimMessagingScope(forUserID: userID)
+        return try await activation.activate(forUserID: userID)
+    }
+
     /// Creates or reuses the server-authoritative direct thread and persists its validated local
-    /// projection before returning. Call surfaces use this instead of inventing a local thread id,
-    /// so navigation can occur only after authenticated server and encrypted-store success.
+    /// projection before returning. This metadata is safe to retain before Signal enrollment;
+    /// messages still enter only the protected local outbox, and the flush boundary activates
+    /// E2EE before preparing or transporting any fanout.
     func ensureDirectConversation(
         forUserID userID: String,
         recipientUserID: String,
@@ -1141,16 +1405,21 @@ actor SecureMessagingExchangeCoordinator {
         let recipient = try canonicalUUID(recipientUserID, error: .invalidRecipient)
         let local = try canonicalUUID(userID, error: .invalidAccount)
         guard recipient != local else { throw SecureMessagingExchangeError.invalidRecipient }
+        let commitIdentity = try authenticatedQueueIdentity(
+            forUserID: local,
+            commitAdmission: commitAdmission
+        )
         let canonicalExpectedConversationID = try expectedConversationID.map {
             try canonicalUUID($0, error: .invalidConversation)
-        }
-        if let commitAdmission,
-           !ProtectedCommunicationAdmissionGate.shared.permits(commitAdmission) {
-            throw CancellationError()
         }
 
         let dto = try await transport.createDirectMessagingConversation(
             try CreateDirectMessagingConversationRequest(memberId: recipient)
+        )
+        try requireAuthenticatedQueueIdentity(
+            commitIdentity,
+            forUserID: local,
+            commitAdmission: commitAdmission
         )
         let validated = try validateConversation(
             dto,
@@ -1163,16 +1432,9 @@ actor SecureMessagingExchangeCoordinator {
         else {
             throw SecureMessagingExchangeError.invalidConversation
         }
-        if let commitAdmission,
-           !ProtectedCommunicationAdmissionGate.shared.permits(commitAdmission) {
-            throw CancellationError()
-        }
-
         let projection = validated.localProjection
         let persist: (inout PersistedState) throws -> Void = { state in
-            guard state.profile?.id.caseInsensitiveCompare(local) == .orderedSame,
-                  state.communicationOwnerUserID?.caseInsensitiveCompare(local) == .orderedSame,
-                  state.secureMessaging?.enrollment?.userID == local
+            guard Self.permitsLocalQueueState(state, userID: local)
             else { throw SecureMessagingExchangeError.invalidAccount }
             let sameID = state.conversations.filter {
                 $0.id.caseInsensitiveCompare(validated.id) == .orderedSame
@@ -1210,6 +1472,11 @@ actor SecureMessagingExchangeCoordinator {
                 state.conversations.append(projection)
             }
         }
+        try requireAuthenticatedQueueIdentity(
+            commitIdentity,
+            forUserID: local,
+            commitAdmission: commitAdmission
+        )
         if let commitAdmission {
             try await store.update(admission: commitAdmission, persist)
         } else {
@@ -1217,12 +1484,12 @@ actor SecureMessagingExchangeCoordinator {
         }
 
         let snapshot = await store.snapshot()
-        guard commitAdmission.map({
-            ProtectedCommunicationAdmissionGate.shared.permits($0)
-        }) ?? true,
-              snapshot.profile?.id.caseInsensitiveCompare(local) == .orderedSame,
-              snapshot.communicationOwnerUserID?.caseInsensitiveCompare(local) == .orderedSame,
-              snapshot.secureMessaging?.enrollment?.userID == local
+        try requireAuthenticatedQueueIdentity(
+            commitIdentity,
+            forUserID: local,
+            commitAdmission: commitAdmission
+        )
+        guard Self.permitsLocalQueueState(snapshot, userID: local)
         else { throw CancellationError() }
         let matches = snapshot.conversations.filter {
             $0.id.caseInsensitiveCompare(validated.id) == .orderedSame
@@ -1766,38 +2033,35 @@ actor SecureMessagingExchangeCoordinator {
         recipientUserID: String,
         title: String,
         text: String,
-        clientMessageID: UUID? = nil
+        clientMessageID: UUID? = nil,
+        commitAdmission: ProtectedCommunicationAdmissionLease? = nil
     ) async throws -> SecureMessagingQueueResult {
         let recipient = try canonicalUUID(recipientUserID, error: .invalidRecipient)
         let local = try canonicalUUID(userID, error: .invalidAccount)
         guard recipient != local else { throw SecureMessagingExchangeError.invalidRecipient }
-        let dto = try await transport.createDirectMessagingConversation(
-            try CreateDirectMessagingConversationRequest(memberId: recipient)
-        )
-        let validated = try validateConversation(
-            dto,
-            currentUserID: local,
-            expectedRecipientUserID: recipient,
-            fallbackTitle: title
-        )
-        let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let clientMessageID,
-           let existing = try Self.existingDeferredTextResult(
-               in: await store.snapshot(),
-               clientMessageID: clientMessageID,
-               localUserID: local,
-               recipientUserIDs: [recipient],
-               conversation: validated.localProjection,
-               body: body,
-               scheduledAt: nil
-           ) {
-            return existing
-        }
-        return try await queueText(
+        let queueIdentity = try authenticatedQueueIdentity(
             forUserID: local,
-            conversation: validated,
-            text: body,
-            newClientMessageID: clientMessageID
+            commitAdmission: commitAdmission
+        )
+        let conversation = try await ensureDirectConversation(
+            forUserID: local,
+            recipientUserID: recipient,
+            title: title,
+            commitAdmission: commitAdmission
+        )
+        try requireAuthenticatedQueueIdentity(
+            queueIdentity,
+            forUserID: local,
+            commitAdmission: commitAdmission
+        )
+        return try await queueDeferredText(
+            forUserID: local,
+            conversationID: conversation.id,
+            expectedRecipientUserID: recipient,
+            title: title,
+            text: text,
+            clientMessageID: clientMessageID,
+            commitAdmission: commitAdmission
         )
     }
 
@@ -1858,6 +2122,10 @@ actor SecureMessagingExchangeCoordinator {
             throw SecureMessagingCryptoError.invalidContent
         }
         let local = try canonicalUUID(userID, error: .invalidAccount)
+        let queueIdentity = try authenticatedQueueIdentity(
+            forUserID: local,
+            commitAdmission: commitAdmission
+        )
         let conversationID = try canonicalUUID(conversationID, error: .invalidConversation)
         let recipient = try expectedRecipientUserID.map {
             try canonicalUUID($0, error: .invalidRecipient)
@@ -1897,6 +2165,11 @@ actor SecureMessagingExchangeCoordinator {
         else { throw SecureMessagingCryptoError.invalidContent }
         let replyTarget = replyToServerMessageID?.lowercased()
         let snapshot = await store.snapshot()
+        try requireAuthenticatedQueueIdentity(
+            queueIdentity,
+            forUserID: local,
+            commitAdmission: commitAdmission
+        )
         guard Self.permitsLocalQueueState(snapshot, userID: local),
               let conversation = snapshot.conversations.first(where: {
                   $0.id == conversationID
@@ -1955,6 +2228,11 @@ actor SecureMessagingExchangeCoordinator {
                 submittedDraftBody: submittedDraftBody,
                 submittedDraftMediaAttachments: submittedDraftMediaAttachments,
                 draftClearVersion: draftClearVersion,
+                commitAdmission: commitAdmission
+            )
+            try requireAuthenticatedQueueIdentity(
+                queueIdentity,
+                forUserID: local,
                 commitAdmission: commitAdmission
             )
             return existing
@@ -2033,6 +2311,11 @@ actor SecureMessagingExchangeCoordinator {
                 }
         }
         do {
+            try requireAuthenticatedQueueIdentity(
+                queueIdentity,
+                forUserID: local,
+                commitAdmission: commitAdmission
+            )
             if let commitAdmission {
                 try await store.update(admission: commitAdmission, commitMutation)
             } else {
@@ -2044,6 +2327,11 @@ actor SecureMessagingExchangeCoordinator {
             // idempotency receipt; any non-identical collision still fails closed.
             if let clientMessageID {
                 let raced = await store.snapshot()
+                try requireAuthenticatedQueueIdentity(
+                    queueIdentity,
+                    forUserID: local,
+                    commitAdmission: commitAdmission
+                )
                 guard Self.permitsLocalQueueState(raced, userID: local),
                       let racedConversation = raced.conversations.first(where: {
                           $0.id == conversationID
@@ -2076,6 +2364,11 @@ actor SecureMessagingExchangeCoordinator {
                     draftClearVersion: draftClearVersion,
                     commitAdmission: commitAdmission
                 )
+                try requireAuthenticatedQueueIdentity(
+                    queueIdentity,
+                    forUserID: local,
+                    commitAdmission: commitAdmission
+                )
                 return existing
             }
             throw StoreError.accountChanged
@@ -2095,8 +2388,12 @@ actor SecureMessagingExchangeCoordinator {
     ) -> Bool {
         if let recipient = expectedRecipientUserID {
             // A pinned single peer is exclusively a DIRECT contract — even a two-member group
-            // must be addressed as a group so its roster/attestation semantics apply.
-            return !conversation.isGroup
+            // must be addressed as a group so its roster/attestation semantics apply. Legacy nil
+            // remains direct, but an unknown future type is never downgraded merely because it is
+            // not spelled "group".
+            return (conversation.conversationType == nil
+                    || conversation.conversationType
+                        == SecureMessagingWire.directConversationType)
                 && conversation.participantUserIds.count == 2
                 && Set(conversation.participantUserIds) == Set([localUserID, recipient])
         }
@@ -2120,6 +2417,47 @@ actor SecureMessagingExchangeCoordinator {
         }
         guard let owner = state.communicationOwnerUserID else { return true }
         return owner.caseInsensitiveCompare(userID) == .orderedSame
+    }
+
+    /// A process-wide queue commit must carry the same account generation, authenticated session,
+    /// and protected-store lease captured by AppModel. The lease is checked again atomically by
+    /// SecureLocalStore, while this identity check prevents callers from supplying a valid lease
+    /// outside the task-local session that owns it. Injected test coordinators retain their
+    /// intentionally unbound behavior unless a lease is explicitly supplied.
+    private func authenticatedQueueIdentity(
+        forUserID userID: String,
+        commitAdmission: ProtectedCommunicationAdmissionLease?
+    ) throws -> SecureMessagingActivationIdentity? {
+        guard requiresAuthenticatedActivationScope || commitAdmission != nil else { return nil }
+        guard let commitAdmission,
+              let scope = SecureMessagingActivationBinding.scope,
+              scope.commitAdmission == commitAdmission
+        else { throw SecureMessagingActivationError.accountChanged }
+        let identity = try SecureMessagingActivationIdentity.current(
+            userID: userID,
+            requiresAuthenticatedScope: true
+        )
+        guard identity.userID == userID,
+              ProtectedCommunicationAdmissionGate.shared.permits(commitAdmission)
+        else { throw CancellationError() }
+        return identity
+    }
+
+    private func requireAuthenticatedQueueIdentity(
+        _ expectedIdentity: SecureMessagingActivationIdentity?,
+        forUserID userID: String,
+        commitAdmission: ProtectedCommunicationAdmissionLease?
+    ) throws {
+        guard let expectedIdentity else { return }
+        if let commitAdmission,
+           !ProtectedCommunicationAdmissionGate.shared.permits(commitAdmission) {
+            throw CancellationError()
+        }
+        let currentIdentity = try authenticatedQueueIdentity(
+            forUserID: userID,
+            commitAdmission: commitAdmission
+        )
+        guard currentIdentity == expectedIdentity else { throw CancellationError() }
     }
 
     /// Rich media requires EVERY receiving member's devices to be attested — one stale member
@@ -3479,7 +3817,7 @@ actor SecureMessagingExchangeCoordinator {
         message: LocalMessage,
         forUserID userID: String
     ) async throws {
-        try await store.update { state in
+        try await updateStoreForMessagingWork(forUserID: userID) { state in
             guard state.profile?.id == userID,
                   let indices = Self.exactPendingProjectionIndices(
                       in: state,
@@ -3499,6 +3837,7 @@ actor SecureMessagingExchangeCoordinator {
         forUserID userID: String
     ) async throws -> SecureMessagingQueueResult {
         let local = try canonicalUUID(userID, error: .invalidAccount)
+        _ = try claimMessagingScope(forUserID: local)
         let mediaDiagnosticsProducerScope = await LocalMediaPerformanceMonitor.shared
             .captureProducerScope()
         let snapshot = await store.snapshot()
@@ -3614,7 +3953,7 @@ actor SecureMessagingExchangeCoordinator {
                 // binding for every device-capability decision below. Reading the opening
                 // snapshot's enrollment here used to strand voice/video/document commands
                 // forever when the composer queued them during key recovery.
-                let activated = try await activation.activate(forUserID: local)
+                let activated = try await activateMessagingState(forUserID: local)
                 guard let enrollment = activated.enrollment, enrollment.userID == local else {
                     throw SecureMessagingExchangeError.invalidAccount
                 }
@@ -3789,7 +4128,7 @@ actor SecureMessagingExchangeCoordinator {
                 else { throw SecureMediaAttachmentError.invalidMedia }
                 // Activation precedes the admission gate so a rotated device enrollment is
                 // attested first and the gate judges the device that actually uploads.
-                let activated = try await activation.activate(forUserID: local)
+                let activated = try await activateMessagingState(forUserID: local)
                 guard let enrollment = activated.enrollment, enrollment.userID == local
                 else { throw SecureMessagingExchangeError.invalidAccount }
                 // §7: a capability withdrawn after queue fails the whole message closed before
@@ -4268,7 +4607,7 @@ actor SecureMessagingExchangeCoordinator {
             expectedRecipientUserID: recipient,
             fallbackTitle: title
         )
-        _ = try await activation.activate(forUserID: local)
+        _ = try await activateMessagingState(forUserID: local)
         if KitChatMediaKind(mediaType: mediaType) != .image
             || mediaData.count
                 > MessagingRichMediaCapabilityPolicy.broadlyCompatibleMaximumPlaintextBytes {
@@ -4952,7 +5291,7 @@ actor SecureMessagingExchangeCoordinator {
         message: LocalMessage,
         forUserID userID: String
     ) async throws -> LocalMessage {
-        try await store.update { state in
+        try await updateStoreForMessagingWork(forUserID: userID) { state in
             guard state.profile?.id == userID,
                   let indices = Self.exactPendingProjectionIndices(
                       in: state,
@@ -5278,7 +5617,7 @@ actor SecureMessagingExchangeCoordinator {
                 forUserID: userID
             )
         }
-        _ = try await activation.activate(forUserID: userID)
+        _ = try await activateMessagingState(forUserID: userID)
         let clientMessageID = existingMessageID ?? newClientMessageID ?? UUID()
         let commandID = existingCommandID ?? UUID()
         let canonicalClientMessageID = clientMessageID.uuidString.lowercased()
@@ -5511,7 +5850,8 @@ actor SecureMessagingExchangeCoordinator {
                 try await store.commitSecureMessaging(
                     forUserID: userID,
                     expectedState: initialCrypto,
-                    nextState: nextCrypto
+                    nextState: nextCrypto,
+                    admission: try messagingCommitAdmission(forUserID: userID)
                 ) { state in
                     Self.upsert(conversation: queuedConversation, in: &state)
                     if existingMessageID != nil {
@@ -5559,6 +5899,7 @@ actor SecureMessagingExchangeCoordinator {
         forUserID userID: String
     ) async throws -> EncryptedMessageDTO {
         let userID = try canonicalUUID(userID, error: .invalidAccount)
+        _ = try claimMessagingScope(forUserID: userID)
         let snapshot = await store.snapshot()
         guard snapshot.profile?.id == userID,
               let command = snapshot.outbox.first(where: {
@@ -5595,7 +5936,7 @@ actor SecureMessagingExchangeCoordinator {
                 userID: userID,
                 enrollment: snapshot.secureMessaging?.enrollment
             )
-            try await store.update { state in
+            try await updateStoreForMessagingWork(forUserID: userID) { state in
                 guard state.profile?.id == userID,
                       let indices = Self.exactPendingProjectionIndices(
                           in: state,
@@ -5825,7 +6166,7 @@ actor SecureMessagingExchangeCoordinator {
         message: LocalMessage,
         userID: String
     ) async throws {
-        try await store.update { state in
+        try await updateStoreForMessagingWork(forUserID: userID) { state in
             guard state.profile?.id == userID,
                   let indices = Self.exactPendingProjectionIndices(
                       in: state,
@@ -5849,7 +6190,7 @@ actor SecureMessagingExchangeCoordinator {
         message: LocalMessage,
         userID: String
     ) async throws {
-        try await store.update { state in
+        try await updateStoreForMessagingWork(forUserID: userID) { state in
             guard state.profile?.id == userID,
                   let indices = Self.exactPendingProjectionIndices(
                       in: state,
@@ -5901,7 +6242,7 @@ actor SecureMessagingExchangeCoordinator {
             &reopenedMessage,
             descriptor: descriptor
         ) else { throw SecureMessagingExchangeError.messageNotRetryable }
-        try await store.update { state in
+        try await updateStoreForMessagingWork(forUserID: userID) { state in
             guard state.profile?.id == userID,
                   let indices = Self.exactPendingProjectionIndices(
                       in: state,
@@ -5957,7 +6298,7 @@ actor SecureMessagingExchangeCoordinator {
             &reopened,
             descriptor: descriptor
         ) else { throw SecureMessagingExchangeError.messageNotRetryable }
-        try await store.update { state in
+        try await updateStoreForMessagingWork(forUserID: userID) { state in
             guard state.profile?.id == userID,
                   let indices = Self.exactPendingProjectionIndices(
                       in: state,
@@ -5979,6 +6320,7 @@ actor SecureMessagingExchangeCoordinator {
         message: LocalMessage,
         forUserID userID: String
     ) async throws {
+        _ = try messagingCommitAdmission(forUserID: userID)
         let snapshot = await store.snapshot()
         guard snapshot.profile?.id == userID,
               Self.exactPendingProjectionIndices(
@@ -6016,33 +6358,140 @@ actor SecureMessagingExchangeCoordinator {
     }
 
     func sync(forUserID userID: String) async throws -> SecureMessagingSyncResult {
-        let userID = try canonicalUUID(userID, error: .invalidAccount)
-        if let syncTask {
-            guard syncUserID == userID else {
-                throw SecureMessagingExchangeError.invalidAccount
-            }
-            return try await syncTask.value
+        try await SecureMessagingActivationBinding.withIsolatedUnboundScopeIfNeeded(
+            requiresAuthenticatedScope: requiresAuthenticatedActivationScope
+        ) {
+            try await self.syncInCurrentScope(forUserID: userID)
         }
+    }
+
+    private func syncInCurrentScope(
+        forUserID userID: String
+    ) async throws -> SecureMessagingSyncResult {
+        let userID = try canonicalUUID(userID, error: .invalidAccount)
+        let identity = try claimMessagingScope(forUserID: userID)
+        if let syncTask {
+            if syncIdentity == identity {
+                let generation = syncGeneration
+                do {
+                    let result = try await syncTask.value
+                    guard syncGeneration == generation else { throw CancellationError() }
+                    return result
+                } catch {
+                    guard syncGeneration == generation else { throw CancellationError() }
+                    throw error
+                }
+            }
+            syncTask.cancel()
+        }
+        syncGeneration &+= 1
+        let generation = syncGeneration
         let task = Task { [weak self] in
             guard let self else { throw CancellationError() }
             return try await self.performSync(forUserID: userID)
         }
-        syncUserID = userID
+        syncIdentity = identity
         syncTask = task
         do {
             let result = try await task.value
-            syncTask = nil
-            syncUserID = nil
+            guard SecureMessagingScopedWorkFence.accepts(
+                expectedIdentity: identity,
+                expectedGeneration: generation,
+                currentIdentity: syncIdentity,
+                currentGeneration: syncGeneration
+            ) else { throw CancellationError() }
+            clearSyncIfCurrent(identity, generation: generation)
             return result
         } catch {
-            syncTask = nil
-            syncUserID = nil
+            guard SecureMessagingScopedWorkFence.accepts(
+                expectedIdentity: identity,
+                expectedGeneration: generation,
+                currentIdentity: syncIdentity,
+                currentGeneration: syncGeneration
+            ) else { throw CancellationError() }
+            clearSyncIfCurrent(identity, generation: generation)
             throw error
         }
     }
 
+    private func messagingWorkIdentity(
+        forUserID userID: String
+    ) throws -> SecureMessagingActivationIdentity {
+        return try SecureMessagingActivationIdentity.current(
+            userID: userID,
+            requiresAuthenticatedScope: requiresAuthenticatedActivationScope
+        )
+    }
+
+    private func messagingCommitAdmission(
+        forUserID userID: String
+    ) throws -> ProtectedCommunicationAdmissionLease? {
+        try Task.checkCancellation()
+        guard let admission = SecureMessagingActivationBinding.scope?.commitAdmission else {
+            return nil
+        }
+        guard admission.accountID == userID,
+              ProtectedCommunicationAdmissionGate.shared.permits(admission)
+        else { throw CancellationError() }
+        return admission
+    }
+
+    @discardableResult
+    private func claimMessagingScope(
+        forUserID userID: String
+    ) throws -> SecureMessagingActivationIdentity {
+        let identity = try messagingWorkIdentity(forUserID: userID)
+        cancelSync(ifOwnedByDifferentScopeThan: identity)
+        invalidateHistoryFlush(ifOwnedByDifferentScopeThan: identity)
+        cancelHistoryContinuation(ifOwnedByDifferentScopeThan: identity)
+        return identity
+    }
+
+    private func updateStoreForMessagingWork(
+        forUserID userID: String,
+        _ mutation: (inout PersistedState) throws -> Void
+    ) async throws {
+        if let admission = try messagingCommitAdmission(forUserID: userID) {
+            try await store.update(admission: admission, mutation)
+        } else {
+            try await store.update(mutation)
+        }
+    }
+
+    private func cancelSync(
+        ifOwnedByDifferentScopeThan identity: SecureMessagingActivationIdentity
+    ) {
+        guard let syncIdentity, syncIdentity != identity else { return }
+        syncGeneration &+= 1
+        syncTask?.cancel()
+        syncTask = nil
+        self.syncIdentity = nil
+    }
+
+    private func clearSyncIfCurrent(
+        _ identity: SecureMessagingActivationIdentity,
+        generation: UInt64
+    ) {
+        guard SecureMessagingScopedWorkFence.accepts(
+            expectedIdentity: identity,
+            expectedGeneration: generation,
+            currentIdentity: syncIdentity,
+            currentGeneration: syncGeneration
+        ) else { return }
+        syncTask = nil
+        syncIdentity = nil
+    }
+
+    private func invalidateHistoryFlush(
+        ifOwnedByDifferentScopeThan identity: SecureMessagingActivationIdentity
+    ) {
+        guard let historyFlushIdentity, historyFlushIdentity != identity else { return }
+        historyFlushGeneration &+= 1
+        self.historyFlushIdentity = nil
+    }
+
     private func performSync(forUserID userID: String) async throws -> SecureMessagingSyncResult {
-        _ = try await activation.activate(forUserID: userID)
+        _ = try await activateMessagingState(forUserID: userID)
         var pageCount = 0
         var receivedCount = 0
         var transitionCount = 0
@@ -6078,13 +6527,30 @@ actor SecureMessagingExchangeCoordinator {
     }
 
     private func flushHistoryBackfills(forUserID userID: String) async throws {
-        guard !isFlushingHistory else { return }
-        isFlushingHistory = true
-        defer { isFlushingHistory = false }
+        let identity = try messagingWorkIdentity(forUserID: userID)
+        guard historyFlushIdentity != identity else { return }
+        historyFlushGeneration &+= 1
+        let generation = historyFlushGeneration
+        historyFlushIdentity = identity
+        defer {
+            if SecureMessagingScopedWorkFence.accepts(
+                expectedIdentity: identity,
+                expectedGeneration: generation,
+                currentIdentity: historyFlushIdentity,
+                currentGeneration: historyFlushGeneration
+            ) {
+                historyFlushIdentity = nil
+            }
+        }
 
         var reconciliationNeedsRetry = false
         do {
-            try await reconcileHistoryBackfillTargetsIfNeeded(forUserID: userID)
+            try await reconcileHistoryBackfillTargetsIfNeeded(
+                forUserID: userID,
+                identity: identity,
+                generation: generation
+            )
+            try requireCurrentHistoryFlush(identity: identity, generation: generation)
         } catch is CancellationError {
             throw CancellationError()
         } catch let error as SecureMessagingExchangeError where error == .invalidAccount {
@@ -6100,8 +6566,9 @@ actor SecureMessagingExchangeCoordinator {
             batchSize: 4
         )
         while drain.workUnits < drain.maximumWorkUnits {
-            try Task.checkCancellation()
+            try requireCurrentHistoryFlush(identity: identity, generation: generation)
             let snapshot = await store.snapshot()
+            try requireCurrentHistoryFlush(identity: identity, generation: generation)
             guard snapshot.profile?.id == userID,
                   let crypto = snapshot.secureMessaging,
                   let enrollment = crypto.enrollment,
@@ -6129,11 +6596,14 @@ actor SecureMessagingExchangeCoordinator {
                     task,
                     userID: userID
                 )
+                try requireCurrentHistoryFlush(identity: identity, generation: generation)
                 drain.recordAttempt(of: task, madeProgress: madeProgress)
             }
         }
 
+        try requireCurrentHistoryFlush(identity: identity, generation: generation)
         let finalSnapshot = await store.snapshot()
+        try requireCurrentHistoryFlush(identity: identity, generation: generation)
         guard finalSnapshot.profile?.id == userID,
               let finalCrypto = finalSnapshot.secureMessaging,
               finalCrypto.enrollment?.userID == userID
@@ -6143,6 +6613,19 @@ actor SecureMessagingExchangeCoordinator {
             pending: reconciliationNeedsRetry || !finalCrypto.historyBackfillTasks.isEmpty,
             madeProgress: drain.madeProgress
         )
+    }
+
+    private func requireCurrentHistoryFlush(
+        identity: SecureMessagingActivationIdentity,
+        generation: UInt64
+    ) throws {
+        try Task.checkCancellation()
+        guard SecureMessagingScopedWorkFence.accepts(
+            expectedIdentity: identity,
+            expectedGeneration: generation,
+            currentIdentity: historyFlushIdentity,
+            currentGeneration: historyFlushGeneration
+        ) else { throw CancellationError() }
     }
 
     private func reconcileHistoryContinuation(
@@ -6167,17 +6650,28 @@ actor SecureMessagingExchangeCoordinator {
         forUserID userID: String,
         delayNanoseconds: UInt64
     ) {
+        guard let identity = try? messagingWorkIdentity(forUserID: userID) else {
+            cancelHistoryContinuation()
+            return
+        }
+        if let runningIdentity = runningHistoryContinuationIdentity,
+           runningIdentity != identity {
+            runningHistoryContinuationTask?.cancel()
+            runningHistoryContinuationTask = nil
+            runningHistoryContinuationIdentity = nil
+            runningHistoryContinuationGeneration = nil
+        }
         if let existing = historyContinuationTask {
-            let replacesAnotherAccount = historyContinuationUserID != userID
+            let replacesAnotherScope = historyContinuationIdentity != identity
             let expeditesRetry = delayNanoseconds == 0
                 && (historyContinuationDelayNanoseconds ?? 0) > 0
-            guard replacesAnotherAccount || expeditesRetry else { return }
+            guard replacesAnotherScope || expeditesRetry else { return }
             existing.cancel()
         }
 
         historyContinuationGeneration &+= 1
         let generation = historyContinuationGeneration
-        historyContinuationUserID = userID
+        historyContinuationIdentity = identity
         historyContinuationDelayNanoseconds = delayNanoseconds
         historyContinuationTask = Task { [weak self] in
             do {
@@ -6193,54 +6687,144 @@ actor SecureMessagingExchangeCoordinator {
             guard let self else { return }
             await self.runScheduledHistoryContinuation(
                 forUserID: userID,
+                identity: identity,
                 generation: generation
             )
         }
     }
 
+#if DEBUG
+    /// Exercises the real delayed-task ownership path without making production retry timing a
+    /// test dependency. The unit test still replaces the scope through the public activation API.
+    func scheduleHistoryContinuationForTesting(
+        forUserID userID: String,
+        delayNanoseconds: UInt64
+    ) {
+        scheduleHistoryContinuation(
+            forUserID: userID,
+            delayNanoseconds: delayNanoseconds
+        )
+    }
+
+    func historyContinuationOwnershipForTesting() -> (scheduled: Bool, running: Bool) {
+        (historyContinuationTask != nil, runningHistoryContinuationTask != nil)
+    }
+#endif
+
     private func cancelHistoryContinuation() {
         historyContinuationGeneration &+= 1
         historyContinuationTask?.cancel()
+        runningHistoryContinuationTask?.cancel()
         historyContinuationTask = nil
-        historyContinuationUserID = nil
+        historyContinuationIdentity = nil
         historyContinuationDelayNanoseconds = nil
+        runningHistoryContinuationTask = nil
+        runningHistoryContinuationIdentity = nil
+        runningHistoryContinuationGeneration = nil
+    }
+
+    private func cancelHistoryContinuation(
+        ifOwnedByDifferentScopeThan identity: SecureMessagingActivationIdentity
+    ) {
+        let scheduledIsStale = historyContinuationIdentity.map({ $0 != identity }) ?? false
+        let runningIsStale = runningHistoryContinuationIdentity.map({ $0 != identity }) ?? false
+        if scheduledIsStale || runningIsStale { cancelHistoryContinuation() }
+    }
+
+    private func beginRunningHistoryContinuation(
+        identity: SecureMessagingActivationIdentity,
+        generation: UInt64
+    ) -> Bool {
+        guard SecureMessagingScopedWorkFence.accepts(
+                  expectedIdentity: identity,
+                  expectedGeneration: generation,
+                  currentIdentity: historyContinuationIdentity,
+                  currentGeneration: historyContinuationGeneration
+              ),
+              let task = historyContinuationTask,
+              !task.isCancelled
+        else { return false }
+        historyContinuationTask = nil
+        historyContinuationIdentity = nil
+        historyContinuationDelayNanoseconds = nil
+        runningHistoryContinuationTask = task
+        runningHistoryContinuationIdentity = identity
+        runningHistoryContinuationGeneration = generation
+        return true
+    }
+
+    @discardableResult
+    private func clearRunningHistoryContinuationIfCurrent(
+        identity: SecureMessagingActivationIdentity,
+        generation: UInt64
+    ) -> Bool {
+        guard let currentGeneration = runningHistoryContinuationGeneration,
+              SecureMessagingScopedWorkFence.accepts(
+                  expectedIdentity: identity,
+                  expectedGeneration: generation,
+                  currentIdentity: runningHistoryContinuationIdentity,
+                  currentGeneration: currentGeneration
+              )
+        else { return false }
+        runningHistoryContinuationTask = nil
+        runningHistoryContinuationIdentity = nil
+        runningHistoryContinuationGeneration = nil
+        return true
     }
 
     private func runScheduledHistoryContinuation(
         forUserID userID: String,
+        identity: SecureMessagingActivationIdentity,
         generation: UInt64
     ) async {
-        guard historyContinuationGeneration == generation,
-              historyContinuationUserID == userID
-        else { return }
-        if isFlushingHistory {
+        guard beginRunningHistoryContinuation(
+            identity: identity,
+            generation: generation
+        ), !Task.isCancelled else { return }
+        if let flushingIdentity = historyFlushIdentity {
             // A foreground sync can enter the bounded drain while this continuation is sleeping.
             // Keep one delayed fallback until that in-flight drain either cancels it, expedites it
             // after progress, or fails; never spin actor jobs while its network awaits are pending.
-            historyContinuationTask = nil
-            historyContinuationUserID = nil
-            historyContinuationDelayNanoseconds = nil
-            scheduleHistoryContinuation(
-                forUserID: userID,
-                delayNanoseconds:
-                    SecureMessagingHistoryContinuationPolicy.failureRetryNanoseconds
+            let stillOwnsRun = clearRunningHistoryContinuationIfCurrent(
+                identity: identity,
+                generation: generation
             )
+            if flushingIdentity == identity, stillOwnsRun {
+                scheduleHistoryContinuation(
+                    forUserID: userID,
+                    delayNanoseconds:
+                        SecureMessagingHistoryContinuationPolicy.failureRetryNanoseconds
+                )
+            }
             return
         }
-        historyContinuationTask = nil
-        historyContinuationUserID = nil
-        historyContinuationDelayNanoseconds = nil
         do {
             try await flushHistoryBackfills(forUserID: userID)
+            clearRunningHistoryContinuationIfCurrent(
+                identity: identity,
+                generation: generation
+            )
         } catch is CancellationError {
+            clearRunningHistoryContinuationIfCurrent(
+                identity: identity,
+                generation: generation
+            )
             return
         } catch let error as SecureMessagingExchangeError where error == .invalidAccount {
+            clearRunningHistoryContinuationIfCurrent(
+                identity: identity,
+                generation: generation
+            )
             return
         } catch {
             let snapshot = await store.snapshot()
             let stillPending = snapshot.profile?.id == userID
                 && snapshot.secureMessaging?.enrollment?.userID == userID
                 && !(snapshot.secureMessaging?.historyBackfillTasks.isEmpty ?? true)
+            guard clearRunningHistoryContinuationIfCurrent(
+                identity: identity,
+                generation: generation
+            ) else { return }
             reconcileHistoryContinuation(
                 forUserID: userID,
                 pending: stillPending,
@@ -6355,7 +6939,8 @@ actor SecureMessagingExchangeCoordinator {
                 try await store.commitSecureMessaging(
                     forUserID: userID,
                     expectedState: initial,
-                    nextState: next
+                    nextState: next,
+                    admission: try messagingCommitAdmission(forUserID: userID)
                 )
                 return
             } catch SecureMessagingCryptoError.staleState {
@@ -6397,15 +6982,21 @@ actor SecureMessagingExchangeCoordinator {
     }
 
     private func reconcileHistoryBackfillTargetsIfNeeded(
-        forUserID userID: String
+        forUserID userID: String,
+        identity: SecureMessagingActivationIdentity,
+        generation: UInt64
     ) async throws {
+        try requireCurrentHistoryFlush(identity: identity, generation: generation)
         let snapshot = await store.snapshot()
         guard snapshot.profile?.id == userID,
               let initial = snapshot.secureMessaging,
               let enrollment = initial.enrollment,
               enrollment.userID == userID
         else { throw SecureMessagingExchangeError.invalidAccount }
-        if historyReconciledEnrollment == enrollment { return }
+        if historyReconciledIdentity == identity,
+           historyReconciledEnrollment == enrollment {
+            return
+        }
 
         let response = try await transport.messagingConversations()
         guard let rawItems = response.items,
@@ -6474,6 +7065,8 @@ actor SecureMessagingExchangeCoordinator {
                 currentDeviceID: enrollment.serverDeviceID
             )
             if next == currentCrypto {
+                try requireCurrentHistoryFlush(identity: identity, generation: generation)
+                historyReconciledIdentity = identity
                 historyReconciledEnrollment = enrollment
                 return
             }
@@ -6481,8 +7074,11 @@ actor SecureMessagingExchangeCoordinator {
                 try await store.commitSecureMessaging(
                     forUserID: userID,
                     expectedState: currentCrypto,
-                    nextState: next
+                    nextState: next,
+                    admission: try messagingCommitAdmission(forUserID: userID)
                 )
+                try requireCurrentHistoryFlush(identity: identity, generation: generation)
+                historyReconciledIdentity = identity
                 historyReconciledEnrollment = enrollment
                 return
             } catch SecureMessagingCryptoError.staleState {
@@ -6894,7 +7490,8 @@ actor SecureMessagingExchangeCoordinator {
                 try await store.commitSecureMessaging(
                     forUserID: userID,
                     expectedState: initialCrypto,
-                    nextState: nextCrypto
+                    nextState: nextCrypto,
+                    admission: try messagingCommitAdmission(forUserID: userID)
                 ) { state in
                     guard try Self.validatedHistorySource(
                         candidate,
@@ -6994,7 +7591,8 @@ actor SecureMessagingExchangeCoordinator {
                 try await store.commitSecureMessaging(
                     forUserID: userID,
                     expectedState: initialCrypto,
-                    nextState: nextCrypto
+                    nextState: nextCrypto,
+                    admission: try messagingCommitAdmission(forUserID: userID)
                 )
                 return
             } catch SecureMessagingCryptoError.staleState {
@@ -7060,7 +7658,8 @@ actor SecureMessagingExchangeCoordinator {
                 try await store.commitSecureMessaging(
                     forUserID: userID,
                     expectedState: initialCrypto,
-                    nextState: nextCrypto
+                    nextState: nextCrypto,
+                    admission: try messagingCommitAdmission(forUserID: userID)
                 )
                 return
             } catch SecureMessagingCryptoError.staleState {
@@ -8088,7 +8687,8 @@ actor SecureMessagingExchangeCoordinator {
                 try await store.commitSecureMessaging(
                     forUserID: userID,
                     expectedState: initialCrypto,
-                    nextState: crypto
+                    nextState: crypto,
+                    admission: try messagingCommitAdmission(forUserID: userID)
                 ) { state in
                     // Server conversation timestamps can advance for reaction-only events. Sync
                     // the title/roster here, then derive visible activity exclusively from the
@@ -8352,6 +8952,7 @@ actor SecureMessagingExchangeCoordinator {
                 // Reconcile current same-account targets again before this sync finishes so the
                 // newly retained message can continue to every enrolled device.
                 if shouldReconcileHistoryTargets || !recoveredHistoryMessages.isEmpty {
+                    historyReconciledIdentity = nil
                     historyReconciledEnrollment = nil
                 }
                 return SecureMessagingSyncResult(
@@ -8402,7 +9003,8 @@ actor SecureMessagingExchangeCoordinator {
                 try await store.commitSecureMessaging(
                     forUserID: userID,
                     expectedState: initialCrypto,
-                    nextState: nextCrypto
+                    nextState: nextCrypto,
+                    admission: try messagingCommitAdmission(forUserID: userID)
                 )
             } catch SecureMessagingCryptoError.staleState {
                 continue

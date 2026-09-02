@@ -92,6 +92,107 @@ enum VisibleConversationMessagingPolicy {
     }
 }
 
+/// Resolves only an unambiguous, server-addressable direct thread for the local-first composer.
+/// A duplicate must never be selected by recency because doing so could bind the message to a
+/// different server conversation than the sender opened.
+enum DirectMessageLocalConversationPolicy {
+    enum Resolution: Equatable {
+        case missing
+        case existing(Conversation)
+        case invalid
+        case ambiguous
+    }
+
+    static func resolve(
+        conversations: [Conversation],
+        currentUserID: String,
+        recipientUserID: String
+    ) -> Resolution {
+        guard SecureMessagingValidation.isCanonicalUUID(currentUserID),
+              SecureMessagingValidation.isCanonicalUUID(recipientUserID),
+              currentUserID != recipientUserID
+        else { return .invalid }
+        let participantIDs = Set([currentUserID, recipientUserID])
+        let structurallyMatching = conversations.filter { conversation in
+            guard SecureMessagingValidation.isCanonicalUUID(conversation.id),
+                  conversation.participantUserIds.count == 2,
+                  conversation.participantUserIds.allSatisfy({
+                      SecureMessagingValidation.isCanonicalUUID($0)
+                  })
+            else { return false }
+            return Set(conversation.participantUserIds) == participantIDs
+        }
+        // `nil` is the backward-compatible encoding written before conversation types became
+        // durable. Every explicit value is server-owned: accepting an unknown non-"group" value
+        // (for example, a future "channel") as a direct thread — or silently creating a second
+        // thread around it — could bind plaintext intent to semantics this client never reviewed.
+        guard !structurallyMatching.contains(where: { conversation in
+            guard let type = conversation.conversationType else { return false }
+            return type != SecureMessagingWire.directConversationType
+                && type != SecureMessagingWire.groupConversationType
+        }) else { return .invalid }
+        let matches = structurallyMatching.filter {
+            $0.conversationType == nil
+                || $0.conversationType == SecureMessagingWire.directConversationType
+        }
+        switch matches.count {
+        case 0: return .missing
+        case 1: return .existing(matches[0])
+        default: return .ambiguous
+        }
+    }
+}
+
+/// Pure admission and routing decisions shared by the new-message UI and AppModel. Keeping this
+/// boundary free of network or singleton state makes the local-first invariant executable: a
+/// missing current E2EE enrollment never disables composition, while a known privacy block and
+/// an ambiguous/unknown local thread still fail before any queue mutation.
+enum NewMessageComposerPolicy {
+    enum DirectRoute: Equatable {
+        case create
+        case existing(Conversation)
+        case blocked
+        case invalid
+    }
+
+    static func canSubmit(
+        appMutationsAllowed: Bool,
+        localQueueAvailable: Bool,
+        body: String
+    ) -> Bool {
+        appMutationsAllowed
+            && localQueueAvailable
+            && !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    static func directRoute(
+        conversations: [Conversation],
+        currentUserID: String,
+        recipientUserID: String,
+        privacyAllowsLocalQueue: Bool
+    ) -> DirectRoute {
+        guard privacyAllowsLocalQueue else { return .blocked }
+        switch DirectMessageLocalConversationPolicy.resolve(
+            conversations: conversations,
+            currentUserID: currentUserID,
+            recipientUserID: recipientUserID
+        ) {
+        case .missing:
+            return .create
+        case .existing(let conversation):
+            return .existing(conversation)
+        case .invalid, .ambiguous:
+            return .invalid
+        }
+    }
+
+    static func navigationConversation(
+        after result: SecureMessagingQueueResult?
+    ) -> Conversation? {
+        result?.conversation
+    }
+}
+
 struct ActiveCallInvitationContext: Equatable {
     let call: CallRecord
     let callID: String
@@ -4504,8 +4605,10 @@ final class AppModel: ObservableObject {
         ) else { return }
 
         do {
-            let created = try await APIClientSessionBinding.$sessionID.withValue(
-                expectedSessionID
+            let created = try await SecureMessagingActivationBinding.withAuthenticatedScope(
+                accountGeneration: expectedAccountEpoch,
+                sessionID: expectedSessionID,
+                commitAdmission: commitAdmission
             ) {
                 try await SecureMessagingExchangeCoordinator.shared.ensureDirectConversation(
                     forUserID: currentUserID,
@@ -8051,7 +8154,15 @@ final class AppModel: ObservableObject {
                 sessionID: expectedSessionID
               )
         else { return }
-        guard await reloadCapabilities() else { return }
+        // Capability discovery governs communication/provider release gates, but it is not an
+        // authority for the authenticated wallet projection. Start it independently so a slow or
+        // failed capability request cannot delay bootstrap or leave Recent activity empty while
+        // the wallet API is healthy. `reloadCapabilities` owns its account/session fence; gated
+        // features remain fail-closed until the task succeeds.
+        let capabilityRefreshTask = Task { @MainActor [weak self] in
+            guard let self else { return false }
+            return await self.reloadCapabilities()
+        }
         guard !Task.isCancelled,
               !isSigningOut,
               isSignedIn,
@@ -8059,10 +8170,9 @@ final class AppModel: ObservableObject {
               accountEpoch == expectedAccountEpoch,
               await sessions.current()?.sessionId == expectedSessionID
         else { return }
-        // Fresh discovery is the earliest safe reconnect boundary for a visible process-only
-        // call attempt. Start its idempotent submission before wallet/bootstrap and history I/O;
-        // cancellation, backgrounding and account replacement still fence the in-memory gate,
-        // and nothing is made durable or replayable after relaunch.
+        // Already-confirmed communication state may resume immediately while discovery refreshes.
+        // Its own feature and identity fences still fail closed, and the post-discovery wake below
+        // catches a feature that becomes available only in the new response.
         resumeEphemeralOutgoingCallIfPossible()
 
         // Wake durable communication work without putting finance behind it. A resumable media
@@ -8165,6 +8275,17 @@ final class AppModel: ObservableObject {
             sessionID: expectedSessionID,
             userID: expectedUserID
         )
+
+        // Communication work uses the newly confirmed capability projection when available, but
+        // it can no longer sit in front of the independent customer-finance refresh above.
+        _ = await capabilityRefreshTask.value
+        guard await callHistoryContextIsCurrent(
+            accountEpoch: expectedAccountEpoch,
+            sessionID: expectedSessionID,
+            userID: expectedUserID
+        ) else { return }
+        resumeEphemeralOutgoingCallIfPossible()
+        scheduleOutboxWake()
 
         // Communication blocks are account-wide authorization state. Refresh them before
         // rebuilding recipient pickers so a stale local contact cannot remain selectable.
@@ -8469,6 +8590,26 @@ final class AppModel: ObservableObject {
               communicationAccessGranted,
               let userID = profile?.id
         else { return .noData }
+        let context: AuthenticatedSecurityContext
+        if let expectedContext {
+            guard expectedContext.userID.caseInsensitiveCompare(userID) == .orderedSame,
+                  await authenticatedSecurityContextIsCurrent(expectedContext)
+            else { return .noData }
+            context = expectedContext
+        } else {
+            guard let session = await sessions.current(),
+                  session.accountId?.caseInsensitiveCompare(userID) == .orderedSame
+            else { return .noData }
+            context = AuthenticatedSecurityContext(
+                accountEpoch: accountEpoch,
+                userID: userID,
+                sessionID: session.sessionId
+            )
+            guard await authenticatedSecurityContextIsCurrent(context) else { return .noData }
+        }
+        guard let communicationAdmission = ProtectedCommunicationAdmissionGate.shared.lease(
+            forAccountID: userID
+        ) else { return .noData }
         let syncAttempt = secureMessagingSyncError.begin()
         do {
             let previousServerMessageIDs: Set<String>
@@ -8479,11 +8620,18 @@ final class AppModel: ObservableObject {
             } else {
                 previousServerMessageIDs = []
             }
-            try await SecureMessagingExchangeCoordinator.shared.activate(forUserID: userID)
-            let result = try await SecureMessagingExchangeCoordinator.shared.sync(forUserID: userID)
+            let result = try await SecureMessagingActivationBinding.withAuthenticatedScope(
+                accountGeneration: context.accountEpoch,
+                sessionID: context.sessionID,
+                commitAdmission: communicationAdmission
+            ) {
+                try await SecureMessagingExchangeCoordinator.shared.activate(forUserID: userID)
+                return try await SecureMessagingExchangeCoordinator.shared.sync(
+                    forUserID: userID
+                )
+            }
             let latestState = await store.snapshot()
-            if let expectedContext,
-               !(await authenticatedSecurityContextIsCurrent(expectedContext)) {
+            if !(await authenticatedSecurityContextIsCurrent(context)) {
                 return .noData
             }
             await publishLatestState()
@@ -8866,8 +9014,10 @@ final class AppModel: ObservableObject {
         ) else { return false }
 
         do {
-            let created = try await APIClientSessionBinding.$sessionID.withValue(
-                expectedSessionID
+            let created = try await SecureMessagingActivationBinding.withAuthenticatedScope(
+                accountGeneration: expectedAccountEpoch,
+                sessionID: expectedSessionID,
+                commitAdmission: commitAdmission
             ) {
                 try await SecureMessagingExchangeCoordinator.shared.ensureDirectConversation(
                     forUserID: currentUserID,
@@ -9196,15 +9346,21 @@ final class AppModel: ObservableObject {
             ), let commitAdmission = ProtectedCommunicationAdmissionGate.shared.lease(
                 forAccountID: currentUserID
             ) else { return false }
-            _ = try await SecureMessagingExchangeCoordinator.shared.queueDeferredText(
-                forUserID: currentUserID,
-                conversationID: conversation.id,
-                expectedRecipientUserID: recipientUserID,
-                title: conversation.title,
-                text: text,
-                clientMessageID: clientMessageID,
+            _ = try await SecureMessagingActivationBinding.withAuthenticatedScope(
+                accountGeneration: expectedAccountEpoch,
+                sessionID: currentSession.sessionId,
                 commitAdmission: commitAdmission
-            )
+            ) {
+                try await SecureMessagingExchangeCoordinator.shared.queueDeferredText(
+                    forUserID: currentUserID,
+                    conversationID: conversation.id,
+                    expectedRecipientUserID: recipientUserID,
+                    title: conversation.title,
+                    text: text,
+                    clientMessageID: clientMessageID,
+                    commitAdmission: commitAdmission
+                )
+            }
             let queuedState = await store.snapshot()
             guard ProtectedCommunicationAdmissionGate.shared.permits(commitAdmission),
                   await outboxContextIsCurrent(
@@ -11544,6 +11700,8 @@ final class AppModel: ObservableObject {
             accountEpoch: expectedAccountEpoch,
             userID: userID,
             sessionID: expectedSessionID
+        ), let commitAdmission = ProtectedCommunicationAdmissionGate.shared.lease(
+            forAccountID: userID
         ) else { return false }
         if let recipientUserID,
            !communicationPrivacyAllowsLocalQueue(to: recipientUserID) {
@@ -11558,19 +11716,26 @@ final class AppModel: ObservableObject {
             return false
         }
         do {
-            _ = try await SecureMessagingExchangeCoordinator.shared.queueDeferredText(
-                forUserID: userID,
-                conversationID: cleanConversationId,
-                expectedRecipientUserID: recipientUserID,
-                title: title,
-                text: trimmed,
-                clientMessageID: clientMessageID,
-                submittedDraftBody: draftClearVersion == nil ? nil : body,
-                submittedDraftMediaAttachments: submittedDraftMediaAttachments,
-                draftClearVersion: draftClearVersion,
-                deliverAt: deliverAt,
-                replyToServerMessageID: replyTarget
-            )
+            _ = try await SecureMessagingActivationBinding.withAuthenticatedScope(
+                accountGeneration: expectedAccountEpoch,
+                sessionID: expectedSessionID,
+                commitAdmission: commitAdmission
+            ) {
+                try await SecureMessagingExchangeCoordinator.shared.queueDeferredText(
+                    forUserID: userID,
+                    conversationID: cleanConversationId,
+                    expectedRecipientUserID: recipientUserID,
+                    title: title,
+                    text: trimmed,
+                    clientMessageID: clientMessageID,
+                    submittedDraftBody: draftClearVersion == nil ? nil : body,
+                    submittedDraftMediaAttachments: submittedDraftMediaAttachments,
+                    draftClearVersion: draftClearVersion,
+                    deliverAt: deliverAt,
+                    replyToServerMessageID: replyTarget,
+                    commitAdmission: commitAdmission
+                )
+            }
             guard await reloadOutboxStateIfCurrent(
                 accountEpoch: expectedAccountEpoch,
                 userID: userID,
@@ -14927,9 +15092,9 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Direct chats must first be created/replayed by the authenticated messaging API so the
-    /// server-issued conversation UUID and authoritative device roster can be encrypted against.
-    /// Keep this boundary explicit; never recreate the old `direct:<user-id>` placeholder.
+    /// A new direct chat first obtains its authenticated server UUID; an existing validated local
+    /// thread needs no network round trip. Both paths commit the bubble and protected outbox row
+    /// before activation or roster work. Never recreate the old `direct:<user-id>` placeholder.
     @discardableResult
     func queueDirectMessage(
         recipientId: String,
@@ -14946,7 +15111,7 @@ final class AppModel: ObservableObject {
         return result != nil
     }
 
-    /// Returns the exact conversation whose encrypted outbox projection is durable locally.
+    /// Returns the exact conversation whose protected outbox projection is durable locally.
     /// New-chat UI uses this result to navigate only after the idempotent queue commit succeeds.
     func queueDirectMessageResult(
         recipientId: String,
@@ -15012,57 +15177,85 @@ final class AppModel: ObservableObject {
             return nil
         }
         let cleanRecipientID = recipientUUID.uuidString.lowercased()
-        if let denial = communicationPrivacyDenialMessage(
-            for: cleanRecipientID,
-            blockedMessage: "Unblock this account before starting a chat."
-        ) {
-            lastError = denial
-            return nil
-        }
-        guard secureMessagingAvailable,
-              let userID = profile?.id,
+        guard secureMessagingLocalQueueAvailable,
+              let rawUserID = profile?.id,
+              let userUUID = UUID(uuidString: rawUserID),
               let expectedSessionID = await sessions.current()?.sessionId
         else {
             lastError = messagingSendFailureMessage
             return nil
         }
+        let userID = userUUID.uuidString.lowercased()
         let expectedAccountEpoch = accountEpoch
         guard await outboxContextIsCurrent(
             accountEpoch: expectedAccountEpoch,
             userID: userID,
             sessionID: expectedSessionID
+        ), let commitAdmission = ProtectedCommunicationAdmissionGate.shared.lease(
+            forAccountID: userID
         ) else { return nil }
+        let existingConversation: Conversation?
+        switch NewMessageComposerPolicy.directRoute(
+            conversations: state.conversations,
+            currentUserID: userID,
+            recipientUserID: cleanRecipientID,
+            privacyAllowsLocalQueue: communicationPrivacyAllowsLocalQueue(
+                to: cleanRecipientID
+            )
+        ) {
+        case .create:
+            existingConversation = nil
+        case .existing(let conversation):
+            existingConversation = conversation
+        case .blocked:
+            lastError = "Unblock this account before starting a chat."
+            return nil
+        case .invalid:
+            lastError = messagingSendFailureMessage
+            return nil
+        }
+        if existingConversation == nil {
+            guard isOnline else {
+                lastError = "Connect to the internet once to start this conversation."
+                return nil
+            }
+            guard secureMessagingReleasePermitted else {
+                lastError = messagingSendFailureMessage
+                return nil
+            }
+            if let denial = communicationPrivacyDenialMessage(
+                for: cleanRecipientID,
+                blockedMessage: "Unblock this account before starting a chat."
+            ) {
+                lastError = denial
+                return nil
+            }
+        }
         do {
             let result: SecureMessagingQueueResult
-            if isOnline {
-                result = try await APIClientSessionBinding.$sessionID.withValue(expectedSessionID) {
-                    try await SecureMessagingExchangeCoordinator.shared.queueDirectText(
+            result = try await SecureMessagingActivationBinding.withAuthenticatedScope(
+                accountGeneration: expectedAccountEpoch,
+                sessionID: expectedSessionID,
+                commitAdmission: commitAdmission
+            ) {
+                if let conversation = existingConversation {
+                    return try await SecureMessagingExchangeCoordinator.shared.queueDeferredText(
                         forUserID: userID,
-                        recipientUserID: cleanRecipientID,
+                        conversationID: conversation.id,
+                        expectedRecipientUserID: cleanRecipientID,
                         title: title,
                         text: trimmed,
-                        clientMessageID: clientMessageID
+                        clientMessageID: clientMessageID,
+                        commitAdmission: commitAdmission
                     )
                 }
-            } else {
-                let recipient = cleanRecipientID
-                let local = UUID(uuidString: userID)?.uuidString.lowercased()
-                guard let local,
-                      let conversation = state.conversations.first(where: {
-                          !$0.isGroup
-                              && Set($0.participantUserIds) == Set([local, recipient])
-                      })
-                else {
-                    lastError = "Connect to the internet once to start this conversation."
-                    return nil
-                }
-                result = try await SecureMessagingExchangeCoordinator.shared.queueDeferredText(
-                    forUserID: local,
-                    conversationID: conversation.id,
-                    expectedRecipientUserID: recipient,
+                return try await SecureMessagingExchangeCoordinator.shared.queueDirectText(
+                    forUserID: userID,
+                    recipientUserID: cleanRecipientID,
                     title: title,
                     text: trimmed,
-                    clientMessageID: clientMessageID
+                    clientMessageID: clientMessageID,
+                    commitAdmission: commitAdmission
                 )
             }
             guard await reloadOutboxStateIfCurrent(
@@ -17425,8 +17618,10 @@ final class AppModel: ObservableObject {
                         guard ProtectedCommunicationAdmissionGate.shared.permits(
                             communicationAdmission
                         ), !isSubmittingAccountDeletion else { return }
-                        _ = try await APIClientSessionBinding.$sessionID.withValue(
-                            expectedSessionID
+                        _ = try await SecureMessagingActivationBinding.withAuthenticatedScope(
+                            accountGeneration: expectedAccountEpoch,
+                            sessionID: expectedSessionID,
+                            commitAdmission: communicationAdmission
                         ) {
                             try await SecureMessagingExchangeCoordinator.shared.prepareDeferredMessage(
                                 commandID: command.id,
@@ -17491,7 +17686,11 @@ final class AppModel: ObservableObject {
                     guard ProtectedCommunicationAdmissionGate.shared.permits(
                         communicationAdmission
                     ), !isSubmittingAccountDeletion else { return }
-                    _ = try await APIClientSessionBinding.$sessionID.withValue(expectedSessionID) {
+                    _ = try await SecureMessagingActivationBinding.withAuthenticatedScope(
+                        accountGeneration: expectedAccountEpoch,
+                        sessionID: expectedSessionID,
+                        commitAdmission: communicationAdmission
+                    ) {
                         try await SecureMessagingExchangeCoordinator.shared.sendQueuedMessage(
                             commandID: command.id,
                             forUserID: expectedUserID

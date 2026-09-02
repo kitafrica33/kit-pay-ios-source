@@ -25,6 +25,9 @@ MESSAGING_API = ROOT / "KitPay/Core/APIClient+Messaging.swift"
 COORDINATOR = ROOT / "KitPay/Core/SecureMessagingCoordinator.swift"
 APP_DELEGATE = ROOT / "KitPay/App/NotificationCoordinator.swift"
 CHAT_MEDIA_VIEWS = ROOT / "KitPay/Features/Messages/ChatMediaViews.swift"
+CHAT_MEDIA_THUMBNAILS = ROOT / "KitPay/Features/Messages/ChatMediaThumbnails.swift"
+CHAT_MEDIA_ALBUM = ROOT / "KitPay/Features/Messages/ChatMediaAlbumGridView.swift"
+MEDIA_LIBRARY = ROOT / "KitPay/Features/Messages/ConversationMediaLibraryView.swift"
 MEDIA_GALLERY = ROOT / "KitPay/Features/Messages/KitMediaGalleryView.swift"
 VIDEO_PLAYBACK = ROOT / "KitPay/Features/Messages/ChatVideoPictureInPicture.swift"
 V2_TESTS = ROOT / "KitPayTests/MediaMessageV2ContractTests.swift"
@@ -108,6 +111,32 @@ class MediaMessageV2SourceContract(unittest.TestCase):
             combined.count("self.protectedOriginalLease = protectedOriginalLease"),
             2,
         )
+
+    def test_every_video_poster_uses_the_validated_canonical_asset_boundary(self) -> None:
+        """A received MOV declared as MP4 must never be probed through its raw `.mp4` URL.
+        Every bubble/grid/gallery path must carry the freshly resolved MIME and byte count into
+        the one policy-backed generator, which also deduplicates overlapping decoder work."""
+        thumbnails = CHAT_MEDIA_THUMBNAILS.read_text(encoding="utf-8")
+        views = CHAT_MEDIA_VIEWS.read_text(encoding="utf-8")
+        album = CHAT_MEDIA_ALBUM.read_text(encoding="utf-8")
+        library = MEDIA_LIBRARY.read_text(encoding="utf-8")
+        gallery = MEDIA_GALLERY.read_text(encoding="utf-8")
+
+        self.assertEqual(thumbnails.count("AVAssetImageGenerator("), 1)
+        self.assertNotIn("AVAssetImageGenerator(", library)
+        self.assertIn("ChatVideoPlaybackAssetPolicy.prepare(", thumbnails)
+        self.assertIn("defer { ChatMediaTempFiles.removeTemporaryFile(sourceURL) }", thumbnails)
+        self.assertIn(
+            "defer { ChatMediaTempFiles.removeTemporaryFile(prepared.temporaryAliasURL) }",
+            thumbnails,
+        )
+        self.assertIn("withExtendedLifetime(protectedOriginalLease)", thumbnails)
+        self.assertIn("private static var inFlight:", thumbnails)
+        self.assertGreaterEqual(thumbnails.count("expectedByteCount: expectedByteCount"), 4)
+        self.assertGreaterEqual(library.count("ChatVideoPosterGenerator.thumbnail("), 2)
+        for call_site in (views, album, library, gallery):
+            self.assertIn("mediaType:", call_site)
+            self.assertIn("expectedByteCount:", call_site)
 
     def test_legacy_received_video_is_file_backed_before_player_presentation(self) -> None:
         """Older installs stored received plaintext as a sealed whole-file blob. Keeping the

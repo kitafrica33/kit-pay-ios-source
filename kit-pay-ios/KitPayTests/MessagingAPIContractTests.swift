@@ -825,6 +825,94 @@ final class MessagingAPIContractTests: XCTestCase {
         XCTAssertEqual(gate.begin(key: contentEdit) { editedDraftID }, editedDraftID)
     }
 
+    func testNewMessageComposerUsesLocalQueueWithoutCurrentEnrollmentAndHonorsPrivacy() {
+        let localUserID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1"
+        let recipientUserID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2"
+        let conversation = Conversation(
+            id: "cccccccc-cccc-4ccc-8ccc-ccccccccccc3",
+            title: "Existing direct thread",
+            participantUserIds: [localUserID, recipientUserID],
+            unreadCount: 0,
+            updatedAt: Date(timeIntervalSince1970: 1_756_800_000),
+            conversationType: SecureMessagingWire.directConversationType
+        )
+
+        // No enrollment is an input: the UI consumes the protected-local-queue gate, whose
+        // release policy is deliberately independent of network discovery and key activation.
+        let localQueueAvailableWithoutEnrollment = SecureMessagingLocalQueueReleasePolicy.permits(
+            buildEnabled: true
+        )
+        XCTAssertTrue(NewMessageComposerPolicy.canSubmit(
+            appMutationsAllowed: true,
+            localQueueAvailable: localQueueAvailableWithoutEnrollment,
+            body: "Visible locally first"
+        ))
+        XCTAssertFalse(NewMessageComposerPolicy.canSubmit(
+            appMutationsAllowed: true,
+            localQueueAvailable: true,
+            body: "  \n "
+        ))
+        XCTAssertEqual(
+            NewMessageComposerPolicy.directRoute(
+                conversations: [conversation],
+                currentUserID: localUserID,
+                recipientUserID: recipientUserID,
+                privacyAllowsLocalQueue: true
+            ),
+            .existing(conversation)
+        )
+        XCTAssertEqual(
+            NewMessageComposerPolicy.directRoute(
+                conversations: [],
+                currentUserID: localUserID,
+                recipientUserID: recipientUserID,
+                privacyAllowsLocalQueue: true
+            ),
+            .create
+        )
+        XCTAssertEqual(
+            NewMessageComposerPolicy.directRoute(
+                conversations: [conversation],
+                currentUserID: localUserID,
+                recipientUserID: recipientUserID,
+                privacyAllowsLocalQueue: false
+            ),
+            .blocked
+        )
+
+        var unknownType = conversation
+        unknownType.conversationType = "channel"
+        XCTAssertEqual(
+            NewMessageComposerPolicy.directRoute(
+                conversations: [unknownType],
+                currentUserID: localUserID,
+                recipientUserID: recipientUserID,
+                privacyAllowsLocalQueue: true
+            ),
+            .invalid
+        )
+    }
+
+    func testNewMessageComposerNavigatesOnlyAfterDurableQueueResult() {
+        let conversation = Conversation(
+            id: conversationId,
+            title: "Queued conversation",
+            participantUserIds: [],
+            unreadCount: 0,
+            updatedAt: Date(timeIntervalSince1970: 1_756_800_000)
+        )
+        XCTAssertNil(NewMessageComposerPolicy.navigationConversation(after: nil))
+
+        let result = SecureMessagingQueueResult(
+            conversation: conversation,
+            clientMessageID: UUID(uuidString: messageId)!
+        )
+        XCTAssertEqual(
+            NewMessageComposerPolicy.navigationConversation(after: result),
+            conversation
+        )
+    }
+
     func testKeyPublicationEncodesOnlyReviewedV2PublicMaterial() throws {
         let request = try keyPublication()
 
@@ -1000,6 +1088,100 @@ final class MessagingAPIContractTests: XCTestCase {
                 expectedSHA256Hex: encrypted.sha256Hex
             )
         )
+    }
+
+    func testStreamingAttachmentCipherRoundTripsAcrossDifferentChunkBoundaries() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "kit-streaming-cipher-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let plaintextURL = directory.appendingPathComponent("plain.bin")
+        let ciphertextURL = directory.appendingPathComponent("cipher.bin")
+        let decryptedURL = directory.appendingPathComponent("decrypted.bin")
+        let plaintext = Data((0 ..< 70_013).map { UInt8($0 % 251) })
+        let keyMaterial = Data(
+            (0 ..< SecureMediaAttachmentCipher.keyMaterialBytes).map(UInt8.init)
+        )
+        try plaintext.write(to: plaintextURL, options: .atomic)
+
+        let encrypted = try SecureMediaAttachmentCipher.encryptFile(
+            plaintextURL: plaintextURL,
+            ciphertextURL: ciphertextURL,
+            expectedPlaintextByteSize: plaintext.count,
+            keyMaterial: keyMaterial,
+            attachmentID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            chunkBytes: 4_093
+        )
+        try SecureMediaAttachmentCipher.decryptFile(
+            ciphertextURL: ciphertextURL,
+            plaintextURL: decryptedURL,
+            expectedCiphertextByteSize: encrypted.ciphertextByteSize,
+            expectedCiphertextSHA256: encrypted.ciphertextSHA256,
+            expectedPlaintextByteSize: plaintext.count,
+            keyMaterial: keyMaterial,
+            chunkBytes: 997
+        )
+
+        XCTAssertEqual(try Data(contentsOf: decryptedURL), plaintext)
+    }
+
+    func testStreamingAttachmentCipherDeletesOutputAfterTamperingOrTruncation() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "kit-streaming-cipher-invalid-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let plaintextURL = directory.appendingPathComponent("plain.bin")
+        let ciphertextURL = directory.appendingPathComponent("cipher.bin")
+        let tamperedURL = directory.appendingPathComponent("tampered.bin")
+        let truncatedURL = directory.appendingPathComponent("truncated.bin")
+        let tamperedOutputURL = directory.appendingPathComponent("tampered-output.bin")
+        let truncatedOutputURL = directory.appendingPathComponent("truncated-output.bin")
+        let plaintext = Data((0 ..< 32_777).map { UInt8($0 % 239) })
+        let keyMaterial = Data(repeating: 0x5c, count: SecureMediaAttachmentCipher.keyMaterialBytes)
+        try plaintext.write(to: plaintextURL, options: .atomic)
+        let encrypted = try SecureMediaAttachmentCipher.encryptFile(
+            plaintextURL: plaintextURL,
+            ciphertextURL: ciphertextURL,
+            expectedPlaintextByteSize: plaintext.count,
+            keyMaterial: keyMaterial,
+            attachmentID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            chunkBytes: 2_047
+        )
+
+        var tampered = try Data(contentsOf: ciphertextURL)
+        tampered[tampered.startIndex + 20] ^= 0x01
+        try tampered.write(to: tamperedURL, options: .atomic)
+        XCTAssertThrowsError(try SecureMediaAttachmentCipher.decryptFile(
+            ciphertextURL: tamperedURL,
+            plaintextURL: tamperedOutputURL,
+            expectedCiphertextByteSize: encrypted.ciphertextByteSize,
+            expectedCiphertextSHA256: encrypted.ciphertextSHA256,
+            expectedPlaintextByteSize: plaintext.count,
+            keyMaterial: keyMaterial,
+            chunkBytes: 1_021
+        )) { error in
+            XCTAssertEqual(error as? SecureMediaAttachmentError, .invalidCiphertext)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tamperedOutputURL.path))
+
+        let truncated = Data((try Data(contentsOf: ciphertextURL)).dropLast())
+        try truncated.write(to: truncatedURL, options: .atomic)
+        XCTAssertThrowsError(try SecureMediaAttachmentCipher.decryptFile(
+            ciphertextURL: truncatedURL,
+            plaintextURL: truncatedOutputURL,
+            expectedCiphertextByteSize: Int64(truncated.count),
+            expectedCiphertextSHA256: encrypted.ciphertextSHA256,
+            expectedPlaintextByteSize: plaintext.count,
+            keyMaterial: keyMaterial,
+            chunkBytes: 1_021
+        )) { error in
+            XCTAssertEqual(error as? SecureMediaAttachmentError, .invalidCiphertext)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: truncatedOutputURL.path))
     }
 
     func testMediaDescriptorIsCanonicalAndKeepsKeysOutOfServerMetadata() throws {

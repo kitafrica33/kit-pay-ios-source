@@ -33,6 +33,8 @@ jobs:
         run: python3 -m unittest discover -s .github/scripts/tests -p 'test_verification_badge_placement.py'
       - name: Test media-message-v2 source contract
         run: python3 -m unittest discover -s .github/scripts/tests -p 'test_media_message_v2_contract.py'
+      - name: Test media diagnostics source contract
+        run: python3 -m unittest discover -s .github/scripts/tests -p 'test_ios_media_diagnostics_contract.py'
       - name: Select current Xcode
         run: sudo xcode-select --switch /Applications/Xcode.app
       - name: Install pinned native dependencies

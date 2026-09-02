@@ -145,7 +145,33 @@ actor SecureLocalStore {
         forUserID expectedUserID: String,
         expectedState: SecureMessagingPersistentState?,
         nextState: SecureMessagingPersistentState,
+        admission lease: ProtectedCommunicationAdmissionLease? = nil,
         project: (inout PersistedState) throws -> Void = { _ in }
+    ) throws {
+        if let lease {
+            try ProtectedCommunicationAdmissionGate.shared.withAuthorizedCommit(lease) {
+                try commitSecureMessagingCandidate(
+                    forUserID: expectedUserID,
+                    expectedState: expectedState,
+                    nextState: nextState,
+                    project: project
+                )
+            }
+            return
+        }
+        try commitSecureMessagingCandidate(
+            forUserID: expectedUserID,
+            expectedState: expectedState,
+            nextState: nextState,
+            project: project
+        )
+    }
+
+    private func commitSecureMessagingCandidate(
+        forUserID expectedUserID: String,
+        expectedState: SecureMessagingPersistentState?,
+        nextState: SecureMessagingPersistentState,
+        project: (inout PersistedState) throws -> Void
     ) throws {
         try requireMutableState()
         var candidate = state

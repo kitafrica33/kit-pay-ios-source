@@ -1733,7 +1733,12 @@ struct VideoMessageBubbleView: View {
                 conversationId: message.conversationId,
                 itemIndex: nil
             ) {
-                await makePoster(fileURL: localFile.url)
+                await makePoster(
+                    fileURL: localFile.url,
+                    mediaType: localFile.mediaType,
+                    expectedByteCount: localFile.byteCount,
+                    protectedOriginalLease: localFile.accessLease
+                )
                 return
             }
             await loader.load(
@@ -1785,7 +1790,12 @@ struct VideoMessageBubbleView: View {
             conversationId: message.conversationId,
             itemIndex: nil
         ) {
-            await makePoster(fileURL: localFile.url)
+            await makePoster(
+                fileURL: localFile.url,
+                mediaType: localFile.mediaType,
+                expectedByteCount: localFile.byteCount,
+                protectedOriginalLease: localFile.accessLease
+            )
             protectedOriginalLease = localFile.accessLease
             playbackURL = localFile.url
             playbackMediaType = localFile.mediaType
@@ -1841,23 +1851,37 @@ struct VideoMessageBubbleView: View {
     private func makePoster(from item: SecureMediaLoadPolicy.LoadedItem) async {
         guard poster == nil else { return }
         if let localFileURL = item.localFileURL {
-            await makePoster(fileURL: localFileURL)
+            await makePoster(
+                fileURL: localFileURL,
+                mediaType: item.mediaType,
+                expectedByteCount: item.byteCount,
+                protectedOriginalLease: item.localFileLease
+            )
             return
         }
         poster = await ChatMediaThumbnailStore.shared.videoThumbnail(
             forKey: descriptor.storageKey,
             maxPixel: 248,
             from: item.data,
-            mediaType: item.mediaType
+            mediaType: item.mediaType,
+            expectedByteCount: item.byteCount
         )
     }
 
-    private func makePoster(fileURL: URL) async {
+    private func makePoster(
+        fileURL: URL,
+        mediaType: String,
+        expectedByteCount: Int,
+        protectedOriginalLease: SecureMediaOriginalAccessLease?
+    ) async {
         guard poster == nil else { return }
         poster = await ChatMediaThumbnailStore.shared.videoThumbnail(
             forKey: descriptor.storageKey,
             maxPixel: 248,
-            fromFileURL: fileURL
+            fromFileURL: fileURL,
+            mediaType: mediaType,
+            expectedByteCount: expectedByteCount,
+            protectedOriginalLease: protectedOriginalLease
         )
     }
 }

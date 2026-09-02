@@ -736,6 +736,201 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
         )
     }
 
+    func testQueueDirectTextCommitsPendingMessageBeforeEnrollment() async throws {
+        let userID = "10000000-0000-4000-8000-000000000075"
+        let peerID = "10000000-0000-4000-8000-000000000076"
+        let conversationID = "30000000-0000-4000-8000-000000000075"
+        let clientMessageID = UUID(uuidString: "80000000-0000-4000-8000-000000000075")!
+        let store = try await makeStore(userID: userID)
+        try await store.update { state in
+            state.communicationOwnerUserID = userID
+            state.secureMessaging = nil
+        }
+        let transport = SuspendedMessagingExchangeTransport(
+            scenario: .createConversation(directConversationDTO(
+                id: conversationID,
+                userID: userID,
+                peerID: peerID,
+                peerName: "ExampleContact"
+            ))
+        )
+        let coordinator = SecureMessagingExchangeCoordinator(
+            transport: transport,
+            store: store,
+            engine: SecureMessagingCryptoEngine(),
+            provisioningPreKeyCount: 1
+        )
+
+        let result = try await coordinator.queueDirectText(
+            forUserID: userID,
+            recipientUserID: peerID,
+            title: "ExampleContact",
+            text: "  visible before keys recover  ",
+            clientMessageID: clientMessageID
+        )
+
+        XCTAssertEqual(result.conversation.id, conversationID)
+        XCTAssertEqual(result.clientMessageID, clientMessageID)
+        let createdMemberIDs = await transport.createdMemberIDs()
+        let unexpectedNetworkCallCount = await transport.unexpectedNetworkCallCount()
+        XCTAssertEqual(createdMemberIDs, [[peerID]])
+        XCTAssertEqual(unexpectedNetworkCallCount, 0)
+        let snapshot = await store.snapshot()
+        XCTAssertNil(snapshot.secureMessaging)
+        XCTAssertEqual(snapshot.conversations.map(\.id), [conversationID])
+        let message = try XCTUnwrap(snapshot.messages.first)
+        XCTAssertEqual(snapshot.messages.count, 1)
+        XCTAssertEqual(message.id, clientMessageID)
+        XCTAssertEqual(message.conversationId, conversationID)
+        XCTAssertEqual(message.body, "visible before keys recover")
+        XCTAssertEqual(message.state, .queued)
+        let command = try XCTUnwrap(snapshot.outbox.first)
+        XCTAssertEqual(snapshot.outbox.count, 1)
+        XCTAssertEqual(command.messageId, clientMessageID)
+        XCTAssertEqual(command.conversationId, conversationID)
+        XCTAssertEqual(command.recipientUserIds, [peerID])
+        XCTAssertNil(command.secureMessageFanout)
+    }
+
+    func testExistingFirstMessageRejectsStaleSameUserLoginLeaseWithoutMutation() async throws {
+        let userID = "10000000-0000-4000-8000-000000000077"
+        let peerID = "10000000-0000-4000-8000-000000000078"
+        let conversationID = "30000000-0000-4000-8000-000000000077"
+        let oldAccountGeneration = UUID(
+            uuidString: "60000000-0000-4000-8000-000000000077"
+        )!
+        let oldSessionID = "70000000-0000-4000-8000-000000000077"
+        let store = try await makeStore(userID: userID)
+        try await store.update { state in
+            state.communicationOwnerUserID = userID
+            state.conversations = [Conversation(
+                id: conversationID,
+                title: "ExampleContact",
+                participantUserIds: [userID, peerID],
+                unreadCount: 0,
+                updatedAt: Date(timeIntervalSince1970: 1_756_800_000)
+            )]
+        }
+        let coordinator = SecureMessagingExchangeCoordinator(
+            transport: OfflineExchangeTransport(),
+            store: store,
+            engine: SecureMessagingCryptoEngine(),
+            provisioningPreKeyCount: 1,
+            requiresAuthenticatedActivationScope: true
+        )
+        let gate = ProtectedCommunicationAdmissionGate.shared
+        gate.quarantine()
+        gate.restore(forAccountID: userID)
+        let staleLease = try XCTUnwrap(gate.lease(forAccountID: userID))
+        gate.quarantine()
+        gate.restore(forAccountID: userID)
+        defer { gate.quarantine() }
+
+        do {
+            _ = try await SecureMessagingActivationBinding.withAuthenticatedScope(
+                accountGeneration: oldAccountGeneration,
+                sessionID: oldSessionID,
+                commitAdmission: staleLease
+            ) {
+                try await coordinator.queueDeferredText(
+                    forUserID: userID,
+                    conversationID: conversationID,
+                    expectedRecipientUserID: peerID,
+                    title: "ExampleContact",
+                    text: "must not cross a same-user login",
+                    clientMessageID: UUID(
+                        uuidString: "80000000-0000-4000-8000-000000000077"
+                    ),
+                    commitAdmission: staleLease
+                )
+            }
+            XCTFail("A stale same-user account lifetime must not queue into the replacement store")
+        } catch let error as SecureMessagingActivationError {
+            XCTAssertEqual(error, .accountChanged)
+        }
+
+        let snapshot = await store.snapshot()
+        XCTAssertTrue(snapshot.messages.isEmpty)
+        XCTAssertTrue(snapshot.outbox.isEmpty)
+        XCTAssertEqual(snapshot.conversations.map(\.id), [conversationID])
+    }
+
+    func testNewFirstMessageRejectsSameUserLoginReplacementAfterNetworkSuspension() async throws {
+        let userID = "10000000-0000-4000-8000-000000000079"
+        let peerID = "10000000-0000-4000-8000-000000000080"
+        let conversationID = "30000000-0000-4000-8000-000000000079"
+        let oldAccountGeneration = UUID(
+            uuidString: "60000000-0000-4000-8000-000000000079"
+        )!
+        let oldSessionID = "70000000-0000-4000-8000-000000000079"
+        let clientMessageID = UUID(
+            uuidString: "80000000-0000-4000-8000-000000000079"
+        )!
+        let store = try await makeStore(userID: userID)
+        try await store.update { state in
+            state.communicationOwnerUserID = userID
+            state.secureMessaging = nil
+        }
+        let transport = SuspendedMessagingExchangeTransport(
+            scenario: .suspendedCreateConversation(directConversationDTO(
+                id: conversationID,
+                userID: userID,
+                peerID: peerID,
+                peerName: "ExampleContact"
+            ))
+        )
+        let coordinator = SecureMessagingExchangeCoordinator(
+            transport: transport,
+            store: store,
+            engine: SecureMessagingCryptoEngine(),
+            provisioningPreKeyCount: 1,
+            requiresAuthenticatedActivationScope: true
+        )
+        let gate = ProtectedCommunicationAdmissionGate.shared
+        gate.quarantine()
+        gate.restore(forAccountID: userID)
+        let staleLease = try XCTUnwrap(gate.lease(forAccountID: userID))
+        defer { gate.quarantine() }
+
+        let queued = Task {
+            try await SecureMessagingActivationBinding.withAuthenticatedScope(
+                accountGeneration: oldAccountGeneration,
+                sessionID: oldSessionID,
+                commitAdmission: staleLease
+            ) {
+                try await coordinator.queueDirectText(
+                    forUserID: userID,
+                    recipientUserID: peerID,
+                    title: "ExampleContact",
+                    text: "must not survive relogin",
+                    clientMessageID: clientMessageID,
+                    commitAdmission: staleLease
+                )
+            }
+        }
+        try await transport.waitUntilRequestStarted()
+
+        // A same-user sign-out/re-login keeps the account id but rotates both the protected-store
+        // generation and the AppModel account/session lifetime. The response already in flight is
+        // not authority to mutate the replacement lifetime.
+        gate.quarantine()
+        gate.restore(forAccountID: userID)
+        let replacementLease = try XCTUnwrap(gate.lease(forAccountID: userID))
+        XCTAssertNotEqual(staleLease, replacementLease)
+        await transport.releaseRequest()
+
+        do {
+            _ = try await queued.value
+            XCTFail("A stale network result must not create a bubble or outbox command")
+        } catch is CancellationError {
+            // Expected: the exact protected-store lease was invalidated during the suspension.
+        }
+        let snapshot = await store.snapshot()
+        XCTAssertTrue(snapshot.conversations.isEmpty)
+        XCTAssertTrue(snapshot.messages.isEmpty)
+        XCTAssertTrue(snapshot.outbox.isEmpty)
+    }
+
     func testEnsureDirectConversationRejectsUnexpectedBoundConversationIDWithoutPersisting() async throws {
         let userID = "10000000-0000-4000-8000-000000000073"
         let peerID = "10000000-0000-4000-8000-000000000074"
@@ -1509,6 +1704,683 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
         ).supportsReviewedV2)
     }
 
+    func testDirectMessageLocalConversationPolicyRequiresOneCanonicalTwoPartyThread() {
+        let localUserID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1"
+        let recipientUserID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2"
+        let thirdUserID = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee5"
+        let date = Date(timeIntervalSince1970: 1_700_000_000)
+        let expected = Conversation(
+            id: "cccccccc-cccc-4ccc-8ccc-ccccccccccc3",
+            title: "Expected direct thread",
+            participantUserIds: [recipientUserID, localUserID],
+            unreadCount: 0,
+            updatedAt: date
+        )
+        let twoMemberGroup = Conversation(
+            id: "dddddddd-dddd-4ddd-8ddd-ddddddddddd4",
+            title: "Not a direct thread",
+            participantUserIds: [localUserID, recipientUserID],
+            unreadCount: 0,
+            updatedAt: date,
+            conversationType: SecureMessagingWire.groupConversationType
+        )
+        let threePartyThread = Conversation(
+            id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee6",
+            title: "Malformed direct thread",
+            participantUserIds: [localUserID, recipientUserID, thirdUserID],
+            unreadCount: 0,
+            updatedAt: date
+        )
+        let noncanonical = Conversation(
+            id: "abcdefab-cdef-4abc-8def-abcdefabcde7".uppercased(),
+            title: "Noncanonical thread",
+            participantUserIds: [localUserID, recipientUserID],
+            unreadCount: 0,
+            updatedAt: date
+        )
+        let unknownType = Conversation(
+            id: "abababab-abab-4aba-8aba-abababababab",
+            title: "Unknown server thread",
+            participantUserIds: [localUserID, recipientUserID],
+            unreadCount: 0,
+            updatedAt: date,
+            conversationType: "channel"
+        )
+
+        XCTAssertEqual(
+            DirectMessageLocalConversationPolicy.resolve(
+                conversations: [
+                    twoMemberGroup,
+                    threePartyThread,
+                    noncanonical,
+                    expected,
+                ],
+                currentUserID: localUserID,
+                recipientUserID: recipientUserID
+            ),
+            .existing(expected)
+        )
+        XCTAssertEqual(
+            DirectMessageLocalConversationPolicy.resolve(
+                conversations: [noncanonical],
+                currentUserID: localUserID,
+                recipientUserID: recipientUserID
+            ),
+            .missing
+        )
+        XCTAssertEqual(
+            DirectMessageLocalConversationPolicy.resolve(
+                conversations: [unknownType],
+                currentUserID: localUserID,
+                recipientUserID: recipientUserID
+            ),
+            .invalid,
+            "An unknown explicit server type must never be downgraded to a direct chat."
+        )
+
+        let duplicate = Conversation(
+            id: "ffffffff-ffff-4fff-8fff-fffffffffff8",
+            title: "Duplicate direct thread",
+            participantUserIds: [localUserID, recipientUserID],
+            unreadCount: 0,
+            updatedAt: date.addingTimeInterval(1)
+        )
+        XCTAssertEqual(
+            DirectMessageLocalConversationPolicy.resolve(
+                conversations: [expected, duplicate],
+                currentUserID: localUserID,
+                recipientUserID: recipientUserID
+            ),
+            .ambiguous
+        )
+    }
+
+    func testDeferredTextRejectsUnknownExplicitConversationTypeBeforeNetworkOrWrite() async throws {
+        let localUserID = "10000000-0000-4000-8000-000000000081"
+        let recipientUserID = "10000000-0000-4000-8000-000000000082"
+        let conversationID = "30000000-0000-4000-8000-000000000081"
+        let store = try await makeStore(userID: localUserID)
+        try await store.update { state in
+            state.communicationOwnerUserID = localUserID
+            state.conversations = [Conversation(
+                id: conversationID,
+                title: "Unsupported channel",
+                participantUserIds: [localUserID, recipientUserID],
+                unreadCount: 0,
+                updatedAt: Date(timeIntervalSince1970: 1_756_800_000),
+                conversationType: "channel"
+            )]
+        }
+        let transport = OfflineExchangeTransport()
+        let coordinator = SecureMessagingExchangeCoordinator(
+            transport: transport,
+            store: store,
+            engine: SecureMessagingCryptoEngine(),
+            provisioningPreKeyCount: 1
+        )
+
+        do {
+            _ = try await coordinator.queueDeferredText(
+                forUserID: localUserID,
+                conversationID: conversationID,
+                expectedRecipientUserID: recipientUserID,
+                title: "Unsupported channel",
+                text: "Must remain local and unqueued"
+            )
+            XCTFail("An unknown server conversation type must fail closed")
+        } catch let error as SecureMessagingExchangeError {
+            XCTAssertEqual(error, .invalidConversation)
+        }
+
+        let networkCallCount = await transport.networkCallCount()
+        XCTAssertEqual(networkCallCount, 0)
+        let snapshot = await store.snapshot()
+        XCTAssertTrue(snapshot.messages.isEmpty)
+        XCTAssertTrue(snapshot.outbox.isEmpty)
+    }
+
+    func testReplacementAccountActivationSupersedesOldFlightAndKeepsOutboxRunnable() async throws {
+        let oldUserID = "10000000-0000-4000-8000-000000000091"
+        let replacementUserID = "10000000-0000-4000-8000-000000000092"
+        let oldAccountGeneration = UUID(uuidString: "60000000-0000-4000-8000-000000000091")!
+        let replacementAccountGeneration = UUID(
+            uuidString: "60000000-0000-4000-8000-000000000092"
+        )!
+        let oldSessionID = "70000000-0000-4000-8000-000000000091"
+        let replacementSessionID = "70000000-0000-4000-8000-000000000092"
+        let store = try await makeStore(userID: oldUserID)
+        let engine = SecureMessagingCryptoEngine()
+        let provisioned = try await engine.provision(from: .empty, preKeyCount: 1)
+        let replacementStatus = enrolledStatus(bundle: provisioned.bundle)
+        let replacementBinding = try SecureMessagingMapper.enrollmentBinding(
+            from: replacementStatus,
+            userID: replacementUserID
+        )
+        let replacementCrypto = try await engine.bindEnrollment(
+            replacementBinding,
+            to: provisioned.state
+        )
+        let transport = SupersededActivationTransport(status: replacementStatus)
+        let coordinator = SecureMessagingCoordinator(
+            transport: transport,
+            store: store,
+            engine: engine,
+            provisioningPreKeyCount: 1
+        )
+
+        let oldActivation = Task {
+            try await SecureMessagingActivationBinding.withAuthenticatedScope(
+                accountGeneration: oldAccountGeneration,
+                sessionID: oldSessionID
+            ) {
+                try await coordinator.activate(forUserID: oldUserID)
+            }
+        }
+        try await transport.waitUntilFirstStatusStarted()
+
+        let queued = OfflineCommand(
+            id: UUID(uuidString: "90000000-0000-4000-8000-000000000092")!,
+            kind: .secureMessage,
+            createdAt: Date(timeIntervalSince1970: 1_756_800_000),
+            nextAttemptAt: Date(timeIntervalSince1970: 1_756_800_000),
+            attemptCount: 0,
+            conversationId: "30000000-0000-4000-8000-000000000092",
+            messageId: UUID(uuidString: "80000000-0000-4000-8000-000000000092")!,
+            recipientUserIds: ["10000000-0000-4000-8000-000000000093"],
+            recipientName: "Replacement recipient",
+            video: nil,
+            expiresAt: nil,
+            secureMessageFanout: nil
+        )
+        var replacement = PersistedState.empty
+        replacement.profile = UserProfile(
+            id: replacementUserID,
+            name: "Replacement user",
+            email: nil,
+            phone: "+256700000092",
+            tag: nil,
+            kycStatus: nil,
+            paymentPinSet: nil,
+            mfaEnabled: nil,
+            profileSetupRequired: false
+        )
+        replacement.communicationOwnerUserID = replacementUserID
+        replacement.secureMessaging = replacementCrypto
+        replacement.outbox = [queued]
+        try await store.replace(replacement)
+
+        let replacementActivation = Task {
+            try await SecureMessagingActivationBinding.withAuthenticatedScope(
+                accountGeneration: replacementAccountGeneration,
+                sessionID: replacementSessionID
+            ) {
+                try await coordinator.activate(forUserID: replacementUserID)
+            }
+        }
+        try await transport.waitUntilSecondStatusStarted()
+
+        // Let the cancelled former flight unwind while replacement activation is still live.
+        // Its stale cleanup and stale result must neither clear nor escape across generation 2.
+        await transport.releaseFirstStatus()
+        do {
+            _ = try await oldActivation.value
+            XCTFail("The superseded account must not finish activation")
+        } catch is CancellationError {
+            // Expected: AppModel treats cancellation as an obsolete flush, not a session error.
+        }
+
+        // A second replacement-account caller must still join the live generation-2 flight. If
+        // stale generation-1 cleanup cleared it, this call would incorrectly issue status #3.
+        let coalescedReplacementActivation = Task {
+            try await SecureMessagingActivationBinding.withAuthenticatedScope(
+                accountGeneration: replacementAccountGeneration,
+                sessionID: replacementSessionID
+            ) {
+                try await coordinator.activate(forUserID: replacementUserID)
+            }
+        }
+        for _ in 0..<10 { await Task.yield() }
+        let requestsWhileReplacementIsSuspended = await transport.statusRequestCount()
+        XCTAssertEqual(requestsWhileReplacementIsSuspended, 2)
+
+        await transport.releaseSecondStatus()
+        let activated = try await replacementActivation.value
+        let coalesced = try await coalescedReplacementActivation.value
+        XCTAssertEqual(activated.enrollment?.userID, replacementUserID)
+        XCTAssertEqual(coalesced.enrollment?.userID, replacementUserID)
+        let live = await store.snapshot()
+        XCTAssertEqual(live.profile?.id, replacementUserID)
+        XCTAssertEqual(live.outbox.first?.failureDisposition, nil)
+        XCTAssertEqual(
+            OutboxPolicy.readyCommands(live.outbox, at: Date()).map(\.id),
+            [queued.id],
+            "The active replacement session must retain an automatically drainable command."
+        )
+        let statusRequestCount = await transport.statusRequestCount()
+        XCTAssertEqual(statusRequestCount, 2)
+        let finalSnapshot = await store.snapshot()
+        XCTAssertEqual(finalSnapshot.profile?.id, replacementUserID)
+    }
+
+    func testABAAccountReplacementKeepsFinalActivationFlightOwnedByItsExactLifetime() async throws {
+        let userA = "10000000-0000-4000-8000-000000000081"
+        let userB = "10000000-0000-4000-8000-000000000082"
+        let firstGeneration = UUID(uuidString: "60000000-0000-4000-8000-000000000081")!
+        let middleGeneration = UUID(uuidString: "60000000-0000-4000-8000-000000000082")!
+        let finalGeneration = UUID(uuidString: "60000000-0000-4000-8000-000000000083")!
+        let firstSession = "70000000-0000-4000-8000-000000000081"
+        let middleSession = "70000000-0000-4000-8000-000000000082"
+        let finalSession = "70000000-0000-4000-8000-000000000083"
+        let store = try await makeStore(userID: userA)
+        let engine = SecureMessagingCryptoEngine()
+        let provisioned = try await engine.provision(from: .empty, preKeyCount: 1)
+        let status = enrolledStatus(bundle: provisioned.bundle)
+        let bindingA = try SecureMessagingMapper.enrollmentBinding(from: status, userID: userA)
+        let bindingB = try SecureMessagingMapper.enrollmentBinding(from: status, userID: userB)
+        let cryptoA = try await engine.bindEnrollment(bindingA, to: provisioned.state)
+        let cryptoB = try await engine.bindEnrollment(bindingB, to: provisioned.state)
+        try await store.update { $0.secureMessaging = cryptoA }
+        let transport = SupersededActivationTransport(
+            firstStatus: status,
+            replacementStatus: status,
+            finalStatus: status
+        )
+        let coordinator = SecureMessagingCoordinator(
+            transport: transport,
+            store: store,
+            engine: engine,
+            provisioningPreKeyCount: 1
+        )
+
+        let firstActivation = Task {
+            try await SecureMessagingActivationBinding.withAuthenticatedScope(
+                accountGeneration: firstGeneration,
+                sessionID: firstSession
+            ) {
+                try await coordinator.activate(forUserID: userA)
+            }
+        }
+        try await transport.waitUntilFirstStatusStarted()
+
+        var middleState = PersistedState.empty
+        middleState.profile = UserProfile(
+            id: userB,
+            name: "Middle user",
+            email: nil,
+            phone: "+256700000082",
+            tag: nil,
+            kycStatus: nil,
+            paymentPinSet: nil,
+            mfaEnabled: nil,
+            profileSetupRequired: false
+        )
+        middleState.communicationOwnerUserID = userB
+        middleState.secureMessaging = cryptoB
+        try await store.replace(middleState)
+        let middleActivation = Task {
+            try await SecureMessagingActivationBinding.withAuthenticatedScope(
+                accountGeneration: middleGeneration,
+                sessionID: middleSession
+            ) {
+                try await coordinator.activate(forUserID: userB)
+            }
+        }
+        try await transport.waitUntilSecondStatusStarted()
+
+        var finalState = PersistedState.empty
+        finalState.profile = UserProfile(
+            id: userA,
+            name: "Final user A",
+            email: nil,
+            phone: "+256700000081",
+            tag: nil,
+            kycStatus: nil,
+            paymentPinSet: nil,
+            mfaEnabled: nil,
+            profileSetupRequired: false
+        )
+        finalState.communicationOwnerUserID = userA
+        finalState.secureMessaging = cryptoA
+        try await store.replace(finalState)
+        let finalActivation = Task {
+            try await SecureMessagingActivationBinding.withAuthenticatedScope(
+                accountGeneration: finalGeneration,
+                sessionID: finalSession
+            ) {
+                try await coordinator.activate(forUserID: userA)
+            }
+        }
+        try await transport.waitUntilThirdStatusStarted()
+
+        await transport.releaseFirstStatus()
+        await transport.releaseSecondStatus()
+        for activation in [firstActivation, middleActivation] {
+            do {
+                _ = try await activation.value
+                XCTFail("A superseded A→B flight must not publish into the final A lifetime")
+            } catch is CancellationError {
+                // Both obsolete generations normalize their result to cancellation.
+            }
+        }
+
+        let coalescedFinalActivation = Task {
+            try await SecureMessagingActivationBinding.withAuthenticatedScope(
+                accountGeneration: finalGeneration,
+                sessionID: finalSession
+            ) {
+                try await coordinator.activate(forUserID: userA)
+            }
+        }
+        for _ in 0..<10 { await Task.yield() }
+        let requestCountBeforeFinalRelease = await transport.statusRequestCount()
+        XCTAssertEqual(requestCountBeforeFinalRelease, 3)
+
+        await transport.releaseThirdStatus()
+        let activated = try await finalActivation.value
+        let coalesced = try await coalescedFinalActivation.value
+        XCTAssertEqual(activated.enrollment, bindingA)
+        XCTAssertEqual(coalesced.enrollment, bindingA)
+        let live = await store.snapshot()
+        XCTAssertEqual(live.profile?.id, userA)
+        XCTAssertEqual(live.secureMessaging?.enrollment, bindingA)
+    }
+
+    func testSameUserReplacementSessionSupersedesStaleSuccessfulActivation() async throws {
+        let userID = "10000000-0000-4000-8000-000000000094"
+        // Hold the account generation fixed so this regression independently proves that the
+        // authenticated server session participates in the single-flight identity.
+        let accountGeneration = UUID(uuidString: "60000000-0000-4000-8000-000000000094")!
+        let oldSessionID = "70000000-0000-4000-8000-000000000094"
+        let replacementSessionID = "70000000-0000-4000-8000-000000000095"
+        let store = try await makeStore(userID: userID)
+        let engine = SecureMessagingCryptoEngine()
+
+        let oldProvisioned = try await engine.provision(from: .empty, preKeyCount: 1)
+        let oldStatus = enrolledStatus(bundle: oldProvisioned.bundle)
+        let oldBinding = try SecureMessagingMapper.enrollmentBinding(
+            from: oldStatus,
+            userID: userID
+        )
+        let oldCrypto = try await engine.bindEnrollment(
+            oldBinding,
+            to: oldProvisioned.state
+        )
+        try await store.update { $0.secureMessaging = oldCrypto }
+
+        let replacementProvisioned = try await engine.provision(from: .empty, preKeyCount: 1)
+        let replacementStatus = enrolledStatus(bundle: replacementProvisioned.bundle)
+        let replacementBinding = try SecureMessagingMapper.enrollmentBinding(
+            from: replacementStatus,
+            userID: userID
+        )
+        let replacementCrypto = try await engine.bindEnrollment(
+            replacementBinding,
+            to: replacementProvisioned.state
+        )
+        let transport = SupersededActivationTransport(
+            firstStatus: oldStatus,
+            replacementStatus: replacementStatus
+        )
+        let coordinator = SecureMessagingCoordinator(
+            transport: transport,
+            store: store,
+            engine: engine,
+            provisioningPreKeyCount: 1
+        )
+
+        let staleActivation = Task {
+            try await SecureMessagingActivationBinding.withAuthenticatedScope(
+                accountGeneration: accountGeneration,
+                sessionID: oldSessionID
+            ) {
+                try await coordinator.activate(forUserID: userID)
+            }
+        }
+        try await transport.waitUntilFirstStatusStarted()
+
+        let queued = OfflineCommand(
+            id: UUID(uuidString: "90000000-0000-4000-8000-000000000094")!,
+            kind: .secureMessage,
+            createdAt: Date(timeIntervalSince1970: 1_756_800_000),
+            nextAttemptAt: Date(timeIntervalSince1970: 1_756_800_000),
+            attemptCount: 0,
+            conversationId: "30000000-0000-4000-8000-000000000094",
+            messageId: UUID(uuidString: "80000000-0000-4000-8000-000000000094")!,
+            recipientUserIds: ["10000000-0000-4000-8000-000000000096"],
+            recipientName: "Replacement recipient",
+            video: nil,
+            expiresAt: nil,
+            secureMessageFanout: nil
+        )
+        try await store.update {
+            $0.secureMessaging = replacementCrypto
+            $0.outbox = [queued]
+        }
+
+        let replacementActivation = Task {
+            try await SecureMessagingActivationBinding.withAuthenticatedScope(
+                accountGeneration: accountGeneration,
+                sessionID: replacementSessionID
+            ) {
+                try await coordinator.activate(forUserID: userID)
+            }
+        }
+        try await transport.waitUntilSecondStatusStarted()
+        await transport.releaseFirstStatus()
+        do {
+            _ = try await staleActivation.value
+            XCTFail("A successful response from the replaced session must stay cancelled")
+        } catch is CancellationError {
+            // The replacement scope owns the slot and the same-user store now.
+        }
+
+        await transport.releaseSecondStatus()
+        let activated = try await replacementActivation.value
+
+        XCTAssertEqual(activated.enrollment, replacementBinding)
+        let statusRequestCount = await transport.statusRequestCount()
+        XCTAssertEqual(statusRequestCount, 2)
+        let live = await store.snapshot()
+        XCTAssertEqual(live.secureMessaging?.enrollment, replacementBinding)
+        XCTAssertEqual(live.outbox.map(\.id), [queued.id])
+        XCTAssertEqual(
+            OutboxPolicy.readyCommands(live.outbox, at: Date()).map(\.id),
+            [queued.id]
+        )
+    }
+
+    func testSameUserReplacementGenerationDoesNotInheritStaleActivationError() async throws {
+        let userID = "10000000-0000-4000-8000-000000000097"
+        let oldGeneration = UUID(uuidString: "60000000-0000-4000-8000-000000000097")!
+        let replacementGeneration = UUID(
+            uuidString: "60000000-0000-4000-8000-000000000098"
+        )!
+        // Deliberately retain the same server session id: account generation must independently
+        // prevent a logout/recovery boundary from inheriting the older flight's terminal error.
+        let sessionID = "70000000-0000-4000-8000-000000000097"
+        let store = try await makeStore(userID: userID)
+        let engine = SecureMessagingCryptoEngine()
+        let provisioned = try await engine.provision(from: .empty, preKeyCount: 1)
+        let status = enrolledStatus(bundle: provisioned.bundle)
+        let binding = try SecureMessagingMapper.enrollmentBinding(from: status, userID: userID)
+        let crypto = try await engine.bindEnrollment(binding, to: provisioned.state)
+        try await store.update { $0.secureMessaging = crypto }
+        let transport = SupersededActivationTransport(
+            firstStatus: status,
+            replacementStatus: status,
+            firstRequestFails: true
+        )
+        let coordinator = SecureMessagingCoordinator(
+            transport: transport,
+            store: store,
+            engine: engine,
+            provisioningPreKeyCount: 1
+        )
+
+        let staleActivation = Task {
+            try await SecureMessagingActivationBinding.withAuthenticatedScope(
+                accountGeneration: oldGeneration,
+                sessionID: sessionID
+            ) {
+                try await coordinator.activate(forUserID: userID)
+            }
+        }
+        try await transport.waitUntilFirstStatusStarted()
+
+        let replacementActivation = Task {
+            try await SecureMessagingActivationBinding.withAuthenticatedScope(
+                accountGeneration: replacementGeneration,
+                sessionID: sessionID
+            ) {
+                try await coordinator.activate(forUserID: userID)
+            }
+        }
+        try await transport.waitUntilSecondStatusStarted()
+        await transport.releaseFirstStatus()
+        do {
+            _ = try await staleActivation.value
+            XCTFail("The replaced account generation must not surface its stale error")
+        } catch is CancellationError {
+            // Superseded errors are normalized to cancellation for the obsolete caller.
+        }
+
+        await transport.releaseSecondStatus()
+        let activated = try await replacementActivation.value
+
+        XCTAssertEqual(activated.enrollment, binding)
+        let statusRequestCount = await transport.statusRequestCount()
+        XCTAssertEqual(statusRequestCount, 2)
+        let live = await store.snapshot()
+        XCTAssertEqual(live.secureMessaging?.enrollment, binding)
+    }
+
+    func testSameUserReplacementSessionSupersedesStaleSyncFlight() async throws {
+        let userID = "10000000-0000-4000-8000-000000000090"
+        let accountGeneration = UUID(uuidString: "60000000-0000-4000-8000-000000000090")!
+        let oldSessionID = "70000000-0000-4000-8000-000000000090"
+        let replacementSessionID = "70000000-0000-4000-8000-000000000089"
+        let store = try await makeStore(userID: userID)
+        let engine = SecureMessagingCryptoEngine()
+        let provisioned = try await engine.provision(from: .empty, preKeyCount: 1)
+        let status = enrolledStatus(bundle: provisioned.bundle)
+        let binding = try SecureMessagingMapper.enrollmentBinding(from: status, userID: userID)
+        let crypto = try await engine.bindEnrollment(binding, to: provisioned.state)
+        try await store.update { $0.secureMessaging = crypto }
+        let transport = SupersededActivationTransport(status: status)
+        let coordinator = SecureMessagingExchangeCoordinator(
+            transport: transport,
+            store: store,
+            engine: engine,
+            provisioningPreKeyCount: 1
+        )
+
+        let staleSync = Task {
+            try await SecureMessagingActivationBinding.withAuthenticatedScope(
+                accountGeneration: accountGeneration,
+                sessionID: oldSessionID
+            ) {
+                try await coordinator.sync(forUserID: userID)
+            }
+        }
+        try await transport.waitUntilFirstStatusStarted()
+
+        let replacementSync = Task {
+            try await SecureMessagingActivationBinding.withAuthenticatedScope(
+                accountGeneration: accountGeneration,
+                sessionID: replacementSessionID
+            ) {
+                try await coordinator.sync(forUserID: userID)
+            }
+        }
+        try await transport.waitUntilSecondStatusStarted()
+        await transport.releaseFirstStatus()
+        do {
+            _ = try await staleSync.value
+            XCTFail("The replacement session must not join the stale same-user sync")
+        } catch is CancellationError {
+            // The obsolete sync is cancelled without affecting the replacement flight.
+        }
+
+        await transport.releaseSecondStatus()
+        let result = try await replacementSync.value
+        XCTAssertEqual(result.pages, 1)
+        let statusRequestCount = await transport.statusRequestCount()
+        XCTAssertEqual(statusRequestCount, 2)
+        let live = await store.snapshot()
+        XCTAssertEqual(live.secureMessaging?.enrollment, binding)
+    }
+
+    func testProcessActivationFailsClosedWithoutCompleteAuthenticatedScope() async throws {
+        let userID = "10000000-0000-4000-8000-000000000099"
+        let store = try await makeStore(userID: userID)
+        let engine = SecureMessagingCryptoEngine()
+        let provisioned = try await engine.provision(from: .empty, preKeyCount: 1)
+        let status = enrolledStatus(bundle: provisioned.bundle)
+        let transport = SupersededActivationTransport(status: status)
+        let coordinator = SecureMessagingCoordinator(
+            transport: transport,
+            store: store,
+            engine: engine,
+            provisioningPreKeyCount: 1,
+            requiresAuthenticatedActivationScope: true
+        )
+
+        do {
+            _ = try await coordinator.activate(forUserID: userID)
+            XCTFail("The process-wide coordinator must reject an unbound activation")
+        } catch let error as SecureMessagingActivationError {
+            XCTAssertEqual(error, .accountChanged)
+        }
+        do {
+            _ = try await SecureMessagingActivationBinding.withAuthenticatedScope(
+                accountGeneration: UUID(
+                    uuidString: "60000000-0000-4000-8000-000000000099"
+                )!,
+                sessionID: "70000000-0000-4000-8000-000000000099"
+            ) {
+                try await coordinator.activate(forUserID: userID)
+            }
+            XCTFail("A process-wide activation scope without a protected-store lease must fail")
+        } catch let error as SecureMessagingActivationError {
+            XCTAssertEqual(error, .accountChanged)
+        }
+
+        let exchange = SecureMessagingExchangeCoordinator(
+            transport: transport,
+            store: store,
+            engine: engine,
+            provisioningPreKeyCount: 1,
+            requiresAuthenticatedActivationScope: true
+        )
+        do {
+            _ = try await exchange.sync(forUserID: userID)
+            XCTFail("The process-wide exchange sync must reject an unbound operation")
+        } catch let error as SecureMessagingActivationError {
+            XCTAssertEqual(error, .accountChanged)
+        }
+        do {
+            _ = try await exchange.prepareDeferredMessage(
+                commandID: UUID(),
+                forUserID: userID
+            )
+            XCTFail("The process-wide outbox preparation must reject an unbound operation")
+        } catch let error as SecureMessagingActivationError {
+            XCTAssertEqual(error, .accountChanged)
+        }
+        do {
+            _ = try await exchange.sendQueuedMessage(
+                commandID: UUID(),
+                forUserID: userID
+            )
+            XCTFail("The process-wide outbox send must reject an unbound operation")
+        } catch let error as SecureMessagingActivationError {
+            XCTAssertEqual(error, .accountChanged)
+        }
+
+        let statusRequestCount = await transport.statusRequestCount()
+        XCTAssertEqual(statusRequestCount, 0)
+    }
+
     func testDeferredTextUpdatesChatOrderAndSurvivesRelaunchWithoutNetwork() async throws {
         let localUserID = "10000000-0000-0000-0000-000000000011"
         let recipientUserID = "10000000-0000-0000-0000-000000000012"
@@ -1702,7 +2574,7 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
         )
     }
 
-    func testTextAndMediaEnterEncryptedOutboxBeforeE2EEEnrollmentWithoutNetwork() async throws {
+    func testExistingDirectTextAndMediaEnterOutboxBeforeEnrollmentWithoutNetwork() async throws {
         let localUserID = "10000000-0000-4000-8000-000000000015"
         let recipientUserID = "10000000-0000-4000-8000-000000000016"
         let conversationID = "30000000-0000-4000-8000-000000000015"
@@ -1725,10 +2597,20 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
             engine: SecureMessagingCryptoEngine(),
             provisioningPreKeyCount: 1
         )
+        let queuedSnapshot = await store.snapshot()
+        let resolution = DirectMessageLocalConversationPolicy.resolve(
+            conversations: queuedSnapshot.conversations,
+            currentUserID: localUserID,
+            recipientUserID: recipientUserID
+        )
+        guard case .existing(let existingConversation) = resolution else {
+            XCTFail("The canonical two-party conversation must be selected for local queueing")
+            return
+        }
 
         let text = try await coordinator.queueDeferredText(
             forUserID: localUserID,
-            conversationID: conversationID,
+            conversationID: existingConversation.id,
             expectedRecipientUserID: recipientUserID,
             title: "ExampleContact",
             text: "held until keys recover"
@@ -1736,7 +2618,7 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
         let mediaBytes = Data(repeating: 0x7a, count: 32_000)
         let media = try await coordinator.queueDeferredImage(
             forUserID: localUserID,
-            conversationID: conversationID,
+            conversationID: existingConversation.id,
             expectedRecipientUserID: recipientUserID,
             title: "ExampleContact",
             mediaData: mediaBytes,
@@ -1745,9 +2627,13 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
         )
 
         let queueNetworkCallCount = await transport.networkCallCount()
-        XCTAssertEqual(queueNetworkCallCount, 0)
+        XCTAssertEqual(
+            queueNetworkCallCount,
+            0,
+            "Local queueing must not activate E2EE or touch messaging transport before flush"
+        )
         let snapshot = await store.snapshot()
-        XCTAssertNil(snapshot.secureMessaging?.enrollment)
+        XCTAssertNil(snapshot.secureMessaging)
         XCTAssertEqual(snapshot.messages.map(\.id), [text.clientMessageID, media.clientMessageID])
         XCTAssertTrue(snapshot.messages.allSatisfy { $0.state == .queued })
         XCTAssertEqual(snapshot.outbox.count, 2)
@@ -3636,6 +4522,125 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
             ),
             SecureMessagingHistoryContinuationPolicy.failureRetryNanoseconds
         )
+    }
+
+    func testSyncAndHistoryContinuationFenceRejectsSameUserReplacementScopesAndStaleRuns() {
+        let userID = "10000000-0000-4000-8000-000000000069"
+        let firstGeneration = UUID(uuidString: "60000000-0000-4000-8000-000000000069")!
+        let replacementGeneration = UUID(
+            uuidString: "60000000-0000-4000-8000-000000000070"
+        )!
+        let first = SecureMessagingActivationIdentity(
+            userID: userID,
+            accountGeneration: firstGeneration,
+            sessionID: "70000000-0000-4000-8000-000000000069",
+            admissionGeneration: 3
+        )
+        let replacementSession = SecureMessagingActivationIdentity(
+            userID: userID,
+            accountGeneration: firstGeneration,
+            sessionID: "70000000-0000-4000-8000-000000000070",
+            admissionGeneration: 3
+        )
+        let replacementAccountGeneration = SecureMessagingActivationIdentity(
+            userID: userID,
+            accountGeneration: replacementGeneration,
+            sessionID: first.sessionID,
+            admissionGeneration: 3
+        )
+        let replacementAdmissionGeneration = SecureMessagingActivationIdentity(
+            userID: userID,
+            accountGeneration: firstGeneration,
+            sessionID: first.sessionID,
+            admissionGeneration: 4
+        )
+
+        XCTAssertTrue(SecureMessagingScopedWorkFence.accepts(
+            expectedIdentity: first,
+            expectedGeneration: 4,
+            currentIdentity: first,
+            currentGeneration: 4
+        ))
+        XCTAssertFalse(SecureMessagingScopedWorkFence.accepts(
+            expectedIdentity: first,
+            expectedGeneration: 4,
+            currentIdentity: replacementSession,
+            currentGeneration: 4
+        ), "A delayed history retry must not survive a same-user session replacement")
+        XCTAssertFalse(SecureMessagingScopedWorkFence.accepts(
+            expectedIdentity: first,
+            expectedGeneration: 4,
+            currentIdentity: replacementAccountGeneration,
+            currentGeneration: 4
+        ), "A delayed history retry must not survive a new account lifetime")
+        XCTAssertFalse(SecureMessagingScopedWorkFence.accepts(
+            expectedIdentity: first,
+            expectedGeneration: 4,
+            currentIdentity: replacementAdmissionGeneration,
+            currentGeneration: 4
+        ), "A protected-store lease replacement must invalidate inherited messaging work")
+        XCTAssertFalse(SecureMessagingScopedWorkFence.accepts(
+            expectedIdentity: first,
+            expectedGeneration: 4,
+            currentIdentity: first,
+            currentGeneration: 5
+        ), "A stale completion cannot requeue after its exact scope was superseded")
+    }
+
+    func testReplacementSessionCancelsScheduledHistoryContinuationBeforeItRuns() async throws {
+        let userID = "10000000-0000-4000-8000-000000000071"
+        let accountGeneration = UUID(
+            uuidString: "60000000-0000-4000-8000-000000000071"
+        )!
+        let originalSessionID = "70000000-0000-4000-8000-000000000071"
+        let replacementSessionID = "70000000-0000-4000-8000-000000000072"
+        let store = try await makeStore(userID: userID)
+        let engine = SecureMessagingCryptoEngine()
+        let provisioned = try await engine.provision(from: .empty, preKeyCount: 1)
+        let status = enrolledStatus(bundle: provisioned.bundle)
+        let binding = try SecureMessagingMapper.enrollmentBinding(from: status, userID: userID)
+        let crypto = try await engine.bindEnrollment(binding, to: provisioned.state)
+        try await store.update { $0.secureMessaging = crypto }
+        let transport = SupersededActivationTransport(status: status)
+        let coordinator = SecureMessagingExchangeCoordinator(
+            transport: transport,
+            store: store,
+            engine: engine,
+            provisioningPreKeyCount: 1
+        )
+
+        await SecureMessagingActivationBinding.withAuthenticatedScope(
+            accountGeneration: accountGeneration,
+            sessionID: originalSessionID
+        ) {
+            await coordinator.scheduleHistoryContinuationForTesting(
+                forUserID: userID,
+                delayNanoseconds: 5_000_000_000
+            )
+        }
+        let scheduled = await coordinator.historyContinuationOwnershipForTesting()
+        XCTAssertTrue(scheduled.scheduled)
+        XCTAssertFalse(scheduled.running)
+
+        let replacementActivation = Task {
+            try await SecureMessagingActivationBinding.withAuthenticatedScope(
+                accountGeneration: accountGeneration,
+                sessionID: replacementSessionID
+            ) {
+                try await coordinator.activate(forUserID: userID)
+            }
+        }
+        try await transport.waitUntilFirstStatusStarted()
+
+        let cancelled = await coordinator.historyContinuationOwnershipForTesting()
+        XCTAssertFalse(cancelled.scheduled)
+        XCTAssertFalse(cancelled.running)
+
+        await transport.releaseFirstStatus()
+        try await replacementActivation.value
+        try await Task.sleep(nanoseconds: 50_000_000)
+        let historyRequests = await transport.messagingConversationListRequestCount()
+        XCTAssertEqual(historyRequests, 0)
     }
 
     func testHistoryAttemptDispositionCompletesTerminalTargetAndRestartsInvalidCursor() throws {
@@ -6674,6 +7679,7 @@ private actor SuspendedMessagingExchangeTransport: SecureMessagingExchangeTransp
         case conversation(MessagingConversationDTO)
         case conversationFailure(conversationID: String)
         case createConversation(MessagingConversationDTO)
+        case suspendedCreateConversation(MessagingConversationDTO)
         case sendSuccess(EncryptedMessageDTO)
         case sendStaleRoster(conversationID: String)
         case readReceipt(MessagingReadReceiptDTO)
@@ -6742,7 +7748,8 @@ private actor SuspendedMessagingExchangeTransport: SecureMessagingExchangeTransp
                 message: "Please retry.",
                 httpStatus: 503
             )
-        case .createConversation, .sendSuccess, .sendStaleRoster, .readReceipt:
+        case .createConversation, .suspendedCreateConversation,
+                .sendSuccess, .sendStaleRoster, .readReceipt:
             return try reject()
         }
     }
@@ -6764,7 +7771,8 @@ private actor SuspendedMessagingExchangeTransport: SecureMessagingExchangeTransp
                 message: "The roster changed.",
                 httpStatus: 409
             )
-        case .conversation, .conversationFailure, .createConversation, .readReceipt:
+        case .conversation, .conversationFailure, .createConversation,
+                .suspendedCreateConversation, .readReceipt:
             return try reject()
         }
     }
@@ -6784,11 +7792,17 @@ private actor SuspendedMessagingExchangeTransport: SecureMessagingExchangeTransp
     func createDirectMessagingConversation(
         _ request: CreateDirectMessagingConversationRequest
     ) async throws -> MessagingConversationDTO {
-        guard case .createConversation(let response) = scenario else {
+        switch scenario {
+        case .createConversation(let response):
+            requestedDirectMemberIDs.append(request.memberIds)
+            return response
+        case .suspendedCreateConversation(let response):
+            requestedDirectMemberIDs.append(request.memberIds)
+            await suspendExpectedRequest()
+            return response
+        case .conversation, .conversationFailure, .sendSuccess, .sendStaleRoster, .readReceipt:
             return try reject()
         }
-        requestedDirectMemberIDs.append(request.memberIds)
-        return response
     }
 
     func messagingDeviceRoster(
@@ -7343,6 +8357,232 @@ private actor ActivationTransportStub: SecureMessagingActivationTransport {
 
     func publishedRequests() -> [PublishMessagingKeyBundleRequest] { requests }
     func resetRequests() -> [ResetMessagingEnrollmentRequest] { recordedResetRequests }
+}
+
+/// Holds the former account's status request even after task cancellation, matching a transport
+/// whose underlying system callback cannot abort synchronously. A second request must therefore
+/// be allowed to activate the replacement account without waiting for or inheriting that flight.
+private actor SupersededActivationTransport: SecureMessagingExchangeTransport {
+    enum Failure: Error {
+        case expectedFirstRequestDidNotStart
+        case expectedThirdRequestDidNotStart
+        case staleRequest
+        case unexpectedMutation
+    }
+
+    private let firstStatus: MessagingKeyStatusDTO
+    private let replacementStatus: MessagingKeyStatusDTO
+    private let finalStatus: MessagingKeyStatusDTO?
+    private let firstRequestFails: Bool
+    private var statusRequests = 0
+    private var firstStatusStarted = false
+    private var firstStatusReleased = false
+    private var firstStatusWaiters: [CheckedContinuation<Void, Never>] = []
+    private var secondStatusStarted = false
+    private var secondStatusReleased = false
+    private var secondStatusWaiters: [CheckedContinuation<Void, Never>] = []
+    private var thirdStatusStarted = false
+    private var thirdStatusReleased = false
+    private var thirdStatusWaiters: [CheckedContinuation<Void, Never>] = []
+    private var messagingConversationListRequests = 0
+
+    init(status: MessagingKeyStatusDTO) {
+        firstStatus = status
+        replacementStatus = status
+        finalStatus = nil
+        firstRequestFails = false
+    }
+
+    init(
+        firstStatus: MessagingKeyStatusDTO,
+        replacementStatus: MessagingKeyStatusDTO,
+        finalStatus: MessagingKeyStatusDTO? = nil,
+        firstRequestFails: Bool = false
+    ) {
+        self.firstStatus = firstStatus
+        self.replacementStatus = replacementStatus
+        self.finalStatus = finalStatus
+        self.firstRequestFails = firstRequestFails
+    }
+
+    func waitUntilFirstStatusStarted() async throws {
+        for _ in 0..<500 {
+            if firstStatusStarted { return }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        throw Failure.expectedFirstRequestDidNotStart
+    }
+
+    func releaseFirstStatus() {
+        firstStatusReleased = true
+        let waiters = firstStatusWaiters
+        firstStatusWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
+    func waitUntilSecondStatusStarted() async throws {
+        for _ in 0..<500 {
+            if secondStatusStarted { return }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        throw Failure.expectedFirstRequestDidNotStart
+    }
+
+    func releaseSecondStatus() {
+        secondStatusReleased = true
+        let waiters = secondStatusWaiters
+        secondStatusWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
+    func waitUntilThirdStatusStarted() async throws {
+        for _ in 0..<500 {
+            if thirdStatusStarted { return }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        throw Failure.expectedThirdRequestDidNotStart
+    }
+
+    func releaseThirdStatus() {
+        thirdStatusReleased = true
+        let waiters = thirdStatusWaiters
+        thirdStatusWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
+    func statusRequestCount() -> Int { statusRequests }
+
+    func messagingConversationListRequestCount() -> Int {
+        messagingConversationListRequests
+    }
+
+    func messagingKeyStatus() async throws -> MessagingKeyStatusDTO {
+        statusRequests += 1
+        let requestNumber = statusRequests
+        if requestNumber == 1 {
+            firstStatusStarted = true
+            if !firstStatusReleased {
+                await withCheckedContinuation { continuation in
+                    firstStatusWaiters.append(continuation)
+                }
+            }
+        } else if requestNumber == 2 {
+            secondStatusStarted = true
+            if !secondStatusReleased {
+                await withCheckedContinuation { continuation in
+                    secondStatusWaiters.append(continuation)
+                }
+            }
+        } else if requestNumber == 3, finalStatus != nil {
+            thirdStatusStarted = true
+            if !thirdStatusReleased {
+                await withCheckedContinuation { continuation in
+                    thirdStatusWaiters.append(continuation)
+                }
+            }
+        }
+        if requestNumber == 1 {
+            if firstRequestFails { throw Failure.staleRequest }
+            return firstStatus
+        }
+        if requestNumber == 3, let finalStatus { return finalStatus }
+        return replacementStatus
+    }
+
+    func publishMessagingKeyBundle(
+        _ request: PublishMessagingKeyBundleRequest
+    ) async throws -> MessagingKeyStatusDTO {
+        throw Failure.unexpectedMutation
+    }
+
+    func resetMessagingEnrollment(
+        _ request: ResetMessagingEnrollmentRequest
+    ) async throws -> ResetMessagingEnrollmentDTO {
+        throw Failure.unexpectedMutation
+    }
+
+    func messagingConversations() async throws -> MessagingConversationListDTO {
+        messagingConversationListRequests += 1
+        return MessagingConversationListDTO(items: [])
+    }
+
+    func messagingConversation(id: String) async throws -> MessagingConversationDTO {
+        throw Failure.unexpectedMutation
+    }
+
+    func createDirectMessagingConversation(
+        _ request: CreateDirectMessagingConversationRequest
+    ) async throws -> MessagingConversationDTO {
+        throw Failure.unexpectedMutation
+    }
+
+    func messagingDeviceRoster(
+        conversationId: String
+    ) async throws -> MessagingDeviceRosterDTO {
+        throw Failure.unexpectedMutation
+    }
+
+    func historicalMessagingDeviceRoster(
+        conversationId: String,
+        rosterRevision: String
+    ) async throws -> MessagingDeviceRosterDTO {
+        throw Failure.unexpectedMutation
+    }
+
+    func consumeMessagingKeyBundles(
+        conversationId: String,
+        request: ConsumeMessagingKeyBundlesRequest
+    ) async throws -> ConsumedMessagingKeyBundlesDTO {
+        throw Failure.unexpectedMutation
+    }
+
+    func sendEncryptedMessage(
+        conversationId: String,
+        request: SendEncryptedMessageRequest
+    ) async throws -> EncryptedMessageDTO {
+        throw Failure.unexpectedMutation
+    }
+
+    func uploadMessagingAttachment(
+        mediaType: String,
+        ciphertext: Data
+    ) async throws -> MessagingAttachmentUploadDTO {
+        throw Failure.unexpectedMutation
+    }
+
+    func downloadMessagingAttachment(
+        storageKey: String,
+        expectedByteSize: Int64
+    ) async throws -> Data {
+        throw Failure.unexpectedMutation
+    }
+
+    func syncEncryptedMessages(
+        cursor: String?,
+        limit: Int
+    ) async throws -> MessagingSyncDTO {
+        MessagingSyncDTO(
+            events: [],
+            page: CursorPage(
+                nextCursor: cursor ?? "sync-cursor-1",
+                hasMore: false,
+                limit: limit
+            )
+        )
+    }
+
+    func acknowledgeMessageDelivery(
+        _ request: AcknowledgeMessageDeliveryRequest
+    ) async throws -> MessageDeliveryAcknowledgementDTO {
+        throw Failure.unexpectedMutation
+    }
+
+    func markMessagingConversationRead(
+        conversationId: String,
+        request: MarkMessagingConversationReadRequest
+    ) async throws -> MessagingReadReceiptDTO {
+        throw Failure.unexpectedMutation
+    }
 }
 
 private struct MediaBatchFlushFixture {

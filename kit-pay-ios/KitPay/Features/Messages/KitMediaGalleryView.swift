@@ -967,7 +967,10 @@ private struct GalleryVideoPage: View {
                 poster = await ChatMediaThumbnailStore.shared.videoThumbnail(
                     forKey: item.thumbnailKey,
                     maxPixel: 400,
-                    fromFileURL: playbackURL
+                    fromFileURL: playbackURL,
+                    mediaType: loaded.mediaType,
+                    expectedByteCount: loaded.byteCount,
+                    protectedOriginalLease: loaded.localFileLease
                 )
             }
         }

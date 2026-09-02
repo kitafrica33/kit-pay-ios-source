@@ -10033,9 +10033,11 @@ private struct NewMessageSheet: View {
                         }
                         .disabled(
                             submissionGate.isSubmitting
-                                || !model.appReviewDemoMutationsAllowed
-                                || !model.secureMessagingAvailable
-                                || message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                || !NewMessageComposerPolicy.canSubmit(
+                                    appMutationsAllowed: model.appReviewDemoMutationsAllowed,
+                                    localQueueAvailable: model.secureMessagingLocalQueueAvailable,
+                                    body: message
+                                )
                         )
                     }
                 }
@@ -10073,9 +10075,11 @@ private struct NewMessageSheet: View {
                 clientMessageID: clientMessageID,
                 succeeded: result != nil
             )
-            guard let result else { return }
+            guard let conversation = NewMessageComposerPolicy.navigationConversation(
+                after: result
+            ) else { return }
             message = ""
-            onQueued(result.conversation)
+            onQueued(conversation)
         }
     }
 
