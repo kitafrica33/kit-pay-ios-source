@@ -2575,6 +2575,9 @@ extension Notification.Name {
     static let kitPushTokenInvalidated = Notification.Name("africa.kit.pay.push-token-invalidated")
     static let kitRemoteWakeReceived = Notification.Name("africa.kit.pay.remote-wake")
     static let kitCallMediaFailed = Notification.Name("africa.kit.pay.call-media-failed")
+    static let kitCallRemoteParticipantConnected = Notification.Name(
+        "africa.kit.pay.call-remote-participant-connected"
+    )
     static let kitCallLifecycleEvent = Notification.Name("africa.kit.pay.call-lifecycle-event")
     static let kitPendingOutgoingCallEnded = Notification.Name(
         "africa.kit.pay.pending-outgoing-call-ended"

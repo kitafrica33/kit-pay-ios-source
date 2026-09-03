@@ -64,11 +64,11 @@ final class AppStoreScreenshotUITests: XCTestCase {
         require(app.staticTexts["Wallet balance"], in: app, message: "Home did not return")
 
         tap(app.buttons["Bank"], in: app, message: "Bank transfer shortcut is unavailable")
-        require(app.navigationBars["Bank transfer"], in: app, message: "Bank transfer did not open")
+        require(app.navigationBars["Bank"], in: app, message: "Bank did not open")
         require(
-            app.staticTexts["Saved beneficiaries"],
+            app.staticTexts["Send to bank"],
             in: app,
-            message: "Bank transfer fixture did not load"
+            message: "Bank fixture did not load"
         )
         require(
             app.staticTexts[fixtureContactName].firstMatch,

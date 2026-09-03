@@ -923,6 +923,343 @@ final class CallLifecycleTests: XCTestCase {
         XCTAssertNil(gate.attempt)
     }
 
+    func testOutgoingCallRingDeadlineCapsProvisionalAttemptAtFortyFiveSeconds() throws {
+        let attempt = ephemeralAttempt(
+            clientCallID: "51000000-0000-4000-8000-000000000010"
+        )
+        var gate = OutgoingCallRingDeadlineGate()
+        let ticket = try XCTUnwrap(gate.begin(attempt, monotonicNow: 100))
+
+        XCTAssertEqual(ticket.deadline.monotonicTime, 145)
+        XCTAssertNil(gate.consumeExpired(
+            ticket,
+            activeClientCallID: attempt.clientCallIDString,
+            activeBackendCallID: nil,
+            activeLease: attempt.lease,
+            answeredBackendCallID: nil,
+            monotonicNow: 144.999
+        ))
+        XCTAssertEqual(gate.ticket, ticket)
+        XCTAssertEqual(gate.consumeExpired(
+            ticket,
+            activeClientCallID: attempt.clientCallIDString,
+            activeBackendCallID: nil,
+            activeLease: attempt.lease,
+            answeredBackendCallID: nil,
+            monotonicNow: 145
+        ), .cancelProvisional(
+            clientCallID: attempt.clientCallIDString,
+            lease: attempt.lease
+        ))
+        XCTAssertNil(gate.ticket)
+    }
+
+    func testOutgoingCallStartResponsePromotesOnlyRingingOrAnsweredState() {
+        XCTAssertEqual(
+            OutgoingCallStartResponsePolicy.disposition(for: .queued),
+            .ringing
+        )
+        XCTAssertEqual(
+            OutgoingCallStartResponsePolicy.disposition(for: .ringing),
+            .ringing
+        )
+        XCTAssertEqual(
+            OutgoingCallStartResponsePolicy.disposition(for: .active),
+            .answered
+        )
+        for terminalState in [
+            CallState.completed,
+            .missed,
+            .declined,
+            .failed,
+        ] {
+            XCTAssertEqual(
+                OutgoingCallStartResponsePolicy.disposition(for: terminalState),
+                .terminal
+            )
+        }
+    }
+
+    func testOutgoingCallRingDeadlineBlocksResumeAndPromotionOnceDueUnlessAlreadyAnswered() throws {
+        let attempt = ephemeralAttempt(
+            clientCallID: "51000000-0000-4000-8000-000000000016"
+        )
+        let backendCallID = "56000000-0000-4000-8000-000000000016"
+        var ringingGate = OutgoingCallRingDeadlineGate()
+        _ = try XCTUnwrap(ringingGate.begin(attempt, monotonicNow: 100))
+
+        XCTAssertTrue(ringingGate.permitsSubmission(for: attempt, monotonicNow: 144.999))
+        XCTAssertFalse(ringingGate.permitsSubmission(for: attempt, monotonicNow: 145))
+        XCTAssertNil(ringingGate.promote(
+            clientCallID: attempt.clientCallIDString,
+            lease: attempt.lease,
+            backendCallID: backendCallID,
+            ringExpiresAt: nil,
+            serverTime: nil,
+            monotonicNow: 145
+        ))
+        XCTAssertTrue(ringingGate.cancel(
+            clientCallID: attempt.clientCallIDString,
+            lease: attempt.lease
+        ))
+        let replacement = ephemeralAttempt(
+            clientCallID: "51000000-0000-4000-8000-000000000017"
+        )
+        XCTAssertNotNil(ringingGate.begin(replacement, monotonicNow: 146))
+
+        var answeredGate = OutgoingCallRingDeadlineGate()
+        _ = try XCTUnwrap(answeredGate.begin(attempt, monotonicNow: 100))
+        let answered = try XCTUnwrap(answeredGate.promote(
+            clientCallID: attempt.clientCallIDString,
+            lease: attempt.lease,
+            backendCallID: backendCallID,
+            ringExpiresAt: "2026-08-18T12:00:10Z",
+            serverTime: "2026-08-18T12:00:10Z",
+            answerAlreadyAccepted: true,
+            monotonicNow: 145
+        ))
+        XCTAssertEqual(answered.backendCallID, backendCallID)
+        XCTAssertTrue(answered.deadline.isExpired(at: 145))
+    }
+
+    func testOutgoingCallRingDeadlineUsesServerRemainingWindowWithoutExtendingLocalCeiling() throws {
+        let attempt = ephemeralAttempt(
+            clientCallID: "51000000-0000-4000-8000-000000000011"
+        )
+        let backendCallID = "56000000-0000-4000-8000-000000000011"
+        var shortenedGate = OutgoingCallRingDeadlineGate()
+        _ = try XCTUnwrap(shortenedGate.begin(attempt, monotonicNow: 100))
+        let shortened = try XCTUnwrap(shortenedGate.promote(
+            clientCallID: attempt.clientCallIDString,
+            lease: attempt.lease,
+            backendCallID: backendCallID,
+            ringExpiresAt: "2026-08-18T12:00:22Z",
+            serverTime: "2026-08-18T12:00:10Z",
+            monotonicNow: 110
+        ))
+        XCTAssertEqual(shortened.backendCallID, backendCallID)
+        XCTAssertEqual(shortened.deadline.monotonicTime, 122)
+
+        var cappedGate = OutgoingCallRingDeadlineGate()
+        _ = try XCTUnwrap(cappedGate.begin(attempt, monotonicNow: 100))
+        let capped = try XCTUnwrap(cappedGate.promote(
+            clientCallID: attempt.clientCallIDString,
+            lease: attempt.lease,
+            backendCallID: backendCallID,
+            ringExpiresAt: "2026-08-18T12:01:10Z",
+            serverTime: "2026-08-18T12:00:10Z",
+            monotonicNow: 110
+        ))
+        XCTAssertEqual(capped.deadline.monotonicTime, 145)
+    }
+
+    func testOutgoingCallRingDeadlineRetainsLocalCeilingForMissingOrMalformedServerTime() throws {
+        let attempt = ephemeralAttempt(
+            clientCallID: "51000000-0000-4000-8000-000000000012"
+        )
+        let backendCallID = "56000000-0000-4000-8000-000000000012"
+
+        for timestamps in [
+            (ringExpiresAt: Optional<String>.none, serverTime: Optional<String>.none),
+            (ringExpiresAt: "2026-08-18T12:00:45Z", serverTime: Optional<String>.none),
+            (ringExpiresAt: "not-a-time", serverTime: "2026-08-18T12:00:10Z"),
+            (ringExpiresAt: "2026-08-18T12:00:45Z", serverTime: "not-a-time"),
+        ] {
+            var gate = OutgoingCallRingDeadlineGate()
+            _ = try XCTUnwrap(gate.begin(attempt, monotonicNow: 100))
+            let promoted = try XCTUnwrap(gate.promote(
+                clientCallID: attempt.clientCallIDString,
+                lease: attempt.lease,
+                backendCallID: backendCallID,
+                ringExpiresAt: timestamps.ringExpiresAt,
+                serverTime: timestamps.serverTime,
+                monotonicNow: 110
+            ))
+            XCTAssertEqual(promoted.deadline.monotonicTime, 145)
+        }
+    }
+
+    func testOutgoingCallRingDeadlineRejectsStaleAttemptAccountAndBackendIdentity() throws {
+        let attempt = ephemeralAttempt(
+            clientCallID: "51000000-0000-4000-8000-000000000013"
+        )
+        let backendCallID = "56000000-0000-4000-8000-000000000013"
+        let otherLease = CallMediaAccountLease(
+            accountEpoch: UUID(uuidString: "54000000-0000-4000-8000-000000000099")!,
+            userID: attempt.lease.userID,
+            sessionID: attempt.lease.sessionID
+        )
+
+        var staleAttemptGate = OutgoingCallRingDeadlineGate()
+        let provisional = try XCTUnwrap(staleAttemptGate.begin(attempt, monotonicNow: 100))
+        XCTAssertNil(staleAttemptGate.promote(
+            clientCallID: "51000000-0000-4000-8000-000000000099",
+            lease: attempt.lease,
+            backendCallID: backendCallID,
+            ringExpiresAt: nil,
+            serverTime: nil,
+            monotonicNow: 110
+        ))
+        XCTAssertNil(staleAttemptGate.promote(
+            clientCallID: attempt.clientCallIDString,
+            lease: otherLease,
+            backendCallID: backendCallID,
+            ringExpiresAt: nil,
+            serverTime: nil,
+            monotonicNow: 110
+        ))
+        let promoted = try XCTUnwrap(staleAttemptGate.promote(
+            clientCallID: attempt.clientCallIDString,
+            lease: attempt.lease,
+            backendCallID: backendCallID,
+            ringExpiresAt: nil,
+            serverTime: nil,
+            monotonicNow: 110
+        ))
+        XCTAssertNil(staleAttemptGate.consumeExpired(
+            provisional,
+            activeClientCallID: attempt.clientCallIDString,
+            activeBackendCallID: backendCallID,
+            activeLease: attempt.lease,
+            answeredBackendCallID: nil,
+            monotonicNow: 145
+        ))
+        XCTAssertEqual(staleAttemptGate.ticket, promoted)
+
+        var staleAccountGate = OutgoingCallRingDeadlineGate()
+        _ = try XCTUnwrap(staleAccountGate.begin(attempt, monotonicNow: 100))
+        let accountTicket = try XCTUnwrap(staleAccountGate.promote(
+            clientCallID: attempt.clientCallIDString,
+            lease: attempt.lease,
+            backendCallID: backendCallID,
+            ringExpiresAt: nil,
+            serverTime: nil,
+            monotonicNow: 110
+        ))
+        XCTAssertNil(staleAccountGate.consumeExpired(
+            accountTicket,
+            activeClientCallID: nil,
+            activeBackendCallID: backendCallID,
+            activeLease: otherLease,
+            answeredBackendCallID: nil,
+            monotonicNow: 145
+        ))
+
+        var staleBackendGate = OutgoingCallRingDeadlineGate()
+        _ = try XCTUnwrap(staleBackendGate.begin(attempt, monotonicNow: 100))
+        let backendTicket = try XCTUnwrap(staleBackendGate.promote(
+            clientCallID: attempt.clientCallIDString,
+            lease: attempt.lease,
+            backendCallID: backendCallID,
+            ringExpiresAt: nil,
+            serverTime: nil,
+            monotonicNow: 110
+        ))
+        XCTAssertNil(staleBackendGate.consumeExpired(
+            backendTicket,
+            activeClientCallID: nil,
+            activeBackendCallID: "56000000-0000-4000-8000-000000000099",
+            activeLease: attempt.lease,
+            answeredBackendCallID: nil,
+            monotonicNow: 145
+        ))
+    }
+
+    func testOutgoingCallAnswerWinningAtDeadlinePreventsTermination() throws {
+        let attempt = ephemeralAttempt(
+            clientCallID: "51000000-0000-4000-8000-000000000014"
+        )
+        let backendCallID = "56000000-0000-4000-8000-000000000014"
+        var gate = OutgoingCallRingDeadlineGate()
+        _ = try XCTUnwrap(gate.begin(attempt, monotonicNow: 100))
+        let ticket = try XCTUnwrap(gate.promote(
+            clientCallID: attempt.clientCallIDString,
+            lease: attempt.lease,
+            backendCallID: backendCallID,
+            ringExpiresAt: nil,
+            serverTime: nil,
+            monotonicNow: 110
+        ))
+
+        XCTAssertNil(gate.consumeExpired(
+            ticket,
+            activeClientCallID: nil,
+            activeBackendCallID: backendCallID,
+            activeLease: attempt.lease,
+            answeredBackendCallID: backendCallID,
+            monotonicNow: 145
+        ))
+        XCTAssertNil(gate.ticket)
+    }
+
+    func testOutgoingCallAnswerForAnotherCallDoesNotPreventTermination() throws {
+        let attempt = ephemeralAttempt(
+            clientCallID: "51000000-0000-4000-8000-000000000018"
+        )
+        let backendCallID = "56000000-0000-4000-8000-000000000018"
+        var gate = OutgoingCallRingDeadlineGate()
+        _ = try XCTUnwrap(gate.begin(attempt, monotonicNow: 100))
+        let ticket = try XCTUnwrap(gate.promote(
+            clientCallID: attempt.clientCallIDString,
+            lease: attempt.lease,
+            backendCallID: backendCallID,
+            ringExpiresAt: nil,
+            serverTime: nil,
+            monotonicNow: 110
+        ))
+
+        XCTAssertEqual(gate.consumeExpired(
+            ticket,
+            activeClientCallID: nil,
+            activeBackendCallID: backendCallID,
+            activeLease: attempt.lease,
+            answeredBackendCallID: "56000000-0000-4000-8000-000000000099",
+            monotonicNow: 145
+        ), .endAuthenticated(
+            callID: backendCallID,
+            lease: attempt.lease
+        ))
+        XCTAssertNil(gate.ticket)
+    }
+
+    func testOutgoingCallRingDeadlineExpiryIsIdempotent() throws {
+        let attempt = ephemeralAttempt(
+            clientCallID: "51000000-0000-4000-8000-000000000015"
+        )
+        let backendCallID = "56000000-0000-4000-8000-000000000015"
+        var gate = OutgoingCallRingDeadlineGate()
+        _ = try XCTUnwrap(gate.begin(attempt, monotonicNow: 100))
+        let ticket = try XCTUnwrap(gate.promote(
+            clientCallID: attempt.clientCallIDString,
+            lease: attempt.lease,
+            backendCallID: backendCallID,
+            ringExpiresAt: nil,
+            serverTime: nil,
+            monotonicNow: 110
+        ))
+        let expected = OutgoingCallRingDeadlineExpiration.endAuthenticated(
+            callID: backendCallID,
+            lease: attempt.lease
+        )
+
+        XCTAssertEqual(gate.consumeExpired(
+            ticket,
+            activeClientCallID: nil,
+            activeBackendCallID: backendCallID,
+            activeLease: attempt.lease,
+            answeredBackendCallID: nil,
+            monotonicNow: 145
+        ), expected)
+        XCTAssertNil(gate.consumeExpired(
+            ticket,
+            activeClientCallID: nil,
+            activeBackendCallID: backendCallID,
+            activeLease: attempt.lease,
+            answeredBackendCallID: nil,
+            monotonicNow: 145
+        ))
+    }
+
     func testMicrophoneModesApplyDistinctLiveAudioProcessingProfiles() {
         let automatic = KitMicrophoneMode.automatic.audioProcessingOptions
         XCTAssertTrue(automatic.echoCancellation)
@@ -3091,6 +3428,16 @@ final class CallLifecycleTests: XCTestCase {
         )
         XCTAssertEqual(staleStartResponse.state, .active)
         XCTAssertEqual(staleStartResponse.answeredAt, refreshedActive.answeredAt)
+
+        var refreshedTerminal = partialServerResult
+        refreshedTerminal.state = .declined
+        refreshedTerminal.endedAt = Date(timeIntervalSince1970: 13)
+        let terminalStartResponse = CallLifecyclePolicy.mergingStartResponse(
+            partialServerResult,
+            with: refreshedTerminal
+        )
+        XCTAssertEqual(terminalStartResponse.state, .declined)
+        XCTAssertEqual(terminalStartResponse.endedAt, refreshedTerminal.endedAt)
     }
 
     func testConversationTimelineInterleavesMessagesAndCallsChronologically() {

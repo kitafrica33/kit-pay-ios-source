@@ -133,6 +133,186 @@ enum EphemeralOutgoingCallRetryPolicy {
     }
 }
 
+enum OutgoingCallStartResponseDisposition: Equatable {
+    case ringing
+    case answered
+    case terminal
+}
+
+enum OutgoingCallStartResponsePolicy {
+    static func disposition(for state: CallState) -> OutgoingCallStartResponseDisposition {
+        switch state {
+        case .queued, .ringing:
+            .ringing
+        case .active:
+            .answered
+        case .completed, .missed, .declined, .failed:
+            .terminal
+        }
+    }
+}
+
+/// Process-local ownership of the finite period in which an outgoing call may keep ringing.
+/// The first deadline is anchored to the monotonic clock as soon as the provisional screen is
+/// created. A successful backend response may shorten it with the server's authoritative remaining
+/// ring window, but can never extend the original 45-second ceiling.
+struct OutgoingCallRingDeadlineTicket: Equatable, Sendable {
+    let clientCallID: String
+    let lease: CallMediaAccountLease
+    let backendCallID: String?
+    let deadline: CallRingDeadline
+}
+
+enum OutgoingCallRingDeadlineExpiration: Equatable, Sendable {
+    case cancelProvisional(clientCallID: String, lease: CallMediaAccountLease)
+    case endAuthenticated(callID: String, lease: CallMediaAccountLease)
+}
+
+/// A one-shot gate around the outgoing ring deadline. The task holding a ticket has no authority
+/// on its own: expiry must consume the exact current ticket and re-prove the visible call identity,
+/// account lease, and answer state. This keeps a cancelled task or a previous account from ending a
+/// replacement call even if it resumes late on the main actor.
+struct OutgoingCallRingDeadlineGate: Sendable {
+    static let provisionalLifetime: TimeInterval = 45
+
+    private(set) var ticket: OutgoingCallRingDeadlineTicket?
+
+    @discardableResult
+    mutating func begin(
+        _ attempt: EphemeralOutgoingCallAttempt,
+        monotonicNow: TimeInterval = CallMonotonicClock.now()
+    ) -> OutgoingCallRingDeadlineTicket? {
+        guard ticket == nil, monotonicNow.isFinite else { return nil }
+        let newTicket = OutgoingCallRingDeadlineTicket(
+            clientCallID: attempt.clientCallIDString,
+            lease: attempt.lease,
+            backendCallID: nil,
+            deadline: CallRingDeadline(
+                monotonicTime: monotonicNow + Self.provisionalLifetime
+            )
+        )
+        ticket = newTicket
+        return newTicket
+    }
+
+    func permitsSubmission(
+        for attempt: EphemeralOutgoingCallAttempt,
+        monotonicNow: TimeInterval = CallMonotonicClock.now()
+    ) -> Bool {
+        guard let current = ticket else { return false }
+        return current.backendCallID == nil
+            && current.clientCallID.caseInsensitiveCompare(attempt.clientCallIDString)
+                == .orderedSame
+            && current.lease == attempt.lease
+            && !current.deadline.isExpired(at: monotonicNow)
+    }
+
+    /// Binds the provisional deadline to the authenticated call ID. Missing or malformed server
+    /// timestamps retain the safe local ceiling; a valid server delta may only shorten it.
+    @discardableResult
+    mutating func promote(
+        clientCallID: String,
+        lease: CallMediaAccountLease,
+        backendCallID: String,
+        ringExpiresAt: String?,
+        serverTime: String?,
+        answerAlreadyAccepted: Bool = false,
+        monotonicNow: TimeInterval = CallMonotonicClock.now()
+    ) -> OutgoingCallRingDeadlineTicket? {
+        guard monotonicNow.isFinite,
+              let current = ticket,
+              current.backendCallID == nil,
+              current.clientCallID.caseInsensitiveCompare(clientCallID) == .orderedSame,
+              current.lease == lease,
+              let canonicalBackendCallID = Self.canonicalCallID(backendCallID)
+        else { return nil }
+
+        let serverDeadline = CallRingDeadline(
+            ringExpiresAt: ringExpiresAt,
+            serverTime: serverTime,
+            monotonicNow: monotonicNow
+        )
+        let refinedDeadline = CallRingDeadline(
+            monotonicTime: min(
+                current.deadline.monotonicTime,
+                serverDeadline?.monotonicTime ?? current.deadline.monotonicTime
+            )
+        )
+        guard answerAlreadyAccepted || !refinedDeadline.isExpired(at: monotonicNow) else {
+            return nil
+        }
+        let promoted = OutgoingCallRingDeadlineTicket(
+            clientCallID: current.clientCallID,
+            lease: current.lease,
+            backendCallID: canonicalBackendCallID,
+            deadline: refinedDeadline
+        )
+        ticket = promoted
+        return promoted
+    }
+
+    /// Cancels only matching ownership. Supplying no identity intentionally retires all authority
+    /// at a process/account boundary.
+    @discardableResult
+    mutating func cancel(
+        clientCallID: String? = nil,
+        backendCallID: String? = nil,
+        lease: CallMediaAccountLease? = nil
+    ) -> Bool {
+        guard let current = ticket else { return false }
+        if let clientCallID,
+           current.clientCallID.caseInsensitiveCompare(clientCallID) != .orderedSame {
+            return false
+        }
+        if let backendCallID,
+           current.backendCallID?.caseInsensitiveCompare(backendCallID) != .orderedSame {
+            return false
+        }
+        if let lease, current.lease != lease { return false }
+        ticket = nil
+        return true
+    }
+
+    /// Consumes a due ticket at most once. A current ticket whose live presentation no longer
+    /// matches is retired without action; a stale task ticket cannot alter newer state.
+    mutating func consumeExpired(
+        _ expected: OutgoingCallRingDeadlineTicket,
+        activeClientCallID: String?,
+        activeBackendCallID: String?,
+        activeLease: CallMediaAccountLease?,
+        answeredBackendCallID: String?,
+        monotonicNow: TimeInterval = CallMonotonicClock.now()
+    ) -> OutgoingCallRingDeadlineExpiration? {
+        guard ticket == expected,
+              expected.deadline.isExpired(at: monotonicNow)
+        else { return nil }
+
+        // This ticket has reached its only decision point. Clearing first makes duplicate wakes
+        // inert even when teardown below publishes another lifecycle event synchronously.
+        ticket = nil
+        guard activeLease == expected.lease else { return nil }
+
+        if let backendCallID = expected.backendCallID {
+            guard Self.canonicalCallID(activeBackendCallID) == backendCallID else { return nil }
+            if Self.canonicalCallID(answeredBackendCallID) == backendCallID { return nil }
+            return .endAuthenticated(callID: backendCallID, lease: expected.lease)
+        }
+
+        guard Self.canonicalCallID(activeClientCallID) == expected.clientCallID else { return nil }
+        return .cancelProvisional(
+            clientCallID: expected.clientCallID,
+            lease: expected.lease
+        )
+    }
+
+    private static func canonicalCallID(_ rawValue: String?) -> String? {
+        guard let rawValue,
+              let value = UUID(uuidString: rawValue.trimmingCharacters(in: .whitespacesAndNewlines))
+        else { return nil }
+        return value.uuidString.lowercased()
+    }
+}
+
 struct CallableContact: Identifiable, Hashable {
     let id: String
     let name: String

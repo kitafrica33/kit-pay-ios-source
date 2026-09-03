@@ -1330,6 +1330,8 @@ final class AppModel: ObservableObject {
     private var ephemeralOutgoingCallTask: Task<Void, Never>?
     private var ephemeralOutgoingCallTaskID: UUID?
     private var ephemeralOutgoingCallResumePending = false
+    private var outgoingCallRingDeadlineGate = OutgoingCallRingDeadlineGate()
+    private var outgoingCallRingDeadlineTask: Task<Void, Never>?
     private var pendingEphemeralCallCancellations: [String: EphemeralOutgoingCallAttempt] = [:]
     private var ephemeralCallCancellationTask: Task<Void, Never>?
     private var conversationDraftWriterID = UUID()
@@ -1378,7 +1380,9 @@ final class AppModel: ObservableObject {
 
 #if DEBUG && APP_STORE_SCREENSHOTS
         if AppStoreScreenshotFixture.isActive {
-            state = AppStoreScreenshotFixture.state
+            let fixtureState = AppStoreScreenshotFixture.state
+            state = fixtureState
+            sessionAssurance = fixtureState.sessionAssurance
             publishedStateRevision = 1
             capabilities = AppStoreScreenshotFixture.capabilities
             communicationPreferences = AppStoreScreenshotFixture.communicationPreferences
@@ -1591,6 +1595,22 @@ final class AppModel: ObservableObject {
         )
         observers.append(
             NotificationCenter.default.addObserver(
+                forName: .kitCallRemoteParticipantConnected,
+                object: nil,
+                queue: .main
+            ) { [weak self] notification in
+                guard let callID = notification.object as? String else { return }
+                MainActor.assumeIsolated {
+                    guard let self, let lease = self.callMediaAccountLease else { return }
+                    self.cancelOutgoingCallRingDeadline(
+                        backendCallID: callID,
+                        lease: lease
+                    )
+                }
+            }
+        )
+        observers.append(
+            NotificationCenter.default.addObserver(
                 forName: .kitPendingOutgoingCallEnded,
                 object: nil,
                 queue: .main
@@ -1624,14 +1644,13 @@ final class AppModel: ObservableObject {
                     // The push fallback of the answer signal. Applied directly — the refresh
                     // that used to be this wake's only effect still runs, but off the path
                     // between the callee picking up and this device reflecting it.
-                    Task { @MainActor in
-                        guard let self else { return }
-                        self.handleCallAnswerSignal(
+                    MainActor.assumeIsolated {
+                        self?.handleCallAnswerSignal(
                             callId: answered.callId,
                             signal: answered.signal
                         )
-                        await self.refresh()
                     }
+                    Task { @MainActor in await self?.refresh() }
                     return
                 }
                 Task { @MainActor in
@@ -1711,6 +1730,7 @@ final class AppModel: ObservableObject {
         communicationReplayTask?.cancel()
         mediaPreprocessingTask?.cancel()
         ephemeralOutgoingCallTask?.cancel()
+        outgoingCallRingDeadlineTask?.cancel()
         ephemeralCallCancellationTask?.cancel()
         observers.forEach(NotificationCenter.default.removeObserver)
     }
@@ -2077,6 +2097,12 @@ final class AppModel: ObservableObject {
         }
         if case .systemAction(let action) = event,
            action.kind == .decline || action.kind == .end || action.kind == .timedOut {
+            if let lease = callMediaAccountLease {
+                cancelOutgoingCallRingDeadline(
+                    backendCallID: action.callId,
+                    lease: lease
+                )
+            }
             // Cancellation intent must be visible while an earlier answer request is suspended.
             // Otherwise accepted media could reconnect briefly after the user has hung up.
             locallyTerminatedCallIds.insert(action.callId.lowercased())
@@ -2590,6 +2616,7 @@ final class AppModel: ObservableObject {
                 : nil
         }
         if revokedMediaLease != nil {
+            cancelOutgoingCallRingDeadline(lease: revokedMediaLease)
             callMediaAccountLease = nil
             await CallMediaCoordinator.shared.resetForSignOut(revoking: revokedMediaLease)
         }
@@ -2876,6 +2903,7 @@ final class AppModel: ObservableObject {
         if let targetAccountID,
            let targetLease = callMediaAccountLease,
            targetLease.userID.caseInsensitiveCompare(targetAccountID) == .orderedSame {
+            cancelOutgoingCallRingDeadline(lease: targetLease)
             callMediaAccountLease = nil
             didResumeAuthenticatedSession = false
             await CallMediaCoordinator.shared.resetForSignOut(revoking: targetLease)
@@ -4066,6 +4094,7 @@ final class AppModel: ObservableObject {
             throw AuthUIError.staleResponse
         }
         cancelEphemeralOutgoingCall(dismissPresentation: true)
+        cancelOutgoingCallRingDeadline()
         clearAllCallWaitingState()
         activeConversationID = nil
         stopVisibleConversationSync()
@@ -5120,6 +5149,7 @@ final class AppModel: ObservableObject {
         let cancelledOutgoingAttempt = cancelEphemeralOutgoingCall(
             dismissPresentation: true
         )
+        cancelOutgoingCallRingDeadline()
         callMediaAccountLease = nil
         // Revoke every in-flight account fence before the first suspension, then let both
         // user-initiated and silent avatar work unwind before credentials or encrypted state
@@ -9998,6 +10028,7 @@ final class AppModel: ObservableObject {
             await publishLatestState()
             rebuildCallContacts()
             reconcileCallWaitingAfterHistoryRefresh()
+            reconcileOutgoingCallRingDeadlineAfterHistoryRefresh()
             await CallMediaCoordinator.shared.reconcileBackendCalls(state.calls)
         } catch {
             // Chat opening must remain offline-first. A cancelled, incomplete, or malformed
@@ -10066,6 +10097,7 @@ final class AppModel: ObservableObject {
             await publishLatestState()
             rebuildCallContacts()
             reconcileCallWaitingAfterHistoryRefresh()
+            reconcileOutgoingCallRingDeadlineAfterHistoryRefresh()
             await CallMediaCoordinator.shared.reconcileBackendCalls(state.calls)
             return true
         } catch {
@@ -17297,6 +17329,14 @@ final class AppModel: ObservableObject {
             lastError = "Finish or cancel the current call attempt before starting another."
             return
         }
+        guard let ringDeadline = outgoingCallRingDeadlineGate.begin(attempt) else {
+            _ = ephemeralOutgoingCallGate.cancel(
+                clientCallID: attempt.clientCallIDString
+            )
+            lastError = "This call is unavailable right now."
+            return
+        }
+        scheduleOutgoingCallRingDeadline(ringDeadline)
         // Cleared before the request goes out, so only an answer to the call this attempt
         // is about to place can ever be claimed by it.
         pendingCallAnswers.removeAll()
@@ -17317,6 +17357,10 @@ final class AppModel: ObservableObject {
         ) else {
             _ = ephemeralOutgoingCallGate.cancel(
                 clientCallID: attempt.clientCallIDString
+            )
+            cancelOutgoingCallRingDeadline(
+                clientCallID: attempt.clientCallIDString,
+                lease: attempt.lease
             )
             lastError = "Finish or cancel the current call attempt before starting another."
             return
@@ -17429,6 +17473,12 @@ final class AppModel: ObservableObject {
     }
 
     private func handleRemoteCallMediaEndedWake(_ wake: RemoteCallMediaEndedWake) {
+        if let lease = callMediaAccountLease {
+            cancelOutgoingCallRingDeadline(
+                backendCallID: wake.callId,
+                lease: lease
+            )
+        }
         guard let endedCallID = canonicalCallID(wake.callId),
               let waiting = callWaitingState.waitingCall,
               waiting.callID != endedCallID
@@ -18120,11 +18170,127 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func scheduleOutgoingCallRingDeadline(
+        _ ticket: OutgoingCallRingDeadlineTicket
+    ) {
+        outgoingCallRingDeadlineTask?.cancel()
+        outgoingCallRingDeadlineTask = Task { @MainActor [weak self] in
+            let remaining = ticket.deadline.remaining()
+            do {
+                if remaining > 0 {
+                    try await Task.sleep(for: .seconds(remaining))
+                }
+            } catch {
+                return
+            }
+            guard let self, !Task.isCancelled else { return }
+            await self.expireOutgoingCallRingDeadline(ticket)
+        }
+    }
+
+    @discardableResult
+    private func cancelOutgoingCallRingDeadline(
+        clientCallID: String? = nil,
+        backendCallID: String? = nil,
+        lease: CallMediaAccountLease? = nil
+    ) -> Bool {
+        guard outgoingCallRingDeadlineGate.cancel(
+            clientCallID: clientCallID,
+            backendCallID: backendCallID,
+            lease: lease
+        ) else { return false }
+        outgoingCallRingDeadlineTask?.cancel()
+        outgoingCallRingDeadlineTask = nil
+        return true
+    }
+
+    private func expireOutgoingCallRingDeadline(
+        _ expected: OutgoingCallRingDeadlineTicket
+    ) async {
+        guard outgoingCallRingDeadlineGate.ticket == expected else { return }
+        guard expected.deadline.isExpired() else {
+            // Sleeping and the uptime clock are both monotonic, but tolerate an early wake without
+            // consuming the only expiry decision or losing the timer.
+            scheduleOutgoingCallRingDeadline(expected)
+            return
+        }
+
+        let media = CallMediaCoordinator.shared
+        let presentedCallID = media.activeCall?.id
+        let matchingRecord = expected.backendCallID.flatMap { backendCallID in
+            state.calls.first {
+                $0.id.caseInsensitiveCompare(backendCallID) == .orderedSame
+            }
+        }
+        let recordIsTerminal = matchingRecord.map {
+            [.completed, .missed, .declined, .failed].contains($0.state)
+        } ?? false
+        let activeBackendCallID: String?
+        if let presentedCallID,
+           media.state != .idle,
+           media.state != .ending,
+           !recordIsTerminal,
+           media.ownsAuthenticatedCall(callID: presentedCallID, lease: expected.lease) {
+            activeBackendCallID = presentedCallID
+        } else {
+            activeBackendCallID = nil
+        }
+        let answerWon = media.presentedCallWasAnswered
+            || media.media.hasRemoteParticipant
+            || media.media.remoteParticipantConnectedAt != nil
+            || matchingRecord?.state == .active
+            || matchingRecord?.answeredAt != nil
+        let answeredBackendCallID = answerWon ? activeBackendCallID : nil
+
+        outgoingCallRingDeadlineTask = nil
+        guard let expiration = outgoingCallRingDeadlineGate.consumeExpired(
+            expected,
+            activeClientCallID: ephemeralOutgoingCallGate.attempt?.clientCallIDString,
+            activeBackendCallID: activeBackendCallID,
+            activeLease: callMediaAccountLease,
+            answeredBackendCallID: answeredBackendCallID
+        ) else { return }
+
+        switch expiration {
+        case .cancelProvisional(let clientCallID, let lease):
+            guard ephemeralOutgoingCallGate.attempt?.lease == lease else { return }
+            cancelEphemeralOutgoingCall(
+                clientCallID: clientCallID,
+                dismissPresentation: true
+            )
+        case .endAuthenticated(let callID, let lease):
+            // This exact-ID/lease operation enters the ordinary CallKit end path. Its fallback
+            // publishes the same durable backend termination and tears media down directly.
+            _ = media.requestEnd(callID: callID, lease: lease)
+        }
+    }
+
+    private func reconcileOutgoingCallRingDeadlineAfterHistoryRefresh() {
+        guard let ticket = outgoingCallRingDeadlineGate.ticket,
+              let backendCallID = ticket.backendCallID,
+              let record = state.calls.first(where: {
+                  $0.id.caseInsensitiveCompare(backendCallID) == .orderedSame
+              }),
+              ![.queued, .ringing].contains(record.state)
+        else { return }
+        cancelOutgoingCallRingDeadline(
+            backendCallID: backendCallID,
+            lease: ticket.lease
+        )
+    }
+
     /// Resumes only the call that is still visible in this foreground process. Nothing from this
     /// path is written to the durable outbox, scheduled as background work, or restored at launch.
     private func resumeEphemeralOutgoingCallIfPossible() {
+        guard let attempt = ephemeralOutgoingCallGate.attempt else { return }
+        guard outgoingCallRingDeadlineGate.permitsSubmission(for: attempt) else {
+            cancelEphemeralOutgoingCall(
+                clientCallID: attempt.clientCallIDString,
+                dismissPresentation: true
+            )
+            return
+        }
         guard appReviewDemoMutationsAllowed,
-              let attempt = ephemeralOutgoingCallGate.attempt,
               isOnline,
               !isSigningOut,
               isSignedIn,
@@ -18168,6 +18334,10 @@ final class AppModel: ObservableObject {
         guard let attempt = ephemeralOutgoingCallGate.cancel(
             clientCallID: clientCallID
         ) else { return nil }
+        cancelOutgoingCallRingDeadline(
+            clientCallID: attempt.clientCallIDString,
+            lease: attempt.lease
+        )
         ephemeralOutgoingCallResumePending = false
         ephemeralOutgoingCallTask?.cancel()
         if dismissPresentation {
@@ -18303,6 +18473,13 @@ final class AppModel: ObservableObject {
                 ephemeralOutgoingCallGate.suspendSubmission()
                 return
             }
+            guard outgoingCallRingDeadlineGate.permitsSubmission(for: attempt) else {
+                cancelEphemeralOutgoingCall(
+                    clientCallID: attempt.clientCallIDString,
+                    dismissPresentation: true
+                )
+                return
+            }
             guard let submission = ephemeralOutgoingCallGate.beginSubmission() else { return }
 
             do {
@@ -18364,16 +18541,26 @@ final class AppModel: ObservableObject {
         taskID: UUID
     ) async {
         let attempt = submission.attempt
-        let contextIsCurrent = await outboxContextIsCurrent(
-            accountEpoch: attempt.lease.accountEpoch,
-            userID: attempt.lease.userID,
-            sessionID: attempt.lease.sessionID
-        )
-        guard contextIsCurrent,
+        // Do not suspend before arbitrating the response against the ring deadline. Whichever
+        // MainActor job runs first at the boundary must win atomically: a ringing response that is
+        // already late is rejected, while an authenticated answer (or its exact buffered signal)
+        // is promoted and claimed before the expiry task can tear it down. The account lease is
+        // synchronously revoked before sign-out/account replacement performs any suspension.
+        guard !Task.isCancelled,
               appReviewDemoMutationsAllowed,
+              !isSigningOut,
+              !isSubmittingAccountDeletion,
+              !acceptedAccountDeletionCleanupBlocked,
+              !protectedLocalStateRecoveryBlocked,
+              !unresolvedAccountDeletionAttemptBlocked,
+              isSignedIn,
               isOnline,
+              accountSetupStep == nil,
+              communicationAccessGranted,
               callsFeatureEnabled,
               UIApplication.shared.applicationState != .background,
+              accountEpoch == attempt.lease.accountEpoch,
+              profile?.id.caseInsensitiveCompare(attempt.lease.userID) == .orderedSame,
               callMediaAccountLease == attempt.lease,
               ephemeralOutgoingCallGate.accepts(submission)
                 || ephemeralOutgoingCallGate.attempt == attempt
@@ -18387,17 +18574,34 @@ final class AppModel: ObservableObject {
         }
 
         let mapped = mapCall(result.call)
+        let responseRecord = CallLifecyclePolicy.mergingStartResponse(
+            mapped,
+            with: state.calls.first {
+                $0.id.caseInsensitiveCompare(mapped.id) == .orderedSame
+            }
+        )
+        let responseDisposition = OutgoingCallStartResponsePolicy.disposition(
+            for: responseRecord.state
+        )
+        guard responseDisposition != .terminal else {
+            cancelEphemeralOutgoingCall(
+                clientCallID: attempt.clientCallIDString,
+                dismissPresentation: true
+            )
+            await endLateAcceptedCall(result.call.id, lease: attempt.lease)
+            return
+        }
         let handoff: CallMediaHandoff
         do {
             handoff = try CallMediaHandoff(
                 session: result,
                 participantAvatarURL: callParticipantAvatarURL(
-                    for: mapped.participantUserIds,
-                    identities: mapped.participantIdentities
+                    for: responseRecord.participantUserIds,
+                    identities: responseRecord.participantIdentities
                 ),
                 participantVerification: callParticipantVerification(
-                    for: mapped.participantUserIds,
-                    identities: mapped.participantIdentities
+                    for: responseRecord.participantUserIds,
+                    identities: responseRecord.participantIdentities
                 )
             )
         } catch {
@@ -18414,6 +18618,27 @@ final class AppModel: ObservableObject {
             lease: attempt.lease,
             handoff: handoff
         )
+        let responseAlreadyAnswered = responseDisposition == .answered
+            || responseRecord.answeredAt != nil
+            || pendingCallAnswers.contains {
+                $0.callId.caseInsensitiveCompare(handoff.callId) == .orderedSame
+            }
+        guard let authenticatedRingDeadline = outgoingCallRingDeadlineGate.promote(
+            clientCallID: attempt.clientCallIDString,
+            lease: attempt.lease,
+            backendCallID: result.call.id,
+            ringExpiresAt: result.call.ringExpiresAt,
+            serverTime: result.call.serverTime ?? result.serverTime,
+            answerAlreadyAccepted: responseAlreadyAnswered
+        ) else {
+            cancelEphemeralOutgoingCall(
+                clientCallID: attempt.clientCallIDString,
+                dismissPresentation: true
+            )
+            await endLateAcceptedCall(result.call.id, lease: attempt.lease)
+            return
+        }
+        scheduleOutgoingCallRingDeadline(authenticatedRingDeadline)
         let acceptedAttempt = ephemeralOutgoingCallGate.accepts(submission)
             ? ephemeralOutgoingCallGate.finishAccepted(submission)
             : ephemeralOutgoingCallGate.finishCurrentAttemptAccepted(attempt)
@@ -18423,6 +18648,15 @@ final class AppModel: ObservableObject {
                 request: request
               )
         else {
+            cancelOutgoingCallRingDeadline(
+                clientCallID: attempt.clientCallIDString,
+                backendCallID: result.call.id,
+                lease: attempt.lease
+            )
+            CallMediaCoordinator.shared.dismissPendingOutgoing(
+                clientCallID: attempt.clientCallIDString,
+                lease: attempt.lease
+            )
             await endLateAcceptedCall(result.call.id, lease: attempt.lease)
             return
         }
@@ -18430,6 +18664,20 @@ final class AppModel: ObservableObject {
         // or the push can finally be matched and applied — before anything below spends time
         // between the pickup and this screen reflecting it.
         claimPendingCallAnswer(callId: result.call.id)
+        if !CallMediaCoordinator.shared.presentedCallWasAnswered,
+           responseAlreadyAnswered {
+            // An idempotent retry can return a call that was answered while its first response was
+            // lost. The authenticated response itself then wins the deadline race even if neither
+            // the realtime frame nor its push fallback reached this process.
+            handleCallAnswerSignal(
+                callId: result.call.id,
+                signal: CallAnswerSignalPolicy.signal(
+                    callId: result.call.id,
+                    answeredAt: result.call.answeredAt,
+                    serverTime: result.call.serverTime ?? result.serverTime
+                )
+            )
+        }
         if ephemeralOutgoingCallTaskID != taskID {
             // A response from the cancelled transport won the idempotent race. Fence the newer
             // request for this same client call ID; a duplicate response must not end this call.
@@ -18437,6 +18685,14 @@ final class AppModel: ObservableObject {
             ephemeralOutgoingCallTask = nil
             ephemeralOutgoingCallTaskID = nil
         }
+
+        // The synchronous lease/epoch fences above make response arbitration safe. Revalidate the
+        // Keychain-backed session separately before this response is allowed to touch persistence.
+        guard await outboxContextIsCurrent(
+            accountEpoch: attempt.lease.accountEpoch,
+            userID: attempt.lease.userID,
+            sessionID: attempt.lease.sessionID
+        ) else { return }
 
         do {
             try await store.update { persisted in
@@ -20057,7 +20313,13 @@ final class AppModel: ObservableObject {
 
         let media = CallMediaCoordinator.shared
         if media.activeCall?.id.caseInsensitiveCompare(callId) == .orderedSame {
-            media.applyCallAnswered(callId: callId, signal: signal)
+            if let lease = callMediaAccountLease {
+                cancelOutgoingCallRingDeadline(
+                    backendCallID: callId,
+                    lease: lease
+                )
+            }
+            guard media.applyCallAnswered(callId: callId, signal: signal) else { return }
             if media.activeCall?.direction == "outgoing" {
                 // CallKit renders wall-clock dates, so the connect instant is derived from
                 // the two server timestamps and mapped onto local time at receipt. The
@@ -20398,6 +20660,10 @@ final class AppModel: ObservableObject {
                 sessionID: failure.lease.sessionID
               )
         else { return }
+        cancelOutgoingCallRingDeadline(
+            backendCallID: failure.callId,
+            lease: failure.lease
+        )
         lastError = "Call media failed: \(failure.message)"
         await terminateCall(id: failure.callId, kind: .end, reason: "network_error")
     }

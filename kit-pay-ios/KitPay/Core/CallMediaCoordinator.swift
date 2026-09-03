@@ -1550,6 +1550,10 @@ final class CallMediaCoordinator: ObservableObject {
                     callId: callId,
                     connectedAt: connectedAt
                 )
+                NotificationCenter.default.post(
+                    name: .kitCallRemoteParticipantConnected,
+                    object: callId
+                )
             }
         }
         media.onAudioSessionConfigurationFailed = { [weak self] callId in
@@ -1596,19 +1600,22 @@ final class CallMediaCoordinator: ObservableObject {
     /// attempt, or another account's session can never satisfy it. Without an instant pair
     /// the answer still counts — the caller stops hearing "Ringing…" — it just anchors no
     /// timer, which the media connection then does.
-    func applyCallAnswered(callId: String, signal: CallAnswerSignal?) {
+    @discardableResult
+    func applyCallAnswered(callId: String, signal: CallAnswerSignal?) -> Bool {
         guard state != .idle,
               state != .ending,
               let presentedCallId = activeCall?.id,
               presentedCallId.caseInsensitiveCompare(callId) == .orderedSame
-        else { return }
+        else { return false }
         answeredCallId = presentedCallId
-        guard let signal else { return }
-        durationAnchor = CallDurationAnchorPolicy.anchor(
-            signal: signal,
-            monotonicNow: CallMonotonicClock.now(),
-            previous: durationAnchor
-        )
+        if let signal {
+            durationAnchor = CallDurationAnchorPolicy.anchor(
+                signal: signal,
+                monotonicNow: CallMonotonicClock.now(),
+                previous: durationAnchor
+            )
+        }
+        return true
     }
 
     /// Whether the presented call has been answered, by any validated route.
@@ -1985,6 +1992,21 @@ final class CallMediaCoordinator: ObservableObject {
                 await NotificationCoordinator.shared.endCallBypassingCallKit(callId: callId)
             }
         }
+    }
+
+    /// Deadline-owned variant of `requestEnd()`. Re-proving the authenticated ID and account
+    /// lease in the same main-actor turn prevents an old timer from ending a replacement call.
+    @discardableResult
+    func requestEnd(callID: String, lease: CallMediaAccountLease) -> Bool {
+        guard accountLeaseGate.accepts(lease),
+              activeAccountLease == lease,
+              pendingOutgoingClientCallID == nil,
+              activeCall?.id.caseInsensitiveCompare(callID) == .orderedSame,
+              state != .idle,
+              state != .ending
+        else { return false }
+        requestEnd()
+        return true
     }
 
     func requestMuted(_ muted: Bool) {

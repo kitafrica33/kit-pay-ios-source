@@ -14,6 +14,7 @@ CALLS = ROOT / "KitPay/Features/Calls/CallsView.swift"
 HOME = ROOT / "KitPay/Features/Home/HomeView.swift"
 MOBILE_MONEY = ROOT / "KitPay/Features/Home/MobileMoneyView.swift"
 BANK_TRANSFER = ROOT / "KitPay/Features/Home/BankTransferView.swift"
+CAPTURE_TEST = ROOT / "KitPayUITests/AppStoreScreenshotUITests.swift"
 SCREENSHOT_WORKFLOW = ROOT / ".github/workflows/ios-app-store-screenshots.yml"
 
 
@@ -50,8 +51,15 @@ class AppStoreScreenshotFixtureSourceTests(unittest.TestCase):
             "ContactBackgroundRefreshScheduler.shared.installHandler"
         )
         self.assertLess(fixture_install, scheduler_install)
-        self.assertIn("state = AppStoreScreenshotFixture.state", app_model)
+        self.assertIn("let fixtureState = AppStoreScreenshotFixture.state", app_model)
+        self.assertIn("state = fixtureState", app_model)
+        self.assertIn("sessionAssurance = fixtureState.sessionAssurance", app_model)
         self.assertIn("isLoading = false\n            return", app_model)
+
+        fixture = FIXTURE.read_text(encoding="utf-8")
+        self.assertIn("fixture.sessionAssurance = SessionAssuranceDTO(", fixture)
+        self.assertIn("basis: SessionScopedAccessPolicy.fullAssurance", fixture)
+        self.assertIn("readOnly: false", fixture)
 
         for path, expected in (
             (MOBILE_MONEY, "AppStoreScreenshotFixture.mobileMoneyOperations"),
@@ -67,6 +75,17 @@ class AppStoreScreenshotFixtureSourceTests(unittest.TestCase):
         self.assertEqual(project.count("AppStoreScreenshotUITests.swift in Sources"), 2)
         self.assertIn("KitPay/App/AppStoreScreenshotFixture.swift", project)
         self.assertIn("KitPayUITests/AppStoreScreenshotUITests.swift", project)
+
+    def test_bank_capture_assertions_match_the_presented_screen(self) -> None:
+        bank_transfer = BANK_TRANSFER.read_text(encoding="utf-8")
+        capture_test = CAPTURE_TEST.read_text(encoding="utf-8")
+
+        self.assertIn('.navigationTitle("Bank")', bank_transfer)
+        self.assertIn('Text("Send to bank")', bank_transfer)
+        self.assertIn('app.navigationBars["Bank"]', capture_test)
+        self.assertIn('app.staticTexts["Send to bank"]', capture_test)
+        self.assertNotIn('app.navigationBars["Bank transfer"]', capture_test)
+        self.assertNotIn('app.staticTexts["Saved beneficiaries"]', capture_test)
 
     def test_authenticated_review_demo_is_release_built_and_session_gated(self) -> None:
         source = REVIEW_DEMO.read_text(encoding="utf-8")

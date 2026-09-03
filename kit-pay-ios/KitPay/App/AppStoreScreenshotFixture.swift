@@ -96,6 +96,33 @@ enum AppStoreScreenshotFixture {
             ),
         ]
         fixture.selectedWalletId = walletID
+        fixture.sessionAssurance = SessionAssuranceDTO(
+            deviceIdentity: DeviceIdentityAssuranceDTO(
+                status: "verified",
+                required: true,
+                epoch: 1,
+                verifiedAt: "2026-08-24T09:40:00Z"
+            ),
+            loginUnlock: LoginUnlockAssuranceDTO(
+                status: "unlocked",
+                required: true,
+                method: "pin",
+                methods: ["pin"],
+                unlockedAt: "2026-08-24T09:40:00Z"
+            ),
+            access: "full",
+            communicationAccess: SessionCommunicationAccessDTO(
+                allowed: true,
+                basis: SessionScopedAccessPolicy.fullAssurance,
+                requiredAction: nil
+            ),
+            financialAccess: SessionFinancialAccessDTO(
+                allowed: true,
+                basis: SessionScopedAccessPolicy.fullAssurance,
+                requiredAction: nil,
+                readOnly: false
+            )
+        )
         fixture.transactions = transactions
         fixture.contacts = contacts
         fixture.conversations = conversations
