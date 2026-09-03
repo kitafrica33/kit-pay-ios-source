@@ -101,6 +101,77 @@ struct CallAnsweredPush: Equatable, Sendable {
     }
 }
 
+/// One terminal call-lifecycle fact delivered by the backend's silent APNs channel.
+///
+/// These events close native CallKit surfaces even when no media room was ever attached. In
+/// particular, a caller can end a still-ringing call, so waiting for a LiveKit disconnect cannot
+/// be the only remote-end path. Type and state are validated as a pair before the UUID may affect
+/// CallKit; a non-terminal `call.declined` sent to another participant is deliberately ignored.
+enum CallTerminalPushDisposition: Equatable, Sendable {
+    case remoteEnded
+    case declinedElsewhere
+    case unanswered
+
+    var publicationRetirement: IncomingCallPublicationRetirement {
+        switch self {
+        case .remoteEnded:
+            return .terminal(.remoteEnded)
+        case .declinedElsewhere:
+            return .terminal(.declinedElsewhere)
+        case .unanswered:
+            return .naturallyExpired
+        }
+    }
+}
+
+enum CallTerminalPushHandlingDisposition: Equatable, Sendable {
+    case rememberTerminal
+    case retireOfferedCall
+}
+
+/// Keeps an authoritative terminal signal scoped to one exact UUID. A signal may precede its
+/// VoIP ring, in which case it creates only a tombstone; once that UUID has a pending, quarantined,
+/// or authenticated native surface, the same signal is allowed to retire it.
+enum CallTerminalPushPolicy {
+    static func disposition(
+        hasPendingPublication: Bool,
+        hasMatchingQuarantinedCall: Bool,
+        hasMatchingAuthenticatedCall: Bool
+    ) -> CallTerminalPushHandlingDisposition {
+        if hasPendingPublication || hasMatchingQuarantinedCall || hasMatchingAuthenticatedCall {
+            return .retireOfferedCall
+        }
+        return .rememberTerminal
+    }
+}
+
+struct CallTerminalPush: Equatable, Sendable {
+    let callId: String
+    let disposition: CallTerminalPushDisposition
+
+    init?(payload: [AnyHashable: Any]) {
+        guard let type = payload["type"] as? String,
+              let state = payload["state"] as? String
+        else { return nil }
+        let disposition: CallTerminalPushDisposition
+        switch (type, state) {
+        case ("call.ended", "ended"):
+            disposition = .remoteEnded
+        case ("call.declined", "declined"):
+            disposition = .declinedElsewhere
+        case ("call.missed", "missed"):
+            disposition = .unanswered
+        default:
+            return nil
+        }
+        guard let callId = CallAnswerSignalPolicy.callId(payload["call_id"] as? String) else {
+            return nil
+        }
+        self.callId = callId
+        self.disposition = disposition
+    }
+}
+
 /// Where a call's displayed duration counts from, in monotonic-clock seconds.
 ///
 /// Monotonic rather than wall-clock, because an NTP correction mid-call would otherwise jump

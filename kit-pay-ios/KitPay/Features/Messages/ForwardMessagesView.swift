@@ -566,7 +566,7 @@ struct ForwardMessagesView: View {
         var successfulTargets = 0
         var failures: [ForwardTargetFailure] = []
 
-        targetLoop: for (index, target) in targets.enumerated() {
+        for (index, target) in targets.enumerated() {
             func publishProgress() {
                 phase = .sending(
                     ForwardSendingProgress(
@@ -580,11 +580,10 @@ struct ForwardMessagesView: View {
             }
             publishProgress()
 
-            var pendingItems = items
             var sentForTarget = 0
             var itemFailureReasons: [String] = []
             let recipientUserID = target.recipientUserID
-            let conversationID: String
+            var conversationID: String?
             let title: String
 
             switch target.kind {
@@ -594,72 +593,42 @@ struct ForwardMessagesView: View {
 
             case let .contact(contact):
                 title = contact.name
-                let firstTextIndex = pendingItems.firstIndex {
-                    if case .text = $0 { return true }
-                    return false
-                }
-                if let firstTextIndex,
-                   case let .text(_, body) = pendingItems[firstTextIndex] {
-                    // A bare contact needs a server-issued conversation first;
-                    // the first text item creates (or idempotently replays) it.
-                    let result = await model.queueDirectMessageResult(
-                        recipientId: recipientUserID,
-                        title: title,
-                        body: body,
-                        clientMessageID: UUID()
-                    )
-                    completedUnits += 1
-                    if let result {
-                        conversationID = result.conversation.id
-                        pendingItems.remove(at: firstTextIndex)
-                        sentForTarget += 1
-                        totalSent += 1
-                        publishProgress()
-                    } else {
-                        completedUnits += max(0, pendingItems.count - 1)
-                        failures.append(
-                            ForwardTargetFailure(
-                                id: target.id,
-                                name: target.displayName,
-                                reason: model.lastError ?? "Couldn't start this chat."
-                            )
-                        )
-                        continue targetLoop
-                    }
-                } else if let existing = existingDirectConversation(with: recipientUserID) {
-                    // Media-only payload: there is no direct-media-thread API,
-                    // so reuse the newest existing direct conversation.
-                    conversationID = existing.id
-                } else {
-                    completedUnits += pendingItems.count
-                    failures.append(
-                        ForwardTargetFailure(
-                            id: target.id,
-                            name: target.displayName,
-                            reason: "Needs an existing chat. Send them a message first, then forward."
-                        )
-                    )
-                    continue targetLoop
-                }
+                conversationID = existingDirectConversation(with: recipientUserID)?.id
             }
 
-            for item in pendingItems {
+            for item in items {
                 publishProgress()
                 switch item {
                 case let .text(_, body):
-                    let queued = await model.queueMessage(
-                        conversationId: conversationID,
-                        title: title,
+                    let messageID = UUID()
+                    if let conversationID {
+                        let queued = await model.queueMessage(
+                            conversationId: conversationID,
+                            title: title,
+                            recipientId: recipientUserID,
+                            body: body,
+                            clientMessageID: messageID,
+                            draftClearVersion: nil
+                        )
+                        if queued {
+                            sentForTarget += 1
+                            totalSent += 1
+                        } else {
+                            itemFailureReasons.append(
+                                model.lastError ?? "Couldn't forward this message."
+                            )
+                        }
+                    } else if let result = await model.queueDirectMessageResult(
                         recipientId: recipientUserID,
+                        title: title,
                         body: body,
-                        clientMessageID: UUID(),
-                        draftClearVersion: nil
-                    )
-                    if queued {
+                        clientMessageID: messageID
+                    ) {
+                        conversationID = result.conversation.id
                         sentForTarget += 1
                         totalSent += 1
                     } else {
-                        itemFailureReasons.append(model.lastError ?? "Couldn't forward this message.")
+                        itemFailureReasons.append(model.lastError ?? "Couldn't start this chat.")
                     }
 
                 case let .media(itemID, sourceConversationID):
@@ -691,19 +660,49 @@ struct ForwardMessagesView: View {
                                 throw SecureMediaAttachmentError.invalidMedia
                             }
                         }
-                        let queued = await model.queueMediaMessage(
-                            conversationId: conversationID,
-                            title: title,
-                            recipientId: recipientUserID,
-                            mediaData: loadedMedia.localFileURL == nil ? loadedMedia.data : nil,
-                            mediaType: loadedMedia.mediaType,
-                            caption: loadedMedia.caption,
-                            localMediaID: forwardedMediaID,
-                            plaintextByteSize: loadedMedia.byteCount,
-                            localStorageKind: forwardedFileURL == nil ? nil : .protectedFile,
-                            submittedDraftBody: nil,
-                            draftClearVersion: nil
-                        )
+                        let messageID = UUID()
+                        let queued: Bool
+                        if let conversationID {
+                            queued = await model.queueMediaMessage(
+                                conversationId: conversationID,
+                                title: title,
+                                recipientId: recipientUserID,
+                                mediaData: loadedMedia.localFileURL == nil
+                                    ? loadedMedia.data
+                                    : nil,
+                                mediaType: loadedMedia.mediaType,
+                                caption: loadedMedia.caption,
+                                localMediaID: forwardedMediaID,
+                                plaintextByteSize: loadedMedia.byteCount,
+                                localStorageKind: forwardedFileURL == nil
+                                    ? nil
+                                    : .protectedFile,
+                                clientMessageID: messageID,
+                                submittedDraftBody: nil,
+                                draftClearVersion: nil
+                            )
+                        } else {
+                            queued = await model.queueDirectMediaMessage(
+                                recipientId: recipientUserID,
+                                title: title,
+                                mediaData: loadedMedia.localFileURL == nil
+                                    ? loadedMedia.data
+                                    : nil,
+                                mediaType: loadedMedia.mediaType,
+                                caption: loadedMedia.caption,
+                                localMediaID: forwardedMediaID,
+                                plaintextByteSize: loadedMedia.byteCount,
+                                localStorageKind: forwardedFileURL == nil
+                                    ? nil
+                                    : .protectedFile,
+                                clientMessageID: messageID
+                            )
+                            if queued {
+                                conversationID = existingDirectConversation(
+                                    with: recipientUserID
+                                )?.id
+                            }
+                        }
                         if queued {
                             sentForTarget += 1
                             totalSent += 1

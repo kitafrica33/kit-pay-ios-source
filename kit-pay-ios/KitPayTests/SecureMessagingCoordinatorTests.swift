@@ -959,6 +959,256 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
         XCTAssertEqual(mediaMessage.localMediaRecords?.first?.conversationID, text.conversation.id)
     }
 
+    func testFirstContactSingleMediaCommitsConversationBubbleAndOutboxAtomically() async throws {
+        let userID = "10000000-0000-4000-8000-000000000194"
+        let peerID = "10000000-0000-4000-8000-000000000195"
+        let provisionalID = "30000000-0000-4000-8000-000000000194"
+        let messageID = UUID(uuidString: "80000000-0000-4000-8000-000000000194")!
+        let mediaID = UUID(uuidString: "70000000-0000-4000-8000-000000000194")!
+        let jpeg = Data([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0xff, 0xd9])
+        let store = try await makeStore(userID: userID)
+        try await store.update { state in
+            state.communicationOwnerUserID = userID
+            state.secureMessaging = nil
+        }
+        let transport = OfflineExchangeTransport()
+        let coordinator = SecureMessagingExchangeCoordinator(
+            transport: transport,
+            store: store,
+            engine: SecureMessagingCryptoEngine(),
+            provisioningPreKeyCount: 1
+        )
+
+        let first = try await coordinator.queueDeferredImage(
+            forUserID: userID,
+            conversationID: provisionalID,
+            expectedRecipientUserID: peerID,
+            title: "Waswa Titus Zera",
+            mediaData: jpeg,
+            mediaType: "image/jpeg",
+            caption: "same media message",
+            localMediaID: mediaID,
+            clientMessageID: messageID,
+            provisionalDirectRecipientUserID: peerID
+        )
+        let replay = try await coordinator.queueDeferredImage(
+            forUserID: userID,
+            conversationID: provisionalID,
+            expectedRecipientUserID: peerID,
+            title: "Waswa Titus Zera",
+            mediaData: jpeg,
+            mediaType: "image/jpeg",
+            caption: "same media message",
+            localMediaID: mediaID,
+            clientMessageID: messageID,
+            provisionalDirectRecipientUserID: peerID
+        )
+
+        XCTAssertEqual(first, replay)
+        XCTAssertTrue(first.conversation.isProvisionalDirect)
+        XCTAssertEqual(first.conversation.id, provisionalID)
+        let singleMediaNetworkCallCount = await transport.networkCallCount()
+        XCTAssertEqual(singleMediaNetworkCallCount, 0)
+        let snapshot = await store.snapshot()
+        XCTAssertEqual(snapshot.conversations.count, 1)
+        XCTAssertEqual(snapshot.messages.count, 1)
+        XCTAssertEqual(snapshot.outbox.count, 1)
+        XCTAssertEqual(snapshot.messages[0].id, messageID)
+        XCTAssertEqual(snapshot.messages[0].conversationId, provisionalID)
+        XCTAssertEqual(snapshot.messages[0].body, "same media message")
+        XCTAssertEqual(snapshot.messages[0].pendingAttachment?.caption, "same media message")
+        XCTAssertEqual(snapshot.messages[0].localMediaRecords?.map(\.conversationID), [provisionalID])
+        XCTAssertEqual(snapshot.outbox[0].messageId, messageID)
+        XCTAssertEqual(snapshot.outbox[0].conversationId, provisionalID)
+        XCTAssertEqual(snapshot.outbox[0].recipientUserIds, [peerID])
+        XCTAssertNil(snapshot.outbox[0].secureMessageFanout)
+    }
+
+    func testFirstContactMediaBatchCommitsOneCaptionedMessageWithoutNetwork() async throws {
+        let userID = "10000000-0000-4000-8000-000000000196"
+        let peerID = "10000000-0000-4000-8000-000000000197"
+        let provisionalID = "30000000-0000-4000-8000-000000000196"
+        let messageID = UUID(uuidString: "80000000-0000-4000-8000-000000000196")!
+        let firstID = "70000000-0000-4000-8000-000000000196"
+        let secondID = "70000000-0000-4000-8000-000000000197"
+        let firstBytes = Data(repeating: 0x61, count: 257)
+        let secondBytes = Data(repeating: 0x62, count: 513)
+        let batch = try KitMediaMessageV2OutboundBatch.queued(
+            attachments: [
+                .init(
+                    attachmentID: firstID,
+                    mediaType: "image/jpeg",
+                    plaintextByteSize: firstBytes.count,
+                    localStorageKey: firstID
+                ),
+                .init(
+                    attachmentID: secondID,
+                    mediaType: "video/mp4",
+                    plaintextByteSize: secondBytes.count,
+                    localStorageKey: secondID
+                ),
+            ],
+            rawCaption: "one batch caption",
+            keyMaterialFactory: {
+                Data(repeating: 0x63, count: SecureMediaAttachmentCipher.keyMaterialBytes)
+            }
+        )
+        let store = try await makeStore(userID: userID)
+        try await store.update { state in
+            state.communicationOwnerUserID = userID
+            state.secureMessaging = nil
+        }
+        let transport = OfflineExchangeTransport()
+        let blobs = InMemoryMediaBlobStore(seed: [
+            firstID: firstBytes,
+            secondID: secondBytes,
+        ])
+        let coordinator = SecureMessagingExchangeCoordinator(
+            transport: transport,
+            store: store,
+            engine: SecureMessagingCryptoEngine(),
+            provisioningPreKeyCount: 1,
+            mediaBlobs: blobs.access(forUserID: userID)
+        )
+
+        let queued = try await coordinator.queueDeferredMediaBatch(
+            forUserID: userID,
+            conversationID: provisionalID,
+            expectedRecipientUserID: peerID,
+            title: "Waswa Titus Zera",
+            batch: batch,
+            clientMessageID: messageID,
+            provisionalDirectRecipientUserID: peerID
+        )
+
+        XCTAssertTrue(queued.conversation.isProvisionalDirect)
+        let mediaBatchNetworkCallCount = await transport.networkCallCount()
+        XCTAssertEqual(mediaBatchNetworkCallCount, 0)
+        let snapshot = await store.snapshot()
+        XCTAssertEqual(snapshot.conversations.map(\.id), [provisionalID])
+        XCTAssertEqual(snapshot.messages.count, 1)
+        XCTAssertEqual(snapshot.outbox.count, 1)
+        XCTAssertEqual(snapshot.messages[0].id, messageID)
+        XCTAssertEqual(snapshot.messages[0].body, "one batch caption")
+        XCTAssertEqual(snapshot.messages[0].pendingMediaBatch, batch)
+        XCTAssertEqual(snapshot.messages[0].localMediaRecords?.count, 2)
+        XCTAssertTrue(snapshot.messages[0].localMediaRecords?.allSatisfy({
+            $0.conversationID == provisionalID
+        }) == true)
+        XCTAssertEqual(snapshot.outbox[0].messageId, messageID)
+        XCTAssertEqual(snapshot.outbox[0].conversationId, provisionalID)
+        XCTAssertEqual(snapshot.outbox[0].recipientUserIds, [peerID])
+    }
+
+    func testConcurrentFirstContactMediaBatchRetryConvergesOnExactCommittedProjection()
+        async throws {
+        let userID = "10000000-0000-4000-8000-000000000198"
+        let peerID = "10000000-0000-4000-8000-000000000199"
+        let firstProvisionalID = "30000000-0000-4000-8000-000000000198"
+        let secondProvisionalID = "30000000-0000-4000-8000-000000000199"
+        let messageID = UUID(uuidString: "80000000-0000-4000-8000-000000000198")!
+        let firstID = "70000000-0000-4000-8000-000000000198"
+        let secondID = "70000000-0000-4000-8000-000000000199"
+        let firstBytes = Data(repeating: 0x71, count: 257)
+        let secondBytes = Data(repeating: 0x72, count: 513)
+        let batch = try KitMediaMessageV2OutboundBatch.queued(
+            attachments: [
+                .init(
+                    attachmentID: firstID,
+                    mediaType: "image/jpeg",
+                    plaintextByteSize: firstBytes.count,
+                    localStorageKey: firstID
+                ),
+                .init(
+                    attachmentID: secondID,
+                    mediaType: "video/mp4",
+                    plaintextByteSize: secondBytes.count,
+                    localStorageKey: secondID
+                ),
+            ],
+            rawCaption: "one stable concurrent batch",
+            keyMaterialFactory: {
+                Data(repeating: 0x73, count: SecureMediaAttachmentCipher.keyMaterialBytes)
+            }
+        )
+        let store = try await makeStore(userID: userID)
+        try await store.update { state in
+            state.communicationOwnerUserID = userID
+            state.secureMessaging = nil
+        }
+        let transport = OfflineExchangeTransport()
+        // Both calls must capture the conversation-less snapshot before either can commit. This
+        // exercises the post-snapshot stable-ID recovery path deterministically rather than
+        // relying on executor scheduling to happen to produce the race.
+        let blobs = SuspendedMediaValidationBlobStore(
+            userID: userID,
+            seed: [
+                firstID: firstBytes,
+                secondID: secondBytes,
+            ]
+        )
+        let coordinator = SecureMessagingExchangeCoordinator(
+            transport: transport,
+            store: store,
+            engine: SecureMessagingCryptoEngine(),
+            provisioningPreKeyCount: 1,
+            mediaBlobs: blobs.access()
+        )
+
+        let firstTask = Task {
+            try await coordinator.queueDeferredMediaBatch(
+                forUserID: userID,
+                conversationID: firstProvisionalID,
+                expectedRecipientUserID: peerID,
+                title: "Waswa Titus Zera",
+                batch: batch,
+                clientMessageID: messageID,
+                provisionalDirectRecipientUserID: peerID
+            )
+        }
+        try await blobs.waitUntilValidationStarted()
+        let secondResult: SecureMessagingQueueResult
+        do {
+            secondResult = try await coordinator.queueDeferredMediaBatch(
+                forUserID: userID,
+                conversationID: secondProvisionalID,
+                expectedRecipientUserID: peerID,
+                title: "Waswa Titus Zera",
+                batch: batch,
+                clientMessageID: messageID,
+                provisionalDirectRecipientUserID: peerID
+            )
+        } catch {
+            await blobs.releaseValidation()
+            firstTask.cancel()
+            throw error
+        }
+        await blobs.releaseValidation()
+        let firstResult = try await firstTask.value
+
+        XCTAssertEqual(firstResult.conversation.id, secondResult.conversation.id)
+        XCTAssertEqual(firstResult.clientMessageID, secondResult.clientMessageID)
+        XCTAssertTrue(firstResult.conversation.isProvisionalDirect)
+        XCTAssertTrue(
+            [firstProvisionalID, secondProvisionalID].contains(firstResult.conversation.id)
+        )
+        let networkCallCount = await transport.networkCallCount()
+        XCTAssertEqual(networkCallCount, 0)
+        let snapshot = await store.snapshot()
+        XCTAssertEqual(snapshot.conversations.map(\.id), [firstResult.conversation.id])
+        XCTAssertTrue(snapshot.conversations[0].matchesLocalConversationID(firstProvisionalID))
+        XCTAssertTrue(snapshot.conversations[0].matchesLocalConversationID(secondProvisionalID))
+        XCTAssertEqual(snapshot.messages.map(\.id), [messageID])
+        XCTAssertEqual(snapshot.messages[0].conversationId, firstResult.conversation.id)
+        XCTAssertEqual(
+            snapshot.messages[0].localMediaRecords?.map(\.conversationID),
+            [firstResult.conversation.id, firstResult.conversation.id]
+        )
+        XCTAssertEqual(snapshot.outbox.compactMap(\.messageId), [messageID])
+        XCTAssertEqual(snapshot.outbox[0].conversationId, firstResult.conversation.id)
+        XCTAssertEqual(snapshot.outbox[0].recipientUserIds, [peerID])
+    }
+
     func testProvisionalDirectReconciliationAtomicallyRemapsAllLocalReferences() throws {
         let userID = "10000000-0000-4000-8000-000000000183"
         let peerID = "10000000-0000-4000-8000-000000000184"

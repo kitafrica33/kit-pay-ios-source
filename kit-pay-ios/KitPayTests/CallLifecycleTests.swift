@@ -1169,6 +1169,17 @@ final class CallLifecycleTests: XCTestCase {
         )
     }
 
+    func testVoIPCredentialDoesNotMaskAPNsRegistrationFailure() {
+        var state = RemoteNotificationRegistrationRetryState()
+
+        state.recordFailure()
+        state.recordToken(provider: "apns_voip")
+        XCTAssertTrue(state.isNeeded)
+
+        state.recordToken(provider: "apns")
+        XCTAssertFalse(state.isNeeded)
+    }
+
     func testPendingCallEventCacheReplaysInOrderDeduplicatesAndAcknowledges() throws {
         let callId = "550e8400-e29b-41d4-a716-446655440000"
         let push = try XCTUnwrap(IncomingCallPush(payload: [

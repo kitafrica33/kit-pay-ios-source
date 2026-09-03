@@ -1237,6 +1237,43 @@ enum ProvisionalDirectConversationPolicy {
         return replaced.isEmpty ? nil : replaced
     }
 
+    /// Remembers an in-memory provisional UUID that converged on a different local direct row.
+    /// A composer already mounted under that UUID can then follow the committed conversation just
+    /// as it does after server promotion. Invalid or ambiguous state is never repaired by guessing.
+    static func recordLocalAlias(
+        _ rawAlias: String,
+        forConversationID rawConversationID: String,
+        in state: inout PersistedState
+    ) -> Bool {
+        guard let alias = canonicalUUID(rawAlias),
+              let conversationID = canonicalUUID(rawConversationID)
+        else { return false }
+        if alias == conversationID { return true }
+        let indices = state.conversations.indices.filter {
+            state.conversations[$0].id == conversationID
+        }
+        guard indices.count == 1,
+              let index = indices.first,
+              !state.conversations[index].isGroup,
+              state.conversations[index].participantUserIds.count == 2,
+              !state.conversations.contains(where: {
+                  $0.id == alias && $0.id != conversationID
+              })
+        else { return false }
+
+        let rawAliases = state.conversations[index].localConversationAliases ?? []
+        let canonicalAliases = rawAliases.compactMap(canonicalUUID)
+        guard canonicalAliases.count == rawAliases.count else { return false }
+        var seen = Set<String>()
+        let aliases = ([alias] + canonicalAliases).filter {
+            $0 != conversationID && seen.insert($0).inserted
+        }
+        state.conversations[index].localConversationAliases = aliases.isEmpty
+            ? nil
+            : Array(aliases.prefix(maximumAliasCount))
+        return true
+    }
+
     private static func canonicalUUID(_ rawValue: String) -> String? {
         guard rawValue == rawValue.trimmingCharacters(in: .whitespacesAndNewlines),
               let uuid = UUID(uuidString: rawValue)
@@ -2273,10 +2310,9 @@ actor SecureMessagingExchangeCoordinator {
         )
     }
 
-    /// The sole conversation-bootstrap path: text may mint a provisional direct UUID when the
-    /// reviewed server capability is present. Media queue methods intentionally require a known
-    /// conversation ID; once this text path has created the thread they can use that provisional
-    /// ID and remain fully local-first while the same outbox materializes it.
+    /// Text first-contact queueing. Under the reviewed server capability it may mint a
+    /// provisional direct UUID and atomically persist the thread, bubble and outbox command;
+    /// single and batched media use the same transaction boundary in their dedicated paths.
     func queueDirectText(
         forUserID userID: String,
         recipientUserID: String,
@@ -2636,6 +2672,13 @@ actor SecureMessagingExchangeCoordinator {
             guard Self.upsert(conversation: committedConversation, in: &state) else {
                 throw SecureMessagingExchangeError.invalidConversation
             }
+            if provisionalRecipient != nil, committedConversation.id != conversationID {
+                guard ProvisionalDirectConversationPolicy.recordLocalAlias(
+                    conversationID,
+                    forConversationID: committedConversation.id,
+                    in: &state
+                ) else { throw SecureMessagingExchangeError.invalidConversation }
+            }
             state.messages.append(committedMessage)
             state.outbox.append(committedCommand)
             if let submittedDraftBody, let draftClearVersion {
@@ -2700,6 +2743,9 @@ actor SecureMessagingExchangeCoordinator {
                 try await clearDraftAfterIdempotentQueueIfNeeded(
                     clientMessageID: clientMessageID,
                     conversationID: racedConversation.id,
+                    requestedConversationAlias: provisionalRecipient == nil
+                        ? nil
+                        : conversationID,
                     localUserID: local,
                     submittedDraftBody: submittedDraftBody,
                     submittedDraftMediaAttachments: submittedDraftMediaAttachments,
@@ -2750,10 +2796,74 @@ actor SecureMessagingExchangeCoordinator {
         return result
     }
 
+    /// Resolves the conversation used by a local media commit. A caller that was admitted by the
+    /// exact offline-direct capability may supply a fresh UUIDv4 and recipient; the provisional
+    /// row is only returned as a value here and is not persisted until the same transaction as
+    /// the media bubble and outbox command. If another first-contact send already won, reuse its
+    /// one direct row instead so concurrent media/text sends converge before either reaches the
+    /// network.
+    private static func directMediaQueueConversation(
+        requestedConversationID: String,
+        provisionalRecipientUserID: String?,
+        title: String,
+        createdAt: Date,
+        localUserID: String,
+        expectedRecipientUserID: String?,
+        conversations: [Conversation]
+    ) throws -> Conversation? {
+        let conversation: Conversation?
+        if let provisionalRecipientUserID {
+            guard expectedRecipientUserID == provisionalRecipientUserID else {
+                throw SecureMessagingExchangeError.invalidRecipient
+            }
+            switch DirectMessageLocalConversationPolicy.resolve(
+                conversations: conversations,
+                currentUserID: localUserID,
+                recipientUserID: provisionalRecipientUserID
+            ) {
+            case .missing:
+                guard !conversations.contains(where: {
+                    $0.id == requestedConversationID
+                }) else {
+                    throw SecureMessagingExchangeError.invalidConversation
+                }
+                conversation = ProvisionalDirectConversationPolicy.make(
+                    id: requestedConversationID,
+                    localUserID: localUserID,
+                    recipientUserID: provisionalRecipientUserID,
+                    title: title,
+                    createdAt: createdAt
+                )
+            case .existing(let existing):
+                guard existing.id == requestedConversationID
+                        || !conversations.contains(where: {
+                            $0.id == requestedConversationID
+                        })
+                else { throw SecureMessagingExchangeError.invalidConversation }
+                conversation = existing
+            case .invalid, .ambiguous:
+                throw SecureMessagingExchangeError.invalidConversation
+            }
+        } else {
+            let matches = conversations.filter { $0.id == requestedConversationID }
+            guard matches.count <= 1 else {
+                throw SecureMessagingExchangeError.invalidConversation
+            }
+            conversation = matches.first
+        }
+        guard let conversation,
+              permitsDeferredQueue(
+                  conversation: conversation,
+                  localUserID: localUserID,
+                  expectedRecipientUserID: expectedRecipientUserID
+              )
+        else { return nil }
+        return conversation
+    }
+
     /// Direct queueing keeps its exact two-party rule, including a capability-created provisional
-    /// direct thread. This lets media selected after the first local text bubble join that same
-    /// outbox without gaining a second conversation-creation path. A nil pinned recipient is valid
-    /// only for a stored, validated group thread that includes the local account.
+    /// direct thread. A nil pinned recipient is valid only for a stored, validated group thread
+    /// that includes the local account.
     private static func permitsDeferredQueue(
         conversation: Conversation,
         localUserID: String,
@@ -3228,7 +3338,9 @@ actor SecureMessagingExchangeCoordinator {
         draftClearVersion: ConversationDraftWriteVersion? = nil,
         deliverAt: Date? = nil,
         replyToServerMessageID: String? = nil,
-        commitAdmission: ProtectedCommunicationAdmissionLease? = nil
+        provisionalDirectRecipientUserID: String? = nil,
+        commitAdmission: ProtectedCommunicationAdmissionLease? = nil,
+        concurrentCommitRecoveryAttempted: Bool = false
     ) async throws -> SecureMessagingQueueResult {
         guard (submittedDraftBody == nil) == (draftClearVersion == nil),
               draftClearVersion != nil || submittedDraftMediaAttachments == nil,
@@ -3242,9 +3354,18 @@ actor SecureMessagingExchangeCoordinator {
             forUserID: local,
             commitAdmission: commitAdmission
         )
-        let conversationID = try canonicalUUID(conversationID, error: .invalidConversation)
+        let requestedConversationID = try canonicalUUID(
+            conversationID,
+            error: .invalidConversation
+        )
         let recipient = try expectedRecipientUserID.map {
             try canonicalUUID($0, error: .invalidRecipient)
+        }
+        let provisionalRecipient = try provisionalDirectRecipientUserID.map {
+            try canonicalUUID($0, error: .invalidRecipient)
+        }
+        guard provisionalRecipient == nil || provisionalRecipient == recipient else {
+            throw SecureMessagingExchangeError.invalidRecipient
         }
         let trimmedCaption = caption?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3316,6 +3437,7 @@ actor SecureMessagingExchangeCoordinator {
                 consumingStorageKeys: proposedStorageKeys
             ) else { throw SecureMessagingCryptoError.invalidContent }
         }
+        let createdAt = Date()
         let snapshot = await store.snapshot()
         try requireAuthenticatedQueueIdentity(
             queueIdentity,
@@ -3323,15 +3445,17 @@ actor SecureMessagingExchangeCoordinator {
             commitAdmission: commitAdmission
         )
         guard Self.permitsLocalQueueState(snapshot, userID: local),
-              let conversation = snapshot.conversations.first(where: {
-                  $0.id == conversationID
-              }),
-              Self.permitsDeferredQueue(
-                  conversation: conversation,
+              let conversation = try Self.directMediaQueueConversation(
+                  requestedConversationID: requestedConversationID,
+                  provisionalRecipientUserID: provisionalRecipient,
+                  title: title,
+                  createdAt: createdAt,
                   localUserID: local,
-                  expectedRecipientUserID: recipient
+                  expectedRecipientUserID: recipient,
+                  conversations: snapshot.conversations
               )
         else { throw SecureMessagingExchangeError.invalidConversation }
+        let conversationID = conversation.id
         if let replyTarget {
             try Self.requireLocalReplyTarget(
                 replyTarget,
@@ -3380,6 +3504,9 @@ actor SecureMessagingExchangeCoordinator {
             try await clearDraftAfterIdempotentQueueIfNeeded(
                 clientMessageID: clientMessageID,
                 conversationID: conversation.id,
+                requestedConversationAlias: provisionalRecipient == nil
+                    ? nil
+                    : requestedConversationID,
                 localUserID: local,
                 submittedDraftBody: submittedDraftBody,
                 submittedDraftMediaAttachments: submittedDraftMediaAttachments,
@@ -3396,7 +3523,6 @@ actor SecureMessagingExchangeCoordinator {
 
         let messageID = clientMessageID ?? UUID()
         let commandID = UUID()
-        let createdAt = Date()
         let stableMediaID = suppliedStableMediaID ?? UUID().uuidString.lowercased()
         let proposedOwnershipKeys = proposedStorageKeys.union([stableMediaID])
         let outboundKeyMaterial = try SecureMediaAttachmentCipher.randomKeyMaterial()
@@ -3461,37 +3587,84 @@ actor SecureMessagingExchangeCoordinator {
             scheduledAt: scheduledAt,
             awaitingMediaPreprocessing: preprocessingJob == nil ? nil : true
         )
-        var updatedConversation = conversation
-        if scheduledAt == nil {
-            updatedConversation.updatedAt = createdAt
-        }
-        let queuedConversation = updatedConversation
         let commitMutation: (inout PersistedState) throws -> Void = { state in
             guard Self.permitsLocalQueueState(state, userID: local),
                   !state.messages.contains(where: { $0.id == messageID }),
                   !state.outbox.contains(where: { $0.id == commandID }),
+                  !state.outbox.contains(where: { $0.messageId == messageID }),
                   state.messages.allSatisfy({ existing in
                       Set(existing.localMediaOwnershipKeys)
                           .isDisjoint(with: proposedOwnershipKeys)
                   }),
                   ConversationDraftPolicy.localMediaStorageKeysOwnedByDrafts(
                       in: state,
-                      excludingSubmittedDraftFor: conversationID,
+                      excludingSubmittedDraftFor: requestedConversationID,
                       submittedBody: submittedDraftBody,
                       submittedMediaAttachments: submittedDraftMediaAttachments,
                       draftClearVersion: draftClearVersion,
                       consumingStorageKeys: proposedStorageKeys
-                  ).isDisjoint(with: proposedOwnershipKeys)
+                  ).isDisjoint(with: proposedOwnershipKeys),
+                  let resolvedConversation = try Self.directMediaQueueConversation(
+                      requestedConversationID: requestedConversationID,
+                      provisionalRecipientUserID: provisionalRecipient,
+                      title: title,
+                      createdAt: createdAt,
+                      localUserID: local,
+                      expectedRecipientUserID: recipient,
+                      conversations: state.conversations
+                  ),
+                  Self.deferredCommandRecipients(
+                      conversation: resolvedConversation,
+                      localUserID: local,
+                      expectedRecipientUserID: recipient
+                  ) == commandRecipients
             else { throw StoreError.accountChanged }
-            guard Self.upsert(conversation: queuedConversation, in: &state) else {
+            if let replyTarget {
+                try Self.requireLocalReplyTarget(
+                    replyTarget,
+                    conversationID: resolvedConversation.id,
+                    in: state
+                )
+            }
+            var committedConversation = resolvedConversation
+            if scheduledAt == nil {
+                committedConversation.updatedAt = max(
+                    committedConversation.updatedAt,
+                    createdAt
+                )
+            }
+            var committedMessage = localMessage
+            var committedCommand = command
+            if committedConversation.id != conversationID {
+                committedMessage.conversationId = committedConversation.id
+                if var records = committedMessage.localMediaRecords {
+                    for index in records.indices {
+                        records[index].conversationID = committedConversation.id
+                    }
+                    guard records.allSatisfy(\.isStructurallyValid) else {
+                        throw SecureMediaAttachmentError.invalidMedia
+                    }
+                    committedMessage.localMediaRecords = records
+                }
+                committedCommand.conversationId = committedConversation.id
+            }
+            guard Self.upsert(conversation: committedConversation, in: &state) else {
                 throw SecureMessagingExchangeError.invalidConversation
             }
-            state.messages.append(localMessage)
-            state.outbox.append(command)
+            if provisionalRecipient != nil,
+               committedConversation.id != requestedConversationID {
+                guard ProvisionalDirectConversationPolicy.recordLocalAlias(
+                    requestedConversationID,
+                    forConversationID: committedConversation.id,
+                    in: &state
+                ) else { throw SecureMessagingExchangeError.invalidConversation }
+            }
+            state.messages.append(committedMessage)
+            state.outbox.append(committedCommand)
             if let submittedDraftBody, let draftClearVersion {
                 _ = ConversationDraftPolicy.clearAfterSuccessfulQueue(
                     submittedBody: submittedDraftBody,
-                    conversationID: conversationID,
+                    conversationID: requestedConversationID,
                     ownerUserID: local,
                     writeVersion: draftClearVersion,
                     submittedMediaAttachments: submittedDraftMediaAttachments,
@@ -3504,13 +3677,65 @@ actor SecureMessagingExchangeCoordinator {
             forUserID: local,
             commitAdmission: commitAdmission
         )
-        if let commitAdmission {
-            try await store.update(admission: commitAdmission, commitMutation)
-        } else {
-            try await store.update(commitMutation)
+        do {
+            if let commitAdmission {
+                try await store.update(admission: commitAdmission, commitMutation)
+            } else {
+                try await store.update(commitMutation)
+            }
+        } catch StoreError.accountChanged {
+            // The media/file validation above suspends this actor. An identical stable-ID retry,
+            // or another first-contact send that establishes the one direct thread, can therefore
+            // win the protected-store commit after our snapshot. Re-enter once against live state:
+            // exact projection matching turns an identical winner into success, while every
+            // collision/account change still fails closed on the second attempt.
+            guard provisionalRecipient != nil, !concurrentCommitRecoveryAttempted
+            else { throw StoreError.accountChanged }
+            return try await queueDeferredImage(
+                forUserID: local,
+                conversationID: requestedConversationID,
+                expectedRecipientUserID: recipient,
+                title: title,
+                mediaData: mediaData,
+                mediaType: mediaType,
+                caption: caption,
+                localStorageKey: canonicalLocalStorageKey,
+                localMediaID: UUID(uuidString: stableMediaID),
+                plaintextByteSize: mediaByteCount,
+                localStorageKind: localStorageKind,
+                duration: duration,
+                preprocessingJob: preprocessingJob,
+                clientMessageID: messageID,
+                submittedDraftBody: submittedDraftBody,
+                submittedDraftMediaAttachments: submittedDraftMediaAttachments,
+                draftClearVersion: draftClearVersion,
+                deliverAt: deliverAt,
+                replyToServerMessageID: replyTarget,
+                provisionalDirectRecipientUserID: provisionalRecipient,
+                commitAdmission: commitAdmission,
+                concurrentCommitRecoveryAttempted: true
+            )
         }
+        let committed = await store.snapshot()
+        try requireAuthenticatedQueueIdentity(
+            queueIdentity,
+            forUserID: local,
+            commitAdmission: commitAdmission
+        )
+        guard Self.permitsLocalQueueState(committed, userID: local),
+              committed.messages.filter({ $0.id == messageID }).count == 1,
+              let committedMessage = committed.messages.first(where: { $0.id == messageID }),
+              let committedConversation = committed.conversations.first(where: {
+                  $0.id == committedMessage.conversationId
+              }),
+              Self.permitsDeferredQueue(
+                  conversation: committedConversation,
+                  localUserID: local,
+                  expectedRecipientUserID: recipient
+              )
+        else { throw StoreError.accountChanged }
         return SecureMessagingQueueResult(
-            conversation: queuedConversation,
+            conversation: committedConversation,
             clientMessageID: messageID
         )
     }
@@ -3668,13 +3893,16 @@ actor SecureMessagingExchangeCoordinator {
     private func clearDraftAfterIdempotentQueueIfNeeded(
         clientMessageID: UUID,
         conversationID: String,
+        requestedConversationAlias: String? = nil,
         localUserID: String,
         submittedDraftBody: String?,
         submittedDraftMediaAttachments: [ConversationDraftMediaAttachment]?,
         draftClearVersion: ConversationDraftWriteVersion?,
         commitAdmission: ProtectedCommunicationAdmissionLease?
     ) async throws {
-        guard let submittedDraftBody, let draftClearVersion else { return }
+        guard requestedConversationAlias != nil
+                || (submittedDraftBody != nil && draftClearVersion != nil)
+        else { return }
         let mutation: (inout PersistedState) throws -> Void = { state in
             guard Self.permitsLocalQueueState(state, userID: localUserID),
                   state.messages.contains(where: {
@@ -3684,14 +3912,23 @@ actor SecureMessagingExchangeCoordinator {
                           && $0.isOutgoing
                   })
             else { throw StoreError.accountChanged }
-            _ = ConversationDraftPolicy.clearAfterSuccessfulQueue(
-                submittedBody: submittedDraftBody,
-                conversationID: conversationID,
-                ownerUserID: localUserID,
-                writeVersion: draftClearVersion,
-                submittedMediaAttachments: submittedDraftMediaAttachments,
-                in: &state
-            )
+            if let requestedConversationAlias {
+                guard ProvisionalDirectConversationPolicy.recordLocalAlias(
+                    requestedConversationAlias,
+                    forConversationID: conversationID,
+                    in: &state
+                ) else { throw SecureMessagingExchangeError.invalidConversation }
+            }
+            if let submittedDraftBody, let draftClearVersion {
+                _ = ConversationDraftPolicy.clearAfterSuccessfulQueue(
+                    submittedBody: submittedDraftBody,
+                    conversationID: conversationID,
+                    ownerUserID: localUserID,
+                    writeVersion: draftClearVersion,
+                    submittedMediaAttachments: submittedDraftMediaAttachments,
+                    in: &state
+                )
+            }
         }
         if let commitAdmission {
             try await store.update(admission: commitAdmission, mutation)
@@ -3835,7 +4072,9 @@ actor SecureMessagingExchangeCoordinator {
         draftClearVersion: ConversationDraftWriteVersion? = nil,
         deliverAt: Date? = nil,
         replyToServerMessageID: String? = nil,
-        commitAdmission: ProtectedCommunicationAdmissionLease? = nil
+        provisionalDirectRecipientUserID: String? = nil,
+        commitAdmission: ProtectedCommunicationAdmissionLease? = nil,
+        concurrentCommitRecoveryAttempted: Bool = false
     ) async throws -> SecureMessagingQueueResult {
         guard (submittedDraftBody == nil) == (draftClearVersion == nil),
               draftClearVersion != nil || submittedDraftMediaAttachments == nil,
@@ -3849,9 +4088,18 @@ actor SecureMessagingExchangeCoordinator {
             forUserID: local,
             commitAdmission: commitAdmission
         )
-        let conversationID = try canonicalUUID(conversationID, error: .invalidConversation)
+        let requestedConversationID = try canonicalUUID(
+            conversationID,
+            error: .invalidConversation
+        )
         let recipient = try expectedRecipientUserID.map {
             try canonicalUUID($0, error: .invalidRecipient)
+        }
+        let provisionalRecipient = try provisionalDirectRecipientUserID.map {
+            try canonicalUUID($0, error: .invalidRecipient)
+        }
+        guard provisionalRecipient == nil || provisionalRecipient == recipient else {
+            throw SecureMessagingExchangeError.invalidRecipient
         }
         // The batch arrives fully minted (fresh ids, key material, parked plaintext keys) and
         // not yet uploaded anywhere; a torn or replayed value must never become durable state.
@@ -3884,6 +4132,7 @@ actor SecureMessagingExchangeCoordinator {
             batch,
             preprocessingJobs: preprocessingJobs
         ) else { throw SecureMediaAttachmentError.invalidMedia }
+        let createdAt = Date()
         let snapshot = await store.snapshot()
         try requireAuthenticatedQueueIdentity(
             queueIdentity,
@@ -3891,15 +4140,17 @@ actor SecureMessagingExchangeCoordinator {
             commitAdmission: commitAdmission
         )
         guard Self.permitsLocalQueueState(snapshot, userID: local),
-              let conversation = snapshot.conversations.first(where: {
-                  $0.id == conversationID
-              }),
-              Self.permitsDeferredQueue(
-                  conversation: conversation,
+              let conversation = try Self.directMediaQueueConversation(
+                  requestedConversationID: requestedConversationID,
+                  provisionalRecipientUserID: provisionalRecipient,
+                  title: title,
+                  createdAt: createdAt,
                   localUserID: local,
-                  expectedRecipientUserID: recipient
+                  expectedRecipientUserID: recipient,
+                  conversations: snapshot.conversations
               )
         else { throw SecureMessagingExchangeError.invalidConversation }
+        let conversationID = conversation.id
         if let replyTarget {
             try Self.requireLocalReplyTarget(
                 replyTarget,
@@ -3940,7 +4191,6 @@ actor SecureMessagingExchangeCoordinator {
             commitAdmission: commitAdmission
         )
 
-        let createdAt = Date()
         // Idempotent recognition compares the canonical requested minute, deliberately without
         // reapplying clock eligibility: the stored instant was admissible when first queued and
         // may since have passed while the retry is still the same send.
@@ -3996,17 +4246,25 @@ actor SecureMessagingExchangeCoordinator {
                       }),
                       ConversationDraftPolicy.localMediaStorageKeysOwnedByDrafts(
                           in: state,
-                          excludingSubmittedDraftFor: conversationID,
+                          excludingSubmittedDraftFor: requestedConversationID,
                           submittedBody: submittedDraftBody,
                           submittedMediaAttachments: submittedDraftMediaAttachments,
                           draftClearVersion: draftClearVersion,
                           consumingStorageKeys: offeredStorageKeys
                       ).isDisjoint(with: offeredOwnershipKeys)
                 else { throw StoreError.accountChanged }
+                if provisionalRecipient != nil,
+                   conversation.id != requestedConversationID {
+                    guard ProvisionalDirectConversationPolicy.recordLocalAlias(
+                        requestedConversationID,
+                        forConversationID: conversation.id,
+                        in: &state
+                    ) else { throw SecureMessagingExchangeError.invalidConversation }
+                }
                 if let submittedDraftBody, let draftClearVersion {
                     _ = ConversationDraftPolicy.clearAfterSuccessfulQueue(
                         submittedBody: submittedDraftBody,
-                        conversationID: conversationID,
+                        conversationID: requestedConversationID,
                         ownerUserID: local,
                         writeVersion: draftClearVersion,
                         submittedMediaAttachments: submittedDraftMediaAttachments,
@@ -4098,22 +4356,23 @@ actor SecureMessagingExchangeCoordinator {
                   }),
                   ConversationDraftPolicy.localMediaStorageKeysOwnedByDrafts(
                       in: state,
-                      excludingSubmittedDraftFor: conversationID,
+                      excludingSubmittedDraftFor: requestedConversationID,
                       submittedBody: submittedDraftBody,
                       submittedMediaAttachments: submittedDraftMediaAttachments,
                       draftClearVersion: draftClearVersion,
                       consumingStorageKeys: offeredStorageKeys
                   ).isDisjoint(with: offeredOwnershipKeys),
-                  let liveConversation = state.conversations.first(where: {
-                      $0.id == conversationID
-                  }),
-                  Self.permitsDeferredQueue(
-                      conversation: liveConversation,
+                  let resolvedConversation = try Self.directMediaQueueConversation(
+                      requestedConversationID: requestedConversationID,
+                      provisionalRecipientUserID: provisionalRecipient,
+                      title: title,
+                      createdAt: createdAt,
                       localUserID: local,
-                      expectedRecipientUserID: recipient
+                      expectedRecipientUserID: recipient,
+                      conversations: state.conversations
                   ),
                   Self.deferredCommandRecipients(
-                      conversation: liveConversation,
+                      conversation: resolvedConversation,
                       localUserID: local,
                       expectedRecipientUserID: recipient
                   ) == commandRecipients
@@ -4121,23 +4380,45 @@ actor SecureMessagingExchangeCoordinator {
             if let replyTarget {
                 try Self.requireLocalReplyTarget(
                     replyTarget,
-                    conversationID: conversationID,
+                    conversationID: resolvedConversation.id,
                     in: state
                 )
             }
-            var live = liveConversation
+            var live = resolvedConversation
             if scheduledAt == nil {
                 live.updatedAt = max(live.updatedAt, createdAt)
             }
             guard Self.upsert(conversation: live, in: &state) else {
                 throw SecureMessagingExchangeError.invalidConversation
             }
-            state.messages.append(localMessage)
-            state.outbox.append(command)
+            if provisionalRecipient != nil, live.id != requestedConversationID {
+                guard ProvisionalDirectConversationPolicy.recordLocalAlias(
+                    requestedConversationID,
+                    forConversationID: live.id,
+                    in: &state
+                ) else { throw SecureMessagingExchangeError.invalidConversation }
+            }
+            var committedMessage = localMessage
+            var committedCommand = command
+            if live.id != conversationID {
+                committedMessage.conversationId = live.id
+                if var records = committedMessage.localMediaRecords {
+                    for index in records.indices {
+                        records[index].conversationID = live.id
+                    }
+                    guard records.allSatisfy(\.isStructurallyValid) else {
+                        throw SecureMediaAttachmentError.invalidMedia
+                    }
+                    committedMessage.localMediaRecords = records
+                }
+                committedCommand.conversationId = live.id
+            }
+            state.messages.append(committedMessage)
+            state.outbox.append(committedCommand)
             if let submittedDraftBody, let draftClearVersion {
                 _ = ConversationDraftPolicy.clearAfterSuccessfulQueue(
                     submittedBody: submittedDraftBody,
-                    conversationID: conversationID,
+                    conversationID: requestedConversationID,
                     ownerUserID: local,
                     writeVersion: draftClearVersion,
                     submittedMediaAttachments: submittedDraftMediaAttachments,
@@ -4150,19 +4431,56 @@ actor SecureMessagingExchangeCoordinator {
             forUserID: local,
             commitAdmission: commitAdmission
         )
-        if let commitAdmission {
-            try await store.update(admission: commitAdmission, commitMutation)
-        } else {
-            try await store.update(commitMutation)
+        do {
+            if let commitAdmission {
+                try await store.update(admission: commitAdmission, commitMutation)
+            } else {
+                try await store.update(commitMutation)
+            }
+        } catch StoreError.accountChanged {
+            // A stable-ID retry may have validated the same pre-commit snapshot and won while
+            // this actor was suspended on blob reads/store I/O. Retry once against the live
+            // projection; the idempotent batch verifier compares metadata and every byte before
+            // returning success, and a non-identical collision still fails closed.
+            guard provisionalRecipient != nil, !concurrentCommitRecoveryAttempted
+            else { throw StoreError.accountChanged }
+            return try await queueDeferredMediaBatch(
+                forUserID: local,
+                conversationID: requestedConversationID,
+                expectedRecipientUserID: recipient,
+                title: title,
+                batch: batch,
+                localStorageKinds: localStorageKinds,
+                preprocessingJobs: preprocessingJobs,
+                clientMessageID: messageID,
+                submittedDraftBody: submittedDraftBody,
+                submittedDraftMediaAttachments: submittedDraftMediaAttachments,
+                draftClearVersion: draftClearVersion,
+                deliverAt: deliverAt,
+                replyToServerMessageID: replyTarget,
+                provisionalDirectRecipientUserID: provisionalRecipient,
+                commitAdmission: commitAdmission,
+                concurrentCommitRecoveryAttempted: true
+            )
         }
         let latest = await store.snapshot()
-        let committedConversation: Conversation
-        if latest.profile?.id == local,
-           let live = latest.conversations.first(where: { $0.id == conversationID }) {
-            committedConversation = live
-        } else {
-            committedConversation = conversation
-        }
+        try requireAuthenticatedQueueIdentity(
+            queueIdentity,
+            forUserID: local,
+            commitAdmission: commitAdmission
+        )
+        guard Self.permitsLocalQueueState(latest, userID: local),
+              latest.messages.filter({ $0.id == messageID }).count == 1,
+              let committedMessage = latest.messages.first(where: { $0.id == messageID }),
+              let committedConversation = latest.conversations.first(where: {
+                  $0.id == committedMessage.conversationId
+              }),
+              Self.permitsDeferredQueue(
+                  conversation: committedConversation,
+                  localUserID: local,
+                  expectedRecipientUserID: recipient
+              )
+        else { throw StoreError.accountChanged }
         return SecureMessagingQueueResult(
             conversation: committedConversation,
             clientMessageID: messageID

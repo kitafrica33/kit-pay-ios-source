@@ -1,9 +1,8 @@
 import XCTest
 @testable import KitPay
 
-/// The admission rules for a "this call was answered" signal, and the proof that the socket
-/// frame and the push are held to them equally. Acting on one silences a ringing device,
-/// starts both call timers, and moves CallKit state, so anything that is not the shape the
+/// Admission rules for remote call lifecycle signals. Acting on one can silence a ringing
+/// device, start both call timers, or end CallKit state, so anything that is not the shape the
 /// server actually sends has to stop at the boundary rather than downstream.
 final class CallAnswerSignalTests: XCTestCase {
     // Alphabetic hex digits on purpose: an all-digit id is its own uppercase, which would
@@ -143,6 +142,119 @@ final class CallAnswerSignalTests: XCTestCase {
             CallAnsweredPush(payload: pushPayload(answeredAt: "2026-08-20T09:15:05Z"))
         )
         XCTAssertNil(stale.signal)
+    }
+
+    func testTerminalPushesMapTheBackendsExactLifecycleContracts() throws {
+        let ended = try XCTUnwrap(CallTerminalPush(payload: terminalPushPayload(
+            type: "call.ended",
+            state: "ended",
+            callId: callID.uppercased()
+        )))
+        XCTAssertEqual(ended.callId, callID)
+        XCTAssertEqual(ended.disposition, .remoteEnded)
+        XCTAssertEqual(ended.disposition.publicationRetirement, .terminal(.remoteEnded))
+
+        let declined = try XCTUnwrap(
+            CallTerminalPush(payload: terminalPushPayload(
+                type: "call.declined",
+                state: "declined"
+            ))
+        )
+        XCTAssertEqual(declined.disposition, .declinedElsewhere)
+        XCTAssertEqual(
+            declined.disposition.publicationRetirement,
+            .terminal(.declinedElsewhere)
+        )
+        let missed = try XCTUnwrap(
+            CallTerminalPush(payload: terminalPushPayload(
+                type: "call.missed",
+                state: "missed"
+            ))
+        )
+        XCTAssertEqual(missed.disposition, .unanswered)
+        XCTAssertEqual(missed.disposition.publicationRetirement, .naturallyExpired)
+    }
+
+    func testTerminalPushRejectsNonterminalOrContradictoryLifecyclePayloads() {
+        XCTAssertNil(CallTerminalPush(payload: terminalPushPayload(
+            type: "call.declined",
+            state: "ringing"
+        )))
+        XCTAssertNil(CallTerminalPush(payload: terminalPushPayload(
+            type: "call.ended",
+            state: "missed"
+        )))
+        XCTAssertNil(CallTerminalPush(payload: terminalPushPayload(
+            type: "call.answered",
+            state: "active"
+        )))
+        XCTAssertNil(CallTerminalPush(payload: terminalPushPayload(
+            type: "call.missed",
+            state: "missed",
+            callId: "not-a-uuid"
+        )))
+        XCTAssertNil(CallTerminalPush(payload: [
+            "type": "call.ended",
+            "call_id": callID,
+        ]))
+    }
+
+    func testTerminalPushBeforeVoIPRingTombstonesOnlyItsExactCall() throws {
+        let terminal = try XCTUnwrap(CallTerminalPush(payload: terminalPushPayload(
+            type: "call.ended",
+            state: "ended"
+        )))
+        let callUUID = try XCTUnwrap(UUID(uuidString: terminal.callId))
+        let unrelatedUUID = try XCTUnwrap(
+            UUID(uuidString: "b4b4c4d4-e4f4-4444-8444-444444444444")
+        )
+        XCTAssertEqual(
+            CallTerminalPushPolicy.disposition(
+                hasPendingPublication: false,
+                hasMatchingQuarantinedCall: false,
+                hasMatchingAuthenticatedCall: false
+            ),
+            .rememberTerminal
+        )
+
+        var gate = IncomingCallPublicationGate()
+        gate.retire(callUUID: callUUID, as: terminal.disposition.publicationRetirement)
+        XCTAssertEqual(
+            gate.begin(callUUID: callUUID, generation: 1, alreadyTracked: false),
+            .terminalTombstoned(.remoteEnded)
+        )
+        XCTAssertEqual(
+            gate.begin(callUUID: unrelatedUUID, generation: 1, alreadyTracked: false),
+            .authorized,
+            "A terminal event must not suppress any other CallKit publication"
+        )
+    }
+
+    func testTerminalPushRetiresOnlyAConfirmedMatchingOffer() {
+        XCTAssertEqual(
+            CallTerminalPushPolicy.disposition(
+                hasPendingPublication: true,
+                hasMatchingQuarantinedCall: false,
+                hasMatchingAuthenticatedCall: false
+            ),
+            .retireOfferedCall
+        )
+        XCTAssertEqual(
+            CallTerminalPushPolicy.disposition(
+                hasPendingPublication: false,
+                hasMatchingQuarantinedCall: true,
+                hasMatchingAuthenticatedCall: false
+            ),
+            .retireOfferedCall
+        )
+        XCTAssertEqual(
+            CallTerminalPushPolicy.disposition(
+                hasPendingPublication: false,
+                hasMatchingQuarantinedCall: false,
+                hasMatchingAuthenticatedCall: true
+            ),
+            .retireOfferedCall
+        )
     }
 
     func testBothRoutesProduceTheSameSignal() throws {
@@ -303,6 +415,18 @@ final class CallAnswerSignalTests: XCTestCase {
         if let answeredAt { payload["answered_at"] = answeredAt }
         if let serverTime { payload["server_time"] = serverTime }
         return payload
+    }
+
+    private func terminalPushPayload(
+        type: String,
+        state: String,
+        callId: String? = nil
+    ) -> [AnyHashable: Any] {
+        [
+            "type": type,
+            "call_id": callId ?? callID,
+            "state": state,
+        ]
     }
 
     private func answeredFrameJSON(

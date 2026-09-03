@@ -47,6 +47,10 @@ final class SecureLocalStoreTests: XCTestCase {
         XCTAssertEqual(restored.profile, expected.profile)
         XCTAssertEqual(restored.communicationOwnerUserID, expected.communicationOwnerUserID)
         XCTAssertEqual(restored.sessionAssurance, expected.sessionAssurance)
+        XCTAssertEqual(
+            restored.messagingOfflineDirectCreationCapabilityReceipt,
+            expected.messagingOfflineDirectCreationCapabilityReceipt
+        )
         XCTAssertEqual(restored.contacts, expected.contacts)
         XCTAssertEqual(restored.conversations, expected.conversations)
         XCTAssertEqual(restored.conversationDrafts, expected.conversationDrafts)
@@ -773,6 +777,257 @@ final class SecureLocalStoreTests: XCTestCase {
         )
         let signedOutSnapshot = await reopened.snapshot()
         XCTAssertNil(signedOutSnapshot.communicationPrivacy)
+    }
+
+    func testOfflineDirectCapabilityReceiptSurvivesRelaunchAndClearsAtSignOut() async throws {
+        let ownerUserID = "10000000-0000-4000-8000-000000000031"
+        let sessionID = "20000000-0000-4000-8000-000000000031"
+        let stateURL = temporaryDirectory.appendingPathComponent("offline-direct-state.secure")
+        let key = Data(repeating: 0x53, count: 32)
+        let profile = userProfile(id: ownerUserID, name: "Offline owner")
+        let receipt = try XCTUnwrap(offlineDirectCreationReceipt(
+            ownerUserID: ownerUserID,
+            sessionID: sessionID,
+            enabled: true
+        ))
+        var state = PersistedState.empty
+        state.bindAuthenticatedProfile(profile)
+        state.messagingOfflineDirectCreationCapabilityReceipt = receipt
+
+        let store = SecureLocalStore(stateURL: stateURL, keyData: key)
+        try await store.replace(state)
+        let reopened = SecureLocalStore(stateURL: stateURL, keyData: key)
+        let restored = await reopened.snapshot()
+        XCTAssertEqual(restored.messagingOfflineDirectCreationCapabilityReceipt, receipt)
+        XCTAssertTrue(MessagingOfflineDirectCreationCapabilityPolicy.allowsLocalQueue(
+            authoritativeCapabilities: nil,
+            receipt: restored.messagingOfflineDirectCreationCapabilityReceipt,
+            in: MessagingDeferredFeatureScope(
+                accountEpoch: UUID(),
+                userID: ownerUserID,
+                sessionID: sessionID
+            )
+        ))
+
+        try await reopened.clearFinancialAndSessionProjections(
+            preserveCommunicationHistory: true
+        )
+        let afterSignOut = await reopened.snapshot()
+        XCTAssertNil(afterSignOut.messagingOfflineDirectCreationCapabilityReceipt)
+        try await reopened.update { $0.bindAuthenticatedProfile(profile) }
+        let sameAccountAfterSignIn = await reopened.snapshot()
+        XCTAssertNil(
+            sameAccountAfterSignIn.messagingOfflineDirectCreationCapabilityReceipt,
+            "signing back into the same account must require fresh server authority"
+        )
+    }
+
+    func testOfflineDirectCapabilityRevocationPersistsAndAccountSwitchCannotInheritIt() async throws {
+        let ownerUserID = "10000000-0000-4000-8000-000000000041"
+        let sessionID = "20000000-0000-4000-8000-000000000041"
+        let replacementUserID = "10000000-0000-4000-8000-000000000042"
+        let stateURL = temporaryDirectory.appendingPathComponent("offline-direct-revoked.secure")
+        let key = Data(repeating: 0x54, count: 32)
+        let store = SecureLocalStore(stateURL: stateURL, keyData: key)
+        var state = PersistedState.empty
+        state.bindAuthenticatedProfile(userProfile(id: ownerUserID, name: "Original owner"))
+        state.messagingOfflineDirectCreationCapabilityReceipt = try XCTUnwrap(
+            offlineDirectCreationReceipt(
+                ownerUserID: ownerUserID,
+                sessionID: sessionID,
+                enabled: true
+            )
+        )
+        try await store.replace(state)
+
+        let revoked = try offlineDirectCreationReceipt(
+            ownerUserID: ownerUserID,
+            sessionID: sessionID,
+            enabled: false
+        )
+        XCTAssertNil(revoked)
+        try await store.update {
+            $0.messagingOfflineDirectCreationCapabilityReceipt = revoked
+        }
+        let reopened = SecureLocalStore(stateURL: stateURL, keyData: key)
+        let restored = await reopened.snapshot()
+        XCTAssertNil(restored.messagingOfflineDirectCreationCapabilityReceipt)
+
+        try await reopened.update {
+            $0.bindAuthenticatedProfile(
+                userProfile(id: replacementUserID, name: "Replacement owner")
+            )
+        }
+        let switched = await reopened.snapshot()
+        XCTAssertEqual(switched.profile?.id, replacementUserID)
+        XCTAssertNil(switched.messagingOfflineDirectCreationCapabilityReceipt)
+    }
+
+    func testOfflineDirectCapabilityCASRejectsGrantArrivingAfterNewerRevocation() async throws {
+        let ownerUserID = "10000000-0000-4000-8000-000000000051"
+        let sessionID = "20000000-0000-4000-8000-000000000051"
+        let scope = MessagingDeferredFeatureScope(
+            accountEpoch: UUID(uuidString: "30000000-0000-4000-8000-000000000051")!,
+            userID: ownerUserID,
+            sessionID: sessionID
+        )
+        let stateURL = temporaryDirectory.appendingPathComponent(
+            "offline-direct-generation-race.secure"
+        )
+        let key = Data(repeating: 0x55, count: 32)
+        let staleGrant = try XCTUnwrap(offlineDirectCreationReceipt(
+            ownerUserID: ownerUserID,
+            sessionID: sessionID,
+            enabled: true
+        ))
+        var state = PersistedState.empty
+        state.bindAuthenticatedProfile(userProfile(id: ownerUserID, name: "Race owner"))
+        state.messagingOfflineDirectCreationCapabilityReceipt = staleGrant
+        let store = SecureLocalStore(stateURL: stateURL, keyData: key)
+        try await store.replace(state)
+
+        let optionalOlderRequest = await store
+            .beginMessagingOfflineDirectCreationCapabilityRequest(scope: scope)
+        let optionalNewerRequest = await store
+            .beginMessagingOfflineDirectCreationCapabilityRequest(scope: scope)
+        let olderRequest = try XCTUnwrap(optionalOlderRequest)
+        let newerRequest = try XCTUnwrap(optionalNewerRequest)
+
+        // Deterministically model the actor-hop inversion: the newer server withdrawal reaches
+        // protected storage first, then the older affirmative response tries to commit.
+        let revoked = try await store
+            .commitMessagingOfflineDirectCreationCapabilityDecision(
+                nil,
+                request: newerRequest
+            )
+        let staleCommit = try await store
+            .commitMessagingOfflineDirectCreationCapabilityDecision(
+                staleGrant,
+                request: olderRequest
+            )
+        XCTAssertTrue(revoked)
+        XCTAssertFalse(staleCommit)
+
+        let reopened = SecureLocalStore(stateURL: stateURL, keyData: key)
+        let restored = await reopened.snapshot()
+        XCTAssertNil(restored.messagingOfflineDirectCreationCapabilityReceipt)
+        XCTAssertFalse(MessagingOfflineDirectCreationCapabilityPolicy.allowsLocalQueue(
+            authoritativeCapabilities: nil,
+            receipt: restored.messagingOfflineDirectCreationCapabilityReceipt,
+            in: scope
+        ))
+    }
+
+    func testOfflineDirectCapabilityCASRejectsPriorSessionAfterScopeChange() async throws {
+        let ownerUserID = "10000000-0000-4000-8000-000000000061"
+        let oldSessionID = "20000000-0000-4000-8000-000000000061"
+        let newSessionID = "20000000-0000-4000-8000-000000000062"
+        let oldScope = MessagingDeferredFeatureScope(
+            accountEpoch: UUID(uuidString: "30000000-0000-4000-8000-000000000061")!,
+            userID: ownerUserID,
+            sessionID: oldSessionID
+        )
+        let newScope = MessagingDeferredFeatureScope(
+            accountEpoch: UUID(uuidString: "30000000-0000-4000-8000-000000000062")!,
+            userID: ownerUserID,
+            sessionID: newSessionID
+        )
+        let stateURL = temporaryDirectory.appendingPathComponent(
+            "offline-direct-session-race.secure"
+        )
+        let key = Data(repeating: 0x56, count: 32)
+        let staleGrant = try XCTUnwrap(offlineDirectCreationReceipt(
+            ownerUserID: ownerUserID,
+            sessionID: oldSessionID,
+            enabled: true
+        ))
+        let currentGrant = try XCTUnwrap(offlineDirectCreationReceipt(
+            ownerUserID: ownerUserID,
+            sessionID: newSessionID,
+            enabled: true
+        ))
+        var state = PersistedState.empty
+        state.bindAuthenticatedProfile(userProfile(id: ownerUserID, name: "Session owner"))
+        let store = SecureLocalStore(stateURL: stateURL, keyData: key)
+        try await store.replace(state)
+
+        let optionalOldSessionRequest = await store
+            .beginMessagingOfflineDirectCreationCapabilityRequest(scope: oldScope)
+        let optionalNewSessionRequest = await store
+            .beginMessagingOfflineDirectCreationCapabilityRequest(scope: newScope)
+        let oldSessionRequest = try XCTUnwrap(optionalOldSessionRequest)
+        let newSessionRequest = try XCTUnwrap(optionalNewSessionRequest)
+        let oldSessionCommit = try await store
+            .commitMessagingOfflineDirectCreationCapabilityDecision(
+                staleGrant,
+                request: oldSessionRequest
+            )
+        let currentSessionCommit = try await store
+            .commitMessagingOfflineDirectCreationCapabilityDecision(
+                currentGrant,
+                request: newSessionRequest
+            )
+        XCTAssertFalse(oldSessionCommit)
+        XCTAssertTrue(currentSessionCommit)
+
+        let reopened = SecureLocalStore(stateURL: stateURL, keyData: key)
+        let restored = await reopened.snapshot()
+        XCTAssertFalse(MessagingOfflineDirectCreationCapabilityPolicy.allowsLocalQueue(
+            authoritativeCapabilities: nil,
+            receipt: restored.messagingOfflineDirectCreationCapabilityReceipt,
+            in: oldScope
+        ))
+        XCTAssertTrue(MessagingOfflineDirectCreationCapabilityPolicy.allowsLocalQueue(
+            authoritativeCapabilities: nil,
+            receipt: restored.messagingOfflineDirectCreationCapabilityReceipt,
+            in: newScope
+        ))
+    }
+
+    func testOfflineDirectCapabilityLifecycleRetirementClearsAndRejectsParkedGrant() async throws {
+        let ownerUserID = "10000000-0000-4000-8000-000000000071"
+        let sessionID = "20000000-0000-4000-8000-000000000071"
+        let scope = MessagingDeferredFeatureScope(
+            accountEpoch: UUID(uuidString: "30000000-0000-4000-8000-000000000071")!,
+            userID: ownerUserID,
+            sessionID: sessionID
+        )
+        let stateURL = temporaryDirectory.appendingPathComponent(
+            "offline-direct-retired-context.secure"
+        )
+        let key = Data(repeating: 0x57, count: 32)
+        let grant = try XCTUnwrap(offlineDirectCreationReceipt(
+            ownerUserID: ownerUserID,
+            sessionID: sessionID,
+            enabled: true
+        ))
+        var state = PersistedState.empty
+        state.bindAuthenticatedProfile(userProfile(id: ownerUserID, name: "Retired owner"))
+        state.messagingOfflineDirectCreationCapabilityReceipt = grant
+        let store = SecureLocalStore(stateURL: stateURL, keyData: key)
+        try await store.replace(state)
+
+        let optionalParkedRequest = await store
+            .beginMessagingOfflineDirectCreationCapabilityRequest(scope: scope)
+        let parkedRequest = try XCTUnwrap(optionalParkedRequest)
+        try await store.retireMessagingOfflineDirectCreationCapabilityContext(
+            clearingPersistedReceipt: true
+        )
+        let staleCommit = try await store
+            .commitMessagingOfflineDirectCreationCapabilityDecision(
+                grant,
+                request: parkedRequest
+            )
+        XCTAssertFalse(staleCommit)
+
+        let reopened = SecureLocalStore(stateURL: stateURL, keyData: key)
+        let restored = await reopened.snapshot()
+        XCTAssertNil(restored.messagingOfflineDirectCreationCapabilityReceipt)
+        XCTAssertFalse(MessagingOfflineDirectCreationCapabilityPolicy.allowsLocalQueue(
+            authoritativeCapabilities: nil,
+            receipt: restored.messagingOfflineDirectCreationCapabilityReceipt,
+            in: scope
+        ))
     }
 
     func testCommunicationHistoryIsNeverInheritedByAnotherAuthenticatedAccount() async throws {
@@ -1638,8 +1893,59 @@ final class SecureLocalStoreTests: XCTestCase {
         let restored = try decoder.decode(PersistedState.self, from: legacyData)
 
         XCTAssertNil(restored.pendingProfileAvatarAttachment)
+        XCTAssertNil(restored.messagingOfflineDirectCreationCapabilityReceipt)
         XCTAssertEqual(restored.profile, original.profile)
         XCTAssertEqual(restored.messages, original.messages)
+    }
+
+    private func offlineDirectCreationReceipt(
+        ownerUserID: String,
+        sessionID: String,
+        enabled: Bool
+    ) throws -> MessagingOfflineDirectCreationCapabilityReceipt? {
+        var messaging: [String: Any] = [
+            "ready": true,
+            "version": SecureMessagingWire.protocolVersion,
+            "suite": SecureMessagingWire.protocolSuite,
+            "post_quantum": true,
+        ]
+        if enabled {
+            messaging["offline_direct_creation"] = [
+                "profile": MessagingOfflineDirectCreationCapabilityDTO.reviewedProfile,
+                "ready": true,
+                "request_field": MessagingOfflineDirectCreationCapabilityDTO
+                    .reviewedRequestField,
+                "canonical_id_on_create": true,
+                "existing_pair_wins": true,
+            ]
+        }
+        let data = try JSONSerialization.data(withJSONObject: [
+            "api_version": "v1",
+            "currency": ["code": "UGX", "scale": "2"],
+            "features": ["messaging": true],
+            "protocols": ["messaging": messaging],
+        ])
+        let capabilities = try JSONDecoder().decode(CapabilitiesDTO.self, from: data)
+        return MessagingOfflineDirectCreationCapabilityReceipt(
+            ownerUserID: ownerUserID,
+            sessionID: sessionID,
+            authoritativeCapabilities: capabilities,
+            accountMutationsAllowed: true
+        )
+    }
+
+    private func userProfile(id: String, name: String) -> UserProfile {
+        UserProfile(
+            id: id,
+            name: name,
+            email: nil,
+            phone: "+256700000001",
+            tag: "offline_owner",
+            kycStatus: "verified",
+            paymentPinSet: true,
+            mfaEnabled: true,
+            profileSetupRequired: false
+        )
     }
 
     private func communicationState() -> PersistedState {
@@ -1833,6 +2139,11 @@ final class SecureLocalStoreTests: XCTestCase {
         XCTAssertNil(state.profile, file: file, line: line)
         XCTAssertNil(state.communicationOwnerUserID, file: file, line: line)
         XCTAssertNil(state.sessionAssurance, file: file, line: line)
+        XCTAssertNil(
+            state.messagingOfflineDirectCreationCapabilityReceipt,
+            file: file,
+            line: line
+        )
         XCTAssertTrue(state.wallets.isEmpty, file: file, line: line)
         XCTAssertTrue(state.transactions.isEmpty, file: file, line: line)
         XCTAssertTrue(state.contacts?.isEmpty != false, file: file, line: line)

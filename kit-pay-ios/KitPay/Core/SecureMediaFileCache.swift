@@ -295,6 +295,135 @@ enum LegacyInlineReceivedMediaCompactionPolicy {
     }
 }
 
+/// Recovers the first open of a received video whose authenticated plaintext was cached by an
+/// older build before `LocalMediaRecord` tracked that cache representation. Both KITMEDIA1 and
+/// KITMEDIA2 can reach this state: the row migrates conservatively to `remoteOnly`, while its
+/// account-bound sealed blob remains readable under the descriptor's remote storage key.
+///
+/// The protected file is published first, its exact message/record ownership is committed second,
+/// and the sealed source is retired only after that commit is re-read. The returned item therefore
+/// owns an eviction lease and carries empty Data; no first-open path retains a whole movie beside
+/// AVFoundation's decoder buffers. A failed ownership CAS keeps the sealed source intact.
+enum ReceivedVideoCachedBlobRecovery {
+    static func recover(
+        store: SecureLocalStore,
+        cache: SecureMediaFileCache,
+        userID: String,
+        messageID: UUID,
+        conversationID: String,
+        itemIndex: Int?,
+        expectedResolution: SecureMediaLoadPolicy.Resolved,
+        expectedRecord: LocalMediaRecord?,
+        messageIsOutgoing: Bool,
+        attachmentID: String,
+        storageKey: String,
+        mediaType: String,
+        byteCount: Int,
+        caption: String?
+    ) async throws -> SecureMediaLoadPolicy.LoadedItem? {
+        guard !messageIsOutgoing,
+              KitChatMediaKind(mediaType: mediaType) == .video,
+              byteCount > 0,
+              let expectedRecord,
+              expectedRecord.direction == .received,
+              expectedRecord.localStorageKind == .none,
+              expectedRecord.localStorageKey == nil,
+              expectedRecord.remoteEncryptedObjectID == storageKey,
+              expectedRecord.availabilityState == .remoteOnly,
+              expectedRecord.downloadState == .pending
+                || expectedRecord.downloadState == .failed
+        else { return nil }
+
+        let accessLease: SecureMediaOriginalAccessLease
+        do {
+            guard let promoted = try await cache.promoteEncryptedBlobToProtectedOriginal(
+                forStorageKey: storageKey,
+                userID: userID,
+                mediaType: mediaType,
+                expectedByteCount: byteCount
+            ) else { return nil }
+            accessLease = promoted
+        } catch {
+            // Missing or damaged local cache can still use the authenticated streaming download
+            // at the caller. It must never fall through to whole-Data received-video playback.
+            return nil
+        }
+
+        do {
+            try await store.update { persisted in
+                guard persisted.profile?.id == userID,
+                      SecureMediaLoadPolicy.resolve(
+                          messageID: messageID,
+                          conversationId: conversationID,
+                          itemIndex: itemIndex,
+                          in: persisted.messages
+                      ) == expectedResolution
+                else { throw SecureMediaAttachmentError.invalidDescriptor }
+                let indices = persisted.messages.indices.filter {
+                    persisted.messages[$0].id == messageID
+                        && persisted.messages[$0].conversationId == conversationID
+                }
+                guard indices.count == 1, let index = indices.first,
+                      LocalMediaRecordPolicy.record(
+                          messageID: messageID,
+                          conversationID: conversationID,
+                          attachmentID: attachmentID,
+                          mediaType: mediaType,
+                          fileSize: byteCount,
+                          remoteStorageKey: storageKey,
+                          in: persisted.messages
+                      ) == expectedRecord,
+                      LocalMediaRecordPolicy.markDownloadedProtectedFile(
+                          &persisted.messages[index],
+                          attachmentID: attachmentID,
+                          remoteStorageKey: storageKey,
+                          localStorageKey: storageKey
+                      )
+                else { throw SecureMediaAttachmentError.invalidDescriptor }
+            }
+
+            let committed = await store.snapshot()
+            guard committed.profile?.id == userID,
+                  SecureMediaLoadPolicy.resolve(
+                      messageID: messageID,
+                      conversationId: conversationID,
+                      itemIndex: itemIndex,
+                      in: committed.messages
+                  ) == expectedResolution,
+                  let promotedRecord = LocalMediaRecordPolicy.record(
+                      messageID: messageID,
+                      conversationID: conversationID,
+                      attachmentID: attachmentID,
+                      mediaType: mediaType,
+                      fileSize: byteCount,
+                      remoteStorageKey: storageKey,
+                      in: committed.messages
+                  ),
+                  promotedRecord.localStorageKind == .protectedFile,
+                  promotedRecord.localStorageKey == storageKey,
+                  promotedRecord.availabilityState == .localCached,
+                  promotedRecord.downloadState == .downloaded
+            else { throw SecureMediaAttachmentError.invalidDescriptor }
+
+            await cache.removeEncryptedBlobRepresentation(
+                forStorageKey: storageKey,
+                userID: userID
+            )
+            return SecureMediaLoadPolicy.LoadedItem(localFile: .init(
+                url: accessLease.fileURL,
+                mediaType: mediaType,
+                caption: caption,
+                byteCount: byteCount,
+                attachmentID: attachmentID,
+                accessLease: accessLease
+            ))
+        } catch {
+            await cache.releaseProtectedOriginalLease(accessLease)
+            throw error
+        }
+    }
+}
+
 /// Device-protected local store for chat media.
 ///
 /// The single AES-GCM state file must stay small — every `SecureLocalStore.update` rewrites it in

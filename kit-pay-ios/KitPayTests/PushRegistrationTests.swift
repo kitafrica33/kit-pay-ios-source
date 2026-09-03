@@ -195,6 +195,7 @@ final class PushRegistrationTests: XCTestCase {
             ),
             .retry(after: 300)
         )
+        await manager.cancelAll()
     }
 
     func testOfflineFailureCanRetryImmediatelyWhenConnectivityReturns() async {
@@ -208,6 +209,7 @@ final class PushRegistrationTests: XCTestCase {
             provider: "apns",
             token: "token-a"
         ) { try await operation.perform() }
+        await manager.expediteDeferredRetries(accountID: "user-a")
         let recoveredOutcome = await manager.register(
             accountID: "user-a",
             provider: "apns",
@@ -219,6 +221,102 @@ final class PushRegistrationTests: XCTestCase {
         XCTAssertEqual(callCount, 2)
     }
 
+    func testExhaustedTransientBurstRetriesAutonomouslyAndRegisters() async {
+        let (defaults, suiteName) = isolatedDefaults()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let retryStartedAt = Date(timeIntervalSince1970: 10_000)
+        let operation = FourTransientFailuresThenSuccessPushOperation()
+        let deferredSleeper = ControlledDeferredPushSleeper()
+        let manager = PushRegistrationManager(
+            defaults: defaults,
+            now: { retryStartedAt },
+            sleeper: { _ in },
+            deferredSleeper: { delay in try await deferredSleeper.sleep(delay: delay) },
+            jitter: { 0 }
+        )
+
+        let initialOutcome = await manager.register(
+            accountID: "user-a",
+            provider: "apns",
+            token: "token-a"
+        ) { try await operation.perform() }
+        let deferredDelay = await deferredSleeper.waitUntilScheduled()
+        let initialCallCount = await operation.callCount()
+
+        XCTAssertEqual(initialOutcome, .failed)
+        XCTAssertEqual(initialCallCount, 4)
+        XCTAssertEqual(deferredDelay, 300)
+
+        await deferredSleeper.release()
+        await operation.waitUntilCallCount(5)
+        let recoveredOutcome = await manager.register(
+            accountID: "user-a",
+            provider: "apns",
+            token: "token-a"
+        ) { try await operation.perform() }
+        let settledOutcome = await manager.register(
+            accountID: "user-a",
+            provider: "apns",
+            token: "token-a"
+        ) { try await operation.perform() }
+        let recoveredCallCount = await operation.callCount()
+
+        XCTAssertTrue([.registered, .alreadyRegistered].contains(recoveredOutcome))
+        XCTAssertEqual(settledOutcome, .alreadyRegistered)
+        XCTAssertEqual(recoveredCallCount, 5)
+        await manager.cancelAll()
+    }
+
+    func testDurableRetrySurvivesManagerRecreationAndRecoversWhenDue() async {
+        let (defaults, suiteName) = isolatedDefaults()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let failedAt = Date(timeIntervalSince1970: 10_000)
+        let failingOperation = AlwaysTransientPushOperation()
+        let firstManager = PushRegistrationManager(
+            defaults: defaults,
+            now: { failedAt },
+            sleeper: { _ in },
+            deferredSleeper: { _ in
+                try await Task<Never, Never>.sleep(for: .seconds(3_600))
+            },
+            jitter: { 0 }
+        )
+
+        let failedOutcome = await firstManager.register(
+            accountID: "user-a",
+            provider: "apns",
+            token: "token-a"
+        ) { try await failingOperation.perform() }
+        let failedCallCount = await failingOperation.callCount()
+        XCTAssertEqual(failedOutcome, .failed)
+        XCTAssertEqual(failedCallCount, 4)
+        // Simulate termination: cancel only process-owned tasks. The privacy-preserving retry
+        // record intentionally remains in UserDefaults for the next launch.
+        await firstManager.cancelAll()
+
+        let successfulOperation = PushAttemptCounter()
+        let relaunchedManager = PushRegistrationManager(
+            defaults: defaults,
+            now: { failedAt.addingTimeInterval(301) },
+            jitter: { 0 }
+        )
+        let recoveredOutcome = await relaunchedManager.register(
+            accountID: "user-a",
+            provider: "apns",
+            token: "token-a"
+        ) { await successfulOperation.succeed() }
+        let duplicateOutcome = await relaunchedManager.register(
+            accountID: "user-a",
+            provider: "apns",
+            token: "token-a"
+        ) { await successfulOperation.succeed() }
+        let successfulCallCount = await successfulOperation.callCount()
+
+        XCTAssertEqual(recoveredOutcome, .registered)
+        XCTAssertEqual(duplicateOutcome, .alreadyRegistered)
+        XCTAssertEqual(successfulCallCount, 1)
+    }
+
     func testRetryAfterParserAcceptsSeconds() {
         let response = HTTPURLResponse(
             url: URL(string: "https://pay.kit.africa/")!,
@@ -227,6 +325,25 @@ final class PushRegistrationTests: XCTestCase {
             headerFields: ["Retry-After": "45"]
         )!
         XCTAssertEqual(HTTPRetryAfterParser.delay(from: response), 45)
+    }
+
+    func testDurableRetryBackoffHasBatterySafeFloorAndBoundedCeiling() {
+        XCTAssertEqual(
+            PushRegistrationRetryPolicy.durableRetryDelay(
+                failureCount: 1,
+                minimumDelay: 0,
+                jitterUnitInterval: 0
+            ),
+            60
+        )
+        XCTAssertEqual(
+            PushRegistrationRetryPolicy.durableRetryDelay(
+                failureCount: 10_000,
+                minimumDelay: 100_000,
+                jitterUnitInterval: 1
+            ),
+            6 * 60 * 60
+        )
     }
 
     private func isolatedDefaults() -> (UserDefaults, String) {
@@ -321,4 +438,66 @@ private actor OfflineThenSuccessfulPushOperation {
     }
 
     func callCount() -> Int { calls }
+}
+
+private actor FourTransientFailuresThenSuccessPushOperation {
+    private var calls = 0
+    private var callCountWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
+
+    func perform() throws -> Bool {
+        calls += 1
+        let ready = callCountWaiters.filter { calls >= $0.0 }
+        callCountWaiters.removeAll { calls >= $0.0 }
+        ready.forEach { $0.1.resume() }
+        if calls <= 4 { throw URLError(.timedOut) }
+        return true
+    }
+
+    func waitUntilCallCount(_ target: Int) async {
+        guard calls < target else { return }
+        await withCheckedContinuation { continuation in
+            callCountWaiters.append((target, continuation))
+        }
+    }
+
+    func callCount() -> Int { calls }
+}
+
+private actor AlwaysTransientPushOperation {
+    private var calls = 0
+
+    func perform() throws -> Bool {
+        calls += 1
+        throw URLError(.timedOut)
+    }
+
+    func callCount() -> Int { calls }
+}
+
+private actor ControlledDeferredPushSleeper {
+    private var scheduledDelay: TimeInterval?
+    private var scheduleWaiters: [CheckedContinuation<TimeInterval, Never>] = []
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+    private var released = false
+
+    func sleep(delay: TimeInterval) async throws {
+        scheduledDelay = delay
+        let waiters = scheduleWaiters
+        scheduleWaiters.removeAll()
+        waiters.forEach { $0.resume(returning: delay) }
+        guard !released else { return }
+        await withCheckedContinuation { releaseContinuation = $0 }
+        try Task.checkCancellation()
+    }
+
+    func waitUntilScheduled() async -> TimeInterval {
+        if let scheduledDelay { return scheduledDelay }
+        return await withCheckedContinuation { scheduleWaiters.append($0) }
+    }
+
+    func release() {
+        released = true
+        releaseContinuation?.resume()
+        releaseContinuation = nil
+    }
 }

@@ -19,6 +19,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[3]
 V2_MODELS = ROOT / "KitPay/Core/MediaMessageV2Models.swift"
 V1_MODELS = ROOT / "KitPay/Core/MessagingAPIModels.swift"
 MODELS = ROOT / "KitPay/Core/Models.swift"
+SECURE_STORE = ROOT / "KitPay/Core/SecureLocalStore.swift"
 BACKGROUND_UPLOAD = ROOT / "KitPay/Core/MessagingBackgroundUpload.swift"
 API_CLIENT = ROOT / "KitPay/Core/APIClient.swift"
 MESSAGING_API = ROOT / "KitPay/Core/APIClient+Messaging.swift"
@@ -73,6 +74,109 @@ class MediaMessageV2SourceContract(unittest.TestCase):
         self.v2 = V2_MODELS.read_text(encoding="utf-8")
         self.v1 = V1_MODELS.read_text(encoding="utf-8")
         self.models = MODELS.read_text(encoding="utf-8")
+
+    def test_media_first_contact_uses_atomic_provisional_queueing(self) -> None:
+        """Single, batch, share, and forward entry points must all reach the same protected
+        conversation+message+outbox commit without manufacturing a text message first."""
+        coordinator = COORDINATOR.read_text(encoding="utf-8")
+        app_model = (ROOT / "KitPay/App/AppModel.swift").read_text(encoding="utf-8")
+        messages = (ROOT / "KitPay/Features/Messages/MessagesView.swift").read_text(
+            encoding="utf-8"
+        )
+        forwarding = (ROOT / "KitPay/Features/Messages/ForwardMessagesView.swift").read_text(
+            encoding="utf-8"
+        )
+
+        single = coordinator[
+            coordinator.index("func queueDeferredImage(") : coordinator.index(
+                "private func existingDeferredMediaResult(",
+                coordinator.index("func queueDeferredImage("),
+            )
+        ]
+        batch = coordinator[
+            coordinator.index("func queueDeferredMediaBatch(") : coordinator.index(
+                "private static func batchProjectionMatchesOffered(",
+                coordinator.index("func queueDeferredMediaBatch("),
+            )
+        ]
+        for queue in (single, batch):
+            self.assertIn("provisionalDirectRecipientUserID", queue)
+            self.assertIn("directMediaQueueConversation(", queue)
+            self.assertIn("concurrentCommitRecoveryAttempted", queue)
+            self.assertIn("recordLocalAlias(", queue)
+            self.assertIn("state.messages.append(committedMessage)", queue)
+            self.assertIn("state.outbox.append(committedCommand)", queue)
+            self.assertNotIn("queueDirectText(", queue)
+
+        direct_target = "\n".join(function_body(app_model, "func directMediaQueueTarget("))
+        self.assertIn("messagingOfflineDirectCreationLocalQueueEnabled", direct_target)
+        self.assertIn("ensureDirectConversation(", direct_target)
+        self.assertLess(
+            direct_target.index("messagingOfflineDirectCreationLocalQueueEnabled"),
+            direct_target.index("ensureDirectConversation("),
+        )
+        self.assertNotIn(
+            "capabilities?.enablesMessagingOfflineDirectCreation == true", app_model
+        )
+        self.assertIn("model.newDirectMessageCompositionAllowed", messages)
+        composition_gate = app_model[
+            app_model.index("var newDirectMessageCompositionAllowed: Bool") : app_model.index(
+                "private func bindDeferredMessagingFeatures", app_model.index(
+                    "var newDirectMessageCompositionAllowed: Bool"
+                )
+            )
+        ]
+        self.assertIn("messagingOfflineDirectCreationLocalQueueEnabled", composition_gate)
+        self.assertIn("isOnline", composition_gate)
+        self.assertIn("secureMessagingLocalQueueAvailable", composition_gate)
+        self.assertIn("appReviewDemoMutationsAllowed", composition_gate)
+        self.assertIn("func queueDirectMediaMessage(", app_model)
+        self.assertIn("func queueDirectMediaMessageBatch(", app_model)
+        self.assertIn("sharedInboxProvisionalConversation", app_model)
+        self.assertIn("model.sharedInboxProvisionalConversation", messages)
+        self.assertIn("queueDirectMediaMessage(", forwarding)
+        self.assertNotIn("Needs an existing chat. Send them a message first", forwarding)
+
+    def test_offline_direct_capability_receipt_uses_store_atomic_generation_cas(self) -> None:
+        """An older authenticated grant must not overtake a newer durable withdrawal across
+        the AppModel-to-store actor hop, including a same-account replacement session."""
+        app_model = (ROOT / "KitPay/App/AppModel.swift").read_text(encoding="utf-8")
+        store = SECURE_STORE.read_text(encoding="utf-8")
+        reload_capabilities = "\n".join(
+            function_body(app_model, "private func reloadCapabilities()")
+        )
+        commit = "\n".join(
+            function_body(
+                store,
+                "func commitMessagingOfflineDirectCreationCapabilityDecision(",
+            )
+        )
+
+        observed = reload_capabilities.index(
+            "beginMessagingOfflineDirectCreationCapabilityRequest("
+        )
+        request = reload_capabilities.index("try await api.capabilities()")
+        committed = reload_capabilities.index(
+            "commitMessagingOfflineDirectCreationCapabilityDecision("
+        )
+        self.assertLess(observed, request)
+        self.assertLess(request, committed)
+        self.assertNotIn(
+            "persisted.messagingOfflineDirectCreationCapabilityReceipt = receipt",
+            reload_capabilities,
+        )
+
+        self.assertIn("ticket.contextID == offlineDirectCapabilityCommitFence.contextID", commit)
+        self.assertIn("offlineDirectCapabilityCommitFence.scope == scope", commit)
+        self.assertIn("ticket.requestGeneration >", commit)
+        self.assertIn("state.profile?.id.caseInsensitiveCompare(scope.userID)", commit)
+        self.assertIn("state.communicationOwnerUserID?.caseInsensitiveCompare", commit)
+        self.assertIn("sessionID: scope.sessionID", commit)
+        generation_fence = commit.index(
+            "latestAcceptedRequestGeneration =\nticket.requestGeneration"
+        )
+        persist = commit.index("try persist(candidate)")
+        self.assertLess(generation_fence, persist)
 
     def test_media_loader_delegates_downloads_to_verified_file_hydration(self) -> None:
         """The identity-addressed loader must route remote media through the streaming,
@@ -189,6 +293,49 @@ class MediaMessageV2SourceContract(unittest.TestCase):
         self.assertIn("func promoteEncryptedBlobToProtectedOriginal(", cache)
         self.assertIn("activeOriginalLeases[entryKey, default: []].insert(leaseID)", cache)
         self.assertIn("filesAreIdentical(existing, staging)", cache)
+
+    def test_recovered_v1_and_v2_received_video_blobs_never_return_whole_file_data(self) -> None:
+        """A pre-record cache hit is the first-open migration path for older received media.
+        Both wire shapes must promote the authenticated blob and atomically bind its protected
+        file before returning; a failed promotion may stream again but may never return Data."""
+        app_model = (ROOT / "KitPay/App/AppModel.swift").read_text(encoding="utf-8")
+        loader_start = app_model.index("func loadSecureMediaItem(")
+        loader_end = app_model.index("func queueDirectMessage(", loader_start)
+        loader = app_model[loader_start:loader_end]
+        load = "\n".join(function_body(app_model, "func loadSecureMediaItem("))
+        cache = (ROOT / "KitPay/Core/SecureMediaFileCache.swift").read_text(encoding="utf-8")
+
+        helper_start = cache.index("enum ReceivedVideoCachedBlobRecovery")
+        helper_end = cache.index("/// Device-protected local store", helper_start)
+        helper = cache[helper_start:helper_end]
+        file_publish = helper.index("promoteEncryptedBlobToProtectedOriginal(")
+        state_commit = helper.index("try await store.update", file_publish)
+        ownership_commit = helper.index(
+            "LocalMediaRecordPolicy.markDownloadedProtectedFile(", state_commit
+        )
+        sealed_retirement = helper.index(
+            "removeEncryptedBlobRepresentation(", ownership_commit
+        )
+        file_return = helper.index("LoadedItem(localFile:", sealed_retirement)
+        self.assertLess(file_publish, state_commit)
+        self.assertLess(state_commit, ownership_commit)
+        self.assertLess(ownership_commit, sealed_retirement)
+        self.assertLess(sealed_retirement, file_return)
+
+        load_switch = loader.rindex("\n        switch resolved {\n        case .pendingSingle")
+        batch_start = loader.index("\n        case .sealedBatchItem", load_switch)
+        single_start = loader.index("\n        case .single", batch_start)
+        batch_case = loader[batch_start:single_start]
+        single_case = loader[single_start:]
+        for branch in (batch_case, single_case):
+            recovery = branch.index("recoverCachedReceivedVideoAsProtectedFile(")
+            cache_data = branch.index("SecureMediaFileCache.shared.data(", recovery)
+            data_gate = branch.index("if !isReceivedVideo", recovery)
+            self.assertLess(recovery, data_gate)
+            self.assertLess(data_gate, cache_data)
+
+        self.assertEqual(load.count("recoverCachedReceivedVideoAsProtectedFile("), 3)
+        self.assertIn("if !isReceivedVideo,\nlet localRecord", load)
 
     def test_legacy_inline_received_video_is_retired_before_player_presentation(self) -> None:
         """Some older installs retained authenticated v1 video bytes in attachmentData rather

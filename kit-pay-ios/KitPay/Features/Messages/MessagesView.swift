@@ -271,6 +271,7 @@ struct MessagesView: View {
                 } actions: {
                     Button("New message") { openNewMessage() }
                         .buttonStyle(.borderedProminent)
+                        .disabled(!model.newDirectMessageCompositionAllowed)
                 }
             }
         } else {
@@ -530,9 +531,11 @@ struct MessagesView: View {
                 GlassIconButton(systemName: "square.and.pencil", inBar: true) {
                     openNewMessage()
                 }
-                .disabled(!model.appReviewDemoMutationsAllowed)
+                .disabled(!model.newDirectMessageCompositionAllowed)
                 .accessibilityValue(
-                    model.appReviewDemoMutationsAllowed ? "" : "Unavailable in read-only demo"
+                    model.newDirectMessageCompositionAllowed
+                        ? ""
+                        : "New conversations are temporarily unavailable"
                 )
             }
         }
@@ -883,7 +886,12 @@ struct MessagesView: View {
               let conversation = MessageNotificationConversationPolicy.conversation(
                   id: request.conversationID,
                   in: model.state.conversations
-              )
+              ) ?? model.sharedInboxProvisionalConversation.flatMap({ provisional in
+                  provisional.id.caseInsensitiveCompare(request.conversationID) == .orderedSame
+                      && provisional.isProvisionalDirect
+                      ? provisional
+                      : nil
+              })
         else { return }
         showNewMessage = false
         newMessageContact = nil
@@ -901,8 +909,10 @@ struct MessagesView: View {
     }
 
     private func openNewMessage(contact: WalletContactDTO? = nil) {
-        guard model.appReviewDemoMutationsAllowed else {
-            model.lastError = AppReviewDemoMutationPolicy.readOnlyMessage
+        guard model.newDirectMessageCompositionAllowed else {
+            model.lastError = model.appReviewDemoIsActive
+                ? AppReviewDemoMutationPolicy.readOnlyMessage
+                : "Connect to the internet once to start a conversation."
             return
         }
         newMessagePresentationID = UUID()
@@ -10242,7 +10252,8 @@ private struct NewMessageSheet: View {
                         .disabled(
                             submissionGate.isSubmitting
                                 || !NewMessageComposerPolicy.canSubmit(
-                                    appMutationsAllowed: model.appReviewDemoMutationsAllowed,
+                                    appMutationsAllowed:
+                                        model.newDirectMessageCompositionAllowed,
                                     localQueueAvailable: model.secureMessagingLocalQueueAvailable,
                                     body: message
                                 )
@@ -10262,8 +10273,10 @@ private struct NewMessageSheet: View {
     private func submit(to contact: WalletContactDTO) {
         let sendActionUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
         let sendActionDate = Date()
-        guard model.appReviewDemoMutationsAllowed else {
-            model.lastError = AppReviewDemoMutationPolicy.readOnlyMessage
+        guard model.newDirectMessageCompositionAllowed else {
+            model.lastError = model.appReviewDemoIsActive
+                ? AppReviewDemoMutationPolicy.readOnlyMessage
+                : "Connect to the internet once to start a conversation."
             return
         }
         let previouslyRetainedMessageID = submissionGate.retainedClientMessageID

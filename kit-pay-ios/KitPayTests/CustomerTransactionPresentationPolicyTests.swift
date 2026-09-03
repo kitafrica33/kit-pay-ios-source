@@ -2,6 +2,186 @@ import XCTest
 @testable import KitPay
 
 final class CustomerTransactionPresentationPolicyTests: XCTestCase {
+    func testHistoryEnvelopeQuarantinesMalformedRowsAndClaimMetadataWithoutLosingSafeActivity()
+        async throws {
+        let payload = Data(
+            """
+            {
+              "ok": true,
+              "data": {
+                "items": [
+                  {
+                    "id": "11111111-1111-4111-8111-111111111111",
+                    "wallet_id": "wallet-1",
+                    "reference": "KDP-0001",
+                    "amount": "500000.00",
+                    "totals": {"added": "500000.00", "deducted": "0.00"},
+                    "currency": {"code": "UGX", "scale": "2"},
+                    "type": "bank_deposit",
+                    "direction": "credit",
+                    "status": "completed",
+                    "counterparty": null,
+                    "note": null,
+                    "claim": {"id": 7, "can_accept": "yes"},
+                    "occurred_at": "2026-09-03T08:30:00Z"
+                  },
+                  {
+                    "id": "22222222-2222-4222-8222-222222222222",
+                    "wallet_id": "wallet-1",
+                    "reference": "KIT-BAD-CORE",
+                    "amount": 150000,
+                    "totals": {"added": "0.00", "deducted": "150000.00"},
+                    "currency": {"code": "UGX", "scale": "2"},
+                    "type": "internal_transfer",
+                    "direction": "debit",
+                    "status": "completed",
+                    "counterparty": null,
+                    "note": null,
+                    "claim": null,
+                    "occurred_at": "2026-09-03T08:29:00Z"
+                  },
+                  {
+                    "id": "33333333-3333-4333-8333-333333333333",
+                    "wallet_id": "wallet-1",
+                    "reference": "KIT-0003",
+                    "amount": "150000.00",
+                    "totals": {"added": "0.00", "deducted": "150000.00"},
+                    "currency": {"code": "UGX", "scale": "2"},
+                    "type": "internal_transfer",
+                    "direction": "debit",
+                    "status": "completed",
+                    "counterparty": {"id": "peer", "name": "Waswa", "phone": null, "account_number": null},
+                    "note": "Payment",
+                    "claim": null,
+                    "occurred_at": "2026-09-03T08:28:00Z"
+                  },
+                  {
+                    "id": "44444444-4444-4444-8444-444444444444",
+                    "wallet_id": "wallet-1",
+                    "reference": "KIT-INTERNAL",
+                    "amount": "250.00",
+                    "totals": {"added": "0.00", "deducted": "250.00"},
+                    "currency": {"code": "UGX", "scale": "2"},
+                    "type": "institutional_commission",
+                    "direction": "debit",
+                    "status": "completed",
+                    "counterparty": null,
+                    "note": null,
+                    "claim": null,
+                    "occurred_at": "2026-09-03T08:27:00Z"
+                  }
+                ],
+                "page": {"next_cursor": null, "has_more": false, "limit": 50}
+              },
+              "meta": {
+                "request_id": "55555555-5555-4555-8555-555555555555",
+                "server_time": "2026-09-03T08:31:00Z"
+              }
+            }
+            """.utf8
+        )
+
+        let envelope = try JSONDecoder().decode(APIEnvelope<TransactionPage>.self, from: payload)
+        let page = try XCTUnwrap(envelope.data)
+        XCTAssertEqual(page.sourceItemCount, 4)
+        XCTAssertEqual(page.rejectedItemCount, 1)
+        XCTAssertEqual(page.items.map(\.id), [
+            "11111111-1111-4111-8111-111111111111",
+            "33333333-3333-4333-8333-333333333333",
+            "44444444-4444-4444-8444-444444444444",
+        ])
+        XCTAssertNil(page.items[0].claim, "Malformed claim metadata must fail closed by itself")
+
+        let replacement = CustomerTransactionPresentationPolicy.pageReplacement(
+            for: page,
+            wallet: wallet()
+        )
+        guard case .replace(let safeRows) = replacement else {
+            return XCTFail("Independently valid customer rows must survive one malformed row")
+        }
+        XCTAssertEqual(safeRows.map(\.id), [
+            "11111111-1111-4111-8111-111111111111",
+            "33333333-3333-4333-8333-333333333333",
+        ])
+
+        // Exercise the same encrypted persistence boundary used by AppModel after a refresh.
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("KitPayWalletHistory-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let stateURL = directory.appendingPathComponent("state.secure")
+        let key = Data(repeating: 0x58, count: 32)
+        let store = SecureLocalStore(stateURL: stateURL, keyData: key)
+        var state = PersistedState.empty
+        state.wallets = [wallet()]
+        state.selectedWalletId = "wallet-1"
+        state.transactions = safeRows
+        try await store.replace(state)
+
+        let reopened = SecureLocalStore(stateURL: stateURL, keyData: key)
+        let restored = await reopened.snapshot()
+        XCTAssertEqual(
+            CustomerTransactionPresentationPolicy.customerVisibleTransactions(
+                restored.transactions,
+                selectedWalletID: restored.selectedWalletId,
+                wallets: restored.wallets
+            ).map(\.id),
+            safeRows.map(\.id)
+        )
+    }
+
+    func testNonemptyHistoryWhoseEveryCoreRowIsMalformedPreservesLastGoodProjection() throws {
+        let payload = Data(
+            """
+            {
+              "items": [
+                {
+                  "id": "bad-row",
+                  "wallet_id": "wallet-1",
+                  "reference": "BAD",
+                  "amount": 100,
+                  "totals": {"added": "100", "deducted": "0"},
+                  "currency": {"code": "UGX", "scale": "2"},
+                  "type": "bank_deposit",
+                  "direction": "credit",
+                  "status": "completed",
+                  "occurred_at": "2026-09-03T08:30:00Z"
+                }
+              ],
+              "page": {"next_cursor": null, "has_more": false, "limit": 50}
+            }
+            """.utf8
+        )
+        let page = try JSONDecoder().decode(TransactionPage.self, from: payload)
+
+        XCTAssertEqual(page.sourceItemCount, 1)
+        XCTAssertEqual(page.rejectedItemCount, 1)
+        XCTAssertTrue(page.items.isEmpty)
+        XCTAssertEqual(
+            CustomerTransactionPresentationPolicy.pageReplacement(for: page, wallet: wallet()),
+            .preserveLastGood
+        )
+    }
+
+    func testTrulyEmptyHistoryPageStillClearsTheProjection() throws {
+        let payload = Data(
+            """
+            {
+              "items": [],
+              "page": {"next_cursor": null, "has_more": false, "limit": 50}
+            }
+            """.utf8
+        )
+        let page = try JSONDecoder().decode(TransactionPage.self, from: payload)
+
+        XCTAssertEqual(page.sourceItemCount, 0)
+        XCTAssertEqual(page.rejectedItemCount, 0)
+        XCTAssertEqual(
+            CustomerTransactionPresentationPolicy.pageReplacement(for: page, wallet: wallet()),
+            .replace([])
+        )
+    }
+
     func testFilteredProductionHistoryDecodesAsDenseArrayAndRemainsVisible() throws {
         // The backend may discard an unprovable accounting row before serializing this page.
         // `items` must still be a dense JSON array (`values()` in Laravel), not an object whose

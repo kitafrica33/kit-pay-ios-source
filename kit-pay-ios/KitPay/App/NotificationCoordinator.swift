@@ -292,6 +292,110 @@ struct MessageNotificationAction: Equatable, Sendable {
     }
 }
 
+enum MessageNotificationActionHandlingResult: Equatable, Sendable {
+    /// The route or inline reply committed successfully and may be retired permanently.
+    case completed
+    /// Required authenticated state is not ready yet. Keep the action for a later lifecycle or
+    /// connectivity replay rather than losing a cold-launch tap.
+    case retry
+    /// A fully restored authenticated account proved that this action belongs to another owner.
+    /// This is the only failure that may retire an otherwise valid pending action.
+    case invalidated
+}
+
+/// Persists only privacy-preserving open routes. The notification payload has already replaced
+/// account, conversation and message identifiers with validated UUIDs/digests, and no message
+/// body or sender name is stored. Inline-reply text is deliberately excluded: its handler keeps
+/// the system response alive until the encrypted outbox write finishes.
+private struct MessageNotificationOpenActionStore {
+    private static let lock = NSLock()
+
+    private struct Record: Codable {
+        let requestIdentifier: String
+        let conversationID: String
+        let accountFingerprint: String
+        let messageDigest: String?
+
+        init(_ action: MessageNotificationAction) {
+            requestIdentifier = action.requestIdentifier
+            conversationID = action.conversationID
+            accountFingerprint = action.accountFingerprint
+            messageDigest = action.messageDigest
+        }
+
+        var action: MessageNotificationAction? {
+            guard MessageNotificationContract.isMessageRequestIdentifier(requestIdentifier),
+                  MessageNotificationContract.canonicalUUID(conversationID) == conversationID,
+                  MessageNotificationContract.isIdentifierDigest(accountFingerprint),
+                  messageDigest == nil
+                    || MessageNotificationContract.isIdentifierDigest(messageDigest ?? "")
+            else { return nil }
+            return MessageNotificationAction(
+                requestIdentifier: requestIdentifier,
+                conversationID: conversationID,
+                accountFingerprint: accountFingerprint,
+                messageDigest: messageDigest,
+                kind: .open
+            )
+        }
+    }
+
+    let defaults: UserDefaults
+    let storageKey: String
+
+    func actions() -> [MessageNotificationAction] {
+        Self.lock.lock()
+        defer { Self.lock.unlock() }
+        return actionsLocked()
+    }
+
+    func store(_ action: MessageNotificationAction) {
+        guard case .open = action.kind else { return }
+        Self.lock.lock()
+        defer { Self.lock.unlock() }
+        var actions = actionsLocked()
+        if let index = actions.firstIndex(where: {
+            $0.deduplicationKey == action.deduplicationKey
+        }) {
+            actions[index] = action
+        } else {
+            actions.append(action)
+        }
+        saveLocked(actions)
+    }
+
+    func remove(deduplicationKey: String) {
+        Self.lock.lock()
+        defer { Self.lock.unlock() }
+        saveLocked(actionsLocked().filter { $0.deduplicationKey != deduplicationKey })
+    }
+
+    private func actionsLocked() -> [MessageNotificationAction] {
+        guard let data = defaults.data(forKey: storageKey),
+              let records = try? JSONDecoder().decode([Record].self, from: data)
+        else { return [] }
+        var seen: Set<String> = []
+        let actions = records.compactMap(\.action).filter {
+            seen.insert($0.deduplicationKey).inserted
+        }
+        if actions.count != records.count { saveLocked(actions) }
+        return actions
+    }
+
+    private func saveLocked(_ actions: [MessageNotificationAction]) {
+        let records = actions.compactMap { action -> Record? in
+            guard case .open = action.kind else { return nil }
+            return Record(action)
+        }
+        guard !records.isEmpty else {
+            defaults.removeObject(forKey: storageKey)
+            return
+        }
+        guard let data = try? JSONEncoder().encode(records) else { return }
+        defaults.set(data, forKey: storageKey)
+    }
+}
+
 struct MessageConversationNavigationRequest: Equatable, Identifiable, Sendable {
     let id: UUID
     let conversationID: String
@@ -463,22 +567,72 @@ enum MessageNotificationResponsePolicy {
 }
 
 actor MessageNotificationActionDispatcher {
-    typealias Handler = @MainActor @Sendable (MessageNotificationAction) async -> Bool
+    typealias Handler = @MainActor @Sendable (
+        MessageNotificationAction
+    ) async -> MessageNotificationActionHandlingResult
 
     static let shared = MessageNotificationActionDispatcher()
+    static let defaultStorageKey = "kit-pay-pending-message-notification-opens-v1"
 
+    /// UIKit's completion handler must be released promptly on a cold launch, but queuing an
+    /// unstructured task after that callback leaves a process-termination gap. Persist the opaque
+    /// open route synchronously first; the actor performs all routing and deduplication afterward.
+    static func persistBeforeCompletingSystemResponse(
+        _ action: MessageNotificationAction,
+        defaults: UserDefaults = .standard,
+        storageKey: String = MessageNotificationActionDispatcher.defaultStorageKey
+    ) {
+        MessageNotificationOpenActionStore(
+            defaults: defaults,
+            storageKey: storageKey
+        ).store(action)
+    }
+
+    private let durableStore: MessageNotificationOpenActionStore
     private var handler: Handler?
-    private var pending: [MessageNotificationAction] = []
-    private var pendingKeys: Set<String> = []
+    private var pending: [MessageNotificationAction]
+    private var pendingKeys: Set<String>
     private var activeKeys: Set<String> = []
     private var completedKeys: Set<String> = []
     private var completedOrder: [String] = []
     private let maximumCompletedKeys = 128
 
+    init(
+        defaults: UserDefaults = .standard,
+        storageKey: String = MessageNotificationActionDispatcher.defaultStorageKey
+    ) {
+        let durableStore = MessageNotificationOpenActionStore(
+            defaults: defaults,
+            storageKey: storageKey
+        )
+        self.durableStore = durableStore
+        let restored = durableStore.actions()
+        pending = restored
+        pendingKeys = Set(restored.map(\.deduplicationKey))
+    }
+
     func install(_ handler: @escaping Handler) async {
         // Notification responses can arrive while SwiftUI is still constructing AppModel during
-        // a cold launch. Retain that process-local intent until the account-bound model exists.
+        // a cold launch. Durable open intents also survive termination between UIKit handing the
+        // response off and the account-bound model finishing protected-state restoration.
         self.handler = handler
+        await replayPending()
+    }
+
+    func replayPending() async {
+        // The notification delegate writes open routes synchronously before UIKit's completion
+        // handler. The shared dispatcher may already exist at that point, so fold any records
+        // written after actor initialization into the process-local queue on every lifecycle wake.
+        for action in durableStore.actions() {
+            let key = action.deduplicationKey
+            if completedKeys.contains(key) {
+                durableStore.remove(deduplicationKey: key)
+            } else if !pendingKeys.contains(key), !activeKeys.contains(key) {
+                pending.append(action)
+                pendingKeys.insert(key)
+            }
+        }
+        guard let handler else { return }
         let buffered = pending
         pending.removeAll()
         pendingKeys.removeAll()
@@ -486,26 +640,51 @@ actor MessageNotificationActionDispatcher {
             guard !completedKeys.contains(action.deduplicationKey),
                   activeKeys.insert(action.deduplicationKey).inserted
             else { continue }
-            let completed = await handler(action)
+            let result = await handler(action)
             activeKeys.remove(action.deduplicationKey)
-            if completed { recordCompletion(action.deduplicationKey) }
+            finish(action, result: result)
         }
     }
 
     func dispatch(_ action: MessageNotificationAction) async {
-        guard !completedKeys.contains(action.deduplicationKey),
-              !pendingKeys.contains(action.deduplicationKey),
-              activeKeys.insert(action.deduplicationKey).inserted
-        else { return }
-        guard let handler else {
-            activeKeys.remove(action.deduplicationKey)
-            pending.append(action)
-            pendingKeys.insert(action.deduplicationKey)
+        let key = action.deduplicationKey
+        if completedKeys.contains(key) {
+            // A repeated UIKit callback persisted the route before it could consult this actor.
+            // Retire that new durable copy instead of replaying a completed tap after relaunch.
+            durableStore.remove(deduplicationKey: key)
             return
         }
-        let completed = await handler(action)
-        activeKeys.remove(action.deduplicationKey)
-        if completed { recordCompletion(action.deduplicationKey) }
+        guard !activeKeys.contains(key) else { return }
+        if pendingKeys.remove(key) != nil {
+            // A repeated delivery is an explicit retry opportunity. Remove the parked copy and
+            // execute this newest equivalent action through the normal single-flight path.
+            pending.removeAll { $0.deduplicationKey == key }
+        }
+        guard activeKeys.insert(key).inserted else { return }
+        durableStore.store(action)
+        guard let handler else {
+            activeKeys.remove(key)
+            pending.append(action)
+            pendingKeys.insert(key)
+            return
+        }
+        let result = await handler(action)
+        activeKeys.remove(key)
+        finish(action, result: result)
+    }
+
+    private func finish(
+        _ action: MessageNotificationAction,
+        result: MessageNotificationActionHandlingResult
+    ) {
+        switch result {
+        case .completed, .invalidated:
+            durableStore.remove(deduplicationKey: action.deduplicationKey)
+            recordCompletion(action.deduplicationKey)
+        case .retry:
+            guard pendingKeys.insert(action.deduplicationKey).inserted else { return }
+            pending.append(action)
+        }
     }
 
     private func recordCompletion(_ key: String) {
@@ -522,9 +701,214 @@ struct ClaimablePaymentNotificationAction: Equatable, Sendable {
     let claimID: String
     let conversationID: String?
     let groupPaymentID: String?
+    /// A one-way owner binding captured from an already recovered notification session, or set by
+    /// the first fully authenticated account that handles an otherwise cold-launch action.
+    let accountFingerprint: String?
+
+    init(
+        notificationID: String,
+        claimID: String,
+        conversationID: String?,
+        groupPaymentID: String?,
+        accountFingerprint: String? = nil
+    ) {
+        self.notificationID = notificationID
+        self.claimID = claimID
+        self.conversationID = conversationID
+        self.groupPaymentID = groupPaymentID
+        self.accountFingerprint = accountFingerprint
+    }
 
     var deduplicationKey: String {
         "\(notificationID):\(claimID)"
+    }
+
+    func bound(toAccountFingerprint fingerprint: String) -> Self? {
+        guard MessageNotificationContract.isIdentifierDigest(fingerprint),
+              accountFingerprint == nil || accountFingerprint == fingerprint
+        else { return nil }
+        return Self(
+            notificationID: notificationID,
+            claimID: claimID,
+            conversationID: conversationID,
+            groupPaymentID: groupPaymentID,
+            accountFingerprint: fingerprint
+        )
+    }
+}
+
+enum ClaimablePaymentNotificationActionHandlingResult: Equatable, Sendable {
+    /// The account-authorized route committed successfully and may be retired permanently.
+    case completed
+    /// Protected/authenticated state or the authoritative claim is not ready. Keep the existing
+    /// owner binding and retry on a later lifecycle or connectivity wake.
+    case retry
+    /// Persist the first fully restored account, then immediately invoke the handler again with
+    /// that strengthened action. No network or routing work may begin before this transition.
+    case bindAndContinue(toAccountFingerprint: String)
+    /// A fully restored account or authoritative claim proved that this intent is not admissible.
+    case invalidated
+}
+
+/// Decides whether an authoritative claim lookup can ever succeed if replayed. A withdrawn
+/// feature and a server denial/not-found response are final for this notification route; network,
+/// decoding, cancellation, authentication-refresh, and server failures remain retryable.
+enum ClaimablePaymentNotificationLookupFailurePolicy {
+    static func isTerminal(_ error: Error) -> Bool {
+        if let payload = error as? APIErrorPayload,
+           let status = payload.httpStatus {
+            return [403, 404, 410].contains(status)
+        }
+        if let clientError = error as? APIClientError {
+            switch clientError {
+            case .invalidPayload(let status), .httpStatus(let status),
+                 .httpResponse(let status, _):
+                return [403, 404, 410].contains(status)
+            case .signedOut, .invalidResponse, .invalidURL:
+                return false
+            }
+        }
+        return false
+    }
+}
+
+enum ClaimablePaymentNotificationCapabilityReadiness: Equatable {
+    case enabled
+    case awaitingAuthority
+    case withdrawn
+}
+
+enum ClaimablePaymentNotificationCapabilityPolicy {
+    private static let requiredFeatures = [
+        "wallets", "internal_transfers", "claimable_transfers",
+    ]
+
+    static func readiness(
+        capabilities: CapabilitiesDTO?
+    ) -> ClaimablePaymentNotificationCapabilityReadiness {
+        guard let capabilities else { return .awaitingAuthority }
+        if requiredFeatures.contains(where: capabilities.featureIsWithdrawn) {
+            return .withdrawn
+        }
+        guard requiredFeatures.allSatisfy(capabilities.supportsFeature)
+        else { return .awaitingAuthority }
+        return .enabled
+    }
+}
+
+/// Persists only validated identifiers and a one-way account digest. Claim amount, counterparties,
+/// notification copy, and credentials never enter preferences. For duplicate callbacks the first
+/// owner binding wins: an unbound replay can strengthen an existing record, but it cannot erase or
+/// replace a previously proven account.
+private struct ClaimablePaymentNotificationActionStore {
+    private static let lock = NSLock()
+
+    private struct Record: Codable {
+        let notificationID: String
+        let claimID: String
+        let conversationID: String?
+        let groupPaymentID: String?
+        let accountFingerprint: String?
+
+        init(_ action: ClaimablePaymentNotificationAction) {
+            notificationID = action.notificationID
+            claimID = action.claimID
+            conversationID = action.conversationID
+            groupPaymentID = action.groupPaymentID
+            accountFingerprint = action.accountFingerprint
+        }
+
+        var action: ClaimablePaymentNotificationAction? {
+            guard MessageNotificationContract.canonicalUUID(notificationID) == notificationID,
+                  MessageNotificationContract.canonicalUUID(claimID) == claimID,
+                  conversationID.map({
+                      MessageNotificationContract.canonicalUUID($0) == $0
+                  }) ?? true,
+                  groupPaymentID.map({
+                      MessageNotificationContract.canonicalUUID($0) == $0
+                  }) ?? true,
+                  accountFingerprint.map({
+                      MessageNotificationContract.isIdentifierDigest($0)
+                  }) ?? true
+            else { return nil }
+            return ClaimablePaymentNotificationAction(
+                notificationID: notificationID,
+                claimID: claimID,
+                conversationID: conversationID,
+                groupPaymentID: groupPaymentID,
+                accountFingerprint: accountFingerprint
+            )
+        }
+    }
+
+    let defaults: UserDefaults
+    let storageKey: String
+
+    func actions() -> [ClaimablePaymentNotificationAction] {
+        Self.lock.lock()
+        defer { Self.lock.unlock() }
+        return actionsLocked()
+    }
+
+    @discardableResult
+    func store(
+        _ action: ClaimablePaymentNotificationAction
+    ) -> ClaimablePaymentNotificationAction {
+        Self.lock.lock()
+        defer { Self.lock.unlock() }
+        var actions = actionsLocked()
+        let stored: ClaimablePaymentNotificationAction
+        if let index = actions.firstIndex(where: {
+            $0.deduplicationKey == action.deduplicationKey
+        }) {
+            let existing = actions[index]
+            if existing.accountFingerprint == nil,
+               let incomingFingerprint = action.accountFingerprint,
+               let bound = existing.bound(toAccountFingerprint: incomingFingerprint) {
+                actions[index] = bound
+                stored = bound
+            } else {
+                stored = existing
+            }
+        } else {
+            actions.append(action)
+            stored = action
+        }
+        saveLocked(actions)
+        return stored
+    }
+
+    func remove(deduplicationKey: String) {
+        Self.lock.lock()
+        defer { Self.lock.unlock() }
+        saveLocked(actionsLocked().filter { $0.deduplicationKey != deduplicationKey })
+    }
+
+    func removeAll() {
+        Self.lock.lock()
+        defer { Self.lock.unlock() }
+        defaults.removeObject(forKey: storageKey)
+    }
+
+    private func actionsLocked() -> [ClaimablePaymentNotificationAction] {
+        guard let data = defaults.data(forKey: storageKey),
+              let records = try? JSONDecoder().decode([Record].self, from: data)
+        else { return [] }
+        var seen: Set<String> = []
+        let actions = records.compactMap(\.action).filter {
+            seen.insert($0.deduplicationKey).inserted
+        }
+        if actions.count != records.count { saveLocked(actions) }
+        return actions
+    }
+
+    private func saveLocked(_ actions: [ClaimablePaymentNotificationAction]) {
+        guard !actions.isEmpty else {
+            defaults.removeObject(forKey: storageKey)
+            return
+        }
+        guard let data = try? JSONEncoder().encode(actions.map(Record.init)) else { return }
+        defaults.set(data, forKey: storageKey)
     }
 }
 
@@ -648,6 +1032,84 @@ enum ClaimablePaymentNotificationRoutingPolicy {
         return conversation
     }
 
+    /// Group shares are deliberately unreadable through `GET transfer-claims/{id}`. The group
+    /// payment projection is therefore the authority for a notification carrying group context.
+    /// A sender owns the whole payment; a recipient must additionally prove that the caller-scoped
+    /// `your_share` is the exact claim named by the notification.
+    static func authorizesGroupPayment(
+        action: ClaimablePaymentNotificationAction,
+        groupPayment: GroupPaymentDTO,
+        currentUserID: String?
+    ) -> Bool {
+        guard let actionGroupPaymentID = canonicalUUID(action.groupPaymentID),
+              let actionConversationID = canonicalUUID(action.conversationID),
+              canonicalUUID(groupPayment.id) == actionGroupPaymentID,
+              canonicalUUID(groupPayment.conversationId) == actionConversationID,
+              ["pending", "settled"].contains(groupPayment.status),
+              let currentUserID = canonicalUUID(currentUserID),
+              let senderID = canonicalUUID(groupPayment.sender?.id)
+        else { return false }
+        if currentUserID == senderID { return true }
+        guard let share = groupPayment.yourShare,
+              share.knownStatus != nil,
+              canonicalUUID(share.claimId) == action.claimID
+        else { return false }
+        return true
+    }
+
+    static func conversation(
+        action: ClaimablePaymentNotificationAction,
+        groupPayment: GroupPaymentDTO,
+        conversations: [Conversation],
+        currentUserID: String?
+    ) -> Conversation? {
+        guard authorizesGroupPayment(
+            action: action,
+            groupPayment: groupPayment,
+            currentUserID: currentUserID
+        ),
+            let conversationID = canonicalUUID(action.conversationID),
+            let currentUserID = canonicalUUID(currentUserID),
+            let senderID = canonicalUUID(groupPayment.sender?.id)
+        else { return nil }
+        let matches = conversations.filter {
+            canonicalUUID($0.id) == conversationID
+        }
+        guard matches.count == 1,
+              let conversation = matches.first,
+              conversation.isGroup,
+              let participants = canonicalRoster(conversation.participantUserIds),
+              participants.contains(currentUserID),
+              participants.contains(senderID)
+        else { return nil }
+        return conversation
+    }
+
+    static func targetMessageID(
+        action: ClaimablePaymentNotificationAction,
+        groupPayment: GroupPaymentDTO,
+        conversation: Conversation,
+        messages: [LocalMessage]
+    ) -> UUID? {
+        guard let groupPaymentID = canonicalUUID(action.groupPaymentID),
+              canonicalUUID(groupPayment.id) == groupPaymentID,
+              canonicalUUID(action.conversationID) == canonicalUUID(conversation.id),
+              canonicalUUID(groupPayment.conversationId) == canonicalUUID(conversation.id),
+              let senderID = canonicalUUID(groupPayment.sender?.id)
+        else { return nil }
+        let matches = messages.filter { message in
+            guard canonicalUUID(message.conversationId) == canonicalUUID(conversation.id),
+                  canonicalUUID(message.senderId) == senderID,
+                  let descriptor = KitGroupPaymentMessage.parse(message.body)
+            else { return false }
+            return descriptor.action == .sent
+                && descriptor.groupPaymentId == groupPaymentID
+                && descriptor.matchesAuthoritativePayment(groupPayment)
+        }
+        guard matches.count == 1 else { return nil }
+        return matches[0].id
+    }
+
     static func targetMessageID(
         action: ClaimablePaymentNotificationAction,
         claim: TransferAcceptanceDTO,
@@ -688,47 +1150,213 @@ enum ClaimablePaymentNotificationRoutingPolicy {
 }
 
 actor ClaimablePaymentNotificationActionDispatcher {
-    typealias Handler = @MainActor @Sendable (ClaimablePaymentNotificationAction) async -> Bool
+    typealias Handler = @MainActor @Sendable (
+        ClaimablePaymentNotificationAction
+    ) async -> ClaimablePaymentNotificationActionHandlingResult
 
     static let shared = ClaimablePaymentNotificationActionDispatcher()
+    static let defaultStorageKey = "kit-pay-pending-claim-notification-opens-v1"
 
+    /// Claim taps foreground the app, so UIKit's response lifetime must end promptly. The opaque,
+    /// validated route is committed synchronously first to close the process-termination gap.
+    static func persistBeforeCompletingSystemResponse(
+        _ action: ClaimablePaymentNotificationAction,
+        defaults: UserDefaults = .standard,
+        storageKey: String = ClaimablePaymentNotificationActionDispatcher.defaultStorageKey
+    ) {
+        ClaimablePaymentNotificationActionStore(
+            defaults: defaults,
+            storageKey: storageKey
+        ).store(action)
+    }
+
+    private let durableStore: ClaimablePaymentNotificationActionStore
     private var handler: Handler?
-    private var pending: [ClaimablePaymentNotificationAction] = []
-    private var pendingKeys: Set<String> = []
+    private var pending: [ClaimablePaymentNotificationAction]
+    private var pendingKeys: Set<String>
     private var activeKeys: Set<String> = []
+    /// A lifecycle/capability wake that races an already-running handler must not disappear. The
+    /// active handler consumes this latch only after it has durably re-queued a retry.
+    private var replayAfterActiveKeys: Set<String> = []
+    /// Invalidates a replay snapshot even when it contains more keys than the bounded completed
+    /// deduplication window can retain.
+    private var accountBoundaryGeneration: UInt64 = 0
+    /// An account transition can retire an action while its handler is suspended. Keep those keys
+    /// fenced until the handler unwinds so a late retry result cannot recreate a deleted record.
+    private var retiredActiveKeys: Set<String> = []
     private var completedKeys: Set<String> = []
     private var completedOrder: [String] = []
     private let maximumCompletedKeys = 128
 
+    init(
+        defaults: UserDefaults = .standard,
+        storageKey: String = ClaimablePaymentNotificationActionDispatcher.defaultStorageKey
+    ) {
+        let durableStore = ClaimablePaymentNotificationActionStore(
+            defaults: defaults,
+            storageKey: storageKey
+        )
+        self.durableStore = durableStore
+        let restored = durableStore.actions()
+        pending = restored
+        pendingKeys = Set(restored.map(\.deduplicationKey))
+    }
+
     func install(_ handler: @escaping Handler) async {
         self.handler = handler
+        await replayPending()
+    }
+
+    func replayPending() async {
+        // The notification delegate writes before releasing UIKit. Reload on every explicit wake
+        // because the process-wide actor may have been initialized before that synchronous write.
+        for action in durableStore.actions() {
+            let key = action.deduplicationKey
+            if completedKeys.contains(key) {
+                durableStore.remove(deduplicationKey: key)
+            } else if activeKeys.contains(key) {
+                replayAfterActiveKeys.insert(key)
+            } else {
+                if let index = pending.firstIndex(where: {
+                    $0.deduplicationKey == key
+                }) {
+                    // A synchronous callback may have strengthened an unbound record after this
+                    // actor initialized. Always prefer the store's first-owner-wins snapshot.
+                    pending[index] = action
+                } else {
+                    pending.append(action)
+                    pendingKeys.insert(key)
+                }
+            }
+        }
+        guard let handler else { return }
+        let replayGeneration = accountBoundaryGeneration
         let buffered = pending
         pending.removeAll()
         pendingKeys.removeAll()
         for action in buffered {
+            guard accountBoundaryGeneration == replayGeneration else { return }
             guard !completedKeys.contains(action.deduplicationKey),
                   activeKeys.insert(action.deduplicationKey).inserted
             else { continue }
-            let completed = await handler(action)
-            activeKeys.remove(action.deduplicationKey)
-            if completed { recordCompletion(action.deduplicationKey) }
+            await handle(action, using: handler)
         }
     }
 
     func dispatch(_ action: ClaimablePaymentNotificationAction) async {
-        guard !completedKeys.contains(action.deduplicationKey),
-              !pendingKeys.contains(action.deduplicationKey),
-              activeKeys.insert(action.deduplicationKey).inserted
-        else { return }
-        guard let handler else {
-            activeKeys.remove(action.deduplicationKey)
-            pending.append(action)
-            pendingKeys.insert(action.deduplicationKey)
+        let key = action.deduplicationKey
+        if completedKeys.contains(key) {
+            // A repeated callback may have recreated the durable row before consulting this actor.
+            durableStore.remove(deduplicationKey: key)
             return
         }
-        let completed = await handler(action)
-        activeKeys.remove(action.deduplicationKey)
-        if completed { recordCompletion(action.deduplicationKey) }
+        guard !activeKeys.contains(key) else {
+            // A repeated tap is also an explicit wake. Coalesce it with any lifecycle/capability
+            // wake and run once more if the in-flight attempt finishes as retryable.
+            replayAfterActiveKeys.insert(key)
+            return
+        }
+        if pendingKeys.remove(key) != nil {
+            // A duplicate callback is also an explicit retry opportunity. The store returns the
+            // first (and potentially already account-bound) representation of this exact intent.
+            pending.removeAll { $0.deduplicationKey == key }
+        }
+        let stored = durableStore.store(action)
+        guard activeKeys.insert(key).inserted else { return }
+        guard let handler else {
+            activeKeys.remove(key)
+            pending.append(stored)
+            pendingKeys.insert(key)
+            return
+        }
+        await handle(stored, using: handler)
+    }
+
+    /// Clears all claim routes at a real account boundary. Claim APNs do not carry an owner field,
+    /// so retaining an unbound row would let a later session adopt it. Active handlers are fenced
+    /// until they unwind, preventing a late retry result from recreating the removed record.
+    func invalidateAllPendingActions() {
+        accountBoundaryGeneration &+= 1
+        let keys = Set(durableStore.actions().map(\.deduplicationKey))
+            .union(pending.map(\.deduplicationKey))
+            .union(activeKeys)
+        retiredActiveKeys.formUnion(activeKeys)
+        replayAfterActiveKeys.removeAll()
+        pending.removeAll()
+        pendingKeys.removeAll()
+        durableStore.removeAll()
+        keys.forEach(recordCompletion)
+    }
+
+    private func handle(
+        _ initialAction: ClaimablePaymentNotificationAction,
+        using handler: Handler
+    ) async {
+        let key = initialAction.deduplicationKey
+        var action = initialAction
+        var shouldReplayAfterActiveAttempt = false
+        actionLoop: while true {
+            let result = await handler(action)
+            guard !retiredActiveKeys.contains(key), !completedKeys.contains(key) else {
+                durableStore.remove(deduplicationKey: key)
+                break actionLoop
+            }
+            switch result {
+            case .bindAndContinue(let accountFingerprint):
+                guard action.accountFingerprint == nil,
+                      let bound = action.bound(
+                          toAccountFingerprint: accountFingerprint
+                      )
+                else {
+                    finish(action, result: .invalidated)
+                    break actionLoop
+                }
+                let stored = durableStore.store(bound)
+                guard stored.accountFingerprint == accountFingerprint else {
+                    finish(action, result: .invalidated)
+                    break actionLoop
+                }
+                action = stored
+            case .completed, .retry, .invalidated:
+                finish(action, result: result)
+                shouldReplayAfterActiveAttempt = result == .retry
+                    && replayAfterActiveKeys.contains(key)
+                break actionLoop
+            }
+        }
+        replayAfterActiveKeys.remove(key)
+        activeKeys.remove(key)
+        retiredActiveKeys.remove(key)
+        if shouldReplayAfterActiveAttempt {
+            // The wake happened after this attempt began. Active ownership has now been released
+            // and `.retry` has restored the durable row, so the coalesced replay cannot be lost.
+            await replayPending()
+        }
+    }
+
+    private func finish(
+        _ action: ClaimablePaymentNotificationAction,
+        result: ClaimablePaymentNotificationActionHandlingResult
+    ) {
+        switch result {
+        case .completed, .invalidated:
+            durableStore.remove(deduplicationKey: action.deduplicationKey)
+            recordCompletion(action.deduplicationKey)
+        case .retry:
+            enqueue(durableStore.store(action))
+        case .bindAndContinue:
+            // `handle(_:using:)` consumes this transition. Fail closed if a future caller ever
+            // forwards it here instead of allowing an unbound route to remain replayable.
+            durableStore.remove(deduplicationKey: action.deduplicationKey)
+            recordCompletion(action.deduplicationKey)
+        }
+    }
+
+    private func enqueue(_ action: ClaimablePaymentNotificationAction) {
+        guard !completedKeys.contains(action.deduplicationKey),
+              pendingKeys.insert(action.deduplicationKey).inserted
+        else { return }
+        pending.append(action)
     }
 
     private func recordCompletion(_ key: String) {
@@ -1301,6 +1929,21 @@ final class PushTokenCache: @unchecked Sendable {
     }
 }
 
+struct RemoteNotificationRegistrationRetryState: Equatable, Sendable {
+    private(set) var isNeeded = false
+
+    mutating func recordFailure() {
+        isNeeded = true
+    }
+
+    mutating func recordToken(provider: String) {
+        // PushKit credentials are delivered independently and cannot prove that ordinary APNs
+        // registration recovered after application(_:didFailToRegisterForRemoteNotificationsWithError:).
+        guard provider == "apns" else { return }
+        isNeeded = false
+    }
+}
+
 enum PushRegistrationRetryDecision: Equatable, Sendable {
     case retry(after: TimeInterval)
     case stop
@@ -1309,6 +1952,10 @@ enum PushRegistrationRetryDecision: Equatable, Sendable {
 enum PushRegistrationRetryPolicy {
     private static let exponentialDelays: [TimeInterval] = [2, 4, 8]
     private static let maximumDelay: TimeInterval = 300
+    private static let durableDelays: [TimeInterval] = [
+        60, 5 * 60, 15 * 60, 30 * 60, 60 * 60, 2 * 60 * 60, 4 * 60 * 60, 6 * 60 * 60,
+    ]
+    private static let maximumDurableDelay: TimeInterval = 6 * 60 * 60
 
     static func decision(
         for error: Error,
@@ -1339,6 +1986,29 @@ enum PushRegistrationRetryPolicy {
             return 0
         }
         return 300
+    }
+
+    /// Once the short foreground burst is exhausted, retain a low-frequency recovery lane. The
+    /// first delayed attempt is never earlier than one minute and later failures cap at six hours,
+    /// preventing both permanent registration loss and a battery/network hot loop.
+    static func durableRetryDelay(
+        failureCount: Int,
+        minimumDelay: TimeInterval,
+        jitterUnitInterval: Double = Double.random(in: 0 ... 1)
+    ) -> TimeInterval {
+        let index = min(max(0, failureCount - 1), durableDelays.count - 1)
+        let floor = max(60, min(maximumDurableDelay, minimumDelay))
+        let base = max(durableDelays[index], floor)
+        let jitter = min(1, max(0, jitterUnitInterval))
+        return min(maximumDurableDelay, base * (1 + (0.1 * jitter)))
+    }
+
+    static func isDurablyRetryable(_ error: Error) -> Bool {
+        if let urlError = error as? URLError,
+           connectivityGatedURLErrorCodes.contains(urlError.code) {
+            return true
+        }
+        return isRetryable(error)
     }
 
     private static func retryAfter(from error: Error) -> TimeInterval? {
@@ -1431,38 +2101,58 @@ actor PushRegistrationManager {
     private struct Flight {
         let id: UUID
         let task: Task<ExecutionResult, Never>
+        let operation: Operation
+    }
+
+    private struct DeferredFlight {
+        let id: UUID
+        let task: Task<Void, Never>
+    }
+
+    private struct RetryRecord: Codable, Equatable, Sendable {
+        let tokenFingerprint: String
+        let failureCount: Int
+        let nextAttemptAt: TimeInterval
     }
 
     private enum ExecutionResult: Equatable, Sendable {
         case registered
-        case failed(cooldown: TimeInterval)
+        case failed(retryable: Bool, minimumDelay: TimeInterval)
         case cancelled
     }
 
     private let defaults: UserDefaults
     private let storageKey: String
+    private let retryStorageKey: String
     private let receiptLifetime: TimeInterval
     private let now: @Sendable () -> Date
     private let sleeper: Sleeper
+    private let deferredSleeper: Sleeper
     private let jitter: @Sendable () -> Double
     private var inFlight: [RegistrationKey: Flight] = [:]
-    private var retryNotBefore: [RegistrationKey: Date] = [:]
+    private var deferredFlights: [RegistrationKey: DeferredFlight] = [:]
 
     init(
         defaults: UserDefaults = .standard,
         storageKey: String = "kit-pay-push-registration-receipts-v1",
+        retryStorageKey: String = "kit-pay-push-registration-retries-v1",
         receiptLifetime: TimeInterval = 7 * 24 * 60 * 60,
         now: @escaping @Sendable () -> Date = { Date() },
         sleeper: @escaping Sleeper = { delay in
+            try await Task<Never, Never>.sleep(for: .seconds(delay))
+        },
+        deferredSleeper: @escaping Sleeper = { delay in
             try await Task<Never, Never>.sleep(for: .seconds(delay))
         },
         jitter: @escaping @Sendable () -> Double = { Double.random(in: 0 ... 1) }
     ) {
         self.defaults = defaults
         self.storageKey = storageKey
+        self.retryStorageKey = retryStorageKey
         self.receiptLifetime = receiptLifetime
         self.now = now
         self.sleeper = sleeper
+        self.deferredSleeper = deferredSleeper
         self.jitter = jitter
     }
 
@@ -1483,40 +2173,82 @@ actor PushRegistrationManager {
         )
         var receipts = registrationReceipts()
         if isFreshReceipt(receipts[key.receiptKey], for: key) {
+            removeRetryRecord(for: key)
+            deferredFlights.removeValue(forKey: key)?.task.cancel()
             return .alreadyRegistered
         }
         if receipts.removeValue(forKey: key.receiptKey) != nil {
             saveRegistrationReceipts(receipts)
         }
-        if let retryDate = retryNotBefore[key], retryDate > now() {
-            return .deferred
-        }
-        retryNotBefore.removeValue(forKey: key)
-
         if let flight = inFlight[key] {
             return await finish(flight: flight, for: key)
         }
 
         // A newly issued token supersedes an older token for the same account/provider.
-        let staleKeys = inFlight.keys.filter {
+        let staleKeys = Set(inFlight.keys).union(deferredFlights.keys).filter {
             $0.accountFingerprint == key.accountFingerprint
                 && $0.provider == key.provider
                 && $0.tokenFingerprint != key.tokenFingerprint
         }
         for staleKey in staleKeys {
             inFlight.removeValue(forKey: staleKey)?.task.cancel()
-            retryNotBefore.removeValue(forKey: staleKey)
+            deferredFlights.removeValue(forKey: staleKey)?.task.cancel()
         }
 
+        var retryRecords = registrationRetryRecords()
+        if let retryRecord = retryRecords[key.receiptKey],
+           retryRecord.tokenFingerprint != key.tokenFingerprint {
+            retryRecords.removeValue(forKey: key.receiptKey)
+            saveRegistrationRetryRecords(retryRecords)
+        }
+        if let retryRecord = retryRecords[key.receiptKey],
+           retryRecord.tokenFingerprint == key.tokenFingerprint,
+           retryRecord.nextAttemptAt > now().timeIntervalSince1970 {
+            ensureDeferredRetry(
+                for: key,
+                record: retryRecord,
+                operation: operation
+            )
+            return .deferred
+        }
+
+        deferredFlights.removeValue(forKey: key)?.task.cancel()
         let flightID = UUID()
         let sleeper = self.sleeper
         let jitter = self.jitter
         let task = Task {
             await Self.execute(operation: operation, sleeper: sleeper, jitter: jitter)
         }
-        let flight = Flight(id: flightID, task: task)
+        let flight = Flight(id: flightID, task: task, operation: operation)
         inFlight[key] = flight
         return await finish(flight: flight, for: key)
+    }
+
+    /// Connectivity recovery is a trusted wake signal, not permission to spin. It cancels the
+    /// sleeping task and makes the durable record due; the caller must still replay Apple's cached
+    /// token, which re-enters normal single-flight registration and authentication checks.
+    func expediteDeferredRetries(accountID: String) {
+        let accountFingerprint = Self.fingerprint(accountID.lowercased())
+        let prefix = "\(accountFingerprint)."
+        var records = registrationRetryRecords()
+        var changed = false
+        let matchingReceiptKeys = records.keys.filter { $0.hasPrefix(prefix) }
+        for receiptKey in matchingReceiptKeys {
+            guard let record = records[receiptKey] else { continue }
+            records[receiptKey] = RetryRecord(
+                tokenFingerprint: record.tokenFingerprint,
+                failureCount: record.failureCount,
+                nextAttemptAt: now().timeIntervalSince1970
+            )
+            changed = true
+        }
+        if changed { saveRegistrationRetryRecords(records) }
+        let matchingKeys = deferredFlights.keys.filter {
+            $0.accountFingerprint == accountFingerprint
+        }
+        for key in matchingKeys {
+            deferredFlights.removeValue(forKey: key)?.task.cancel()
+        }
     }
 
     /// Cancels retries and removes durable success for an account. Sign-out calls this before
@@ -1532,13 +2264,15 @@ actor PushRegistrationManager {
         }
         for key in matchingKeys {
             inFlight.removeValue(forKey: key)?.task.cancel()
-            retryNotBefore.removeValue(forKey: key)
+            deferredFlights.removeValue(forKey: key)?.task.cancel()
         }
-        let cooldownKeys = retryNotBefore.keys.filter {
+        let deferredKeys = deferredFlights.keys.filter {
             $0.accountFingerprint == accountFingerprint
                 && (provider == nil || $0.provider == provider)
         }
-        cooldownKeys.forEach { retryNotBefore.removeValue(forKey: $0) }
+        for key in deferredKeys {
+            deferredFlights.removeValue(forKey: key)?.task.cancel()
+        }
 
         var receipts = registrationReceipts()
         let prefix = "\(accountFingerprint)."
@@ -1548,12 +2282,21 @@ actor PushRegistrationManager {
             return receiptKey != "\(prefix)\(provider)"
         }
         saveRegistrationReceipts(receipts)
+
+        var retryRecords = registrationRetryRecords()
+        retryRecords = retryRecords.filter { receiptKey, _ in
+            guard receiptKey.hasPrefix(prefix) else { return true }
+            guard let provider else { return false }
+            return receiptKey != "\(prefix)\(provider)"
+        }
+        saveRegistrationRetryRecords(retryRecords)
     }
 
     func cancelAll() {
         inFlight.values.forEach { $0.task.cancel() }
         inFlight.removeAll()
-        retryNotBefore.removeAll()
+        deferredFlights.values.forEach { $0.task.cancel() }
+        deferredFlights.removeAll()
     }
 
     private func finish(
@@ -1575,10 +2318,33 @@ actor PushRegistrationManager {
             var receipts = registrationReceipts()
             receipts[key.receiptKey] = "\(key.tokenFingerprint):\(now().timeIntervalSince1970)"
             saveRegistrationReceipts(receipts)
-            retryNotBefore.removeValue(forKey: key)
+            removeRetryRecord(for: key)
+            deferredFlights.removeValue(forKey: key)?.task.cancel()
             return .registered
-        case .failed(let cooldown):
-            retryNotBefore[key] = now().addingTimeInterval(cooldown)
+        case .failed(let retryable, let minimumDelay):
+            guard retryable else {
+                removeRetryRecord(for: key)
+                deferredFlights.removeValue(forKey: key)?.task.cancel()
+                return .failed
+            }
+            var records = registrationRetryRecords()
+            let previousFailureCount = records[key.receiptKey].flatMap { record in
+                record.tokenFingerprint == key.tokenFingerprint ? record.failureCount : nil
+            } ?? 0
+            let failureCount = min(Int.max - 1, max(0, previousFailureCount)) + 1
+            let delay = PushRegistrationRetryPolicy.durableRetryDelay(
+                failureCount: failureCount,
+                minimumDelay: minimumDelay,
+                jitterUnitInterval: jitter()
+            )
+            let record = RetryRecord(
+                tokenFingerprint: key.tokenFingerprint,
+                failureCount: failureCount,
+                nextAttemptAt: now().addingTimeInterval(delay).timeIntervalSince1970
+            )
+            records[key.receiptKey] = record
+            saveRegistrationRetryRecords(records)
+            ensureDeferredRetry(for: key, record: record, operation: flight.operation)
             return .failed
         case .cancelled:
             return .cancelled
@@ -1594,7 +2360,9 @@ actor PushRegistrationManager {
         while true {
             do {
                 try Task.checkCancellation()
-                guard try await operation() else { return .failed(cooldown: 900) }
+                guard try await operation() else {
+                    return .failed(retryable: true, minimumDelay: 900)
+                }
                 try Task.checkCancellation()
                 return .registered
             } catch is CancellationError {
@@ -1614,7 +2382,8 @@ actor PushRegistrationManager {
                     }
                 case .stop:
                     return .failed(
-                        cooldown: PushRegistrationRetryPolicy.cooldownAfterStopping(for: error)
+                        retryable: PushRegistrationRetryPolicy.isDurablyRetryable(error),
+                        minimumDelay: PushRegistrationRetryPolicy.cooldownAfterStopping(for: error)
                     )
                 }
             }
@@ -1627,6 +2396,84 @@ actor PushRegistrationManager {
 
     private func saveRegistrationReceipts(_ receipts: [String: String]) {
         defaults.set(receipts, forKey: storageKey)
+    }
+
+    private func registrationRetryRecords() -> [String: RetryRecord] {
+        guard let data = defaults.data(forKey: retryStorageKey),
+              let records = try? JSONDecoder().decode([String: RetryRecord].self, from: data)
+        else { return [:] }
+        let valid = records.filter { receiptKey, record in
+            !receiptKey.isEmpty
+                && MessageNotificationContract.isIdentifierDigest(record.tokenFingerprint)
+                && record.failureCount > 0
+                && record.nextAttemptAt.isFinite
+        }
+        if valid.count != records.count { saveRegistrationRetryRecords(valid) }
+        return valid
+    }
+
+    private func saveRegistrationRetryRecords(_ records: [String: RetryRecord]) {
+        guard !records.isEmpty else {
+            defaults.removeObject(forKey: retryStorageKey)
+            return
+        }
+        guard let data = try? JSONEncoder().encode(records) else { return }
+        defaults.set(data, forKey: retryStorageKey)
+    }
+
+    private func removeRetryRecord(for key: RegistrationKey) {
+        var records = registrationRetryRecords()
+        guard records.removeValue(forKey: key.receiptKey) != nil else { return }
+        saveRegistrationRetryRecords(records)
+    }
+
+    private func ensureDeferredRetry(
+        for key: RegistrationKey,
+        record: RetryRecord,
+        operation: @escaping Operation
+    ) {
+        guard deferredFlights[key] == nil else { return }
+        let delay = max(0, record.nextAttemptAt - now().timeIntervalSince1970)
+        let flightID = UUID()
+        let deferredSleeper = self.deferredSleeper
+        let task = Task { [weak self] in
+            do {
+                try await deferredSleeper(delay)
+                try Task.checkCancellation()
+            } catch {
+                return
+            }
+            await self?.runDeferredRetry(
+                for: key,
+                expectedFlightID: flightID,
+                expectedRecord: record,
+                operation: operation
+            )
+        }
+        deferredFlights[key] = DeferredFlight(id: flightID, task: task)
+    }
+
+    private func runDeferredRetry(
+        for key: RegistrationKey,
+        expectedFlightID: UUID,
+        expectedRecord: RetryRecord,
+        operation: @escaping Operation
+    ) async {
+        guard deferredFlights[key]?.id == expectedFlightID else { return }
+        deferredFlights.removeValue(forKey: key)
+        guard registrationRetryRecords()[key.receiptKey] == expectedRecord,
+              !inFlight.keys.contains(key)
+        else { return }
+
+        let flightID = UUID()
+        let sleeper = self.sleeper
+        let jitter = self.jitter
+        let task = Task {
+            await Self.execute(operation: operation, sleeper: sleeper, jitter: jitter)
+        }
+        let flight = Flight(id: flightID, task: task, operation: operation)
+        inFlight[key] = flight
+        _ = await finish(flight: flight, for: key)
     }
 
     private func isFreshReceipt(
@@ -1777,6 +2624,12 @@ private extension IncomingCallPublicationRetirement {
     }
 }
 
+private extension CallTerminalPushDisposition {
+    var callKitReason: CXCallEndedReason {
+        publicationRetirement.callKitReason
+    }
+}
+
 final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate, PKPushRegistryDelegate {
     static let shared = NotificationCoordinator()
 
@@ -1849,7 +2702,7 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
     /// empty, so a device that was offline or transiently rejected at that moment never asked
     /// again: alerts, background message wakes and call-state sync stayed dead for the rest of the
     /// session, with no token cached to replay. Connectivity recovery now retries.
-    private var needsRemoteRegistrationRetry = false
+    private var remoteRegistrationRetryState = RemoteNotificationRegistrationRetryState()
 
     override init() {
         let configuration = CXProviderConfiguration()
@@ -1936,13 +2789,13 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
     /// returns, which is the condition that most often caused the failure in the first place.
     @MainActor
     func retryRemoteRegistrationIfNeeded() {
-        guard needsRemoteRegistrationRetry, registrationEnabled else { return }
+        guard remoteRegistrationRetryState.isNeeded, registrationEnabled else { return }
         UIApplication.shared.registerForRemoteNotifications()
     }
 
     @MainActor
     fileprivate func recordRemoteRegistrationFailure() {
-        needsRemoteRegistrationRetry = true
+        remoteRegistrationRetryState.recordFailure()
     }
 
     /// Restores token delivery after launch without presenting the notification prompt again.
@@ -2161,7 +3014,7 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
     }
 
     fileprivate func recordAndPublishPushToken(_ registration: PushTokenRegistration) {
-        needsRemoteRegistrationRetry = false
+        remoteRegistrationRetryState.recordToken(provider: registration.provider)
         pushTokens.store(registration)
         guard registrationEnabled, !privacyQuarantineActive else { return }
         publishPushToken(registration)
@@ -2638,6 +3491,39 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
         }
     }
 
+    /// Applies the backend's terminal APNs lifecycle signal directly to CallKit. A remote caller
+    /// can cancel before this device answers, so no LiveKit disconnect exists to end that native
+    /// ringing surface. Remembering an event that wins the race with its VoIP ring also prevents
+    /// the later PushKit publication callback from resurrecting an already-finished call.
+    @MainActor
+    func reportTerminalCallPush(_ push: CallTerminalPush) {
+        guard let callUUID = UUID(uuidString: push.callId) else { return }
+        let hasMatchingQuarantinedCall = quarantinedIncomingCalls[callUUID]?.push.callId
+            .caseInsensitiveCompare(push.callId) == .orderedSame
+        let hasMatchingIncomingCall = incomingCalls[callUUID]?.record.id
+            .caseInsensitiveCompare(push.callId) == .orderedSame
+        let hasMatchingBackendCall = backendCallIds[callUUID]?
+            .caseInsensitiveCompare(push.callId) == .orderedSame
+        switch CallTerminalPushPolicy.disposition(
+            hasPendingPublication: incomingCallPublicationGate.isPending(callUUID),
+            hasMatchingQuarantinedCall: hasMatchingQuarantinedCall,
+            hasMatchingAuthenticatedCall: hasMatchingIncomingCall || hasMatchingBackendCall
+        ) {
+        case .rememberTerminal:
+            incomingCallPublicationGate.retire(
+                callUUID: callUUID,
+                as: push.disposition.publicationRetirement
+            )
+        case .retireOfferedCall:
+            clearCall(callUUID, publicationRetirement: push.disposition.publicationRetirement)
+            callProvider.reportCall(
+                with: callUUID,
+                endedAt: Date(),
+                reason: push.disposition.callKitReason
+            )
+        }
+    }
+
     @MainActor
     private func clearCall(
         _ callUUID: UUID,
@@ -3077,7 +3963,15 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
             categoryIdentifier: content.categoryIdentifier,
             threadIdentifier: content.threadIdentifier,
             userInfo: content.userInfo
-        )
+        ).flatMap { action in
+            // A warm process has already proved the account owning its APNs registration. A cold
+            // launch remains deliberately unbound until AppModel restores one exact session.
+            guard registrationEnabled,
+                  !privacyQuarantineActive,
+                  let communicationOwnerFingerprint
+            else { return action }
+            return action.bound(toAccountFingerprint: communicationOwnerFingerprint)
+        }
         let disposition = NotificationResponseDispositionPolicy.disposition(
             messageAction: messageAction,
             claimAction: claimAction,
@@ -3090,6 +3984,8 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
             if disposition.completesBeforeRouting {
                 // A default tap foregrounds the app. Release UIKit immediately, then let the
                 // actor retain the route while AppModel restores protected/account-bound state.
+                // The synchronous opaque write closes the termination gap before this callback.
+                MessageNotificationActionDispatcher.persistBeforeCompletingSystemResponse(action)
                 completionHandler()
                 Task { await MessageNotificationActionDispatcher.shared.dispatch(action) }
                 return
@@ -3099,6 +3995,8 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
                 completionHandler()
             }
         case .claim(let action):
+            ClaimablePaymentNotificationActionDispatcher
+                .persistBeforeCompletingSystemResponse(action)
             completionHandler()
             Task { await ClaimablePaymentNotificationActionDispatcher.shared.dispatch(action) }
         case .opaqueWake:
@@ -3149,6 +4047,35 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
                 accountFingerprint: accountFingerprint,
                 conversationID: canonicalConversationID
             ) ? request.identifier : nil
+        }
+        if !deliveredIdentifiers.isEmpty {
+            center.removeDeliveredNotifications(withIdentifiers: deliveredIdentifiers)
+        }
+    }
+
+    /// Claim APNs do not include an account fingerprint, so they cannot be filtered safely after
+    /// ownership changes. Retire the entire category at a privacy/account boundary rather than
+    /// allowing an old delivered notification to be rebound to a replacement session.
+    @MainActor
+    func clearClaimablePaymentNotifications() async {
+        let center = UNUserNotificationCenter.current()
+        let pending = await center.pendingNotificationRequests()
+        let pendingIdentifiers = pending.compactMap { request in
+            request.content.categoryIdentifier
+                == ClaimablePaymentNotificationContract.categoryIdentifier
+                ? request.identifier
+                : nil
+        }
+        if !pendingIdentifiers.isEmpty {
+            center.removePendingNotificationRequests(withIdentifiers: pendingIdentifiers)
+        }
+
+        let delivered = await center.deliveredNotifications()
+        let deliveredIdentifiers = delivered.compactMap { notification in
+            notification.request.content.categoryIdentifier
+                == ClaimablePaymentNotificationContract.categoryIdentifier
+                ? notification.request.identifier
+                : nil
         }
         if !deliveredIdentifiers.isEmpty {
             center.removeDeliveredNotifications(withIdentifiers: deliveredIdentifiers)
@@ -3795,6 +4722,9 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
                 )
             }
             return
+        }
+        if let terminalCall = CallTerminalPush(payload: userInfo) {
+            NotificationCoordinator.shared.reportTerminalCallPush(terminalCall)
         }
         NotificationCenter.default.post(name: .kitRemoteWakeReceived, object: userInfo)
         completionHandler(.newData)

@@ -4,6 +4,27 @@ import Foundation
 actor SecureLocalStore {
     static let shared = SecureLocalStore()
 
+    /// Opaque authority issued by this store before capability discovery leaves the device.
+    /// Keeping the generation here, instead of accepting an AppModel-owned counter, also keeps a
+    /// replacement AppModel in the same process from restarting below this actor's commit floor.
+    struct OfflineDirectCapabilityRequestTicket: Equatable, Sendable {
+        fileprivate let contextID: UUID
+        fileprivate let scope: MessagingDeferredFeatureScope?
+        fileprivate let requestGeneration: UInt64
+    }
+
+    /// Orders the final encrypted-store commit for authenticated offline-direct capability
+    /// decisions. Capability requests intentionally overlap, and actor hops are not a FIFO/CAS
+    /// guarantee: an older allowed response can reach this store after a newer denial. A random
+    /// context identity fences account/session lifetimes; a store-owned generation orders the
+    /// accepted responses within that lifetime.
+    private struct OfflineDirectCapabilityCommitFence {
+        var contextID = UUID()
+        var scope: MessagingDeferredFeatureScope?
+        var nextRequestGeneration: UInt64 = 0
+        var latestAcceptedRequestGeneration: UInt64 = 0
+    }
+
     typealias StateDataLoad = @Sendable (URL) throws -> Data
     typealias StateDataPersist = @Sendable (Data, URL) throws -> Void
     typealias KeyDataLoad = @Sendable () throws -> Data?
@@ -43,6 +64,7 @@ actor SecureLocalStore {
         didSet { projectionRevision &+= 1 }
     }
     private var projectionRevision: UInt64 = 0
+    private var offlineDirectCapabilityCommitFence = OfflineDirectCapabilityCommitFence()
 
     init(
         stateURL: URL? = nil,
@@ -143,6 +165,106 @@ actor SecureLocalStore {
             try persist(candidate)
             state = candidate
         }
+    }
+
+    /// Registers the account/session lifetime and returns an unforgeable-in-practice store token
+    /// before network I/O. Starting a newer request in the same scope does not suppress an older
+    /// successful response when the newer request is cancelled; only a newer committed decision
+    /// advances the CAS floor.
+    func beginMessagingOfflineDirectCreationCapabilityRequest(
+        scope: MessagingDeferredFeatureScope?
+    ) -> OfflineDirectCapabilityRequestTicket? {
+        guard scope.map(Self.isValidOfflineDirectCapabilityScope) ?? true else { return nil }
+        if scope != offlineDirectCapabilityCommitFence.scope {
+            rotateOfflineDirectCapabilityContext(to: scope)
+        }
+        offlineDirectCapabilityCommitFence.nextRequestGeneration &+= 1
+        if offlineDirectCapabilityCommitFence.nextRequestGeneration == 0 {
+            // Exhaustion is theoretical, but wrapping must never make an ancient ticket current.
+            rotateOfflineDirectCapabilityContext(to: scope)
+            offlineDirectCapabilityCommitFence.nextRequestGeneration = 1
+        }
+        return OfflineDirectCapabilityRequestTicket(
+            contextID: offlineDirectCapabilityCommitFence.contextID,
+            scope: scope,
+            requestGeneration: offlineDirectCapabilityCommitFence.nextRequestGeneration
+        )
+    }
+
+    /// Retires every outstanding request at an authentication boundary. The context rotation and
+    /// optional encrypted receipt withdrawal share one actor turn with respect to capability
+    /// commits: an older completion either lands first and is then cleared, or lands later and is
+    /// rejected by its obsolete context identity.
+    func retireMessagingOfflineDirectCreationCapabilityContext(
+        clearingPersistedReceipt: Bool
+    ) throws {
+        rotateOfflineDirectCapabilityContext(to: nil)
+        guard clearingPersistedReceipt,
+              state.messagingOfflineDirectCreationCapabilityReceipt != nil
+        else { return }
+        try requireMutableState()
+        var candidate = state
+        candidate.messagingOfflineDirectCreationCapabilityReceipt = nil
+        try persist(candidate)
+        state = candidate
+    }
+
+    /// Atomically compare-and-swaps the durable capability receipt. The generation check and
+    /// encrypted write deliberately happen in one non-suspending actor turn, so a stale grant can
+    /// neither overtake nor reappear after a newer denial/read-only decision for this exact scope.
+    @discardableResult
+    func commitMessagingOfflineDirectCreationCapabilityDecision(
+        _ receipt: MessagingOfflineDirectCreationCapabilityReceipt?,
+        request ticket: OfflineDirectCapabilityRequestTicket
+    ) throws -> Bool {
+        guard let scope = ticket.scope,
+              Self.isValidOfflineDirectCapabilityScope(scope),
+              ticket.contextID == offlineDirectCapabilityCommitFence.contextID,
+              offlineDirectCapabilityCommitFence.scope == scope,
+              ticket.requestGeneration >
+                offlineDirectCapabilityCommitFence.latestAcceptedRequestGeneration,
+              ticket.requestGeneration <=
+                offlineDirectCapabilityCommitFence.nextRequestGeneration,
+              state.profile?.id.caseInsensitiveCompare(scope.userID) == .orderedSame,
+              state.communicationOwnerUserID?.caseInsensitiveCompare(scope.userID) == .orderedSame,
+              receipt.map({
+                  $0.decision(ownerUserID: scope.userID, sessionID: scope.sessionID) == true
+              }) ?? true
+        else { return false }
+
+        // Advance before persistence. If protected storage temporarily fails, an older grant is
+        // still forbidden from taking its place in this process; a fresh request generation may
+        // retry the authoritative decision later.
+        offlineDirectCapabilityCommitFence.latestAcceptedRequestGeneration =
+            ticket.requestGeneration
+        try requireMutableState()
+        var candidate = state
+        candidate.messagingOfflineDirectCreationCapabilityReceipt = receipt
+        try persist(candidate)
+        state = candidate
+        return true
+    }
+
+    private func rotateOfflineDirectCapabilityContext(
+        to scope: MessagingDeferredFeatureScope?
+    ) {
+        offlineDirectCapabilityCommitFence = OfflineDirectCapabilityCommitFence(
+            contextID: UUID(),
+            scope: scope,
+            nextRequestGeneration: 0,
+            latestAcceptedRequestGeneration: 0
+        )
+    }
+
+    private static func isValidOfflineDirectCapabilityScope(
+        _ scope: MessagingDeferredFeatureScope
+    ) -> Bool {
+        guard let ownerID = UUID(uuidString: scope.userID),
+              ownerID.uuidString.lowercased() == scope.userID,
+              let sessionID = UUID(uuidString: scope.sessionID),
+              sessionID.uuidString.lowercased() == scope.sessionID
+        else { return false }
+        return true
     }
 
     /// Atomically compare-and-swaps the complete libsignal state together with any visible
@@ -381,6 +503,7 @@ actor SecureLocalStore {
             || candidate.contactSyncSnapshotScope != nil
             || candidate.contactSyncLastCompletedAt != nil
             || candidate.communicationPrivacy != nil
+            || candidate.messagingOfflineDirectCreationCapabilityReceipt != nil
             || candidate.pendingProfileAvatarAttachment != nil
     }
 

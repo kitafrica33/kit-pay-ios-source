@@ -684,6 +684,7 @@ final class ConversationSoundTests: XCTestCase {
         XCTAssertEqual(action.claimID, claimID)
         XCTAssertEqual(action.conversationID, conversationID)
         XCTAssertEqual(action.groupPaymentID, claimGroupPaymentID)
+        XCTAssertNil(action.accountFingerprint)
 
         var hostileLink = payload
         hostileLink["deep_link"] = "https://attacker.example/payment/claim?claim_id=\(claimID)"
@@ -799,21 +800,531 @@ final class ConversationSoundTests: XCTestCase {
         ))
     }
 
+    func testClaimablePaymentGroupRoutingAuthorizesTheExactRecipientShareAndMessage() throws {
+        let recipientID = "40000000-0000-4000-8000-000000000002"
+        let action = try XCTUnwrap(claimNotificationAction(claimNotificationUserInfo()))
+        let payment = claimGroupPayment(
+            senderID: ownerUserID,
+            shareClaimID: claimID
+        )
+        var group = Conversation(
+            id: conversationID,
+            title: "Trip",
+            participantUserIds: [ownerUserID, recipientID],
+            unreadCount: 1,
+            updatedAt: visibleAt
+        )
+        group.conversationType = SecureMessagingWire.groupConversationType
+        let descriptor = try XCTUnwrap(
+            KitGroupPaymentMessage(announcing: payment, recipientUserIds: [])
+        )
+        let announcement = LocalMessage(
+            id: UUID(uuidString: "50000000-0000-4000-8000-000000000098")!,
+            serverMessageId: "30000000-0000-4000-8000-000000000098",
+            conversationId: conversationID,
+            senderId: ownerUserID,
+            body: descriptor.encoded,
+            createdAt: visibleAt,
+            sentAt: visibleAt,
+            state: .received,
+            failureReason: nil,
+            isOutgoing: false
+        )
+        let outcome = LocalMessage(
+            id: UUID(uuidString: "50000000-0000-4000-8000-000000000097")!,
+            serverMessageId: "30000000-0000-4000-8000-000000000097",
+            conversationId: conversationID,
+            senderId: recipientID,
+            body: try XCTUnwrap(
+                KitGroupPaymentMessage(
+                    outcome: .accepted,
+                    groupPaymentId: claimGroupPaymentID
+                )
+            ).encoded,
+            createdAt: visibleAt,
+            sentAt: visibleAt,
+            state: .sent,
+            failureReason: nil,
+            isOutgoing: true
+        )
+
+        XCTAssertTrue(ClaimablePaymentNotificationRoutingPolicy.authorizesGroupPayment(
+            action: action,
+            groupPayment: payment,
+            currentUserID: recipientID
+        ))
+        XCTAssertEqual(
+            ClaimablePaymentNotificationRoutingPolicy.conversation(
+                action: action,
+                groupPayment: payment,
+                conversations: [group],
+                currentUserID: recipientID
+            ),
+            group
+        )
+        XCTAssertEqual(
+            ClaimablePaymentNotificationRoutingPolicy.targetMessageID(
+                action: action,
+                groupPayment: payment,
+                conversation: group,
+                messages: [outcome, announcement]
+            ),
+            announcement.id
+        )
+    }
+
+    func testClaimablePaymentGroupRoutingAuthorizesTheSenderWithoutAnOwnShare() throws {
+        let recipientID = "40000000-0000-4000-8000-000000000002"
+        let action = try XCTUnwrap(claimNotificationAction(claimNotificationUserInfo()))
+        let payment = claimGroupPayment(senderID: ownerUserID, shareClaimID: nil)
+        var group = Conversation(
+            id: conversationID,
+            title: "Trip",
+            participantUserIds: [ownerUserID, recipientID],
+            unreadCount: 1,
+            updatedAt: visibleAt
+        )
+        group.conversationType = SecureMessagingWire.groupConversationType
+
+        XCTAssertTrue(ClaimablePaymentNotificationRoutingPolicy.authorizesGroupPayment(
+            action: action,
+            groupPayment: payment,
+            currentUserID: ownerUserID
+        ))
+        XCTAssertEqual(
+            ClaimablePaymentNotificationRoutingPolicy.conversation(
+                action: action,
+                groupPayment: payment,
+                conversations: [group],
+                currentUserID: ownerUserID
+            ),
+            group
+        )
+    }
+
+    func testClaimablePaymentGroupRoutingRejectsAuthorityMismatchesAndTerminalNotFound() throws {
+        let recipientID = "40000000-0000-4000-8000-000000000002"
+        let outsiderID = "40000000-0000-4000-8000-000000000003"
+        let action = try XCTUnwrap(claimNotificationAction(claimNotificationUserInfo()))
+        var group = Conversation(
+            id: conversationID,
+            title: "Trip",
+            participantUserIds: [ownerUserID, recipientID],
+            unreadCount: 1,
+            updatedAt: visibleAt
+        )
+        group.conversationType = SecureMessagingWire.groupConversationType
+
+        XCTAssertFalse(ClaimablePaymentNotificationRoutingPolicy.authorizesGroupPayment(
+            action: action,
+            groupPayment: claimGroupPayment(
+                senderID: ownerUserID,
+                shareClaimID: "70000000-0000-4000-8000-000000000099"
+            ),
+            currentUserID: recipientID
+        ))
+        XCTAssertFalse(ClaimablePaymentNotificationRoutingPolicy.authorizesGroupPayment(
+            action: action,
+            groupPayment: claimGroupPayment(
+                senderID: ownerUserID,
+                shareClaimID: claimID,
+                paymentID: "72000000-0000-4000-8000-000000000099"
+            ),
+            currentUserID: recipientID
+        ))
+        XCTAssertFalse(ClaimablePaymentNotificationRoutingPolicy.authorizesGroupPayment(
+            action: action,
+            groupPayment: claimGroupPayment(
+                senderID: ownerUserID,
+                shareClaimID: claimID,
+                paymentConversationID: "10000000-0000-4000-8000-000000000099"
+            ),
+            currentUserID: recipientID
+        ))
+        XCTAssertNil(ClaimablePaymentNotificationRoutingPolicy.conversation(
+            action: action,
+            groupPayment: claimGroupPayment(
+                senderID: ownerUserID,
+                shareClaimID: claimID
+            ),
+            conversations: [group],
+            currentUserID: outsiderID
+        ))
+        XCTAssertTrue(ClaimablePaymentNotificationLookupFailurePolicy.isTerminal(
+            APIErrorPayload(
+                code: "GROUP_PAYMENT_NOT_FOUND",
+                message: "The payment was not found.",
+                httpStatus: 404
+            )
+        ))
+        XCTAssertFalse(ClaimablePaymentNotificationLookupFailurePolicy.isTerminal(
+            APIErrorPayload(
+                code: "GROUP_PAYMENT_TEMPORARILY_UNAVAILABLE",
+                message: "Retry later.",
+                httpStatus: 503
+            )
+        ))
+    }
+
     @MainActor
     func testClaimablePaymentDispatcherBuffersAndDeduplicatesOneTap() async throws {
+        let suiteName = "ConversationSoundTests.claim-notification.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
         let action = try XCTUnwrap(claimNotificationAction(claimNotificationUserInfo()))
-        let dispatcher = ClaimablePaymentNotificationActionDispatcher()
+        let dispatcher = ClaimablePaymentNotificationActionDispatcher(defaults: defaults)
         let probe = ClaimablePaymentNotificationActionProbe()
 
         await dispatcher.dispatch(action)
         await dispatcher.dispatch(action)
         await dispatcher.install { received in
             probe.actions.append(received)
-            return true
+            return .completed
         }
         await dispatcher.dispatch(action)
 
         XCTAssertEqual(probe.actions, [action])
+    }
+
+    @MainActor
+    func testClaimablePaymentTapSurvivesTerminationAndPersistsFirstOwnerBinding() async throws {
+        let suiteName = "ConversationSoundTests.claim-notification.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let action = try XCTUnwrap(claimNotificationAction(claimNotificationUserInfo()))
+        let ownerFingerprint = try XCTUnwrap(
+            MessageNotificationContract.accountFingerprint(for: ownerUserID)
+        )
+        let boundAction = try XCTUnwrap(
+            action.bound(toAccountFingerprint: ownerFingerprint)
+        )
+        // UIKit released the response after this synchronous write, then the process terminated
+        // before AppModel could install its handler.
+        ClaimablePaymentNotificationActionDispatcher.persistBeforeCompletingSystemResponse(
+            action,
+            defaults: defaults
+        )
+
+        let firstRelaunch = ClaimablePaymentNotificationActionDispatcher(defaults: defaults)
+        let probe = ClaimablePaymentNotificationActionProbe()
+        await firstRelaunch.install { received in
+            probe.actions.append(received)
+            return received.accountFingerprint == nil
+                ? .bindAndContinue(toAccountFingerprint: ownerFingerprint)
+                : .retry
+        }
+        XCTAssertEqual(probe.actions, [action, boundAction])
+
+        // A second process observes the strengthened owner binding, then retires the route only
+        // after the handler reports a committed navigation.
+        let secondRelaunch = ClaimablePaymentNotificationActionDispatcher(defaults: defaults)
+        await secondRelaunch.install { received in
+            probe.actions.append(received)
+            return .completed
+        }
+        XCTAssertEqual(probe.actions, [action, boundAction, boundAction])
+
+        let completedRelaunch = ClaimablePaymentNotificationActionDispatcher(defaults: defaults)
+        await completedRelaunch.install { received in
+            probe.actions.append(received)
+            return .completed
+        }
+        XCTAssertEqual(probe.actions, [action, boundAction, boundAction])
+    }
+
+    @MainActor
+    func testClaimablePaymentDuplicateCannotEraseDurableOwnerBinding() async throws {
+        let suiteName = "ConversationSoundTests.claim-notification.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let action = try XCTUnwrap(claimNotificationAction(claimNotificationUserInfo()))
+        let ownerFingerprint = try XCTUnwrap(
+            MessageNotificationContract.accountFingerprint(for: ownerUserID)
+        )
+        let boundAction = try XCTUnwrap(
+            action.bound(toAccountFingerprint: ownerFingerprint)
+        )
+        let replacementFingerprint = try XCTUnwrap(
+            MessageNotificationContract.accountFingerprint(
+                for: "40000000-0000-4000-8000-000000000099"
+            )
+        )
+        let replacementBoundAction = try XCTUnwrap(
+            action.bound(toAccountFingerprint: replacementFingerprint)
+        )
+
+        ClaimablePaymentNotificationActionDispatcher.persistBeforeCompletingSystemResponse(
+            action,
+            defaults: defaults
+        )
+        // This actor initialized while the cold-launch record was still unbound.
+        let dispatcher = ClaimablePaymentNotificationActionDispatcher(defaults: defaults)
+        ClaimablePaymentNotificationActionDispatcher.persistBeforeCompletingSystemResponse(
+            boundAction,
+            defaults: defaults
+        )
+        // Neither an unbound repeated callback nor a conflicting later owner may weaken or
+        // replace the first binding.
+        ClaimablePaymentNotificationActionDispatcher.persistBeforeCompletingSystemResponse(
+            action,
+            defaults: defaults
+        )
+        ClaimablePaymentNotificationActionDispatcher.persistBeforeCompletingSystemResponse(
+            replacementBoundAction,
+            defaults: defaults
+        )
+
+        let probe = ClaimablePaymentNotificationActionProbe()
+        await dispatcher.install { received in
+            probe.actions.append(received)
+            return .completed
+        }
+
+        XCTAssertEqual(probe.actions, [boundAction])
+    }
+
+    @MainActor
+    func testClaimablePaymentDispatcherRetriesFailureAndRetiresInvalidOwner() async throws {
+        let suiteName = "ConversationSoundTests.claim-notification.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let action = try XCTUnwrap(claimNotificationAction(claimNotificationUserInfo()))
+        let ownerFingerprint = try XCTUnwrap(
+            MessageNotificationContract.accountFingerprint(for: ownerUserID)
+        )
+        let boundAction = try XCTUnwrap(
+            action.bound(toAccountFingerprint: ownerFingerprint)
+        )
+        let dispatcher = ClaimablePaymentNotificationActionDispatcher(defaults: defaults)
+        let probe = ClaimablePaymentNotificationActionProbe()
+        await dispatcher.install { received in
+            probe.actions.append(received)
+            return probe.actions.count == 1 ? .retry : .invalidated
+        }
+
+        await dispatcher.dispatch(boundAction)
+        await dispatcher.dispatch(action)
+        await dispatcher.dispatch(action)
+
+        XCTAssertEqual(probe.actions, [boundAction, boundAction])
+        let nextLaunch = ClaimablePaymentNotificationActionDispatcher(defaults: defaults)
+        await nextLaunch.install { received in
+            probe.actions.append(received)
+            return .completed
+        }
+        XCTAssertEqual(probe.actions, [boundAction, boundAction])
+    }
+
+    func testClaimablePaymentLookupFailurePolicyRetiresOnlyTerminalHTTPResults() {
+        for status in [403, 404, 410] {
+            XCTAssertTrue(ClaimablePaymentNotificationLookupFailurePolicy.isTerminal(
+                APIClientError.httpStatus(status)
+            ))
+            XCTAssertTrue(ClaimablePaymentNotificationLookupFailurePolicy.isTerminal(
+                APIClientError.invalidPayload(status: status)
+            ))
+            XCTAssertTrue(ClaimablePaymentNotificationLookupFailurePolicy.isTerminal(
+                APIClientError.httpResponse(status: status, retryAfter: nil)
+            ))
+            XCTAssertTrue(ClaimablePaymentNotificationLookupFailurePolicy.isTerminal(
+                APIErrorPayload(code: "CLAIM_UNAVAILABLE", message: "Unavailable", httpStatus: status)
+            ))
+        }
+
+        for status in [0, 401, 408, 422, 429, 500, 503] {
+            XCTAssertFalse(ClaimablePaymentNotificationLookupFailurePolicy.isTerminal(
+                APIClientError.httpStatus(status)
+            ))
+        }
+        XCTAssertFalse(ClaimablePaymentNotificationLookupFailurePolicy.isTerminal(
+            APIClientError.invalidResponse
+        ))
+        XCTAssertFalse(ClaimablePaymentNotificationLookupFailurePolicy.isTerminal(
+            URLError(.notConnectedToInternet)
+        ))
+    }
+
+    func testClaimablePaymentCapabilityPolicyDistinguishesUnknownFromWithdrawal() {
+        func capabilities(_ features: [String: Bool?]?) -> CapabilitiesDTO {
+            CapabilitiesDTO(
+                apiVersion: "v1",
+                currency: CurrencyDTO(code: "UGX", scale: "2"),
+                features: features,
+                authentication: nil
+            )
+        }
+
+        XCTAssertEqual(
+            ClaimablePaymentNotificationCapabilityPolicy.readiness(capabilities: nil),
+            .awaitingAuthority
+        )
+        XCTAssertEqual(
+            ClaimablePaymentNotificationCapabilityPolicy.readiness(
+                capabilities: capabilities(nil)
+            ),
+            .awaitingAuthority
+        )
+        XCTAssertEqual(
+            ClaimablePaymentNotificationCapabilityPolicy.readiness(
+                capabilities: capabilities(["wallets": true, "internal_transfers": true])
+            ),
+            .awaitingAuthority
+        )
+        XCTAssertEqual(
+            ClaimablePaymentNotificationCapabilityPolicy.readiness(
+                capabilities: capabilities([
+                    "wallets": true,
+                    "internal_transfers": true,
+                    "claimable_transfers": nil,
+                ])
+            ),
+            .awaitingAuthority
+        )
+        for withdrawn in ["wallets", "internal_transfers", "claimable_transfers"] {
+            var features: [String: Bool?] = [
+                "wallets": true,
+                "internal_transfers": true,
+                "claimable_transfers": true,
+            ]
+            features[withdrawn] = false
+            XCTAssertEqual(
+                ClaimablePaymentNotificationCapabilityPolicy.readiness(
+                    capabilities: capabilities(features)
+                ),
+                .withdrawn
+            )
+        }
+        XCTAssertEqual(
+            ClaimablePaymentNotificationCapabilityPolicy.readiness(
+                capabilities: capabilities([
+                    "wallets": true,
+                    "internal_transfers": true,
+                    "claimable_transfers": true,
+                ])
+            ),
+            .enabled
+        )
+    }
+
+    @MainActor
+    func testClaimablePaymentCapabilityWakeIsReplayedAfterActiveRetryUnwinds() async throws {
+        let suiteName = "ConversationSoundTests.claim-notification.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let action = try XCTUnwrap(claimNotificationAction(claimNotificationUserInfo()))
+        let ownerFingerprint = try XCTUnwrap(
+            MessageNotificationContract.accountFingerprint(for: ownerUserID)
+        )
+        let boundAction = try XCTUnwrap(
+            action.bound(toAccountFingerprint: ownerFingerprint)
+        )
+        let dispatcher = ClaimablePaymentNotificationActionDispatcher(defaults: defaults)
+        let probe = ClaimablePaymentNotificationActionProbe()
+        await dispatcher.install { received in
+            probe.actions.append(received)
+            if probe.actions.count == 1 {
+                await probe.suspendHandler()
+                return .retry
+            }
+            return .completed
+        }
+
+        let dispatch = Task { await dispatcher.dispatch(boundAction) }
+        await probe.waitForSuspendedHandler()
+        // Models an authoritative capability refresh completing while the original nil-capability
+        // handler is still suspended. The wake must run once after `.retry` restores the row.
+        await dispatcher.replayPending()
+        probe.resumeHandler()
+        await dispatch.value
+
+        XCTAssertEqual(probe.actions, [boundAction, boundAction])
+        let nextLaunch = ClaimablePaymentNotificationActionDispatcher(defaults: defaults)
+        await nextLaunch.install { received in
+            probe.actions.append(received)
+            return .completed
+        }
+        XCTAssertEqual(probe.actions, [boundAction, boundAction])
+    }
+
+    @MainActor
+    func testAccountBoundaryFencesAnInFlightClaimNotificationRetry() async throws {
+        let suiteName = "ConversationSoundTests.claim-notification.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let action = try XCTUnwrap(claimNotificationAction(claimNotificationUserInfo()))
+        let ownerFingerprint = try XCTUnwrap(
+            MessageNotificationContract.accountFingerprint(for: ownerUserID)
+        )
+        let boundAction = try XCTUnwrap(
+            action.bound(toAccountFingerprint: ownerFingerprint)
+        )
+        let dispatcher = ClaimablePaymentNotificationActionDispatcher(defaults: defaults)
+        let probe = ClaimablePaymentNotificationActionProbe()
+        await dispatcher.install { received in
+            probe.actions.append(received)
+            await probe.suspendHandler()
+            return .retry
+        }
+
+        let dispatch = Task { await dispatcher.dispatch(boundAction) }
+        await probe.waitForSuspendedHandler()
+        await dispatcher.invalidateAllPendingActions()
+        probe.resumeHandler()
+        await dispatch.value
+
+        let nextLaunch = ClaimablePaymentNotificationActionDispatcher(defaults: defaults)
+        await nextLaunch.install { received in
+            probe.actions.append(received)
+            return .completed
+        }
+        XCTAssertEqual(probe.actions, [boundAction])
+    }
+
+    @MainActor
+    func testAccountBoundaryStopsClaimReplayBeyondCompletedDeduplicationWindow() async throws {
+        let suiteName = "ConversationSoundTests.claim-notification.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let ownerFingerprint = try XCTUnwrap(
+            MessageNotificationContract.accountFingerprint(for: ownerUserID)
+        )
+        let actions = (0 ..< 130).map { _ in
+            ClaimablePaymentNotificationAction(
+                notificationID: UUID().uuidString.lowercased(),
+                claimID: UUID().uuidString.lowercased(),
+                conversationID: nil,
+                groupPaymentID: nil,
+                accountFingerprint: ownerFingerprint
+            )
+        }
+        for action in actions {
+            ClaimablePaymentNotificationActionDispatcher.persistBeforeCompletingSystemResponse(
+                action,
+                defaults: defaults
+            )
+        }
+
+        let dispatcher = ClaimablePaymentNotificationActionDispatcher(defaults: defaults)
+        let probe = ClaimablePaymentNotificationActionProbe()
+        let replay = Task {
+            await dispatcher.install { received in
+                probe.actions.append(received)
+                if probe.actions.count == 1 { await probe.suspendHandler() }
+                return .retry
+            }
+        }
+        await probe.waitForSuspendedHandler()
+        await dispatcher.invalidateAllPendingActions()
+        probe.resumeHandler()
+        await replay.value
+
+        XCTAssertEqual(probe.actions, [actions[0]])
+        let nextLaunch = ClaimablePaymentNotificationActionDispatcher(defaults: defaults)
+        await nextLaunch.install { received in
+            probe.actions.append(received)
+            return .completed
+        }
+        XCTAssertEqual(probe.actions, [actions[0]])
     }
 
     func testMessageNotificationResponseRoutesTapAndTrimsInlineReply() throws {
@@ -999,19 +1510,22 @@ final class ConversationSoundTests: XCTestCase {
 
     @MainActor
     func testMessageNotificationDispatcherBuffersColdLaunchAndDeduplicatesResponse() async throws {
+        let suiteName = "ConversationSoundTests.notification.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
         let descriptor = try XCTUnwrap(notificationDescriptor())
         let action = try XCTUnwrap(notificationAction(
             descriptor,
             userInfo: notificationUserInfo(descriptor)
         ))
-        let dispatcher = MessageNotificationActionDispatcher()
+        let dispatcher = MessageNotificationActionDispatcher(defaults: defaults)
         let probe = MessageNotificationActionProbe()
 
         await dispatcher.dispatch(action)
         await dispatcher.dispatch(action)
         await dispatcher.install { received in
             probe.actions.append(received)
-            return true
+            return .completed
         }
         await dispatcher.dispatch(action)
 
@@ -1020,16 +1534,19 @@ final class ConversationSoundTests: XCTestCase {
 
     @MainActor
     func testMessageNotificationDispatcherRetriesOnlyAnUncompletedResponse() async throws {
+        let suiteName = "ConversationSoundTests.notification.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
         let descriptor = try XCTUnwrap(notificationDescriptor())
         let action = try XCTUnwrap(notificationAction(
             descriptor,
             userInfo: notificationUserInfo(descriptor)
         ))
-        let dispatcher = MessageNotificationActionDispatcher()
+        let dispatcher = MessageNotificationActionDispatcher(defaults: defaults)
         let probe = MessageNotificationActionProbe()
         await dispatcher.install { received in
             probe.actions.append(received)
-            return probe.actions.count > 1
+            return probe.actions.count > 1 ? .completed : .retry
         }
 
         await dispatcher.dispatch(action)
@@ -1037,6 +1554,128 @@ final class ConversationSoundTests: XCTestCase {
         await dispatcher.dispatch(action)
 
         XCTAssertEqual(probe.actions, [action, action])
+    }
+
+    @MainActor
+    func testColdLaunchNotificationSurvivesTerminationAndRoutesAfterSyncHydration() async throws {
+        let suiteName = "ConversationSoundTests.notification.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let descriptor = try XCTUnwrap(notificationDescriptor())
+        let action = try XCTUnwrap(notificationAction(
+            descriptor,
+            userInfo: notificationUserInfo(descriptor)
+        ))
+
+        // UIKit delivered the tap, but the process terminated before AppModel installed its
+        // handler. A newly constructed dispatcher represents the next cold launch.
+        MessageNotificationActionDispatcher.persistBeforeCompletingSystemResponse(
+            action,
+            defaults: defaults
+        )
+
+        let relaunchedProcess = MessageNotificationActionDispatcher(defaults: defaults)
+        let probe = MessageNotificationActionProbe()
+        await relaunchedProcess.install { received in
+            probe.actions.append(received)
+            guard probe.conversationAvailable else {
+                probe.syncAttempts += 1
+                return .retry
+            }
+            return .completed
+        }
+
+        XCTAssertEqual(probe.actions, [action])
+        XCTAssertEqual(probe.syncAttempts, 1)
+
+        probe.conversationAvailable = true
+        await relaunchedProcess.replayPending()
+        XCTAssertEqual(probe.actions, [action, action])
+
+        let nextLaunch = MessageNotificationActionDispatcher(defaults: defaults)
+        await nextLaunch.install { received in
+            probe.actions.append(received)
+            return .completed
+        }
+        XCTAssertEqual(probe.actions, [action, action])
+    }
+
+    @MainActor
+    func testAuthenticatedOwnerInvalidationRetiresDurableNotificationRoute() async throws {
+        let suiteName = "ConversationSoundTests.notification.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let descriptor = try XCTUnwrap(notificationDescriptor())
+        let action = try XCTUnwrap(notificationAction(
+            descriptor,
+            userInfo: notificationUserInfo(descriptor)
+        ))
+        let firstLaunch = MessageNotificationActionDispatcher(defaults: defaults)
+        await firstLaunch.dispatch(action)
+        await firstLaunch.install { _ in .invalidated }
+
+        let nextLaunch = MessageNotificationActionDispatcher(defaults: defaults)
+        let probe = MessageNotificationActionProbe()
+        await nextLaunch.install { received in
+            probe.actions.append(received)
+            return .completed
+        }
+
+        XCTAssertTrue(probe.actions.isEmpty)
+    }
+
+    @MainActor
+    func testExistingDispatcherReloadsSynchronousNotificationRoute() async throws {
+        let suiteName = "ConversationSoundTests.notification.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let descriptor = try XCTUnwrap(notificationDescriptor())
+        let action = try XCTUnwrap(notificationAction(
+            descriptor,
+            userInfo: notificationUserInfo(descriptor)
+        ))
+        let dispatcher = MessageNotificationActionDispatcher(defaults: defaults)
+        let probe = MessageNotificationActionProbe()
+
+        MessageNotificationActionDispatcher.persistBeforeCompletingSystemResponse(
+            action,
+            defaults: defaults
+        )
+        await dispatcher.install { received in
+            probe.actions.append(received)
+            return .completed
+        }
+
+        XCTAssertEqual(probe.actions, [action])
+    }
+
+    @MainActor
+    func testCompletedDuplicateTapDoesNotSurviveAnotherLaunch() async throws {
+        let suiteName = "ConversationSoundTests.notification.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let descriptor = try XCTUnwrap(notificationDescriptor())
+        let action = try XCTUnwrap(notificationAction(
+            descriptor,
+            userInfo: notificationUserInfo(descriptor)
+        ))
+        let dispatcher = MessageNotificationActionDispatcher(defaults: defaults)
+        await dispatcher.install { _ in .completed }
+        await dispatcher.dispatch(action)
+
+        MessageNotificationActionDispatcher.persistBeforeCompletingSystemResponse(
+            action,
+            defaults: defaults
+        )
+        await dispatcher.dispatch(action)
+
+        let nextLaunch = MessageNotificationActionDispatcher(defaults: defaults)
+        let probe = MessageNotificationActionProbe()
+        await nextLaunch.install { received in
+            probe.actions.append(received)
+            return .completed
+        }
+        XCTAssertTrue(probe.actions.isEmpty)
     }
 
     func testNotificationReplyUsesAStableAccountBoundClientMessageID() throws {
@@ -1482,11 +2121,72 @@ final class ConversationSoundTests: XCTestCase {
             ])
         )
     }
+
+    private func claimGroupPayment(
+        senderID: String,
+        shareClaimID: String?,
+        paymentID: String? = nil,
+        paymentConversationID: String? = nil
+    ) -> GroupPaymentDTO {
+        var payload: [String: Any] = [
+            "id": paymentID ?? claimGroupPaymentID,
+            "conversation_id": paymentConversationID ?? conversationID,
+            "split_mode": "even",
+            "audience": "all",
+            "currency": ["code": "UGX", "scale": "2"],
+            "recipient_count": 1,
+            "total_amount": "1000.00",
+            "sender": ["id": senderID, "name": "Sender"],
+            "status": "pending",
+            "pending_count": 1,
+            "accepted_count": 0,
+            "returned_count": 0,
+            "can_reverse_unclaimed": true,
+            "recipients": [],
+        ]
+        if let shareClaimID {
+            payload["your_share"] = [
+                "amount": "1000.00",
+                "status": "pending",
+                "claim_id": shareClaimID,
+                "can_accept": true,
+                "can_reject": true,
+            ]
+        }
+        return try! JSONDecoder().decode(
+            GroupPaymentDTO.self,
+            from: JSONSerialization.data(withJSONObject: payload)
+        )
+    }
 }
 
 @MainActor
 private final class ClaimablePaymentNotificationActionProbe {
     var actions: [ClaimablePaymentNotificationAction] = []
+    private var handlerContinuation: CheckedContinuation<Void, Never>?
+    private var handlerWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func suspendHandler() async {
+        await withCheckedContinuation { continuation in
+            handlerContinuation = continuation
+            let waiters = handlerWaiters
+            handlerWaiters.removeAll()
+            waiters.forEach { $0.resume() }
+        }
+    }
+
+    func waitForSuspendedHandler() async {
+        if handlerContinuation != nil { return }
+        await withCheckedContinuation { continuation in
+            handlerWaiters.append(continuation)
+        }
+    }
+
+    func resumeHandler() {
+        let continuation = handlerContinuation
+        handlerContinuation = nil
+        continuation?.resume()
+    }
 }
 
 final class ChatPresentationPolicyTests: XCTestCase {
@@ -1620,6 +2320,8 @@ final class ChatPresentationPolicyTests: XCTestCase {
 @MainActor
 private final class MessageNotificationActionProbe {
     var actions: [MessageNotificationAction] = []
+    var conversationAvailable = false
+    var syncAttempts = 0
 }
 
 @MainActor

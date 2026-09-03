@@ -27,6 +27,8 @@ jobs:
         run: python3 -m unittest discover -s .github/scripts/tests -p 'test_contact_sync_recovery.py'
       - name: Test wallet-refresh reliability source contract
         run: python3 -m unittest discover -s .github/scripts/tests -p 'test_wallet_refresh_reliability.py'
+      - name: Test claim-notification liveness source contract
+        run: python3 -m unittest discover -s .github/scripts/tests -p 'test_claim_notification_liveness.py'
       - name: Test financial chat receipt recovery source contract
         run: python3 -m unittest discover -s .github/scripts/tests -p 'test_financial_chat_receipt_recovery.py'
       - name: Test verification-badge placement source contract

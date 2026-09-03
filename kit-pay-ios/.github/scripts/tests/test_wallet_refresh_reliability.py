@@ -81,7 +81,7 @@ class WalletRefreshReliabilitySourceContract(unittest.TestCase):
             self.source,
             "private func performSelectedWalletTransactionsRefresh(",
         )
-        self.assertIn("try await api.transactions(walletId: key.walletID).items", worker)
+        self.assertIn("try await api.transactions(walletId: key.walletID)", worker)
         self.assertIn(
             "CustomerTransactionPresentationPolicy\n"
             "                .pageReplacement(for: firstPage, wallet: selectedWallet)",

@@ -1412,6 +1412,107 @@ final class MessagingAPIContractTests: XCTestCase {
         XCTAssertEqual(malformed.protocols?.messaging?.supportsReviewedV2, true)
     }
 
+    func testOfflineDirectReceiptBridgesColdOfflineRelaunchForItsExactOwner() throws {
+        let ownerUserID = "10000000-0000-4000-8000-000000000011"
+        let sessionID = "20000000-0000-4000-8000-000000000011"
+        let scope = MessagingDeferredFeatureScope(
+            accountEpoch: UUID(uuidString: "30000000-0000-4000-8000-000000000011")!,
+            userID: ownerUserID,
+            sessionID: sessionID
+        )
+        let receipt = try XCTUnwrap(MessagingOfflineDirectCreationCapabilityReceipt(
+            ownerUserID: ownerUserID.uppercased(),
+            sessionID: sessionID.uppercased(),
+            authoritativeCapabilities: offlineDirectCreationCapabilities(enabled: true),
+            accountMutationsAllowed: true
+        ))
+        // Encoding/decoding represents process death and protected-state restoration. There is
+        // deliberately no live capabilities document on the restored/offline side.
+        let restored = try JSONDecoder().decode(
+            MessagingOfflineDirectCreationCapabilityReceipt.self,
+            from: JSONEncoder().encode(receipt)
+        )
+
+        XCTAssertTrue(MessagingOfflineDirectCreationCapabilityPolicy.allowsLocalQueue(
+            authoritativeCapabilities: nil,
+            receipt: restored,
+            in: scope
+        ))
+        XCTAssertFalse(MessagingOfflineDirectCreationCapabilityPolicy.allowsLocalQueue(
+            authoritativeCapabilities: nil,
+            receipt: nil,
+            in: scope
+        ), "a fresh install/account has no authority to create a provisional thread")
+
+        let replacementAccount = MessagingDeferredFeatureScope(
+            accountEpoch: scope.accountEpoch,
+            userID: "10000000-0000-4000-8000-000000000012",
+            sessionID: sessionID
+        )
+        let replacementSession = MessagingDeferredFeatureScope(
+            accountEpoch: scope.accountEpoch,
+            userID: ownerUserID,
+            sessionID: "20000000-0000-4000-8000-000000000012"
+        )
+        for foreignScope in [replacementAccount, replacementSession] {
+            XCTAssertFalse(MessagingOfflineDirectCreationCapabilityPolicy.allowsLocalQueue(
+                authoritativeCapabilities: nil,
+                receipt: restored,
+                in: foreignScope
+            ))
+        }
+    }
+
+    func testOfflineDirectAuthoritativeRevocationOverridesAndClearsPriorGrant() throws {
+        let ownerUserID = "10000000-0000-4000-8000-000000000021"
+        let sessionID = "20000000-0000-4000-8000-000000000021"
+        let scope = MessagingDeferredFeatureScope(
+            accountEpoch: UUID(uuidString: "30000000-0000-4000-8000-000000000021")!,
+            userID: ownerUserID,
+            sessionID: sessionID
+        )
+        let enabled = try offlineDirectCreationCapabilities(enabled: true)
+        let disabled = try offlineDirectCreationCapabilities(enabled: false)
+        let previousGrant = try XCTUnwrap(MessagingOfflineDirectCreationCapabilityReceipt(
+            ownerUserID: ownerUserID,
+            sessionID: sessionID,
+            authoritativeCapabilities: enabled,
+            accountMutationsAllowed: true
+        ))
+
+        XCTAssertFalse(MessagingOfflineDirectCreationCapabilityPolicy.allowsLocalQueue(
+            authoritativeCapabilities: disabled,
+            receipt: previousGrant,
+            in: scope
+        ), "the current authenticated response must beat a stale affirmative receipt")
+
+        let durableRevocation = MessagingOfflineDirectCreationCapabilityReceipt(
+            ownerUserID: ownerUserID,
+            sessionID: sessionID,
+            authoritativeCapabilities: disabled,
+            accountMutationsAllowed: true
+        )
+        XCTAssertNil(durableRevocation)
+        XCTAssertFalse(MessagingOfflineDirectCreationCapabilityPolicy.allowsLocalQueue(
+            authoritativeCapabilities: nil,
+            receipt: durableRevocation,
+            in: scope
+        ), "a later transient failure must not resurrect an authoritatively revoked grant")
+
+        let readOnlyAccountReceipt = MessagingOfflineDirectCreationCapabilityReceipt(
+            ownerUserID: ownerUserID,
+            sessionID: sessionID,
+            authoritativeCapabilities: enabled,
+            accountMutationsAllowed: false
+        )
+        XCTAssertNil(readOnlyAccountReceipt)
+        XCTAssertFalse(MessagingOfflineDirectCreationCapabilityPolicy.allowsLocalQueue(
+            authoritativeCapabilities: nil,
+            receipt: readOnlyAccountReceipt,
+            in: scope
+        ), "a read-only App Review account must not gain offline write authority")
+    }
+
     func testConversationDecodesStateWrittenBeforeProvisionalDirectFields() throws {
         let original = Conversation(
             id: conversationId,
@@ -3161,6 +3262,31 @@ final class MessagingAPIContractTests: XCTestCase {
     ) throws -> Value {
         let data = try JSONSerialization.data(withJSONObject: object)
         return try JSONDecoder().decode(type, from: data)
+    }
+
+    private func offlineDirectCreationCapabilities(enabled: Bool) throws -> CapabilitiesDTO {
+        var messaging: [String: Any] = [
+            "ready": true,
+            "version": SecureMessagingWire.protocolVersion,
+            "suite": SecureMessagingWire.protocolSuite,
+            "post_quantum": true,
+        ]
+        if enabled {
+            messaging["offline_direct_creation"] = [
+                "profile": MessagingOfflineDirectCreationCapabilityDTO.reviewedProfile,
+                "ready": true,
+                "request_field": MessagingOfflineDirectCreationCapabilityDTO
+                    .reviewedRequestField,
+                "canonical_id_on_create": true,
+                "existing_pair_wins": true,
+            ]
+        }
+        return try decode(CapabilitiesDTO.self, object: [
+            "api_version": "v1",
+            "currency": ["code": "UGX", "scale": "2"],
+            "features": ["messaging": true],
+            "protocols": ["messaging": messaging],
+        ])
     }
 
     private func signalPublicKey(_ byte: UInt8) -> Data {

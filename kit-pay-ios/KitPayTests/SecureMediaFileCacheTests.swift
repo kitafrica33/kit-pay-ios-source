@@ -161,6 +161,109 @@ final class SecureMediaFileCacheTests: XCTestCase {
         await cache.releaseProtectedOriginalLease(lease)
     }
 
+    func testRecoveredV1ReceivedVideoIsFileBackedOnItsFirstCacheOpen() async throws {
+        try await assertReceivedVideoCacheRecovery(makeCachedReceivedVideoFixture(isV2: false))
+    }
+
+    func testRecoveredV2ReceivedVideoIsFileBackedOnItsFirstCacheOpen() async throws {
+        try await assertReceivedVideoCacheRecovery(makeCachedReceivedVideoFixture(isV2: true))
+    }
+
+    func testReceivedVideoCacheRecoveryRejectsMismatchedRecordWithoutReturningData() async throws {
+        let fixture = try makeCachedReceivedVideoFixture(isV2: true)
+        let store = makeRecoveryStore(suffix: "mismatch")
+        try await store.replace(fixture.state)
+        let insertion = await cache.insertIfAbsent(
+            fixture.bytes,
+            forStorageKey: fixture.storageKey,
+            userID: userID
+        )
+        XCTAssertEqual(insertion, .stored)
+
+        let resolved = try XCTUnwrap(SecureMediaLoadPolicy.resolve(
+            messageID: fixture.messageID,
+            conversationId: fixture.conversationID,
+            itemIndex: fixture.itemIndex,
+            in: fixture.state.messages
+        ))
+        var mismatchedRecord = try XCTUnwrap(LocalMediaRecordPolicy.record(
+            messageID: fixture.messageID,
+            conversationID: fixture.conversationID,
+            attachmentID: fixture.attachmentID,
+            mediaType: fixture.mediaType,
+            fileSize: fixture.bytes.count,
+            remoteStorageKey: fixture.storageKey,
+            in: fixture.state.messages
+        ))
+        mismatchedRecord.updatedAt = mismatchedRecord.updatedAt.addingTimeInterval(1)
+
+        do {
+            let unexpected = try await ReceivedVideoCachedBlobRecovery.recover(
+                store: store,
+                cache: cache,
+                userID: userID,
+                messageID: fixture.messageID,
+                conversationID: fixture.conversationID,
+                itemIndex: fixture.itemIndex,
+                expectedResolution: resolved,
+                expectedRecord: mismatchedRecord,
+                messageIsOutgoing: false,
+                attachmentID: fixture.attachmentID,
+                storageKey: fixture.storageKey,
+                mediaType: fixture.mediaType,
+                byteCount: fixture.bytes.count,
+                caption: fixture.caption
+            )
+            XCTFail("mismatched state ownership must fail instead of returning a media item")
+            XCTAssertNil(unexpected)
+        } catch {
+            // Expected: the file publication is harmless, while the authoritative row and sealed
+            // source remain unchanged for an exact retry.
+        }
+
+        let unchanged = await store.snapshot()
+        let unchangedRecord = try XCTUnwrap(LocalMediaRecordPolicy.record(
+            messageID: fixture.messageID,
+            conversationID: fixture.conversationID,
+            attachmentID: fixture.attachmentID,
+            mediaType: fixture.mediaType,
+            fileSize: fixture.bytes.count,
+            remoteStorageKey: fixture.storageKey,
+            in: unchanged.messages
+        ))
+        XCTAssertEqual(unchangedRecord.localStorageKind, .none)
+        XCTAssertEqual(unchangedRecord.availabilityState, .remoteOnly)
+        let retainedSealed = await cache.encryptedBlobData(
+            forStorageKey: fixture.storageKey,
+            userID: userID,
+            expectedByteCount: fixture.bytes.count
+        )
+        XCTAssertEqual(retainedSealed, fixture.bytes)
+
+        // A retry with the exact record reuses the byte-identical crash-published original and
+        // still returns only the leased file representation.
+        let recovered = try await ReceivedVideoCachedBlobRecovery.recover(
+            store: store,
+            cache: cache,
+            userID: userID,
+            messageID: fixture.messageID,
+            conversationID: fixture.conversationID,
+            itemIndex: fixture.itemIndex,
+            expectedResolution: resolved,
+            expectedRecord: unchangedRecord,
+            messageIsOutgoing: false,
+            attachmentID: fixture.attachmentID,
+            storageKey: fixture.storageKey,
+            mediaType: fixture.mediaType,
+            byteCount: fixture.bytes.count,
+            caption: fixture.caption
+        )
+        let loaded = try XCTUnwrap(recovered)
+        XCTAssertTrue(loaded.data.isEmpty)
+        let lease = try XCTUnwrap(loaded.localFileLease)
+        await cache.releaseProtectedOriginalLease(lease)
+    }
+
     func testLegacyInlineReceivedMediaCompactsAsOneFileBackedBatch() async throws {
         let videoBytes = Data(repeating: 0x31, count: 96 * 1_024)
         let documentBytes = Data(repeating: 0x42, count: 48 * 1_024)
@@ -870,6 +973,210 @@ final class SecureMediaFileCacheTests: XCTestCase {
         XCTAssertEqual(second.candidates.map(\.storageKey), [oldestKey])
         let removed = await cache.commitEviction(second, forUserID: userID)
         XCTAssertEqual(removed, Set([oldestKey]))
+    }
+
+    private struct CachedReceivedVideoFixture {
+        let state: PersistedState
+        let messageID: UUID
+        let conversationID: String
+        let itemIndex: Int?
+        let attachmentID: String
+        let storageKey: String
+        let mediaType: String
+        let caption: String?
+        let bytes: Data
+    }
+
+    private func assertReceivedVideoCacheRecovery(
+        _ fixture: CachedReceivedVideoFixture,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        let store = makeRecoveryStore(suffix: fixture.itemIndex == nil ? "v1" : "v2")
+        try await store.replace(fixture.state)
+        let insertion = await cache.insertIfAbsent(
+            fixture.bytes,
+            forStorageKey: fixture.storageKey,
+            userID: userID
+        )
+        XCTAssertEqual(insertion, .stored, file: file, line: line)
+
+        let resolved = try XCTUnwrap(
+            SecureMediaLoadPolicy.resolve(
+                messageID: fixture.messageID,
+                conversationId: fixture.conversationID,
+                itemIndex: fixture.itemIndex,
+                in: fixture.state.messages
+            ),
+            file: file,
+            line: line
+        )
+        let remoteRecord = try XCTUnwrap(
+            LocalMediaRecordPolicy.record(
+                messageID: fixture.messageID,
+                conversationID: fixture.conversationID,
+                attachmentID: fixture.attachmentID,
+                mediaType: fixture.mediaType,
+                fileSize: fixture.bytes.count,
+                remoteStorageKey: fixture.storageKey,
+                in: fixture.state.messages
+            ),
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(remoteRecord.localStorageKind, .none, file: file, line: line)
+        XCTAssertEqual(remoteRecord.availabilityState, .remoteOnly, file: file, line: line)
+
+        let recovered = try await ReceivedVideoCachedBlobRecovery.recover(
+            store: store,
+            cache: cache,
+            userID: userID,
+            messageID: fixture.messageID,
+            conversationID: fixture.conversationID,
+            itemIndex: fixture.itemIndex,
+            expectedResolution: resolved,
+            expectedRecord: remoteRecord,
+            messageIsOutgoing: false,
+            attachmentID: fixture.attachmentID,
+            storageKey: fixture.storageKey,
+            mediaType: fixture.mediaType,
+            byteCount: fixture.bytes.count,
+            caption: fixture.caption
+        )
+        let loaded = try XCTUnwrap(recovered, file: file, line: line)
+        XCTAssertTrue(loaded.data.isEmpty, file: file, line: line)
+        let playbackURL = try XCTUnwrap(loaded.localFileURL, file: file, line: line)
+        let lease = try XCTUnwrap(loaded.localFileLease, file: file, line: line)
+        XCTAssertEqual(playbackURL, lease.fileURL, file: file, line: line)
+
+        let committed = await store.snapshot()
+        let protectedRecord = try XCTUnwrap(
+            LocalMediaRecordPolicy.record(
+                messageID: fixture.messageID,
+                conversationID: fixture.conversationID,
+                attachmentID: fixture.attachmentID,
+                mediaType: fixture.mediaType,
+                fileSize: fixture.bytes.count,
+                remoteStorageKey: fixture.storageKey,
+                in: committed.messages
+            ),
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(protectedRecord.localStorageKind, .protectedFile, file: file, line: line)
+        XCTAssertEqual(protectedRecord.localStorageKey, fixture.storageKey, file: file, line: line)
+        XCTAssertEqual(protectedRecord.availabilityState, .localCached, file: file, line: line)
+        XCTAssertEqual(protectedRecord.downloadState, .downloaded, file: file, line: line)
+
+        let retiredSealed = await cache.encryptedBlobData(
+            forStorageKey: fixture.storageKey,
+            userID: userID,
+            expectedByteCount: fixture.bytes.count
+        )
+        XCTAssertNil(retiredSealed, file: file, line: line)
+        XCTAssertEqual(
+            try Data(contentsOf: playbackURL),
+            fixture.bytes,
+            "retiring the sealed representation must not invalidate the leased playback file",
+            file: file,
+            line: line
+        )
+        let stillLeasedURL = await cache.protectedOriginalURL(
+            forStorageKey: fixture.storageKey,
+            userID: userID,
+            expectedByteCount: fixture.bytes.count
+        )
+        XCTAssertEqual(stillLeasedURL, playbackURL, file: file, line: line)
+        await cache.releaseProtectedOriginalLease(lease)
+    }
+
+    private func makeRecoveryStore(suffix: String) -> SecureLocalStore {
+        SecureLocalStore(
+            stateURL: temporaryDirectory.appendingPathComponent("recovery-\(suffix).secure"),
+            keyData: Data(repeating: 0x91, count: 32)
+        )
+    }
+
+    private func makeCachedReceivedVideoFixture(
+        isV2: Bool
+    ) throws -> CachedReceivedVideoFixture {
+        let videoID = UUID().uuidString.lowercased()
+        let videoStorageKey = UUID().uuidString.lowercased()
+        let videoBytes = Data(repeating: isV2 ? 0x72 : 0x61, count: 64 * 1_024)
+        let caption = isV2 ? nil : "Recovered received clip"
+        let body: String
+        let itemIndex: Int?
+        if isV2 {
+            let descriptor = try XCTUnwrap(KitMediaMessageV2Descriptor(
+                items: [
+                    .init(
+                        attachmentID: videoID,
+                        storageKey: videoStorageKey,
+                        mediaType: "video/mp4",
+                        ciphertextByteSize: Int64(videoBytes.count + 64),
+                        ciphertextSHA256: String(repeating: "71", count: 32),
+                        keyMaterial: Data(
+                            repeating: 0x17,
+                            count: KitMediaMessageV2Descriptor.keyMaterialBytes
+                        ),
+                        plaintextByteSize: videoBytes.count
+                    ),
+                    .init(
+                        attachmentID: UUID().uuidString.lowercased(),
+                        storageKey: UUID().uuidString.lowercased(),
+                        mediaType: "image/jpeg",
+                        ciphertextByteSize: 1_088,
+                        ciphertextSHA256: String(repeating: "42", count: 32),
+                        keyMaterial: Data(
+                            repeating: 0x24,
+                            count: KitMediaMessageV2Descriptor.keyMaterialBytes
+                        ),
+                        plaintextByteSize: 1_024
+                    ),
+                ],
+                caption: nil
+            ))
+            body = descriptor.encoded
+            itemIndex = 0
+        } else {
+            body = try KitMediaMessageDescriptor(
+                attachmentID: videoID,
+                storageKey: videoStorageKey,
+                mediaType: "video/mp4",
+                ciphertextByteSize: Int64(videoBytes.count + 64),
+                ciphertextSHA256: String(repeating: "61", count: 32),
+                keyMaterial: Data(
+                    repeating: 0x16,
+                    count: SecureMediaAttachmentCipher.keyMaterialBytes
+                ),
+                plaintextByteSize: videoBytes.count,
+                caption: caption
+            ).encoded
+            itemIndex = nil
+        }
+        var message = LocalMessage(
+            id: UUID(),
+            conversationId: UUID().uuidString.lowercased(),
+            senderId: UUID().uuidString.lowercased(),
+            body: body,
+            createdAt: Date(timeIntervalSince1970: 1_800_000_000),
+            sentAt: Date(timeIntervalSince1970: 1_800_000_001),
+            state: .received,
+            failureReason: nil,
+            isOutgoing: false
+        )
+        message.localMediaRecords = try XCTUnwrap(LocalMediaRecordPolicy.remoteRecords(for: message))
+        return CachedReceivedVideoFixture(
+            state: legacyInlineReceivedState(messages: [message]),
+            messageID: message.id,
+            conversationID: message.conversationId,
+            itemIndex: itemIndex,
+            attachmentID: videoID,
+            storageKey: videoStorageKey,
+            mediaType: "video/mp4",
+            caption: caption,
+            bytes: videoBytes
+        )
     }
 
     private func importOriginal(key: String, byte: UInt8, count: Int) async throws {

@@ -1173,6 +1173,9 @@ final class AppModel: ObservableObject {
     @Published private(set) var pendingSharedInboxBatch: SharedInboxBatch?
     /// A share that now has a destination, on its way to that conversation's composer.
     @Published private(set) var sharedInboxDelivery: SharedInboxDelivery?
+    /// Compose-only first-contact identity for a shared payload. It never enters protected state
+    /// by itself; explicit Send commits it atomically with the media bubble and outbox command.
+    @Published private(set) var sharedInboxProvisionalConversation: Conversation?
     @Published private(set) var isBackingUpMessages = false
     @Published private(set) var isRestoringMessages = false
     @Published private(set) var isDeletingMessageBackup = false
@@ -1459,6 +1462,19 @@ final class AppModel: ObservableObject {
                           !self.protectedLocalStateRecoveryBlocked,
                           !self.unresolvedAccountDeletionAttemptBlocked
                     else { return }
+                    if let currentUserID = self.profile?.id {
+                        // Connectivity recovery is an explicit wake signal for registrations that
+                        // stopped after bounded transient attempts. Move only this account's
+                        // durable deadlines forward; cached Apple tokens below then coalesce the
+                        // actual backend retry through PushRegistrationManager.
+                        await self.pushRegistrations.expediteDeferredRetries(
+                            accountID: currentUserID
+                        )
+                    }
+                    NotificationCoordinator.shared.retryRemoteRegistrationIfNeeded()
+                    NotificationCoordinator.shared.replayCurrentPushTokens()
+                    await MessageNotificationActionDispatcher.shared.replayPending()
+                    await ClaimablePaymentNotificationActionDispatcher.shared.replayPending()
                     self.scheduleEphemeralCallCancellationDrain()
                     if AuthenticatedProjectionRefreshPolicy.permits(
                         isSigningOut: self.isSigningOut,
@@ -1488,12 +1504,14 @@ final class AppModel: ObservableObject {
                                   self.appReviewDemoMutationsAllowed,
                                   self.capabilities != nil
                             else { return }
-                            NotificationCoordinator.shared.retryRemoteRegistrationIfNeeded()
-                            NotificationCoordinator.shared.replayCurrentPushTokens()
                             self.resumeEphemeralOutgoingCallIfPossible()
                             await self.flushOutbox()
                             self.scheduleAutomaticContactSync()
                             _ = await self.runAutomaticMessageBackupIfDue()
+                            // The refresh/sync above may have hydrated the exact conversation that
+                            // was missing during the first recovery replay.
+                            await MessageNotificationActionDispatcher.shared.replayPending()
+                            await ClaimablePaymentNotificationActionDispatcher.shared.replayPending()
                         }
                     } else if self.isSignedIn {
                         // Incomplete accounts do not enter the full session-resume path, but
@@ -1649,13 +1667,13 @@ final class AppModel: ObservableObject {
         restoreTask = Task { [weak self] in await self?.restore() }
         Task { [weak self] in
             await MessageNotificationActionDispatcher.shared.install { [weak self] action in
-                guard let self else { return false }
+                guard let self else { return .retry }
                 return await self.handleMessageNotificationAction(action)
             }
         }
         Task { [weak self] in
             await ClaimablePaymentNotificationActionDispatcher.shared.install { [weak self] action in
-                guard let self else { return false }
+                guard let self else { return .retry }
                 return await self.handleClaimablePaymentNotificationAction(action)
             }
         }
@@ -1931,6 +1949,35 @@ final class AppModel: ObservableObject {
                 advertisedCapability: capabilities.map { _ in messagingMessageEditsEnabled },
                 in: messagingDeferredFeatureScope
             )
+    }
+    /// Live capability discovery is authoritative. During a cold offline relaunch (or a transient
+    /// refresh failure), only the encrypted receipt issued to this exact account/session keeps
+    /// first-contact text and media queueable; an unproven account remains fail-closed.
+    var messagingOfflineDirectCreationLocalQueueEnabled: Bool {
+        guard secureMessagingLocalQueueAvailable,
+              isSignedIn,
+              !isSigningOut,
+              let scope = messagingDeferredFeatureScope,
+              scope.accountEpoch == accountEpoch,
+              profile?.id.caseInsensitiveCompare(scope.userID) == .orderedSame,
+              state.communicationOwnerUserID?.caseInsensitiveCompare(scope.userID)
+                  == .orderedSame
+        else { return false }
+        if capabilities != nil, !appReviewDemoMutationsAllowed { return false }
+        return MessagingOfflineDirectCreationCapabilityPolicy.allowsLocalQueue(
+            authoritativeCapabilities: capabilities,
+            receipt: state.messagingOfflineDirectCreationCapabilityReceipt,
+            in: scope
+        )
+    }
+    /// A live writable response permits the legacy online create-before-queue path. Offline, the
+    /// direct-creation receipt is the only durable proof that this account may create the local
+    /// provisional thread, so the UI cannot offer a send that the queue boundary must reject.
+    var newDirectMessageCompositionAllowed: Bool {
+        if messagingOfflineDirectCreationLocalQueueEnabled { return true }
+        return isOnline
+            && secureMessagingLocalQueueAvailable
+            && appReviewDemoMutationsAllowed
     }
 
     private func bindDeferredMessagingFeatures(to scope: MessagingDeferredFeatureScope) {
@@ -2569,6 +2616,7 @@ final class AppModel: ObservableObject {
         await NotificationCoordinator.shared.clearMessageNotifications(
             accountFingerprint: targetFingerprint
         )
+        await retireClaimNotificationStateAtAccountBoundary()
         // Keep the accepted marker authoritative until the suspended diagnostics writer has
         // serialized a final clear. A relaunch can then safely repeat the whole exact-target purge.
         guard LocalMediaPerformanceMonitor.shared.clearReport() else {
@@ -2838,6 +2886,10 @@ final class AppModel: ObservableObject {
         await NotificationCoordinator.shared.clearMessageNotifications(
             accountFingerprint: targetFingerprint
         )
+        // Claim alerts have no owner digest, so selective retention cannot be proven while local
+        // ownership is quarantined. Remove every visible claim alert; a tap already journaled by
+        // the delegate remains durable unless this becomes a real account boundary.
+        await NotificationCoordinator.shared.clearClaimablePaymentNotifications()
         callEventDrainTask?.cancel()
         callEventDrainTask = nil
         callSystemEventDrainTask?.cancel()
@@ -2850,6 +2902,11 @@ final class AppModel: ObservableObject {
         }
         queuedCallEvents.removeAll()
         queuedCallSystemActions.removeAll()
+    }
+
+    private func retireClaimNotificationStateAtAccountBoundary() async {
+        await ClaimablePaymentNotificationActionDispatcher.shared.invalidateAllPendingActions()
+        await NotificationCoordinator.shared.clearClaimablePaymentNotifications()
     }
 
     func retryProtectedLocalStateRecovery() async {
@@ -3261,6 +3318,7 @@ final class AppModel: ObservableObject {
                     session,
                     accountEpoch: restorationAccountEpoch
                 ) else { return }
+                await retireClaimNotificationStateAtAccountBoundary()
                 await publishLatestState()
                 _ = await reloadCapabilities()
                 lastError = "Your saved sign-in could not be verified safely. Sign in again."
@@ -3330,6 +3388,7 @@ final class AppModel: ObservableObject {
                     session,
                     accountEpoch: restorationAccountEpoch
                 ) else { return }
+                await retireClaimNotificationStateAtAccountBoundary()
                 await publishLatestState()
                 _ = await reloadCapabilities()
                 lastError = "Your saved sign-in could not be restored safely. Sign in again."
@@ -3493,6 +3552,7 @@ final class AppModel: ObservableObject {
                 message: "Your saved sign-in could not be matched to its account. Sign in again."
             )
         } else {
+            await retireClaimNotificationStateAtAccountBoundary()
             _ = await reloadCapabilities()
             isLoading = false
         }
@@ -3570,6 +3630,7 @@ final class AppModel: ObservableObject {
         activeConversationID = nil
         stopVisibleConversationSync()
         isSignedIn = false
+        await retireClaimNotificationStateAtAccountBoundary()
         resetDeferredMessagingFeatures()
         sessionAssurance = nil
         accountSetupStep = nil
@@ -3982,6 +4043,12 @@ final class AppModel: ObservableObject {
             guard try await sessions.saveIfEmpty(boundSession) else {
                 throw AuthUIError.staleResponse
             }
+            // Retire the previous credential lifetime before the new profile can be exposed.
+            // A parked capability grant either commits before this atomic withdrawal and is
+            // cleared, or reaches the store afterwards with an obsolete opaque ticket.
+            try await store.retireMessagingOfflineDirectCreationCapabilityContext(
+                clearingPersistedReceipt: true
+            )
             // Persisting the authenticated session creates the first possible write authority.
             // Fence it before any subsequent suspension; only a successful authenticated
             // non-demo capability response may release the fence.
@@ -4602,6 +4669,7 @@ final class AppModel: ObservableObject {
         if let delivery = sharedInboxDelivery,
            SharedInboxPolicy.isExpired(receivedAt: delivery.batch.receivedAt, now: now) {
             sharedInboxDelivery = nil
+            sharedInboxProvisionalConversation = nil
             SharedInboxStore.shared.remove(batchID: delivery.batch.id)
         }
         if let batch = pendingSharedInboxBatch,
@@ -4649,8 +4717,8 @@ final class AppModel: ObservableObject {
 
     /// A share-extension choice is a request, never authority. Existing chats are resolved only
     /// from protected local state. A contact without a thread goes through the authenticated,
-    /// server-idempotent direct-conversation creation path when online; offline it remains visible
-    /// in the in-app picker and its bytes stay queued.
+    /// capability-gated provisional composer when available. Older servers retain authenticated,
+    /// server-idempotent creation while online; offline their staged bytes remain queued.
     private func routeRequestedSharedInboxDestinationIfPossible() {
         guard let batch = pendingSharedInboxBatch,
               let destination = batch.destination,
@@ -4682,6 +4750,18 @@ final class AppModel: ObservableObject {
             recipientUserID: recipientUserID
         ) {
             routeSharedInbox(to: conversation.id)
+            return
+        }
+        if messagingOfflineDirectCreationLocalQueueEnabled,
+           let currentUserID = profile?.id,
+           let provisional = ProvisionalDirectConversationPolicy.make(
+               id: destination.conversationID ?? UUID().uuidString.lowercased(),
+               localUserID: currentUserID,
+               recipientUserID: recipientUserID,
+               title: destination.displayName,
+               createdAt: batch.receivedAt
+           ) {
+            routeSharedInbox(to: provisional)
             return
         }
         guard isOnline,
@@ -4792,7 +4872,24 @@ final class AppModel: ObservableObject {
               canDeliverSharedContent,
               let conversation = state.conversations.first(where: {
                   $0.id.caseInsensitiveCompare(conversationID) == .orderedSame
-              }), sharedInboxConversationIsEligible(conversation)
+              })
+        else { return }
+        routeSharedInbox(to: conversation, batch: batch)
+    }
+
+    /// Routes a share into either a stored conversation or a compose-only provisional direct
+    /// thread. The latter remains in memory and in the staged batch destination only; cancelling
+    /// persists no empty conversation, while Send promotes all local state in one transaction.
+    private func routeSharedInbox(
+        to conversation: Conversation,
+        batch: SharedInboxBatch? = nil
+    ) {
+        guard let batch = batch ?? pendingSharedInboxBatch,
+              pendingSharedInboxBatch?.id == batch.id,
+              canDeliverSharedContent,
+              sharedInboxConversationIsEligible(conversation),
+              !conversation.isProvisionalDirect
+                || messagingOfflineDirectCreationLocalQueueEnabled
         else { return }
         let durableConversationIDs = durableSharedInboxConversationIDs(for: batch)
         let canonicalConversationID = SharedInboxPolicy.canonicalConversationID(conversation.id)
@@ -4818,6 +4915,9 @@ final class AppModel: ObservableObject {
             return
         }
         pendingSharedInboxBatch = nil
+        sharedInboxProvisionalConversation = conversation.isProvisionalDirect
+            ? conversation
+            : nil
         sharedInboxDelivery = SharedInboxDelivery(
             conversationID: conversation.id,
             batch: pinnedBatch
@@ -4887,11 +4987,37 @@ final class AppModel: ObservableObject {
             && !isCommunicationBlocked(userID: recipientUserID)
     }
 
+    /// Returns authority for the one compose-only share route that may create a local direct
+    /// conversation. Capability, staged-batch destination, recipient and in-memory projection
+    /// must all agree; ordinary callers cannot turn an arbitrary missing UUID into a thread.
+    private func sharedInboxProvisionalRecipient(conversationID: String) -> String? {
+        guard messagingOfflineDirectCreationLocalQueueEnabled,
+              state.conversations.allSatisfy({
+                  $0.id.caseInsensitiveCompare(conversationID) != .orderedSame
+              }),
+              let delivery = sharedInboxDelivery,
+              delivery.conversationID.caseInsensitiveCompare(conversationID) == .orderedSame,
+              let destination = delivery.batch.destination,
+              destination.kind == .direct,
+              destination.conversationID?.caseInsensitiveCompare(conversationID)
+                  == .orderedSame,
+              let recipient = SharedInboxPolicy.canonicalAccountID(
+                  destination.recipientUserID
+              ),
+              let provisional = sharedInboxProvisionalConversation,
+              provisional.id.caseInsensitiveCompare(conversationID) == .orderedSame,
+              provisional.isProvisionalDirect,
+              provisional.pendingDirectRecipientUserID == recipient
+        else { return nil }
+        return recipient
+    }
+
     /// Called only after every selected shared item is durably represented in the local outbox.
     /// At that point its protected handoff copy is redundant and can be removed.
     func consumeSharedInboxDelivery(_ id: UUID) {
         guard let delivery = sharedInboxDelivery, delivery.id == id else { return }
         sharedInboxDelivery = nil
+        sharedInboxProvisionalConversation = nil
         SharedInboxStore.shared.remove(batchID: delivery.batch.id)
         // A second share that arrived while the first was being placed can be offered now.
         refreshSharedInbox()
@@ -4903,6 +5029,7 @@ final class AppModel: ObservableObject {
     func retrySharedInboxDelivery(_ id: UUID) {
         guard let delivery = sharedInboxDelivery, delivery.id == id else { return }
         sharedInboxDelivery = nil
+        sharedInboxProvisionalConversation = nil
         pendingSharedInboxBatch = delivery.batch
     }
 
@@ -4911,6 +5038,7 @@ final class AppModel: ObservableObject {
     func discardSharedInboxDelivery(_ id: UUID) {
         guard let delivery = sharedInboxDelivery, delivery.id == id else { return }
         sharedInboxDelivery = nil
+        sharedInboxProvisionalConversation = nil
         SharedInboxStore.shared.remove(batchID: delivery.batch.id)
         refreshSharedInbox()
     }
@@ -4928,6 +5056,7 @@ final class AppModel: ObservableObject {
         resolvingSharedInboxBatchID = nil
         pendingSharedInboxBatch = nil
         sharedInboxDelivery = nil
+        sharedInboxProvisionalConversation = nil
         SharedInboxStore.shared.removeAll()
         SharedInboxStore.shared.clearActiveAccount()
     }
@@ -4997,6 +5126,11 @@ final class AppModel: ObservableObject {
         // are cleared.
         accountEpoch = UUID()
         resetDeferredMessagingFeatures()
+        // Rotate the protected-store fence and withdraw its receipt before teardown continues.
+        // A completion already parked at the AppModel-to-store hop is rejected by the new context.
+        try? await store.retireMessagingOfflineDirectCreationCapabilityContext(
+            clearingPersistedReceipt: true
+        )
         guard await resetProtectedCallRecoveryCycle(retiringQueuedEvents: true) else {
             return .contextChanged
         }
@@ -5026,6 +5160,7 @@ final class AppModel: ObservableObject {
         // from this account may survive into a replacement sign-in.
         clearAllCallWaitingState()
         NotificationCoordinator.shared.beginAccountSignOut()
+        await retireClaimNotificationStateAtAccountBoundary()
         callEventDrainTask?.cancel()
         callEventDrainTask = nil
         callSystemEventDrainTask?.cancel()
@@ -5205,6 +5340,9 @@ final class AppModel: ObservableObject {
         await NotificationCoordinator.shared.clearMessageNotifications(
             accountFingerprint: deletedAccountFingerprint
         )
+        // Catch a claim response delivered during remote token teardown as well as the intents
+        // retired when the account boundary began.
+        await retireClaimNotificationStateAtAccountBoundary()
         // The monitor was suspended before teardown. This final serialized clear runs after media
         // producers have been cancelled, and is the authoritative account-boundary result.
         let diagnosticsCleanupSucceeded = LocalMediaPerformanceMonitor.shared.clearReport()
@@ -6188,6 +6326,11 @@ final class AppModel: ObservableObject {
             await resumeAuthenticatedSessionIfNeeded()
         }
         applicationDidBecomeActive()
+        // Re-arm process-death recovery without bypassing the durable push backoff. Notification
+        // opens waiting for biometric/session restoration receive one account-fenced replay here.
+        NotificationCoordinator.shared.replayCurrentPushTokens()
+        await MessageNotificationActionDispatcher.shared.replayPending()
+        await ClaimablePaymentNotificationActionDispatcher.shared.replayPending()
         scheduleForegroundAuthoritativeRefreshIfNeeded()
     }
 
@@ -8114,6 +8257,8 @@ final class AppModel: ObservableObject {
             NotificationCoordinator.shared.resumeRegistration(
                 afterOwnershipRecoveryFor: expectedUserID
             )
+            await MessageNotificationActionDispatcher.shared.replayPending()
+            await ClaimablePaymentNotificationActionDispatcher.shared.replayPending()
             isLoading = false
             return
         }
@@ -8193,6 +8338,8 @@ final class AppModel: ObservableObject {
             userID: expectedUserID,
             sessionID: expectedSessionID
         ) else { return }
+        await MessageNotificationActionDispatcher.shared.replayPending()
+        await ClaimablePaymentNotificationActionDispatcher.shared.replayPending()
         isLoading = false
         scheduleAutomaticContactSync()
         Task { [weak self] in
@@ -8568,7 +8715,7 @@ final class AppModel: ObservableObject {
             let firstPage = try await APIClientSessionBinding.$sessionID.withValue(
                 key.sessionID
             ) {
-                try await api.transactions(walletId: key.walletID).items
+                try await api.transactions(walletId: key.walletID)
             }
             guard case .replace(let transactions) = CustomerTransactionPresentationPolicy
                 .pageReplacement(for: firstPage, wallet: selectedWallet)
@@ -9370,20 +9517,31 @@ final class AppModel: ObservableObject {
 
     private func handleMessageNotificationAction(
         _ action: MessageNotificationAction
-    ) async -> Bool {
+    ) async -> MessageNotificationActionHandlingResult {
         // Accepted-deletion recovery is the first protected-state access barrier. Inline replies
         // must not inspect SessionStore or SecureLocalStore until that launch recovery completes.
         if let restoreTask { await restoreTask.value }
+        // A response may outlive its original account across termination. Retire it only after a
+        // restored authenticated session conclusively proves that it belongs to another owner;
+        // every incomplete launch/setup/offline state remains retryable.
+        if isSignedIn,
+           let currentUserID = profile?.id,
+           let session = await sessions.current(),
+           session.accountId?.caseInsensitiveCompare(currentUserID) == .orderedSame,
+           MessageNotificationContract.accountFingerprint(for: currentUserID)
+            != action.accountFingerprint {
+            return .invalidated
+        }
         guard !isSubmittingAccountDeletion,
               !acceptedAccountDeletionCleanupBlocked,
               !protectedLocalStateRecoveryBlocked,
               !unresolvedAccountDeletionAttemptBlocked
-        else { return false }
+        else { return .retry }
         switch action.kind {
         case .open:
-            return await routeMessageNotificationOpen(action)
+            return await routeMessageNotificationOpen(action) ? .completed : .retry
         case .reply(let text):
-            return await queueMessageNotificationReply(text, action: action)
+            return await queueMessageNotificationReply(text, action: action) ? .completed : .retry
         }
     }
 
@@ -9395,16 +9553,47 @@ final class AppModel: ObservableObject {
               !protectedLocalStateRecoveryBlocked,
               !unresolvedAccountDeletionAttemptBlocked,
               isSignedIn,
+              accountSetupStep == nil,
+              communicationAccessGranted,
               let currentUserID = profile?.id,
               MessageNotificationContract.accountFingerprint(for: currentUserID)
                   == action.accountFingerprint,
               MessageNotificationContract.canonicalUUID(state.communicationOwnerUserID)
                   == MessageNotificationContract.canonicalUUID(currentUserID),
-              let conversation = MessageNotificationConversationPolicy.conversation(
-                  id: action.conversationID,
-                  in: state.conversations
-              )
+              let session = await sessions.current(),
+              session.accountId?.caseInsensitiveCompare(currentUserID) == .orderedSame
         else { return false }
+        let context = AuthenticatedSecurityContext(
+            accountEpoch: accountEpoch,
+            userID: currentUserID,
+            sessionID: session.sessionId
+        )
+        guard await authenticatedSecurityContextIsCurrent(context) else { return false }
+
+        var conversation = MessageNotificationConversationPolicy.conversation(
+            id: action.conversationID,
+            in: state.conversations
+        )
+        if conversation == nil {
+            // A cold APNs launch can beat the first secure-message hydration. Run one normal,
+            // account-fenced incremental sync, then resolve the route from the durable local
+            // projection. Failure remains in the dispatcher's durable queue for connectivity or
+            // foreground recovery; it is never converted into an invalid navigation state.
+            guard isOnline else { return false }
+            _ = await APIClientSessionBinding.$sessionID.withValue(context.sessionID) {
+                await syncSecureMessagingIfPermitted(
+                    presentsVisibleMessageNotifications: false,
+                    reportsFailure: false,
+                    expectedContext: context
+                )
+            }
+            guard await authenticatedSecurityContextIsCurrent(context) else { return false }
+            conversation = MessageNotificationConversationPolicy.conversation(
+                id: action.conversationID,
+                in: state.conversations
+            )
+        }
+        guard let conversation else { return false }
         let targetMessageID = MessageNotificationTargetPolicy.messageID(
             forDigest: action.messageDigest,
             conversationID: conversation.id,
@@ -9425,8 +9614,48 @@ final class AppModel: ObservableObject {
 
     private func handleClaimablePaymentNotificationAction(
         _ action: ClaimablePaymentNotificationAction
-    ) async -> Bool {
+    ) async -> ClaimablePaymentNotificationActionHandlingResult {
         if let restoreTask { await restoreTask.value }
+        let currentSession = await sessions.current()
+        let currentUserID = profile?.id
+        let currentFingerprint = MessageNotificationContract.accountFingerprint(
+            for: currentUserID
+        )
+        let sessionOwnsCurrentProfile = currentUserID.map { userID in
+            currentSession?.accountId?.caseInsensitiveCompare(userID) == .orderedSame
+        } == true
+        let communicationProjectionOwnsCurrentProfile =
+            MessageNotificationContract.canonicalUUID(state.communicationOwnerUserID)
+                == MessageNotificationContract.canonicalUUID(currentUserID)
+
+        // A durable response may outlive its original session. Once a fully restored account is
+        // available, a pre-existing owner mismatch is conclusive and must never be retried under
+        // the replacement account.
+        if isSignedIn,
+           sessionOwnsCurrentProfile,
+           let currentFingerprint,
+           let actionFingerprint = action.accountFingerprint,
+           actionFingerprint != currentFingerprint {
+            return .invalidated
+        }
+
+        if action.accountFingerprint == nil {
+            if isSignedIn,
+               sessionOwnsCurrentProfile,
+               communicationProjectionOwnsCurrentProfile,
+               let currentFingerprint {
+                // This is a state-machine transition, not a delayed retry: the dispatcher writes
+                // the owner synchronously and invokes us again before any claim lookup begins.
+                return .bindAndContinue(toAccountFingerprint: currentFingerprint)
+            }
+            let accountRecoveryMayResume = acceptedAccountDeletionCleanupBlocked
+                || protectedLocalStateRecoveryBlocked
+                || unresolvedAccountDeletionAttemptBlocked
+            // After a clean signed-out restore there is no owner left to prove. Retaining an
+            // unbound claim for an arbitrary future login would cross the account boundary.
+            return !isSignedIn && !accountRecoveryMayResume ? .invalidated : .retry
+        }
+
         guard !isSigningOut,
               !isSubmittingAccountDeletion,
               !acceptedAccountDeletionCleanupBlocked,
@@ -9435,61 +9664,141 @@ final class AppModel: ObservableObject {
               isSignedIn,
               accountSetupStep == nil,
               communicationAccessGranted,
-              let currentUserID = profile?.id,
-              MessageNotificationContract.canonicalUUID(state.communicationOwnerUserID)
-                == MessageNotificationContract.canonicalUUID(currentUserID),
-              let session = await sessions.current(),
-              session.accountId?.caseInsensitiveCompare(currentUserID) == .orderedSame
-        else { return false }
+              let currentUserID,
+              let currentFingerprint,
+              sessionOwnsCurrentProfile,
+              communicationProjectionOwnsCurrentProfile,
+              let currentSession
+        else { return .retry }
+        guard action.accountFingerprint == currentFingerprint
+        else { return .invalidated }
         let context = AuthenticatedSecurityContext(
             accountEpoch: accountEpoch,
             userID: currentUserID,
-            sessionID: session.sessionId
+            sessionID: currentSession.sessionId
         )
-        guard await authenticatedSecurityContextIsCurrent(context) else { return false }
+        guard await authenticatedSecurityContextIsCurrent(context) else { return .retry }
 
-        if isOnline,
-           TransferAcceptancePolicy(features: capabilities?.features).acceptanceEnabled,
-           let claim = try? await APIClientSessionBinding.$sessionID.withValue(
-               context.sessionID,
-               operation: {
-                   try await api.transferAcceptance(transferId: action.claimID)
-               }
-           ) {
-            guard await authenticatedSecurityContextIsCurrent(context),
-                  ClaimablePaymentNotificationRoutingPolicy.authorizesWallet(
-                      action: action,
-                      claim: claim,
-                      currentUserID: currentUserID
-                  )
-            else { return false }
-            if let conversation = ClaimablePaymentNotificationRoutingPolicy.conversation(
+        // Unlike a message notification, the server claim payload does not carry an account
+        // digest. Never surface its claim ID merely because some account is signed in: first load
+        // the exact claim through the fenced session and prove that user is a party. Offline and
+        // transient failures stay durable for connectivity/foreground replay.
+        // Missing/null flags are not a withdrawal. Only an explicit authoritative `false` retires
+        // the route; a partial response remains durable until capability discovery converges.
+        switch ClaimablePaymentNotificationCapabilityPolicy.readiness(
+            capabilities: capabilities
+        ) {
+        case .enabled:
+            break
+        case .awaitingAuthority:
+            return .retry
+        case .withdrawn:
+            return .invalidated
+        }
+        guard isOnline else { return .retry }
+
+        if let groupPaymentID = action.groupPaymentID {
+            // A share of a group payment is intentionally not readable through the standalone
+            // transfer-claim endpoint. Resolve it through the caller-scoped group projection, and
+            // never fall back to the wallet claim route for this branch.
+            guard MessageNotificationContract.canonicalUUID(groupPaymentID) == groupPaymentID
+            else { return .invalidated }
+            let groupPayment: GroupPaymentDTO
+            do {
+                groupPayment = try await APIClientSessionBinding.$sessionID.withValue(
+                    context.sessionID
+                ) {
+                    try await api.groupPayment(id: groupPaymentID)
+                }
+            } catch {
+                return ClaimablePaymentNotificationLookupFailurePolicy.isTerminal(error)
+                    ? .invalidated
+                    : .retry
+            }
+            guard await authenticatedSecurityContextIsCurrent(context) else { return .retry }
+            guard ClaimablePaymentNotificationRoutingPolicy.authorizesGroupPayment(
                 action: action,
-                claim: claim,
+                groupPayment: groupPayment,
+                currentUserID: currentUserID
+            ) else { return .invalidated }
+
+            var conversation = ClaimablePaymentNotificationRoutingPolicy.conversation(
+                action: action,
+                groupPayment: groupPayment,
                 conversations: state.conversations,
                 currentUserID: currentUserID
-            ) {
-                let targetMessageID = ClaimablePaymentNotificationRoutingPolicy.targetMessageID(
-                    action: action,
-                    claim: claim,
-                    conversation: conversation,
-                    messages: state.messages
-                )
-                if requestConversationNavigation(
-                    conversationID: conversation.id,
-                    messageID: targetMessageID
-                ) {
-                    return true
+            )
+            if conversation == nil {
+                _ = await APIClientSessionBinding.$sessionID.withValue(context.sessionID) {
+                    await syncSecureMessagingIfPermitted(
+                        presentsVisibleMessageNotifications: false,
+                        reportsFailure: false,
+                        expectedContext: context
+                    )
                 }
+                guard await authenticatedSecurityContextIsCurrent(context) else { return .retry }
+                conversation = ClaimablePaymentNotificationRoutingPolicy.conversation(
+                    action: action,
+                    groupPayment: groupPayment,
+                    conversations: state.conversations,
+                    currentUserID: currentUserID
+                )
+            }
+            guard let conversation else { return .retry }
+            let targetMessageID = ClaimablePaymentNotificationRoutingPolicy.targetMessageID(
+                action: action,
+                groupPayment: groupPayment,
+                conversation: conversation,
+                messages: state.messages
+            )
+            return requestConversationNavigation(
+                conversationID: conversation.id,
+                messageID: targetMessageID
+            ) ? .completed : .retry
+        }
+
+        let claim: TransferAcceptanceDTO
+        do {
+            claim = try await APIClientSessionBinding.$sessionID.withValue(context.sessionID) {
+                try await api.transferAcceptance(transferId: action.claimID)
+            }
+        } catch {
+            return ClaimablePaymentNotificationLookupFailurePolicy.isTerminal(error)
+                ? .invalidated
+                : .retry
+        }
+        guard await authenticatedSecurityContextIsCurrent(context) else { return .retry }
+        guard ClaimablePaymentNotificationRoutingPolicy.authorizesWallet(
+            action: action,
+            claim: claim,
+            currentUserID: currentUserID
+        ) else { return .invalidated }
+        if let conversation = ClaimablePaymentNotificationRoutingPolicy.conversation(
+            action: action,
+            claim: claim,
+            conversations: state.conversations,
+            currentUserID: currentUserID
+        ) {
+            let targetMessageID = ClaimablePaymentNotificationRoutingPolicy.targetMessageID(
+                action: action,
+                claim: claim,
+                conversation: conversation,
+                messages: state.messages
+            )
+            if requestConversationNavigation(
+                conversationID: conversation.id,
+                messageID: targetMessageID
+            ) {
+                return .completed
             }
         }
 
-        // No payload URL is opened. A missing/offline/contradictory group binding falls back to
-        // the signed-in account's own wallet activity, whose next load is server-authoritative.
-        guard await authenticatedSecurityContextIsCurrent(context) else { return false }
+        // No payload URL is opened. After the exact claim has authorized this account, a missing
+        // or contradictory group binding safely falls back to its own server-backed wallet view.
+        guard await authenticatedSecurityContextIsCurrent(context) else { return .retry }
         selectedTab = MainTabIndex.home
         walletClaimNavigationRequest = WalletClaimNavigationRequest(claimID: action.claimID)
-        return true
+        return .completed
     }
 
     private func queueMessageNotificationReply(
@@ -10707,6 +11016,11 @@ final class AppModel: ObservableObject {
         } else {
             expectedDeferredFeatureScope = nil
         }
+        guard let offlineDirectCapabilityRequest = await store
+            .beginMessagingOfflineDirectCreationCapabilityRequest(
+                scope: expectedDeferredFeatureScope
+            )
+        else { return false }
         // Binding happens before the request suspends. A replacement account/session therefore
         // loses the previous decision immediately, while a retry for this same scope keeps the
         // last authenticated true *or false* result until a newer response is accepted.
@@ -10763,6 +11077,14 @@ final class AppModel: ObservableObject {
                 communicationReplayTask = nil
                 CommunicationBackgroundReplayScheduler.shared.cancel()
             }
+            guard await capabilitiesContextIsCurrent(
+                      accountEpoch: expectedAccountEpoch,
+                      sessionID: expectedSessionID
+                  ), capabilitiesRequestTracker.accepts(
+                      requestGeneration,
+                      cancelled: false
+                  )
+            else { return false }
             if isSignedIn, let currentAssurance = sessionAssurance {
                 sessionAssurance = currentAssurance.applyingTopLevelAccess(
                     communication: discovered.communicationAccess,
@@ -10777,6 +11099,9 @@ final class AppModel: ObservableObject {
                 }
             }
             authenticatedAppReviewDemoOwnerID = demoFence.projectedOwnerID
+            // Publish the new in-memory decision before the protected receipt write suspends. In
+            // particular, an authoritative withdrawal must close every UI/send gate immediately;
+            // removing the durable receipt below preserves that result across the next launch.
             capabilities = discovered
             if let expectedDeferredFeatureScope {
                 messagingDeferredFeatureSnapshot.confirm(
@@ -10786,10 +11111,43 @@ final class AppModel: ObservableObject {
                     for: expectedDeferredFeatureScope
                 )
             }
+            if let expectedDeferredFeatureScope {
+                let receipt = MessagingOfflineDirectCreationCapabilityReceipt(
+                    ownerUserID: expectedDeferredFeatureScope.userID,
+                    sessionID: expectedDeferredFeatureScope.sessionID,
+                    authoritativeCapabilities: discovered,
+                    accountMutationsAllowed: !demoFence.keepsTransportFenceAfterProjection
+                )
+                do {
+                    let decisionCommitted = try await store
+                        .commitMessagingOfflineDirectCreationCapabilityDecision(
+                            receipt,
+                            request: offlineDirectCapabilityRequest
+                        )
+                    // Another accepted response or account/session lifetime reached the protected
+                    // store first. It is authoritative; this completion must not publish or undo it.
+                    guard decisionCommitted else { return false }
+                } catch {
+                    // The live response below remains authoritative for this process. No new
+                    // durable grant exists unless the protected-state write actually committed.
+                }
+                guard await capabilitiesContextIsCurrent(
+                          accountEpoch: expectedAccountEpoch,
+                          sessionID: expectedSessionID
+                      ), capabilitiesRequestTracker.accepts(
+                          requestGeneration,
+                          cancelled: false
+                      )
+                else { return false }
+            }
             await publishLatestState()
             if !demoFence.keepsTransportFenceAfterProjection {
                 await api.setAppReviewDemoReadOnly(false, sessionID: expectedSessionID)
             }
+            // A notification tap may have arrived while capability discovery was unavailable.
+            // The accepted, session-bound response is the authoritative wake for that durable
+            // route; replay now instead of waiting for another foreground or connectivity event.
+            await ClaimablePaymentNotificationActionDispatcher.shared.replayPending()
             return true
         } catch {
             guard await capabilitiesContextIsCurrent(
@@ -11458,6 +11816,15 @@ final class AppModel: ObservableObject {
                 guard available else { return false }
             }
         }
+        // A shared first-contact composer deliberately has no durable conversation yet. Its
+        // staged inbox batch and protected media files remain the draft; writing an empty thread
+        // here would break the atomic conversation+message+outbox boundary. Explicit Send passes
+        // the same draft facts into the queue transaction, which becomes their first state row.
+        if sharedInboxProvisionalRecipient(
+            conversationID: canonicalConversationID
+        ) != nil {
+            return true
+        }
         do {
             try Task.checkCancellation()
             try await store.update { persisted in
@@ -11905,6 +12272,17 @@ final class AppModel: ObservableObject {
             }
             recipientUserID = recipientUUID.uuidString.lowercased()
         }
+        let provisionalRecipient = sharedInboxProvisionalRecipient(
+            conversationID: cleanConversationId
+        )
+        if let provisionalRecipient {
+            guard submissionKind == .userText,
+                  recipientUserID == provisionalRecipient
+            else {
+                lastError = messagingSendFailureMessage
+                return false
+            }
+        }
         guard let userID = profile?.id else {
             lastError = "Choose one valid Kit Pay recipient."
             return false
@@ -11953,6 +12331,7 @@ final class AppModel: ObservableObject {
                     draftClearVersion: draftClearVersion,
                     deliverAt: deliverAt,
                     replyToServerMessageID: replyTarget,
+                    provisionalDirectRecipientUserID: provisionalRecipient,
                     commitAdmission: commitAdmission
                 )
             }
@@ -13238,6 +13617,196 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private struct DirectMediaQueueTarget {
+        let conversationID: String
+        let provisionalRecipientUserID: String?
+    }
+
+    /// Chooses a first-contact media destination without creating an empty chat. The reviewed
+    /// capability yields only an in-memory UUID; the media queue transaction is the first durable
+    /// write. Older servers retain their authenticated create-before-queue behavior.
+    private func directMediaQueueTarget(
+        recipientId: String,
+        title: String
+    ) async -> DirectMediaQueueTarget? {
+        let rawRecipientID = recipientId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !AppReviewDemoMutationPolicy.peerIsReadOnly(
+            rawRecipientID,
+            isDemoActive: appReviewDemoIsActive
+        ) else {
+            lastError = AppReviewDemoMutationPolicy.readOnlyMessage
+            return nil
+        }
+        guard let recipientUUID = UUID(uuidString: rawRecipientID),
+              !cleanTitle.isEmpty,
+              let rawUserID = profile?.id,
+              let userUUID = UUID(uuidString: rawUserID),
+              secureMessagingLocalQueueAvailable
+        else {
+            lastError = messagingSendFailureMessage
+            return nil
+        }
+        let recipient = recipientUUID.uuidString.lowercased()
+        let userID = userUUID.uuidString.lowercased()
+        let route = NewMessageComposerPolicy.directRoute(
+            conversations: state.conversations,
+            currentUserID: userID,
+            recipientUserID: recipient,
+            privacyAllowsLocalQueue: communicationPrivacyAllowsLocalQueue(to: recipient)
+        )
+        switch route {
+        case .existing(let conversation):
+            return DirectMediaQueueTarget(
+                conversationID: conversation.id,
+                provisionalRecipientUserID: nil
+            )
+        case .blocked:
+            lastError = "Unblock this account before starting a chat."
+            return nil
+        case .invalid:
+            lastError = messagingSendFailureMessage
+            return nil
+        case .create:
+            break
+        }
+
+        if messagingOfflineDirectCreationLocalQueueEnabled {
+            return DirectMediaQueueTarget(
+                conversationID: UUID().uuidString.lowercased(),
+                provisionalRecipientUserID: recipient
+            )
+        }
+
+        guard isOnline else {
+            lastError = "Connect to the internet once to start this conversation."
+            return nil
+        }
+        guard secureMessagingReleasePermitted else {
+            lastError = messagingSendFailureMessage
+            return nil
+        }
+        if let denial = communicationPrivacyDenialMessage(
+            for: recipient,
+            blockedMessage: "Unblock this account before starting a chat."
+        ) {
+            lastError = denial
+            return nil
+        }
+        let expectedAccountEpoch = accountEpoch
+        guard let commitAdmission = ProtectedCommunicationAdmissionGate.shared.lease(
+            forAccountID: userID
+        ), let expectedSessionID = await sessions.current()?.sessionId,
+              await outboxContextIsCurrent(
+                  accountEpoch: expectedAccountEpoch,
+                  userID: userID,
+                  sessionID: expectedSessionID,
+                  commitAdmission: commitAdmission
+              )
+        else { return nil }
+        do {
+            let created = try await SecureMessagingActivationBinding.withAuthenticatedScope(
+                accountGeneration: expectedAccountEpoch,
+                sessionID: expectedSessionID,
+                commitAdmission: commitAdmission
+            ) {
+                try await SecureMessagingExchangeCoordinator.shared.ensureDirectConversation(
+                    forUserID: userID,
+                    recipientUserID: recipient,
+                    title: cleanTitle,
+                    commitAdmission: commitAdmission
+                )
+            }
+            guard ProtectedCommunicationAdmissionGate.shared.permits(commitAdmission),
+                  await outboxContextIsCurrent(
+                      accountEpoch: expectedAccountEpoch,
+                      userID: userID,
+                      sessionID: expectedSessionID
+                  )
+            else { return nil }
+            await publishLatestState()
+            return DirectMediaQueueTarget(
+                conversationID: created.id,
+                provisionalRecipientUserID: nil
+            )
+        } catch is CancellationError {
+            return nil
+        } catch {
+            guard await outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: userID,
+                sessionID: expectedSessionID
+            ) else { return nil }
+            lastError = error.localizedDescription
+            return nil
+        }
+    }
+
+    /// First-contact counterpart to `queueMediaMessage`. The stable client message ID and, when
+    /// supported, provisional conversation UUID are minted before any suspension. No text
+    /// bootstrap is created; caption and attachment remain one media message.
+    @discardableResult
+    func queueDirectMediaMessage(
+        recipientId: String,
+        title: String,
+        mediaData: Data?,
+        mediaType: String,
+        caption: String?,
+        localMediaID: UUID? = nil,
+        plaintextByteSize: Int? = nil,
+        localStorageKind: LocalMediaRecord.LocalStorageKind? = nil,
+        duration: TimeInterval? = nil,
+        preprocessingJob: LocalMediaPreprocessingJob? = nil,
+        clientMessageID: UUID? = nil
+    ) async -> Bool {
+        let stableMessageID = clientMessageID ?? UUID()
+        guard let target = await directMediaQueueTarget(
+            recipientId: recipientId,
+            title: title
+        ) else { return false }
+        return await queueMediaMessage(
+            conversationId: target.conversationID,
+            title: title,
+            recipientId: recipientId,
+            mediaData: mediaData,
+            mediaType: mediaType,
+            caption: caption,
+            localMediaID: localMediaID,
+            plaintextByteSize: plaintextByteSize,
+            localStorageKind: localStorageKind,
+            duration: duration,
+            preprocessingJob: preprocessingJob,
+            clientMessageID: stableMessageID,
+            provisionalDirectRecipientUserID: target.provisionalRecipientUserID
+        )
+    }
+
+    /// First-contact counterpart for one 2–8 attachment message. The batch caption, message ID,
+    /// media IDs and provisional conversation ID all remain stable through outbox replay.
+    @discardableResult
+    func queueDirectMediaMessageBatch(
+        recipientId: String,
+        title: String,
+        attachments: [LocalMediaQueueAttachment],
+        rawCaption: String?,
+        clientMessageID: UUID? = nil
+    ) async -> Bool {
+        let stableMessageID = clientMessageID ?? UUID()
+        guard let target = await directMediaQueueTarget(
+            recipientId: recipientId,
+            title: title
+        ) else { return false }
+        return await queueMediaMessageBatch(
+            conversationId: target.conversationID,
+            title: title,
+            recipientId: recipientId,
+            attachments: attachments,
+            rawCaption: rawCaption,
+            clientMessageID: stableMessageID,
+            provisionalDirectRecipientUserID: target.provisionalRecipientUserID
+        )
+    }
+
     /// Sends any allowed media kind (photo, voice note, video, document) end-to-end encrypted.
     /// Every plaintext original is retained in the account-scoped encrypted file cache under
     /// its permanent client media id; small v1 rows may additionally carry an inline copy.
@@ -13259,7 +13828,8 @@ final class AppModel: ObservableObject {
         submittedDraftMediaAttachments: [ConversationDraftMediaAttachment]? = nil,
         draftClearVersion: ConversationDraftWriteVersion? = nil,
         deliverAt: Date? = nil,
-        replyToServerMessageID: String? = nil
+        replyToServerMessageID: String? = nil,
+        provisionalDirectRecipientUserID: String? = nil
     ) async -> Bool {
         guard !isReadOnlyAppReviewDemoConversation(conversationId) else {
             lastError = "This App Review preview is read-only."
@@ -13327,6 +13897,20 @@ final class AppModel: ObservableObject {
                 return false
             }
             recipientUserID = recipientUUID.uuidString.lowercased()
+        }
+        let inferredSharedRecipient = sharedInboxProvisionalRecipient(
+            conversationID: cleanConversationId
+        )
+        let provisionalRecipient = provisionalDirectRecipientUserID
+            ?? inferredSharedRecipient
+        if let provisionalRecipient {
+            guard messagingOfflineDirectCreationLocalQueueEnabled,
+                  !isGroupTarget,
+                  recipientUserID == provisionalRecipient
+            else {
+                lastError = "Connect to the internet once to start this conversation."
+                return false
+            }
         }
         guard let userID = profile?.id else {
             lastError = "Choose one valid Kit Pay recipient."
@@ -13449,6 +14033,7 @@ final class AppModel: ObservableObject {
                     draftClearVersion: draftClearVersion,
                     deliverAt: deliverAt,
                     replyToServerMessageID: replyTarget,
+                    provisionalDirectRecipientUserID: provisionalRecipient,
                     commitAdmission: commitAdmission
                 )
             }
@@ -13500,7 +14085,8 @@ final class AppModel: ObservableObject {
         submittedDraftMediaAttachments: [ConversationDraftMediaAttachment]? = nil,
         draftClearVersion: ConversationDraftWriteVersion? = nil,
         deliverAt: Date? = nil,
-        replyToServerMessageID: String? = nil
+        replyToServerMessageID: String? = nil,
+        provisionalDirectRecipientUserID: String? = nil
     ) async -> Bool {
         guard !isReadOnlyAppReviewDemoConversation(conversationId) else {
             lastError = "This App Review preview is read-only."
@@ -13584,6 +14170,20 @@ final class AppModel: ObservableObject {
                 return false
             }
             recipientUserID = recipientUUID.uuidString.lowercased()
+        }
+        let inferredSharedRecipient = sharedInboxProvisionalRecipient(
+            conversationID: cleanConversationId
+        )
+        let provisionalRecipient = provisionalDirectRecipientUserID
+            ?? inferredSharedRecipient
+        if let provisionalRecipient {
+            guard messagingOfflineDirectCreationLocalQueueEnabled,
+                  !isGroupTarget,
+                  recipientUserID == provisionalRecipient
+            else {
+                lastError = "Connect to the internet once to start this conversation."
+                return false
+            }
         }
         guard let userID = profile?.id else {
             lastError = "Choose one valid Kit Pay recipient."
@@ -13728,6 +14328,7 @@ final class AppModel: ObservableObject {
                     draftClearVersion: draftClearVersion,
                     deliverAt: deliverAt,
                     replyToServerMessageID: replyTarget,
+                    provisionalDirectRecipientUserID: provisionalRecipient,
                     commitAdmission: commitAdmission
                 )
             }
@@ -14853,9 +15454,11 @@ final class AppModel: ObservableObject {
     /// parked there at queue time and copied under the server storage key at each upload
     /// checkpoint, and no server copy is bound to the message before the seal. A sealed item
     /// tries the cache first, then downloads through the coordinator's verifying open path and
-    /// caches the result under the item's storage key for offline rereads. Batch items are never
-    /// stored inline on the message: `attachmentData` is the single-attachment v1 slot, and one
-    /// wallet-state rewrite must not carry up to eight large blobs with it.
+    /// caches the result under the item's storage key for offline rereads. Received videos are
+    /// stricter: any legacy sealed cache hit is promoted to a leased protected file in the same
+    /// call and is never returned as whole-file Data. Batch items are never stored inline on the
+    /// message: `attachmentData` is the single-attachment v1 slot, and one wallet-state rewrite
+    /// must not carry up to eight large blobs with it.
     ///
     /// `allowsDownload` false serves only bytes that are already local (the row's inline slot or
     /// the encrypted cache) and throws before touching the network otherwise — incidental
@@ -14915,6 +15518,8 @@ final class AppModel: ObservableObject {
             remoteStorageKey: mediaIdentity.remoteKey,
             in: snapshot.messages
         )
+        let isReceivedVideo = !resolvedMessage.isOutgoing
+            && KitChatMediaKind(mediaType: mediaIdentity.type) == .video
         func currentResolution() async -> SecureMediaLoadPolicy.Resolved? {
             // Ownership first: an account switch during an await swaps the whole persisted
             // state, and a colliding identity in the successor state must not vouch for bytes
@@ -14927,6 +15532,31 @@ final class AppModel: ObservableObject {
                 itemIndex: itemIndex,
                 in: current.messages
             )
+        }
+        func recoverCachedReceivedVideoAsProtectedFile(
+            storageKey: String,
+            caption: String?
+        ) async throws -> SecureMediaLoadPolicy.LoadedItem? {
+            let recovered = try await ReceivedVideoCachedBlobRecovery.recover(
+                store: store,
+                cache: .shared,
+                userID: userID,
+                messageID: messageID,
+                conversationID: conversationId,
+                itemIndex: itemIndex,
+                expectedResolution: resolved,
+                expectedRecord: localRecord,
+                messageIsOutgoing: resolvedMessage.isOutgoing,
+                attachmentID: mediaIdentity.id,
+                storageKey: storageKey,
+                mediaType: mediaIdentity.type,
+                byteCount: mediaIdentity.size,
+                caption: caption
+            )
+            if recovered != nil {
+                await publishLatestState()
+            }
+            return recovered
         }
         func localRecordStillOwns(_ storageKey: String) async -> Bool {
             let current = await store.snapshot()
@@ -15216,7 +15846,8 @@ final class AppModel: ObservableObject {
                 accessLease: accessLease
             ))
         }
-        if let localRecord,
+        if !isReceivedVideo,
+           let localRecord,
            localRecord.localStorageKind == .encryptedBlob,
            let localStorageKey = localRecord.localStorageKey,
            let local = await SecureMediaFileCache.shared.data(
@@ -15238,6 +15869,9 @@ final class AppModel: ObservableObject {
         }
         switch resolved {
         case .pendingSingle(let pending):
+            guard !isReceivedVideo else {
+                throw SecureMediaAttachmentError.invalidDescriptor
+            }
             if let inline = pending.inlineData {
                 return SecureMediaLoadPolicy.LoadedItem(
                     data: inline,
@@ -15260,6 +15894,9 @@ final class AppModel: ObservableObject {
             )
 
         case .pendingBatchItem(let batch, _, let itemIndex):
+            guard !isReceivedVideo else {
+                throw SecureMediaAttachmentError.invalidDescriptor
+            }
             let item = batch.items[itemIndex]
             for key in [item.localStorageKey, item.storageKey].compactMap({ $0 }) {
                 if let cached = await SecureMediaFileCache.shared.data(
@@ -15278,7 +15915,14 @@ final class AppModel: ObservableObject {
 
         case .sealedBatchItem(let descriptor, _, let itemIndex):
             let item = descriptor.items[itemIndex]
-            if let cached = await SecureMediaFileCache.shared.data(
+            if let recovered = try await recoverCachedReceivedVideoAsProtectedFile(
+                storageKey: item.storageKey,
+                caption: nil
+            ) {
+                return recovered
+            }
+            if !isReceivedVideo,
+               let cached = await SecureMediaFileCache.shared.data(
                 forStorageKey: item.storageKey,
                 userID: userID
             ), cached.count == item.plaintextByteSize,
@@ -15429,7 +16073,14 @@ final class AppModel: ObservableObject {
                 }
                 return false
             }
-            if let cached = await SecureMediaFileCache.shared.data(
+            if let recovered = try await recoverCachedReceivedVideoAsProtectedFile(
+                storageKey: descriptor.storageKey,
+                caption: descriptor.caption
+            ) {
+                return recovered
+            }
+            if !isReceivedVideo,
+               let cached = await SecureMediaFileCache.shared.data(
                 forStorageKey: descriptor.storageKey,
                 userID: userID
             ), cached.count == descriptor.plaintextByteSize,
@@ -15583,7 +16234,7 @@ final class AppModel: ObservableObject {
             return nil
         }
         let allowsProvisionalConversationCreation =
-            capabilities?.enablesMessagingOfflineDirectCreation == true
+            messagingOfflineDirectCreationLocalQueueEnabled
         if existingConversation == nil, !allowsProvisionalConversationCreation {
             guard isOnline else {
                 lastError = "Connect to the internet once to start this conversation."
@@ -19771,12 +20422,24 @@ final class AppModel: ObservableObject {
             accountID: accountID,
             provider: provider,
             token: token
-        ) { [api] in
+        ) { [weak self, api] in
+            guard let self,
+                  await self.outboxContextIsCurrent(
+                    accountEpoch: expectedAccountEpoch,
+                    userID: accountID,
+                    sessionID: expectedSessionID
+                  )
+            else { throw CancellationError() }
             let result = try await APIClientSessionBinding.$sessionID.withValue(
                 expectedSessionID
             ) {
                 try await api.registerPushToken(token, provider: provider)
             }
+            guard await self.outboxContextIsCurrent(
+                accountEpoch: expectedAccountEpoch,
+                userID: accountID,
+                sessionID: expectedSessionID
+            ) else { throw CancellationError() }
             return result.registered == true
         }
     }

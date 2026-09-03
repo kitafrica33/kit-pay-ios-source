@@ -98,10 +98,13 @@ and Apple Liquid Glass.
   transfers after 7 days, and push-notify both parties. Claim-state APNs alerts use category
   `africa.kit.pay.payment.claimable` and interruption level `time-sensitive`; they remain subject
   to the customer's notification permission and Focus settings and never use critical-alert
-  privileges. The main App ID/profile must therefore authorize Time Sensitive Notifications,
-  while the share extension must not. The sender's device also records expiry once with a
-  deterministic encrypted receipt. Without the flag, transfers settle immediately and use
-  `sent`; no claim action is exposed.
+  privileges. Default taps are durably journaled before iOS releases the notification response,
+  bound to the first proven account, and routed only after an exact authenticated claim lookup;
+  failed cold-launch/offline routes remain pending and cannot migrate to a replacement session.
+  The main App ID/profile must therefore authorize Time Sensitive Notifications, while the share
+  extension must not. The sender's device also records expiry once with a deterministic encrypted
+  receipt. Without the flag, transfers settle immediately and use `sent`; no claim action is
+  exposed.
   Financial chat cards use deterministic message IDs, so retries cannot duplicate them. Before
   each immediate transfer, payment-request create/pay/cancel, group-payment create, or group-
   request contribution POST, iOS durably stores the exact account-bound financial/chat intent

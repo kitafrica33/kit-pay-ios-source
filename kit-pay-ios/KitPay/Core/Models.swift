@@ -846,6 +846,79 @@ struct MessagingOfflineDirectCreationCapabilityDTO: Decodable, Equatable {
     }
 }
 
+/// Durable evidence of the last authenticated decision for locally creating a direct thread.
+/// The protected state that carries this receipt is account-bound, and the duplicated owner and
+/// session generation prevent a copied, stale, or replacement-account projection from becoming
+/// authority. The reviewed contract identifiers are recorded as a schema fence so a future wire
+/// profile cannot accidentally inherit an older approval.
+struct MessagingOfflineDirectCreationCapabilityReceipt: Codable, Equatable, Sendable {
+    private static let currentFormatVersion = 1
+
+    let ownerUserID: String
+    let sessionID: String
+    private let formatVersion: Int
+    private let contractProfile: String
+    private let requestField: String
+
+    init?(
+        ownerUserID rawOwnerUserID: String,
+        sessionID rawSessionID: String,
+        authoritativeCapabilities: CapabilitiesDTO,
+        accountMutationsAllowed: Bool
+    ) {
+        guard accountMutationsAllowed,
+              authoritativeCapabilities.enablesMessagingOfflineDirectCreation,
+              let ownerUserID = Self.canonicalUUID(rawOwnerUserID),
+              let sessionID = Self.canonicalUUID(rawSessionID)
+        else { return nil }
+        self.ownerUserID = ownerUserID
+        self.sessionID = sessionID
+        formatVersion = Self.currentFormatVersion
+        contractProfile = MessagingOfflineDirectCreationCapabilityDTO.reviewedProfile
+        requestField = MessagingOfflineDirectCreationCapabilityDTO.reviewedRequestField
+    }
+
+    /// Returns nil for a receipt that is malformed, belongs to another credential generation,
+    /// or names a superseded contract. Only an exact affirmative decision grants local creation.
+    func decision(ownerUserID rawOwnerUserID: String, sessionID rawSessionID: String) -> Bool? {
+        guard formatVersion == Self.currentFormatVersion,
+              contractProfile == MessagingOfflineDirectCreationCapabilityDTO.reviewedProfile,
+              requestField == MessagingOfflineDirectCreationCapabilityDTO.reviewedRequestField,
+              let ownerUserID = Self.canonicalUUID(rawOwnerUserID),
+              let sessionID = Self.canonicalUUID(rawSessionID),
+              self.ownerUserID == ownerUserID,
+              self.sessionID == sessionID
+        else { return nil }
+        return true
+    }
+
+    private static func canonicalUUID(_ rawValue: String) -> String? {
+        let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard value == rawValue, let uuid = UUID(uuidString: value) else { return nil }
+        return uuid.uuidString.lowercased()
+    }
+}
+
+/// Resolves the UI and protected-outbox gate. A live authenticated projection always wins; only
+/// its exact durable receipt may bridge a cold launch or transient refresh failure. Absence is a
+/// denial, so a fresh installation/account never learns authorization from device defaults.
+enum MessagingOfflineDirectCreationCapabilityPolicy {
+    static func allowsLocalQueue(
+        authoritativeCapabilities: CapabilitiesDTO?,
+        receipt: MessagingOfflineDirectCreationCapabilityReceipt?,
+        in scope: MessagingDeferredFeatureScope?
+    ) -> Bool {
+        guard let scope else { return false }
+        if let authoritativeCapabilities {
+            return authoritativeCapabilities.enablesMessagingOfflineDirectCreation
+        }
+        return receipt?.decision(
+            ownerUserID: scope.userID,
+            sessionID: scope.sessionID
+        ) == true
+    }
+}
+
 /// Fail-closed advertisement for the ciphertext-offset upload protocol. The fixed chunk ceiling
 /// is part of the reviewed wire contract, not a server tuning hint: accepting a larger value
 /// could defeat the client's bounded-memory guarantee.
@@ -2984,6 +3057,23 @@ enum CustomerTransactionPresentationPolicy {
         return .replace(presented)
     }
 
+    /// Applies a decoded history page one row at a time. The endpoint is a customer activity
+    /// feed, so one malformed optional claim or one future/malformed row must not erase every
+    /// independently valid movement in the same HTTP 200 response. Core financial fields remain
+    /// strict in `WalletHistoryTransaction`; this boundary still filters unsupported/internal
+    /// types, wrong-wallet rows, wrong currencies, and invalid customer totals before persistence.
+    /// A response containing rows but no safe row preserves the last-known-good projection,
+    /// while a genuinely empty response remains authoritative and clears it.
+    static func pageReplacement(
+        for page: TransactionPage,
+        wallet: Wallet
+    ) -> PageReplacement {
+        guard page.sourceItemCount > 0 else { return .replace([]) }
+        let presented = customerVisibleTransactions(page.items, for: wallet)
+        guard !presented.isEmpty else { return .preserveLastGood }
+        return .replace(presented)
+    }
+
     /// Revalidates a transaction carried by navigation state before a detail screen renders it.
     /// Navigation can outlive a wallet switch or cache migration, so it is not an authority.
     static func customerVisibleTransaction(
@@ -3151,9 +3241,102 @@ struct CursorPage: Codable, Hashable, Sendable {
     }
 }
 
+/// A wallet-history row has a strict financial core and best-effort presentation/action metadata.
+///
+/// A malformed claim must fail closed as a claim (no action buttons), not fail the surrounding
+/// money movement. The direct transfer/claim endpoints continue decoding `WalletTransaction`
+/// strictly; this relaxed boundary exists only for the read-only history collection.
+private struct WalletHistoryTransaction: Decodable {
+    let value: WalletTransaction
+
+    private enum CodingKeys: String, CodingKey {
+        case id, reference, amount, totals, currency, type, direction, status, counterparty, note
+        case claim
+        case walletId = "wallet_id"
+        case occurredAt = "occurred_at"
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        value = WalletTransaction(
+            id: try values.decode(String.self, forKey: .id),
+            walletId: try values.decode(String.self, forKey: .walletId),
+            reference: try values.decode(String.self, forKey: .reference),
+            amount: try values.decode(String.self, forKey: .amount),
+            totals: try values.decode(CustomerTransactionTotals.self, forKey: .totals),
+            currency: try values.decode(CurrencyDTO.self, forKey: .currency),
+            type: try values.decode(String.self, forKey: .type),
+            direction: try values.decode(String.self, forKey: .direction),
+            status: try values.decode(String.self, forKey: .status),
+            counterparty: Self.decodeOptionalPresentationField(
+                Counterparty.self,
+                forKey: .counterparty,
+                from: values
+            ),
+            note: Self.decodeOptionalPresentationField(
+                String.self,
+                forKey: .note,
+                from: values
+            ),
+            claim: Self.decodeOptionalPresentationField(
+                TransferAcceptanceDTO.self,
+                forKey: .claim,
+                from: values
+            ),
+            occurredAt: try values.decode(String.self, forKey: .occurredAt)
+        )
+    }
+
+    private static func decodeOptionalPresentationField<Value: Decodable>(
+        _ type: Value.Type,
+        forKey key: CodingKeys,
+        from values: KeyedDecodingContainer<CodingKeys>
+    ) -> Value? {
+        do {
+            return try values.decodeIfPresent(type, forKey: key)
+        } catch {
+            // Optional display/action metadata is quarantined independently. In particular, a
+            // malformed claim cannot authorize an action because it is represented as nil.
+            return nil
+        }
+    }
+}
+
+private struct LossyWalletHistoryTransaction: Decodable {
+    let value: WalletTransaction?
+
+    init(from decoder: Decoder) throws {
+        do {
+            value = try WalletHistoryTransaction(from: decoder).value
+        } catch {
+            value = nil
+        }
+    }
+}
+
 struct TransactionPage: Decodable {
     let items: [WalletTransaction]
     let page: CursorPage
+    /// Number of JSON elements supplied by the server, including rows rejected by strict core
+    /// decoding. This distinguishes a legitimate empty page from a nonempty unusable response.
+    let sourceItemCount: Int
+    let rejectedItemCount: Int
+
+    private enum CodingKeys: String, CodingKey {
+        case items, page
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        let decodedRows = try values.decode(
+            [LossyWalletHistoryTransaction].self,
+            forKey: .items
+        )
+        items = decodedRows.compactMap(\.value)
+        sourceItemCount = decodedRows.count
+        rejectedItemCount = decodedRows.count - items.count
+        page = try values.decode(CursorPage.self, forKey: .page)
+    }
 }
 
 struct ContactListDTO: Decodable, Sendable {
@@ -6404,6 +6587,11 @@ struct PersistedState: Codable {
     /// It permits cached chats and call history to remain visible offline; every financial or
     /// network mutation still performs its ordinary live authorization checks.
     var sessionAssurance: SessionAssuranceDTO?
+    /// Last authenticated authorization for idempotent local direct-thread creation. This
+    /// is used only while the live capabilities projection is unavailable and only by its exact
+    /// account/session owner. Optional keeps state from older builds fail-closed and decodable.
+    var messagingOfflineDirectCreationCapabilityReceipt:
+        MessagingOfflineDirectCreationCapabilityReceipt?
     var wallets: [Wallet] = []
     /// Server-confirmed active installations for the authenticated account. Optional keeps
     /// encrypted state from older builds backward-decodable and is cleared with session data.
@@ -6517,6 +6705,7 @@ struct PersistedState: Codable {
             || pendingAccountDiscoveryChoice != nil
             || communicationPrivacy != nil
             || sessionAssurance != nil
+            || messagingOfflineDirectCreationCapabilityReceipt != nil
             || !conversations.isEmpty
             || groupProjectionUpdatedAt?.isEmpty == false
             || conversationDrafts?.isEmpty == false
