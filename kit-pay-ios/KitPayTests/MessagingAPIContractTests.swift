@@ -1312,6 +1312,7 @@ final class MessagingAPIContractTests: XCTestCase {
     func testDirectConversationAndReceiptIDsMustBeCanonical() throws {
         let direct = try CreateDirectMessagingConversationRequest(memberId: recipientDeviceId)
         let object = try jsonObject(direct)
+        XCTAssertEqual(Set(object.keys), ["member_ids", "type"])
         XCTAssertEqual(object["member_ids"] as? [String], [recipientDeviceId])
         XCTAssertEqual(object["type"] as? String, "direct")
 
@@ -1322,6 +1323,138 @@ final class MessagingAPIContractTests: XCTestCase {
         )
         XCTAssertThrowsError(
             try AcknowledgeMessageDeliveryRequest(messageIds: [messageId, messageId])
+        )
+    }
+
+    func testDirectConversationClientIdentityIsAnAdditiveCanonicalUUIDv4Field() throws {
+        // Include a hexadecimal letter so the uppercase rejection below is a genuinely
+        // different, non-canonical wire value rather than the same all-numeric UUID.
+        let clientConversationID = "4a444444-4444-4444-8444-444444444444"
+        let request = try CreateDirectMessagingConversationRequest(
+            memberId: recipientDeviceId,
+            clientConversationId: clientConversationID
+        )
+        let object = try jsonObject(request)
+
+        XCTAssertEqual(Set(object.keys), ["client_conversation_id", "member_ids", "type"])
+        XCTAssertEqual(object["client_conversation_id"] as? String, clientConversationID)
+        XCTAssertEqual(object["member_ids"] as? [String], [recipientDeviceId])
+        XCTAssertEqual(object["type"] as? String, "direct")
+
+        for rejected in [
+            clientConversationID.uppercased(),
+            "44444444-4444-1444-8444-444444444444",
+            "44444444-4444-4444-7444-444444444444",
+            "not-a-uuid",
+        ] {
+            XCTAssertThrowsError(try CreateDirectMessagingConversationRequest(
+                memberId: recipientDeviceId,
+                clientConversationId: rejected
+            ))
+        }
+
+        let group = try CreateDirectMessagingConversationRequest(
+            groupMemberIds: [
+                recipientDeviceId,
+                "55555555-5555-4555-8555-555555555555",
+            ],
+            title: "Trip"
+        )
+        XCTAssertNil(try jsonObject(group)["client_conversation_id"])
+    }
+
+    func testOfflineDirectCreationRequiresTheExactReviewedCapability() throws {
+        func capabilities(
+            feature: Any = true,
+            block: Any? = [
+                "profile": "kit-direct-conversation-v1",
+                "ready": true,
+                "request_field": "client_conversation_id",
+                "canonical_id_on_create": true,
+                "existing_pair_wins": true,
+            ]
+        ) throws -> CapabilitiesDTO {
+            var messaging: [String: Any] = [
+                "ready": true,
+                "version": SecureMessagingWire.protocolVersion,
+                "suite": SecureMessagingWire.protocolSuite,
+                "post_quantum": true,
+            ]
+            if let block { messaging["offline_direct_creation"] = block }
+            return try decode(CapabilitiesDTO.self, object: [
+                "api_version": "v1",
+                "currency": ["code": "UGX", "scale": "2"],
+                "features": ["messaging": feature],
+                "protocols": ["messaging": messaging],
+            ])
+        }
+
+        XCTAssertTrue(try capabilities().enablesMessagingOfflineDirectCreation)
+        XCTAssertFalse(try capabilities(feature: false).enablesMessagingOfflineDirectCreation)
+        XCTAssertFalse(try capabilities(block: nil).enablesMessagingOfflineDirectCreation)
+        XCTAssertFalse(try capabilities(block: [
+            "profile": "kit-direct-conversation-v2",
+            "ready": true,
+            "request_field": "client_conversation_id",
+            "canonical_id_on_create": true,
+            "existing_pair_wins": true,
+        ]).enablesMessagingOfflineDirectCreation)
+        XCTAssertFalse(try capabilities(block: [
+            "profile": "kit-direct-conversation-v1",
+            "ready": false,
+            "request_field": "client_conversation_id",
+            "canonical_id_on_create": true,
+            "existing_pair_wins": true,
+        ]).enablesMessagingOfflineDirectCreation)
+
+        let malformed = try capabilities(block: "not-an-object")
+        XCTAssertFalse(malformed.enablesMessagingOfflineDirectCreation)
+        XCTAssertEqual(malformed.protocols?.messaging?.supportsReviewedV2, true)
+    }
+
+    func testConversationDecodesStateWrittenBeforeProvisionalDirectFields() throws {
+        let original = Conversation(
+            id: conversationId,
+            title: "Existing conversation",
+            participantUserIds: [
+                "44444444-4444-4444-8444-444444444444",
+                "55555555-5555-4555-8555-555555555555",
+            ],
+            unreadCount: 1,
+            updatedAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        var object = try jsonObject(original)
+        object.removeValue(forKey: "pendingDirectRecipientUserID")
+        object.removeValue(forKey: "localConversationAliases")
+        let decoded = try decode(Conversation.self, object: object)
+
+        XCTAssertNil(decoded.pendingDirectRecipientUserID)
+        XCTAssertNil(decoded.localConversationAliases)
+        XCTAssertFalse(decoded.isProvisionalDirect)
+    }
+
+    func testPendingDeliveryPresentationIsExplicitAndOutgoingOnly() {
+        XCTAssertEqual(
+            MessageDeliveryPresentationPolicy.statusLabel(for: .queued, isOutgoing: true),
+            "Pending"
+        )
+        XCTAssertEqual(
+            MessageDeliveryPresentationPolicy.statusLabel(for: .encrypting, isOutgoing: true),
+            "Pending"
+        )
+        XCTAssertEqual(
+            MessageDeliveryPresentationPolicy.statusLabel(for: .sending, isOutgoing: true),
+            "Sending"
+        )
+        XCTAssertEqual(
+            MessageDeliveryPresentationPolicy.statusLabel(for: .failed, isOutgoing: true),
+            "Not sent"
+        )
+        XCTAssertNil(
+            MessageDeliveryPresentationPolicy.statusLabel(for: .sent, isOutgoing: true)
+        )
+        XCTAssertNil(
+            MessageDeliveryPresentationPolicy.statusLabel(for: .queued, isOutgoing: false)
         )
     }
 

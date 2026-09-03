@@ -3132,12 +3132,26 @@ final class AppModel: ObservableObject {
                 count += 1
             }
         }
+        let inlineReceivedMediaCompaction: LegacyInlineReceivedMediaCompaction?
+        if let restoredUserID = migratedState.profile?.id {
+            let prepared = await LegacyInlineReceivedMediaCompactionPolicy.prepare(
+                state: migratedState,
+                forUserID: restoredUserID,
+                cache: .shared,
+                now: mediaRecoveryDate
+            )
+            migratedState = prepared.state
+            inlineReceivedMediaCompaction = prepared
+        } else {
+            inlineReceivedMediaCompaction = nil
+        }
         if OutboxPolicy.quarantineMessagesWithoutServerConversation(in: &migratedState) > 0
             || ownerWasMigrated
             || removedLegacyCallAttempts > 0
             || hardenedCustomerTransactions > 0
             || hardenedFinancialChatReceiptRecovery
-            || recoveredLocalMediaRecords > 0 {
+            || recoveredLocalMediaRecords > 0
+            || inlineReceivedMediaCompaction?.didPromote == true {
             do {
                 try await store.replace(migratedState)
             } catch {
@@ -3147,6 +3161,14 @@ final class AppModel: ObservableObject {
             // Even if the best-effort rewrite fails, this process must never replay a legacy
             // durable call attempt. A later launch repeats the same fail-closed migration.
             restoredState = migratedState
+        }
+        // Cache originals stay eviction-leased through the complete state write. Once the store
+        // owns their `.protectedFile` records (or the write has failed and the inline rows remain
+        // authoritative), ordinary cache ownership and the age-gated orphan sweep take over.
+        if let inlineReceivedMediaCompaction {
+            await inlineReceivedMediaCompaction.releaseProtectedOriginalLeases(
+                using: .shared
+            )
         }
         // Queueing writes a protected original before committing its message/outbox row. A
         // process death in that narrow gap can therefore leave an orphan, but a concurrent or
@@ -14849,6 +14871,12 @@ final class AppModel: ObservableObject {
         guard let userID = snapshot.profile?.id else {
             throw SecureMessagingExchangeError.invalidAccount
         }
+        let matchingMessages = snapshot.messages.filter {
+            $0.id == messageID && $0.conversationId == conversationId
+        }
+        guard matchingMessages.count == 1, let resolvedMessage = matchingMessages.first else {
+            throw SecureMediaAttachmentError.invalidDescriptor
+        }
         guard let resolved = SecureMediaLoadPolicy.resolve(
             messageID: messageID,
             conversationId: conversationId,
@@ -15279,13 +15307,19 @@ final class AppModel: ObservableObject {
             // the identity-resolved row itself — nothing suspends between resolution and here.
             if let inlineData,
                KitChatMediaKind(mediaType: descriptor.mediaType) == .video,
-               let localRecord,
-               localRecord.direction == .received,
-               localRecord.localStorageKind == .encryptedState,
-               localRecord.localStorageKey == nil,
-               localRecord.remoteEncryptedObjectID == descriptor.storageKey,
-               localRecord.availabilityState == .localCached,
-               localRecord.downloadState == .downloaded {
+               !resolvedMessage.isOutgoing {
+                // Received video bytes must never reach AVPlayer as a retained Data value. A
+                // missing/mismatched local record means launch compaction could not authenticate
+                // the state transition; fail closed instead of entering the historical
+                // Data + decoder + whole-state rewrite crash path.
+                guard let localRecord,
+                      localRecord.direction == .received,
+                      localRecord.localStorageKind == .encryptedState,
+                      localRecord.localStorageKey == nil,
+                      localRecord.remoteEncryptedObjectID == descriptor.storageKey,
+                      localRecord.availabilityState == .localCached,
+                      localRecord.downloadState == .downloaded
+                else { throw SecureMediaAttachmentError.invalidDescriptor }
                 // Legacy receivers kept the complete decrypted video inside the encrypted state
                 // row. Returning that Data makes the player retain one whole movie while
                 // AVFoundation allocates its own decoder buffers, and every unrelated state
@@ -15421,9 +15455,10 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// A new direct chat first obtains its authenticated server UUID; an existing validated local
-    /// thread needs no network round trip. Both paths commit the bubble and protected outbox row
-    /// before activation or roster work. Never recreate the old `direct:<user-id>` placeholder.
+    /// A new direct chat mints a durable UUIDv4 locally only under the backend's exact
+    /// idempotent-create capability; otherwise it retains the legacy authenticated server-create
+    /// path. Both paths commit the bubble and protected outbox before activation or roster work.
+    /// Never recreate the old `direct:<user-id>` placeholder.
     @discardableResult
     func queueDirectMessage(
         recipientId: String,
@@ -15547,7 +15582,9 @@ final class AppModel: ObservableObject {
             lastError = messagingSendFailureMessage
             return nil
         }
-        if existingConversation == nil {
+        let allowsProvisionalConversationCreation =
+            capabilities?.enablesMessagingOfflineDirectCreation == true
+        if existingConversation == nil, !allowsProvisionalConversationCreation {
             guard isOnline else {
                 lastError = "Connect to the internet once to start this conversation."
                 return nil
@@ -15588,6 +15625,8 @@ final class AppModel: ObservableObject {
                     title: title,
                     text: trimmed,
                     clientMessageID: clientMessageID,
+                    allowsProvisionalConversationCreation:
+                        allowsProvisionalConversationCreation,
                     commitAdmission: commitAdmission
                 )
             }

@@ -154,4 +154,52 @@ final class VoiceNoteDraftPolicyTests: XCTestCase {
             [.previewing]
         )
     }
+
+    @MainActor
+    func testConversationPromotionKeepsTheSameVoiceDraftOwnerForReopen() {
+        let provisionalID = "30000000-0000-4000-8000-000000000201"
+        let authoritativeID = "30000000-0000-4000-8000-000000000202"
+        let registry = VoiceNoteDraftRegistry.shared
+        registry.release(provisionalID)
+        registry.release(authoritativeID)
+        defer {
+            registry.release(provisionalID)
+            registry.release(authoritativeID)
+        }
+
+        let mountedRecorder = registry.recorder(for: provisionalID)
+        XCTAssertTrue(registry.promote(
+            mountedRecorder,
+            from: provisionalID,
+            to: authoritativeID
+        ))
+
+        // Leaving and reopening resolves by the authoritative ID, but the exact recorder that
+        // owns the paused segments survives instead of leaving them stranded under the alias.
+        XCTAssertTrue(registry.recorder(for: authoritativeID) === mountedRecorder)
+    }
+
+    @MainActor
+    func testConversationPromotionDoesNotOverwriteAnotherRegisteredDraft() {
+        let provisionalID = "30000000-0000-4000-8000-000000000203"
+        let authoritativeID = "30000000-0000-4000-8000-000000000204"
+        let registry = VoiceNoteDraftRegistry.shared
+        registry.release(provisionalID)
+        registry.release(authoritativeID)
+        defer {
+            registry.release(provisionalID)
+            registry.release(authoritativeID)
+        }
+
+        let provisionalRecorder = registry.recorder(for: provisionalID)
+        let authoritativeRecorder = registry.recorder(for: authoritativeID)
+
+        XCTAssertFalse(registry.promote(
+            provisionalRecorder,
+            from: provisionalID,
+            to: authoritativeID
+        ))
+        XCTAssertTrue(registry.recorder(for: provisionalID) === provisionalRecorder)
+        XCTAssertTrue(registry.recorder(for: authoritativeID) === authoritativeRecorder)
+    }
 }

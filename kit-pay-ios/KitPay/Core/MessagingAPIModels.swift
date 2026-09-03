@@ -1106,6 +1106,13 @@ enum SecureMessagingWirePolicy {
         return uuid.uuidString.lowercased() == value
     }
 
+    static func isCanonicalUUIDv4(_ value: String) -> Bool {
+        guard isCanonicalUUID(value) else { return false }
+        let bytes = Array(value.utf8)
+        guard bytes.count == 36, bytes[14] == 0x34 else { return false }
+        return [UInt8(0x38), 0x39, 0x61, 0x62].contains(bytes[19])
+    }
+
     static func isRosterRevision(_ value: String) -> Bool {
         matches(value, pattern: #"^v1:sha256:[a-f0-9]{64}$"#)
     }
@@ -1657,14 +1664,22 @@ struct CreateDirectMessagingConversationRequest: Encodable, Equatable, Sendable 
     /// Present only for group creation. Synthesized `encodeIfPresent` keeps the direct-creation
     /// wire body byte-identical to earlier builds (no `title` key at all).
     let title: String?
+    /// Stable identity minted before the first direct-message bubble is committed locally.
+    /// Supporting servers use it for an idempotent create; older servers ignore the omitted
+    /// field because ordinary callers keep passing nil. A peer may have created the pair first,
+    /// so clients must still accept and reconcile a different authoritative response UUID.
+    let clientConversationId: String?
 
-    init(memberId: String) throws {
-        guard SecureMessagingWirePolicy.isCanonicalUUID(memberId) else {
+    init(memberId: String, clientConversationId: String? = nil) throws {
+        guard SecureMessagingWirePolicy.isCanonicalUUID(memberId),
+              clientConversationId.map(SecureMessagingWirePolicy.isCanonicalUUIDv4) ?? true
+        else {
             throw SecureMessagingContractError.invalid("direct-conversation member ID")
         }
         memberIds = [memberId]
         type = SecureMessagingWire.directConversationType
         title = nil
+        self.clientConversationId = clientConversationId
     }
 
     /// Group creation lists every OTHER member (the server adds the creator). Bounded to
@@ -1680,12 +1695,14 @@ struct CreateDirectMessagingConversationRequest: Encodable, Equatable, Sendable 
         memberIds = groupMemberIds
         type = SecureMessagingWire.groupConversationType
         self.title = cleanTitle
+        clientConversationId = nil
     }
 
     enum CodingKeys: String, CodingKey {
         case memberIds = "member_ids"
         case type
         case title
+        case clientConversationId = "client_conversation_id"
     }
 }
 

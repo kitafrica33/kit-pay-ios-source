@@ -722,6 +722,24 @@ final class ChatVideoPictureInPicture: NSObject {
             finishDeferredTeardown()
             return
         }
+        requestTerminalStop(for: controller)
+    }
+
+    /// Paging away from a video is terminal for that page, but must remain owner-scoped: a stale
+    /// page callback cannot stop a newer video's controller. The caller immediately offers its
+    /// teardown through `retainTeardown`; when start/stop is in flight, the delegate owns that
+    /// teardown until AVKit's terminal callback.
+    func stopForPageDeactivation(owner: AnyObject) {
+        guard ownerID == ObjectIdentifier(owner) else { return }
+        attachedPlayer?.pause()
+        guard let controller else {
+            finishDeferredTeardown()
+            return
+        }
+        requestTerminalStop(for: controller)
+    }
+
+    private func requestTerminalStop(for controller: AVPictureInPictureController) {
         synchronizeReportedTransition(for: controller)
         controller.canStartPictureInPictureAutomaticallyFromInline = false
         switch lifecycleIntent.terminalStopRequested(
@@ -772,18 +790,7 @@ final class ChatVideoPictureInPicture: NSObject {
     /// itself rather than sitting on the user's screen showing a frozen last frame.
     func stopForPlaybackEnd(owner: AnyObject) {
         guard ownerID == ObjectIdentifier(owner), let controller else { return }
-        synchronizeReportedTransition(for: controller)
-        controller.canStartPictureInPictureAutomaticallyFromInline = false
-        switch lifecycleIntent.terminalStopRequested(
-            isPictureInPictureActive: controller.isPictureInPictureActive
-        ) {
-        case .stopPictureInPicture:
-            controller.stopPictureInPicture()
-        case .waitForTransition:
-            break
-        case .releaseNow:
-            finishDeferredTeardown()
-        }
+        requestTerminalStop(for: controller)
     }
 
     /// Returning to Kit Pay while the viewer that started the video is still on screen puts

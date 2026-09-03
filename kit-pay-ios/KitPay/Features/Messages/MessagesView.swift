@@ -1477,8 +1477,9 @@ struct ConversationView: View {
     @Environment(\.dismiss) private var dismissConversation
     @StateObject private var callMedia = CallMediaCoordinator.shared
     @ObservedObject private var callTransport = CallMediaCoordinator.shared.media
-    let conversation: Conversation
+    @State private var conversation: Conversation
     private let mediaDiagnosticsProducerScope: LocalMediaDiagnosticProducerScope?
+    @State private var voiceRecorderRegistryConversationID: String
     @State private var draft = ""
     @State private var showPhotoPicker = false
     @State private var selectedPhotoItems: [PhotosPickerItem] = []
@@ -1525,6 +1526,7 @@ struct ConversationView: View {
     /// Only the scroll view knows this once it has taken the drag over, which it always does.
     @State private var isConversationScrollInteracting = false
     @State private var conversationContentHeight: CGFloat = 0
+    @State private var conversationContentMaxY: CGFloat = 0
     @State private var conversationViewportHeight: CGFloat = 0
     @State private var pendingScrollTargetMessageID: UUID?
     /// A notification, global result, or floating player can address one exact local message.
@@ -1586,8 +1588,9 @@ struct ConversationView: View {
     @FocusState private var isComposerFocused: Bool
 
     init(conversation: Conversation) {
-        self.conversation = conversation
+        _conversation = State(initialValue: conversation)
         mediaDiagnosticsProducerScope = LocalMediaPerformanceMonitor.shared.captureProducerScope()
+        _voiceRecorderRegistryConversationID = State(initialValue: conversation.id)
         _incomingSoundPolicy = State(
             initialValue: VisibleConversationSoundPolicy(conversationID: conversation.id)
         )
@@ -1612,7 +1615,7 @@ struct ConversationView: View {
         // not happened yet, and a bubble sitting among sent messages would read as if it had.
         let waiting = scheduledMessageIDs
         let visible = model.state.messages.filter {
-            $0.conversationId == conversation.id && !waiting.contains($0.id)
+            $0.conversationId == currentConversation.id && !waiting.contains($0.id)
         }
         let corrections = MessageEditAggregationPolicy.appliedEdits(in: visible)
         let instructions = MessageEditAggregationPolicy.suppressedMessageIDs(in: visible)
@@ -1636,14 +1639,15 @@ struct ConversationView: View {
     }
 
     private var currentConversation: Conversation {
-        model.state.conversations.first(where: {
-            $0.id.caseInsensitiveCompare(conversation.id) == .orderedSame
-        }) ?? conversation
+        let matches = model.state.conversations.filter {
+            $0.matchesLocalConversationID(conversation.id)
+        }
+        return matches.count == 1 ? matches[0] : conversation
     }
 
     private var scheduledItems: [ScheduledChatItem] {
         model.scheduledChatItems(
-            conversationID: conversation.id,
+            conversationID: currentConversation.id,
             at: AppPresentationClock.now
         )
     }
@@ -1659,6 +1663,7 @@ struct ConversationView: View {
 
     private var scheduledPaymentsEnabled: Bool {
         !isReadOnlyAppReviewPreview
+            && !currentConversation.isProvisionalDirect
             && !isGroupConversation
             && ScheduledPaymentPolicy(capabilities: model.capabilities).chatEnabled
     }
@@ -1683,7 +1688,7 @@ struct ConversationView: View {
 
     private var timelineItems: [ConversationTimelineItem] {
         ConversationTimelinePolicy.items(
-            for: conversation,
+            for: currentConversation,
             allConversations: model.state.conversations,
             currentUserID: model.profile?.id,
             messages: messages,
@@ -1995,7 +2000,7 @@ struct ConversationView: View {
             .environment(
                 \.voiceNoteChatContext,
                 VoiceNoteChatContext(
-                    conversationID: conversation.id,
+                    conversationID: currentConversation.id,
                     conversationTitle: currentConversation.title,
                     displayName: { participantDisplayName(for: $0) }
                 )
@@ -2005,6 +2010,12 @@ struct ConversationView: View {
     // MARK: Presence & typing
 
     private var isGroupConversation: Bool { currentConversation.isGroup }
+
+    /// Calls and money movement require a server-authoritative conversation UUID. Text and media
+    /// remain locally queueable while this first-contact thread is awaiting promotion.
+    private var isServerAddressableConversation: Bool {
+        !currentConversation.isProvisionalDirect
+    }
 
     /// "typing…" (or names in groups) — sourced from the realtime presence center; empty until
     /// the realtime transport is connected, never guessed.
@@ -2842,7 +2853,17 @@ struct ConversationView: View {
                 // iOS 17, where nothing else reports the release at all.
                 .simultaneousGesture(
                     DragGesture(minimumDistance: 12)
-                        .onChanged { _ in updateCameraPullArming() }
+                        .onChanged { _ in
+                            // iOS 17 has no ScrollPhase callback. The row-level reply gesture and
+                            // the ScrollView may both observe this touch, so end opening anchoring
+                            // as soon as either a slow vertical read or a horizontal reply drag
+                            // becomes a real gesture. This prevents late media hydration from
+                            // pulling the reader back to the newest message.
+                            latestPositionPolicy.endOpeningSettling(
+                                conversationID: conversation.id
+                            )
+                            updateCameraPullArming()
+                        }
                         .onEnded { _ in releaseCameraPull() }
                 )
                 .task(id: openingPositionTaskID) {
@@ -3317,7 +3338,7 @@ struct ConversationView: View {
                 .environment(
                     \.voiceNoteChatContext,
                     VoiceNoteChatContext(
-                        conversationID: conversation.id,
+                        conversationID: currentConversation.id,
                         conversationTitle: currentConversation.title,
                         displayName: { participantDisplayName(for: $0) }
                     )
@@ -3865,6 +3886,7 @@ struct ConversationView: View {
     private var conversationLifecycle: some View {
         conversationTasks
         .onAppear {
+            promoteMountedConversationIfNeeded(model.state.conversations)
             if !isReadOnlyAppReviewPreview, !didRestoreDraft, !draftRestoreStarted {
                 draftRestoreStarted = true
                 draft = model.conversationDraft(for: conversation.id)
@@ -3920,6 +3942,9 @@ struct ConversationView: View {
         }
         .onChange(of: model.messageConversationNavigationRequest) { _, _ in
             applyTargetedMessageNavigationIfNeeded()
+        }
+        .onChange(of: model.state.conversations) { _, conversations in
+            promoteMountedConversationIfNeeded(conversations)
         }
         .onChange(of: messages) { _, _ in
             // A cold notification can navigate before its just-synced row reaches the published
@@ -4017,10 +4042,43 @@ struct ConversationView: View {
             // must not cost the user what they already said. Discard stays explicit.
             voiceRecorder.suspend()
             if !voiceRecorder.hasDraft {
-                VoiceNoteDraftRegistry.shared.release(conversation.id)
+                VoiceNoteDraftRegistry.shared.release(voiceRecorderRegistryConversationID)
             }
             presence.stopLocalTyping(conversationID: conversation.id)
             if !isReadOnlyAppReviewPreview, !isSending { persistDraftImmediately() }
+        }
+    }
+
+    private func promoteMountedConversationIfNeeded(_ conversations: [Conversation]) {
+        let matches = conversations.filter {
+            $0.matchesLocalConversationID(conversation.id)
+        }
+        guard matches.count == 1, let promoted = matches.first, promoted != conversation else {
+            return
+        }
+        let previousID = conversation.id
+        if promoted.id != previousID {
+            if VoiceNoteDraftRegistry.shared.promote(
+                voiceRecorder,
+                from: voiceRecorderRegistryConversationID,
+                to: promoted.id
+            ) {
+                voiceRecorderRegistryConversationID = promoted.id
+            }
+            presence.stopLocalTyping(conversationID: previousID)
+            if !isReadOnlyAppReviewPreview {
+                model.setConversationVisible(previousID, visible: false)
+            }
+            incomingSoundPolicy = VisibleConversationSoundPolicy(conversationID: promoted.id)
+            incomingSoundPolicy.beginVisibility(with: model.state.messages)
+            latestPositionPolicy = ConversationLatestPositionPolicy()
+            unseenIncomingCount = 0
+        }
+        conversation = promoted
+        if promoted.id != previousID,
+           !isReadOnlyAppReviewPreview,
+           scenePhase == .active {
+            model.setConversationVisible(promoted.id, visible: true)
         }
     }
 
@@ -4136,7 +4194,7 @@ struct ConversationView: View {
                 // Two lenses only: a third would push the name below its 150pt readable
                 // minimum on the narrowest supported bar. Search lives in the contact sheet.
                 // Group calls are not part of the calling product yet, so groups show none.
-                if !isGroupConversation {
+                if !isGroupConversation && isServerAddressableConversation {
                     KitGlassControlGroup(
                         spacing: ConversationHeaderLayoutPolicy.callControlSpacing
                     ) {
@@ -4318,7 +4376,7 @@ struct ConversationView: View {
                 } label: {
                     Label("Document", systemImage: "doc")
                 }
-                if !isGroupConversation {
+                if !isGroupConversation && isServerAddressableConversation {
                     Button { openSendMoney() } label: {
                         Label("Send money", systemImage: "arrow.up.circle")
                     }
@@ -4453,7 +4511,7 @@ struct ConversationView: View {
             Button {
                 // The one deliberate way a draft dies.
                 voiceRecorder.cancel()
-                VoiceNoteDraftRegistry.shared.release(conversation.id)
+                VoiceNoteDraftRegistry.shared.release(voiceRecorderRegistryConversationID)
             } label: {
                 Image(systemName: "trash.fill")
                     .font(.headline)
@@ -5473,7 +5531,16 @@ struct ConversationView: View {
     private func bubbleTimeRow(_ message: LocalMessage) -> some View {
         HStack(spacing: 4) {
             Text(AppPresentationClock.shortTime(message.createdAt))
-            if message.isOutgoing { Image(systemName: deliveryIcon(message.state)) }
+            if let status = MessageDeliveryPresentationPolicy.statusLabel(
+                for: message.state,
+                isOutgoing: message.isOutgoing
+            ) {
+                Text(status)
+            }
+            if message.isOutgoing {
+                Image(systemName: deliveryIcon(message.state))
+                    .accessibilityHidden(true)
+            }
         }
         .font(.caption2)
         .foregroundStyle(message.isOutgoing ? .white.opacity(0.72) : .secondary)
@@ -6008,6 +6075,12 @@ struct ConversationView: View {
                 Text("Edited")
             }
             Text(AppPresentationClock.shortTime(message.createdAt))
+            if let status = MessageDeliveryPresentationPolicy.statusLabel(
+                for: message.state,
+                isOutgoing: message.isOutgoing
+            ) {
+                Text(status)
+            }
             if message.isOutgoing,
                message.state == .failed,
                conversationMessagingAvailable,
@@ -6027,6 +6100,7 @@ struct ConversationView: View {
                 .accessibilityHint(message.failureReason ?? "Attempts this message again")
             } else if message.isOutgoing {
                 Image(systemName: deliveryIcon(message.state))
+                    .accessibilityHidden(true)
             }
         }
         .font(.caption2)
@@ -6720,6 +6794,10 @@ struct ConversationView: View {
             model.lastError = "This App Review preview is read-only."
             return
         }
+        guard isServerAddressableConversation else {
+            model.lastError = "This chat is still connecting. Your pending messages will send automatically."
+            return
+        }
         guard let recipientUserID else {
             model.lastError = "This conversation does not have one unambiguous Kit Pay recipient."
             return
@@ -7128,11 +7206,11 @@ struct ConversationView: View {
             // finalized audio/mp4 file, so it can begin encryption/upload without another copy;
             // paused-and-resumed notes retain a durable background assembly job.
             guard let recording = await voiceRecorder.finish() else {
-                VoiceNoteDraftRegistry.shared.release(conversation.id)
+                VoiceNoteDraftRegistry.shared.release(voiceRecorderRegistryConversationID)
                 isSending = false
                 return
             }
-            VoiceNoteDraftRegistry.shared.release(conversation.id)
+            VoiceNoteDraftRegistry.shared.release(voiceRecorderRegistryConversationID)
             let mediaID = UUID()
             LocalMediaPerformanceMonitor.shared.begin(
                 mediaID: mediaID,
@@ -7256,6 +7334,10 @@ struct ConversationView: View {
             return
         }
         guard requireMoneyAccess() else { return }
+        guard isServerAddressableConversation else {
+            model.lastError = "This chat is still connecting. Payment requests will be available shortly."
+            return
+        }
         guard !isGroupConversation else {
             model.lastError = "Payment requests are available only in one-to-one Kit Pay chats."
             return
@@ -7294,6 +7376,10 @@ struct ConversationView: View {
             return
         }
         guard requireMoneyAccess() else { return }
+        guard isServerAddressableConversation else {
+            model.lastError = "This chat is still connecting. Sending money will be available shortly."
+            return
+        }
         guard !isGroupConversation else {
             model.lastError = "Sending money is available only in one-to-one Kit Pay chats."
             return
@@ -8525,9 +8611,25 @@ struct ConversationView: View {
     // MARK: Reading position, jump-to-latest, and the pull-past-the-end camera
 
     private func handleScrollMetrics(_ metrics: ConversationScrollMetrics) {
+        let movedTowardHistory = ConversationLatestPositionPolicy
+            .inferredUserMovedTowardHistory(
+                previousContentHeight: conversationContentHeight,
+                previousContentMaxY: conversationContentMaxY,
+                contentHeight: metrics.contentHeight,
+                contentMaxY: metrics.contentMaxY
+            )
         let contentHeightChanged = conversationContentHeight != metrics.contentHeight
+        if movedTowardHistory {
+            // Geometry is the reliable fallback on iOS 17, where ScrollView does not publish its
+            // interaction phase and can cancel a simultaneous drag before `onEnded`. Subtracting
+            // content growth distinguishes a person's upward scroll from a media row expanding.
+            latestPositionPolicy.endOpeningSettling(conversationID: conversation.id)
+        }
         if contentHeightChanged {
             conversationContentHeight = metrics.contentHeight
+        }
+        if conversationContentMaxY != metrics.contentMaxY {
+            conversationContentMaxY = metrics.contentMaxY
         }
         if contentHeightChanged,
            latestPositionPolicy.shouldMaintainOpeningAnchor(
@@ -8910,6 +9012,32 @@ struct ConversationLatestPositionPolicy: Equatable {
             && viewportHeight.isFinite
             && contentHeight > 0
             && viewportHeight > 0
+    }
+
+    /// Infers an upward read gesture from geometry without trusting iOS 18-only scroll phases.
+    /// A row gaining height moves `contentMaxY` by the same amount while the viewport offset is
+    /// unchanged; only the residual movement toward a larger max-Y is user movement into older
+    /// history. Invalid/initial samples deliberately cannot terminate the opening anchor.
+    static func inferredUserMovedTowardHistory(
+        previousContentHeight: CGFloat,
+        previousContentMaxY: CGFloat,
+        contentHeight: CGFloat,
+        contentMaxY: CGFloat,
+        tolerance: CGFloat = 1
+    ) -> Bool {
+        guard previousContentHeight > 0,
+              previousContentHeight.isFinite,
+              previousContentMaxY.isFinite,
+              contentHeight > 0,
+              contentHeight.isFinite,
+              contentMaxY.isFinite,
+              tolerance >= 0,
+              tolerance.isFinite
+        else { return false }
+
+        let contentGrowth = contentHeight - previousContentHeight
+        let viewportMovement = contentMaxY - previousContentMaxY - contentGrowth
+        return viewportMovement > tolerance
     }
 
     static func shouldFollowTimelineChange(

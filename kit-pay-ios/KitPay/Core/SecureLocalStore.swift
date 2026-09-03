@@ -5,6 +5,7 @@ actor SecureLocalStore {
     static let shared = SecureLocalStore()
 
     typealias StateDataLoad = @Sendable (URL) throws -> Data
+    typealias StateDataPersist = @Sendable (Data, URL) throws -> Void
     typealias KeyDataLoad = @Sendable () throws -> Data?
 
     private enum StateLoadStatus: Equatable {
@@ -22,6 +23,7 @@ actor SecureLocalStore {
     private let keyAccount: String
     private let injectedKeyData: Data?
     private let stateDataLoad: StateDataLoad
+    private let stateDataPersist: StateDataPersist
     private let keyDataLoad: KeyDataLoad
     private let stateURL: URL
     // Every stored property that feeds `snapshot()` bumps the projection revision, so a
@@ -47,6 +49,9 @@ actor SecureLocalStore {
         keyData: Data? = nil,
         keyAccount: String = "kit-pay-local-state-key-v1",
         stateDataLoad: @escaping StateDataLoad = { try Data(contentsOf: $0) },
+        stateDataPersist: @escaping StateDataPersist = { data, url in
+            try data.write(to: url, options: [.atomic, .completeFileProtectionUnlessOpen])
+        },
         keyDataLoad: KeyDataLoad? = nil
     ) {
         let resolvedKeyDataLoad: KeyDataLoad = keyDataLoad ?? {
@@ -55,6 +60,7 @@ actor SecureLocalStore {
         self.keyAccount = keyAccount
         injectedKeyData = keyData
         self.stateDataLoad = stateDataLoad
+        self.stateDataPersist = stateDataPersist
         self.keyDataLoad = resolvedKeyDataLoad
         let resolvedURL: URL
         if let stateURL {
@@ -389,7 +395,7 @@ actor SecureLocalStore {
         let clear = try encoder.encode(candidate)
         let sealed = try AES.GCM.seal(clear, using: key)
         guard let combined = sealed.combined else { throw StoreError.invalidCiphertext }
-        try combined.write(to: stateURL, options: [.atomic, .completeFileProtectionUnlessOpen])
+        try stateDataPersist(combined, stateURL)
         stateLoadStatus = .loaded
     }
 

@@ -371,6 +371,28 @@ final class VoiceNoteDraftRegistry {
         return created
     }
 
+    /// Moves the exact recorder owned by a mounted provisional conversation to the server's
+    /// authoritative conversation ID. Main-actor isolation makes the remove/insert indivisible;
+    /// an unexpected recorder already registered at the destination leaves both entries intact
+    /// rather than discarding either draft.
+    @discardableResult
+    func promote(
+        _ recorder: VoiceNoteRecorder,
+        from provisionalConversationID: String,
+        to authoritativeConversationID: String
+    ) -> Bool {
+        let provisionalKey = provisionalConversationID.lowercased()
+        let authoritativeKey = authoritativeConversationID.lowercased()
+        guard recorders[provisionalKey] === recorder else { return false }
+        if provisionalKey == authoritativeKey { return true }
+        if let existing = recorders[authoritativeKey], existing !== recorder {
+            return false
+        }
+        recorders.removeValue(forKey: provisionalKey)
+        recorders[authoritativeKey] = recorder
+        return true
+    }
+
     /// Called after send or discard, when the draft no longer exists to preserve.
     func release(_ conversationID: String) {
         recorders.removeValue(forKey: conversationID.lowercased())

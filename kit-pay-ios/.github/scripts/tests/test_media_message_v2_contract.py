@@ -209,6 +209,52 @@ class MediaMessageV2SourceContract(unittest.TestCase):
         self.assertIn("func promoteInlineReceivedToProtectedFile(", models)
         self.assertIn("message.attachmentData = nil", models)
 
+    def test_launch_compacts_legacy_inline_receives_before_first_state_publication(self) -> None:
+        """Every valid legacy v1 receive is externalized as one candidate state before UI/network
+        work can trigger another whole-state rewrite. File leases cross the durable state commit
+        and are released only afterwards; an individual publication failure keeps that row inline."""
+        app_model = (ROOT / "KitPay/App/AppModel.swift").read_text(encoding="utf-8")
+        cache = (ROOT / "KitPay/Core/SecureMediaFileCache.swift").read_text(encoding="utf-8")
+        restore = "\n".join(function_body(app_model, "func restore() async"))
+
+        prepare = restore.index("LegacyInlineReceivedMediaCompactionPolicy.prepare(")
+        candidate_assignment = restore.index("migratedState = prepared.state", prepare)
+        durable_commit = restore.index("try await store.replace(migratedState)", candidate_assignment)
+        lease_release = restore.index("releaseProtectedOriginalLeases(", durable_commit)
+        first_publish = restore.index("await publishLatestState()", lease_release)
+        self.assertLess(prepare, candidate_assignment)
+        self.assertLess(candidate_assignment, durable_commit)
+        self.assertLess(durable_commit, lease_release)
+        self.assertLess(lease_release, first_publish)
+
+        policy = "\n".join(
+            function_body(
+                cache,
+                "static func prepare(",
+            )
+        )
+        file_publish = policy.index("cache.promoteInlineDataToProtectedOriginal(")
+        state_clear = policy.index(
+            "compactedState.messages[candidate.messageIndex] = proposedMessage"
+        )
+        self.assertLess(file_publish, state_clear)
+        self.assertIn("for candidate in candidates", policy)
+        self.assertIn("failed or conflicting rows remain", cache)
+
+    def test_received_inline_video_cannot_fall_through_to_data_backed_gallery_playback(self) -> None:
+        """If launch compaction could not authenticate a legacy row, opening it must fail closed;
+        retaining the movie Data beside AVPlayer and then persisting duration recreates the crash."""
+        app_model = (ROOT / "KitPay/App/AppModel.swift").read_text(encoding="utf-8")
+        load = "\n".join(function_body(app_model, "func loadSecureMediaItem("))
+        received_gate = load.index("!resolvedMessage.isOutgoing")
+        missing_record_failure = load.index(
+            "else { throw SecureMediaAttachmentError.invalidDescriptor }",
+            received_gate,
+        )
+        generic_inline_return = load.index("if let inlineData {", missing_record_failure)
+        self.assertLess(received_gate, missing_record_failure)
+        self.assertLess(missing_record_failure, generic_inline_return)
+
     def test_percent_encode_bodies_are_identical(self) -> None:
         """§4: v2 percent-encoding MUST byte-match v1's percentEncode; the body is duplicated
         so the v2 core stays Foundation-only, so drift here silently forks the wire format."""

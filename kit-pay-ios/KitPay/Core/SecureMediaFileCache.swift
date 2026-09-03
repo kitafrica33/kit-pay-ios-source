@@ -149,6 +149,152 @@ final class SecureMediaOriginalAccessLease: @unchecked Sendable {
     }
 }
 
+/// Prepared launch/runtime compaction of legacy received KITMEDIA1 plaintext that older builds
+/// embedded in `LocalMessage.attachmentData`. The protected originals stay leased until the
+/// caller has durably committed `state`; releasing them earlier would let cache eviction race the
+/// state transition that first establishes their ownership.
+struct LegacyInlineReceivedMediaCompaction {
+    let state: PersistedState
+    let eligibleCount: Int
+    let promotedCount: Int
+    let promotedByteCount: Int64
+    fileprivate let protectedOriginalLeases: [SecureMediaOriginalAccessLease]
+
+    var didPromote: Bool { promotedCount > 0 }
+
+    /// Must be called only after the compacted state has either been persisted or deliberately
+    /// abandoned. Deinitialization is still a safety net, but this deterministic handoff makes the
+    /// file/state commit ordering reviewable and testable.
+    func releaseProtectedOriginalLeases(using cache: SecureMediaFileCache) async {
+        for lease in protectedOriginalLeases {
+            await cache.releaseProtectedOriginalLease(lease)
+        }
+    }
+}
+
+/// Converts every unambiguous, authenticated legacy received KITMEDIA1 row to file-backed local
+/// storage as one candidate state. It never mutates the caller's state and never clears inline
+/// bytes unless the exact protected original was published first. The caller can consequently
+/// persist every successful row in one encrypted-state rewrite; failed or conflicting rows remain
+/// byte-for-byte unchanged and can be retried on a later activation.
+enum LegacyInlineReceivedMediaCompactionPolicy {
+    private struct MessageIdentity: Hashable {
+        let id: UUID
+        let conversationID: String
+    }
+
+    private struct Candidate {
+        let messageIndex: Int
+        let descriptor: KitMediaMessageDescriptor
+    }
+
+    static func prepare(
+        state sourceState: PersistedState,
+        forUserID userID: String,
+        cache: SecureMediaFileCache,
+        now: Date = Date()
+    ) async -> LegacyInlineReceivedMediaCompaction {
+        var compactedState = sourceState
+        guard sourceState.profile?.id.caseInsensitiveCompare(userID) == .orderedSame,
+              sourceState.communicationOwnerUserID?.caseInsensitiveCompare(userID) == .orderedSame
+        else {
+            return LegacyInlineReceivedMediaCompaction(
+                state: sourceState,
+                eligibleCount: 0,
+                promotedCount: 0,
+                promotedByteCount: 0,
+                protectedOriginalLeases: []
+            )
+        }
+
+        var rowCounts: [MessageIdentity: Int] = [:]
+        var storageKeyClaimingRows: [String: Set<Int>] = [:]
+        for (index, message) in sourceState.messages.enumerated() {
+            rowCounts[
+                MessageIdentity(id: message.id, conversationID: message.conversationId),
+                default: 0
+            ] += 1
+            for key in message.localMediaOwnershipClaims.keys {
+                storageKeyClaimingRows[key, default: []].insert(index)
+            }
+        }
+        let draftStorageKeys = ConversationDraftPolicy.localMediaStorageKeysOwnedByDrafts(
+            in: sourceState
+        )
+
+        let candidates = sourceState.messages.indices.compactMap { index -> Candidate? in
+            let message = sourceState.messages[index]
+            guard !message.isOutgoing,
+                  message.pendingAttachment == nil,
+                  message.pendingMediaBatch == nil,
+                  let inlineData = message.attachmentData,
+                  !inlineData.isEmpty,
+                  let descriptor = KitMediaMessageDescriptor.parse(message.body),
+                  descriptor.plaintextByteSize == inlineData.count,
+                  SecureMessagingWire.allowedAttachmentMediaTypes.contains(descriptor.mediaType),
+                  KitChatMediaLimits.fits(
+                      descriptor.plaintextByteSize,
+                      kind: KitChatMediaKind(mediaType: descriptor.mediaType)
+                  ),
+                  rowCounts[
+                      MessageIdentity(id: message.id, conversationID: message.conversationId)
+                  ] == 1,
+                  storageKeyClaimingRows[descriptor.attachmentID] == Set([index]),
+                  !draftStorageKeys.contains(descriptor.attachmentID)
+            else { return nil }
+            return Candidate(messageIndex: index, descriptor: descriptor)
+        }
+
+        var leases: [SecureMediaOriginalAccessLease] = []
+        leases.reserveCapacity(candidates.count)
+        var promotedByteCount: Int64 = 0
+        for candidate in candidates {
+            let originalMessage = compactedState.messages[candidate.messageIndex]
+            guard let inlineData = originalMessage.attachmentData else { continue }
+
+            // Validate the complete state transition on a private value before touching disk.
+            // `compactedState` itself is assigned only after the protected file exists.
+            var proposedMessage = originalMessage
+            _ = LocalMediaRecordPolicy.migrateAndRecover(&proposedMessage, now: now)
+            guard LocalMediaRecordPolicy.promoteInlineReceivedToProtectedFile(
+                &proposedMessage,
+                attachmentID: candidate.descriptor.attachmentID,
+                remoteStorageKey: candidate.descriptor.storageKey,
+                localStorageKey: candidate.descriptor.attachmentID,
+                expectedInlineData: inlineData,
+                now: now
+            ) else { continue }
+
+            do {
+                guard let lease = try await cache.promoteInlineDataToProtectedOriginal(
+                    inlineData,
+                    forStorageKey: candidate.descriptor.attachmentID,
+                    userID: userID,
+                    mediaType: candidate.descriptor.mediaType,
+                    expectedByteCount: candidate.descriptor.plaintextByteSize
+                ) else { continue }
+                // This assignment is the first point at which the candidate state loses the
+                // inline bytes, and it occurs strictly after the complete protected file exists.
+                compactedState.messages[candidate.messageIndex] = proposedMessage
+                leases.append(lease)
+                promotedByteCount += Int64(candidate.descriptor.plaintextByteSize)
+            } catch {
+                // Keep this exact row untouched. The cache method removes its staging file and
+                // never overwrites an existing representation, so failure cannot lose plaintext.
+                continue
+            }
+        }
+
+        return LegacyInlineReceivedMediaCompaction(
+            state: compactedState,
+            eligibleCount: candidates.count,
+            promotedCount: leases.count,
+            promotedByteCount: promotedByteCount,
+            protectedOriginalLeases: leases
+        )
+    }
+}
+
 /// Device-protected local store for chat media.
 ///
 /// The single AES-GCM state file must stay small — every `SecureLocalStore.update` rewrites it in

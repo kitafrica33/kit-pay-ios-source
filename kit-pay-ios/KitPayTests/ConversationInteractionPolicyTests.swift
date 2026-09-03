@@ -147,6 +147,36 @@ final class ConversationInteractionPolicyTests: XCTestCase {
         ))
     }
 
+    func testOpeningSettlingDetectsSlowMovementTowardOlderHistory() {
+        XCTAssertTrue(ConversationLatestPositionPolicy.inferredUserMovedTowardHistory(
+            previousContentHeight: 900,
+            previousContentMaxY: 700,
+            contentHeight: 900,
+            contentMaxY: 702.1
+        ))
+        XCTAssertFalse(ConversationLatestPositionPolicy.inferredUserMovedTowardHistory(
+            previousContentHeight: 900,
+            previousContentMaxY: 700,
+            contentHeight: 900,
+            contentMaxY: 700.8
+        ), "Sub-point layout noise must not cancel the initial newest-message anchor")
+    }
+
+    func testOpeningSettlingDoesNotMistakeMediaGrowthForAReadGesture() {
+        XCTAssertFalse(ConversationLatestPositionPolicy.inferredUserMovedTowardHistory(
+            previousContentHeight: 900,
+            previousContentMaxY: 700,
+            contentHeight: 1_140,
+            contentMaxY: 940
+        ), "A media row expanding by 240 points explains the same max-Y movement")
+        XCTAssertFalse(ConversationLatestPositionPolicy.inferredUserMovedTowardHistory(
+            previousContentHeight: 0,
+            previousContentMaxY: 0,
+            contentHeight: 900,
+            contentMaxY: 700
+        ), "The first geometry sample is not evidence of user movement")
+    }
+
     func testOpeningSettlingKeepsDirectAndGroupTimelinesPinnedThroughHydration() {
         var policy = ConversationLatestPositionPolicy()
 

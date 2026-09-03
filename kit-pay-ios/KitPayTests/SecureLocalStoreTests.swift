@@ -3,6 +3,10 @@ import XCTest
 @testable import KitPay
 
 final class SecureLocalStoreTests: XCTestCase {
+    private enum PersistenceBudgetError: Error {
+        case exceeded
+    }
+
     private var temporaryDirectory: URL!
 
     override func setUpWithError() throws {
@@ -54,6 +58,159 @@ final class SecureLocalStoreTests: XCTestCase {
         XCTAssertEqual(
             restored.pendingProfileAvatarAttachment,
             expected.pendingProfileAvatarAttachment
+        )
+    }
+
+    func testLegacyInlineMediaCompactionAllowsWalletHistoryToPersistWithinBudget() async throws {
+        let stateURL = temporaryDirectory.appendingPathComponent("state.secure")
+        let mediaDirectory = temporaryDirectory.appendingPathComponent(
+            "media-cache",
+            isDirectory: true
+        )
+        let key = Data(repeating: 0x58, count: 32)
+        let userID = "10000000-0000-4000-8000-000000000001"
+        let messageID = UUID(uuidString: "20000000-0000-4000-8000-000000000002")!
+        let conversationID = "30000000-0000-4000-8000-000000000003"
+        let attachmentID = "40000000-0000-4000-8000-000000000004"
+        let remoteStorageKey = "50000000-0000-4000-8000-000000000005"
+        let legacyVideo = Data(
+            repeating: 0x49,
+            count: KitChatMediaLimits.maximumInlineCacheBytes + 1
+        )
+        let descriptor = try KitMediaMessageDescriptor(
+            attachmentID: attachmentID,
+            storageKey: remoteStorageKey,
+            mediaType: "video/mp4",
+            ciphertextByteSize: Int64(legacyVideo.count) + 64,
+            ciphertextSHA256: String(repeating: "ab", count: 32),
+            keyMaterial: Data(
+                repeating: 0x17,
+                count: SecureMediaAttachmentCipher.keyMaterialBytes
+            ),
+            plaintextByteSize: legacyVideo.count,
+            caption: "Legacy received video"
+        )
+        var original = PersistedState.empty
+        original.communicationOwnerUserID = userID
+        original.profile = UserProfile(
+            id: userID,
+            name: "Wallet owner",
+            email: nil,
+            phone: "+256700000001",
+            tag: "wallet_owner",
+            kycStatus: "verified",
+            paymentPinSet: true,
+            mfaEnabled: true,
+            profileSetupRequired: false
+        )
+        original.wallets = [Wallet(
+            id: "wallet-1",
+            name: "Primary wallet",
+            accountNumber: "KIT-1000",
+            accountType: "personal",
+            currency: CurrencyDTO(code: "UGX", scale: "2"),
+            balances: WalletBalances(available: "150000", ledger: "150000"),
+            status: "active",
+            isPrimary: true
+        )]
+        original.selectedWalletId = "wallet-1"
+        original.messages = [LocalMessage(
+            id: messageID,
+            conversationId: conversationID,
+            senderId: "60000000-0000-4000-8000-000000000006",
+            body: descriptor.encoded,
+            createdAt: Date(timeIntervalSince1970: 1_800_000_000),
+            sentAt: Date(timeIntervalSince1970: 1_800_000_001),
+            state: .received,
+            failureReason: nil,
+            isOutgoing: false,
+            attachmentData: legacyVideo
+        )]
+
+        let seedStore = SecureLocalStore(stateURL: stateURL, keyData: key)
+        try await seedStore.replace(original)
+        XCTAssertGreaterThan(try Data(contentsOf: stateURL).count, legacyVideo.count)
+
+        // Model the finite persistence envelope that exposed the production failure: a valid
+        // wallet response could not commit while a legacy received video was still serialized
+        // into every encrypted whole-state rewrite.
+        let maximumPersistedBytes = 256 * 1_024
+        let constrainedStore = SecureLocalStore(
+            stateURL: stateURL,
+            keyData: key,
+            stateDataPersist: { data, destination in
+                guard data.count <= maximumPersistedBytes else {
+                    throw PersistenceBudgetError.exceeded
+                }
+                try data.write(
+                    to: destination,
+                    options: [.atomic, .completeFileProtectionUnlessOpen]
+                )
+            }
+        )
+        let transaction = WalletTransaction(
+            id: "70000000-0000-4000-8000-000000000007",
+            walletId: "wallet-1",
+            reference: "KIT-RECENT",
+            amount: "150000.00",
+            totals: CustomerTransactionTotals(added: "150000.00", deducted: "0.00"),
+            currency: CurrencyDTO(code: "UGX", scale: "2"),
+            type: "bank_deposit",
+            direction: "credit",
+            status: "completed",
+            counterparty: nil,
+            note: "Bank deposit",
+            occurredAt: "2026-09-03T08:30:00Z"
+        )
+        do {
+            try await constrainedStore.update { $0.transactions = [transaction] }
+            XCTFail("a wallet write must expose the legacy whole-state amplification")
+        } catch PersistenceBudgetError.exceeded {
+            // Expected: the durable projection remains last-known-good when persistence fails.
+        }
+        let failedProjection = await constrainedStore.snapshot()
+        XCTAssertTrue(failedProjection.transactions.isEmpty)
+
+        let mediaCache = SecureMediaFileCache(directoryURL: mediaDirectory)
+        let prepared = await LegacyInlineReceivedMediaCompactionPolicy.prepare(
+            state: failedProjection,
+            forUserID: userID,
+            cache: mediaCache,
+            now: Date(timeIntervalSince1970: 1_800_000_100)
+        )
+        XCTAssertEqual(prepared.eligibleCount, 1)
+        XCTAssertEqual(prepared.promotedCount, 1)
+        XCTAssertEqual(prepared.promotedByteCount, Int64(legacyVideo.count))
+        XCTAssertNil(prepared.state.messages.first?.attachmentData)
+        XCTAssertEqual(
+            prepared.state.messages.first?.localMediaRecords?.first?.localStorageKind,
+            .protectedFile
+        )
+        do {
+            try await constrainedStore.replace(prepared.state)
+        } catch {
+            await prepared.releaseProtectedOriginalLeases(using: mediaCache)
+            throw error
+        }
+        await prepared.releaseProtectedOriginalLeases(using: mediaCache)
+        XCTAssertLessThan(try Data(contentsOf: stateURL).count, maximumPersistedBytes)
+
+        try await constrainedStore.update { $0.transactions = [transaction] }
+        let reopened = SecureLocalStore(stateURL: stateURL, keyData: key)
+        let restored = await reopened.snapshot()
+        XCTAssertEqual(restored.transactions, [transaction])
+        XCTAssertEqual(
+            CustomerTransactionPresentationPolicy.customerVisibleTransactions(
+                restored.transactions,
+                selectedWalletID: restored.selectedWalletId,
+                wallets: restored.wallets
+            ).map(\.id),
+            [transaction.id]
+        )
+        XCTAssertNil(restored.messages.first?.attachmentData)
+        XCTAssertEqual(
+            restored.messages.first?.localMediaRecords?.first?.localStorageKind,
+            .protectedFile
         )
     }
 

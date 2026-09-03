@@ -536,6 +536,15 @@ extension CapabilitiesDTO {
         supportsFeature(MessagingMediaMessageV2CapabilityPolicy.featureKey)
             && protocols?.messaging?.mediaMessage?.supportsIOSV2 == true
     }
+
+    /// First-contact messages may mint a durable local conversation UUID only when the
+    /// authenticated backend advertises the exact idempotent-create contract. Missing, false,
+    /// malformed, or future profiles retain the legacy online create-before-queue behavior.
+    var enablesMessagingOfflineDirectCreation: Bool {
+        supportsFeature("messaging")
+            && protocols?.messaging?.supportsReviewedV2 == true
+            && protocols?.messaging?.offlineDirectCreation?.supportsReviewedV1 == true
+    }
 }
 
 struct CapabilityProtocolsDTO: Decodable {
@@ -743,6 +752,9 @@ struct MessagingProtocolCapabilityDTO: Decodable {
     /// Chunked attachment transport is additive. Its decoder is intentionally isolated so a
     /// malformed rollout block disables resume without taking ordinary encrypted messaging down.
     var resumableAttachments: MessagingResumableAttachmentsCapabilityDTO? = nil
+    /// Additive contract for idempotently promoting a locally-created direct thread. Decode
+    /// failures are confined to this feature so a malformed rollout cannot disable messaging.
+    var offlineDirectCreation: MessagingOfflineDirectCreationCapabilityDTO? = nil
 
     enum CodingKeys: String, CodingKey {
         case ready, version, suite
@@ -750,6 +762,7 @@ struct MessagingProtocolCapabilityDTO: Decodable {
         case richMedia = "rich_media"
         case mediaMessage = "media_message"
         case resumableAttachments = "resumable_attachments"
+        case offlineDirectCreation = "offline_direct_creation"
     }
 
     init(
@@ -759,7 +772,8 @@ struct MessagingProtocolCapabilityDTO: Decodable {
         postQuantum: Bool?,
         richMedia: MessagingRichMediaProtocolCapabilityDTO? = nil,
         mediaMessage: MessagingMediaMessageProtocolCapabilityDTO? = nil,
-        resumableAttachments: MessagingResumableAttachmentsCapabilityDTO? = nil
+        resumableAttachments: MessagingResumableAttachmentsCapabilityDTO? = nil,
+        offlineDirectCreation: MessagingOfflineDirectCreationCapabilityDTO? = nil
     ) {
         self.ready = ready
         self.version = version
@@ -768,6 +782,7 @@ struct MessagingProtocolCapabilityDTO: Decodable {
         self.richMedia = richMedia
         self.mediaMessage = mediaMessage
         self.resumableAttachments = resumableAttachments
+        self.offlineDirectCreation = offlineDirectCreation
     }
 
     init(from decoder: Decoder) throws {
@@ -788,6 +803,10 @@ struct MessagingProtocolCapabilityDTO: Decodable {
             MessagingResumableAttachmentsCapabilityDTO.self,
             forKey: .resumableAttachments
         )
+        offlineDirectCreation = try? values.decodeIfPresent(
+            MessagingOfflineDirectCreationCapabilityDTO.self,
+            forKey: .offlineDirectCreation
+        )
     }
 
     var supportsReviewedV2: Bool {
@@ -795,6 +814,35 @@ struct MessagingProtocolCapabilityDTO: Decodable {
             && version == SecureMessagingWire.protocolVersion
             && suite == SecureMessagingWire.protocolSuite
             && postQuantum == true
+    }
+}
+
+/// Exact backend contract that makes an offline-created direct thread safe to replay. Every
+/// member is affirmative: accepting a partial advertisement could create duplicate server
+/// threads or make the client assume its UUID is canonical when the server did not promise it.
+struct MessagingOfflineDirectCreationCapabilityDTO: Decodable, Equatable {
+    static let reviewedProfile = "kit-direct-conversation-v1"
+    static let reviewedRequestField = "client_conversation_id"
+
+    let profile: String?
+    let ready: Bool?
+    let requestField: String?
+    let canonicalIDOnCreate: Bool?
+    let existingPairWins: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case profile, ready
+        case requestField = "request_field"
+        case canonicalIDOnCreate = "canonical_id_on_create"
+        case existingPairWins = "existing_pair_wins"
+    }
+
+    var supportsReviewedV1: Bool {
+        profile == Self.reviewedProfile
+            && ready == true
+            && requestField == Self.reviewedRequestField
+            && canonicalIDOnCreate == true
+            && existingPairWins == true
     }
 }
 
@@ -3197,6 +3245,24 @@ enum MessageDeliveryState: String, Codable, Hashable {
     case queued, encrypting, sending, sent, delivered, read, failed, received
 }
 
+/// Customer-facing delivery copy. A durable outbox row must say what its clock means; icon-only
+/// metadata made an offline or E2EE-recovery send look stalled even though it was safely queued.
+enum MessageDeliveryPresentationPolicy {
+    static func statusLabel(for state: MessageDeliveryState, isOutgoing: Bool) -> String? {
+        guard isOutgoing else { return nil }
+        switch state {
+        case .queued, .encrypting:
+            return "Pending"
+        case .sending:
+            return "Sending"
+        case .failed:
+            return "Not sent"
+        case .sent, .delivered, .read, .received:
+            return nil
+        }
+    }
+}
+
 // MARK: - Home starter checklist
 
 /// How each starter step's destination is presented. Identity verification is a substantive
@@ -4085,7 +4151,9 @@ struct LocalMediaRecord: Codable, Hashable, Identifiable, Sendable {
 
     let id: String
     let messageID: UUID
-    let conversationID: String
+    /// Stable local thread binding. It changes only when an offline-created direct thread is
+    /// atomically reconciled to the server's authoritative UUID before encryption/upload.
+    var conversationID: String
     let direction: Direction
     var mediaType: String
     var fileSize: Int
@@ -4245,7 +4313,9 @@ struct LocalMessage: Codable, Hashable, Identifiable {
     /// The server message UUID is distinct from the client-generated idempotency UUID for sends.
     /// Keeping both is required to apply authenticated delivery/read sync events correctly.
     var serverMessageId: String? = nil
-    let conversationId: String
+    /// Stable local thread binding. It changes only during the atomic promotion of an
+    /// offline-created direct conversation to its authoritative server UUID.
+    var conversationId: String
     let senderId: String
     var body: String
     let createdAt: Date
@@ -5916,8 +5986,34 @@ struct Conversation: Codable, Hashable, Identifiable {
     /// Authenticated public identity metadata for active members. Optional keeps state written by
     /// older builds readable and lets clients fall back to the synchronized contact directory.
     var memberIdentities: [String: AccountIdentityProjection]? = nil
+    /// Non-nil only while a first-contact direct thread exists solely in the encrypted local
+    /// store. The value pins its one peer; background replay must create exactly that pair before
+    /// any Signal fanout can be prepared. Optional preserves every older state file.
+    var pendingDirectRecipientUserID: String? = nil
+    /// Local UUIDs replaced while resolving a simultaneous first-contact race. A mounted chat can
+    /// follow its original value to the canonical thread without duplicating messages. These are
+    /// local navigation aliases only and never leave the device.
+    var localConversationAliases: [String]? = nil
 
     var isGroup: Bool { conversationType == SecureMessagingWire.groupConversationType }
+
+    var isProvisionalDirect: Bool {
+        conversationType == SecureMessagingWire.directConversationType
+            && participantUserIds.count == 2
+            && participantUserIds.allSatisfy(SecureMessagingValidation.isCanonicalUUID)
+            && pendingDirectRecipientUserID.map {
+                SecureMessagingValidation.isCanonicalUUID($0)
+                    && participantUserIds.contains($0)
+            } == true
+    }
+
+    func matchesLocalConversationID(_ rawValue: String) -> Bool {
+        guard let value = UUID(uuidString: rawValue)?.uuidString.lowercased() else { return false }
+        if id == value { return true }
+        return localConversationAliases?.contains(where: {
+            UUID(uuidString: $0)?.uuidString.lowercased() == value
+        }) == true
+    }
 
     func groupRole(for userID: String?) -> MessagingGroupRole? {
         guard let userID else { return nil }

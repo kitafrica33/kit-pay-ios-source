@@ -102,6 +102,111 @@ final class MessageBackupTests: XCTestCase {
         XCTAssertEqual(payload.messages.map(\.body), ["hello"])
     }
 
+    func testSnapshotAndRestoreExcludeProvisionalThreadsAndDeviceLocalAliases() throws {
+        let provisionalID = "0a1b2c3d-0000-4000-8000-000000001112"
+        let provisionalMessageID = UUID(
+            uuidString: "0a1b2c3d-0000-4000-8000-00000000cccd"
+        )!
+        var state = makeState()
+        state.conversations[0].localConversationAliases = [
+            "0a1b2c3d-0000-4000-8000-000000001113",
+        ]
+        state.conversations.append(try XCTUnwrap(ProvisionalDirectConversationPolicy.make(
+            id: provisionalID,
+            localUserID: userID,
+            recipientUserID: otherUserID,
+            title: "Pending Florence",
+            createdAt: Date(timeIntervalSince1970: 1_700_000_600)
+        )))
+        state.messages.append(LocalMessage(
+            id: provisionalMessageID,
+            conversationId: provisionalID,
+            senderId: userID,
+            body: "device-local pending message",
+            createdAt: Date(timeIntervalSince1970: 1_700_000_600),
+            sentAt: nil,
+            state: .queued,
+            failureReason: nil,
+            isOutgoing: true
+        ))
+        state.pinnedConversationIds = [conversationID, provisionalID]
+        state.mutedConversationIds = [provisionalID]
+
+        let payload = MessageBackupPayload.snapshot(
+            of: state,
+            userID: userID,
+            deviceName: "Kit iPhone",
+            includesMedia: false,
+            createdAt: Date(timeIntervalSince1970: 1_700_001_000)
+        )
+
+        XCTAssertEqual(payload.conversations.map(\.id), [conversationID])
+        XCTAssertNil(payload.conversations[0].pendingDirectRecipientUserID)
+        XCTAssertNil(payload.conversations[0].localConversationAliases)
+        XCTAssertEqual(payload.messages.map(\.body), ["hello"])
+        XCTAssertEqual(payload.pinnedConversationIds, [conversationID])
+        XCTAssertNil(payload.mutedConversationIds)
+        XCTAssertNoThrow(try MessageBackupValidationPolicy.validate(
+            payload,
+            expectedUserID: userID,
+            now: validationNow
+        ))
+
+        var restored = PersistedState.empty
+        try MessageBackupRestorePolicy.merge(
+            payload,
+            into: &restored,
+            currentUserID: userID
+        )
+        XCTAssertEqual(restored.conversations.map(\.id), [conversationID])
+        XCTAssertNil(restored.conversations[0].pendingDirectRecipientUserID)
+        XCTAssertNil(restored.conversations[0].localConversationAliases)
+        XCTAssertEqual(restored.messages.map(\.body), ["hello"])
+        XCTAssertEqual(restored.pinnedConversationIds, [conversationID])
+        XCTAssertNil(restored.mutedConversationIds)
+    }
+
+    func testRestoreRejectsDeviceLocalConversationIdentityState() {
+        var aliasPayload = MessageBackupPayload.snapshot(
+            of: makeState(),
+            userID: userID,
+            deviceName: "Kit iPhone",
+            includesMedia: false,
+            createdAt: Date(timeIntervalSince1970: 1_700_001_000)
+        )
+        aliasPayload.conversations[0].localConversationAliases = [
+            "0a1b2c3d-0000-4000-8000-000000001114",
+        ]
+        var restored = PersistedState.empty
+        XCTAssertThrowsError(try MessageBackupRestorePolicy.merge(
+            aliasPayload,
+            into: &restored,
+            currentUserID: userID
+        )) { error in
+            XCTAssertEqual(error as? MessageBackupError, .invalidBackup)
+        }
+        XCTAssertTrue(restored.conversations.isEmpty)
+
+        var provisionalPayload = MessageBackupPayload.snapshot(
+            of: makeState(),
+            userID: userID,
+            deviceName: "Kit iPhone",
+            includesMedia: false,
+            createdAt: Date(timeIntervalSince1970: 1_700_001_000)
+        )
+        provisionalPayload.conversations[0].conversationType =
+            SecureMessagingWire.directConversationType
+        provisionalPayload.conversations[0].pendingDirectRecipientUserID = otherUserID
+        XCTAssertThrowsError(try MessageBackupRestorePolicy.merge(
+            provisionalPayload,
+            into: &restored,
+            currentUserID: userID
+        )) { error in
+            XCTAssertEqual(error as? MessageBackupError, .invalidBackup)
+        }
+        XCTAssertTrue(restored.conversations.isEmpty)
+    }
+
     func testSnapshotOmitsOrphanedAndLegacyTimelineMetadataBeforeCreateAndRestore() throws {
         var state = makeState()
         let targetID = try XCTUnwrap(state.messages[0].serverMessageId)

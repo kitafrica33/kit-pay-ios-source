@@ -133,6 +133,11 @@ struct KitMediaGalleryView: View {
             preload(around: newValue)
         }
         .onDisappear {
+            // A canceled loader can finish after SwiftUI has removed the cover. Invalidate every
+            // request before releasing the published pages so a non-cooperative media read cannot
+            // put a large inline value (or protected-original lease) back into an off-screen
+            // StateObject.
+            loader.cancelAllAndRelease()
             cleanUpShareFile()
         }
     }
@@ -624,7 +629,7 @@ struct KitMediaGalleryView: View {
 // MARK: - Per-page load state
 
 @MainActor
-private final class GalleryPageLoader: ObservableObject {
+final class GalleryPageLoader: ObservableObject {
     enum PageState {
         case idle
         case loading
@@ -636,6 +641,9 @@ private final class GalleryPageLoader: ObservableObject {
     @Published private(set) var states: [String: PageState] = [:]
 
     private var tasks: [String: Task<Void, Never>] = [:]
+    /// Distinguishes a current load from an older canceled load for the same gallery identity.
+    /// Cancellation is cooperative, so the task object alone cannot prevent stale publication.
+    private var requestIDs: [String: UUID] = [:]
     private var loadData: ((KitGalleryItem) async throws -> SecureMediaLoadPolicy.LoadedItem)?
 
     func configure(
@@ -662,18 +670,27 @@ private final class GalleryPageLoader: ObservableObject {
         }
         guard let loadData else { return }
         states[item.id] = .loading
+        let requestID = UUID()
+        requestIDs[item.id] = requestID
         tasks[item.id] = Task { [weak self] in
             do {
                 let loaded = try await loadData(item)
-                self?.states[item.id] = .loaded(loaded)
+                guard let self, self.requestIDs[item.id] == requestID else { return }
+                guard !Task.isCancelled else {
+                    self.states[item.id] = .idle
+                    self.finishRequest(for: item.id, requestID: requestID)
+                    return
+                }
+                self.states[item.id] = .loaded(loaded)
             } catch {
+                guard let self, self.requestIDs[item.id] == requestID else { return }
                 if error is CancellationError || Task.isCancelled {
-                    self?.states[item.id] = .idle
+                    self.states[item.id] = .idle
                 } else {
-                    self?.states[item.id] = .failed
+                    self.states[item.id] = .failed
                 }
             }
-            self?.tasks[item.id] = nil
+            self?.finishRequest(for: item.id, requestID: requestID)
         }
     }
 
@@ -690,10 +707,7 @@ private final class GalleryPageLoader: ObservableObject {
     /// pages reload instantly from the encrypted file cache when paged back to.
     func cancelLoadsFar(from index: Int, items: [KitGalleryItem]) {
         for (offset, item) in items.enumerated() where abs(offset - index) >= 2 {
-            if let task = tasks[item.id] {
-                task.cancel()
-                tasks[item.id] = nil
-            }
+            invalidateRequest(for: item.id)
             switch state(for: item.id) {
             case .loading, .loaded:
                 states[item.id] = .idle
@@ -701,6 +715,30 @@ private final class GalleryPageLoader: ObservableObject {
                 break
             }
         }
+    }
+
+    /// Cancels all work and synchronously releases every loaded value retained by the gallery.
+    /// Each file-backed value may own an eviction lease, while an old inline value can own several
+    /// megabytes; neither should wait for an implementation-detail StateObject lifetime after the
+    /// full-screen cover has gone away.
+    func cancelAllAndRelease() {
+        for task in tasks.values { task.cancel() }
+        tasks.removeAll(keepingCapacity: false)
+        requestIDs.removeAll(keepingCapacity: false)
+        states.removeAll(keepingCapacity: false)
+        loadData = nil
+    }
+
+    private func invalidateRequest(for id: String) {
+        requestIDs[id] = nil
+        tasks[id]?.cancel()
+        tasks[id] = nil
+    }
+
+    private func finishRequest(for id: String, requestID: UUID) {
+        guard requestIDs[id] == requestID else { return }
+        requestIDs[id] = nil
+        tasks[id] = nil
     }
 }
 
@@ -963,7 +1001,7 @@ private struct GalleryVideoPage: View {
         .onTapGesture { onToggleChrome() }
         .task(id: isActive) {
             guard GalleryVideoActivationPolicy.permitsPreparation(isActive: isActive) else {
-                controller.teardown(allowsPictureInPictureRetention: false)
+                controller.deactivatePage()
                 return
             }
             // Picture in Picture restores at exact gallery identity: item 3 of a
@@ -1009,7 +1047,7 @@ private struct GalleryVideoPage: View {
         .onChange(of: isActive) { _, nowActive in
             if !nowActive {
                 ChatVideoPosterGenerator.cancelPosters(forKey: item.thumbnailKey)
-                controller.teardown(allowsPictureInPictureRetention: false)
+                controller.deactivatePage()
             }
         }
         .onDisappear {
@@ -1298,6 +1336,16 @@ private final class GalleryVideoController: ObservableObject {
         }
         ChatVideoPictureInPicture.shared.detach(owner: self)
         releaseResources()
+    }
+
+    /// Paging away is a terminal viewing intent for this owner, but AVKit may still be between its
+    /// asynchronous start/stop callbacks. Ask the PiP coordinator to stop first, then use the same
+    /// deferred teardown path as disappearance so the player and both file leases survive until
+    /// AVKit has actually released them.
+    func deactivatePage() {
+        pause()
+        ChatVideoPictureInPicture.shared.stopForPageDeactivation(owner: self)
+        teardown()
     }
 
     private func releaseResources() {

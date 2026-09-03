@@ -213,8 +213,20 @@ struct MessageBackupPayload: Codable, Equatable, Sendable {
         includesMedia: Bool,
         createdAt: Date = Date()
     ) -> MessageBackupPayload {
+        // A provisional conversation is inseparable from its device-local outbox, which backups
+        // intentionally exclude. Exporting that conversation alone would restore a ghost thread
+        // with no message to replay. Promotion aliases are navigation state for the originating
+        // device and likewise have no meaning on a restored installation.
+        let conversations = state.conversations.compactMap { conversation -> Conversation? in
+            guard conversation.pendingDirectRecipientUserID == nil else { return nil }
+            var portable = conversation
+            portable.pendingDirectRecipientUserID = nil
+            portable.localConversationAliases = nil
+            return portable
+        }
+        let portableConversationIDs = Set(conversations.map(\.id))
         let conversationsByID = Dictionary(
-            state.conversations.map { ($0.id, $0) },
+            conversations.map { ($0.id, $0) },
             uniquingKeysWith: { first, _ in first }
         )
         let ownerUserID = userID.lowercased()
@@ -222,6 +234,7 @@ struct MessageBackupPayload: Codable, Equatable, Sendable {
         // only messages whose server submission or receipt is already committed; restoring a
         // queued/encrypting/sending/failed local item without its command could silently strand it.
         var messages = state.messages.filter { message in
+            guard portableConversationIDs.contains(message.conversationId) else { return false }
             switch message.state {
             case .sent, .delivered, .read, .received:
                 guard message.pendingAttachment == nil,
@@ -314,11 +327,26 @@ struct MessageBackupPayload: Codable, Equatable, Sendable {
             userID: userID.lowercased(),
             createdAt: createdAt,
             deviceName: deviceName,
-            conversations: state.conversations,
+            conversations: conversations,
             messages: messages,
-            pinnedConversationIds: state.pinnedConversationIds,
-            mutedConversationIds: state.mutedConversationIds
+            pinnedConversationIds: portableConversationReferences(
+                state.pinnedConversationIds,
+                allowedIDs: portableConversationIDs
+            ),
+            mutedConversationIds: portableConversationReferences(
+                state.mutedConversationIds,
+                allowedIDs: portableConversationIDs
+            )
         )
+    }
+
+    private static func portableConversationReferences(
+        _ values: [String]?,
+        allowedIDs: Set<String>
+    ) -> [String]? {
+        guard let values else { return nil }
+        let filtered = values.filter(allowedIDs.contains)
+        return filtered.isEmpty ? nil : filtered
     }
 }
 
@@ -440,6 +468,10 @@ enum MessageBackupValidationPolicy {
         var groupConversationIDs: Set<String> = []
         for conversation in payload.conversations {
             guard SecureMessagingWirePolicy.isCanonicalUUID(conversation.id),
+                  // Neither field is portable: provisional conversations require the omitted
+                  // outbox, and aliases belong only to the installation that minted them.
+                  conversation.pendingDirectRecipientUserID == nil,
+                  conversation.localConversationAliases == nil,
                   conversation.conversationType == nil
                     || conversation.conversationType == SecureMessagingWire.directConversationType
                     || conversation.conversationType == SecureMessagingWire.groupConversationType,

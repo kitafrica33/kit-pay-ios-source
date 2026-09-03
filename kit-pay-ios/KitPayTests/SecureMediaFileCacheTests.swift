@@ -161,6 +161,135 @@ final class SecureMediaFileCacheTests: XCTestCase {
         await cache.releaseProtectedOriginalLease(lease)
     }
 
+    func testLegacyInlineReceivedMediaCompactsAsOneFileBackedBatch() async throws {
+        let videoBytes = Data(repeating: 0x31, count: 96 * 1_024)
+        let documentBytes = Data(repeating: 0x42, count: 48 * 1_024)
+        let video = try makeLegacyInlineReceivedMessage(
+            mediaType: "video/mp4",
+            bytes: videoBytes
+        )
+        let document = try makeLegacyInlineReceivedMessage(
+            mediaType: "application/pdf",
+            bytes: documentBytes
+        )
+        let originalState = legacyInlineReceivedState(messages: [video.message, document.message])
+        let originalEncodedSize = try JSONEncoder().encode(originalState).count
+
+        let prepared = await LegacyInlineReceivedMediaCompactionPolicy.prepare(
+            state: originalState,
+            forUserID: userID,
+            cache: cache,
+            now: Date(timeIntervalSince1970: 1_800_000_001)
+        )
+
+        XCTAssertEqual(prepared.eligibleCount, 2)
+        XCTAssertEqual(prepared.promotedCount, 2)
+        XCTAssertEqual(
+            prepared.promotedByteCount,
+            Int64(videoBytes.count + documentBytes.count)
+        )
+        XCTAssertTrue(prepared.state.messages.allSatisfy { $0.attachmentData == nil })
+        XCTAssertLessThan(try JSONEncoder().encode(prepared.state).count, originalEncodedSize)
+
+        for expected in [video, document] {
+            let message = try XCTUnwrap(prepared.state.messages.first(where: {
+                $0.id == expected.message.id
+            }))
+            let record = try XCTUnwrap(message.localMediaRecords?.first)
+            XCTAssertEqual(record.id, expected.descriptor.attachmentID)
+            XCTAssertEqual(record.localStorageKind, .protectedFile)
+            XCTAssertEqual(record.localStorageKey, expected.descriptor.attachmentID)
+            XCTAssertEqual(record.remoteEncryptedObjectID, expected.descriptor.storageKey)
+            XCTAssertEqual(record.availabilityState, .localCached)
+            XCTAssertEqual(record.downloadState, .downloaded)
+            XCTAssertEqual(record.encryptionState, .decrypted)
+
+            let playbackLease = await cache.protectedOriginalLease(
+                forStorageKey: expected.descriptor.attachmentID,
+                userID: userID,
+                expectedByteCount: expected.descriptor.plaintextByteSize
+            )
+            let lease = try XCTUnwrap(playbackLease)
+            let loaded = SecureMediaLoadPolicy.LoadedItem(localFile: .init(
+                url: lease.fileURL,
+                mediaType: expected.descriptor.mediaType,
+                caption: expected.descriptor.caption,
+                byteCount: expected.descriptor.plaintextByteSize,
+                attachmentID: expected.descriptor.attachmentID,
+                accessLease: lease
+            ))
+            XCTAssertTrue(loaded.data.isEmpty)
+            XCTAssertEqual(loaded.localFileURL, lease.fileURL)
+            XCTAssertEqual(try Data(contentsOf: lease.fileURL), expected.bytes)
+            await cache.releaseProtectedOriginalLease(lease)
+        }
+        await prepared.releaseProtectedOriginalLeases(using: cache)
+    }
+
+    func testLegacyInlineCompactionLeavesMismatchedRowsUnchanged() async throws {
+        let bytes = Data(repeating: 0x53, count: 8 * 1_024)
+        var fixture = try makeLegacyInlineReceivedMessage(
+            mediaType: "video/mp4",
+            bytes: bytes
+        )
+        _ = LocalMediaRecordPolicy.migrateAndRecover(&fixture.message)
+        fixture.message.localMediaRecords?[0].mediaType = "image/jpeg"
+        let originalMessage = fixture.message
+
+        let prepared = await LegacyInlineReceivedMediaCompactionPolicy.prepare(
+            state: legacyInlineReceivedState(messages: [originalMessage]),
+            forUserID: userID,
+            cache: cache
+        )
+
+        XCTAssertEqual(prepared.eligibleCount, 1)
+        XCTAssertEqual(prepared.promotedCount, 0)
+        XCTAssertEqual(prepared.promotedByteCount, 0)
+        XCTAssertEqual(prepared.state.messages, [originalMessage])
+        let protectedURL = await cache.protectedOriginalURL(
+            forStorageKey: fixture.descriptor.attachmentID,
+            userID: userID,
+            expectedByteCount: bytes.count
+        )
+        XCTAssertNil(protectedURL)
+        await prepared.releaseProtectedOriginalLeases(using: cache)
+    }
+
+    func testLegacyInlineCompactionDoesNotClearBytesWhenCachePublicationFails() async throws {
+        let bytes = Data(repeating: 0x64, count: 8 * 1_024)
+        var fixture = try makeLegacyInlineReceivedMessage(
+            mediaType: "video/quicktime",
+            bytes: bytes
+        )
+        _ = LocalMediaRecordPolicy.migrateAndRecover(&fixture.message)
+        let originalMessage = fixture.message
+        let occupied = Data("an existing sealed representation".utf8)
+        let insertion = await cache.insertIfAbsent(
+            occupied,
+            forStorageKey: fixture.descriptor.attachmentID,
+            userID: userID
+        )
+        XCTAssertEqual(insertion, .stored)
+
+        let prepared = await LegacyInlineReceivedMediaCompactionPolicy.prepare(
+            state: legacyInlineReceivedState(messages: [originalMessage]),
+            forUserID: userID,
+            cache: cache
+        )
+
+        XCTAssertEqual(prepared.eligibleCount, 1)
+        XCTAssertEqual(prepared.promotedCount, 0)
+        XCTAssertEqual(prepared.state.messages, [originalMessage])
+        XCTAssertEqual(prepared.state.messages.first?.attachmentData, bytes)
+        let retained = await cache.encryptedBlobData(
+            forStorageKey: fixture.descriptor.attachmentID,
+            userID: userID,
+            expectedByteCount: occupied.count
+        )
+        XCTAssertEqual(retained, occupied)
+        await prepared.releaseProtectedOriginalLeases(using: cache)
+    }
+
     func testStreamedLegacyVideoMayCoexistWithSealedBlobUntilStateCommit() async throws {
         let storageKey = UUID().uuidString.lowercased()
         let videoBytes = Data((0 ..< 64 * 1_024).map { UInt8($0 % 251) })
@@ -762,5 +891,59 @@ final class SecureMediaFileCacheTests: XCTestCase {
             .appendingPathComponent(accountID, isDirectory: true)
             .appendingPathComponent("\(storageKey).original.bin", isDirectory: false)
         try FileManager.default.setAttributes([.modificationDate: date], ofItemAtPath: url.path)
+    }
+
+    private func makeLegacyInlineReceivedMessage(
+        mediaType: String,
+        bytes: Data
+    ) throws -> (
+        message: LocalMessage,
+        descriptor: KitMediaMessageDescriptor,
+        bytes: Data
+    ) {
+        let descriptor = try KitMediaMessageDescriptor(
+            attachmentID: UUID().uuidString.lowercased(),
+            storageKey: UUID().uuidString.lowercased(),
+            mediaType: mediaType,
+            ciphertextByteSize: Int64(bytes.count) + 64,
+            ciphertextSHA256: String(repeating: "ab", count: 32),
+            keyMaterial: Data(
+                repeating: 0x75,
+                count: SecureMediaAttachmentCipher.keyMaterialBytes
+            ),
+            plaintextByteSize: bytes.count,
+            caption: "Legacy received attachment"
+        )
+        let message = LocalMessage(
+            id: UUID(),
+            conversationId: UUID().uuidString.lowercased(),
+            senderId: UUID().uuidString.lowercased(),
+            body: descriptor.encoded,
+            createdAt: Date(timeIntervalSince1970: 1_800_000_000),
+            sentAt: Date(timeIntervalSince1970: 1_800_000_000),
+            state: .received,
+            failureReason: nil,
+            isOutgoing: false,
+            attachmentData: bytes
+        )
+        return (message, descriptor, bytes)
+    }
+
+    private func legacyInlineReceivedState(messages: [LocalMessage]) -> PersistedState {
+        var state = PersistedState.empty
+        state.profile = UserProfile(
+            id: userID,
+            name: "Media Recipient",
+            email: "media-recipient@example.test",
+            phone: "+256700000000",
+            tag: "media_recipient",
+            kycStatus: "verified",
+            paymentPinSet: true,
+            mfaEnabled: true,
+            profileSetupRequired: false
+        )
+        state.communicationOwnerUserID = userID
+        state.messages = messages
+        return state
     }
 }

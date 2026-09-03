@@ -792,6 +792,360 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
         XCTAssertNil(command.secureMessageFanout)
     }
 
+    func testCapabilityApprovedFirstContactQueuesLocallyAndSurvivesRelaunch() async throws {
+        let userID = "10000000-0000-4000-8000-000000000181"
+        let peerID = "10000000-0000-4000-8000-000000000182"
+        let clientMessageID = UUID(uuidString: "80000000-0000-4000-8000-000000000181")!
+        let store = try await makeStore(userID: userID)
+        try await store.update { state in
+            state.communicationOwnerUserID = userID
+            state.secureMessaging = nil
+        }
+        let transport = OfflineExchangeTransport()
+        let coordinator = SecureMessagingExchangeCoordinator(
+            transport: transport,
+            store: store,
+            engine: SecureMessagingCryptoEngine(),
+            provisioningPreKeyCount: 1
+        )
+
+        let first = try await coordinator.queueDirectText(
+            forUserID: userID,
+            recipientUserID: peerID,
+            title: "Waswa Titus Zera",
+            text: "  appears before the network  ",
+            clientMessageID: clientMessageID,
+            allowsProvisionalConversationCreation: true
+        )
+        let retry = try await coordinator.queueDirectText(
+            forUserID: userID,
+            recipientUserID: peerID,
+            title: "Waswa Titus Zera",
+            text: "appears before the network",
+            clientMessageID: clientMessageID,
+            allowsProvisionalConversationCreation: true
+        )
+
+        XCTAssertTrue(SecureMessagingWirePolicy.isCanonicalUUIDv4(first.conversation.id))
+        XCTAssertTrue(first.conversation.isProvisionalDirect)
+        XCTAssertEqual(first.conversation.pendingDirectRecipientUserID, peerID)
+        XCTAssertEqual(retry.conversation.id, first.conversation.id)
+        let networkCallCount = await transport.networkCallCount()
+        XCTAssertEqual(networkCallCount, 0)
+
+        let snapshot = await store.snapshot()
+        XCTAssertEqual(snapshot.conversations.count, 1)
+        XCTAssertEqual(snapshot.messages.count, 1)
+        XCTAssertEqual(snapshot.outbox.count, 1)
+        XCTAssertEqual(snapshot.messages[0].conversationId, first.conversation.id)
+        XCTAssertEqual(snapshot.messages[0].state, .queued)
+        XCTAssertEqual(snapshot.outbox[0].conversationId, first.conversation.id)
+        XCTAssertEqual(snapshot.outbox[0].messageId, clientMessageID)
+        XCTAssertNil(snapshot.outbox[0].secureMessageFanout)
+
+        let reopened = SecureLocalStore(
+            stateURL: temporaryDirectory.appendingPathComponent("state.secure"),
+            keyData: Data(repeating: 0x91, count: 32)
+        )
+        let restored = await reopened.snapshot()
+        XCTAssertEqual(restored.conversations.map(\.id), [first.conversation.id])
+        XCTAssertTrue(restored.conversations[0].isProvisionalDirect)
+        XCTAssertEqual(restored.messages.map(\.id), [clientMessageID])
+        XCTAssertEqual(restored.outbox.compactMap(\.messageId), [clientMessageID])
+    }
+
+    func testConcurrentFirstContactSendsConvergeOnOneProvisionalConversation() async throws {
+        let userID = "10000000-0000-4000-8000-000000000190"
+        let peerID = "10000000-0000-4000-8000-000000000191"
+        let firstMessageID = UUID(uuidString: "80000000-0000-4000-8000-000000000190")!
+        let secondMessageID = UUID(uuidString: "80000000-0000-4000-8000-000000000191")!
+        let store = try await makeStore(userID: userID)
+        try await store.update { state in
+            state.communicationOwnerUserID = userID
+            state.secureMessaging = nil
+        }
+        let transport = OfflineExchangeTransport()
+        let coordinator = SecureMessagingExchangeCoordinator(
+            transport: transport,
+            store: store,
+            engine: SecureMessagingCryptoEngine(),
+            provisioningPreKeyCount: 1
+        )
+
+        async let first = coordinator.queueDirectText(
+            forUserID: userID,
+            recipientUserID: peerID,
+            title: "Waswa Titus Zera",
+            text: "first local message",
+            clientMessageID: firstMessageID,
+            allowsProvisionalConversationCreation: true
+        )
+        async let second = coordinator.queueDirectText(
+            forUserID: userID,
+            recipientUserID: peerID,
+            title: "Waswa Titus Zera",
+            text: "second local message",
+            clientMessageID: secondMessageID,
+            allowsProvisionalConversationCreation: true
+        )
+        let (firstResult, secondResult) = try await (first, second)
+        let results = [firstResult, secondResult]
+
+        XCTAssertEqual(Set(results.map { $0.conversation.id }).count, 1)
+        let networkCallCount = await transport.networkCallCount()
+        XCTAssertEqual(networkCallCount, 0)
+        let snapshot = await store.snapshot()
+        XCTAssertEqual(snapshot.conversations.count, 1)
+        XCTAssertTrue(snapshot.conversations[0].isProvisionalDirect)
+        XCTAssertEqual(Set(snapshot.messages.map(\.id)), Set([firstMessageID, secondMessageID]))
+        XCTAssertEqual(snapshot.outbox.count, 2)
+        XCTAssertEqual(
+            Set(snapshot.messages.map(\.conversationId)),
+            Set([snapshot.conversations[0].id])
+        )
+        XCTAssertEqual(
+            Set(snapshot.outbox.compactMap(\.conversationId)),
+            Set([snapshot.conversations[0].id])
+        )
+    }
+
+    func testMediaQueuesLocallyAfterTextBootstrapsAProvisionalConversation() async throws {
+        let userID = "10000000-0000-4000-8000-000000000192"
+        let peerID = "10000000-0000-4000-8000-000000000193"
+        let store = try await makeStore(userID: userID)
+        try await store.update { state in
+            state.communicationOwnerUserID = userID
+            state.secureMessaging = nil
+        }
+        let transport = OfflineExchangeTransport()
+        let coordinator = SecureMessagingExchangeCoordinator(
+            transport: transport,
+            store: store,
+            engine: SecureMessagingCryptoEngine(),
+            provisioningPreKeyCount: 1
+        )
+        let text = try await coordinator.queueDirectText(
+            forUserID: userID,
+            recipientUserID: peerID,
+            title: "Waswa Titus Zera",
+            text: "thread bootstrap",
+            allowsProvisionalConversationCreation: true
+        )
+        let jpeg = Data([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0xff, 0xd9])
+
+        let media = try await coordinator.queueDeferredImage(
+            forUserID: userID,
+            conversationID: text.conversation.id,
+            expectedRecipientUserID: peerID,
+            title: "Waswa Titus Zera",
+            mediaData: jpeg,
+            mediaType: "image/jpeg",
+            caption: "offline proof"
+        )
+
+        let networkCallCount = await transport.networkCallCount()
+        XCTAssertEqual(networkCallCount, 0)
+        let snapshot = await store.snapshot()
+        XCTAssertEqual(snapshot.conversations.count, 1)
+        XCTAssertEqual(snapshot.messages.count, 2)
+        XCTAssertEqual(snapshot.outbox.count, 2)
+        XCTAssertTrue(snapshot.messages.allSatisfy {
+            $0.conversationId == text.conversation.id && $0.state == .queued
+        })
+        let mediaMessage = try XCTUnwrap(snapshot.messages.first(where: {
+            $0.id == media.clientMessageID
+        }))
+        XCTAssertNotNil(mediaMessage.pendingAttachment)
+        XCTAssertEqual(mediaMessage.localMediaRecords?.first?.conversationID, text.conversation.id)
+    }
+
+    func testProvisionalDirectReconciliationAtomicallyRemapsAllLocalReferences() throws {
+        let userID = "10000000-0000-4000-8000-000000000183"
+        let peerID = "10000000-0000-4000-8000-000000000184"
+        let provisionalID = "30000000-0000-4000-8000-000000000183"
+        let authoritativeID = "30000000-0000-4000-8000-000000000184"
+        let messageID = UUID(uuidString: "80000000-0000-4000-8000-000000000183")!
+        let mediaID = "70000000-0000-4000-8000-000000000183"
+        let createdAt = Date(timeIntervalSince1970: 1_756_800_000)
+        let provisional = try XCTUnwrap(ProvisionalDirectConversationPolicy.make(
+            id: provisionalID,
+            localUserID: userID,
+            recipientUserID: peerID,
+            title: "Waswa Titus Zera",
+            createdAt: createdAt
+        ))
+        let media = try XCTUnwrap(LocalMediaRecordPolicy.queuedOutgoing(
+            id: mediaID,
+            messageID: messageID,
+            conversationID: provisionalID,
+            mediaType: "image/jpeg",
+            fileSize: 8,
+            localStorageKey: nil,
+            storesInline: true,
+            now: createdAt
+        ))
+        let message = LocalMessage(
+            id: messageID,
+            conversationId: provisionalID,
+            senderId: userID,
+            body: "Pending attachment",
+            createdAt: createdAt,
+            sentAt: nil,
+            state: .queued,
+            failureReason: nil,
+            isOutgoing: true,
+            localMediaRecords: [media]
+        )
+        let command = OfflineCommand(
+            id: UUID(uuidString: "90000000-0000-4000-8000-000000000183")!,
+            kind: .secureMessage,
+            createdAt: createdAt,
+            nextAttemptAt: createdAt,
+            attemptCount: 0,
+            conversationId: provisionalID,
+            messageId: messageID,
+            recipientUserIds: [peerID],
+            recipientName: "Waswa Titus Zera",
+            video: nil,
+            expiresAt: nil
+        )
+        var state = PersistedState.empty
+        state.profile = UserProfile(
+            id: userID,
+            name: "Secure User",
+            email: nil,
+            phone: "+256700000183",
+            tag: nil,
+            kycStatus: nil,
+            paymentPinSet: nil,
+            mfaEnabled: nil,
+            profileSetupRequired: false
+        )
+        state.communicationOwnerUserID = userID
+        state.conversations = [provisional]
+        state.messages = [message]
+        state.outbox = [command]
+        state.conversationDrafts = [
+            provisionalID: ConversationDraft(body: "next message", updatedAt: createdAt),
+        ]
+        state.pinnedConversationIds = [provisionalID]
+        state.mutedConversationIds = [provisionalID]
+        let authoritative = Conversation(
+            id: authoritativeID,
+            title: "Waswa",
+            participantUserIds: [userID, peerID],
+            unreadCount: 0,
+            updatedAt: createdAt.addingTimeInterval(10),
+            conversationType: SecureMessagingWire.directConversationType
+        )
+
+        XCTAssertTrue(ProvisionalDirectConversationPolicy.reconcile(
+            provisionalID: provisionalID,
+            authoritative: authoritative,
+            localUserID: userID,
+            recipientUserID: peerID,
+            in: &state
+        ))
+
+        XCTAssertEqual(state.conversations.map(\.id), [authoritativeID])
+        XCTAssertEqual(state.conversations[0].localConversationAliases, [provisionalID])
+        XCTAssertNil(state.conversations[0].pendingDirectRecipientUserID)
+        XCTAssertEqual(state.messages.map(\.conversationId), [authoritativeID])
+        XCTAssertEqual(state.messages[0].localMediaRecords?.map(\.conversationID), [authoritativeID])
+        XCTAssertEqual(state.outbox.compactMap(\.conversationId), [authoritativeID])
+        XCTAssertEqual(state.conversationDrafts?.count, 1)
+        XCTAssertNotNil(state.conversationDrafts?[authoritativeID])
+        XCTAssertEqual(state.pinnedConversationIds, [authoritativeID])
+        XCTAssertEqual(state.mutedConversationIds, [authoritativeID])
+    }
+
+    func testMalformedProvisionalReconciliationLeavesStateUnchanged() throws {
+        let userID = "10000000-0000-4000-8000-000000000185"
+        let peerID = "10000000-0000-4000-8000-000000000186"
+        let provisionalID = "30000000-0000-4000-8000-000000000185"
+        let createdAt = Date(timeIntervalSince1970: 1_756_800_000)
+        var state = PersistedState.empty
+        state.profile = UserProfile(
+            id: userID,
+            name: "Secure User",
+            email: nil,
+            phone: "+256700000185",
+            tag: nil,
+            kycStatus: nil,
+            paymentPinSet: nil,
+            mfaEnabled: nil,
+            profileSetupRequired: false
+        )
+        state.communicationOwnerUserID = userID
+        state.conversations = [try XCTUnwrap(ProvisionalDirectConversationPolicy.make(
+            id: provisionalID,
+            localUserID: userID,
+            recipientUserID: peerID,
+            title: "Waswa",
+            createdAt: createdAt
+        ))]
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let before = try encoder.encode(state)
+        let malformed = Conversation(
+            id: "30000000-0000-4000-8000-000000000186",
+            title: "Wrong pair",
+            participantUserIds: [userID, "10000000-0000-4000-8000-000000000187"],
+            unreadCount: 0,
+            updatedAt: createdAt,
+            conversationType: SecureMessagingWire.directConversationType
+        )
+
+        XCTAssertFalse(ProvisionalDirectConversationPolicy.reconcile(
+            provisionalID: provisionalID,
+            authoritative: malformed,
+            localUserID: userID,
+            recipientUserID: peerID,
+            in: &state
+        ))
+        XCTAssertEqual(try encoder.encode(state), before)
+
+        let duplicate = try XCTUnwrap(ProvisionalDirectConversationPolicy.make(
+            id: "30000000-0000-4000-8000-000000000187",
+            localUserID: userID,
+            recipientUserID: peerID,
+            title: "Duplicate local race",
+            createdAt: createdAt.addingTimeInterval(1)
+        ))
+        state.conversations.append(duplicate)
+        let beforeAmbiguousAttempt = try encoder.encode(state)
+        let validAuthoritative = Conversation(
+            id: "30000000-0000-4000-8000-000000000188",
+            title: "Waswa",
+            participantUserIds: [userID, peerID],
+            unreadCount: 0,
+            updatedAt: createdAt.addingTimeInterval(2),
+            conversationType: SecureMessagingWire.directConversationType
+        )
+        XCTAssertFalse(ProvisionalDirectConversationPolicy.reconcile(
+            provisionalID: provisionalID,
+            authoritative: validAuthoritative,
+            localUserID: userID,
+            recipientUserID: peerID,
+            in: &state
+        ))
+        XCTAssertEqual(try encoder.encode(state), beforeAmbiguousAttempt)
+    }
+
+    func testProvisionalReplayUsesStableClientConversationIDAndPromotesBeforeCrypto() async throws {
+        try await assertProvisionalReplay(
+            advertisesCapability: true,
+            expectsClientConversationID: true
+        )
+    }
+
+    func testProvisionalReplayOmitsClientConversationIDAfterCapabilityWithdrawal() async throws {
+        try await assertProvisionalReplay(
+            advertisesCapability: false,
+            expectsClientConversationID: false
+        )
+    }
+
     func testExistingFirstMessageRejectsStaleSameUserLoginLeaseWithoutMutation() async throws {
         let userID = "10000000-0000-4000-8000-000000000077"
         let peerID = "10000000-0000-4000-8000-000000000078"
@@ -6430,6 +6784,102 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
         return state
     }
 
+    private func assertProvisionalReplay(
+        advertisesCapability: Bool,
+        expectsClientConversationID: Bool
+    ) async throws {
+        let userID = "10000000-0000-4000-8000-000000000188"
+        let peerID = "10000000-0000-4000-8000-000000000189"
+        let authoritativeID = "30000000-0000-4000-8000-000000000189"
+        let messageID = UUID(uuidString: "80000000-0000-4000-8000-000000000188")!
+        let store = try await makeStore(userID: userID)
+        try await store.update { state in
+            state.communicationOwnerUserID = userID
+            state.secureMessaging = nil
+        }
+        let transport = ProvisionalDirectReplayTransport(
+            capabilitiesDocument: try offlineDirectCreationCapabilities(
+                enabled: advertisesCapability
+            ),
+            authoritativeConversation: directConversationDTO(
+                id: authoritativeID,
+                userID: userID,
+                peerID: peerID,
+                peerName: "Waswa Titus Zera"
+            )
+        )
+        let coordinator = SecureMessagingExchangeCoordinator(
+            transport: transport,
+            store: store,
+            engine: SecureMessagingCryptoEngine(),
+            provisioningPreKeyCount: 1
+        )
+        let queued = try await coordinator.queueDirectText(
+            forUserID: userID,
+            recipientUserID: peerID,
+            title: "Waswa Titus Zera",
+            text: "durable before materialization",
+            clientMessageID: messageID,
+            allowsProvisionalConversationCreation: true
+        )
+        let provisionalID = queued.conversation.id
+        let queuedSnapshot = await store.snapshot()
+        let commandID = try XCTUnwrap(queuedSnapshot.outbox.first?.id)
+
+        do {
+            _ = try await coordinator.prepareDeferredMessage(
+                commandID: commandID,
+                forUserID: userID
+            )
+            XCTFail("The fixture must stop immediately after canonical promotion")
+        } catch ProvisionalDirectReplayTransport.Failure.afterPromotion {
+            // Expected: the next authoritative conversation read proves remapping happened before
+            // enrollment, roster, encryption, media upload, or transmission can begin.
+        }
+
+        let requests = await transport.createRequests()
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(requests[0].memberIds, [peerID])
+        XCTAssertEqual(
+            requests[0].clientConversationId,
+            expectsClientConversationID ? provisionalID : nil
+        )
+        let events = await transport.events()
+        XCTAssertEqual(events, ["capabilities", "create", "conversation:\(authoritativeID)"])
+        let snapshot = await store.snapshot()
+        XCTAssertEqual(snapshot.conversations.map(\.id), [authoritativeID])
+        XCTAssertEqual(snapshot.conversations[0].localConversationAliases, [provisionalID])
+        XCTAssertEqual(snapshot.messages.map(\.conversationId), [authoritativeID])
+        XCTAssertEqual(snapshot.outbox.compactMap(\.conversationId), [authoritativeID])
+        XCTAssertEqual(snapshot.messages.map(\.state), [.queued])
+        XCTAssertTrue(snapshot.outbox.allSatisfy { $0.secureMessageFanout == nil })
+    }
+
+    private func offlineDirectCreationCapabilities(enabled: Bool) throws -> CapabilitiesDTO {
+        var messaging: [String: Any] = [
+            "ready": true,
+            "version": SecureMessagingWire.protocolVersion,
+            "suite": SecureMessagingWire.protocolSuite,
+            "post_quantum": true,
+        ]
+        if enabled {
+            messaging["offline_direct_creation"] = [
+                "profile": MessagingOfflineDirectCreationCapabilityDTO.reviewedProfile,
+                "ready": true,
+                "request_field": MessagingOfflineDirectCreationCapabilityDTO.reviewedRequestField,
+                "canonical_id_on_create": true,
+                "existing_pair_wins": true,
+            ]
+        }
+        let data = try JSONSerialization.data(withJSONObject: [
+            "api_version": "v1",
+            "currency": ["code": "UGX", "scale": "2"],
+            "features": ["messaging": true],
+            "protocols": ["messaging": messaging],
+        ])
+        return try JSONDecoder().decode(CapabilitiesDTO.self, from: data)
+    }
+
     private func directConversationDTO(
         id: String,
         userID: String,
@@ -8687,6 +9137,105 @@ private actor DeferredImageCheckpointTransport: SecureMessagingExchangeTransport
         conversationId: String,
         request: SendEncryptedMessageRequest
     ) async throws -> EncryptedMessageDTO { try reject() }
+
+    func downloadMessagingAttachment(
+        storageKey: String,
+        expectedByteSize: Int64
+    ) async throws -> Data { try reject() }
+
+    func syncEncryptedMessages(
+        cursor: String?,
+        limit: Int
+    ) async throws -> MessagingSyncDTO { try reject() }
+
+    func acknowledgeMessageDelivery(
+        _ request: AcknowledgeMessageDeliveryRequest
+    ) async throws -> MessageDeliveryAcknowledgementDTO { try reject() }
+
+    func markMessagingConversationRead(
+        conversationId: String,
+        request: MarkMessagingConversationReadRequest
+    ) async throws -> MessagingReadReceiptDTO { try reject() }
+}
+
+/// Materializes one provisional conversation, then deliberately stops on the first canonical
+/// conversation read. Its ordered call log proves promotion happens before E2EE activation or
+/// any attachment/network side effect.
+private actor ProvisionalDirectReplayTransport: SecureMessagingExchangeTransport {
+    enum Failure: Error { case afterPromotion, unexpectedNetworkCall }
+
+    private let capabilitiesDocument: CapabilitiesDTO
+    private let authoritativeConversation: MessagingConversationDTO
+    private var recordedRequests: [CreateDirectMessagingConversationRequest] = []
+    private var recordedEvents: [String] = []
+
+    init(
+        capabilitiesDocument: CapabilitiesDTO,
+        authoritativeConversation: MessagingConversationDTO
+    ) {
+        self.capabilitiesDocument = capabilitiesDocument
+        self.authoritativeConversation = authoritativeConversation
+    }
+
+    func createRequests() -> [CreateDirectMessagingConversationRequest] { recordedRequests }
+    func events() -> [String] { recordedEvents }
+
+    func capabilities() async throws -> CapabilitiesDTO {
+        recordedEvents.append("capabilities")
+        return capabilitiesDocument
+    }
+
+    func createDirectMessagingConversation(
+        _ request: CreateDirectMessagingConversationRequest
+    ) async throws -> MessagingConversationDTO {
+        recordedEvents.append("create")
+        recordedRequests.append(request)
+        return authoritativeConversation
+    }
+
+    func messagingConversation(id: String) async throws -> MessagingConversationDTO {
+        recordedEvents.append("conversation:\(id)")
+        guard id == authoritativeConversation.id else { throw Failure.unexpectedNetworkCall }
+        throw Failure.afterPromotion
+    }
+
+    private func reject<T>() throws -> T { throw Failure.unexpectedNetworkCall }
+
+    func messagingKeyStatus() async throws -> MessagingKeyStatusDTO { try reject() }
+
+    func publishMessagingKeyBundle(
+        _ request: PublishMessagingKeyBundleRequest
+    ) async throws -> MessagingKeyStatusDTO { try reject() }
+
+    func resetMessagingEnrollment(
+        _ request: ResetMessagingEnrollmentRequest
+    ) async throws -> ResetMessagingEnrollmentDTO { try reject() }
+
+    func messagingConversations() async throws -> MessagingConversationListDTO { try reject() }
+
+    func messagingDeviceRoster(
+        conversationId: String
+    ) async throws -> MessagingDeviceRosterDTO { try reject() }
+
+    func historicalMessagingDeviceRoster(
+        conversationId: String,
+        rosterRevision: String
+    ) async throws -> MessagingDeviceRosterDTO { try reject() }
+
+    func consumeMessagingKeyBundles(
+        conversationId: String,
+        request: ConsumeMessagingKeyBundlesRequest
+    ) async throws -> ConsumedMessagingKeyBundlesDTO { try reject() }
+
+    func sendEncryptedMessage(
+        conversationId: String,
+        request: SendEncryptedMessageRequest
+    ) async throws -> EncryptedMessageDTO { try reject() }
+
+    func uploadMessagingAttachment(
+        mediaType: String,
+        ciphertext: Data
+    ) async throws -> MessagingAttachmentUploadDTO { try reject() }
 
     func downloadMessagingAttachment(
         storageKey: String,
