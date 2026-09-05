@@ -13,6 +13,7 @@ import re
 
 from ios_profile_entitlements import (
     authorizes_cloudkit,
+    authorizes_ios_platforms,
     authorizes_production_icloud,
 )
 
@@ -139,7 +140,7 @@ def verify_broadcast_extension(args: argparse.Namespace, app_info: dict) -> None
         (info.get("RTCAppGroupIdentifier") == args.app_group, "extension IPC group"),
         (profile.get("UUID") == args.expected_broadcast_profile_uuid, "profile UUID"),
         (profile.get("TeamIdentifier") == [args.team_id], "profile team"),
-        (profile.get("Platform") == ["iOS"], "profile platform"),
+        (authorizes_ios_platforms(profile.get("Platform")), "profile platform"),
         ("ProvisionedDevices" not in profile and profile.get("ProvisionsAllDevices") is not True, "App Store distribution"),
     )
     for passed, label in checks:

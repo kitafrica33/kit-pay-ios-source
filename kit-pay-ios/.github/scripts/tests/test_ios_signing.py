@@ -221,6 +221,33 @@ def certificate_resource(
 
 
 class IOSProfileEntitlementAuthorizationTests(unittest.TestCase):
+    def test_ios_platform_authorization_matrix(self) -> None:
+        cases = (
+            ("ios-only", ["iOS"], True),
+            ("apple-ios-profile", ["iOS", "xrOS", "visionOS"], True),
+            ("apple-ios-profile-reversed", ["visionOS", "xrOS", "iOS"], True),
+            ("ios-and-xros", ["iOS", "xrOS"], True),
+            ("ios-and-visionos", ["visionOS", "iOS"], True),
+            ("missing-or-null", None, False),
+            ("empty-list", [], False),
+            ("scalar-ios", "iOS", False),
+            ("tuple-ios", ("iOS",), False),
+            ("dictionary-ios", {"iOS": True}, False),
+            ("nonstring-scalar", 1, False),
+            ("nonstring-list", ["iOS", 1], False),
+            ("nested-list", ["iOS", ["visionOS"]], False),
+            ("dictionary-entry", ["iOS", {"visionOS": True}], False),
+            ("duplicate-ios", ["iOS", "iOS"], False),
+            ("duplicate-extra-platform", ["iOS", "xrOS", "xrOS"], False),
+            ("unknown-extra-platform", ["iOS", "futureOS"], False),
+            ("macos-extra-platform", ["iOS", "macOS"], False),
+            ("no-ios", ["xrOS", "visionOS"], False),
+            ("wrong-case", ["ios"], False),
+        )
+        for label, value, expected in cases:
+            with self.subTest(label=label):
+                self.assertIs(PROFILE_ENTITLEMENTS.authorizes_ios_platforms(value), expected)
+
     def test_cloudkit_service_authorization_matrix(self) -> None:
         cases = (
             ("wildcard", "*", True),
@@ -327,7 +354,9 @@ class PrepareIOSSigningTests(unittest.TestCase):
             export_path = root / "ExportOptions.plist"
             uuid_path = root / "uuid"
             certificate_path = root / "distribution.der"
-            write_plist(profile_path, profile())
+            apple_profile = profile()
+            apple_profile["Platform"] = ["iOS", "xrOS", "visionOS"]
+            write_plist(profile_path, apple_profile)
             certificate_path.write_bytes(CERTIFICATE_DER)
 
             subprocess.run(
@@ -370,8 +399,12 @@ class PrepareIOSSigningTests(unittest.TestCase):
             certificate_path.write_bytes(CERTIFICATE_DER)
             app_profile_path = root / "profile.plist"
             share_profile_path = root / "share-profile.plist"
-            write_plist(app_profile_path, profile())
-            write_plist(share_profile_path, share_profile())
+            for profile_path, value in (
+                (app_profile_path, profile()),
+                (share_profile_path, share_profile()),
+            ):
+                value["Platform"] = ["iOS", "xrOS", "visionOS"]
+                write_plist(profile_path, value)
 
             for role, bundle, profile_path, uuid_name in (
                 ("app", BUNDLE, app_profile_path, "uuid"),
@@ -412,6 +445,42 @@ class PrepareIOSSigningTests(unittest.TestCase):
                 {BUNDLE: PROFILE_UUID, SHARE_BUNDLE: SHARE_PROFILE_UUID},
             )
             self.assertEqual(export["signingStyle"], "manual")
+
+    def test_rejects_malformed_profile_platforms_before_export(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = pathlib.Path(raw)
+            profile_path = root / "profile.plist"
+            certificate_path = root / "distribution.der"
+            certificate_path.write_bytes(CERTIFICATE_DER)
+            export_path = root / "ExportOptions.plist"
+            command = [
+                "python3", str(PREPARE), "--app-group", APP_GROUP,
+                "--profile-plist", str(profile_path), "--certificate-der", str(certificate_path),
+                "--team-id", TEAM,
+                "--export-options", str(export_path), "--profile-uuid-output", str(root / "uuid"),
+            ]
+            for role, bundle, factory in (
+                ("app", BUNDLE, profile),
+                ("extension", SHARE_BUNDLE, share_profile),
+            ):
+                for platforms in (
+                    None, [], "iOS", ["xrOS", "visionOS"], ["iOS", "futureOS"],
+                    ["iOS", "iOS"], ["iOS", 1], ["iOS", ["visionOS"]], {"iOS": True},
+                ):
+                    with self.subTest(role=role, platforms=platforms):
+                        invalid = factory()
+                        if platforms is None:
+                            invalid.pop("Platform")
+                        else:
+                            invalid["Platform"] = platforms
+                        write_plist(profile_path, invalid)
+                        result = subprocess.run(
+                            [*command, "--bundle-id", bundle, "--role", role],
+                            capture_output=True, text=True,
+                        )
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn("not authorized for the iOS platform", result.stderr)
+                        self.assertFalse(export_path.exists())
 
     def test_rejects_profiles_that_do_not_authorize_the_app_group(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -1628,12 +1697,12 @@ class SigningConfigurationTests(unittest.TestCase):
         readme = (ROOT / "README.md").read_text()
 
         self.assertIn("default: 1.0.16", workflow)
-        self.assertIn('default: "69"', workflow)
-        self.assertIn("v1.0.16-build69", workflow)
+        self.assertIn('default: "70"', workflow)
+        self.assertIn("v1.0.16-build70", workflow)
         # Six each: Debug and Release of the app and both extensions. iOS refuses to
         # install an app whose extension carries a different version, so they move together.
         self.assertEqual(project.count("MARKETING_VERSION = 1.0.16;"), 6)
-        self.assertEqual(project.count("CURRENT_PROJECT_VERSION = 69;"), 6)
+        self.assertEqual(project.count("CURRENT_PROJECT_VERSION = 70;"), 6)
         self.assertNotIn("MARKETING_VERSION = 1.0.1;", project)
         self.assertIn("1.0.16-r39", readme)
         self.assertIn("group_payment_request.{created,contributed,completed,cancelled,expired}", readme)
@@ -2156,7 +2225,10 @@ class VerifyIOSArchiveTests(unittest.TestCase):
             )
             extension_embedded = root / "share-embedded.plist"
             extension_signed = root / "share-signed.plist"
-            write_plist(extension_embedded, share_profile())
+            archive_share_profile = share_profile()
+            archive_share_profile["Platform"] = ["iOS", "xrOS", "visionOS"]
+            archive_share_profile["Entitlements"]["keychain-access-groups"] = [f"{TEAM}.*", "com.apple.token"]
+            write_plist(extension_embedded, archive_share_profile)
             write_plist(
                 extension_signed,
                 {
@@ -2183,14 +2255,27 @@ class VerifyIOSArchiveTests(unittest.TestCase):
             write_plist(broadcast_path / "Info.plist", broadcast_info)
             broadcast_profile = share_profile()
             broadcast_profile["UUID"] = broadcast_uuid
+            # All three profiles generated by Apple for build 69 carry this list.
+            broadcast_profile["Platform"] = ["iOS", "xrOS", "visionOS"]
             broadcast_profile["Entitlements"]["application-identifier"] = f"{TEAM}.{broadcast_bundle}"
+            broadcast_profile["Entitlements"]["keychain-access-groups"] = [f"{TEAM}.*", "com.apple.token"]
+            # Apple's profile authorizes keychain access; this extension does not request it.
+            broadcast_signed_entitlements = {
+                key: value for key, value in broadcast_profile["Entitlements"].items()
+                if key != "keychain-access-groups"
+            }
             broadcast_embedded = root / "broadcast-embedded.plist"
             broadcast_signed = root / "broadcast-signed.plist"
             write_plist(broadcast_embedded, broadcast_profile)
-            write_plist(broadcast_signed, broadcast_profile["Entitlements"])
+            write_plist(broadcast_signed, broadcast_signed_entitlements)
             embedded = root / "embedded.plist"
             signed = root / "signed.plist"
-            write_plist(embedded, profile())
+            archive_app_profile = profile()
+            archive_app_profile["Platform"] = ["iOS", "xrOS", "visionOS"]
+            archive_app_profile["Entitlements"]["keychain-access-groups"] = [f"{TEAM}.*", "com.apple.token"]
+            archive_app_profile["Entitlements"]["com.apple.developer.icloud-services"] = "*"
+            archive_app_profile["Entitlements"][ICLOUD_ENVIRONMENT_KEY] = ["Production", "Development"]
+            write_plist(embedded, archive_app_profile)
             write_plist(
                 signed,
                 {
@@ -2271,12 +2356,15 @@ class VerifyIOSArchiveTests(unittest.TestCase):
                 "--run-attempt",
                 "1",
             ]
-            subprocess.run(
-                command,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
+            for platforms in (["iOS"], ["iOS", "xrOS", "visionOS"], ["visionOS", "xrOS", "iOS"]):
+                with self.subTest(broadcast_platforms=platforms):
+                    write_plist(embedded, {**archive_app_profile, "Platform": platforms})
+                    write_plist(extension_embedded, {**archive_share_profile, "Platform": platforms})
+                    write_plist(broadcast_embedded, {**broadcast_profile, "Platform": platforms})
+                    subprocess.run(command, check=True, capture_output=True, text=True)
+            write_plist(embedded, archive_app_profile)
+            write_plist(extension_embedded, archive_share_profile)
+            write_plist(broadcast_embedded, broadcast_profile)
 
             result = json.loads(evidence.read_text(encoding="utf-8"))
             self.assertEqual(result["target"]["bundleId"], BUNDLE)
@@ -2289,6 +2377,39 @@ class VerifyIOSArchiveTests(unittest.TestCase):
             )
 
             self.assertEqual(result["target"]["broadcastExtensionBundleId"], broadcast_bundle)
+            for platforms in (
+                None, [], "iOS", ["xrOS", "visionOS"], ["iOS", "futureOS"],
+                ["iOS", "macOS"], ["iOS", "iOS"], ["iOS", 1],
+                ["iOS", ["visionOS"]], {"iOS": True},
+            ):
+                with self.subTest(invalid_broadcast_platforms=platforms):
+                    invalid = dict(broadcast_profile)
+                    if platforms is None:
+                        invalid.pop("Platform")
+                    else:
+                        invalid["Platform"] = platforms
+                    write_plist(broadcast_embedded, invalid)
+                    rejected = subprocess.run(command, capture_output=True, text=True)
+                    self.assertNotEqual(rejected.returncode, 0)
+                    self.assertIn("Broadcast extension has invalid profile platform", rejected.stderr)
+            write_plist(broadcast_embedded, broadcast_profile)
+
+            # The valid Apple platform list must not bypass the other profile guards.
+            for alteration, message in (
+                ({"UUID": PROFILE_UUID}, "profile UUID"),
+                ({"TeamIdentifier": ["Z9Y8X7W6V5"]}, "profile team"),
+                ({"ProvisionedDevices": ["unexpected-device"]}, "App Store distribution"),
+                ({"ProvisionsAllDevices": True}, "App Store distribution"),
+                ({"ExpirationDate": dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=1)}, "has expired"),
+                ({"Entitlements": {**broadcast_profile["Entitlements"], APP_GROUP_KEY: ["group.example.other"]}}, "identity or app-group entitlement"),
+            ):
+                with self.subTest(broadcast_profile_guard=message):
+                    write_plist(broadcast_embedded, {**broadcast_profile, **alteration})
+                    rejected = subprocess.run(command, capture_output=True, text=True)
+                    self.assertNotEqual(rejected.returncode, 0)
+                    self.assertIn(message, rejected.stderr)
+            write_plist(broadcast_embedded, broadcast_profile)
+
             for altered, message in (
                 ({**broadcast_info, "CFBundleVersion": "41"}, "build number"),
                 ({**broadcast_info, "RTCAppGroupIdentifier": "group.some.other.app"}, "IPC group"),
@@ -2299,11 +2420,17 @@ class VerifyIOSArchiveTests(unittest.TestCase):
                 self.assertNotEqual(invalid_broadcast.returncode, 0)
                 self.assertIn(message, invalid_broadcast.stderr)
             write_plist(broadcast_path / "Info.plist", broadcast_info)
-            write_plist(broadcast_signed, {**broadcast_profile["Entitlements"], "get-task-allow": True})
-            invalid_broadcast = subprocess.run(command, capture_output=True, text=True)
-            self.assertNotEqual(invalid_broadcast.returncode, 0)
-            self.assertIn("Broadcast extension identity", invalid_broadcast.stderr)
-            write_plist(broadcast_signed, broadcast_profile["Entitlements"])
+            for alteration, message in (
+                ({"get-task-allow": True}, "Broadcast extension identity"),
+                ({"keychain-access-groups": [f"{TEAM}.shared"]}, "must not access shared keychain"),
+                ({"aps-environment": "production"}, "must not access push notifications or iCloud"),
+            ):
+                with self.subTest(broadcast_signed_guard=message):
+                    write_plist(broadcast_signed, {**broadcast_signed_entitlements, **alteration})
+                    invalid_broadcast = subprocess.run(command, capture_output=True, text=True)
+                    self.assertNotEqual(invalid_broadcast.returncode, 0)
+                    self.assertIn(message, invalid_broadcast.stderr)
+            write_plist(broadcast_signed, broadcast_signed_entitlements)
 
             app_profile_without_time_sensitive = profile()
             app_profile_without_time_sensitive["Entitlements"].pop(

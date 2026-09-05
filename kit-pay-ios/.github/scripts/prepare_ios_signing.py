@@ -11,6 +11,7 @@ import re
 
 from ios_profile_entitlements import (
     authorizes_cloudkit,
+    authorizes_ios_platforms,
     authorizes_production_icloud,
 )
 
@@ -81,8 +82,7 @@ def main() -> None:
     if not isinstance(profile_uuid, str) or not UUID_PATTERN.fullmatch(profile_uuid):
         fail("The provisioning profile has no valid UUID")
 
-    platforms = profile.get("Platform")
-    if not isinstance(platforms, list) or "iOS" not in platforms:
+    if not authorizes_ios_platforms(profile.get("Platform")):
         fail("The provisioning profile is not authorized for the iOS platform")
     try:
         imported_certificate = args.certificate_der.read_bytes()

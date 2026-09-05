@@ -263,6 +263,9 @@ Developer portal. Enabling `APP_GROUPS` through App Store Connect alone does not
 association; generated profiles must pass the existing exact App Group entitlement validation.
 The bounded 200-result bundle-ID prefix lookup still rejects incomplete responses and requires
 a unique exact iOS-capable identifier.
+Profile platform validation requires a nonempty, unique list containing `iOS`; Apple's additional
+`xrOS` and `visionOS` entries are accepted, while malformed or unknown platform values are rejected
+both before signing and during final broadcast-extension verification.
 
 Publication workflows are manual. Ordinary pushes and pull requests do not start quality jobs,
 Mac builds, or Simulators. Use **Build iOS Simulator** only when an explicit diagnostic build is
