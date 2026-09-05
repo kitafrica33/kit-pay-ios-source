@@ -28,7 +28,7 @@ on:
       build_number:
         description: Monotonically increasing integer CFBundleVersion
         required: true
-        default: "71"
+        default: "72"
         type: string
       confirmation:
         description: Type ARCHIVE_KIT_PAY_APP_STORE
@@ -37,7 +37,7 @@ on:
       corresponding_source_url:
         description: >-
           Exact public AGPL corresponding-source release URL for this build, for example
-          https://github.com/kitafrica33/kit-pay-ios-source/releases/tag/v1.0.16-build71 .
+          https://github.com/kitafrica33/kit-pay-ios-source/releases/tag/v1.0.16-build72 .
           The archive is rejected unless this tagged release is already publicly available.
         required: true
         type: string
@@ -257,18 +257,7 @@ jobs:
           echo "ipad_id=$ipad_id" >> "$GITHUB_OUTPUT"
       - name: Prepare native test Simulator
         if: ${{ !inputs.update_screenshots || steps.screenshots.outputs.reused == 'true' }}
-        run: |
-          set -euo pipefail
-          DEVICE_ID="$(xcrun simctl list devices available -j | python3 -c 'import json,sys; data=json.load(sys.stdin)["devices"]; print(next(device["udid"] for devices in data.values() for device in devices if device.get("isAvailable") and device["name"].startswith("iPhone")))')"
-          # Pre-answer the Contacts prompt. AppModel asks for Contacts at launch and skips it only
-          # for unit-test hosts, which a UI test is not: the app runs as its own process, so the
-          # system alert appears and nothing in an unattended run taps it. While that alert is up
-          # the scene is not active, and the app — correctly — covers its sign-in form with
-          # "Authentication details hidden", so no UI test can ever get past launch.
-          xcrun simctl boot "$DEVICE_ID" >/dev/null 2>&1 || true
-          xcrun simctl bootstatus "$DEVICE_ID" -b >/dev/null 2>&1
-          xcrun simctl privacy "$DEVICE_ID" grant contacts africa.kit.pay.ios || true
-          echo "KITPAY_TEST_DEVICE_ID=$DEVICE_ID" >> "$GITHUB_ENV"
+        run: python3 .github/scripts/prepare_ios_test_simulator.py
       - name: Prepare the screenshot iPhone for all native checks
         if: ${{ inputs.publication_target == 'app-store' && inputs.update_screenshots && steps.screenshots.outputs.reused != 'true' }}
         env:
@@ -746,12 +735,14 @@ jobs:
             ${{ runner.temp }}/KitPay-opening-camera.xcresult
             ${{ runner.temp }}/KitPay-quality.xcresult
             ${{ runner.temp }}/KitPay-camera-pan.log
+            ${{ runner.temp }}/KitPay-native-simulator-*.json
+            ${{ runner.temp }}/KitPay-test-product-registration-*.json
           if-no-files-found: warn
           retention-days: 30
           compression-level: 0
 
       - name: Retain native UI failure evidence
-        if: ${{ failure() }}
+        if: ${{ failure() && inputs.publication_target == 'app-store' && inputs.update_screenshots && steps.screenshots.outputs.reused != 'true' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: kit-pay-app-store-screenshot-failure-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -763,14 +754,14 @@ jobs:
           retention-days: 30
           compression-level: 0
 
-      - name: Remove screenshot simulators
+      - name: Remove owned test simulators
         if: ${{ always() }}
         env:
           IPHONE_ID: ${{ steps.devices.outputs.iphone_id }}
           IPAD_ID: ${{ steps.devices.outputs.ipad_id }}
         run: |
           set +e
-          for device_id in "$IPHONE_ID" "$IPAD_ID"; do
+          for device_id in "$IPHONE_ID" "$IPAD_ID" "${KITPAY_NATIVE_TEST_DEVICE_ID:-}"; do
             if [[ "$device_id" =~ ^[0-9A-Fa-f-]{36}$ ]]; then
               xcrun simctl shutdown "$device_id" 2>/dev/null
               xcrun simctl delete "$device_id" 2>/dev/null

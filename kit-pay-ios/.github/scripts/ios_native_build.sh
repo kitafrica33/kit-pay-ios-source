@@ -6,7 +6,7 @@ mode="${1:?Select build, test, marketing-iphone, or marketing-ipad}"
 : "${RUNNER_TEMP:?}"
 common=(
   -workspace KitPay.xcworkspace -scheme KitPay -configuration Debug
-  -sdk iphonesimulator -destination "platform=iOS Simulator,id=$KITPAY_TEST_DEVICE_ID"
+  -sdk iphonesimulator -destination "platform=iOS Simulator,id=$KITPAY_TEST_DEVICE_ID,arch=arm64"
   -derivedDataPath "$RUNNER_TEMP/KitPay-quality-derived"
   -clonedSourcePackagesDirPath "$RUNNER_TEMP/KitPayPackages"
   -disableAutomaticPackageResolution -onlyUsePackageVersionsFromResolvedFile
@@ -21,6 +21,7 @@ case "$mode" in
     xcodebuild "${common[@]}" build-for-testing
     ;;
   test)
+    python3 .github/scripts/install_ios_test_products.py
     xcrun simctl spawn "$KITPAY_TEST_DEVICE_ID" log stream \
       --style compact --level debug \
       --predicate 'eventMessage CONTAINS "[KitPayCameraPull]"' \
@@ -52,8 +53,9 @@ case "$mode" in
       test-without-building
     ;;
   marketing-ipad)
+    python3 .github/scripts/install_ios_test_products.py
     xcodebuild "${common[@]}" -resultBundlePath "$RUNNER_TEMP/KitPay-iPad.xcresult" \
-      -only-testing:KitPayUITests/AppStoreScreenshotUITests \
+      -only-testing:KitPayUITests/AppStoreScreenshotUITests/testCaptureAppStoreScreenshots \
       test-without-building
     ;;
   *) echo 'Unknown native build mode' >&2; exit 2 ;;

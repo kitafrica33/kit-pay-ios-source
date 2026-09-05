@@ -5,6 +5,7 @@ import base64
 import json
 import os
 from pathlib import Path
+import plistlib
 import re
 import subprocess
 import sys
@@ -57,6 +58,21 @@ class WorkflowSelectionTests(unittest.TestCase):
             expression = expression.replace("steps.screenshots.outputs.reused", repr(reused))
             expression = expression.replace("!", " not ").replace("||", " or ")
             self.assertEqual(eval(expression.strip(), {"__builtins__": {}}), expected)
+
+    def test_screenshot_failure_artifact_runs_only_for_selected_new_images(self):
+        archive = (ROOT / ".github/workflows/ios-app-store-archive.yml").read_text()
+        condition = re.search(r"if: \$\{\{ (.+) \}\}", step(archive, "Retain native UI failure evidence")).group(1)
+        for failed in (False, True):
+            for target in ("testflight", "app-store"):
+                for update in (False, True):
+                    for reused in ("", "false", "true"):
+                        expression = condition.replace("failure()", repr(failed))
+                        expression = expression.replace("inputs.publication_target", repr(target))
+                        expression = expression.replace("inputs.update_screenshots", repr(update))
+                        expression = expression.replace("steps.screenshots.outputs.reused", repr(reused))
+                        expression = expression.replace("&&", " and ")
+                        self.assertEqual(eval(expression, {"__builtins__": {}}),
+                                         failed and target == "app-store" and update and reused != "true")
 
     def test_testflight_upload_never_builds_and_processing_uses_linux(self):
         workflow = (ROOT / ".github/workflows/ios-testflight-upload.yml").read_text()
@@ -124,8 +140,30 @@ with open(os.environ['KITPAY_TEST_COMMAND_LOG'], 'a') as f: f.write(json.dumps(s
 if os.environ.get('KITPAY_FAIL_FOCUSED') == '1' and any(a.startswith('-only-testing:KitPayTests/ConversationNativeOpeningTests') for a in sys.argv): sys.exit(65)
 """)
             executable.chmod(0o755)
-            (root / "xcrun").write_text("#!/bin/sh\nexit 0\n")
+            products = root / "KitPay-quality-derived/Build/Products/Debug-iphonesimulator"
+            product_ids = {"KitPay.app": "africa.kit.pay.ios",
+                           "KitPayUITests-Runner.app": "africa.kit.pay.ios.uitests.xctrunner"}
+            for name, identifier in product_ids.items():
+                bundle = products / name
+                bundle.mkdir(parents=True)
+                (bundle / "Info.plist").write_bytes(plistlib.dumps({
+                    "CFBundleIdentifier": identifier, "CFBundleExecutable": "fixture",
+                    "CFBundleSupportedPlatforms": ["iPhoneSimulator"],
+                }))
+                (bundle / "fixture").write_bytes(b"fixture")
+            (root / "xcrun").write_text("""#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+if sys.argv[1:3] == ['simctl', 'listapps']:
+    print(json.dumps({identifier: {'CFBundleIdentifier': identifier, 'ApplicationType': 'User',
+        'Path': str(Path(os.environ['RUNNER_TEMP']) / 'installed' / identifier)}
+        for identifier in ('africa.kit.pay.ios', 'africa.kit.pay.ios.uitests.xctrunner')}))
+elif sys.argv[1:3] == ['simctl', 'get_app_container']:
+    print(Path(os.environ['RUNNER_TEMP']) / 'installed' / sys.argv[4])
+""")
             (root / "xcrun").chmod(0o755)
+            (root / "plutil").write_text("#!/usr/bin/env python3\nimport sys\nsys.stdout.buffer.write(sys.stdin.buffer.read())\n")
+            (root / "plutil").chmod(0o755)
             log = root / "commands.jsonl"
             env = {**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"],
                    "RUNNER_TEMP": str(root), "KITPAY_TEST_DEVICE_ID": "fixture-device",
@@ -177,6 +215,9 @@ if os.environ.get('KITPAY_FAIL_FOCUSED') == '1' and any(a.startswith('-only-test
                 self.assertEqual(calls[0][-1], "test-without-building")
         _, calls = self.execute("marketing-iphone")
         self.assertIn("-only-testing:KitPayUITests/AppStoreScreenshotUITests/testCaptureAppStoreScreenshots", calls[0])
+        _, calls = self.execute("marketing-ipad")
+        self.assertIn("-only-testing:KitPayUITests/AppStoreScreenshotUITests/testCaptureAppStoreScreenshots", calls[0])
+        self.assertNotIn("-only-testing:KitPayUITests/AppStoreScreenshotUITests", calls[0])
 
 
 class ReadinessTests(unittest.TestCase):

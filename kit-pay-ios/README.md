@@ -292,6 +292,17 @@ builds the signed Release archive. The Release build also verifies production co
 screenshot fixture. Download caches retain checksum-verified libsignal and SwiftPM archives,
 not signing material or compiled app products.
 
+When new screenshots are not needed, native validation uses one clean iPhone 17
+Pro Simulator on the pinned iOS 26.5 (23F77) runtime; new screenshot runs reuse
+their required iPhone 14 Plus. After one compilation, it installs the existing app and UI test
+runner and checks their installed-app entries and containers before XCTest starts.
+Registration checks have a deadline and never reinstall or rerun failed tests.
+These entries do not prove FrontBoard launch readiness; successful UI execution
+remains required. Preparation and registration receipts are retained with native
+evidence, and cleanup deletes only Simulators created by this run. When new
+marketing screenshots are requested, the iPad runs only screenshot capture using
+the existing compiled products.
+
 Select `publication_target=testflight` for TestFlight preparation. It creates no marketing
 screenshots. For an App Store asset update select `app-store` and `update_screenshots=true`;
 otherwise existing store screenshots stay in place. The workflow first verifies retained screenshot

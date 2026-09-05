@@ -1691,18 +1691,20 @@ class AppStoreProfileGeneratorTests(unittest.TestCase):
 
 
 class SigningConfigurationTests(unittest.TestCase):
-    def test_build_65_release_identity_is_consistent(self) -> None:
+    def test_release_identity_is_consistent(self) -> None:
         workflow = (ROOT / ".github/workflows/ios-app-store-archive.yml").read_text()
         project = (ROOT / "KitPay.xcodeproj/project.pbxproj").read_text()
         readme = (ROOT / "README.md").read_text()
 
         self.assertIn("default: 1.0.16", workflow)
-        self.assertIn('default: "71"', workflow)
-        self.assertIn("v1.0.16-build71", workflow)
+        build = re.search(r'(?s)      build_number:.*?        default: "([1-9][0-9]*)"', workflow)
+        self.assertIsNotNone(build)
+        build_number = build.group(1)
+        self.assertIn(f"v1.0.16-build{build_number}", workflow)
         # Six each: Debug and Release of the app and both extensions. iOS refuses to
         # install an app whose extension carries a different version, so they move together.
         self.assertEqual(project.count("MARKETING_VERSION = 1.0.16;"), 6)
-        self.assertEqual(project.count("CURRENT_PROJECT_VERSION = 71;"), 6)
+        self.assertEqual(project.count(f"CURRENT_PROJECT_VERSION = {build_number};"), 6)
         self.assertNotIn("MARKETING_VERSION = 1.0.1;", project)
         self.assertIn("1.0.16-r39", readme)
         self.assertIn("group_payment_request.{created,contributed,completed,cancelled,expired}", readme)
