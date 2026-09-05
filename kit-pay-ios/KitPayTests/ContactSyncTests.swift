@@ -944,7 +944,14 @@ final class ContactSyncTests: XCTestCase {
             currentUserID: currentUserID.uppercased(),
             contacts: [member, saved]
         )
+        let indexed = ConversationContactPresentationPolicy.presentation(
+            for: conversation,
+            currentUserID: currentUserID.uppercased(),
+            directory: ConversationContactDirectoryIndex([member, saved])
+        )
 
+        XCTAssertEqual(indexed, presentation,
+                       "Indexing must preserve saved-contact precedence and duplicate avatar fallback")
         XCTAssertEqual(presentation.recipientUserID, exampleContactUserID)
         XCTAssertEqual(presentation.displayName, "ExampleContact in Contacts")
         XCTAssertEqual(presentation.contact, saved)

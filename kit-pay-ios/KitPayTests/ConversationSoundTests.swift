@@ -9,6 +9,31 @@ final class ConversationSoundTests: XCTestCase {
     private let conversationID = "10000000-0000-4000-8000-000000000001"
     private let visibleAt = Date(timeIntervalSince1970: 1_000)
 
+    func testNotificationResponseCompletionHopsToMainAndIsConsumedOnce() async {
+        let completed = expectation(description: "System response finished on main")
+        completed.assertForOverFulfill = true
+        let completion = NotificationSystemResponseCompletion {
+            XCTAssertTrue(Thread.isMainThread,
+                          "UIKit scene restoration must never run on a cooperative executor")
+            completed.fulfill()
+        }
+
+        await Task.detached {
+            completion.complete()
+            completion.complete()
+        }.value
+        await fulfillment(of: [completed], timeout: 2)
+        completion.complete()
+    }
+
+    @MainActor
+    func testMainThreadNotificationCompletionReleasesUIKitBeforeRouting() {
+        var completed = false
+        let completion = NotificationSystemResponseCompletion { completed = true }
+        completion.complete()
+        XCTAssertTrue(completed, "An already-main notification tap must release its handoff immediately")
+    }
+
     func testInitialMessagesFormASilentBaseline() {
         let restored = message(id: 1, createdAt: visibleAt.addingTimeInterval(-10))
         var policy = VisibleConversationSoundPolicy(conversationID: conversationID)

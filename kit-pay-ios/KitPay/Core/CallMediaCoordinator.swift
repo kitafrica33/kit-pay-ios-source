@@ -293,9 +293,10 @@ enum CallVideoStatePolicy {
     static func carriesVideo(
         originalCallWasVideo: Bool,
         localCameraEnabled: Bool,
-        remoteVideoAvailable: Bool
+        remoteVideoAvailable: Bool,
+        localScreenSharing: Bool = false
     ) -> Bool {
-        originalCallWasVideo || localCameraEnabled || remoteVideoAvailable
+        originalCallWasVideo || localCameraEnabled || remoteVideoAvailable || localScreenSharing
     }
 }
 
@@ -558,7 +559,9 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
         }
     }
 
+    @MainActor private(set) lazy var screenSharing = CallScreenSharingController()
     @Published private(set) var localVideoTrack: VideoTrack?
+    @Published private(set) var remoteVideoIsScreenShare = false
     @Published private(set) var remoteVideoTrack: VideoTrack?
     @Published private(set) var remoteParticipantSurfaces: [LiveKitRemoteParticipantSurface] = []
     @Published private(set) var isMicrophoneEnabled = false
@@ -689,7 +692,11 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
         guard connectionGeneration == expectedGeneration else {
             throw CancellationError()
         }
-        let connectionRoom = Room(delegate: self)
+        let connectionRoom = Room(delegate: self, roomOptions: RoomOptions(
+            defaultScreenShareCaptureOptions: ScreenShareCaptureOptions(
+                dimensions: .h1080_169, fps: 15, appAudio: false, useBroadcastExtension: true
+            )
+        ))
         room = connectionRoom
 
         do {
@@ -712,6 +719,7 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
                 throw LiveKitCallMediaError.mediaUnavailable
             }
             connectedCallId = callId
+            screenSharing.bind(room: connectionRoom, callID: callId)
             CallMediaPrewarmer.shared.rememberConnectedMediaURL(handoff.url)
             updateRemoteParticipantPresence(in: connectionRoom)
             refreshRemoteParticipantSurfaces(in: connectionRoom)
@@ -788,6 +796,7 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
 
     @MainActor
     func disconnect() async {
+        screenSharing.unbind()
         connectionGeneration &+= 1
         let disconnectingRoom = room
         room = nil
@@ -1163,6 +1172,7 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
     private func resetPublishedMedia(preservingCallContinuity: Bool = false) {
         localVideoTrack = nil
         remoteVideoTrack = nil
+        remoteVideoIsScreenShare = false
         remoteParticipantSurfaces = []
         localAudioTrack = nil
         if !preservingCallContinuity {
@@ -1287,6 +1297,8 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
         }
 
         remoteParticipantSurfaces = surfaces
+        let sharesScreen = surfaces.contains { $0.screenShareTrack != nil }
+        if remoteVideoIsScreenShare != sharesScreen { remoteVideoIsScreenShare = sharesScreen }
         var preferredTrack: VideoTrack?
         for surface in surfaces where preferredTrack == nil {
             preferredTrack = surface.screenShareTrack
@@ -1315,7 +1327,9 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
         participant: LocalParticipant,
         didPublishTrack publication: LocalTrackPublication
     ) {
-        guard let track = publication.track as? VideoTrack else { return }
+        // A screen-share publication must never replace the local camera preview.
+        guard publication.source == .camera,
+              let track = publication.track as? VideoTrack else { return }
         Task { @MainActor [weak self] in
             guard let self, self.room === room else { return }
             self.localVideoTrack = track
@@ -1457,6 +1471,7 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
         Task { @MainActor [weak self] in
             guard let self else { return }
             guard self.room === room else { return }
+            self.screenSharing.unbind()
             self.room = nil
             let callId = connectedCallId
             connectedCallId = nil
@@ -1525,12 +1540,20 @@ final class CallMediaCoordinator: ObservableObject {
     private var reconnectAttemptsRemaining = CallMediaReconnectPolicy.retryDelaysNanoseconds.count
     private var remoteAbsenceTask: Task<Void, Never>?
     private var remotePresenceCancellable: AnyCancellable?
+    private var screenSharingCancellable: AnyCancellable?
     private var callKitAudioErrorRecovery = CallKitAudioSessionErrorRecoveryState()
 
     private init() {
         let media = LiveKitCallMediaTransport()
         self.media = media
         session = CallMediaSessionDriver(transport: media)
+        media.screenSharing.onError = { [weak self] error in self?.recordControlError(error) }
+        screenSharingCancellable = media.screenSharing.$phase.removeDuplicates().sink { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.refreshCallKitVideoState()
+                CallOverlayWindowController.shared.refreshPictureInPicture()
+            }
+        }
         media.onUnexpectedDisconnect = { [weak self] callId, event in
             Task { @MainActor in
                 await self?.handleUnexpectedDisconnect(callId: callId, event: event)
@@ -1578,6 +1601,22 @@ final class CallMediaCoordinator: ObservableObject {
         reconnectStabilityTask?.cancel()
         remoteAbsenceTask?.cancel()
     }
+
+#if DEBUG && APP_STORE_SCREENSHOTS
+    /// Exercises the real call surfaces without opening media, signalling, or a system call.
+    func installCallLayoutFixtureIfRequested() {
+        guard AppStoreScreenshotFixture.isActive,
+              ProcessInfo.processInfo.arguments.contains("--kit-call-layout-fixture-v1"),
+              activeCall == nil else { return }
+        activeCall = ActiveCallPresentation(
+            id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            participantName: "Amina Demo",
+            video: false,
+            direction: "incoming"
+        )
+        state = .connected
+    }
+#endif
 
     var statusText: String {
         switch state {
@@ -1982,6 +2021,7 @@ final class CallMediaCoordinator: ObservableObject {
             return
         }
         invalidateReconnect()
+        media.screenSharing.stop()
         state = .ending
         let accepted = NotificationCoordinator.shared.requestEndCall(callId: callId)
         if !accepted {
@@ -2066,11 +2106,42 @@ final class CallMediaCoordinator: ObservableObject {
         }
     }
 
+    func requestScreenSharing() {
+        guard let callID = activeCall?.id, state == .connected,
+              activeAccountLease.map({ accountLeaseGate.accepts($0) }) == true else { return }
+        do {
+            try media.screenSharing.requestStart(
+                callID: callID, applicationIsActive: UIApplication.shared.applicationState == .active
+            )
+            controlError = nil
+        } catch {
+            controlError = error.localizedDescription
+        }
+    }
+
+    func confirmScreenSharing() {
+        guard let callID = activeCall?.id, state == .connected,
+              activeAccountLease.map({ accountLeaseGate.accepts($0) }) == true else {
+            media.screenSharing.stop()
+            return
+        }
+        do {
+            try media.screenSharing.confirmSharing(callID: callID)
+            controlError = nil
+        } catch {
+            media.screenSharing.stop()
+            controlError = error.localizedDescription
+        }
+    }
+
+    func stopScreenSharing() { media.screenSharing.stop() }
+
     var callCarriesVideo: Bool {
         CallVideoStatePolicy.carriesVideo(
             originalCallWasVideo: activeCall?.video == true,
             localCameraEnabled: media.isCameraEnabled,
-            remoteVideoAvailable: media.remoteVideoTrack != nil
+            remoteVideoAvailable: media.remoteVideoTrack != nil,
+            localScreenSharing: media.screenSharing.phase.isActive
         )
     }
 

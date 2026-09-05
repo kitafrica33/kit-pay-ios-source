@@ -1,9 +1,77 @@
 import XCTest
 import AVFoundation
+import Combine
 import UIKit
 @testable import KitPay
 
 final class ChatMediaPolicyTests: XCTestCase {
+    @MainActor
+    func testStoppingAnIdleVoicePlayerDoesNotInvalidateSwiftUIAgain() {
+        let player = VoiceNotePlayer.shared
+        player.stop()
+        var updates = 0
+        let subscription = player.objectWillChange.sink { updates += 1 }
+
+        player.stop()
+        player.stop()
+
+        XCTAssertEqual(updates, 0,
+                       "Repeated video-layer updates must not create an idle-player render loop")
+        withExtendedLifetime(subscription) {}
+    }
+
+    @MainActor
+    func testStoppingPausedPlaybackClearsStateOnce() {
+        let player = VoiceNotePlayer.shared
+        player.toggle(data: AndroidCallToneRenderer.ringbackWAV, id: UUID(),
+                      context: VoiceNotePlaybackContext(
+                        conversationID: UUID().uuidString, speaker: "Test", conversationTitle: "Test"
+                      ))
+        player.pause()
+        XCTAssertNotNil(player.playingID)
+        var updates = 0
+        let subscription = player.objectWillChange.sink { updates += 1 }
+        player.stop()
+        XCTAssertNil(player.playingID)
+        XCTAssertGreaterThan(updates, 0)
+        let firstStopUpdates = updates
+
+        player.stop()
+
+        XCTAssertEqual(updates, firstStopUpdates)
+        withExtendedLifetime(subscription) {}
+    }
+
+    @MainActor
+    func testRetiredVoicePlayerCallbacksCannotStopReplacementPlayback() async throws {
+        let bytes = AndroidCallToneRenderer.ringbackWAV
+        let retiredPlayer = try AVAudioPlayer(data: bytes)
+        let replacementID = UUID()
+        let player = VoiceNotePlayer.shared
+        defer { player.stop() }
+        player.toggle(data: bytes, id: replacementID, context: VoiceNotePlaybackContext(
+            conversationID: UUID().uuidString, speaker: "Test", conversationTitle: "Test"
+        ))
+        player.pause()
+        XCTAssertEqual(player.playingID, replacementID)
+
+        player.audioPlayerDidFinishPlaying(retiredPlayer, successfully: true)
+        player.audioPlayerDecodeErrorDidOccur(retiredPlayer, error: nil)
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(player.playingID, replacementID)
+        XCTAssertTrue(player.isPaused)
+    }
+
+    func testMediaClockRejectsUnrepresentableDurationsWithoutTrapping() {
+        for invalid in [Double.nan, .infinity, -.infinity, -1, Double(Int.max), .greatestFiniteMagnitude] {
+            XCTAssertEqual(ChatMediaPlaybackClock.label(invalid), "--:--")
+        }
+        XCTAssertEqual(ChatMediaPlaybackClock.label(0), "0:00")
+        XCTAssertEqual(ChatMediaPlaybackClock.label(59.6), "1:00")
+        XCTAssertEqual(ChatMediaPlaybackClock.label(125), "2:05")
+        XCTAssertEqual(ChatMediaPlaybackClock.label(3600), "60:00")
+    }
+
     private func makeDescriptor(
         mediaType: String,
         plaintextByteSize: Int = 4_000,
@@ -2993,6 +3061,83 @@ final class ChatMediaPolicyTests: XCTestCase {
     func testGalleryVideoPreparationIsAdmittedOnlyForTheActivePage() {
         XCTAssertTrue(GalleryVideoActivationPolicy.permitsPreparation(isActive: true))
         XCTAssertFalse(GalleryVideoActivationPolicy.permitsPreparation(isActive: false))
+    }
+
+    @MainActor
+    func testGalleryReplacementIgnoresCallbacksQueuedByItsPreviousPlayer() async throws {
+        let source = try await makePlayableVideo(fileType: .mp4, pathExtension: "mp4")
+        defer { try? FileManager.default.removeItem(at: source) }
+        let byteCount = try fileByteCount(source)
+        let controller = GalleryVideoController()
+        defer { controller.teardown(allowsPictureInPictureRetention: false) }
+        let identity = ChatVideoGalleryIdentity(messageID: UUID(), itemIndex: 0)
+        let contentKey = UUID().uuidString
+        let firstPrepared = await controller.prepare(
+            fileURL: source,
+            ownsFile: false,
+            protectedOriginalLease: nil,
+            mediaType: "video/mp4",
+            expectedByteCount: byteCount,
+            contentKey: contentKey,
+            mediaID: UUID(),
+            isOutgoing: false,
+            galleryIdentity: identity,
+            restoreFromPictureInPicture: { _ in }
+        )
+        XCTAssertTrue(firstPrepared)
+        let oldItem = try XCTUnwrap(controller.player?.currentItem)
+
+        controller.toggleMute()
+        controller.setScrubbing(true)
+        controller.deactivatePage()
+
+        let replacementPrepared = await controller.prepare(
+            fileURL: source,
+            ownsFile: false,
+            protectedOriginalLease: nil,
+            mediaType: "video/mp4",
+            expectedByteCount: byteCount,
+            contentKey: contentKey,
+            mediaID: UUID(),
+            isOutgoing: false,
+            galleryIdentity: identity,
+            restoreFromPictureInPicture: { _ in }
+        )
+        XCTAssertTrue(replacementPrepared)
+        let replacementItem = try XCTUnwrap(controller.player?.currentItem)
+        XCTAssertFalse(oldItem === replacementItem)
+        XCTAssertTrue(controller.isMuted)
+        XCTAssertTrue(try XCTUnwrap(controller.player).isMuted,
+                      "Revisiting a muted page must not restart its audio behind a muted icon")
+        controller.togglePlayback()
+        controller.receivePlaybackTime(CMTime(seconds: 0.5, preferredTimescale: 600),
+                                       from: replacementItem)
+        XCTAssertEqual(controller.currentTime, 0.5,
+                       "A page left during scrubbing must accept its replacement's progress")
+
+        // These deliveries represent actor tasks already queued before observer removal. They
+        // must be rejected at delivery even though a replacement player is now active.
+        controller.receivePlaybackTime(CMTime(seconds: 1, preferredTimescale: 600), from: oldItem)
+        controller.handlePlaybackEnded(item: oldItem)
+        XCTAssertEqual(controller.currentTime, 0.5)
+        XCTAssertTrue(controller.isPlaying,
+                      "An old end notification must not pause, rewind or close the new player")
+
+        controller.handlePlaybackEnded(item: replacementItem)
+        XCTAssertFalse(controller.isPlaying)
+        XCTAssertEqual(controller.currentTime, 0)
+
+        ChatMediaAccountLifetime.invalidate()
+        controller.togglePlayback()
+        XCTAssertFalse(controller.isPlaying,
+                       "A retained gallery from the previous account cannot restart playback")
+        let stalePrepared = await controller.prepare(
+            fileURL: source, ownsFile: false, protectedOriginalLease: nil,
+            mediaType: "video/mp4", expectedByteCount: byteCount, contentKey: contentKey,
+            mediaID: UUID(), isOutgoing: false, galleryIdentity: identity,
+            restoreFromPictureInPicture: { _ in XCTFail("Retired account restored PiP") }
+        )
+        XCTAssertFalse(stalePrepared)
     }
 
     @MainActor

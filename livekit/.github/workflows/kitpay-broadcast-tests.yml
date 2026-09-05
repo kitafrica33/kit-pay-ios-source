@@ -1,0 +1,58 @@
+name: Kit Pay broadcast lifecycle
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kitpay-broadcast-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  broadcast:
+    runs-on: macos-26
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Lint the changed Swift files
+        env:
+          SCRIPT_INPUT_FILE_COUNT: '4'
+          SCRIPT_INPUT_FILE_0: Sources/LiveKit/Broadcast/BroadcastScreenCapturer.swift
+          SCRIPT_INPUT_FILE_1: Sources/LiveKit/Broadcast/IPC/IPCChannel.swift
+          SCRIPT_INPUT_FILE_2: Tests/LiveKitCoreTests/Broadcast/BroadcastScreenCapturerTests.swift
+          SCRIPT_INPUT_FILE_3: Tests/LiveKitCoreTests/Broadcast/IPCChannelTests.swift
+        run: |
+          set -euo pipefail
+          if ! command -v swiftlint >/dev/null; then brew install swiftlint; fi
+          swiftlint lint --strict --use-script-input-files
+          swiftformat --lint "$SCRIPT_INPUT_FILE_0" "$SCRIPT_INPUT_FILE_1" "$SCRIPT_INPUT_FILE_2" "$SCRIPT_INPUT_FILE_3"
+      - name: Test receiver cancellation and broadcast IPC on iOS
+        run: |
+          set -euo pipefail
+          sudo xcode-select --switch /Applications/Xcode.app
+          device_id="$(xcrun simctl list devices available -j | python3 -c 'import json,sys; devices=json.load(sys.stdin)["devices"]; print(next(d["udid"] for group in devices.values() for d in group if d.get("isAvailable") and d["name"].startswith("iPhone")))')"
+          xcodebuild test -scheme LiveKit \
+            -destination "platform=iOS Simulator,id=${device_id}" \
+            -parallel-testing-enabled NO \
+            -only-testing:LiveKitCoreTests/BroadcastScreenCapturerTests \
+            -only-testing:LiveKitCoreTests/IPCChannelTests \
+            -only-testing:LiveKitCoreTests/BroadcastAudioCodecTests \
+            -only-testing:LiveKitCoreTests/BroadcastImageCodecTests \
+            -only-testing:LiveKitCoreTests/SocketPathTests \
+            -resultBundlePath "$RUNNER_TEMP/broadcast.xcresult" \
+            ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= \
+            PROVISIONING_PROFILE_SPECIFIER= \
+            | tee "$RUNNER_TEMP/broadcast.log"
+      - name: Retain native evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kitpay-broadcast-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/broadcast.log
+            ${{ runner.temp }}/broadcast.xcresult
+          if-no-files-found: ignore
+          retention-days: 14

@@ -3,6 +3,17 @@ import Dispatch
 import Foundation
 import OSLog
 
+/// Media/container metadata can be finite without fitting Swift's integer range. Formatting
+/// must never trap while a received clip, trim editor or voice note is being displayed.
+enum ChatMediaPlaybackClock {
+    static func label(_ interval: TimeInterval) -> String {
+        guard interval.isFinite, interval >= 0,
+              let seconds = Int(exactly: interval.rounded())
+        else { return "--:--" }
+        return "\(seconds / 60):\(String(format: "%02d", seconds % 60))"
+    }
+}
+
 enum LocalMediaDiagnosticDirection: String, Codable, Sendable {
     case outgoing
     case incoming

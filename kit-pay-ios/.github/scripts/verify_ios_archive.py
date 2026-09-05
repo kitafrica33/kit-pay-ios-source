@@ -98,6 +98,11 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--extension-profile-plist", type=pathlib.Path, required=True)
     parser.add_argument("--extension-entitlements-plist", type=pathlib.Path, required=True)
     parser.add_argument("--expected-extension-profile-uuid", required=True)
+    parser.add_argument("--broadcast-extension", type=pathlib.Path, required=True)
+    parser.add_argument("--broadcast-bundle-id", required=True)
+    parser.add_argument("--broadcast-profile-plist", type=pathlib.Path, required=True)
+    parser.add_argument("--broadcast-entitlements-plist", type=pathlib.Path, required=True)
+    parser.add_argument("--expected-broadcast-profile-uuid", required=True)
     parser.add_argument("--app-group", required=True)
     parser.add_argument("--version", required=True)
     parser.add_argument("--build-number", required=True)
@@ -110,6 +115,54 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--run-attempt", required=True)
     return parser.parse_args()
+
+
+def verify_broadcast_extension(args: argparse.Namespace, app_info: dict) -> None:
+    info = load_plist(args.broadcast_extension / "Info.plist", "Broadcast extension Info.plist")
+    profile = load_plist(args.broadcast_profile_plist, "Broadcast extension profile")
+    signed = load_plist(args.broadcast_entitlements_plist, "Broadcast extension entitlements")
+    authorized = profile.get("Entitlements", {})
+    extension = info.get("NSExtension", {})
+    application_id = f"{args.team_id}.{args.broadcast_bundle_id}"
+    if not isinstance(authorized, dict) or not isinstance(extension, dict):
+        fail("Broadcast extension metadata is malformed")
+    checks = (
+        (args.broadcast_bundle_id == f"{args.bundle_id}.broadcast", "bundle naming"),
+        (info.get("CFBundleIdentifier") == args.broadcast_bundle_id, "bundle identifier"),
+        (info.get("CFBundleShortVersionString") == args.version, "marketing version"),
+        (info.get("CFBundleVersion") == args.build_number, "build number"),
+        (extension.get("NSExtensionPointIdentifier") == "com.apple.broadcast-services-upload", "ReplayKit registration"),
+        (extension.get("NSExtensionPrincipalClass") == "KitPayBroadcast.SampleHandler", "sample handler"),
+        (extension.get("RPBroadcastProcessMode") == "RPBroadcastProcessModeSampleBuffer", "sample-buffer capture mode"),
+        (app_info.get("RTCScreenSharingExtension") == args.broadcast_bundle_id, "app broadcast target"),
+        (app_info.get("RTCAppGroupIdentifier") == args.app_group, "app IPC group"),
+        (info.get("RTCAppGroupIdentifier") == args.app_group, "extension IPC group"),
+        (profile.get("UUID") == args.expected_broadcast_profile_uuid, "profile UUID"),
+        (profile.get("TeamIdentifier") == [args.team_id], "profile team"),
+        (profile.get("Platform") == ["iOS"], "profile platform"),
+        ("ProvisionedDevices" not in profile and profile.get("ProvisionsAllDevices") is not True, "App Store distribution"),
+    )
+    for passed, label in checks:
+        if not passed:
+            fail(f"Broadcast extension has invalid {label}")
+    for entitlements in (authorized, signed):
+        if (entitlements.get("application-identifier") != application_id
+                or entitlements.get("com.apple.developer.team-identifier") != args.team_id
+                or entitlements.get("get-task-allow") is not False
+                or not authorizes_app_group(entitlements, args.app_group, args.team_id)):
+            fail("Broadcast extension identity or app-group entitlement is invalid")
+        if any(key in entitlements for key in (
+            "aps-environment", "com.apple.developer.usernotifications.time-sensitive",
+            "com.apple.developer.icloud-container-identifiers", "com.apple.developer.icloud-services",
+        )):
+            fail("Broadcast extension must not access push notifications or iCloud")
+    if "keychain-access-groups" in signed:
+        fail("Broadcast extension must not access shared keychain credentials")
+    expiration = profile.get("ExpirationDate")
+    if not isinstance(expiration, dt.datetime):
+        fail("Broadcast extension profile expiration is missing")
+    if expiration.replace(tzinfo=dt.timezone.utc) <= dt.datetime.now(dt.timezone.utc):
+        fail("Broadcast extension profile has expired")
 
 
 def main() -> None:
@@ -386,6 +439,8 @@ def main() -> None:
         if not passed:
             fail(message)
 
+    verify_broadcast_extension(args, info)
+
     evidence = {
         "schemaVersion": 1,
         "evidenceType": "github-actions-ios-app-store-archive",
@@ -393,6 +448,7 @@ def main() -> None:
         "sourceCommit": args.source_commit,
         "target": {
             "bundleId": args.bundle_id,
+            "broadcastExtensionBundleId": args.broadcast_bundle_id,
             "version": args.version,
             "buildNumber": args.build_number,
             "correspondingSourceURL": expected_source_url,

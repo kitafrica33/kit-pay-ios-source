@@ -45,6 +45,9 @@ final class AppStoreScreenshotUITests: XCTestCase {
             in: app,
             message: "Fixture payment event is missing"
         )
+        let newest = app.staticTexts["Yes — 6:00 PM works for me."].firstMatch
+        require(newest, in: app, message: "The actual newest fixture message is missing")
+        XCTAssertTrue(newest.isHittable, "First opening must reveal the actual newest message")
         capture(app, named: "03-conversation")
 
         let back = app.navigationBars.buttons.element(boundBy: 0)
@@ -94,6 +97,86 @@ final class AppStoreScreenshotUITests: XCTestCase {
         capture(app, named: "07-profile")
     }
 
+    func testChatBottomPullOpensCameraOnlyAfterADeliberateRelease() {
+        let app = XCUIApplication()
+        app.launchArguments += [
+            fixtureArgument,
+            "-AppleLanguages", "(en)",
+            "-AppleLocale", "en_UG",
+            "-UIUserInterfaceStyle", "Light",
+        ]
+        app.launch()
+        require(app.staticTexts["Wallet balance"], in: app, message: "Fixture Home did not load")
+        tap(app.buttons["Messages"], in: app, message: "Messages tab is unavailable")
+        require(app.navigationBars["Chats"], in: app, message: "Chats did not open")
+        let conversation = app.staticTexts[fixtureContactName].firstMatch
+        require(conversation, in: app, message: "Primary fixture conversation is missing")
+        // The row owns the tap action; its StaticText child can report isHittable=false.
+        // Use XCTest's native row tap, as the marketing capture does, and verify navigation.
+        conversation.tap()
+        require(app.buttons["Open \(fixtureContactName)'s profile"].firstMatch, in: app,
+                message: "Fixture conversation did not open")
+
+        let timeline = app.scrollViews["conversation-timeline"]
+        require(timeline, in: app, message: "Conversation timeline did not appear")
+        let newest = app.staticTexts["Yes — 6:00 PM works for me."].firstMatch
+        require(newest, in: app, message: "The actual newest fixture message did not appear")
+        XCTAssertTrue(newest.isHittable, "Opening a chat must reveal the newest message")
+        let closeCamera = app.buttons["Close camera"]
+        XCTAssertFalse(closeCamera.waitForExistence(timeout: 1),
+                       "Opening/layout anchoring must never open the camera")
+        retainHierarchy(app, named: "camera-pull-before-short-drag")
+
+        let start = timeline.coordinate(withNormalizedOffset: CGVector(dx: 0.8, dy: 0.85))
+        start.press(forDuration: 0.05, thenDragTo: timeline.coordinate(
+            withNormalizedOffset: CGVector(dx: 0.8, dy: 0.78)
+        ))
+        XCTAssertFalse(closeCamera.waitForExistence(timeout: 1),
+                       "A short bottom pull must remain in the chat")
+        retainHierarchy(app, named: "camera-pull-before-deliberate-drag")
+
+        start.press(forDuration: 0.05, thenDragTo: timeline.coordinate(
+            withNormalizedOffset: CGVector(dx: 0.8, dy: 0.25)
+        ))
+        // The real camera surface can request camera/microphone permission even though the
+        // Simulator has no capture device. Resolve only those system prompts before closing it.
+        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        for _ in 0 ..< 2 {
+            let alert = springboard.alerts.firstMatch
+            guard alert.waitForExistence(timeout: 2) else { break }
+            for label in ["Allow", "OK", "Don’t Allow", "Don't Allow"] {
+                if alert.buttons[label].exists {
+                    alert.buttons[label].tap()
+                    break
+                }
+            }
+        }
+        if app.alerts["Camera"].exists { app.alerts["Camera"].buttons["OK"].tap() }
+        retainHierarchy(app, named: "camera-pull-after-deliberate-release")
+        tap(closeCamera, in: app, message: "A deliberate bottom pull did not open the real camera")
+        require(timeline, in: app, message: "Closing camera did not restore the chat")
+        XCTAssertFalse(closeCamera.waitForExistence(timeout: 1),
+                       "The consumed release must not reopen camera after dismissal")
+
+        tap(app.buttons["Open \(fixtureContactName)'s profile"].firstMatch, in: app,
+            message: "Conversation profile is unavailable")
+        tap(app.buttons["Search"], in: app, message: "Chat search is unavailable")
+        require(app.textFields["Search messages & documents"], in: app,
+                message: "Chat search field did not appear")
+        require(app.keyboards.firstMatch, in: app, message: "Search keyboard did not appear")
+        XCTAssertFalse(closeCamera.waitForExistence(timeout: 1),
+                       "Keyboard resizing must not launch the camera")
+        timeline.coordinate(withNormalizedOffset: CGVector(dx: 0.8, dy: 0.85))
+            .press(forDuration: 0.05, thenDragTo: timeline.coordinate(
+                withNormalizedOffset: CGVector(dx: 0.8, dy: 0.2)
+            ))
+        XCTAssertFalse(closeCamera.waitForExistence(timeout: 1),
+                       "Pulling in search must never open the camera")
+        tap(app.buttons["Done"], in: app, message: "Chat search could not close")
+        XCTAssertFalse(closeCamera.waitForExistence(timeout: 1),
+                       "Keyboard dismissal must not launch the camera")
+    }
+
     private func tap(
         _ element: XCUIElement,
         in app: XCUIApplication,
@@ -128,6 +211,13 @@ final class AppStoreScreenshotUITests: XCTestCase {
         // A short fixed settle keeps the retained artwork free of half-transition frames.
         Thread.sleep(forTimeInterval: 0.35)
         let attachment = XCTAttachment(screenshot: app.screenshot())
+        attachment.name = name
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
+    private func retainHierarchy(_ app: XCUIApplication, named name: String) {
+        let attachment = XCTAttachment(string: app.debugDescription)
         attachment.name = name
         attachment.lifetime = .keepAlways
         add(attachment)

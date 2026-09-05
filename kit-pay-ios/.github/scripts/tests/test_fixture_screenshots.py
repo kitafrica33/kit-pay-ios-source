@@ -15,7 +15,7 @@ HOME = ROOT / "KitPay/Features/Home/HomeView.swift"
 MOBILE_MONEY = ROOT / "KitPay/Features/Home/MobileMoneyView.swift"
 BANK_TRANSFER = ROOT / "KitPay/Features/Home/BankTransferView.swift"
 CAPTURE_TEST = ROOT / "KitPayUITests/AppStoreScreenshotUITests.swift"
-SCREENSHOT_WORKFLOW = ROOT / ".github/workflows/ios-app-store-screenshots.yml"
+SCREENSHOT_WORKFLOW = ROOT / ".github/workflows/ios-app-store-archive.yml"
 
 
 class AppStoreScreenshotFixtureSourceTests(unittest.TestCase):

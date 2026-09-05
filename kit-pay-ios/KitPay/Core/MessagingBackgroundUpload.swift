@@ -199,6 +199,9 @@ final class MessagingBackgroundAttachmentUploader: NSObject, URLSessionDataDeleg
         MessagingBackgroundUploadResult,
         Error
     >
+    typealias SessionFactory = @Sendable (URLSessionDelegate, OperationQueue) -> URLSession
+    private let sessionFactory: SessionFactory?
+    private let storageRootOverride: URL?
 
     private let delegateQueue: OperationQueue = {
         let queue = OperationQueue()
@@ -208,6 +211,7 @@ final class MessagingBackgroundAttachmentUploader: NSObject, URLSessionDataDeleg
         return queue
     }()
     private lazy var session: URLSession = {
+        if let sessionFactory { return sessionFactory(self, delegateQueue) }
         let configuration = URLSessionConfiguration.background(
             withIdentifier: Self.sessionIdentifier
         )
@@ -243,6 +247,14 @@ final class MessagingBackgroundAttachmentUploader: NSObject, URLSessionDataDeleg
     private var backgroundEventsCompletionGate = MessagingBackgroundEventsCompletionGate()
 
     private override init() {
+        sessionFactory = nil
+        storageRootOverride = nil
+        super.init()
+    }
+
+    init(sessionFactory: @escaping SessionFactory, storageRoot: URL) {
+        self.sessionFactory = sessionFactory
+        storageRootOverride = storageRoot
         super.init()
     }
 
@@ -253,24 +265,35 @@ final class MessagingBackgroundAttachmentUploader: NSObject, URLSessionDataDeleg
     /// Reconnect the delegate to tasks restored by iOS and remove crash leftovers that no live
     /// task or durable completion can own. This does not require an authenticated account.
     func prepareForApplicationLaunch() {
-        let session = self.session
-        session.getAllTasks { [weak self] tasks in
-            self?.delegateQueue.addOperation { [weak self] in
-                guard let self else { return }
-                var activeAttemptIDs: Set<String> = []
-                for task in tasks {
-                    guard let context = MessagingBackgroundUploadContext.decode(
-                        taskDescription: task.taskDescription
-                    ) else {
-                        task.cancel()
-                        continue
+        // Background-session construction synchronously contacts system services. Keep it off
+        // the launch thread, and serialize its lazy initialization with upload/cancel requests.
+        delegateQueue.addOperation { [weak self] in
+            guard let self else { return }
+            self.session.getAllTasks { [weak self] tasks in
+                self?.delegateQueue.addOperation { [weak self] in
+                    guard let self else { return }
+                    var activeAttemptIDs: Set<String> = []
+                    for task in tasks {
+                        guard let context = MessagingBackgroundUploadContext.decode(
+                            taskDescription: task.taskDescription
+                        ) else {
+                            task.cancel()
+                            continue
+                        }
+                        guard !self.revokedBindings.contains(self.bindingKey(for: context)) else {
+                            task.cancel()
+                            continue
+                        }
+                        activeAttemptIDs.insert(context.attemptID)
+                        self.taskContexts[task.taskIdentifier] = context
+                        task.resume()
                     }
-                    activeAttemptIDs.insert(context.attemptID)
-                    self.taskContexts[task.taskIdentifier] = context
-                    task.resume()
+                    // A foreground enqueue may have completed after getAllTasks took its
+                    // snapshot. Its locally owned chunk must survive launch cleanup too.
+                    activeAttemptIDs.formUnion(self.taskContexts.values.map(\.attemptID))
+                    self.removeOrphanedChunkFiles(retaining: activeAttemptIDs)
+                    self.pruneDurableResults()
                 }
-                self.removeOrphanedChunkFiles(retaining: activeAttemptIDs)
-                self.pruneDurableResults()
             }
         }
     }
@@ -723,16 +746,20 @@ final class MessagingBackgroundAttachmentUploader: NSObject, URLSessionDataDeleg
     }
 
     private func storageDirectory() throws -> URL {
-        let applicationSupport = try FileManager.default.url(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: true
-        )
-        let directory = applicationSupport.appendingPathComponent(
-            "KitMessagingBackgroundUploads-v1",
-            isDirectory: true
-        )
+        let directory: URL
+        if let storageRootOverride {
+            directory = storageRootOverride
+        } else {
+            let applicationSupport = try FileManager.default.url(
+                for: .applicationSupportDirectory,
+                in: .userDomainMask,
+                appropriateFor: nil,
+                create: true
+            )
+            directory = applicationSupport.appendingPathComponent(
+                "KitMessagingBackgroundUploads-v1", isDirectory: true
+            )
+        }
         try FileManager.default.createDirectory(
             at: directory,
             withIntermediateDirectories: true,

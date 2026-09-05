@@ -752,6 +752,11 @@ private struct MediaLibraryAudioRow: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.voiceNoteChatContext) private var chatContext
     @ObservedObject private var player = VoiceNotePlayer.shared
+    @State private var mediaAccountLifetime = ChatMediaAccountLifetime.current
+
+    private var mediaAccountIsCurrent: Bool {
+        mediaAccountLifetime == ChatMediaAccountLifetime.current && model.isSignedIn
+    }
 
     let item: ConversationMediaItem
 
@@ -846,6 +851,7 @@ private struct MediaLibraryAudioRow: View {
     /// that fresh result. A note that no longer resolves stops playing instead of continuing
     /// from stale bytes.
     private func refreshThenToggle() async {
+        guard mediaAccountIsCurrent else { return }
         isLoading = true
         errorMessage = nil
         defer { isLoading = false }
@@ -855,6 +861,7 @@ private struct MediaLibraryAudioRow: View {
                    messageID: item.messageID,
                    conversationId: item.conversationID
                ) {
+                guard mediaAccountIsCurrent else { return }
                 player.toggle(
                     fileURLs: playback.fileURLs,
                     segmentDurations: playback.segmentDurations,
@@ -870,6 +877,7 @@ private struct MediaLibraryAudioRow: View {
             ) {
                 let fresh = SecureMediaLoadPolicy.LoadedItem(localFile: localFile)
                 loaded = fresh
+                guard mediaAccountIsCurrent else { return }
                 player.toggle(
                     fileURL: localFile.url,
                     id: item.playbackID,
@@ -885,6 +893,7 @@ private struct MediaLibraryAudioRow: View {
             )
             loaded = fresh
             if let fileURL = fresh.localFileURL {
+                guard mediaAccountIsCurrent else { return }
                 player.toggle(
                     fileURL: fileURL,
                     id: item.playbackID,
@@ -892,6 +901,7 @@ private struct MediaLibraryAudioRow: View {
                     protectedOriginalLease: fresh.localFileLease
                 )
             } else {
+                guard mediaAccountIsCurrent else { return }
                 player.toggle(
                     data: fresh.data,
                     id: item.playbackID,
@@ -900,7 +910,7 @@ private struct MediaLibraryAudioRow: View {
             }
         } catch {
             loaded = nil
-            if player.playingID == item.playbackID { player.stop() }
+            if mediaAccountIsCurrent, player.playingID == item.playbackID { player.stop() }
             errorMessage = model.isOnline ? "Couldn't play. Tap to retry." : "Available when online"
         }
     }

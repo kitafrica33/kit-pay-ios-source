@@ -37,6 +37,9 @@ final class VoiceNotePlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     private var progressTask: Task<Void, Never>?
     private var interruptionObserver: NSObjectProtocol?
     private var hasRemoteCommands = false
+    private var ownsPlaybackAudioSession = false
+    private var ownsNowPlayingInfo = false
+    private var playbackGeneration = UUID()
 
     override private init() {
         super.init()
@@ -97,6 +100,7 @@ final class VoiceNotePlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
         do {
             try AVAudioSession.sharedInstance().setCategory(.playback, mode: .spokenAudio)
             try AVAudioSession.sharedInstance().setActive(true)
+            ownsPlaybackAudioSession = true
             queueURLs = fileURLs
             queueDurations = segmentDurations
             playing = VoiceNotePlayingNote(id: id, context: context)
@@ -130,6 +134,7 @@ final class VoiceNotePlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
         do {
             try AVAudioSession.sharedInstance().setCategory(.playback, mode: .spokenAudio)
             try AVAudioSession.sharedInstance().setActive(true)
+            ownsPlaybackAudioSession = true
             let player = try makePlayer()
             player.delegate = self
             player.prepareToPlay()
@@ -224,6 +229,13 @@ final class VoiceNotePlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     func stop() {
+        playbackGeneration = UUID()
+        // A representable can re-offer the same video layer on every SwiftUI update. Stopping an
+        // idle voice player must not publish fresh state or perform MediaPlayer/audio IPC again.
+        guard playing != nil || player != nil || queuePlayer != nil || progressTask != nil
+                || protectedOriginalLease != nil || queueEndObserver != nil
+                || hasRemoteCommands || ownsPlaybackAudioSession || ownsNowPlayingInfo
+        else { return }
         progressTask?.cancel()
         progressTask = nil
         player?.stop()
@@ -243,10 +255,13 @@ final class VoiceNotePlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
         duration = 0
         clearNowPlaying()
         removeRemoteCommands()
-        try? AVAudioSession.sharedInstance().setActive(
-            false,
-            options: [.notifyOthersOnDeactivation]
-        )
+        if ownsPlaybackAudioSession {
+            ownsPlaybackAudioSession = false
+            try? AVAudioSession.sharedInstance().setActive(
+                false,
+                options: [.notifyOthersOnDeactivation]
+            )
+        }
         VoiceNoteOverlayWindowController.shared.refresh()
     }
 
@@ -264,11 +279,17 @@ final class VoiceNotePlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     // MARK: AVAudioPlayerDelegate
 
     nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
-        Task { @MainActor in self.stop() }
+        Task { @MainActor [weak self, weak player] in
+            guard let self, let player, self.player === player else { return }
+            self.stop()
+        }
     }
 
     nonisolated func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
-        Task { @MainActor in self.stop() }
+        Task { @MainActor [weak self, weak player] in
+            guard let self, let player, self.player === player else { return }
+            self.stop()
+        }
     }
 
     // MARK: Progress
@@ -300,29 +321,40 @@ final class VoiceNotePlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     private func installRemoteCommands() {
         guard !hasRemoteCommands else { return }
         hasRemoteCommands = true
+        let generation = playbackGeneration
         let center = MPRemoteCommandCenter.shared()
         // MediaPlayer does not promise these arrive on the main thread, so each hop rather than
         // asserting isolation it has not been given.
         center.playCommand.addTarget { _ in
-            Task { @MainActor in VoiceNotePlayer.shared.resume() }
+            Task { @MainActor in
+                VoiceNotePlayer.shared.performRemoteCommand(generation: generation) { $0.resume() }
+            }
             return .success
         }
         center.pauseCommand.addTarget { _ in
-            Task { @MainActor in VoiceNotePlayer.shared.pause() }
+            Task { @MainActor in
+                VoiceNotePlayer.shared.performRemoteCommand(generation: generation) { $0.pause() }
+            }
             return .success
         }
         center.togglePlayPauseCommand.addTarget { _ in
-            Task { @MainActor in VoiceNotePlayer.shared.toggleCurrent() }
+            Task { @MainActor in
+                VoiceNotePlayer.shared.performRemoteCommand(generation: generation) { $0.toggleCurrent() }
+            }
             return .success
         }
         center.skipForwardCommand.preferredIntervals = [15]
         center.skipForwardCommand.addTarget { _ in
-            Task { @MainActor in VoiceNotePlayer.shared.seek(by: 15) }
+            Task { @MainActor in
+                VoiceNotePlayer.shared.performRemoteCommand(generation: generation) { $0.seek(by: 15) }
+            }
             return .success
         }
         center.skipBackwardCommand.preferredIntervals = [15]
         center.skipBackwardCommand.addTarget { _ in
-            Task { @MainActor in VoiceNotePlayer.shared.seek(by: -15) }
+            Task { @MainActor in
+                VoiceNotePlayer.shared.performRemoteCommand(generation: generation) { $0.seek(by: -15) }
+            }
             return .success
         }
         center.changePlaybackPositionCommand.addTarget { event in
@@ -332,6 +364,7 @@ final class VoiceNotePlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
             let positionTime = event.positionTime
             Task { @MainActor in
                 let player = VoiceNotePlayer.shared
+                guard player.playbackGeneration == generation else { return }
                 player.seek(
                     toFraction: VoiceNoteSeekPolicy.fraction(
                         forTime: positionTime,
@@ -341,6 +374,11 @@ final class VoiceNotePlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
             }
             return .success
         }
+    }
+
+    private func performRemoteCommand(generation: UUID, action: (VoiceNotePlayer) -> Void) {
+        guard playbackGeneration == generation else { return }
+        action(self)
     }
 
     private func removeRemoteCommands() {
@@ -358,6 +396,7 @@ final class VoiceNotePlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     /// The lock screen shows who is speaking and where, never the note's contents.
     private func publishNowPlaying() {
         guard let playing, (player != nil || queuePlayer != nil) else { return }
+        ownsNowPlayingInfo = true
         MPNowPlayingInfoCenter.default().nowPlayingInfo = [
             MPMediaItemPropertyTitle: playing.context.title,
             MPMediaItemPropertyArtist: playing.context.subtitle,
@@ -396,8 +435,11 @@ final class VoiceNotePlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
             forName: .AVPlayerItemDidPlayToEndTime,
             object: last,
             queue: .main
-        ) { _ in
-            MainActor.assumeIsolated { VoiceNotePlayer.shared.stop() }
+        ) { [weak self, weak queue] _ in
+            MainActor.assumeIsolated {
+                guard let self, let queue, self.queuePlayer === queue else { return }
+                self.stop()
+            }
         }
         queuePlayer = queue
         queue.seek(to: CMTime(seconds: offset, preferredTimescale: 600))
@@ -405,6 +447,8 @@ final class VoiceNotePlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     private func clearNowPlaying() {
+        guard ownsNowPlayingInfo else { return }
+        ownsNowPlayingInfo = false
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
     }
 }

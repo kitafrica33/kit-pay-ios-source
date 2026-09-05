@@ -1045,8 +1045,7 @@ private struct KitVideoTrimView: View {
     }
 
     private func timeLabel(_ seconds: Double) -> String {
-        let whole = Int(seconds.rounded())
-        return String(format: "%d:%02d", whole / 60, whole % 60)
+        ChatMediaPlaybackClock.label(seconds)
     }
 
     private func preparePlayer() {

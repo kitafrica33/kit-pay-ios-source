@@ -309,7 +309,12 @@ private extension ClosedRange where Bound == CGFloat {
 /// instead of covered by it or crowded against it.
 enum CallBannerMetrics {
     /// Height of the strip's content below the top safe-area inset.
-    static let contentHeight: CGFloat = 60
+    static let contentHeight: CGFloat = 56
+
+    static func contentFrame(container: CGRect, topInset: CGFloat) -> CGRect {
+        CGRect(x: container.minX, y: container.minY + max(0, topInset),
+               width: container.width, height: contentHeight)
+    }
 }
 
 /// Which screen edge the minimized video tile is tucked behind.
@@ -580,6 +585,7 @@ struct ActiveCallView: View {
     @EnvironmentObject private var model: AppModel
     @ObservedObject private var coordinator: CallMediaCoordinator
     @ObservedObject private var media: LiveKitCallMediaTransport
+    @ObservedObject private var screenSharing: CallScreenSharingController
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.accessibilityVoiceOverEnabled) private var voiceOverEnabled
@@ -587,6 +593,7 @@ struct ActiveCallView: View {
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.scenePhase) private var scenePhase
     @State private var showsMoreControls = false
+    @State private var confirmsScreenSharing = false
     @State private var controlsAreVisible = true
     @State private var autoHideGeneration = 0
     @State private var localPreviewCorner: CallFloatingCorner = .bottomTrailing
@@ -598,6 +605,7 @@ struct ActiveCallView: View {
     init(coordinator: CallMediaCoordinator, onMinimize: @escaping () -> Void = {}) {
         _coordinator = ObservedObject(wrappedValue: coordinator)
         _media = ObservedObject(wrappedValue: coordinator.media)
+        _screenSharing = ObservedObject(wrappedValue: coordinator.media.screenSharing)
         self.onMinimize = onMinimize
     }
 
@@ -682,6 +690,9 @@ struct ActiveCallView: View {
                         }
                         callHeader(compactLandscape: compactLandscape)
                         Spacer(minLength: 24)
+                        if screenSharing.phase != .idle {
+                            screenSharingStatus
+                        }
                         controlsPanel
                     }
                     .padding(
@@ -722,6 +733,13 @@ struct ActiveCallView: View {
                 if showsMoreControls {
                     MoreCallControlsOverlay(
                         selectedMode: media.microphoneMode,
+                        screenSharingPhase: screenSharing.phase,
+                        canStartScreenSharing: coordinator.state == .connected,
+                        shareScreen: {
+                            dismissMoreControls()
+                            coordinator.requestScreenSharing()
+                        },
+                        stopScreenSharing: coordinator.stopScreenSharing,
                         selectMode: { mode in
                             coordinator.setMicrophoneMode(mode)
                             dismissMoreControls()
@@ -736,9 +754,16 @@ struct ActiveCallView: View {
             // rounded screen corners, and home indicator. Clipping here would trim every
             // `ignoresSafeArea` background back to the modal's safe content rectangle.
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .onAppear(perform: revealControls)
+            .onAppear {
+                revealControls()
+                if screenSharing.phase == .awaitingConfirmation { confirmsScreenSharing = true }
+            }
             .onChange(of: coordinator.state) { _, _ in revealControls() }
             .onChange(of: media.isCameraEnabled) { _, _ in revealControls() }
+            .onChange(of: screenSharing.phase) { _, phase in
+                revealControls()
+                confirmsScreenSharing = phase == .awaitingConfirmation && scenePhase == .active
+            }
             .onChange(of: media.localVideoTrack != nil) { _, _ in revealControls() }
             .onChange(of: media.remoteVideoTrack != nil) { _, _ in revealControls() }
             .onChange(of: media.remoteParticipantSurfaces.count) { _, _ in revealControls() }
@@ -746,7 +771,10 @@ struct ActiveCallView: View {
             // Surface the chrome so the new route is visible instead of changing under hidden UI.
             .onChange(of: media.audioRoute) { _, _ in revealControls() }
             .onChange(of: scenePhase) { _, phase in
-                if phase == .active { revealControls() }
+                if phase == .active {
+                    revealControls()
+                    if screenSharing.phase == .awaitingConfirmation { confirmsScreenSharing = true }
+                }
             }
             .onChange(of: voiceOverEnabled) { _, _ in revealControls() }
             .onChange(of: switchControlEnabled) { _, _ in revealControls() }
@@ -796,6 +824,12 @@ struct ActiveCallView: View {
             }
         }
         .preferredColorScheme(hasVideoBackdrop ? .dark : nil)
+        .alert("Share your screen with \(coordinator.activeCall?.participantName ?? "this call")?", isPresented: $confirmsScreenSharing) {
+            Button("Share screen") { coordinator.confirmScreenSharing() }
+            Button("Cancel", role: .cancel) { coordinator.stopScreenSharing() }
+        } message: {
+            Text("Everyone in this call can see your screen, including notifications. Your microphone still follows the call’s Mute control.")
+        }
     }
 
     @ViewBuilder
@@ -834,7 +868,7 @@ struct ActiveCallView: View {
                 }
             }
         } else if let remoteTrack = media.remoteVideoTrack {
-            SwiftUIVideoView(remoteTrack, layoutMode: .fill, mirrorMode: .off)
+            SwiftUIVideoView(remoteTrack, layoutMode: media.remoteVideoIsScreenShare ? .fit : .fill, mirrorMode: .off)
                 .ignoresSafeArea()
                 .accessibilityElement(children: .ignore)
                 .accessibilityLabel("Video from \(coordinator.activeCall?.participantName ?? "caller")")
@@ -962,6 +996,30 @@ struct ActiveCallView: View {
                 onMinimize()
             }
         }
+    }
+
+    private var screenSharingStatus: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "rectangle.on.rectangle")
+            Text(screenSharing.phase == .sharing ? "You’re sharing your screen"
+                 : screenSharing.phase == .awaitingApproval ? "Waiting for screen sharing approval"
+                 : screenSharing.phase == .awaitingConfirmation ? "Confirm sharing with this call"
+                 : screenSharing.phase == .stopping ? "Stopping screen sharing…" : "Starting screen sharing…")
+                .font(.subheadline.weight(.semibold))
+            Spacer(minLength: 4)
+            if screenSharing.phase.canStop {
+                Button(screenSharing.phase == .awaitingApproval ? "Cancel" : "Stop") {
+                    coordinator.stopScreenSharing()
+                }
+                .font(.subheadline.bold())
+                .frame(minWidth: 44, minHeight: 44)
+                .accessibilityLabel("Stop screen sharing")
+            }
+        }
+        .padding(.horizontal, 14)
+        .foregroundStyle(callForeground)
+        .kitGlass(cornerRadius: 22, tint: panelTint, tintStrength: 1)
+        .accessibilityIdentifier("call.screen-sharing.status")
     }
 
     private var controlsPanel: some View {
@@ -1132,7 +1190,8 @@ struct ActiveCallView: View {
             hasVideoSurface: hasRemoteParticipantGrid
                 || media.remoteVideoTrack != nil
                 || (media.isCameraEnabled && media.localVideoTrack != nil),
-            isAdditionalControlsPresented: showsMoreControls || showsAddParticipant,
+            isAdditionalControlsPresented: showsMoreControls || showsAddParticipant
+                || confirmsScreenSharing || screenSharing.phase != .idle,
             hasWaitingCall: model.waitingCall != nil,
             isFloatingSurfaceInteracting: localPreviewIsDragging,
             isAssistiveNavigationActive: assistiveNavigationEnabled,
@@ -1853,6 +1912,7 @@ private struct ActiveCallParticipantSheet: View {
 struct MinimizedCallView: View {
     @ObservedObject private var coordinator: CallMediaCoordinator
     @ObservedObject private var media: LiveKitCallMediaTransport
+    @ObservedObject private var screenSharing: CallScreenSharingController
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     /// Free resting origin of the video tile (window coordinates); `nil` means the default
@@ -1864,6 +1924,7 @@ struct MinimizedCallView: View {
     @State private var isDragging = false
     /// VoiceOver's adjustable action still moves the tile between the well-known anchors.
     @State private var accessibilityAnchor: CallFloatingCorner = .bottomTrailing
+    let windowSafeAreaInsets: EdgeInsets
     let reopen: () -> Void
     /// Reports where the surface is drawn, in window coordinates, so the host window can forward
     /// only the touches that land on it and let everything else reach the app underneath.
@@ -1873,13 +1934,16 @@ struct MinimizedCallView: View {
         coordinator: CallMediaCoordinator,
         position: Binding<CGPoint?>,
         tuckedEdge: Binding<CallFloatingTuckEdge?>,
+        windowSafeAreaInsets: EdgeInsets,
         reopen: @escaping () -> Void,
         onSurfaceFrameChange: ((CGRect) -> Void)? = nil
     ) {
         _coordinator = ObservedObject(wrappedValue: coordinator)
         _media = ObservedObject(wrappedValue: coordinator.media)
+        _screenSharing = ObservedObject(wrappedValue: coordinator.media.screenSharing)
         _position = position
         _tuckedEdge = tuckedEdge
+        self.windowSafeAreaInsets = windowSafeAreaInsets
         self.reopen = reopen
         self.onSurfaceFrameChange = onSurfaceFrameChange
     }
@@ -1909,11 +1973,11 @@ struct MinimizedCallView: View {
         for call: ActiveCallPresentation,
         in geometry: GeometryProxy
     ) -> some View {
-        let insets = CallFloatingInsets(geometry.safeAreaInsets)
+        let insets = CallFloatingInsets(windowSafeAreaInsets)
         let container = geometry.size
         // The overlay window ignores safe areas, so the status-bar clearance is read from the
         // window rather than from this (zeroed) geometry.
-        let topInset = max(insets.top, Self.windowTopSafeAreaInset())
+        let topInset = insets.top
         let surfaceSize = CallFloatingSurfaceLayoutPolicy.minimizedSurfaceSize(
             container: container,
             isVideo: true
@@ -2074,18 +2138,16 @@ struct MinimizedCallView: View {
         for call: ActiveCallPresentation,
         in geometry: GeometryProxy
     ) -> some View {
-        let topInset = Self.windowTopSafeAreaInset()
+        let topInset = max(0, windowSafeAreaInsets.top)
         let barContentHeight = CallBannerMetrics.contentHeight
-        let barFrame = CGRect(
-            x: geometry.frame(in: .global).minX,
-            y: geometry.frame(in: .global).minY,
-            width: geometry.size.width,
-            height: topInset + barContentHeight
+        let barFrame = CallBannerMetrics.contentFrame(
+            container: geometry.frame(in: .global), topInset: topInset
         )
-        return ZStack {
+        return ZStack(alignment: .bottom) {
             Button(action: reopen) {
                 Color.clear
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: barContentHeight)
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -2147,6 +2209,7 @@ struct MinimizedCallView: View {
                 ) {
                     coordinator.requestMuted(media.isMicrophoneEnabled)
                 }
+                .accessibilityIdentifier("call.banner.mute")
                 minimizedControl(
                     icon: "phone.down.fill",
                     label: "End call",
@@ -2156,9 +2219,13 @@ struct MinimizedCallView: View {
                 ) {
                     coordinator.requestEnd()
                 }
+                .accessibilityIdentifier("call.banner.end")
             }
-            .padding(.horizontal, 14)
+            .padding(.leading, max(14, windowSafeAreaInsets.leading + 8))
+            .padding(.trailing, max(14, windowSafeAreaInsets.trailing + 8))
             .frame(height: barContentHeight)
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("call.banner.row")
         }
         .frame(height: topInset + barContentHeight, alignment: .bottom)
         .frame(maxWidth: .infinity)
@@ -2191,15 +2258,6 @@ struct MinimizedCallView: View {
         .accessibilityValue(compactStatus(for: call))
         .onAppear { onSurfaceFrameChange?(barFrame) }
         .onChange(of: barFrame) { _, frame in onSurfaceFrameChange?(frame) }
-    }
-
-    /// The overlay window ignores safe areas so the video tile can use the whole screen; the
-    /// banner still needs the real top inset to clear the status area and Dynamic Island.
-    private static func windowTopSafeAreaInset() -> CGFloat {
-        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
-        let window = scenes.flatMap(\.windows).first(where: \.isKeyWindow)
-            ?? scenes.first?.windows.first
-        return window?.safeAreaInsets.top ?? 59
     }
 
     private func minimizedDragGesture(
@@ -2424,7 +2482,7 @@ struct MinimizedCallView: View {
     ) -> some View {
         ZStack {
             if let remoteTrack = media.remoteVideoTrack {
-                SwiftUIVideoView(remoteTrack, layoutMode: .fill, mirrorMode: .off)
+                SwiftUIVideoView(remoteTrack, layoutMode: media.remoteVideoIsScreenShare ? .fit : .fill, mirrorMode: .off)
             } else {
                 ZStack {
                     LiquidCallBackdrop(
@@ -2467,6 +2525,7 @@ struct MinimizedCallView: View {
         for call: ActiveCallPresentation,
         at date: Date = Date()
     ) -> String {
+        if screenSharing.phase.isActive { return "Sharing screen" }
         if media.hasRemoteParticipant {
             // The same anchor the full-screen header uses, so minimizing the call never
             // changes what the timer says.
@@ -2902,6 +2961,10 @@ private struct MoreCallControlsOverlay: View {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.colorScheme) private var colorScheme
     let selectedMode: KitMicrophoneMode
+    let screenSharingPhase: CallScreenSharingPhase
+    let canStartScreenSharing: Bool
+    let shareScreen: () -> Void
+    let stopScreenSharing: () -> Void
     let selectMode: (KitMicrophoneMode) -> Void
     let dismiss: () -> Void
 
@@ -2963,6 +3026,18 @@ private struct MoreCallControlsOverlay: View {
                 .buttonStyle(.plain)
                 .accessibilityLabel("Close microphone modes")
             }
+
+            Button(action: screenSharingPhase == .idle ? shareScreen : stopScreenSharing) {
+                Label(screenSharingPhase == .idle ? "Share screen" : "Stop screen sharing",
+                      systemImage: "rectangle.on.rectangle")
+                    .font(.subheadline.weight(.semibold))
+                    .frame(maxWidth: .infinity, minHeight: 48, alignment: .leading)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(screenSharingPhase == .idle ? !canStartScreenSharing : !screenSharingPhase.canStop)
+            .accessibilityIdentifier("call.screen-sharing.control")
+            Divider()
 
             ForEach(KitMicrophoneMode.allCases) { mode in
                 Button {

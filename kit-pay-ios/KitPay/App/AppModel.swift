@@ -2896,6 +2896,10 @@ final class AppModel: ObservableObject {
     private func enterCommunicationPrivacyQuarantine() async {
         authenticatedAppReviewDemoOwnerID = nil
         let targetAccountID = privacyQuarantineTargetAccountID
+        if targetAccountID == nil
+            || profile?.id.caseInsensitiveCompare(targetAccountID ?? "") == .orderedSame {
+            resetTransientChatMediaForAccountBoundary()
+        }
         clearAllCallWaitingState()
         NotificationCoordinator.shared.beginPrivacyQuarantine(
             targetAccountID: targetAccountID
@@ -3655,9 +3659,11 @@ final class AppModel: ObservableObject {
             failedSession,
             accountEpoch: expectedAccountEpoch
         ) else { return }
+        guard accountEpoch == expectedAccountEpoch, !isSigningOut else { return }
         activeConversationID = nil
         stopVisibleConversationSync()
         isSignedIn = false
+        resetTransientChatMediaForAccountBoundary()
         await retireClaimNotificationStateAtAccountBoundary()
         resetDeferredMessagingFeatures()
         sessionAssurance = nil
@@ -4101,6 +4107,7 @@ final class AppModel: ObservableObject {
         resetForegroundAuthoritativeRefresh()
         cancelWalletHistoryRefresh()
         pendingDeepLink = nil
+        resetTransientChatMediaForAccountBoundary()
         accountEpoch = UUID()
         resetDeferredMessagingFeatures()
         guard await resetProtectedCallRecoveryCycle(retiringQueuedEvents: true) else {
@@ -5096,6 +5103,15 @@ final class AppModel: ObservableObject {
         URLCache.shared.removeAllCachedResponses()
     }
 
+    /// Invoked synchronously after the account/attempt guard and before teardown suspends.
+    /// No delayed observer can apply this cleanup to a replacement account.
+    private func resetTransientChatMediaForAccountBoundary() {
+        ChatMediaAccountLifetime.invalidate()
+        VoiceNotePlayer.shared.stop()
+        VoiceNoteDraftRegistry.shared.resetForAccountBoundary()
+        ChatVideoPictureInPicture.shared.stopForAccountBoundary()
+    }
+
     @discardableResult
     private func performSignOut(
         removeBiometricCredential: Bool,
@@ -5119,6 +5135,7 @@ final class AppModel: ObservableObject {
             else { return .contextChanged }
         }
         isSigningOut = true
+        resetTransientChatMediaForAccountBoundary()
         // Diagnostics have no account identifiers, but their exact event times and media sizes
         // still belong only to the account that produced them. A filesystem failure is retried
         // and blocks any later account adoption in `adoptAuthenticatedResult`.
@@ -13482,10 +13499,13 @@ final class AppModel: ObservableObject {
     /// durable message, so a failed or interrupted prewrite never becomes a false local record.
     func persistStagedMediaOriginal(mediaID: UUID, data: Data) async -> Bool {
         let mediaDiagnosticsScope = LocalMediaPerformanceMonitor.shared.captureProducerScope()
-        guard !data.isEmpty else { return false }
+        guard !data.isEmpty, isSignedIn, !isSigningOut, let userID = profile?.id else { return false }
         let expectedAccountEpoch = accountEpoch
         let snapshot = await store.snapshot()
-        guard let userID = snapshot.profile?.id else { return false }
+        guard expectedAccountEpoch == accountEpoch, isSignedIn, !isSigningOut,
+              snapshot.profile?.id.caseInsensitiveCompare(userID) == .orderedSame,
+              snapshot.communicationOwnerUserID?.caseInsensitiveCompare(userID) == .orderedSame
+        else { return false }
         let key = mediaID.uuidString.lowercased()
         let insertion = await SecureMediaFileCache.shared.insertIfAbsent(
             data,
@@ -13530,13 +13550,17 @@ final class AppModel: ObservableObject {
         requiresConstantTimeClone: Bool = false
     ) async -> URL? {
         let mediaDiagnosticsScope = LocalMediaPerformanceMonitor.shared.captureProducerScope()
-        guard KitChatMediaLimits.fitsLocalOriginal(
+        guard isSignedIn, !isSigningOut, let userID = profile?.id,
+              KitChatMediaLimits.fitsLocalOriginal(
             byteCount: byteCount,
             mediaType: mediaType
         ) else { return nil }
         let expectedAccountEpoch = accountEpoch
         let snapshot = await store.snapshot()
-        guard let userID = snapshot.profile?.id else { return nil }
+        guard expectedAccountEpoch == accountEpoch, isSignedIn, !isSigningOut,
+              snapshot.profile?.id.caseInsensitiveCompare(userID) == .orderedSame,
+              snapshot.communicationOwnerUserID?.caseInsensitiveCompare(userID) == .orderedSame
+        else { return nil }
         let key = mediaID.uuidString.lowercased()
         let destination: URL
         do {

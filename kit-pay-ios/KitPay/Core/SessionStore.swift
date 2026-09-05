@@ -23,12 +23,17 @@ enum SessionRefreshReplayPolicy {
 
 actor SessionStore {
     static let shared = SessionStore()
-    private let account = "kit-pay-session-v1"
-    private let refreshAttemptAccount = "kit-pay-session-refresh-attempt-v1"
+    private let account: String
+    private let refreshAttemptAccount: String
     private var cached: SessionTokens?
     private var refreshAttempt: SessionRefreshAttempt?
 
-    init() {
+    init(
+        account: String = "kit-pay-session-v1",
+        refreshAttemptAccount: String = "kit-pay-session-refresh-attempt-v1"
+    ) {
+        self.account = account
+        self.refreshAttemptAccount = refreshAttemptAccount
         if let data = try? KeychainStore.data(for: account) {
             cached = try? JSONDecoder().decode(SessionTokens.self, from: data)
         }

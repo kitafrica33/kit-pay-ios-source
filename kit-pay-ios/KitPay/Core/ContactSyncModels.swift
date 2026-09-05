@@ -623,6 +623,24 @@ struct ConversationContactPresentation: Equatable, Sendable {
     let contact: WalletContactDTO?
 }
 
+/// One directory scan per chat-list/search render. Preserve duplicate order so the existing
+/// saved-contact name and avatar precedence remain identical to a direct directory lookup.
+struct ConversationContactDirectoryIndex {
+    private var contactsByRecipient: [String: [WalletContactDTO]] = [:]
+
+    init(_ contacts: [WalletContactDTO]) {
+        for contact in contacts {
+            guard let recipientID = ContactRecipientDirectory.recipientUserId(for: contact)
+            else { continue }
+            contactsByRecipient[recipientID, default: []].append(contact)
+        }
+    }
+
+    func contacts(for recipientID: String) -> [WalletContactDTO] {
+        contactsByRecipient[recipientID] ?? []
+    }
+}
+
 /// Gives every chat surface one stable identity presentation. A name saved in this iPhone's
 /// Contacts app wins over the mutable server conversation title, while the member avatar still
 /// comes from the synchronized Kit Pay directory. Ambiguous/group rosters deliberately fall back
@@ -632,6 +650,25 @@ enum ConversationContactPresentationPolicy {
         for conversation: Conversation,
         currentUserID: String?,
         contacts: [WalletContactDTO]
+    ) -> ConversationContactPresentation {
+        presentation(for: conversation, currentUserID: currentUserID) { recipientID in
+            contacts.filter { ContactRecipientDirectory.recipientUserId(for: $0) == recipientID }
+        }
+    }
+
+    static func presentation(
+        for conversation: Conversation,
+        currentUserID: String?,
+        directory: ConversationContactDirectoryIndex
+    ) -> ConversationContactPresentation {
+        presentation(for: conversation, currentUserID: currentUserID,
+                     matchingContacts: directory.contacts(for:))
+    }
+
+    private static func presentation(
+        for conversation: Conversation,
+        currentUserID: String?,
+        matchingContacts: (String) -> [WalletContactDTO]
     ) -> ConversationContactPresentation {
         let fallbackName = cleanName(conversation.title) ?? "Kit Pay user"
         guard let currentUserID = canonicalUserID(currentUserID) else {
@@ -664,9 +701,7 @@ enum ConversationContactPresentationPolicy {
             )
         }
 
-        let matches = contacts.filter {
-            ContactRecipientDirectory.recipientUserId(for: $0) == recipientUserID
-        }
+        let matches = matchingContacts(recipientUserID)
         let savedContact = matches.first {
             $0.contactId?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
         }

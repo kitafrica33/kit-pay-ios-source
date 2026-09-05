@@ -1139,14 +1139,13 @@ private struct GalleryVideoPage: View {
     }
 
     private static func timeLabel(_ seconds: Double) -> String {
-        let whole = Int(seconds.rounded())
-        return String(format: "%d:%02d", whole / 60, whole % 60)
+        ChatMediaPlaybackClock.label(seconds)
     }
 }
 
 /// Owns the AVPlayer, its protected temp file, and observers for one video page.
 @MainActor
-private final class GalleryVideoController: ObservableObject {
+final class GalleryVideoController: ObservableObject {
     @Published private(set) var player: AVPlayer?
     @Published private(set) var isPlaying = false
     @Published private(set) var isMuted = false
@@ -1178,6 +1177,7 @@ private final class GalleryVideoController: ObservableObject {
     private var diagnosticMediaID: UUID?
     private var diagnosticIsOutgoing = false
     private var diagnosticByteCount: Int?
+    private let mediaAccountLifetime = ChatMediaAccountLifetime.current
     private let diagnosticProducerScope = LocalMediaPerformanceMonitor.shared.captureProducerScope()
     private var didRecordPlaybackStart = false
     private var didRecordTerminalFailure = false
@@ -1199,6 +1199,7 @@ private final class GalleryVideoController: ObservableObject {
         galleryIdentity: ChatVideoGalleryIdentity,
         restoreFromPictureInPicture: @escaping (ChatVideoGalleryIdentity) -> Void
     ) async -> Bool {
+        guard mediaAccountLifetime == ChatMediaAccountLifetime.current else { return false }
         self.galleryIdentity = galleryIdentity
         self.restoreFromPictureInPicture = restoreFromPictureInPicture
         guard player == nil, !isPreparing else { return player != nil }
@@ -1240,6 +1241,10 @@ private final class GalleryVideoController: ObservableObject {
         galleryIdentity: ChatVideoGalleryIdentity,
         restoreFromPictureInPicture: @escaping (ChatVideoGalleryIdentity) -> Void
     ) async -> Bool {
+        guard mediaAccountLifetime == ChatMediaAccountLifetime.current else {
+            if ownsFile { ChatMediaTempFiles.removeTemporaryFile(url) }
+            return false
+        }
         self.galleryIdentity = galleryIdentity
         self.restoreFromPictureInPicture = restoreFromPictureInPicture
         guard player == nil, !isPreparing else {
@@ -1264,6 +1269,7 @@ private final class GalleryVideoController: ObservableObject {
             return false
         }
         guard !Task.isCancelled,
+              mediaAccountLifetime == ChatMediaAccountLifetime.current,
               preparationID == identifier,
               sourceFileURL == url
         else {
@@ -1279,6 +1285,7 @@ private final class GalleryVideoController: ObservableObject {
                 expectedByteCount: expectedByteCount
             )
             guard !Task.isCancelled,
+                  mediaAccountLifetime == ChatMediaAccountLifetime.current,
                   preparationID == identifier,
                   sourceFileURL == url
             else {
@@ -1294,18 +1301,14 @@ private final class GalleryVideoController: ObservableObject {
             playerItem = item
             let player = AVPlayer(playerItem: item)
             player.automaticallyWaitsToMinimizeStalling = true
+            player.isMuted = isMuted
             self.player = player
             timeObserver = player.addPeriodicTimeObserver(
                 forInterval: CMTime(seconds: 0.25, preferredTimescale: 600),
                 queue: .main
             ) { [weak self] time in
                 Task { @MainActor in
-                    guard let self, !self.isScrubbing else { return }
-                    let seconds = time.seconds
-                    if seconds.isFinite {
-                        self.currentTime = seconds
-                        self.recordPlaybackStartedIfNeeded(position: seconds)
-                    }
+                    self?.receivePlaybackTime(time, from: item)
                 }
             }
             observePlaybackItem(item)
@@ -1316,6 +1319,16 @@ private final class GalleryVideoController: ObservableObject {
             failPreparation(error)
             return false
         }
+    }
+
+    /// AVFoundation's callbacks hop to the main actor. Removing an observer cannot recall an
+    /// already-enqueued callback, so its item identity must still match after that hop.
+    func receivePlaybackTime(_ time: CMTime, from item: AVPlayerItem) {
+        guard playerItem === item, !isScrubbing else { return }
+        let seconds = time.seconds
+        guard seconds.isFinite else { return }
+        currentTime = max(0, min(seconds, duration))
+        recordPlaybackStartedIfNeeded(position: currentTime)
     }
 
     /// Reported by the layer host as it comes up, and again on reuse.
@@ -1362,6 +1375,7 @@ private final class GalleryVideoController: ObservableObject {
         asset = nil
         playerLayer = nil
         isPlaying = false
+        isScrubbing = false
         hasStartedPlayback = false
         currentTime = 0
         duration = 0
@@ -1383,6 +1397,7 @@ private final class GalleryVideoController: ObservableObject {
     }
 
     func togglePlayback() {
+        guard mediaAccountLifetime == ChatMediaAccountLifetime.current else { return }
         guard let player else { return }
         if isPlaying {
             player.pause()
@@ -1403,6 +1418,7 @@ private final class GalleryVideoController: ObservableObject {
     /// Points the floating window at this page's video. Armed on every play, so the hand-off
     /// always follows the video the user is actually watching.
     private func armPictureInPicture() {
+        guard mediaAccountLifetime == ChatMediaAccountLifetime.current else { return }
         guard let playerLayer, let galleryIdentity, let restoreFromPictureInPicture else { return }
         ChatVideoPictureInPicture.shared.attach(
             playerLayer: playerLayer,
@@ -1446,7 +1462,7 @@ private final class GalleryVideoController: ObservableObject {
             object: item,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor in self?.handlePlaybackEnded() }
+            Task { @MainActor in self?.handlePlaybackEnded(item: item) }
         }
         stallObserver = NotificationCenter.default.addObserver(
             forName: .AVPlayerItemPlaybackStalled,
@@ -1557,9 +1573,9 @@ private final class GalleryVideoController: ObservableObject {
         ChatVideoPictureInPicture.shared.stopForPlaybackEnd(owner: self)
     }
 
-    private func handlePlaybackEnded() {
-        guard isPlaying else { return }
-        let position = playerItem?.currentTime().seconds ?? currentTime
+    func handlePlaybackEnded(item: AVPlayerItem) {
+        guard playerItem === item, isPlaying else { return }
+        let position = item.currentTime().seconds
         recordPlaybackStartedIfNeeded(position: position)
         recordPlayback(.completed, position: position)
         isPlaying = false

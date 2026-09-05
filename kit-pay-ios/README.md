@@ -43,6 +43,8 @@ and Apple Liquid Glass.
   brand canvas under Reduce Transparency or Increase Contrast.
 - An ongoing call keeps one floating surface above every sheet, cover, and tab, with inline mute and
   hang-up, and a video call hands off to system Picture in Picture when you leave the app.
+- ReplayKit screen sharing in voice and video calls, with system consent followed by confirmation
+  of the current call. The call microphone keeps its existing mute control; app audio is excluded.
 - App Store icon, privacy manifest, and Xcode CI build/test validation.
 
 ## Deliberate release gates
@@ -254,5 +256,30 @@ readiness.
 3. **Physical-device acceptance.** APNs, PushKit, CallKit, biometric prompts, LiveKit audio and
    video, Bluetooth routing, and Picture in Picture cannot be exercised in the Simulator or in CI.
    `PARITY.md` carries the acceptance script.
+
+Publication workflows are manual. Ordinary pushes and pull requests do not start quality jobs,
+Mac builds, or Simulators. Use **Build iOS Simulator** only when an explicit diagnostic build is
+needed; a release does not depend on that separate run.
+
+**Signed iOS App Store archive** checks protected source, shared validators, Apple credentials,
+the unused build number, and public corresponding source before native setup. Its one Mac runner
+resolves dependencies once, compiles the test products once, runs the native unit/UI suite, and
+builds the signed Release archive. The Release build also verifies production code without the
+screenshot fixture. Download caches retain checksum-verified libsignal and SwiftPM archives,
+not signing material or compiled app products.
+
+Select `publication_target=testflight` for TestFlight preparation. It creates no marketing
+screenshots. For an App Store asset update select `app-store` and `update_screenshots=true`;
+otherwise existing store screenshots stay in place. The workflow first verifies retained screenshot
+provenance, compatibility, and PNG hashes. If new images are required, the existing test products
+capture the exact iPhone and iPad classes without recompilation. Reused images retain their original
+source and capture date. An optional `screenshot_artifact_id` selects a retained set explicitly.
+
+**Upload verified iOS archive to TestFlight** takes the successful archive run ID and reuses its
+signed IPA. Cheap publication checks run first, followed by signature and artifact-hash validation
+and upload on a Mac. Apple's processing wait runs on Linux. Upload retries must use the retained
+archive; an already uploaded build is handled through its existing App Store Connect record.
+Signing, extension entitlements, public source, immutable artifacts, and physical-device acceptance
+remain release requirements. Details and validation are in [CI_WORKFLOWS.md](CI_WORKFLOWS.md).
 
 See [PARITY.md](PARITY.md) for parity, TestFlight gates, and the post-TestFlight product backlog.

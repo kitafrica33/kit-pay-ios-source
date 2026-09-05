@@ -77,6 +77,33 @@ enum KitCameraOutput {
 
 // MARK: - Controller
 
+/// Permission callbacks, the main queue and the capture queue share this exact presentation
+/// lifetime. Closing and reopening the camera never lets an older permission result restart it.
+final class KitCameraSessionLifetime: @unchecked Sendable {
+    private let lock = NSLock()
+    private var current: UUID?
+
+    func begin() -> UUID {
+        lock.lock()
+        defer { lock.unlock() }
+        let token = UUID()
+        current = token
+        return token
+    }
+
+    func invalidate() {
+        lock.lock()
+        defer { lock.unlock() }
+        current = nil
+    }
+
+    func isCurrent(_ token: UUID) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return current == token
+    }
+}
+
 /// Owns the AVFoundation capture stack for `KitCameraView`: photo capture with flash,
 /// segmented video recording with pause/resume, torch, camera flip, tap-to-focus, and zoom.
 ///
@@ -112,6 +139,7 @@ final class KitCameraController: NSObject, ObservableObject, @unchecked Sendable
     let session = AVCaptureSession()
 
     private let sessionQueue = DispatchQueue(label: "africa.kit.pay.ios.camera-session")
+    private let sessionLifetime = KitCameraSessionLifetime()
     private let photoOutput = AVCapturePhotoOutput()
     private let movieOutput = AVCaptureMovieFileOutput()
     private var videoInput: AVCaptureDeviceInput?
@@ -132,9 +160,11 @@ final class KitCameraController: NSObject, ObservableObject, @unchecked Sendable
     // MARK: Lifecycle
 
     func start() {
+        let token = sessionLifetime.begin()
         AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
-            guard let self else { return }
+            guard let self, self.sessionLifetime.isCurrent(token) else { return }
             DispatchQueue.main.async {
+                guard self.sessionLifetime.isCurrent(token) else { return }
                 self.isAuthorized = granted
                 self.authorizationChecked = true
             }
@@ -145,27 +175,28 @@ final class KitCameraController: NSObject, ObservableObject, @unchecked Sendable
                 // input during that window fails, and the already-installed video input used to
                 // prevent every later start from retrying it.
                 AVCaptureDevice.requestAccess(for: .audio) { [weak self] _ in
-                    self?.configureAndStartSession()
+                    self?.configureAndStartSession(lifetime: token)
                 }
             case .authorized, .denied, .restricted:
-                self.configureAndStartSession()
+                self.configureAndStartSession(lifetime: token)
             @unknown default:
-                self.configureAndStartSession()
+                self.configureAndStartSession(lifetime: token)
             }
         }
     }
 
-    private func configureAndStartSession() {
+    private func configureAndStartSession(lifetime token: UUID) {
         sessionQueue.async { [weak self] in
-            guard let self else { return }
+            guard let self, self.sessionLifetime.isCurrent(token) else { return }
             self.configureSessionIfNeeded()
-            if !self.session.isRunning {
+            if self.sessionLifetime.isCurrent(token), !self.session.isRunning {
                 self.session.startRunning()
             }
         }
     }
 
     func stop() {
+        sessionLifetime.invalidate()
         // The repeating timer lives on the main run loop; invalidate it here (stop() is
         // called from onDisappear on main) or it outlives the controller and fires forever.
         stopDurationTimer()

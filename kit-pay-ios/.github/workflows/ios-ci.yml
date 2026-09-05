@@ -1,67 +1,42 @@
-name: iOS quality
+name: Build iOS Simulator
 
+# Explicit diagnostic builds only. Publication performs its own essential checks
+# in the release runner; ordinary pushes and PRs allocate no Mac or Simulator.
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ios-${{ github.ref }}
+  group: ios-manual-build-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: macos-26
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-      - name: Test release validators
-        run: python3 -m unittest discover -s .github/scripts/tests -p 'test_ios_signing.py'
-      - name: Test App Store screenshot evidence tools
-        run: python3 -m unittest discover -s .github/scripts/tests -p 'test_*screenshots.py'
-      - name: Test contact-sync recovery source contract
-        run: python3 -m unittest discover -s .github/scripts/tests -p 'test_contact_sync_recovery.py'
-      - name: Test wallet-refresh reliability source contract
-        run: python3 -m unittest discover -s .github/scripts/tests -p 'test_wallet_refresh_reliability.py'
-      - name: Test claim-notification liveness source contract
-        run: python3 -m unittest discover -s .github/scripts/tests -p 'test_claim_notification_liveness.py'
-      - name: Test financial chat receipt recovery source contract
-        run: python3 -m unittest discover -s .github/scripts/tests -p 'test_financial_chat_receipt_recovery.py'
-      - name: Test verification-badge placement source contract
-        run: python3 -m unittest discover -s .github/scripts/tests -p 'test_verification_badge_placement.py'
-      - name: Test media-message-v2 source contract
-        run: python3 -m unittest discover -s .github/scripts/tests -p 'test_media_message_v2_contract.py'
-      - name: Test media diagnostics source contract
-        run: python3 -m unittest discover -s .github/scripts/tests -p 'test_ios_media_diagnostics_contract.py'
-      - name: Test outgoing-call ring-deadline source contract
-        run: python3 -m unittest discover -s .github/scripts/tests -p 'test_outgoing_call_ring_deadline.py'
-      - name: Select current Xcode
-        run: sudo xcode-select --switch /Applications/Xcode.app
-      - name: Install pinned native dependencies
-        run: pod install --repo-update
-      - name: Validate project and compile for Simulator
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Test shared source and release validators once
+        run: python3 -m unittest discover -s .github/scripts/tests
+      - name: Select pinned Xcode
         run: |
           set -euo pipefail
-          xcodebuild -workspace KitPay.xcworkspace -scheme KitPay -list
-          xcodebuild \
-            -workspace KitPay.xcworkspace \
-            -scheme KitPay \
-            -configuration Debug \
-            -sdk iphonesimulator \
-            -destination 'generic/platform=iOS Simulator' \
-            SWIFT_ENABLE_EXPLICIT_MODULES=NO \
-            CODE_SIGNING_ALLOWED=NO \
-            clean build
-      # Ad-hoc signed for the Simulator rather than unsigned. An unsigned app has no
-      # application-identifier entitlement, so every Keychain read returns
-      # errSecMissingEntitlement — and Kit Pay fails closed on that, parking the launch on its
-      # "Unlocking protected data" recovery screen. Correct behaviour, but it means an unsigned
-      # test run can never get past launch. Simulator signing needs no certificate.
-      - name: Run unit and UI tests
+          sudo xcode-select --switch /Applications/Xcode_26.6.app
+          test "$(xcodebuild -version)" = $'Xcode 26.6\nBuild version 17F113'
+      - name: Restore verified dependency downloads
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/Library/Caches/org.signal.libsignal
+            ~/Library/Caches/org.swift.swiftpm
+          key: ios-downloads-${{ runner.os }}-${{ runner.arch }}-xcode26.6-${{ hashFiles('Podfile', '**/Package.resolved') }}
+      - name: Resolve pinned native dependencies once
+        run: bash .github/scripts/install_ios_dependencies.sh
+      - name: Prepare native test Simulator
         run: |
           set -euo pipefail
           DEVICE_ID="$(xcrun simctl list devices available -j | python3 -c 'import json,sys; data=json.load(sys.stdin)["devices"]; print(next(device["udid"] for devices in data.values() for device in devices if device.get("isAvailable") and device["name"].startswith("iPhone")))')"
@@ -71,18 +46,22 @@ jobs:
           # the scene is not active, and the app — correctly — covers its sign-in form with
           # "Authentication details hidden", so no UI test can ever get past launch.
           xcrun simctl boot "$DEVICE_ID" >/dev/null 2>&1 || true
-          xcrun simctl bootstatus "$DEVICE_ID" -b >/dev/null 2>&1 || true
+          xcrun simctl bootstatus "$DEVICE_ID" -b >/dev/null 2>&1
           xcrun simctl privacy "$DEVICE_ID" grant contacts africa.kit.pay.ios || true
-          xcodebuild \
-            -workspace KitPay.xcworkspace \
-            -scheme KitPay \
-            -configuration Debug \
-            -sdk iphonesimulator \
-            -destination "platform=iOS Simulator,id=${DEVICE_ID}" \
-            -parallel-testing-enabled NO \
-            SWIFT_ENABLE_EXPLICIT_MODULES=NO \
-            CODE_SIGN_IDENTITY=- \
-            CODE_SIGN_STYLE=Manual \
-            PROVISIONING_PROFILE_SPECIFIER= \
-            DEVELOPMENT_TEAM= \
-            test
+          echo "KITPAY_TEST_DEVICE_ID=$DEVICE_ID" >> "$GITHUB_ENV"
+      - name: Compile all native tests once
+        run: bash .github/scripts/ios_native_build.sh build
+      - name: Run native unit and UI checks from the same build
+        run: bash .github/scripts/ios_native_build.sh test
+      - name: Retain native quality evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kit-pay-ios-quality-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/KitPay-opening-camera.xcresult
+            ${{ runner.temp }}/KitPay-quality.xcresult
+            ${{ runner.temp }}/KitPay-camera-pan.log
+          if-no-files-found: warn
+          retention-days: 30
+          compression-level: 0

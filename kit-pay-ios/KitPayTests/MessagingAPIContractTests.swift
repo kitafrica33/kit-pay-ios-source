@@ -8,6 +8,103 @@ final class MessagingAPIContractTests: XCTestCase {
     private let messageId = "33333333-3333-4333-8333-333333333333"
     private let rosterRevision = "v1:sha256:" + String(repeating: "a", count: 64)
 
+    @MainActor
+    func testLaunchPreparationConstructsItsSessionOffMainOnTheDelegateQueue() async {
+        let initialized = expectation(description: "Background session constructed off main")
+        initialized.assertForOverFulfill = true
+        let storageRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("background-upload-launch-\(UUID().uuidString)")
+        let session = URLSession(configuration: .ephemeral)
+        let uploader = MessagingBackgroundAttachmentUploader(
+            sessionFactory: { _, delegateQueue in
+                XCTAssertFalse(Thread.isMainThread,
+                               "Background URLSession construction must not block AppDelegate launch")
+                XCTAssertTrue(OperationQueue.current === delegateQueue,
+                              "Launch and transfer requests must share serialized session creation")
+                initialized.fulfill()
+                return session
+            },
+            storageRoot: storageRoot
+        )
+        defer {
+            session.invalidateAndCancel()
+            try? FileManager.default.removeItem(at: storageRoot)
+        }
+
+        uploader.prepareForApplicationLaunch()
+        uploader.prepareForApplicationLaunch()
+        await fulfillment(of: [initialized], timeout: 2)
+    }
+
+    func testLateLaunchSnapshotCannotResumeRevokedTaskOrDeleteNewForegroundChunk() async throws {
+        let accountID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        let replacementAccountID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab"
+        let sessionID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        let chunk = Data(repeating: 7, count: 32)
+        func context(account: String) throws -> MessagingBackgroundUploadContext {
+            try XCTUnwrap(MessagingBackgroundUploadContext(
+                accountID: account, sessionID: sessionID, accessToken: "test-token",
+                uploadID: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                byteOffset: 0, byteSize: chunk.count,
+                ciphertextSHA256: SecureMessagingValidation.sha256Hex(chunk)
+            ))
+        }
+        let oldContext = try context(account: accountID)
+        let currentContext = try context(account: replacementAccountID)
+        let storageRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("background-upload-restore-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: storageRoot) }
+        let snapshots = (0 ..< 3).map { expectation(description: "Task snapshot \($0)") }
+        let resumed = expectation(description: "New foreground task started")
+        let session = ControlledBackgroundUploadSession()
+        session.onEnumeration = { snapshots[$0].fulfill() }
+        session.createdTask.onResume = { resumed.fulfill() }
+        let uploader = MessagingBackgroundAttachmentUploader(
+            sessionFactory: { _, queue in
+                session.setDelegateQueue(queue)
+                return session
+            }, storageRoot: storageRoot
+        )
+        let retiredTask = ControlledBackgroundUploadTask()
+        retiredTask.taskDescription = oldContext.taskDescription
+
+        uploader.prepareForApplicationLaunch()
+        await fulfillment(of: [snapshots[0]], timeout: 2)
+        uploader.cancelTransfers(accountID: accountID, sessionID: sessionID)
+        await fulfillment(of: [snapshots[1]], timeout: 2)
+        var request = URLRequest(url: URL(string: "https://example.invalid/chunk")!)
+        request.httpMethod = "PATCH"
+        let upload = Task {
+            try await uploader.upload(request: request, chunk: chunk, context: currentContext)
+        }
+        await fulfillment(of: [snapshots[2]], timeout: 2)
+        // Snapshot order is explicit: hold launch cleanup while the fresh transfer is enqueued.
+        session.deliverSnapshot(2, tasks: [])
+        await fulfillment(of: [resumed], timeout: 2)
+        let freshChunk = storageRoot.appendingPathComponent(currentContext.attemptID + ".chunk")
+        let orphan = storageRoot.appendingPathComponent("orphan.chunk")
+        try Data([1]).write(to: orphan)
+
+        session.deliverSnapshot(0, tasks: [retiredTask])
+        session.deliverSnapshot(1, tasks: [])
+        await session.drainDelegateQueue()
+
+        XCTAssertEqual(retiredTask.resumeCount, 0)
+        XCTAssertEqual(retiredTask.cancelCount, 1)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: freshChunk.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: orphan.path))
+        session.onDelegateQueue {
+            uploader.urlSession(session, task: session.createdTask,
+                                didCompleteWithError: URLError(.cancelled))
+        }
+        do {
+            _ = try await upload.value
+            XCTFail("Controlled cancellation must finish the foreground waiter")
+        } catch {
+            XCTAssertEqual((error as? URLError)?.code, .cancelled)
+        }
+    }
+
     func testBackgroundEventsCompletionGateRejectsReplacedAndDuplicateCallbacks() {
         var gate = MessagingBackgroundEventsCompletionGate()
         let replaced = gate.install()
@@ -3348,5 +3445,71 @@ final class MessagingAPIContractTests: XCTestCase {
     private func jsonObject<Value: Encodable>(_ value: Value) throws -> [String: Any] {
         let data = try JSONEncoder().encode(value)
         return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    }
+}
+
+private final class ControlledBackgroundUploadTask: URLSessionUploadTask, @unchecked Sendable {
+    private let lock = NSLock()
+    private let identifier = Int.random(in: 1 ... Int.max)
+    private var descriptionValue: String?
+    private var resumes = 0
+    private var cancellations = 0
+    var onResume: (() -> Void)?
+
+    override var taskIdentifier: Int { identifier }
+    override var response: URLResponse? { nil }
+    override var taskDescription: String? {
+        get { lock.withLock { descriptionValue } }
+        set { lock.withLock { descriptionValue = newValue } }
+    }
+    var resumeCount: Int { lock.withLock { resumes } }
+    var cancelCount: Int { lock.withLock { cancellations } }
+
+    override func resume() {
+        lock.withLock { resumes += 1 }
+        onResume?()
+    }
+    override func cancel() { lock.withLock { cancellations += 1 } }
+}
+
+private final class ControlledBackgroundUploadSession: URLSession, @unchecked Sendable {
+    private let lock = NSLock()
+    private var queuedWork: OperationQueue?
+    private var snapshots: [@Sendable ([URLSessionTask]) -> Void] = []
+    let createdTask = ControlledBackgroundUploadTask()
+    var onEnumeration: ((Int) -> Void)?
+
+    func setDelegateQueue(_ queue: OperationQueue) { lock.withLock { queuedWork = queue } }
+
+    override func getAllTasks(
+        completionHandler: @escaping @Sendable ([URLSessionTask]) -> Void
+    ) {
+        let index = lock.withLock {
+            snapshots.append(completionHandler)
+            return snapshots.count - 1
+        }
+        onEnumeration?(index)
+    }
+
+    override func uploadTask(with request: URLRequest, fromFile fileURL: URL) -> URLSessionUploadTask {
+        createdTask
+    }
+
+    func deliverSnapshot(_ index: Int, tasks: [URLSessionTask]) {
+        let callback = lock.withLock { snapshots[index] }
+        callback(tasks)
+    }
+
+    func onDelegateQueue(_ action: @escaping @Sendable () -> Void) {
+        lock.withLock { queuedWork }?.addOperation(action)
+    }
+
+    func drainDelegateQueue() async {
+        guard let queue = lock.withLock({ queuedWork }) else { return }
+        await withCheckedContinuation { continuation in
+            let barrier = BlockOperation { continuation.resume() }
+            for operation in queue.operations { barrier.addDependency(operation) }
+            queue.addOperation(barrier)
+        }
     }
 }

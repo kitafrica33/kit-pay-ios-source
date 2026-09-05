@@ -669,17 +669,20 @@ final class ChatVideoPictureInPicture: NSObject {
         // A live call owns the audio route; a chat video must never take it, and a voice note
         // playing underneath would fight this one for it.
         guard CallMediaCoordinator.shared.activeCall == nil else { return }
-        VoiceNotePlayer.shared.stop()
 
         let identity = ObjectIdentifier(owner)
-        if ownerID == identity, controller?.contentSource?.playerLayer === playerLayer {
+        let isCurrentLayer = ownerID == identity
+            && controller?.contentSource?.playerLayer === playerLayer
+        // A declined takeover must not interrupt another playback owner.
+        guard isCurrentLayer || !isHandedOff else { return }
+        VoiceNotePlayer.shared.stop()
+        if isCurrentLayer {
             self.galleryIdentity = galleryIdentity
             restoreHandler = restore
             return
         }
         // A different video takes over cleanly, unless one is already handed off — that one has
         // been promised the floating window until it ends.
-        guard !isHandedOff else { return }
         releaseController()
 
         // Background playback needs a category that survives leaving the app; without it the
@@ -723,6 +726,14 @@ final class ChatVideoPictureInPicture: NSObject {
             return
         }
         requestTerminalStop(for: controller)
+    }
+
+    /// Revoke restoration immediately, including while AVKit finishes an asynchronous
+    /// transition. Its existing controller-identity checks reject late callbacks.
+    func stopForAccountBoundary() {
+        galleryIdentity = nil
+        restoreHandler = nil
+        stopForExplicitViewerDismissal()
     }
 
     /// Paging away from a video is terminal for that page, but must remain owner-scoped: a stale

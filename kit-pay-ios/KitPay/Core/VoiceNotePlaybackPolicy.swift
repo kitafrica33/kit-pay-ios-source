@@ -1,6 +1,15 @@
 import CoreGraphics
 import Foundation
 
+/// Plaintext presentation belongs to the account lifetime that created its view/controller.
+/// A delayed media lookup cannot start playback after logout and replacement authentication.
+@MainActor
+enum ChatMediaAccountLifetime {
+    private(set) static var current = UUID()
+
+    static func invalidate() { current = UUID() }
+}
+
 /// Who is speaking and where, kept alongside a playing voice note so the floating bar can name it
 /// after the bubble that started it has scrolled away or the chat has been left entirely.
 struct VoiceNotePlaybackContext: Equatable {

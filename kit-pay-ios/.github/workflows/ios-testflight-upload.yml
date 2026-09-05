@@ -29,16 +29,20 @@ concurrency:
   group: kit-pay-ios-testflight-upload
   cancel-in-progress: false
 
+env:
+  IOS_BUNDLE_ID: africa.kit.pay.ios
+  MARKETING_VERSION: ${{ inputs.marketing_version }}
+  BUILD_NUMBER: ${{ inputs.build_number }}
+
 jobs:
-  upload:
-    name: Verify archived IPA and upload to TestFlight
-    runs-on: macos-latest
-    timeout-minutes: 90
+  preflight:
+    name: Verify publication intent and credentials
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     environment: production
-    env:
-      IOS_BUNDLE_ID: africa.kit.pay.ios
-      MARKETING_VERSION: ${{ inputs.marketing_version }}
-      BUILD_NUMBER: ${{ inputs.build_number }}
+    outputs:
+      artifact_name: ${{ steps.archive.outputs.artifact_name }}
+      run_attempt: ${{ steps.archive.outputs.run_attempt }}
     steps:
       - name: Check out current protected source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -117,6 +121,7 @@ jobs:
               'status': 'completed',
               'conclusion': 'success',
               'path': '.github/workflows/ios-app-store-archive.yml',
+              'workflow_id': 336812515,
           }
           for field, value in expected.items():
               if run.get(field) != value:
@@ -124,6 +129,9 @@ jobs:
           run_repository = run.get('repository')
           if not isinstance(run_repository, dict) or run_repository.get('full_name') != repository:
               raise SystemExit('The archive workflow run belongs to a different repository')
+          for field in ('repository', 'head_repository'):
+              if run.get(field, {}).get('id') != 1337983268:
+                  raise SystemExit('The archive repository identity is incorrect')
           run_attempt = run.get('run_attempt')
           if type(run_attempt) is not int or run_attempt < 1:
               raise SystemExit('The archive workflow run attempt is invalid')
@@ -134,22 +142,30 @@ jobs:
               output.write(f'artifact_name={artifact_name}\n')
           PY
 
-      - name: Test TestFlight artifact validator
-        run: >-
-          python3 -m unittest discover
-          -s .github/scripts/tests
-          -p 'test_ios_testflight_artifact.py'
+      - name: Verify Apple upload readiness before downloading artifacts
+        env:
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+        run: python3 .github/scripts/ios_release_readiness.py --mode upload
 
-      - name: Test credential-safe TestFlight processing poller
-        run: >-
-          python3 -m unittest discover
-          -s .github/scripts/tests
-          -p 'test_wait_for_testflight_build.py'
+  upload:
+    name: Verify signed bytes and upload the existing IPA
+    needs: preflight
+    runs-on: macos-latest
+    timeout-minutes: 30
+    environment: production
+    steps:
+      - name: Check out current protected source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Download exact verified archive artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: ${{ steps.archive.outputs.artifact_name }}
+          name: ${{ needs.preflight.outputs.artifact_name }}
           path: ${{ runner.temp }}/kitpay-testflight-input
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
@@ -158,7 +174,7 @@ jobs:
       - name: Verify evidence, source, target, and immutable artifact bytes
         env:
           ARCHIVE_RUN_ID: ${{ inputs.archive_run_id }}
-          ARCHIVE_RUN_ATTEMPT: ${{ steps.archive.outputs.run_attempt }}
+          ARCHIVE_RUN_ATTEMPT: ${{ needs.preflight.outputs.run_attempt }}
         run: |
           set -euo pipefail
           python3 .github/scripts/verify_ios_testflight_artifact.py \
@@ -246,16 +262,6 @@ jobs:
             --apiIssuer "$APP_STORE_CONNECT_ISSUER_ID"
           test "$(shasum -a 256 "$ipa_path" | awk '{print $1}')" = "$expected_ipa_sha"
 
-      - name: Wait for exact uploaded build to finish TestFlight processing
-        env:
-          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
-          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
-          APP_STORE_CONNECT_PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
-          IOS_VERSION: ${{ inputs.marketing_version }}
-          IOS_BUILD_NUMBER: ${{ inputs.build_number }}
-          TESTFLIGHT_POLL_TIMEOUT_SECONDS: '3600'
-        run: python3 .github/scripts/wait_for_testflight_build.py
-
       - name: Remove App Store Connect key and downloaded archive
         if: ${{ always() }}
         run: |
@@ -275,3 +281,26 @@ jobs:
               "$RUNNER_TEMP/kitpay-app-store-connect-key-id" \
               "$RUNNER_TEMP/kitpay-testflight-ipa-sha256"
           fi
+
+  processing:
+    name: Wait for factual TestFlight processing on Linux
+    needs: upload
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    environment: production
+    steps:
+      - name: Check out current protected source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Wait for exact uploaded build to finish TestFlight processing
+        env:
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+          IOS_VERSION: ${{ inputs.marketing_version }}
+          IOS_BUILD_NUMBER: ${{ inputs.build_number }}
+          TESTFLIGHT_POLL_TIMEOUT_SECONDS: '3600'
+        run: python3 .github/scripts/wait_for_testflight_build.py

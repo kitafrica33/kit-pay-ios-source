@@ -274,7 +274,6 @@ struct VoiceNoteMiniPlayerBar: View {
 
     private var remainingLabel: String {
         let remaining = max(0, player.duration * (1 - player.progress))
-        let seconds = Int(remaining.rounded())
-        return String(format: "%d:%02d", seconds / 60, seconds % 60)
+        return ChatMediaPlaybackClock.label(remaining)
     }
 }

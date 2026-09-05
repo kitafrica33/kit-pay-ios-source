@@ -4,7 +4,7 @@ import XCTest
 /// The complete transition table for a voice-note draft. A draft is plaintext audio that
 /// exists only on this device until Send, so the two properties every row here defends
 /// are: nothing leaves the device except through an explicit Send, and nothing is thrown
-/// away except through an explicit discard.
+/// away except through an explicit discard or an account boundary.
 final class VoiceNoteDraftPolicyTests: XCTestCase {
     private let allPhases: [VoiceNoteDraftPhase] = [.idle, .recording, .paused, .previewing]
 
@@ -159,13 +159,8 @@ final class VoiceNoteDraftPolicyTests: XCTestCase {
     func testConversationPromotionKeepsTheSameVoiceDraftOwnerForReopen() {
         let provisionalID = "30000000-0000-4000-8000-000000000201"
         let authoritativeID = "30000000-0000-4000-8000-000000000202"
-        let registry = VoiceNoteDraftRegistry.shared
-        registry.release(provisionalID)
-        registry.release(authoritativeID)
-        defer {
-            registry.release(provisionalID)
-            registry.release(authoritativeID)
-        }
+        let registry = VoiceNoteDraftRegistry()
+        defer { registry.resetForAccountBoundary() }
 
         let mountedRecorder = registry.recorder(for: provisionalID)
         XCTAssertTrue(registry.promote(
@@ -183,13 +178,8 @@ final class VoiceNoteDraftPolicyTests: XCTestCase {
     func testConversationPromotionDoesNotOverwriteAnotherRegisteredDraft() {
         let provisionalID = "30000000-0000-4000-8000-000000000203"
         let authoritativeID = "30000000-0000-4000-8000-000000000204"
-        let registry = VoiceNoteDraftRegistry.shared
-        registry.release(provisionalID)
-        registry.release(authoritativeID)
-        defer {
-            registry.release(provisionalID)
-            registry.release(authoritativeID)
-        }
+        let registry = VoiceNoteDraftRegistry()
+        defer { registry.resetForAccountBoundary() }
 
         let provisionalRecorder = registry.recorder(for: provisionalID)
         let authoritativeRecorder = registry.recorder(for: authoritativeID)
@@ -201,5 +191,81 @@ final class VoiceNoteDraftPolicyTests: XCTestCase {
         ))
         XCTAssertTrue(registry.recorder(for: provisionalID) === provisionalRecorder)
         XCTAssertTrue(registry.recorder(for: authoritativeID) === authoritativeRecorder)
+    }
+
+    @MainActor
+    func testAccountReplacementRevokesMountedRecorderAndCannotPromoteItOverNewOwner() async {
+        let registry = VoiceNoteDraftRegistry()
+        defer { registry.resetForAccountBoundary() }
+        let sharedGroupID = "30000000-0000-4000-8000-000000000205"
+        let firstAccountRecorder = registry.recorder(for: sharedGroupID)
+        firstAccountRecorder.cancel()
+        // Sending/discarding does not untrack the mounted recorder. It can record again
+        // without escaping the next account-boundary cleanup.
+        XCTAssertTrue(registry.recorder(for: sharedGroupID) === firstAccountRecorder)
+
+        registry.resetForAccountBoundary()
+        let secondAccountRecorder = registry.recorder(for: sharedGroupID)
+        XCTAssertFalse(secondAccountRecorder === firstAccountRecorder)
+        XCTAssertTrue(firstAccountRecorder.isInvalidated)
+        XCTAssertFalse(secondAccountRecorder.isInvalidated)
+        let staleRecording = await firstAccountRecorder.finish()
+        XCTAssertNil(staleRecording)
+        XCTAssertFalse(registry.promote(
+            firstAccountRecorder, from: sharedGroupID, to: sharedGroupID
+        ))
+        firstAccountRecorder.suspend()
+        firstAccountRecorder.cancel()
+        XCTAssertTrue(registry.recorder(for: sharedGroupID) === secondAccountRecorder)
+        XCTAssertFalse(secondAccountRecorder.isInvalidated)
+    }
+
+    @MainActor
+    func testPermissionResponseAfterAccountReplacementCannotRestartCaptureOrAffectNewOwner() async {
+        let requested = expectation(description: "Microphone permission request reached")
+        var permissionReply: CheckedContinuation<Bool, Never>?
+        var requestCount = 0
+        let firstAccountRecorder = VoiceNoteRecorder {
+            requestCount += 1
+            return await withCheckedContinuation { continuation in
+                permissionReply = continuation
+                requested.fulfill()
+            }
+        }
+        var firstRecorderPending = true
+        let registry = VoiceNoteDraftRegistry {
+            if firstRecorderPending {
+                firstRecorderPending = false
+                return firstAccountRecorder
+            }
+            return VoiceNoteRecorder()
+        }
+        defer { registry.resetForAccountBoundary() }
+        let groupID = "30000000-0000-4000-8000-000000000206"
+        let mounted = registry.recorder(for: groupID)
+        let pendingStart = Task { await mounted.start() }
+        await fulfillment(of: [requested], timeout: 2)
+        registry.resetForAccountBoundary()
+        let replacement = registry.recorder(for: groupID)
+
+        permissionReply?.resume(returning: true)
+        await pendingStart.value
+        await mounted.start()
+        XCTAssertEqual(requestCount, 1)
+        XCTAssertEqual(mounted.phase, .idle)
+        XCTAssertFalse(mounted.hasDraft)
+        XCTAssertNil(mounted.errorMessage)
+        XCTAssertFalse(replacement.isInvalidated)
+        XCTAssertTrue(registry.recorder(for: groupID) === replacement)
+    }
+
+    func testCameraPermissionFromDismissedPresentationCannotAuthorizeReopenedCamera() {
+        let lifetime = KitCameraSessionLifetime()
+        let oldPermission = lifetime.begin()
+        lifetime.invalidate()
+        XCTAssertFalse(lifetime.isCurrent(oldPermission))
+        let newPermission = lifetime.begin()
+        XCTAssertFalse(lifetime.isCurrent(oldPermission))
+        XCTAssertTrue(lifetime.isCurrent(newPermission))
     }
 }

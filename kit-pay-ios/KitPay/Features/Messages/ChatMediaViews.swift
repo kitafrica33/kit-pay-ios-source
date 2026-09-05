@@ -506,6 +506,11 @@ struct PendingSecureMediaMessageView: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.voiceNoteChatContext) private var chatContext
     @ObservedObject private var player = VoiceNotePlayer.shared
+    @State private var mediaAccountLifetime = ChatMediaAccountLifetime.current
+
+    private var mediaAccountIsCurrent: Bool {
+        mediaAccountLifetime == ChatMediaAccountLifetime.current && model.isSignedIn
+    }
     let message: LocalMessage
     let attachment: LocalPendingAttachment
     let mediaDiagnosticsProducerScope = LocalMediaPerformanceMonitor.shared
@@ -695,8 +700,7 @@ struct PendingSecureMediaMessageView: View {
         let size = sizeLabel ?? "Saved locally"
         if kind == .voice || kind == .audio,
            let duration = message.localMediaRecords?.first(where: { $0.id == mediaID.uuidString.lowercased() })?.duration {
-            let seconds = Int(duration.rounded())
-            return "Queued · \(seconds / 60):\(String(format: "%02d", seconds % 60)) · \(size)"
+            return "Queued · \(ChatMediaPlaybackClock.label(duration)) · \(size)"
         }
         return "Queued · \(size)"
     }
@@ -726,11 +730,13 @@ struct PendingSecureMediaMessageView: View {
     }
 
     private func openLocalOriginal() async {
+        guard mediaAccountIsCurrent else { return }
         if kind == .voice || kind == .audio,
            let playback = await model.loadPendingVoicePlayback(
                messageID: message.id,
                conversationId: message.conversationId
            ) {
+            guard mediaAccountIsCurrent else { return }
             player.toggle(
                 fileURLs: playback.fileURLs,
                 segmentDurations: playback.segmentDurations,
@@ -753,6 +759,7 @@ struct PendingSecureMediaMessageView: View {
                conversationId: message.conversationId,
                itemIndex: nil
            ) {
+            guard mediaAccountIsCurrent else { return }
             if kind == .voice || kind == .audio {
                 player.toggle(
                     fileURL: localFile.url,
@@ -783,7 +790,7 @@ struct PendingSecureMediaMessageView: View {
             return
         }
         await loadLocalOriginal()
-        guard let loaded else { return }
+        guard mediaAccountIsCurrent, let loaded else { return }
         switch KitChatMediaKind(mediaType: loaded.mediaType) {
         case .image:
             guard let image = loaded.downsampledImage(maximumPixelSize: 4_096) else {
@@ -802,6 +809,7 @@ struct PendingSecureMediaMessageView: View {
             )
         case .voice, .audio:
             if let fileURL = loaded.localFileURL {
+                guard mediaAccountIsCurrent else { return }
                 player.toggle(
                     fileURL: fileURL,
                     id: mediaID,
@@ -809,6 +817,7 @@ struct PendingSecureMediaMessageView: View {
                     protectedOriginalLease: loaded.localFileLease
                 )
             } else {
+                guard mediaAccountIsCurrent else { return }
                 player.toggle(
                     data: loaded.data,
                     id: mediaID,
@@ -929,6 +938,11 @@ struct SecureMediaBatchItemView: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.voiceNoteChatContext) private var chatContext
     @ObservedObject private var player = VoiceNotePlayer.shared
+    @State private var mediaAccountLifetime = ChatMediaAccountLifetime.current
+
+    private var mediaAccountIsCurrent: Bool {
+        mediaAccountLifetime == ChatMediaAccountLifetime.current && model.isSignedIn
+    }
     let message: LocalMessage
     let itemIndex: Int
     let itemCount: Int
@@ -1185,12 +1199,14 @@ struct SecureMediaBatchItemView: View {
     /// previously loaded UI state never services it. If the row no longer resolves, a note
     /// still playing under this identity is stopped rather than left presenting stale audio.
     private func refreshThenPlay() async {
+        guard mediaAccountIsCurrent else { return }
         guard !loader.isLoading else { return }
         if let localFile = await model.loadProtectedLocalMediaFile(
             messageID: message.id,
             conversationId: message.conversationId,
             itemIndex: itemIndex
         ) {
+            guard mediaAccountIsCurrent else { return }
             player.toggle(
                 fileURL: localFile.url,
                 id: voiceNoteID,
@@ -1211,10 +1227,11 @@ struct SecureMediaBatchItemView: View {
             conversationId: message.conversationId,
             itemIndex: itemIndex
         ) else {
-            if player.playingID == voiceNoteID { player.stop() }
+            if mediaAccountIsCurrent, player.playingID == voiceNoteID { player.stop() }
             return
         }
         if let fileURL = fresh.localFileURL {
+            guard mediaAccountIsCurrent else { return }
             player.toggle(
                 fileURL: fileURL,
                 id: voiceNoteID,
@@ -1222,6 +1239,7 @@ struct SecureMediaBatchItemView: View {
                 protectedOriginalLease: fresh.localFileLease
             )
         } else {
+            guard mediaAccountIsCurrent else { return }
             player.toggle(
                 data: fresh.data,
                 id: voiceNoteID,
@@ -1237,12 +1255,13 @@ struct SecureMediaBatchItemView: View {
     }
 
     private func refreshThenPresent() async {
-        guard !loader.isLoading else { return }
+        guard mediaAccountIsCurrent, !loader.isLoading else { return }
         if let localFile = await model.loadProtectedLocalMediaFile(
             messageID: message.id,
             conversationId: message.conversationId,
             itemIndex: itemIndex
         ) {
+            guard mediaAccountIsCurrent else { return }
             localPresentation = localFile
             if kind == .video {
                 playbackURL = localFile.url
@@ -1270,7 +1289,7 @@ struct SecureMediaBatchItemView: View {
     // Temp-file bytes, declared type, viewer branch, and suggested name all come from the same
     // fresh resolution — never from the item facts this bubble captured at render time.
     private func present(_ item: SecureMediaLoadPolicy.LoadedItem) {
-        guard playbackURL == nil, documentURL == nil else { return }
+        guard mediaAccountIsCurrent, playbackURL == nil, documentURL == nil else { return }
         let presentedKind = KitChatMediaKind(mediaType: item.mediaType)
         let url = item.localFileURL ?? (try? ChatMediaTempFiles.writeTemporaryFile(
             data: item.data,
@@ -1462,6 +1481,11 @@ struct VoiceNoteBubbleView: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.voiceNoteChatContext) private var chatContext
     @ObservedObject private var player = VoiceNotePlayer.shared
+    @State private var mediaAccountLifetime = ChatMediaAccountLifetime.current
+
+    private var mediaAccountIsCurrent: Bool {
+        mediaAccountLifetime == ChatMediaAccountLifetime.current && model.isSignedIn
+    }
     let message: LocalMessage
     let descriptor: KitMediaMessageDescriptor
     let displayKind: KitChatMediaKind
@@ -1609,12 +1633,14 @@ struct VoiceNoteBubbleView: View {
     /// previously loaded UI state never services it. If the row no longer resolves, a note
     /// still playing under this identity is stopped rather than left presenting stale audio.
     private func refreshThenToggle() async {
+        guard mediaAccountIsCurrent else { return }
         guard !loader.isLoading else { return }
         if let localFile = await model.loadProtectedLocalMediaFile(
             messageID: message.id,
             conversationId: message.conversationId,
             itemIndex: nil
         ) {
+            guard mediaAccountIsCurrent else { return }
             player.toggle(
                 fileURL: localFile.url,
                 id: message.id,
@@ -1636,10 +1662,11 @@ struct VoiceNoteBubbleView: View {
             conversationId: message.conversationId,
             itemIndex: nil
         ) else {
-            if isCurrent { player.stop() }
+            if mediaAccountIsCurrent, isCurrent { player.stop() }
             return
         }
         if let fileURL = fresh.localFileURL {
+            guard mediaAccountIsCurrent else { return }
             player.toggle(
                 fileURL: fileURL,
                 id: message.id,
@@ -1647,6 +1674,7 @@ struct VoiceNoteBubbleView: View {
                 protectedOriginalLease: fresh.localFileLease
             )
         } else {
+            guard mediaAccountIsCurrent else { return }
             player.toggle(data: fresh.data, id: message.id, context: playbackContext)
         }
         if player.playingID == message.id,
@@ -1669,8 +1697,7 @@ struct VoiceNoteBubbleView: View {
     }
 
     private func durationLabel(_ interval: TimeInterval) -> String {
-        let seconds = Int(interval.rounded())
-        return String(format: "%d:%02d", seconds / 60, seconds % 60)
+        ChatMediaPlaybackClock.label(interval)
     }
 }
 
@@ -2039,6 +2066,7 @@ private final class MediaVideoPlaybackController: ObservableObject {
     private var diagnosticMediaID: UUID?
     private var diagnosticIsOutgoing = false
     private var diagnosticByteCount: Int?
+    private let mediaAccountLifetime = ChatMediaAccountLifetime.current
     private let diagnosticProducerScope = LocalMediaPerformanceMonitor.shared.captureProducerScope()
     private var expectedDuration: Double?
     private var didRecordPlaybackStart = false
@@ -2053,6 +2081,7 @@ private final class MediaVideoPlaybackController: ObservableObject {
         mediaID: UUID,
         isOutgoing: Bool
     ) async {
+        guard mediaAccountLifetime == ChatMediaAccountLifetime.current else { return }
         if player != nil || isPreparing {
             guard sourceFileURL != fileURL else { return }
             stop()
@@ -2076,6 +2105,7 @@ private final class MediaVideoPlaybackController: ObservableObject {
             return
         }
         guard !Task.isCancelled,
+              mediaAccountLifetime == ChatMediaAccountLifetime.current,
               preparationID == identifier,
               sourceFileURL == fileURL
         else {
@@ -2091,6 +2121,7 @@ private final class MediaVideoPlaybackController: ObservableObject {
                 expectedByteCount: expectedByteCount
             )
             guard !Task.isCancelled,
+                  mediaAccountLifetime == ChatMediaAccountLifetime.current,
                   preparationID == identifier,
                   sourceFileURL == fileURL
             else {
@@ -2111,7 +2142,8 @@ private final class MediaVideoPlaybackController: ObservableObject {
                 queue: .main
             ) { [weak self] time in
                 Task { @MainActor in
-                    self?.recordPlaybackStartedIfNeeded(position: time.seconds)
+                    guard let self, self.playerItem === item else { return }
+                    self.recordPlaybackStartedIfNeeded(position: time.seconds)
                 }
             }
             observePlaybackItem(item)

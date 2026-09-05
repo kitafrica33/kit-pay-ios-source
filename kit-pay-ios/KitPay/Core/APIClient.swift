@@ -34,8 +34,10 @@ enum SecurityPreferencesAPIEndpoint: Equatable {
 actor APIClient {
     private struct SessionRefreshFlight {
         let id: UUID
-        let sessionID: String
+        let rejectedSession: SessionTokens
         let task: Task<SessionTokens, Error>
+
+        var sessionID: String { rejectedSession.sessionId }
     }
 
     static let shared = APIClient(sessionStore: .shared)
@@ -1667,7 +1669,7 @@ actor APIClient {
                 _ = try await refreshFlight.task.value
             } catch {
                 if SessionRefreshPolicy.isTerminal(error) {
-                    await invalidateSession(matching: refreshFlight.sessionID)
+                    await invalidateSession(ifCurrent: refreshFlight.rejectedSession)
                     throw APIClientError.signedOut
                 }
                 throw error
@@ -1683,7 +1685,7 @@ actor APIClient {
         }
         refreshFlight = SessionRefreshFlight(
             id: flightID,
-            sessionID: rejected.sessionId,
+            rejectedSession: rejected,
             task: task
         )
         defer {
@@ -1695,7 +1697,7 @@ actor APIClient {
             _ = try await task.value
         } catch {
             if SessionRefreshPolicy.isTerminal(error) {
-                await invalidateSession(matching: rejected.sessionId)
+                await invalidateSession(ifCurrent: rejected)
                 throw APIClientError.signedOut
             }
             throw error
@@ -1751,13 +1753,17 @@ actor APIClient {
         return updated
     }
 
-    private func invalidateSession(matching sessionID: String?) async {
-        guard let sessionID,
-              let current = await sessionStore.current(),
-              current.sessionId.caseInsensitiveCompare(sessionID) == .orderedSame
-        else { return }
-        try? await sessionStore.clear()
-        NotificationCenter.default.post(name: .kitSessionInvalidated, object: sessionID)
+    /// A rejected refresh owns only its exact credential generation. Checking the session and
+    /// clearing it in separate actor calls could erase a sign-in that won between those calls;
+    /// even a successful token rotation on the same session must survive a stale failure.
+    func invalidateSession(ifCurrent rejected: SessionTokens) async {
+        do {
+            guard try await sessionStore.clearIfCurrent(rejected) else { return }
+        } catch {
+            // A matched clear revokes in-memory authority before deleting Keychain records.
+            // The app must still conceal that expired account if persistent cleanup fails.
+        }
+        NotificationCenter.default.post(name: .kitSessionInvalidated, object: rejected.sessionId)
     }
 
     private func endpoint(_ path: String, queryItems: [URLQueryItem]) throws -> URL {

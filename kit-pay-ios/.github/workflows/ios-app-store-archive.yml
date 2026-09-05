@@ -4,6 +4,22 @@ run-name: Archive Kit Pay ${{ inputs.marketing_version }} (${{ inputs.build_numb
 on:
   workflow_dispatch:
     inputs:
+      publication_target:
+        description: Select the intended destination; TestFlight needs no marketing screenshots
+        required: true
+        default: testflight
+        type: choice
+        options: [testflight, app-store]
+      update_screenshots:
+        description: Prepare new store assets only when an App Store screenshot upload is needed
+        required: true
+        default: false
+        type: boolean
+      screenshot_artifact_id:
+        description: Optional retained screenshot artifact to verify and reuse; otherwise discover one
+        required: false
+        default: ""
+        type: string
       marketing_version:
         description: CFBundleShortVersionString (for example 1.0.16)
         required: true
@@ -12,7 +28,7 @@ on:
       build_number:
         description: Monotonically increasing integer CFBundleVersion
         required: true
-        default: "61"
+        default: "62"
         type: string
       confirmation:
         description: Type ARCHIVE_KIT_PAY_APP_STORE
@@ -21,23 +37,25 @@ on:
       corresponding_source_url:
         description: >-
           Exact public AGPL corresponding-source release URL for this build, for example
-          https://github.com/kitafrica33/kit-pay-ios-source/releases/tag/v1.0.16-build61 .
+          https://github.com/kitafrica33/kit-pay-ios-source/releases/tag/v1.0.16-build62 .
           The archive is rejected unless this tagged release is already publicly available.
         required: true
         type: string
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: kit-pay-ios-app-store-archive
   cancel-in-progress: false
 
 jobs:
-  quality:
-    name: Verify protected source and tests
-    runs-on: macos-latest
-    timeout-minutes: 45
+  preflight:
+    name: Check publication and credentials before native setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: production
     outputs:
       source_sha: ${{ steps.source.outputs.sha }}
       corresponding_source_url: ${{ steps.source.outputs.corresponding_source_url }}
@@ -53,16 +71,21 @@ jobs:
           MARKETING_VERSION: ${{ inputs.marketing_version }}
           BUILD_NUMBER: ${{ inputs.build_number }}
           CORRESPONDING_SOURCE_URL: ${{ inputs.corresponding_source_url }}
+          PUBLICATION_TARGET: ${{ inputs.publication_target }}
+          UPDATE_SCREENSHOTS: ${{ inputs.update_screenshots }}
         run: |
           set -euo pipefail
           test "$GITHUB_REF" = 'refs/heads/main'
           test "$CONFIRMATION" = 'ARCHIVE_KIT_PAY_APP_STORE'
+          case "$PUBLICATION_TARGET" in testflight|app-store) ;; *) exit 1 ;; esac
+          if [[ "$UPDATE_SCREENSHOTS" == 'true' ]]; then test "$PUBLICATION_TARGET" = 'app-store'; fi
           [[ "$MARKETING_VERSION" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]]
           [[ "$BUILD_NUMBER" =~ ^[1-9][0-9]*$ ]]
           (( ${#MARKETING_VERSION} <= 64 ))
           (( ${#BUILD_NUMBER} <= 18 ))
           expected_source_url="https://github.com/kitafrica33/kit-pay-ios-source/releases/tag/v${MARKETING_VERSION}-build${BUILD_NUMBER}"
           test "$CORRESPONDING_SOURCE_URL" = "$expected_source_url"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           test "$(git rev-parse HEAD)" = "$(git rev-parse refs/remotes/origin/main)"
           echo "sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
           echo "corresponding_source_url=$expected_source_url" >> "$GITHUB_OUTPUT"
@@ -86,74 +109,272 @@ jobs:
               --header 'Cookie:' \
               --output /dev/null \
               "$CORRESPONDING_SOURCE_URL"
-      - name: Select current Xcode
-        run: sudo xcode-select --switch /Applications/Xcode.app
-      - name: Install pinned native dependencies
-        run: pod install --repo-update
-      - name: Test release validators
-        run: python3 -m unittest discover -s .github/scripts/tests -p 'test_ios_signing.py'
-      - name: Test App Store screenshot evidence tools
-        run: python3 -m unittest discover -s .github/scripts/tests -p 'test_*screenshots.py'
-      # Simulator Keychain access still requires an application-identifier entitlement. Use
-      # ad-hoc signing (which needs no certificate or provisioning profile) just as protected CI
-      # does; an unsigned test host correctly receives errSecMissingEntitlement and would make
-      # every fail-closed Keychain-backed cache test reject otherwise-valid writes.
-      - name: Build and run unit tests without protected signing material
-        run: |
-          set -euo pipefail
-          xcodebuild -workspace KitPay.xcworkspace -scheme KitPay -list
-          device_id="$(
-            xcrun simctl list devices available -j \
-              | python3 -c 'import json,sys; data=json.load(sys.stdin)["devices"]; print(next(device["udid"] for devices in data.values() for device in devices if device.get("isAvailable") and device["name"].startswith("iPhone")))'
-          )"
-          xcodebuild \
-            -workspace KitPay.xcworkspace \
-            -scheme KitPay \
-            -configuration Debug \
-            -sdk iphonesimulator \
-            -destination "platform=iOS Simulator,id=${device_id}" \
-            -parallel-testing-enabled NO \
-            -only-testing:KitPayTests \
-            SWIFT_ENABLE_EXPLICIT_MODULES=NO \
-            CODE_SIGN_IDENTITY=- \
-            CODE_SIGN_STYLE=Manual \
-            PROVISIONING_PROFILE_SPECIFIER= \
-            DEVELOPMENT_TEAM= \
-            clean test
+      - name: Test shared source and release validators once
+        run: python3 -m unittest discover -s .github/scripts/tests
+      - name: Verify Apple publication and signing readiness
+        env:
+          IOS_BUNDLE_ID: africa.kit.pay.ios
+          MARKETING_VERSION: ${{ inputs.marketing_version }}
+          BUILD_NUMBER: ${{ inputs.build_number }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          CERTIFICATE_BASE64: ${{ secrets.IOS_DISTRIBUTION_CERTIFICATE_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.IOS_DISTRIBUTION_CERTIFICATE_PASSWORD }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+        run: python3 .github/scripts/ios_release_readiness.py --mode archive
 
   archive:
     name: Sign, verify, and retain App Store artifacts
-    needs: quality
-    runs-on: macos-latest
-    timeout-minutes: 90
+    needs: preflight
+    runs-on: macos-26
+    timeout-minutes: 100
     environment: production
     env:
       IOS_BUNDLE_ID: africa.kit.pay.ios
       IOS_SHARE_BUNDLE_ID: africa.kit.pay.ios.share
+      IOS_BROADCAST_BUNDLE_ID: africa.kit.pay.ios.broadcast
       IOS_APP_GROUP: group.africa.kit.pay.ios
       MARKETING_VERSION: ${{ inputs.marketing_version }}
       BUILD_NUMBER: ${{ inputs.build_number }}
-      CORRESPONDING_SOURCE_URL: ${{ needs.quality.outputs.corresponding_source_url }}
+      CORRESPONDING_SOURCE_URL: ${{ needs.preflight.outputs.corresponding_source_url }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Recheck exact quality-gated source
+      - name: Recheck exact selected source
         env:
-          EXPECTED_SHA: ${{ needs.quality.outputs.source_sha }}
+          EXPECTED_SHA: ${{ needs.preflight.outputs.source_sha }}
         run: |
           set -euo pipefail
           [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
           test "$GITHUB_SHA" = "$EXPECTED_SHA"
           test "$GITHUB_REF" = 'refs/heads/main'
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           test "$(git rev-parse HEAD)" = "$(git rev-parse refs/remotes/origin/main)"
           expected_source_url="https://github.com/kitafrica33/kit-pay-ios-source/releases/tag/v${MARKETING_VERSION}-build${BUILD_NUMBER}"
           test "$CORRESPONDING_SOURCE_URL" = "$expected_source_url"
-      - name: Select current Xcode
-        run: sudo xcode-select --switch /Applications/Xcode.app
-      - name: Install pinned native dependencies
-        run: pod install --repo-update
+      - name: Reuse valid store screenshots when an asset update is selected
+        id: screenshots
+        if: ${{ inputs.publication_target == 'app-store' && inputs.update_screenshots }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_ARTIFACT_ID: ${{ inputs.screenshot_artifact_id }}
+        run: |
+          python3 .github/scripts/ios_screenshot_reuse.py reuse \
+            --source-sha "$GITHUB_SHA" \
+            --candidate-artifact-id "$CANDIDATE_ARTIFACT_ID" \
+            --destination "$GITHUB_WORKSPACE/build/app-store-screenshots" \
+            --xcode-version $'Xcode 26.6\nBuild version 17F113' \
+            --runtime 'iOS 26.5 23F77' \
+            --receipt "$RUNNER_TEMP/KitPay-screenshot-reuse.json" \
+            --github-output "$GITHUB_OUTPUT"
+      - name: Select pinned Xcode
+        run: |
+          set -euo pipefail
+          sudo xcode-select --switch /Applications/Xcode_26.6.app
+          test "$(xcodebuild -version)" = $'Xcode 26.6\nBuild version 17F113'
+      - name: Restore verified dependency downloads
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/Library/Caches/org.signal.libsignal
+            ~/Library/Caches/org.swift.swiftpm
+          key: ios-downloads-${{ runner.os }}-${{ runner.arch }}-xcode26.6-${{ hashFiles('Podfile', '**/Package.resolved') }}
+      - name: Resolve pinned native dependencies once
+        run: bash .github/scripts/install_ios_dependencies.sh
+      - name: Require exact App Store device classes
+        if: ${{ inputs.publication_target == 'app-store' && inputs.update_screenshots && steps.screenshots.outputs.reused != 'true' }}
+        id: simulators
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import subprocess
+
+          def output(*arguments: str) -> dict:
+              return json.loads(subprocess.check_output(arguments, text=True))
+
+          expected_runtime = {
+              "identifier": "com.apple.CoreSimulator.SimRuntime.iOS-26-5",
+              "name": "iOS 26.5",
+              "version": "26.5",
+              "buildversion": "23F77",
+          }
+          runtimes = [
+              runtime
+              for runtime in output("xcrun", "simctl", "list", "runtimes", "available", "-j")["runtimes"]
+              if runtime.get("isAvailable", True)
+              and runtime.get("identifier") == expected_runtime["identifier"]
+          ]
+          if len(runtimes) != 1:
+              raise SystemExit(
+                  f"Required runtime {expected_runtime['identifier']} is unavailable or ambiguous"
+              )
+          runtime = runtimes[0]
+          for field in ("identifier", "name", "version", "buildversion"):
+              if runtime.get(field) != expected_runtime[field]:
+                  raise SystemExit(
+                      f"Required iOS runtime {field}={expected_runtime[field]!r}; "
+                      f"found {runtime.get(field)!r}"
+                  )
+          device_types = output("xcrun", "simctl", "list", "devicetypes", "-j")["devicetypes"]
+
+          def require(names: tuple[str, ...]) -> dict:
+              for name in names:
+                  for device_type in device_types:
+                      if device_type.get("name") == name:
+                          return device_type
+              available = ", ".join(sorted(item.get("name", "") for item in device_types))
+              raise SystemExit(f"Required device type {names} is unavailable. Available: {available}")
+
+          iphone = require(("iPhone 14 Plus",))
+          ipad = require((
+              "iPad Pro 13-inch (M4)",
+              "iPad Pro 13-inch (M4) (8GB)",
+              "iPad Pro 13-inch (M4) (16GB)",
+          ))
+          print(f"runtime_id={runtime['identifier']}")
+          print(f"runtime_name={runtime['name']} {runtime.get('buildversion', '')}".rstrip())
+          print(f"iphone_type={iphone['identifier']}")
+          print(f"ipad_type={ipad['identifier']}")
+          PY
+      - name: Create clean screenshot simulators
+        if: ${{ inputs.publication_target == 'app-store' && inputs.update_screenshots && steps.screenshots.outputs.reused != 'true' }}
+        id: devices
+        env:
+          RUNTIME_ID: ${{ steps.simulators.outputs.runtime_id }}
+          IPHONE_TYPE: ${{ steps.simulators.outputs.iphone_type }}
+          IPAD_TYPE: ${{ steps.simulators.outputs.ipad_type }}
+        run: |
+          set -euo pipefail
+          iphone_id="$(xcrun simctl create 'KitPay App Store iPhone' "$IPHONE_TYPE" "$RUNTIME_ID")"
+          ipad_id="$(xcrun simctl create 'KitPay App Store iPad' "$IPAD_TYPE" "$RUNTIME_ID")"
+          [[ "$iphone_id" =~ ^[0-9A-Fa-f-]{36}$ ]]
+          [[ "$ipad_id" =~ ^[0-9A-Fa-f-]{36}$ ]]
+          echo "iphone_id=$iphone_id" >> "$GITHUB_OUTPUT"
+          echo "ipad_id=$ipad_id" >> "$GITHUB_OUTPUT"
+      - name: Prepare native test Simulator
+        if: ${{ !inputs.update_screenshots || steps.screenshots.outputs.reused == 'true' }}
+        run: |
+          set -euo pipefail
+          DEVICE_ID="$(xcrun simctl list devices available -j | python3 -c 'import json,sys; data=json.load(sys.stdin)["devices"]; print(next(device["udid"] for devices in data.values() for device in devices if device.get("isAvailable") and device["name"].startswith("iPhone")))')"
+          # Pre-answer the Contacts prompt. AppModel asks for Contacts at launch and skips it only
+          # for unit-test hosts, which a UI test is not: the app runs as its own process, so the
+          # system alert appears and nothing in an unattended run taps it. While that alert is up
+          # the scene is not active, and the app — correctly — covers its sign-in form with
+          # "Authentication details hidden", so no UI test can ever get past launch.
+          xcrun simctl boot "$DEVICE_ID" >/dev/null 2>&1 || true
+          xcrun simctl bootstatus "$DEVICE_ID" -b >/dev/null 2>&1
+          xcrun simctl privacy "$DEVICE_ID" grant contacts africa.kit.pay.ios || true
+          echo "KITPAY_TEST_DEVICE_ID=$DEVICE_ID" >> "$GITHUB_ENV"
+      - name: Prepare the screenshot iPhone for all native checks
+        if: ${{ inputs.publication_target == 'app-store' && inputs.update_screenshots && steps.screenshots.outputs.reused != 'true' }}
+        env:
+          DEVICE_ID: ${{ steps.devices.outputs.iphone_id }}
+        run: |
+          set -euo pipefail
+          xcrun simctl boot "$DEVICE_ID"
+          xcrun simctl bootstatus "$DEVICE_ID" -b
+          xcrun simctl privacy "$DEVICE_ID" grant contacts africa.kit.pay.ios || true
+          echo "KITPAY_TEST_DEVICE_ID=$DEVICE_ID" >> "$GITHUB_ENV"
+      - name: Compile all native tests once
+        run: bash .github/scripts/ios_native_build.sh build
+      - name: Run native unit and UI checks from the same build
+        run: bash .github/scripts/ios_native_build.sh test
+      - name: Capture iPhone 6.5-inch screenshots
+        if: ${{ inputs.publication_target == 'app-store' && inputs.update_screenshots && steps.screenshots.outputs.reused != 'true' }}
+        env:
+          DEVICE_ID: ${{ steps.devices.outputs.iphone_id }}
+        run: |
+          set -euo pipefail
+          xcrun simctl bootstatus "$DEVICE_ID" -b
+          xcrun simctl ui "$DEVICE_ID" appearance light
+          xcrun simctl status_bar "$DEVICE_ID" override \
+            --time '9:41' \
+            --operatorName 'Kit' \
+            --wifiBars 3 \
+            --cellularBars 4 \
+            --batteryState charged \
+            --batteryLevel 100
+          KITPAY_TEST_DEVICE_ID="$DEVICE_ID" bash .github/scripts/ios_native_build.sh marketing-iphone
+          xcrun simctl shutdown "$DEVICE_ID"
+      - name: Capture iPad 13-inch screenshots
+        if: ${{ inputs.publication_target == 'app-store' && inputs.update_screenshots && steps.screenshots.outputs.reused != 'true' }}
+        env:
+          DEVICE_ID: ${{ steps.devices.outputs.ipad_id }}
+        run: |
+          set -euo pipefail
+          xcrun simctl boot "$DEVICE_ID"
+          xcrun simctl bootstatus "$DEVICE_ID" -b
+          xcrun simctl ui "$DEVICE_ID" appearance light
+          xcrun simctl status_bar "$DEVICE_ID" override \
+            --time '9:41' \
+            --wifiBars 3 \
+            --batteryState charged \
+            --batteryLevel 100
+          KITPAY_TEST_DEVICE_ID="$DEVICE_ID" bash .github/scripts/ios_native_build.sh marketing-ipad
+          xcrun simctl shutdown "$DEVICE_ID"
+      - name: Export, normalize, and validate screenshots
+        if: ${{ inputs.publication_target == 'app-store' && inputs.update_screenshots && steps.screenshots.outputs.reused != 'true' }}
+        env:
+          RUNTIME_NAME: ${{ steps.simulators.outputs.runtime_name }}
+        run: |
+          set -euo pipefail
+          evidence_root="$GITHUB_WORKSPACE/build/app-store-screenshots"
+          mkdir -p "$evidence_root/xcresult-exports"
+
+          xcrun xcresulttool export attachments \
+            --path "$RUNNER_TEMP/KitPay-iPhone.xcresult" \
+            --output-path "$evidence_root/xcresult-exports/iphone"
+          xcrun xcresulttool export attachments \
+            --path "$RUNNER_TEMP/KitPay-iPad.xcresult" \
+            --output-path "$evidence_root/xcresult-exports/ipad"
+
+          python3 .github/scripts/collect_xcresult_screenshots.py \
+            --export-directory "$evidence_root/xcresult-exports/iphone" \
+            --output-directory "$evidence_root/iphone-6.5/en-US"
+          python3 .github/scripts/collect_xcresult_screenshots.py \
+            --export-directory "$evidence_root/xcresult-exports/ipad" \
+            --output-directory "$evidence_root/ipad-13/en-US"
+
+          python3 .github/scripts/validate_app_store_screenshots.py \
+            --root "$evidence_root" \
+            --source-commit "$GITHUB_SHA" \
+            --locale en-US \
+            --iphone-runtime "$RUNTIME_NAME" \
+            --ipad-runtime "$RUNTIME_NAME" \
+            --manifest "$evidence_root/KitPay-App-Store-screenshots.json"
+          mv "$RUNNER_TEMP/KitPay-iPhone.xcresult" "$evidence_root/KitPay-iPhone.xcresult"
+          mv "$RUNNER_TEMP/KitPay-iPad.xcresult" "$evidence_root/KitPay-iPad.xcresult"
+          python3 .github/scripts/ios_screenshot_reuse.py stamp \
+            --source-sha "$GITHUB_SHA" \
+            --manifest "$evidence_root/KitPay-App-Store-screenshots.json" \
+            --xcode-version $'Xcode 26.6\nBuild version 17F113' \
+            --runtime 'iOS 26.5 23F77'
+      - name: Retain screenshots and test evidence
+        if: ${{ inputs.publication_target == 'app-store' && inputs.update_screenshots && steps.screenshots.outputs.reused != 'true' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kit-pay-app-store-screenshots-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            build/app-store-screenshots/iphone-6.5/en-US/*.png
+            build/app-store-screenshots/ipad-13/en-US/*.png
+            build/app-store-screenshots/KitPay-App-Store-screenshots.json
+            build/app-store-screenshots/KitPay-iPhone.xcresult
+            build/app-store-screenshots/KitPay-iPad.xcresult
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+      - name: Retain screenshot reuse evidence
+        if: ${{ inputs.publication_target == 'app-store' && inputs.update_screenshots }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kit-pay-ios-screenshot-selection-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/KitPay-screenshot-reuse.json
+          if-no-files-found: error
+          retention-days: 90
       - name: Import existing Apple distribution certificate
         env:
           APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
@@ -270,6 +491,14 @@ jobs:
             --register-bundle-name "Kit Pay Share" \
             --skip-icloud-capability \
             --skip-time-sensitive-notifications-capability
+          python3 .github/scripts/create_ios_app_store_profile.py \
+            --bundle-id "$IOS_BROADCAST_BUNDLE_ID" \
+            --certificate-der "$RUNNER_TEMP/kitpay-distribution-certificate.der" \
+            --profile-name "Kit Pay Screen Sharing App Store ${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --profile-output "$RUNNER_TEMP/kitpay-broadcast-app-store.mobileprovision" \
+            --register-bundle-name "Kit Pay Screen Sharing" \
+            --skip-icloud-capability \
+            --skip-time-sensitive-notifications-capability
 
       - name: Validate and install generated App Store profile
         env:
@@ -285,6 +514,9 @@ jobs:
           security cms -D \
             -i "$RUNNER_TEMP/kitpay-share-app-store.mobileprovision" \
             > "$RUNNER_TEMP/kitpay-share-profile.plist"
+          security cms -D \
+            -i "$RUNNER_TEMP/kitpay-broadcast-app-store.mobileprovision" \
+            > "$RUNNER_TEMP/kitpay-broadcast-profile.plist"
           python3 .github/scripts/prepare_ios_signing.py \
             --profile-plist "$RUNNER_TEMP/kitpay-profile.plist" \
             --certificate-der "$RUNNER_TEMP/kitpay-distribution-certificate.der" \
@@ -304,6 +536,15 @@ jobs:
             --app-group "$IOS_APP_GROUP" \
             --export-options "$RUNNER_TEMP/KitPayExportOptions.generated.plist" \
             --profile-uuid-output "$RUNNER_TEMP/kitpay-share-profile-uuid"
+          python3 .github/scripts/prepare_ios_signing.py \
+            --profile-plist "$RUNNER_TEMP/kitpay-broadcast-profile.plist" \
+            --certificate-der "$RUNNER_TEMP/kitpay-distribution-certificate.der" \
+            --bundle-id "$IOS_BROADCAST_BUNDLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --role extension \
+            --app-group "$IOS_APP_GROUP" \
+            --export-options "$RUNNER_TEMP/KitPayExportOptions.generated.plist" \
+            --profile-uuid-output "$RUNNER_TEMP/kitpay-broadcast-profile-uuid"
 
           profile_directory="$HOME/Library/MobileDevice/Provisioning Profiles"
           mkdir -p "$profile_directory"
@@ -315,6 +556,10 @@ jobs:
           install -m 600 \
             "$RUNNER_TEMP/kitpay-share-app-store.mobileprovision" \
             "$profile_directory/${share_profile_uuid}.mobileprovision"
+          broadcast_profile_uuid="$(<"$RUNNER_TEMP/kitpay-broadcast-profile-uuid")"
+          install -m 600 \
+            "$RUNNER_TEMP/kitpay-broadcast-app-store.mobileprovision" \
+            "$profile_directory/${broadcast_profile_uuid}.mobileprovision"
       - name: Archive and export signed IPA
         env:
           APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
@@ -322,6 +567,7 @@ jobs:
           set -euo pipefail
           profile_uuid="$(<"$RUNNER_TEMP/kitpay-profile-uuid")"
           share_profile_uuid="$(<"$RUNNER_TEMP/kitpay-share-profile-uuid")"
+          broadcast_profile_uuid="$(<"$RUNNER_TEMP/kitpay-broadcast-profile-uuid")"
           archive_path="$RUNNER_TEMP/KitPay.xcarchive"
           export_path="$GITHUB_WORKSPACE/build/app-store"
           mkdir -p "$export_path"
@@ -331,15 +577,18 @@ jobs:
             -scheme KitPay \
             -configuration Release \
             -destination 'generic/platform=iOS' \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/KitPayPackages" \
+            -disableAutomaticPackageResolution -onlyUsePackageVersionsFromResolvedFile \
             -archivePath "$archive_path" \
             KITPAY_APPLE_TEAM_ID="$APPLE_TEAM_ID" \
             KITPAY_PROFILE_UUID="$profile_uuid" \
             KITPAY_SHARE_PROFILE_UUID="$share_profile_uuid" \
+            KITPAY_BROADCAST_PROFILE_UUID="$broadcast_profile_uuid" \
             SWIFT_ENABLE_EXPLICIT_MODULES=NO \
             MARKETING_VERSION="$MARKETING_VERSION" \
             CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
             KIT_CORRESPONDING_SOURCE_URL="$CORRESPONDING_SOURCE_URL" \
-            clean archive
+            archive
 
           xcodebuild \
             -exportArchive \
@@ -383,10 +632,9 @@ jobs:
           codesign -d --entitlements :- "$app_path" \
             > "$RUNNER_TEMP/kitpay-signed-entitlements.plist" 2>/dev/null
 
-          # The share extension is the only other signed bundle in the IPA. Exactly one, at the
-          # only place iOS will load it from.
+          # Both independently signed extensions must be present at the only location iOS loads.
           plugin_count="$(find "$app_path/PlugIns" -maxdepth 1 -type d -name '*.appex' | wc -l | tr -d ' ')"
-          test "$plugin_count" = '1'
+          test "$plugin_count" = '2'
           extension_path="$app_path/PlugIns/KitPayShare.appex"
           test -d "$extension_path"
           test -s "$extension_path/embedded.mobileprovision"
@@ -395,9 +643,18 @@ jobs:
             > "$RUNNER_TEMP/kitpay-share-embedded-profile.plist"
           codesign -d --entitlements :- "$extension_path" \
             > "$RUNNER_TEMP/kitpay-share-signed-entitlements.plist" 2>/dev/null
+          broadcast_extension_path="$app_path/PlugIns/KitPayBroadcast.appex"
+          test -d "$broadcast_extension_path"
+          test -s "$broadcast_extension_path/embedded.mobileprovision"
+          security cms -D \
+            -i "$broadcast_extension_path/embedded.mobileprovision" \
+            > "$RUNNER_TEMP/kitpay-broadcast-embedded-profile.plist"
+          codesign -d --entitlements :- "$broadcast_extension_path" \
+            > "$RUNNER_TEMP/kitpay-broadcast-signed-entitlements.plist" 2>/dev/null
 
           profile_uuid="$(<"$RUNNER_TEMP/kitpay-profile-uuid")"
           share_profile_uuid="$(<"$RUNNER_TEMP/kitpay-share-profile-uuid")"
+          broadcast_profile_uuid="$(<"$RUNNER_TEMP/kitpay-broadcast-profile-uuid")"
           python3 .github/scripts/verify_ios_archive.py \
             --app "$app_path" \
             --extension "$extension_path" \
@@ -405,6 +662,11 @@ jobs:
             --extension-profile-plist "$RUNNER_TEMP/kitpay-share-embedded-profile.plist" \
             --extension-entitlements-plist "$RUNNER_TEMP/kitpay-share-signed-entitlements.plist" \
             --expected-extension-profile-uuid "$share_profile_uuid" \
+            --broadcast-extension "$broadcast_extension_path" \
+            --broadcast-bundle-id "$IOS_BROADCAST_BUNDLE_ID" \
+            --broadcast-profile-plist "$RUNNER_TEMP/kitpay-broadcast-embedded-profile.plist" \
+            --broadcast-entitlements-plist "$RUNNER_TEMP/kitpay-broadcast-signed-entitlements.plist" \
+            --expected-broadcast-profile-uuid "$broadcast_profile_uuid" \
             --app-group "$IOS_APP_GROUP" \
             --embedded-profile-plist "$RUNNER_TEMP/kitpay-embedded-profile.plist" \
             --signed-entitlements-plist "$RUNNER_TEMP/kitpay-signed-entitlements.plist" \
@@ -439,7 +701,8 @@ jobs:
           set +e
           for uuid_file in \
             "$RUNNER_TEMP/kitpay-profile-uuid" \
-            "$RUNNER_TEMP/kitpay-share-profile-uuid"; do
+            "$RUNNER_TEMP/kitpay-share-profile-uuid" \
+            "$RUNNER_TEMP/kitpay-broadcast-profile-uuid"; do
             if [[ -f "$uuid_file" ]]; then
               profile_uuid="$(<"$uuid_file")"
               if [[ "$profile_uuid" =~ ^[0-9A-Fa-f-]{36}$ ]]; then
@@ -457,14 +720,59 @@ jobs:
             "$RUNNER_TEMP/kitpay-distribution-certificate.der" \
             "$RUNNER_TEMP/kitpay-app-store.mobileprovision" \
             "$RUNNER_TEMP/kitpay-share-app-store.mobileprovision" \
+            "$RUNNER_TEMP/kitpay-broadcast-app-store.mobileprovision" \
             "$RUNNER_TEMP/kitpay-profile.plist" \
             "$RUNNER_TEMP/kitpay-share-profile.plist" \
+            "$RUNNER_TEMP/kitpay-broadcast-profile.plist" \
             "$RUNNER_TEMP/kitpay-embedded-profile.plist" \
             "$RUNNER_TEMP/kitpay-share-embedded-profile.plist" \
+            "$RUNNER_TEMP/kitpay-broadcast-embedded-profile.plist" \
             "$RUNNER_TEMP/kitpay-signed-entitlements.plist" \
             "$RUNNER_TEMP/kitpay-share-signed-entitlements.plist" \
+            "$RUNNER_TEMP/kitpay-broadcast-signed-entitlements.plist" \
             "$RUNNER_TEMP/kitpay-profile-uuid" \
             "$RUNNER_TEMP/kitpay-share-profile-uuid" \
+            "$RUNNER_TEMP/kitpay-broadcast-profile-uuid" \
             "$RUNNER_TEMP/kitpay-original-keychains.txt" \
             "$RUNNER_TEMP/kitpay-code-signing-identities.txt" \
             "$RUNNER_TEMP/KitPayExportOptions.generated.plist"
+
+      - name: Retain native quality evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kit-pay-ios-quality-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/KitPay-opening-camera.xcresult
+            ${{ runner.temp }}/KitPay-quality.xcresult
+            ${{ runner.temp }}/KitPay-camera-pan.log
+          if-no-files-found: warn
+          retention-days: 30
+          compression-level: 0
+
+      - name: Retain native UI failure evidence
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kit-pay-app-store-screenshot-failure-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/KitPay-iPhone.xcresult
+            ${{ runner.temp }}/KitPay-iPad.xcresult
+            build/app-store-screenshots/
+          if-no-files-found: warn
+          retention-days: 30
+          compression-level: 0
+
+      - name: Remove screenshot simulators
+        if: ${{ always() }}
+        env:
+          IPHONE_ID: ${{ steps.devices.outputs.iphone_id }}
+          IPAD_ID: ${{ steps.devices.outputs.ipad_id }}
+        run: |
+          set +e
+          for device_id in "$IPHONE_ID" "$IPAD_ID"; do
+            if [[ "$device_id" =~ ^[0-9A-Fa-f-]{36}$ ]]; then
+              xcrun simctl shutdown "$device_id" 2>/dev/null
+              xcrun simctl delete "$device_id" 2>/dev/null
+            fi
+          done

@@ -241,7 +241,8 @@ final class CallOverlayWindowController {
         let coordinator = CallMediaCoordinator.shared
         var style: CallOverlaySurfaceStyle?
         if presenter.showsSurface, coordinator.activeCall != nil, window != nil {
-            style = coordinator.callCarriesVideo ? .videoTile : .audioStrip
+            style = (coordinator.activeCall?.video == true || coordinator.media.isCameraEnabled
+                || coordinator.media.remoteVideoTrack != nil) ? .videoTile : .audioStrip
         }
         if presenter.surfaceStyle != style {
             presenter.surfaceStyle = style
@@ -322,41 +323,44 @@ private struct CallOverlayRootView: View {
     @ObservedObject var media: LiveKitCallMediaTransport
 
     var body: some View {
-        Group {
-            if presenter.showsSurface {
-                MinimizedCallView(
-                    coordinator: coordinator,
-                    position: $presenter.videoTilePosition,
-                    tuckedEdge: $presenter.videoTileTuckedEdge,
-                    reopen: { presenter.reopen() },
-                    onSurfaceFrameChange: { frame in
-                        presenter.hitRegion.frame = frame
-                    }
-                )
-            } else {
-                // The window stays attached so Picture in Picture keeps a live source view, but it
-                // must draw (almost) nothing while the full-screen call UI is what the user sees.
-                // AVKit refuses to start Picture in Picture from a source view that renders no
-                // video, so a video call keeps a minimal live renderer mounted in a corner. It is
-                // never interactive: the window's hit region is `.zero` in this state, and hit
-                // testing is disabled besides.
-                ZStack(alignment: .bottomTrailing) {
-                    Color.clear
-                    if coordinator.callCarriesVideo,
-                       let remoteTrack = media.remoteVideoTrack {
-                        SwiftUIVideoView(remoteTrack, layoutMode: .fill, mirrorMode: .off)
-                            .frame(width: 2, height: 2)
-                            .opacity(0.02)
-                            .allowsHitTesting(false)
-                            .accessibilityHidden(true)
-                            .padding(2)
+        GeometryReader { safeAreaGeometry in
+            Group {
+                if presenter.showsSurface {
+                    MinimizedCallView(
+                        coordinator: coordinator,
+                        position: $presenter.videoTilePosition,
+                        tuckedEdge: $presenter.videoTileTuckedEdge,
+                        windowSafeAreaInsets: safeAreaGeometry.safeAreaInsets,
+                        reopen: { presenter.reopen() },
+                        onSurfaceFrameChange: { frame in
+                            presenter.hitRegion.frame = frame
+                        }
+                    )
+                } else {
+                    // The window stays attached so Picture in Picture keeps a live source view, but it
+                    // must draw (almost) nothing while the full-screen call UI is what the user sees.
+                    // AVKit refuses to start Picture in Picture from a source view that renders no
+                    // video, so a video call keeps a minimal live renderer mounted in a corner. It is
+                    // never interactive: the window's hit region is `.zero` in this state, and hit
+                    // testing is disabled besides.
+                    ZStack(alignment: .bottomTrailing) {
+                        Color.clear
+                        if coordinator.callCarriesVideo,
+                           let remoteTrack = media.remoteVideoTrack {
+                            SwiftUIVideoView(remoteTrack, layoutMode: media.remoteVideoIsScreenShare ? .fit : .fill, mirrorMode: .off)
+                                .frame(width: 2, height: 2)
+                                .opacity(0.02)
+                                .allowsHitTesting(false)
+                                .accessibilityHidden(true)
+                                .padding(2)
+                        }
                     }
                 }
             }
+            // The bubble positions itself against the full screen, including the areas behind the
+            // status bar and home indicator, exactly as it did inside the root overlay.
+            .ignoresSafeArea()
         }
-        // The bubble positions itself against the full screen, including the areas behind the
-        // status bar and home indicator, exactly as it did inside the root overlay.
-        .ignoresSafeArea()
     }
 }
 
@@ -540,7 +544,7 @@ private struct CallPictureInPictureContent: View {
         ZStack {
             Color.black
             if let remoteTrack = media.remoteVideoTrack {
-                SwiftUIVideoView(remoteTrack, layoutMode: .fill, mirrorMode: .off)
+                SwiftUIVideoView(remoteTrack, layoutMode: media.remoteVideoIsScreenShare ? .fit : .fill, mirrorMode: .off)
             } else if let call = coordinator.activeCall {
                 RemoteAvatarView(
                     name: call.participantName,

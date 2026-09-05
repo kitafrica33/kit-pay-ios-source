@@ -245,6 +245,7 @@ struct MessagesView: View {
         // in long histories (the old per-row scan was the source of the delayed-tap defect).
         let lastByConversation = latestMessagesByConversation()
         let visibleConversations = conversations
+        let contactIndex = ConversationContactDirectoryIndex(model.contactDirectory)
         let resolvedActiveCallConversationID = model.resolvedConversationID(
             forActiveCall: callMedia.activeCall
         )
@@ -296,7 +297,7 @@ struct MessagesView: View {
                             let identity = ConversationContactPresentationPolicy.presentation(
                                 for: conversation,
                                 currentUserID: model.profile?.id,
-                                contacts: model.contactDirectory
+                                directory: contactIndex
                             )
                             let context = ChatRowContext(
                                 lastMessage: lastByConversation[conversation.id],
@@ -1132,7 +1133,7 @@ private struct MessageGlobalSearchView: View {
 
         var seenRecipientIDs: Set<String> = []
         let communicationContacts = model.communicationContactDirectory
-        let presentationContacts = model.contactDirectory
+        let presentationContacts = ConversationContactDirectoryIndex(model.contactDirectory)
         let contactSections = ContactRecipientDirectory.sectionsFromOrdered(
             communicationContacts,
             query: searchQuery,
@@ -1162,7 +1163,7 @@ private struct MessageGlobalSearchView: View {
                 let identity = ConversationContactPresentationPolicy.presentation(
                     for: conversation,
                     currentUserID: model.profile?.id,
-                    contacts: presentationContacts
+                    directory: presentationContacts
                 )
                 let lastMessage = latestMessageByConversation[conversation.id]
                 let matchesIdentity = globalSearchMatches(
@@ -1207,7 +1208,7 @@ private struct MessageGlobalSearchView: View {
                 let identity = ConversationContactPresentationPolicy.presentation(
                     for: conversation,
                     currentUserID: model.profile?.id,
-                    contacts: presentationContacts
+                    directory: presentationContacts
                 )
                 return MessageGlobalMessageHit(
                     message: message,
@@ -1529,14 +1530,14 @@ struct ConversationView: View {
     /// appeared. `defaultScrollAnchor` alone runs before restored messages and hydrated payment
     /// cards have necessarily reached their final size.
     @State private var latestPositionPolicy = ConversationLatestPositionPolicy()
-    @State private var deferredLatestPositionRequest = 0
     @State private var cameraPullProgress: CGFloat = 0
     @State private var cameraPull = ConversationCameraPullGesture()
+    /// Captured from the native scroll view at pan begin. SwiftUI preferences may still be zero
+    /// or stale even after the timeline is visible; they cannot admit or reject a native pull.
+    @State private var cameraPullGeometry: ConversationCameraPullGeometry?
     /// Whether a finger is currently on the thread, as reported by the scroll view itself.
     /// Only the scroll view knows this once it has taken the drag over, which it always does.
     @State private var isConversationScrollInteracting = false
-    @State private var conversationContentHeight: CGFloat = 0
-    @State private var conversationContentMaxY: CGFloat = 0
     @State private var conversationViewportHeight: CGFloat = 0
     @State private var pendingScrollTargetMessageID: UUID?
     /// A notification, global result, or floating player can address one exact local message.
@@ -1613,6 +1614,12 @@ struct ConversationView: View {
 
     private var messages: [LocalMessage] { correctedProjection.messages }
 
+    /// This exact mounted recorder is revoked synchronously at account teardown. Retained
+    /// composer tasks must prove their original lifetime before adopting any new bytes.
+    private var composerAccountIsCurrent: Bool {
+        !voiceRecorder.isInvalidated && model.isSignedIn
+    }
+
     /// The thread as it currently reads, with every correction already applied.
     ///
     /// Applying the fold here rather than at each bubble is what keeps the whole screen honest
@@ -1686,17 +1693,25 @@ struct ConversationView: View {
     }
 
     private var pendingScheduledPayments: [ScheduledPaymentDTO] {
-        chatScheduledPayments.items.filter {
-            !terminalScheduledPaymentIDs.contains($0.id.lowercased())
+        let terminalIDs = terminalScheduledPaymentIDs
+        return chatScheduledPayments.items.filter {
+            !terminalIDs.contains($0.id.lowercased())
         }
     }
 
-    private var scheduledPaymentLoadID: String {
-        let terminal = terminalScheduledPaymentIDs.sorted().joined(separator: ",")
+    private func scheduledPaymentLoadID(in timeline: [ConversationTimelineItem]) -> String {
+        let terminal = Set(timeline.compactMap { item -> String? in
+            guard case .scheduledPayment(_, let descriptor) = item else { return nil }
+            return descriptor.scheduledPaymentID
+        }).sorted().joined(separator: ",")
         return "\(model.isOnline):\(model.financialAccessGranted):\(scheduledPaymentsEnabled):\(conversation.id.lowercased()):\(terminal)"
     }
 
     private var timelineItems: [ConversationTimelineItem] {
+        makeTimelineItems(messages: messages)
+    }
+
+    private func makeTimelineItems(messages: [LocalMessage]) -> [ConversationTimelineItem] {
         ConversationTimelinePolicy.items(
             for: currentConversation,
             allConversations: model.state.conversations,
@@ -1812,13 +1827,18 @@ struct ConversationView: View {
 
     private var cameraPullIsEligible: Bool {
         !isReadOnlyAppReviewPreview && conversationMessagingAvailable
+            && !timelineItems.isEmpty
+            && scenePhase == .active
+            && !showCameraCapture && !showVideoNoteCamera
+            && galleryTarget == nil && editorSession == nil
+            && !showContactProfile && !showGroupProfile && !showGroupMediaLibrary
+            && pendingScrollTargetMessageID == nil
             && ConversationCameraPullPolicy.isEligible(
-            contentHeight: conversationContentHeight,
-            viewportHeight: conversationViewportHeight,
+            geometry: cameraPullGeometry,
             isSelectingMessages: isSelectingMessages,
             isSearchingMessages: isSearchingMessages,
-            isRecordingVoiceNote: voiceRecorder.isRecording,
-            isComposerFocused: isComposerFocused
+            hasVoiceNoteDraft: voiceRecorder.hasDraft,
+            isEditingMessage: editTarget != nil
         )
     }
 
@@ -1843,9 +1863,11 @@ struct ConversationView: View {
         paymentRequestEvents.filter { !$0.message.isOutgoing }
     }
 
-    private var incomingPaymentRequestLoadID: String {
-        let descriptorMessageIDs = paymentRequestEvents.map {
-            $0.message.id.uuidString.lowercased()
+    private func incomingPaymentRequestLoadID(in timeline: [ConversationTimelineItem]) -> String {
+        let descriptorMessageIDs = timeline.compactMap { item -> String? in
+            guard case .payment(let message, let descriptor) = item,
+                  descriptor.isRequest else { return nil }
+            return message.id.uuidString.lowercased()
         }
         return "\(model.isOnline):\(model.financialAccessGranted):\(descriptorMessageIDs.joined(separator: ","))"
     }
@@ -1867,8 +1889,8 @@ struct ConversationView: View {
     /// Reloads transfer-acceptance authority whenever the set of transfer events changes (a new
     /// transfer arriving, a RESPONSE landing — which is exactly when a pending bubble's buttons
     /// go stale), capabilities arrive, or connectivity returns.
-    private var transferEventLoadID: String {
-        let transferMessageIDs = timelineItems.compactMap { item -> String? in
+    private func transferEventLoadID(in timeline: [ConversationTimelineItem]) -> String {
+        let transferMessageIDs = timeline.compactMap { item -> String? in
             guard case .payment(let message, let descriptor) = item,
                   descriptor.action.isTransferEvent
             else { return nil }
@@ -1909,8 +1931,8 @@ struct ConversationView: View {
 
     /// Re-reads group payment authority whenever a payment is announced or answered — which is
     /// exactly when a card's buttons and counts go stale — or when connectivity returns.
-    private var groupPaymentLoadID: String {
-        let eventIDs = timelineItems.compactMap { item -> String? in
+    private func groupPaymentLoadID(in timeline: [ConversationTimelineItem]) -> String {
+        let eventIDs = timeline.compactMap { item -> String? in
             switch item {
             case .groupPayment(let message, _), .groupPaymentEvent(let message, _):
                 return message.id.uuidString.lowercased()
@@ -1933,9 +1955,9 @@ struct ConversationView: View {
             && ScheduledGroupPaymentPolicy(capabilities: model.capabilities).enabled
     }
 
-    private var scheduledGroupPaymentLoadID: String {
+    private func scheduledGroupPaymentLoadID(in timeline: [ConversationTimelineItem]) -> String {
         let known = chatScheduledGroupPayments.items.map(\.id).sorted().joined(separator: ",")
-        let terminal = timelineItems.compactMap { item -> String? in
+        let terminal = timeline.compactMap { item -> String? in
             switch item {
             case .scheduledGroupPaymentOutcome(let message, _),
                  .groupPayment(let message, _):
@@ -1974,8 +1996,8 @@ struct ConversationView: View {
         }
     }
 
-    private var groupPaymentRequestLoadID: String {
-        let eventIDs = timelineItems.compactMap { item -> String? in
+    private func groupPaymentRequestLoadID(in timeline: [ConversationTimelineItem]) -> String {
+        let eventIDs = timeline.compactMap { item -> String? in
             switch item {
             case .groupPaymentRequest(let message, _),
                  .groupPaymentRequestEvent(let message, _):
@@ -2627,6 +2649,7 @@ struct ConversationView: View {
         // and re-trigger on every keystroke.
         let projection = correctedProjection
         let timelineSnapshot = projection.messages
+        let renderedTimeline = makeTimelineItems(messages: timelineSnapshot)
         let correctionDates = projection.editedAt
         let albumMembership: [UUID: ChatMediaAlbumMembership] =
             isSelectingMessages ? [:] : ChatMediaAlbumPolicy.membership(for: timelineSnapshot)
@@ -2641,7 +2664,7 @@ struct ConversationView: View {
         // Rows that render nothing are excluded, so a silent event by another member cannot make
         // the same person be introduced twice in a row.
         let namedSenderMessageIDs = ConversationSenderRunPolicy.namedMessageIDs(
-            in: timelineItems,
+            in: renderedTimeline,
             isGroup: isGroupConversation,
             isRendered: { message in
                 rendersAsBubble(
@@ -2674,7 +2697,7 @@ struct ConversationView: View {
                         if let transferError = chatTransfers.errorMessage {
                             paymentErrorBanner(transferError)
                         }
-                        ForEach(timelineItems) { item in
+                        ForEach(renderedTimeline) { item in
                             switch item {
                             case .message(let message):
                                 if let systemEvent = KitSystemMessage.parse(message.body) {
@@ -2809,25 +2832,57 @@ struct ConversationView: View {
                         }
                         Color.clear
                             .frame(height: 1)
+                            .padding(.bottom, 12)
                             .id(ConversationScrollAnchor.bottom)
                     }
                     .padding(.horizontal, 14)
-                    .padding(.vertical, 12)
+                    .padding(.top, 12)
                     .background(
                         GeometryReader { contentGeometry in
                             Color.clear.preference(
                                 key: ConversationScrollMetricsKey.self,
                                 value: ConversationScrollMetrics(
-                                    contentHeight: contentGeometry.size.height,
                                     contentMaxY: contentGeometry
                                         .frame(in: .named("conversationScroll")).maxY
                                 )
                             )
                         }
                     )
+                    .background(
+                        ConversationScrollPanReporter(
+                            conversationID: conversation.id,
+                            shouldKeepOpeningAtBottom: {
+                                latestPositionPolicy.shouldApplyNativeOpeningAnchor(
+                                    conversationID: conversation.id,
+                                    hasTimelineContent: !renderedTimeline.isEmpty,
+                                    hasExplicitTarget: pendingScrollTargetMessageID != nil,
+                                    isInteracting: isConversationScrollInteracting
+                                )
+                            },
+                            shouldFollowLayoutChanges: {
+                                pendingScrollTargetMessageID == nil
+                                    && !isConversationScrollInteracting
+                            },
+                            onOpeningPositioned: {
+                                guard !latestPositionPolicy.hasPositioned(
+                                    conversationID: conversation.id
+                                ) else { return }
+                                _ = latestPositionPolicy.claimOpening(
+                                    conversationID: conversation.id,
+                                    hasTimelineContent: !renderedTimeline.isEmpty
+                                )
+                            },
+                            onBegin: beginCameraPull,
+                            onProgress: updateCameraPull,
+                            onCancel: cancelCameraPull,
+                            onEnd: finishCameraPull
+                        )
+                    )
                 }
                 .coordinateSpace(name: "conversationScroll")
+                .accessibilityIdentifier("conversation-timeline")
                 .defaultScrollAnchor(.bottom)
+                .scrollBounceBehavior(.always)
                 .scrollDismissesKeyboard(.interactively)
                 .background(
                     GeometryReader { viewportGeometry in
@@ -2843,137 +2898,28 @@ struct ConversationView: View {
                 .onPreferenceChange(ConversationScrollMetricsKey.self) { metrics in
                     handleScrollMetrics(metrics)
                 }
-                // Where "the finger came up" comes from. On iOS 18 and later the scroll view says
-                // so itself; below that, the drag gesture is the only thing there is.
-                .modifier(
-                    ConversationScrollInteractionReporter(
-                        onInteractingChange: { interacting in
-                            isConversationScrollInteracting = interacting
-                            if interacting {
-                                latestPositionPolicy.endOpeningSettling(
-                                    conversationID: conversation.id
-                                )
-                            }
-                        },
-                        onRelease: releaseCameraPull
-                    )
-                )
-                // Runs alongside the scroll rather than competing with it, and the minimum distance
-                // keeps taps and the bubbles' own long-press menus out of it entirely. Kept for
-                // iOS 17, where nothing else reports the release at all.
-                .simultaneousGesture(
-                    DragGesture(minimumDistance: 12)
-                        .onChanged { _ in
-                            // iOS 17 has no ScrollPhase callback. The row-level reply gesture and
-                            // the ScrollView may both observe this touch, so end opening anchoring
-                            // as soon as either a slow vertical read or a horizontal reply drag
-                            // becomes a real gesture. This prevents late media hydration from
-                            // pulling the reader back to the newest message.
-                            latestPositionPolicy.endOpeningSettling(
-                                conversationID: conversation.id
-                            )
-                            updateCameraPullArming()
-                        }
-                        .onEnded { _ in releaseCameraPull() }
-                )
-                .task(id: openingPositionTaskID) {
-                    guard ConversationLatestPositionPolicy.openingLayoutIsReady(
-                        hasTimelineContent: !timelineItems.isEmpty,
-                        contentHeight: conversationContentHeight,
-                        viewportHeight: conversationViewportHeight
-                    ) else { return }
-                    // Geometry has now confirmed both the viewport and the LazyVStack's content,
-                    // so the bottom anchor exists. Claiming before that layout pass made an early
-                    // no-op permanent: the thread looked caught between offsets and the first
-                    // upward drag only started working after a compensating downward drag.
-                    await Task.yield()
-                    guard !Task.isCancelled,
-                          pendingScrollTargetMessageID == nil,
-                          latestPositionPolicy.claimOpening(
-                              conversationID: conversation.id,
-                              hasTimelineContent: !timelineItems.isEmpty
-                          )
-                    else { return }
-                    scrollToBottom(using: scrollProxy, animated: false)
-                    // A second transaction after the first offset change lets SwiftUI settle the
-                    // lazy rows and composer inset. It is non-animated and only occurs on entry.
-                    await Task.yield()
-                    guard !Task.isCancelled,
-                          latestPositionPolicy.hasPositioned(conversationID: conversation.id)
-                    else { return }
-                    scrollToBottom(using: scrollProxy, animated: false)
+                .onChange(of: cameraPullIsEligible) { _, eligible in
+                    if !eligible { cancelCameraPull() }
                 }
-                .onChange(of: timelineItems.last?.id) { _, _ in
-                    if latestPositionPolicy.shouldMaintainOpeningAnchor(
-                        conversationID: conversation.id,
-                        hasExplicitTarget: pendingScrollTargetMessageID != nil,
-                        isInteracting: isConversationScrollInteracting
-                    ) {
-                        scrollToBottom(using: scrollProxy, animated: false)
-                        return
-                    }
-                    // A message the user just sent always snaps to the latest position; an
-                    // incoming message must never yank them away from what they are reading.
-                    if ConversationLatestPositionPolicy.shouldFollowTimelineChange(
+                .onChange(of: conversation.id) { _, _ in cancelCameraPull() }
+                .onChange(of: renderedTimeline.last?.id) { _, _ in
+                    // Own sends explicitly jump to latest. Incoming rows and hydrated cards
+                    // follow only from a previously near-bottom native geometry/offset sample.
+                    if ConversationLatestPositionPolicy.shouldFollowOutgoingMessage(
                         hasPositionedCurrentConversation: latestPositionPolicy.hasPositioned(
                             conversationID: conversation.id
                         ),
                         latestMessageIsOutgoing: latestTimelineMessageIsOutgoing,
-                        isNearLatest: isNearLatestMessage
+                        isInteracting: isConversationScrollInteracting,
+                        hasExplicitTarget: pendingScrollTargetMessageID != nil
                     ) {
                         scrollToBottom(using: scrollProxy)
                     }
                 }
-                .onChange(of: chatGroupPayments.payments) { previous, updated in
-                    guard previous != updated,
-                          ConversationLatestPositionPolicy.shouldFollowPaymentHydration(
-                              hasPositionedCurrentConversation: latestPositionPolicy.hasPositioned(
-                                  conversationID: conversation.id
-                              ),
-                              isNearLatest: isNearLatestMessage,
-                              isInteracting: isConversationScrollInteracting
-                          )
-                    else { return }
-                    // The authoritative share list expands an existing card without changing its
-                    // timeline id. Re-address the bottom after that layout pass so it does not
-                    // grow over the composer or leave the thread feeling stuck.
-                    deferredLatestPositionRequest &+= 1
-                }
-                .onChange(of: chatGroupPaymentRequests.requests) { previous, updated in
-                    guard previous != updated,
-                          ConversationLatestPositionPolicy.shouldFollowPaymentHydration(
-                              hasPositionedCurrentConversation: latestPositionPolicy.hasPositioned(
-                                  conversationID: conversation.id
-                              ),
-                              isNearLatest: isNearLatestMessage,
-                              isInteracting: isConversationScrollInteracting
-                          )
-                    else { return }
-                    deferredLatestPositionRequest &+= 1
-                }
-                .task(id: deferredLatestPositionRequest) {
-                    guard deferredLatestPositionRequest > 0 else { return }
-                    await Task.yield()
-                    guard !Task.isCancelled else { return }
-                    let maintainsOpening = latestPositionPolicy.shouldMaintainOpeningAnchor(
-                        conversationID: conversation.id,
-                        hasExplicitTarget: pendingScrollTargetMessageID != nil,
-                        isInteracting: isConversationScrollInteracting
-                    )
-                    guard maintainsOpening
-                        || ConversationLatestPositionPolicy.shouldFollowPaymentHydration(
-                              hasPositionedCurrentConversation: latestPositionPolicy.hasPositioned(
-                                  conversationID: conversation.id
-                              ),
-                              isNearLatest: isNearLatestMessage,
-                              isInteracting: isConversationScrollInteracting
-                          )
-                    else { return }
-                    scrollToBottom(using: scrollProxy, animated: false)
-                }
                 .onChange(of: pendingScrollTargetMessageID) { _, target in
                     guard let target else { return }
-                    latestPositionPolicy.endOpeningSettling(conversationID: conversation.id)
+                    cancelCameraPull()
+                    latestPositionPolicy.userDidChoosePosition(conversationID: conversation.id)
                     withAnimation(.easeOut(duration: 0.25)) {
                         scrollProxy.scrollTo(
                             "message:\(target.uuidString.lowercased())",
@@ -3793,6 +3739,9 @@ struct ConversationView: View {
     }
 
     private var conversationTasks: some View {
+        // Task identities share this render's timeline instead of independently repeating its
+        // edit fold, descriptor parsing, call ownership matching and chronological sort.
+        let taskTimeline = timelineItems
         let draftPersistenceTaskKey = ConversationDraftPersistenceTaskKey(
             conversationID: conversation.id,
             body: draft,
@@ -3806,7 +3755,7 @@ struct ConversationView: View {
             guard !isReadOnlyAppReviewPreview else { return }
             await model.markConversationRead(conversation.id)
         }
-        .task(id: incomingPaymentRequestLoadID) {
+        .task(id: incomingPaymentRequestLoadID(in: taskTimeline)) {
             guard !isReadOnlyAppReviewPreview,
                   model.financialAccessGranted,
                   paymentRecipientUserID != nil,
@@ -3816,7 +3765,7 @@ struct ConversationView: View {
             await chatPaymentRequests.load(isOnline: true)
             validateLoadedChatPaymentRequests()
         }
-        .task(id: transferEventLoadID) {
+        .task(id: transferEventLoadID(in: taskTimeline)) {
             guard !isReadOnlyAppReviewPreview,
                   model.financialAccessGranted,
                   paymentRecipientUserID != nil,
@@ -3830,7 +3779,7 @@ struct ConversationView: View {
             )
             await documentObservedAutoReversals()
         }
-        .task(id: groupPaymentLoadID) {
+        .task(id: groupPaymentLoadID(in: taskTimeline)) {
             guard !isReadOnlyAppReviewPreview,
                   model.financialAccessGranted,
                   model.isOnline,
@@ -3842,7 +3791,7 @@ struct ConversationView: View {
                 paymentIds: conversationGroupPaymentIDs
             )
         }
-        .task(id: groupPaymentRequestLoadID) {
+        .task(id: groupPaymentRequestLoadID(in: taskTimeline)) {
             guard !isReadOnlyAppReviewPreview,
                   model.financialAccessGranted,
                   model.isOnline,
@@ -3856,7 +3805,7 @@ struct ConversationView: View {
                 isOnline: true
             )
         }
-        .task(id: scheduledGroupPaymentLoadID) {
+        .task(id: scheduledGroupPaymentLoadID(in: taskTimeline)) {
             guard model.financialAccessGranted else { return }
             await chatScheduledGroupPayments.load(
                 conversationID: conversation.id,
@@ -3864,7 +3813,7 @@ struct ConversationView: View {
                 isOnline: model.isOnline
             )
         }
-        .task(id: scheduledPaymentLoadID) {
+        .task(id: scheduledPaymentLoadID(in: taskTimeline)) {
             guard model.financialAccessGranted else { return }
             await chatScheduledPayments.load(
                 conversationID: conversation.id,
@@ -3884,7 +3833,7 @@ struct ConversationView: View {
             } catch {
                 return
             }
-            _ = await model.persistConversationDraft(
+            _ = await persistConversationDraft(
                 draftPersistenceTaskKey.body,
                 conversationId: draftPersistenceTaskKey.conversationID,
                 writeVersion: writeVersion,
@@ -3904,7 +3853,7 @@ struct ConversationView: View {
                     let restored = await model.restoredConversationDraftMedia(
                         for: conversation.id
                     )
-                    guard !didRestoreDraft else { return }
+                    guard composerAccountIsCurrent, !didRestoreDraft else { return }
                     let existingIDs = Set(stagedAttachments.map(\.id))
                     let newAttachments = restored
                         .filter { !existingIDs.contains($0.manifest.id) }
@@ -4022,6 +3971,7 @@ struct ConversationView: View {
             }
         }
         .onChange(of: scenePhase) { _, phase in
+            if phase != .active { cancelCameraPull() }
             guard !isReadOnlyAppReviewPreview else { return }
             if phase == .active {
                 incomingSoundPolicy.beginVisibility(with: messages)
@@ -4041,6 +3991,8 @@ struct ConversationView: View {
             stopReadOnlyGroupInteractions()
         }
         .onDisappear {
+            cancelCameraPull()
+            isConversationScrollInteracting = false
             incomingSoundPolicy.endVisibility()
             if !isReadOnlyAppReviewPreview {
                 model.setConversationVisible(conversation.id, visible: false)
@@ -4051,9 +4003,6 @@ struct ConversationView: View {
             // An ordinary interruption pauses the draft and keeps it; leaving the chat
             // must not cost the user what they already said. Discard stays explicit.
             voiceRecorder.suspend()
-            if !voiceRecorder.hasDraft {
-                VoiceNoteDraftRegistry.shared.release(voiceRecorderRegistryConversationID)
-            }
             presence.stopLocalTyping(conversationID: conversation.id)
             if !isReadOnlyAppReviewPreview, !isSending { persistDraftImmediately() }
         }
@@ -4521,7 +4470,6 @@ struct ConversationView: View {
             Button {
                 // The one deliberate way a draft dies.
                 voiceRecorder.cancel()
-                VoiceNoteDraftRegistry.shared.release(voiceRecorderRegistryConversationID)
             } label: {
                 Image(systemName: "trash.fill")
                     .font(.headline)
@@ -4842,6 +4790,7 @@ struct ConversationView: View {
                 ownsTemporaryFile: false
             )
         case .voice, .audio:
+            guard composerAccountIsCurrent else { return }
             let context = VoiceNotePlaybackContext(
                 conversationID: conversation.id,
                 speaker: "You",
@@ -6886,7 +6835,7 @@ struct ConversationView: View {
     }
 
     private func sendDraft(deliverAt: Date? = nil) {
-        guard didRestoreDraft, !isReadOnlyAppReviewPreview else { return }
+        guard didRestoreDraft, composerAccountIsCurrent, !isReadOnlyAppReviewPreview else { return }
         guard canSendMessage else { return }
         let sendActionUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
         let sendActionDate = Date()
@@ -6988,12 +6937,13 @@ struct ConversationView: View {
             // Draft persistence is best-effort bookkeeping. The message pipeline has its own
             // durability, so a failed draft write (for example a brand-new conversation that
             // has not been persisted yet) must never block the send itself.
-            let draftPersisted = await model.persistConversationDraft(
+            let draftPersisted = await persistConversationDraft(
                 submittedDraft,
                 conversationId: conversation.id,
                 writeVersion: persistenceVersion,
                 mediaAttachments: submittedDraftMediaAttachments
             )
+            guard composerAccountIsCurrent else { isSending = false; return }
             guard submittedAttachments.isEmpty || draftPersisted else {
                 model.lastError = CustomerFacingMessagingCopy.draftSaveFailure
                 isSending = false
@@ -7067,11 +7017,12 @@ struct ConversationView: View {
         deliverAt: Date? = nil,
         replyToServerMessageID: String? = nil
     ) async -> Bool {
+        guard composerAccountIsCurrent else { return false }
         var durableAttachments = attachments
         for index in durableAttachments.indices {
             let attachment = durableAttachments[index]
             guard let sourceURL = attachment.localFileURL else { continue }
-            guard let permanentURL = await model.persistStagedMediaOriginal(
+            guard let permanentURL = await persistStagedMediaOriginal(
                 mediaID: attachment.id,
                 sourceURL: sourceURL,
                 mediaType: attachment.originalMediaType ?? attachment.mediaType,
@@ -7100,6 +7051,7 @@ struct ConversationView: View {
                 stagedAttachments[stagedIndex] = durable
             }
         }
+        guard composerAccountIsCurrent else { return false }
         let queued: Bool
         if durableAttachments.count == 1, let attachment = durableAttachments.first {
             let caption = text.nilIfBlank
@@ -7184,14 +7136,14 @@ struct ConversationView: View {
     }
 
     private func persistDraftImmediately(removingMediaIDsAfterSuccess mediaIDs: [UUID] = []) {
-        guard didRestoreDraft, !isSending else { return }
+        guard didRestoreDraft, composerAccountIsCurrent, !isSending else { return }
         let currentDraft = draft
         let mediaAttachments = stagedAttachments.compactMap(\.draftMediaAttachment)
         let writeVersion = model.nextConversationDraftWriteVersion()
         draftWriteVersion = writeVersion
         immediateDraftPersistenceTask?.cancel()
         immediateDraftPersistenceTask = Task {
-            let persisted = await model.persistConversationDraft(
+            let persisted = await persistConversationDraft(
                 currentDraft,
                 conversationId: conversation.id,
                 writeVersion: writeVersion,
@@ -7205,7 +7157,7 @@ struct ConversationView: View {
     }
 
     private func sendVoiceNote() {
-        guard didRestoreDraft, !isReadOnlyAppReviewPreview else { return }
+        guard didRestoreDraft, composerAccountIsCurrent, !isReadOnlyAppReviewPreview else { return }
         let answering = replyTarget.flatMap { canReply(to: $0) ? $0 : nil }?
             .serverMessageId?
             .lowercased()
@@ -7216,11 +7168,13 @@ struct ConversationView: View {
             // finalized audio/mp4 file, so it can begin encryption/upload without another copy;
             // paused-and-resumed notes retain a durable background assembly job.
             guard let recording = await voiceRecorder.finish() else {
-                VoiceNoteDraftRegistry.shared.release(voiceRecorderRegistryConversationID)
                 isSending = false
                 return
             }
-            VoiceNoteDraftRegistry.shared.release(voiceRecorderRegistryConversationID)
+            defer {
+                if !composerAccountIsCurrent { recording.removeFiles() }
+            }
+            guard composerAccountIsCurrent else { isSending = false; return }
             let mediaID = UUID()
             LocalMediaPerformanceMonitor.shared.begin(
                 mediaID: mediaID,
@@ -7234,7 +7188,7 @@ struct ConversationView: View {
             var importedIDs: [UUID] = []
             for (index, segment) in recording.segments.enumerated() {
                 let segmentID = index == 0 ? mediaID : UUID()
-                guard let permanentURL = await model.persistStagedMediaOriginal(
+                guard let permanentURL = await persistStagedMediaOriginal(
                     mediaID: segmentID,
                     sourceURL: segment.fileURL,
                     mediaType: VoiceNoteRecorder.Recording.mediaType,
@@ -7264,6 +7218,7 @@ struct ConversationView: View {
                 for: sources,
                 outputStorageKey: UUID().uuidString.lowercased()
             )
+            guard composerAccountIsCurrent else { isSending = false; return }
             let queued = await model.queueMediaMessage(
                 conversationId: conversation.id,
                 title: conversation.title,
@@ -7302,6 +7257,7 @@ struct ConversationView: View {
         playableURLs: [URL],
         importedIDs: [UUID]
     ) async {
+        guard composerAccountIsCurrent else { recording.removeFiles(); return }
         guard let retryURL = await VoiceNoteSegmentAssembler.assembleToFile(playableURLs),
               let byteCount = try? retryURL.resourceValues(forKeys: [.fileSizeKey]).fileSize,
               byteCount > 0
@@ -7309,12 +7265,17 @@ struct ConversationView: View {
             model.lastError = "That voice note could not be queued. Its protected draft will be retained for recovery."
             return
         }
+        guard composerAccountIsCurrent else {
+            try? FileManager.default.removeItem(at: retryURL)
+            recording.removeFiles()
+            return
+        }
         let retryMediaID = UUID()
         LocalMediaPerformanceMonitor.shared.begin(
             mediaID: retryMediaID,
             producerScope: mediaDiagnosticsProducerScope
         )
-        guard let permanentURL = await model.persistStagedMediaOriginal(
+        guard let permanentURL = await persistStagedMediaOriginal(
             mediaID: retryMediaID,
             sourceURL: retryURL,
             mediaType: VoiceNoteRecorder.Recording.mediaType,
@@ -7495,11 +7456,55 @@ struct ConversationView: View {
 
     // MARK: Attachment staging
 
+    private func persistConversationDraft(
+        _ body: String,
+        conversationId: String,
+        writeVersion: ConversationDraftWriteVersion,
+        mediaAttachments: [ConversationDraftMediaAttachment]? = nil
+    ) async -> Bool {
+        guard composerAccountIsCurrent else { return false }
+        let saved = await model.persistConversationDraft(
+            body, conversationId: conversationId, writeVersion: writeVersion,
+            mediaAttachments: mediaAttachments
+        )
+        return composerAccountIsCurrent && saved
+    }
+
+    private func persistStagedMediaOriginal(mediaID: UUID, data: Data) async -> Bool {
+        guard composerAccountIsCurrent else { return false }
+        let saved = await model.persistStagedMediaOriginal(mediaID: mediaID, data: data)
+        return composerAccountIsCurrent && saved
+    }
+
+    private func persistStagedMediaOriginal(
+        mediaID: UUID,
+        sourceURL: URL,
+        mediaType: String,
+        byteCount: Int,
+        moveSource: Bool,
+        requiresConstantTimeClone: Bool = false
+    ) async -> URL? {
+        guard composerAccountIsCurrent else { return nil }
+        let saved = await model.persistStagedMediaOriginal(
+            mediaID: mediaID, sourceURL: sourceURL, mediaType: mediaType,
+            byteCount: byteCount, moveSource: moveSource,
+            requiresConstantTimeClone: requiresConstantTimeClone
+        )
+        return composerAccountIsCurrent ? saved : nil
+    }
+
     /// Photos keep the creative-editor confirmation flow. Video originals are first adopted and
     /// staged, then the editor reads that protected local source so trim/export is never a gate
     /// for local visibility or playback.
     private func handleCameraOutput(_ output: KitCameraOutput?) {
         guard let output else { return }
+        guard composerAccountIsCurrent else {
+            switch output {
+            case .photo(let url, _, _), .video(let url, _):
+                try? FileManager.default.removeItem(at: url)
+            }
+            return
+        }
         let acceptedAt = Date()
         switch output {
         case let .photo(fileURL, mediaType, preview):
@@ -7531,6 +7536,11 @@ struct ConversationView: View {
         acceptedAt: Date
     ) {
         let originalVideoURL: URL? = if case .video(let url, _) = original { url } else { nil }
+        guard composerAccountIsCurrent else {
+            if let originalVideoURL { try? FileManager.default.removeItem(at: originalVideoURL) }
+            if case .video(let url, _)? = output { try? FileManager.default.removeItem(at: url) }
+            return
+        }
         switch output {
         case .photo(let image):
             stageCameraPhoto(image, mediaID: mediaID, acceptedAt: acceptedAt)
@@ -7559,6 +7569,7 @@ struct ConversationView: View {
 
     /// Appends one more attachment, keeping the staged set within the cap.
     private func stageAttachment(_ attachment: ChatStagedAttachment) {
+        guard composerAccountIsCurrent else { return }
         guard stagedAttachments.count < ConversationAttachmentStagingPolicy.maximumStagedAttachments
         else {
             model.lastError = "You can attach up to \(ConversationAttachmentStagingPolicy.maximumStagedAttachments) files per message."
@@ -7576,7 +7587,7 @@ struct ConversationView: View {
         persistDraftImmediately()
         guard let data = attachment.data else { return }
         Task {
-            let saved = await model.persistStagedMediaOriginal(
+            let saved = await persistStagedMediaOriginal(
                 mediaID: attachment.id,
                 data: data
             )
@@ -7635,7 +7646,7 @@ struct ConversationView: View {
                         at: acceptedAt,
                         producerScope: mediaDiagnosticsProducerScope
                     )
-                    guard let permanentURL = await model.persistStagedMediaOriginal(
+                    guard let permanentURL = await persistStagedMediaOriginal(
                         mediaID: mediaID,
                         sourceURL: picked.url,
                         mediaType: mediaType,
@@ -7682,7 +7693,7 @@ struct ConversationView: View {
                         at: acceptedAt,
                         producerScope: mediaDiagnosticsProducerScope
                     )
-                    guard let permanentURL = await model.persistStagedMediaOriginal(
+                    guard let permanentURL = await persistStagedMediaOriginal(
                         mediaID: mediaID,
                         sourceURL: picked.url,
                         mediaType: sourceMediaType,
@@ -7843,7 +7854,7 @@ struct ConversationView: View {
                           mediaType: mediaType
                       )
                 else { throw AttachmentSelectionError.fileTooLarge }
-                guard let permanentURL = await model.persistStagedMediaOriginal(
+                guard let permanentURL = await persistStagedMediaOriginal(
                     mediaID: mediaID,
                     sourceURL: sourceURL,
                     mediaType: mediaType,
@@ -7940,7 +7951,7 @@ struct ConversationView: View {
                   stagedAttachments.contains(where: { $0.id == mediaID })
             else { return }
             guard let prepared,
-                  await model.persistStagedMediaOriginal(mediaID: mediaID, data: prepared.data)
+                  await persistStagedMediaOriginal(mediaID: mediaID, data: prepared.data)
             else {
                 stagedAttachments.removeAll { $0.id == mediaID }
                 model.lastError = AttachmentSelectionError.invalidImage.localizedDescription
@@ -7991,7 +8002,7 @@ struct ConversationView: View {
                 at: existing.acceptedAt,
                 producerScope: mediaDiagnosticsProducerScope
             )
-            guard await model.persistStagedMediaOriginal(
+            guard await persistStagedMediaOriginal(
                 mediaID: editedMediaID,
                 data: prepared.data
             ) else {
@@ -8048,7 +8059,7 @@ struct ConversationView: View {
                 else {
                     throw AttachmentSelectionError.fileTooLarge
                 }
-                guard let permanentURL = await model.persistStagedMediaOriginal(
+                guard let permanentURL = await persistStagedMediaOriginal(
                     mediaID: mediaID,
                     sourceURL: url,
                     mediaType: mediaType,
@@ -8131,7 +8142,7 @@ struct ConversationView: View {
                 at: acceptedAt,
                 producerScope: mediaDiagnosticsProducerScope
             )
-            guard let permanentURL = await model.persistStagedMediaOriginal(
+            guard let permanentURL = await persistStagedMediaOriginal(
                 mediaID: mediaID,
                 sourceURL: picked.url,
                 mediaType: mediaType,
@@ -8253,7 +8264,7 @@ struct ConversationView: View {
                     at: existing.acceptedAt,
                     producerScope: mediaDiagnosticsProducerScope
                 )
-                guard let permanentURL = await model.persistStagedMediaOriginal(
+                guard let permanentURL = await persistStagedMediaOriginal(
                     mediaID: editedMediaID,
                     sourceURL: url,
                     mediaType: mediaType,
@@ -8361,7 +8372,7 @@ struct ConversationView: View {
                 return
             }
             guard let inboxURL,
-                  let permanentURL = await model.persistStagedMediaOriginal(
+                  let permanentURL = await persistStagedMediaOriginal(
                       mediaID: item.id,
                       sourceURL: inboxURL,
                       mediaType: item.mediaType,
@@ -8525,7 +8536,7 @@ struct ConversationView: View {
                 if generation == attachmentLoadGeneration { isLoadingAttachment = false }
             }
             do {
-                guard let permanentURL = await model.persistStagedMediaOriginal(
+                guard let permanentURL = await persistStagedMediaOriginal(
                     mediaID: mediaID,
                     sourceURL: url,
                     mediaType: mediaType,
@@ -8597,16 +8608,8 @@ struct ConversationView: View {
         }
     }
 
-    private var openingPositionTaskID: String {
-        let ready = ConversationLatestPositionPolicy.openingLayoutIsReady(
-            hasTimelineContent: !timelineItems.isEmpty,
-            contentHeight: conversationContentHeight,
-            viewportHeight: conversationViewportHeight
-        )
-        return "\(conversation.id.lowercased()):\(timelineItems.last?.id ?? "empty"):\(ready)"
-    }
-
     private func scrollToBottom(using proxy: ScrollViewProxy, animated: Bool = true) {
+        cancelCameraPull()
         unseenIncomingCount = 0
         let position = {
             proxy.scrollTo(ConversationScrollAnchor.bottom, anchor: .bottom)
@@ -8621,37 +8624,6 @@ struct ConversationView: View {
     // MARK: Reading position, jump-to-latest, and the pull-past-the-end camera
 
     private func handleScrollMetrics(_ metrics: ConversationScrollMetrics) {
-        let movedTowardHistory = ConversationLatestPositionPolicy
-            .inferredUserMovedTowardHistory(
-                previousContentHeight: conversationContentHeight,
-                previousContentMaxY: conversationContentMaxY,
-                contentHeight: metrics.contentHeight,
-                contentMaxY: metrics.contentMaxY
-            )
-        let contentHeightChanged = conversationContentHeight != metrics.contentHeight
-        if movedTowardHistory {
-            // Geometry is the reliable fallback on iOS 17, where ScrollView does not publish its
-            // interaction phase and can cancel a simultaneous drag before `onEnded`. Subtracting
-            // content growth distinguishes a person's upward scroll from a media row expanding.
-            latestPositionPolicy.endOpeningSettling(conversationID: conversation.id)
-        }
-        if contentHeightChanged {
-            conversationContentHeight = metrics.contentHeight
-        }
-        if conversationContentMaxY != metrics.contentMaxY {
-            conversationContentMaxY = metrics.contentMaxY
-        }
-        if contentHeightChanged,
-           latestPositionPolicy.shouldMaintainOpeningAnchor(
-               conversationID: conversation.id,
-               hasExplicitTarget: pendingScrollTargetMessageID != nil,
-               isInteracting: isConversationScrollInteracting
-           ) {
-            // Lazy rows, restored history and hydrated financial cards can all gain height after
-            // the first anchor exists. Keep asking for the bottom until the user touches the
-            // thread or chooses an exact navigation target.
-            deferredLatestPositionRequest &+= 1
-        }
         guard conversationViewportHeight > 0 else { return }
         let distanceFromLatest = metrics.contentMaxY - conversationViewportHeight
         let nearLatest = distanceFromLatest < ConversationCameraPullPolicy.nearLatestDistance
@@ -8659,42 +8631,76 @@ struct ConversationView: View {
             isNearLatestMessage = nearLatest
             if nearLatest { unseenIncomingCount = 0 }
         }
+    }
 
-        // Each of these writes back into `@State`, so they are only made when they change
-        // something: an unconditional write here re-runs layout, which re-delivers the metrics.
-        guard cameraPullIsEligible else {
-            if cameraPullProgress != 0 { cameraPullProgress = 0 }
-            if cameraPull.isArmed { cameraPull.cancel() }
+    private func beginCameraPull(
+        geometry: ConversationCameraPullGeometry, distanceFromLatest: CGFloat
+    ) {
+        isConversationScrollInteracting = true
+        latestPositionPolicy.userDidChoosePosition(conversationID: conversation.id)
+        cameraPullGeometry = geometry
+        cameraPull.begin(
+            isEligible: cameraPullIsEligible,
+            distanceFromLatest: distanceFromLatest
+        )
+        ConversationCameraPullDiagnostics.log(
+            "begin eligible=\(cameraPullIsEligible) admitted=\(cameraPull.isTracking)"
+                + " distance=\(distanceFromLatest) review=\(isReadOnlyAppReviewPreview)"
+                + " messaging=\(conversationMessagingAvailable) active=\(scenePhase == .active)"
+                + " content=\(geometry.contentHeight) viewport=\(geometry.viewportHeight)"
+                + " nativeGeometryValid=\(geometry.isValid)"
+                + " selecting=\(isSelectingMessages) searching=\(isSearchingMessages)"
+                + " voiceDraft=\(voiceRecorder.hasDraft) editing=\(editTarget != nil)"
+        )
+        if cameraPullProgress != 0 { cameraPullProgress = 0 }
+    }
+
+    private func updateCameraPull(progress: CGFloat) {
+        ConversationCameraPullDiagnostics.log(
+            "progress value=\(progress) eligible=\(cameraPullIsEligible)"
+                + " tracking=\(cameraPull.isTracking) armed=\(cameraPull.isArmed)"
+        )
+        guard cameraPullIsEligible, cameraPull.isTracking else {
+            cancelCameraPull()
             return
         }
-        let overscroll = max(0, -distanceFromLatest)
-        if cameraPullProgress != overscroll {
-            cameraPullProgress = overscroll
-        }
-        // Taking an armed pull back before letting go, for the case where the scroll view has
-        // swallowed the drag gesture and its `onChanged` no longer arrives. Only ever read while
-        // the finger is still down: the release itself also collapses the overscroll as the thread
-        // bounces to rest, and disarming from that would swallow the camera just asked for.
-        if isConversationScrollInteracting {
-            cameraPull.dragged(progress: overscroll)
-        }
-        guard !cameraPull.isArmed,
-              overscroll >= ConversationCameraPullPolicy.triggerDistance
-        else { return }
-        if cameraPull.overscrolled(to: overscroll) {
+        cameraPull.dragged(progress: progress)
+        if cameraPullProgress != progress { cameraPullProgress = progress }
+        if cameraPull.overscrolled(to: progress) {
+            ConversationCameraPullDiagnostics.log("armed value=\(progress)")
             UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+            UIAccessibility.post(notification: .announcement,
+                                 argument: "Release to open camera")
         }
     }
 
-    private func updateCameraPullArming() {
-        guard cameraPull.isArmed else { return }
-        cameraPull.dragged(progress: cameraPullProgress)
+    private func finishCameraPull(cancelled: Bool) {
+        ConversationCameraPullDiagnostics.log(
+            "release cancelled=\(cancelled) eligible=\(cameraPullIsEligible)"
+                + " tracking=\(cameraPull.isTracking) armed=\(cameraPull.isArmed)"
+        )
+        isConversationScrollInteracting = false
+        if cancelled {
+            cancelCameraPull()
+            return
+        }
+        let shouldOpen = cameraPull.released() && cameraPullIsEligible
+        cameraPullGeometry = nil
+        ConversationCameraPullDiagnostics.log("release opens=\(shouldOpen)")
+        if cameraPullProgress != 0 { cameraPullProgress = 0 }
+        if shouldOpen {
+            isComposerFocused = false
+            showCameraCapture = true
+        }
     }
 
-    /// Opens the camera on the release the indicator promised, and only then.
-    private func releaseCameraPull() {
-        guard cameraPull.isArmed, cameraPull.released(), cameraPullIsEligible else { return }
-        showCameraCapture = true
+    private func cancelCameraPull() {
+        if cameraPull.isTracking || cameraPull.isArmed {
+            ConversationCameraPullDiagnostics.log("cancel activeGesture=true")
+        }
+        if cameraPull.isTracking || cameraPull.isArmed { cameraPull.cancel() }
+        if cameraPullGeometry != nil { cameraPullGeometry = nil }
+        if cameraPullProgress != 0 { cameraPullProgress = 0 }
     }
 
     private var cameraPullIndicator: some View {
@@ -8712,7 +8718,7 @@ struct ConversationView: View {
                         .rotationEffect(.degrees(-90))
                 }
                 .scaleEffect(0.6 + 0.4 * progress)
-            Text(cameraPull.isArmed ? "Release for camera" : "Keep pulling for camera")
+            Text(cameraPull.isArmed ? "Release to open camera" : "Pull further to open camera")
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(KitColor.secondaryText)
         }
@@ -8827,37 +8833,384 @@ enum ConversationMessageSearchPolicy {
     }
 }
 
-/// Reports when a finger goes onto the thread and when it comes back off.
-///
-/// `DragGesture`'s `onEnded` is not delivered once a scroll view takes the drag over — and a pull
-/// past the last message is a scroll, every time. So the release the indicator kept promising
-/// ("Release for camera") never arrived and the camera never opened. iOS 18 publishes scroll
-/// phases, which is the signal this gesture wanted all along; iOS 17 is left with the drag gesture,
-/// which is all it has.
-private struct ConversationScrollInteractionReporter: ViewModifier {
-    let onInteractingChange: (Bool) -> Void
-    let onRelease: () -> Void
+/// Numeric diagnostics are limited to the explicitly launched, compile-time screenshot fixture.
+private enum ConversationCameraPullDiagnostics {
+    static func log(_ message: @autoclosure () -> String) {
+#if DEBUG && APP_STORE_SCREENSHOTS
+        guard AppStoreScreenshotFixture.isActive else { return }
+        NSLog("[KitPayCameraPull] %@", message())
+#endif
+    }
+}
 
-    func body(content: Content) -> some View {
-        if #available(iOS 18.0, *) {
-            content.onScrollPhaseChange { oldPhase, newPhase in
-                let was = oldPhase.hasFingerDown
-                let now = newPhase.hasFingerDown
-                guard was != now else { return }
-                onInteractingChange(now)
-                if was { onRelease() }
+/// Observes the scroll view's existing pan recognizer without adding a competing gesture. This
+/// works on iOS 17 as well as newer systems and distinguishes a real release from cancellation.
+/// Geometry changes, inertial bounce and programmatic scrolling never generate a pan callback.
+struct ConversationScrollPanReporter: UIViewRepresentable {
+    let conversationID: String
+    let shouldKeepOpeningAtBottom: () -> Bool
+    let shouldFollowLayoutChanges: () -> Bool
+    let onOpeningPositioned: () -> Void
+    let onBegin: (ConversationCameraPullGeometry, CGFloat) -> Void
+    let onProgress: (CGFloat) -> Void
+    let onCancel: () -> Void
+    let onEnd: (Bool) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeUIView(context: Context) -> Probe {
+        let view = Probe()
+        view.isUserInteractionEnabled = false
+        view.coordinator = context.coordinator
+        return view
+    }
+
+    func updateUIView(_ uiView: Probe, context: Context) {
+        context.coordinator.updateCallbacks(self)
+        context.coordinator.attach(from: uiView)
+    }
+
+    static func dismantleUIView(_ uiView: Probe, coordinator: Coordinator) {
+        coordinator.detach()
+        uiView.coordinator = nil
+    }
+
+    final class Probe: UIView {
+        weak var coordinator: Coordinator?
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            coordinator?.attach(from: self)
+        }
+
+        override func layoutSubviews() {
+            super.layoutSubviews()
+            coordinator?.attach(from: self)
+        }
+    }
+
+    @MainActor
+    final class Coordinator: NSObject {
+        var callbacks: ConversationScrollPanReporter
+        private weak var scrollView: UIScrollView?
+        private var initialGeometry: ConversationCameraPullGeometry?
+        private var panIsActive = false
+        private var interactionConversationID: String?
+        private var acknowledgedConversationID: String?
+        private var previousNativeSample: NativeSample?
+        private var positionRequest: PositionRequest?
+        private var isApplyingPosition = false
+#if DEBUG && APP_STORE_SCREENSHOTS
+        private var lastUnattachedHierarchy: String?
+#endif
+        private var geometryObservations: [NSKeyValueObservation] = []
+
+        private struct NativeSample: Equatable {
+            let geometry: ConversationCameraPullGeometry
+            let offset: CGPoint
+
+            @MainActor init(_ scroll: UIScrollView) {
+                geometry = ConversationCameraPullGeometry(
+                    contentHeight: scroll.contentSize.height,
+                    viewportHeight: scroll.bounds.height,
+                    viewportWidth: scroll.bounds.width,
+                    topInset: scroll.adjustedContentInset.top,
+                    bottomInset: scroll.adjustedContentInset.bottom
+                )
+                offset = scroll.contentOffset
             }
-        } else {
-            content
+
+            var isNearBottom: Bool {
+                geometry.bottomOffset.isFinite && offset.y.isFinite
+                    && max(0, geometry.bottomOffset - offset.y)
+                        < ConversationCameraPullPolicy.nearLatestDistance
+            }
+        }
+
+        private struct PositionRequest {
+            enum Kind {
+                case opening
+                case layoutFollow(expectedOffset: CGPoint)
+            }
+
+            let id = UUID()
+            let conversationID: String
+            let kind: Kind
+        }
+
+        init(_ callbacks: ConversationScrollPanReporter) { self.callbacks = callbacks }
+
+        func updateCallbacks(_ callbacks: ConversationScrollPanReporter) {
+            if self.callbacks.conversationID.lowercased() != callbacks.conversationID.lowercased() {
+                positionRequest = nil
+                previousNativeSample = nil
+                acknowledgedConversationID = nil
+                interactionConversationID = nil
+                initialGeometry = nil
+                panIsActive = false
+            }
+            self.callbacks = callbacks
+        }
+
+        func attach(from view: UIView) {
+            var ancestor = view.superview
+#if DEBUG && APP_STORE_SCREENSHOTS
+            var hierarchy: [String] = []
+#endif
+            while let current = ancestor {
+#if DEBUG && APP_STORE_SCREENSHOTS
+                hierarchy.append(String(describing: type(of: current)))
+#endif
+                if let scroll = current as? UIScrollView {
+#if DEBUG && APP_STORE_SCREENSHOTS
+                    lastUnattachedHierarchy = nil
+#endif
+                    if scrollView !== scroll {
+                        detach()
+                        scrollView = scroll
+                        scroll.panGestureRecognizer.addTarget(self, action: #selector(panChanged(_:)))
+                        // Content, viewport and inset changes can arrive without resizing Probe.
+                        // Origin changes are observed separately so queued following yields to
+                        // VoiceOver, keyboard and other native scrolling as well as touch pans.
+                        geometryObservations = [
+                            scroll.observe(\.contentSize) { [weak self] _, _ in
+                                MainActor.assumeIsolated { self?.nativePositionChanged() }
+                            },
+                            scroll.observe(\.contentOffset) { [weak self] _, _ in
+                                MainActor.assumeIsolated { self?.nativePositionChanged() }
+                            },
+                            scroll.observe(\.bounds) { [weak self] _, _ in
+                                MainActor.assumeIsolated { self?.nativePositionChanged() }
+                            },
+                            scroll.observe(\.frame) { [weak self] _, _ in
+                                MainActor.assumeIsolated { self?.nativePositionChanged() }
+                            },
+                            scroll.observe(\.contentInset) { [weak self] _, _ in
+                                MainActor.assumeIsolated { self?.nativePositionChanged() }
+                            },
+                            scroll.observe(\.adjustedContentInset) { [weak self] _, _ in
+                                MainActor.assumeIsolated { self?.nativePositionChanged() }
+                            },
+                        ]
+                        ConversationCameraPullDiagnostics.log(
+                            "attach class=\(type(of: scroll)) native=\(ObjectIdentifier(scroll))"
+                        )
+                    }
+                    nativePositionChanged()
+                    return
+                }
+                ancestor = current.superview
+            }
+#if DEBUG && APP_STORE_SCREENSHOTS
+            let signature = hierarchy.joined(separator: ">")
+            if lastUnattachedHierarchy != signature {
+                lastUnattachedHierarchy = signature
+                ConversationCameraPullDiagnostics.log("attach missingScroll ancestors=\(signature)")
+            }
+#endif
+        }
+
+        private func nativePositionChanged() {
+            guard let scroll = scrollView else { return }
+            let sample = NativeSample(scroll)
+            let previous = previousNativeSample
+            previousNativeSample = sample
+            guard !isApplyingPosition else { return }
+
+            let originChanged = previous.map { $0.offset != sample.offset } ?? false
+            if originChanged, case .layoutFollow = positionRequest?.kind {
+                positionRequest = nil
+            }
+
+            let conversationID = callbacks.conversationID.lowercased()
+            if canOwnOpening(conversationID: conversationID) {
+                schedulePosition(.opening, in: scroll)
+                return
+            }
+
+            // Only a geometry change may follow an established reading position. A native
+            // offset change updates that position and never reasserts the opening anchor.
+            guard let previous, previous.geometry != sample.geometry, !originChanged,
+                  callbacks.shouldFollowLayoutChanges(), !isNativeInteracting(scroll)
+            else { return }
+            if case .layoutFollow = positionRequest?.kind {
+                // Preserve the original near-bottom intent through coalesced row/inset changes.
+                return
+            }
+            guard previous.isNearBottom else { return }
+            schedulePosition(.layoutFollow(expectedOffset: sample.offset), in: scroll)
+        }
+
+        private func canOwnOpening(conversationID: String) -> Bool {
+            acknowledgedConversationID != conversationID
+                && interactionConversationID != conversationID
+                && callbacks.shouldKeepOpeningAtBottom()
+        }
+
+        private func schedulePosition(_ kind: PositionRequest.Kind, in scroll: UIScrollView) {
+            guard positionRequest == nil else { return }
+            let request = PositionRequest(
+                conversationID: callbacks.conversationID.lowercased(), kind: kind
+            )
+            positionRequest = request
+            DispatchQueue.main.async { [weak self, weak scroll] in
+                guard let self else { return }
+                defer {
+                    if self.positionRequest?.id == request.id {
+                        self.positionRequest = nil
+                    }
+                }
+                guard let scroll, self.canApplyPosition(request, to: scroll) else { return }
+                // SwiftUI can report positive estimated heights before its bottom ID resolves.
+                // Position only after native layout, and acknowledge the observed native offset.
+                scroll.layoutIfNeeded()
+                guard self.canApplyPosition(request, to: scroll) else { return }
+                let geometry = NativeSample(scroll).geometry
+                guard ConversationLatestPositionPolicy.openingLayoutIsReady(
+                    hasTimelineContent: true,
+                    contentHeight: geometry.contentHeight,
+                    viewportHeight: geometry.viewportHeight
+                ), geometry.bottomOffset.isFinite else { return }
+                self.isApplyingPosition = true
+                if abs(scroll.contentOffset.y - geometry.bottomOffset) > 0.5 {
+                    scroll.setContentOffset(
+                        CGPoint(x: scroll.contentOffset.x, y: geometry.bottomOffset), animated: false
+                    )
+                }
+                self.isApplyingPosition = false
+                let observed = NativeSample(scroll)
+                self.previousNativeSample = observed
+                guard self.canApplyPosition(request, to: scroll, checkExpectedOffset: false)
+                else { return }
+                if abs(observed.offset.y - observed.geometry.bottomOffset) <= 1 {
+                    if case .opening = request.kind {
+                        // This local receipt closes ownership before SwiftUI can render it.
+                        self.acknowledgedConversationID = request.conversationID
+                        self.positionRequest = nil
+                        ConversationCameraPullDiagnostics.log(
+                            "opening acknowledged offset=\(observed.offset.y)"
+                                + " bottom=\(observed.geometry.bottomOffset)"
+                        )
+                        self.callbacks.onOpeningPositioned()
+                    }
+                } else if geometry != observed.geometry {
+                    // Retry a real geometry change during correction, but never loop merely
+                    // because the native view rejected an unchanged offset request.
+                    self.positionRequest = nil
+                    switch request.kind {
+                    case .opening:
+                        self.schedulePosition(.opening, in: scroll)
+                    case .layoutFollow:
+                        self.schedulePosition(.layoutFollow(expectedOffset: observed.offset), in: scroll)
+                    }
+                }
+            }
+        }
+
+        private func canApplyPosition(
+            _ request: PositionRequest, to scroll: UIScrollView, checkExpectedOffset: Bool = true
+        ) -> Bool {
+            guard positionRequest?.id == request.id,
+                  callbacks.conversationID.lowercased() == request.conversationID,
+                  scrollView === scroll, scroll.window != nil, !isNativeInteracting(scroll)
+            else { return false }
+            switch request.kind {
+            case .opening:
+                return canOwnOpening(conversationID: request.conversationID)
+            case .layoutFollow(let expectedOffset):
+                return callbacks.shouldFollowLayoutChanges()
+                    && (!checkExpectedOffset || scroll.contentOffset == expectedOffset)
+            }
+        }
+
+        private func isNativeInteracting(_ scroll: UIScrollView) -> Bool {
+            panIsActive || scroll.isTracking || scroll.isDragging || scroll.isDecelerating
+        }
+
+        func detach() {
+            positionRequest = nil
+            previousNativeSample = nil
+            geometryObservations.removeAll()
+            scrollView?.panGestureRecognizer.removeTarget(self, action: #selector(panChanged(_:)))
+            scrollView = nil
+            initialGeometry = nil
+            panIsActive = false
+        }
+
+        @objc func panChanged(_ pan: UIPanGestureRecognizer) {
+            guard let scrollView else { return }
+            let geometry = ConversationCameraPullGeometry(
+                contentHeight: scrollView.contentSize.height,
+                viewportHeight: scrollView.bounds.height,
+                viewportWidth: scrollView.bounds.width,
+                topInset: scrollView.adjustedContentInset.top,
+                bottomInset: scrollView.adjustedContentInset.bottom
+            )
+            let translation = pan.translation(in: scrollView)
+            ConversationCameraPullDiagnostics.log(
+                "pan state=\(pan.state.rawValue) native=\(ObjectIdentifier(scrollView))"
+                    + " content=\(geometry.contentHeight) viewport=\(geometry.viewportHeight)"
+                    + " width=\(geometry.viewportWidth) top=\(geometry.topInset)"
+                    + " bottom=\(geometry.bottomInset) offset=\(scrollView.contentOffset.y)"
+                    + " rest=\(geometry.bottomOffset) tx=\(translation.x) ty=\(translation.y)"
+            )
+            switch pan.state {
+            case .began:
+                // Fence a queued opening callback before SwiftUI processes its State update.
+                positionRequest = nil
+                panIsActive = true
+                interactionConversationID = callbacks.conversationID.lowercased()
+                initialGeometry = geometry
+                let distance = geometry.bottomOffset - scrollView.contentOffset.y
+                callbacks.onBegin(geometry, distance.isFinite ? max(0, distance) : .nan)
+            case .changed:
+                guard initialGeometry != nil else { return }
+                guard initialGeometry == geometry else {
+                    ConversationCameraPullDiagnostics.log("pan cancelled=geometryChanged")
+                    initialGeometry = nil
+                    callbacks.onCancel()
+                    return
+                }
+                let verticalPull = translation.y < 0 && abs(translation.y) > abs(translation.x)
+                ConversationCameraPullDiagnostics.log("pan vertical=\(verticalPull)")
+                callbacks.onProgress(verticalPull
+                    ? max(0, scrollView.contentOffset.y - geometry.bottomOffset)
+                    : 0)
+            case .ended:
+                let cancelled = initialGeometry == nil || initialGeometry != geometry
+                initialGeometry = nil
+                panIsActive = false
+                callbacks.onEnd(cancelled)
+            case .cancelled, .failed:
+                initialGeometry = nil
+                panIsActive = false
+                callbacks.onEnd(true)
+            default:
+                break
+            }
         }
     }
 }
 
-@available(iOS 18.0, *)
-private extension ScrollPhase {
-    /// The phases that mean the customer is still touching the thread. Deceleration and the
-    /// rubber-band settle are both the aftermath of a release, not part of one.
-    var hasFingerDown: Bool { self == .tracking || self == .interacting }
+/// Exact viewport/content identity for one drag. A keyboard, rotation, hydrated row or inset
+/// change invalidates the pull instead of being mistaken for additional finger travel.
+struct ConversationCameraPullGeometry: Equatable {
+    let contentHeight: CGFloat
+    let viewportHeight: CGFloat
+    let viewportWidth: CGFloat
+    let topInset: CGFloat
+    let bottomInset: CGFloat
+
+    var isValid: Bool {
+        contentHeight.isFinite && contentHeight > 0
+            && viewportHeight.isFinite && viewportHeight > 0
+            && viewportWidth.isFinite && viewportWidth > 0
+            && topInset.isFinite && bottomInset.isFinite && bottomOffset.isFinite
+    }
+
+    var bottomOffset: CGFloat {
+        max(-topInset, contentHeight - viewportHeight + bottomInset)
+    }
 }
 
 /// How far past the last message the user must pull before the camera opens.
@@ -8867,76 +9220,88 @@ private extension ScrollPhase {
 /// a deliberate but easy gesture. (110pt required ~250pt of finger travel and read as broken.)
 enum ConversationCameraPullPolicy {
     static let triggerDistance: CGFloat = 60
-    /// Overscroll must fall back under this before another pull can fire.
-    static let rearmDistance: CGFloat = 6
+    static let bottomStartTolerance: CGFloat = 1
     /// Within this distance of the latest message the user counts as "caught up".
     static let nearLatestDistance: CGFloat = 56
 
     /// The indicator and camera launch must use this same gate so the UI never advertises an
     /// action that the current conversation interaction would reject.
+    /// Stable keyboard focus permits a fresh drag; native viewport/inset changes cancel the
+    /// current one. Editing remains excluded even after its keyboard is dismissed.
     static func isEligible(
-        contentHeight: CGFloat,
-        viewportHeight: CGFloat,
+        geometry: ConversationCameraPullGeometry?,
         isSelectingMessages: Bool,
         isSearchingMessages: Bool,
-        isRecordingVoiceNote: Bool,
-        isComposerFocused: Bool
+        hasVoiceNoteDraft: Bool,
+        isEditingMessage: Bool
     ) -> Bool {
-        viewportHeight > 0
-            && contentHeight > viewportHeight
+        geometry?.isValid == true
             && !isSelectingMessages
             && !isSearchingMessages
-            && !isRecordingVoiceNote
-            && !isComposerFocused
+            && !hasVoiceNoteDraft
+            && !isEditingMessage
     }
 }
 
 /// The pull-past-the-end camera gesture, as the two-step promise the indicator makes: pulling far
-/// enough *arms* the camera ("Release for camera"), and the release opens it.
+/// enough *arms* the camera ("Release to open camera"), and the release opens it.
 ///
 /// It used to open the moment the threshold was crossed — the chat was snatched away mid-drag,
 /// while the label was still telling the customer to let go first, and a pull they wanted to take
 /// back could not be taken back.
 struct ConversationCameraPullGesture: Equatable {
     private(set) var isArmed = false
+    private(set) var isTracking = false
+    private var didCrossThreshold = false
 
-    /// Reports the pull distance. Returns true on the transition into the armed state, which is
-    /// the single moment the haptic should fire.
+    /// Ordinary scrolling which only reaches the bottom midway through a drag cannot arm it.
+    mutating func begin(isEligible: Bool, distanceFromLatest: CGFloat) {
+        isArmed = false
+        didCrossThreshold = false
+        isTracking = isEligible
+            && distanceFromLatest.isFinite
+            && distanceFromLatest >= 0
+            && distanceFromLatest <= ConversationCameraPullPolicy.bottomStartTolerance
+    }
+
+    /// Reports the pull distance. Only the first threshold crossing in this drag emits a haptic.
     mutating func overscrolled(to overscroll: CGFloat) -> Bool {
-        guard overscroll >= ConversationCameraPullPolicy.triggerDistance, !isArmed else {
+        guard isTracking, overscroll.isFinite,
+              overscroll >= ConversationCameraPullPolicy.triggerDistance, !isArmed else {
             return false
         }
         isArmed = true
-        return true
+        let shouldHaptic = !didCrossThreshold
+        didCrossThreshold = true
+        return shouldHaptic
     }
 
-    /// Reports the pull distance while the finger is still moving, which is the only place an
-    /// armed pull is taken back.
-    ///
-    /// Deliberately not driven by the scroll metrics: the release *also* drops the overscroll back
-    /// under the threshold as the list bounces to rest, so disarming from that would race
-    /// `released()` and swallow the camera the customer just asked for. Reading it during the drag
-    /// covers both cases that should cancel — pulling back before letting go, and an armed pull
-    /// left over from a gesture that ended without ever delivering its release.
+    /// Retraction below the trigger takes back the promise. Only real pan updates enter here;
+    /// inertial bounce after release cannot disarm the last position chosen by the finger.
     mutating func dragged(progress: CGFloat) {
-        guard isArmed, progress < ConversationCameraPullPolicy.rearmDistance else { return }
+        guard progress.isFinite, progress >= 0 else {
+            cancel()
+            return
+        }
+        guard isArmed, progress < ConversationCameraPullPolicy.triggerDistance else { return }
         isArmed = false
     }
 
     /// Returns true if this release is the one the indicator promised would open the camera.
     mutating func released() -> Bool {
-        defer { isArmed = false }
-        return isArmed
+        defer { cancel() }
+        return isTracking && isArmed
     }
 
     /// The conversation stopped accepting the gesture (selection, search, recording, composing).
     mutating func cancel() {
         isArmed = false
+        isTracking = false
+        didCrossThreshold = false
     }
 }
 
 private struct ConversationScrollMetrics: Equatable {
-    var contentHeight: CGFloat = 0
     var contentMaxY: CGFloat = 0
 }
 
@@ -8977,7 +9342,6 @@ private struct RecorderLevelWave: View {
 /// while an incoming message still cannot pull somebody away from older history.
 struct ConversationLatestPositionPolicy: Equatable {
     private(set) var positionedConversationID: String?
-    private(set) var openingSettlingConversationID: String?
 
     mutating func claimOpening(
         conversationID: String,
@@ -8989,7 +9353,6 @@ struct ConversationLatestPositionPolicy: Equatable {
         let canonical = conversationID.lowercased()
         guard positionedConversationID != canonical else { return false }
         positionedConversationID = canonical
-        openingSettlingConversationID = canonical
         return true
     }
 
@@ -8997,19 +9360,21 @@ struct ConversationLatestPositionPolicy: Equatable {
         positionedConversationID == conversationID.lowercased()
     }
 
-    mutating func endOpeningSettling(conversationID: String) {
-        guard openingSettlingConversationID == conversationID.lowercased() else { return }
-        openingSettlingConversationID = nil
+    /// A touch or exact-message navigation owns the reading position even if it arrives before
+    /// native opening positioning. Recording that receipt prevents any pending correction
+    /// from taking the position back after the finger lifts or the navigation target clears.
+    mutating func userDidChoosePosition(conversationID: String) {
+        positionedConversationID = conversationID.lowercased()
     }
 
-    func shouldMaintainOpeningAnchor(
+    func shouldApplyNativeOpeningAnchor(
         conversationID: String,
+        hasTimelineContent: Bool,
         hasExplicitTarget: Bool,
         isInteracting: Bool
     ) -> Bool {
-        openingSettlingConversationID == conversationID.lowercased()
-            && !hasExplicitTarget
-            && !isInteracting
+        hasTimelineContent && !hasExplicitTarget && !isInteracting
+            && !hasPositioned(conversationID: conversationID)
     }
 
     static func openingLayoutIsReady(
@@ -9024,46 +9389,16 @@ struct ConversationLatestPositionPolicy: Equatable {
             && viewportHeight > 0
     }
 
-    /// Infers an upward read gesture from geometry without trusting iOS 18-only scroll phases.
-    /// A row gaining height moves `contentMaxY` by the same amount while the viewport offset is
-    /// unchanged; only the residual movement toward a larger max-Y is user movement into older
-    /// history. Invalid/initial samples deliberately cannot terminate the opening anchor.
-    static func inferredUserMovedTowardHistory(
-        previousContentHeight: CGFloat,
-        previousContentMaxY: CGFloat,
-        contentHeight: CGFloat,
-        contentMaxY: CGFloat,
-        tolerance: CGFloat = 1
-    ) -> Bool {
-        guard previousContentHeight > 0,
-              previousContentHeight.isFinite,
-              previousContentMaxY.isFinite,
-              contentHeight > 0,
-              contentHeight.isFinite,
-              contentMaxY.isFinite,
-              tolerance >= 0,
-              tolerance.isFinite
-        else { return false }
-
-        let contentGrowth = contentHeight - previousContentHeight
-        let viewportMovement = contentMaxY - previousContentMaxY - contentGrowth
-        return viewportMovement > tolerance
-    }
-
-    static func shouldFollowTimelineChange(
+    static func shouldFollowOutgoingMessage(
         hasPositionedCurrentConversation: Bool,
         latestMessageIsOutgoing: Bool,
-        isNearLatest: Bool
+        isInteracting: Bool = false,
+        hasExplicitTarget: Bool = false
     ) -> Bool {
-        hasPositionedCurrentConversation && (latestMessageIsOutgoing || isNearLatest)
-    }
-
-    static func shouldFollowPaymentHydration(
-        hasPositionedCurrentConversation: Bool,
-        isNearLatest: Bool,
-        isInteracting: Bool
-    ) -> Bool {
-        hasPositionedCurrentConversation && isNearLatest && !isInteracting
+        hasPositionedCurrentConversation
+            && !isInteracting
+            && !hasExplicitTarget
+            && latestMessageIsOutgoing
     }
 }
 

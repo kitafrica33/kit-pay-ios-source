@@ -11,8 +11,8 @@ import Foundation
 ///
 /// Every segment lands in a file-protected temporary file, plaintext audio that never
 /// leaves this device until Send reads it back for the encrypted attachment pipeline. Only
-/// Send or an explicit discard deletes a draft; an ordinary UI interruption merely pauses
-/// it, which is why the registry below keeps recorders alive across view teardowns.
+/// Send, an explicit discard, or an account boundary deletes a draft; an ordinary UI
+/// interruption merely pauses it, so the registry keeps it alive across view teardowns.
 @MainActor
 final class VoiceNoteRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
     struct Recording {
@@ -56,6 +56,16 @@ final class VoiceNoteRecorder: NSObject, ObservableObject, AVAudioRecorderDelega
     /// Whether this recorder is the one that activated the shared audio session. The session is
     /// shared with `VoiceNotePlayer`, and handing it back is only ours to do if we took it.
     private var ownsAudioSession = false
+    private let requestRecordPermission: @MainActor () async -> Bool
+    private var captureRequestID = UUID()
+    private(set) var isInvalidated = false
+
+    init(requestRecordPermission: @escaping @MainActor () async -> Bool = {
+        await AVAudioApplication.requestRecordPermission()
+    }) {
+        self.requestRecordPermission = requestRecordPermission
+        super.init()
+    }
 
     var isRecording: Bool { phase == .recording }
     var isPreviewing: Bool { phase == .previewing }
@@ -67,12 +77,19 @@ final class VoiceNoteRecorder: NSObject, ObservableObject, AVAudioRecorderDelega
     var hasPlayableSegments: Bool { !segmentURLs.isEmpty }
 
     func start() async {
-        guard VoiceNoteDraftPolicy.startRecording(phase) != nil else { return }
+        guard !isInvalidated, VoiceNoteDraftPolicy.startRecording(phase) != nil else { return }
         guard CallMediaCoordinator.shared.activeCall == nil else {
             errorMessage = "Finish your call before recording a voice note."
             return
         }
-        guard await AVAudioApplication.requestRecordPermission() else {
+        let requestID = UUID()
+        captureRequestID = requestID
+        let permitted = await requestRecordPermission()
+        guard !Task.isCancelled, !isInvalidated, captureRequestID == requestID,
+              VoiceNoteDraftPolicy.startRecording(phase) != nil,
+              CallMediaCoordinator.shared.activeCall == nil
+        else { return }
+        guard permitted else {
             errorMessage = "Allow microphone access in Settings to record voice notes."
             return
         }
@@ -116,8 +133,11 @@ final class VoiceNoteRecorder: NSObject, ObservableObject, AVAudioRecorderDelega
             forName: .AVPlayerItemDidPlayToEndTime,
             object: lastItem,
             queue: .main
-        ) { [weak self] _ in
-            MainActor.assumeIsolated { self?.endPreview() }
+        ) { [weak self, weak player] _ in
+            MainActor.assumeIsolated {
+                guard let self, let player, self.previewPlayer === player else { return }
+                self.endPreview()
+            }
         }
         previewPlayer = player
         phase = previewing
@@ -135,6 +155,8 @@ final class VoiceNoteRecorder: NSObject, ObservableObject, AVAudioRecorderDelega
     /// Stops and returns the finished note, or nil when it is too short to be worth sending.
     /// This is the only path a draft may leave the device on, and it consumes the draft.
     func finish() async -> Recording? {
+        captureRequestID = UUID()
+        guard !isInvalidated else { return nil }
         stopPreviewPlayback()
         finalizeActiveSegment()
         let urls = segmentURLs
@@ -176,6 +198,7 @@ final class VoiceNoteRecorder: NSObject, ObservableObject, AVAudioRecorderDelega
 
     /// The explicit discard: everything captured so far is deleted, live or finalized.
     func cancel() {
+        captureRequestID = UUID()
         stopPreviewPlayback()
         recorder?.stop()
         stopMetering()
@@ -191,10 +214,19 @@ final class VoiceNoteRecorder: NSObject, ObservableObject, AVAudioRecorderDelega
         releaseAudioSession()
     }
 
+    /// Mounted views and pending permission callbacks may outlive logout. Revocation is
+    /// permanent for this recorder; a new account must obtain a new registry entry.
+    func invalidateForAccountBoundary() {
+        isInvalidated = true
+        cancel()
+        errorMessage = nil
+    }
+
     /// An ordinary UI interruption — leaving the chat, a read-only flip, backgrounding.
     /// The microphone stops and the audio stays: the draft is preserved for the user's
-    /// return, and only Send or an explicit discard ever deletes it.
+    /// return. Account teardown uses permanent invalidation instead.
     func suspend() {
+        captureRequestID = UUID()
         stopPreviewPlayback()
         finalizeActiveSegment()
         phase = VoiceNoteDraftPolicy.phaseAfterInterruption(
@@ -208,13 +240,15 @@ final class VoiceNoteRecorder: NSObject, ObservableObject, AVAudioRecorderDelega
         successfully flag: Bool
     ) {
         guard !flag else { return }
-        Task { @MainActor in
+        Task { @MainActor [weak self, weak recorder] in
+            guard let self, let recorder, self.recorder === recorder else { return }
             self.errorMessage = "Recording stopped unexpectedly."
             self.cancel()
         }
     }
 
     private func beginSegment() {
+        guard !isInvalidated else { return }
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("kit-voice-\(UUID().uuidString).m4a", isDirectory: false)
         let settings: [String: Any] = [
@@ -351,22 +385,24 @@ final class VoiceNoteRecorder: NSObject, ObservableObject, AVAudioRecorderDelega
 /// A recorder owned by the conversation view dies with it, and navigation, recomposition,
 /// and read-only flips all destroy that view. The recorder instead lives here, keyed by
 /// conversation, holding only temp files and counters — so leaving the chat and coming
-/// back costs the user nothing they said. A draft leaves this registry in exactly two
-/// ways: it is sent, or it is explicitly discarded. Process death is the one interruption
-/// that still loses it, which is what makes these files safe to hold.
+/// back costs the user nothing they said. Logout/account replacement revokes every recorder
+/// and deletes its files before another account can open the same conversation.
 @MainActor
 final class VoiceNoteDraftRegistry {
     static let shared = VoiceNoteDraftRegistry()
 
     private var recorders: [String: VoiceNoteRecorder] = [:]
+    private let makeRecorder: @MainActor () -> VoiceNoteRecorder
 
-    private init() {}
+    init(makeRecorder: @escaping @MainActor () -> VoiceNoteRecorder = { VoiceNoteRecorder() }) {
+        self.makeRecorder = makeRecorder
+    }
 
     /// The one recorder for this conversation, created on first use.
     func recorder(for conversationID: String) -> VoiceNoteRecorder {
         let key = conversationID.lowercased()
         if let existing = recorders[key] { return existing }
-        let created = VoiceNoteRecorder()
+        let created = makeRecorder()
         recorders[key] = created
         return created
     }
@@ -393,9 +429,12 @@ final class VoiceNoteDraftRegistry {
         return true
     }
 
-    /// Called after send or discard, when the draft no longer exists to preserve.
-    func release(_ conversationID: String) {
-        recorders.removeValue(forKey: conversationID.lowercased())
+    /// Keep even an empty mounted recorder registered: after sending, the same view can
+    /// record again. Its later draft must still be reached by account cleanup.
+    func resetForAccountBoundary() {
+        let previous = Array(recorders.values)
+        recorders.removeAll()
+        previous.forEach { $0.invalidateForAccountBoundary() }
     }
 }
 

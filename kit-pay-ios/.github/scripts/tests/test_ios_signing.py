@@ -1564,36 +1564,50 @@ class AppStoreProfileGeneratorTests(unittest.TestCase):
 
 
 class SigningConfigurationTests(unittest.TestCase):
-    def test_build_61_release_identity_is_consistent(self) -> None:
+    def test_build_62_release_identity_is_consistent(self) -> None:
         workflow = (ROOT / ".github/workflows/ios-app-store-archive.yml").read_text()
         project = (ROOT / "KitPay.xcodeproj/project.pbxproj").read_text()
         readme = (ROOT / "README.md").read_text()
 
         self.assertIn("default: 1.0.16", workflow)
-        self.assertIn('default: "61"', workflow)
-        self.assertIn("v1.0.16-build61", workflow)
-        # Four each: Debug and Release of the app and of the share extension. iOS refuses to
+        self.assertIn('default: "62"', workflow)
+        self.assertIn("v1.0.16-build62", workflow)
+        # Six each: Debug and Release of the app and both extensions. iOS refuses to
         # install an app whose extension carries a different version, so they move together.
-        self.assertEqual(project.count("MARKETING_VERSION = 1.0.16;"), 4)
-        self.assertEqual(project.count("CURRENT_PROJECT_VERSION = 61;"), 4)
+        self.assertEqual(project.count("MARKETING_VERSION = 1.0.16;"), 6)
+        self.assertEqual(project.count("CURRENT_PROJECT_VERSION = 62;"), 6)
         self.assertNotIn("MARKETING_VERSION = 1.0.1;", project)
         self.assertIn("1.0.16-r39", readme)
         self.assertIn("group_payment_request.{created,contributed,completed,cancelled,expired}", readme)
         self.assertIn("scheduled_payment.{completed,failed,cancelled}", readme)
         self.assertIn("scheduled_group_payment.{completed,failed,cancelled}", readme)
 
-    def test_archive_unit_tests_are_ad_hoc_signed_for_keychain_entitlements(self) -> None:
-        workflow = (ROOT / ".github/workflows/ios-app-store-archive.yml").read_text()
-        unit_test_step = workflow.split(
-            "      - name: Build and run unit tests without protected signing material\n",
-            1,
-        )[1].split("\n\n  archive:\n", 1)[0]
+    def test_native_tests_are_ad_hoc_signed_for_keychain_entitlements(self) -> None:
+        commands = (ROOT / ".github/scripts/ios_native_build.sh").read_text()
+        for setting in ("CODE_SIGN_IDENTITY=-", "CODE_SIGN_STYLE=Manual",
+                        "PROVISIONING_PROFILE_SPECIFIER=", "DEVELOPMENT_TEAM="):
+            self.assertIn(setting, commands)
+        self.assertNotIn("CODE_SIGNING_ALLOWED=NO", commands)
+        self.assertIn("build-for-testing", commands)
+        self.assertIn("test-without-building", commands)
 
-        self.assertIn("CODE_SIGN_IDENTITY=-", unit_test_step)
-        self.assertIn("CODE_SIGN_STYLE=Manual", unit_test_step)
-        self.assertIn("PROVISIONING_PROFILE_SPECIFIER=", unit_test_step)
-        self.assertIn("DEVELOPMENT_TEAM=", unit_test_step)
-        self.assertNotIn("CODE_SIGNING_ALLOWED=NO", unit_test_step)
+    def test_release_checks_share_the_signing_runner_before_protected_material(self) -> None:
+        workflow = (ROOT / ".github/workflows/ios-app-store-archive.yml").read_text()
+        preflight, archive = workflow.split("\n  archive:\n", 1)
+        self.assertIn("runs-on: ubuntu-latest", preflight)
+        self.assertIn("ios_release_readiness.py --mode archive", preflight)
+        self.assertNotIn("xcodebuild", preflight)
+        self.assertNotIn("pod install", preflight)
+        self.assertEqual(archive.count("install_ios_dependencies.sh"), 1)
+        self.assertEqual(archive.count("ios_native_build.sh build"), 1)
+        self.assertEqual(archive.count("ios_native_build.sh test"), 1)
+        self.assertLess(archive.index("ios_native_build.sh test"),
+                        archive.index("Import existing Apple distribution certificate"))
+        production = archive.split("      - name: Archive and export signed IPA\n", 1)[1]
+        self.assertIn("-configuration Release", production)
+        self.assertNotIn("APP_STORE_SCREENSHOTS", production)
+        self.assertNotIn("clean archive", production)
+        self.assertIn("Verify signature, profile, entitlements, and artifact hashes", production)
 
     def test_message_edit_floor_stays_pinned_to_the_first_kitedit1_release(self) -> None:
         """The edit capability floor is compatibility data, not build identity.
@@ -1649,7 +1663,7 @@ class SigningConfigurationTests(unittest.TestCase):
         self.assertIn("dstSubfolderSpec = 13", project)
         self.assertIn("Embed Foundation Extensions", project)
         self.assertIn("CODE_SIGN_ENTITLEMENTS = KitPayShare/KitPayShare.entitlements;", project)
-        self.assertEqual(project.count("APPLICATION_EXTENSION_API_ONLY = YES;"), 2)
+        self.assertEqual(project.count("APPLICATION_EXTENSION_API_ONLY = YES;"), 4)
         self.assertIn('--register-bundle-name "Kit Pay Share"', (
             ROOT / ".github/workflows/ios-app-store-archive.yml"
         ).read_text())
@@ -1662,6 +1676,21 @@ class SigningConfigurationTests(unittest.TestCase):
             share_info["NSExtension"]["NSExtensionPointIdentifier"],
             "com.apple.share-services",
         )
+
+    def test_broadcast_extension_uses_replaykit_and_the_shared_call_ipc_group(self) -> None:
+        with (ROOT / "KitPayBroadcast/Info.plist").open("rb") as source:
+            info = plistlib.load(source)
+        with (ROOT / "KitPayBroadcast/KitPayBroadcast.entitlements").open("rb") as source:
+            entitlements = plistlib.load(source)
+        project = (ROOT / "KitPay.xcodeproj/project.pbxproj").read_text()
+        workflow = (ROOT / ".github/workflows/ios-app-store-archive.yml").read_text()
+        self.assertEqual(entitlements, {APP_GROUP_KEY: [APP_GROUP]})
+        self.assertEqual(info["RTCAppGroupIdentifier"], APP_GROUP)
+        self.assertEqual(info["NSExtension"]["NSExtensionPointIdentifier"], "com.apple.broadcast-services-upload")
+        self.assertEqual(info["NSExtension"]["RPBroadcastProcessMode"], "RPBroadcastProcessModeSampleBuffer")
+        self.assertIn("KITPAY_BROADCAST_PROFILE_UUID", project)
+        self.assertIn('--broadcast-extension "$broadcast_extension_path"', workflow)
+        self.assertIn("test \"$plugin_count\" = '2'", workflow)
 
     def test_call_ui_supports_landscape_on_phone_and_tablet(self) -> None:
         with (ROOT / "KitPay/Info.plist").open("rb") as source:
@@ -1726,16 +1755,20 @@ class SigningConfigurationTests(unittest.TestCase):
             "APP_STORE_CONNECT_PRIVATE_KEY",
         ):
             reference = "${{ secrets." + secret + " }}"
-            self.assertEqual(workflow.count(reference), 1)
+            # The read-only Linux readiness check and profile creation each need
+            # the API key. Native build/test commands must never inherit it.
+            self.assertEqual(workflow.count(reference), 2)
             self.assertIn(reference, generation_step)
+            readiness = workflow.split("      - name: Verify Apple publication and signing readiness", 1)[1].split("\n  archive:", 1)[0]
+            self.assertIn(reference, readiness)
         self.assertIn("create_ios_app_store_profile.py", generation_step)
         self.assertIn(
             '--profile-output "$RUNNER_TEMP/kitpay-app-store.mobileprovision"',
             generation_step,
         )
-        # The generated app profile, generated extension profile, and final signed archive are
+        # The app profile, both extension profiles, and final signed archive are
         # each checked against the same exact App Group identifier.
-        self.assertEqual(workflow.count('--app-group "$IOS_APP_GROUP"'), 3)
+        self.assertEqual(workflow.count('--app-group "$IOS_APP_GROUP"'), 4)
         self.assertIn(
             'security cms -D \\\n            -i "$RUNNER_TEMP/kitpay-app-store.mobileprovision"',
             workflow,
@@ -2034,6 +2067,8 @@ class VerifyIOSArchiveTests(unittest.TestCase):
                     "KitCorrespondingSourceURL": SOURCE_URL,
                     "ITSAppUsesNonExemptEncryption": False,
                     "UIBackgroundModes": ["remote-notification"],
+                    "RTCAppGroupIdentifier": APP_GROUP,
+                    "RTCScreenSharingExtension": BUNDLE + ".broadcast",
                 },
             )
             write_plist(
@@ -2073,6 +2108,28 @@ class VerifyIOSArchiveTests(unittest.TestCase):
                     APP_GROUP_KEY: [APP_GROUP],
                 },
             )
+            broadcast_bundle = BUNDLE + ".broadcast"
+            broadcast_uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+            broadcast_path = app / "PlugIns" / "KitPayBroadcast.appex"
+            broadcast_path.mkdir()
+            broadcast_info = {
+                "CFBundleIdentifier": broadcast_bundle,
+                "CFBundleShortVersionString": "1.2.3", "CFBundleVersion": "42",
+                "RTCAppGroupIdentifier": APP_GROUP,
+                "NSExtension": {
+                    "NSExtensionPointIdentifier": "com.apple.broadcast-services-upload",
+                    "NSExtensionPrincipalClass": "KitPayBroadcast.SampleHandler",
+                    "RPBroadcastProcessMode": "RPBroadcastProcessModeSampleBuffer",
+                },
+            }
+            write_plist(broadcast_path / "Info.plist", broadcast_info)
+            broadcast_profile = share_profile()
+            broadcast_profile["UUID"] = broadcast_uuid
+            broadcast_profile["Entitlements"]["application-identifier"] = f"{TEAM}.{broadcast_bundle}"
+            broadcast_embedded = root / "broadcast-embedded.plist"
+            broadcast_signed = root / "broadcast-signed.plist"
+            write_plist(broadcast_embedded, broadcast_profile)
+            write_plist(broadcast_signed, broadcast_profile["Entitlements"])
             embedded = root / "embedded.plist"
             signed = root / "signed.plist"
             write_plist(embedded, profile())
@@ -2128,6 +2185,11 @@ class VerifyIOSArchiveTests(unittest.TestCase):
                 str(extension_signed),
                 "--expected-extension-profile-uuid",
                 SHARE_PROFILE_UUID,
+                "--broadcast-extension", str(broadcast_path),
+                "--broadcast-bundle-id", broadcast_bundle,
+                "--broadcast-profile-plist", str(broadcast_embedded),
+                "--broadcast-entitlements-plist", str(broadcast_signed),
+                "--expected-broadcast-profile-uuid", broadcast_uuid,
                 "--app-group",
                 APP_GROUP,
                 "--version",
@@ -2167,6 +2229,23 @@ class VerifyIOSArchiveTests(unittest.TestCase):
                 result["artifacts"]["ipa"]["sha256"],
                 hashlib.sha256(b"ipa").hexdigest(),
             )
+
+            self.assertEqual(result["target"]["broadcastExtensionBundleId"], broadcast_bundle)
+            for altered, message in (
+                ({**broadcast_info, "CFBundleVersion": "41"}, "build number"),
+                ({**broadcast_info, "RTCAppGroupIdentifier": "group.some.other.app"}, "IPC group"),
+                ({**broadcast_info, "NSExtension": {"NSExtensionPointIdentifier": "com.apple.share-services"}}, "ReplayKit registration"),
+            ):
+                write_plist(broadcast_path / "Info.plist", altered)
+                invalid_broadcast = subprocess.run(command, capture_output=True, text=True)
+                self.assertNotEqual(invalid_broadcast.returncode, 0)
+                self.assertIn(message, invalid_broadcast.stderr)
+            write_plist(broadcast_path / "Info.plist", broadcast_info)
+            write_plist(broadcast_signed, {**broadcast_profile["Entitlements"], "get-task-allow": True})
+            invalid_broadcast = subprocess.run(command, capture_output=True, text=True)
+            self.assertNotEqual(invalid_broadcast.returncode, 0)
+            self.assertIn("Broadcast extension identity", invalid_broadcast.stderr)
+            write_plist(broadcast_signed, broadcast_profile["Entitlements"])
 
             app_profile_without_time_sensitive = profile()
             app_profile_without_time_sensitive["Entitlements"].pop(

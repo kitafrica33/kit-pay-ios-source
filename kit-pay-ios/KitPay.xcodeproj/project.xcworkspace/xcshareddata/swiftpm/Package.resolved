@@ -3,10 +3,9 @@
     {
       "identity" : "client-sdk-swift",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/livekit/client-sdk-swift.git",
+      "location" : "https://github.com/aelsoftware/client-sdk-swift.git",
       "state" : {
-        "revision" : "79fb2beee98e45556bffebefa50b5d05c3382af1",
-        "version" : "2.16.0"
+        "revision" : "8867edc5ac936053d1dd41e44c8d823ac29b82f3"
       }
     },
     {

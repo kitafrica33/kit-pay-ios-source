@@ -233,6 +233,60 @@ final class WalletAPIEncodingTests: XCTestCase {
         XCTAssertFalse(SessionRefreshReplayPolicy.matches(attempt, session: rotated))
     }
 
+    func testLateRefreshFailureCannotEraseReplacementOrRotatedCredentials() async throws {
+        let namespace = "kit-session-invalidation-test-\(UUID().uuidString)"
+        let refreshNamespace = "\(namespace)-refresh"
+        defer {
+            try? KeychainStore.remove(namespace)
+            try? KeychainStore.remove(refreshNamespace)
+        }
+        let store = SessionStore(account: namespace, refreshAttemptAccount: refreshNamespace)
+        let api = APIClient(sessionStore: store)
+        let rejected = SessionTokens(
+            accessToken: "old-access",
+            refreshToken: "old-refresh",
+            tokenType: "Bearer",
+            accessExpiresAt: nil,
+            refreshExpiresAt: nil,
+            sessionId: "550e8400-e29b-41d4-a716-446655440000"
+        )
+        let rotated = SessionTokens(
+            accessToken: "new-access",
+            refreshToken: "new-refresh",
+            tokenType: "Bearer",
+            accessExpiresAt: nil,
+            refreshExpiresAt: nil,
+            sessionId: rejected.sessionId
+        )
+        let replacement = SessionTokens(
+            accessToken: "replacement-access",
+            refreshToken: "replacement-refresh",
+            tokenType: "Bearer",
+            accessExpiresAt: nil,
+            refreshExpiresAt: nil,
+            sessionId: "550e8400-e29b-41d4-a716-446655440001"
+        )
+
+        for newer in [rotated, replacement] {
+            try await store.save(rejected)
+            // The failed flight captured `rejected` before suspension. New credentials win
+            // before its invalidation crosses into SessionStore's actor.
+            try await store.save(newer)
+            await api.invalidateSession(ifCurrent: rejected)
+            let current = await store.current()
+            XCTAssertEqual(current, newer)
+            let restored = SessionStore(account: namespace, refreshAttemptAccount: refreshNamespace)
+            let persisted = await restored.current()
+            XCTAssertEqual(persisted, newer, "The Keychain must also retain the winning generation")
+        }
+
+        try await store.save(rejected)
+        await api.invalidateSession(ifCurrent: rejected)
+        let invalidated = await store.current()
+        XCTAssertNil(invalidated, "A failure for the still-current generation must sign out")
+        XCTAssertNil(try KeychainStore.data(for: namespace))
+    }
+
     func testTransferStepUpIntentEncodesAnExplicitNullNote() throws {
         let request = CreateStepUpRequest(
             purpose: "wallet_transfer",

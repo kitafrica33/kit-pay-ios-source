@@ -60,6 +60,9 @@ struct KitPayApp: App {
                         )
                     }
                     syncMinimizedCallSurface()
+#if DEBUG && APP_STORE_SCREENSHOTS
+                    callMedia.installCallLayoutFixtureIfRequested()
+#endif
                 }
                 .onChange(of: hasPresentableCall) { _, _ in syncMinimizedCallSurface() }
                 .onChange(of: showsMinimizedCall) { _, _ in syncMinimizedCallSurface() }

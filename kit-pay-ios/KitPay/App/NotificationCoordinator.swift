@@ -458,6 +458,28 @@ enum NotificationResponseDispositionPolicy {
     }
 }
 
+/// UIKit may perform scene restoration inside this callback. Its caller can finish on any
+/// executor, so transfer the one system completion to the main queue before invoking it.
+final class NotificationSystemResponseCompletion: @unchecked Sendable {
+    private let lock = NSLock()
+    private var handler: (() -> Void)?
+
+    init(_ handler: @escaping () -> Void) { self.handler = handler }
+
+    func complete() {
+        lock.lock()
+        let callback = handler
+        handler = nil
+        lock.unlock()
+        guard let callback else { return }
+        if Thread.isMainThread {
+            callback()
+        } else {
+            DispatchQueue.main.async(execute: callback)
+        }
+    }
+}
+
 enum MessageNotificationTargetPolicy {
     /// Resolves the privacy-preserving digest from a locally generated notification back to one
     /// exact, already authenticated server message. Ambiguous or stale projections open the
@@ -3939,17 +3961,30 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
         willPresent notification: UNNotification,
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
     ) {
-        guard registrationEnabled, !privacyQuarantineActive else {
-            completionHandler([])
-            return
+        Task { @MainActor in
+            guard registrationEnabled, !privacyQuarantineActive else {
+                completionHandler([])
+                return
+            }
+            completionHandler([.banner, .badge, .sound, .list])
         }
-        completionHandler([.banner, .badge, .sound, .list])
     }
 
     func userNotificationCenter(
         _ center: UNUserNotificationCenter,
         didReceive response: UNNotificationResponse,
         withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
+        let completion = NotificationSystemResponseCompletion(completionHandler)
+        Task { @MainActor in
+            handleNotificationResponse(response, completion: completion)
+        }
+    }
+
+    @MainActor
+    private func handleNotificationResponse(
+        _ response: UNNotificationResponse,
+        completion: NotificationSystemResponseCompletion
     ) {
         let content = response.notification.request.content
         let userText = (response as? UNTextInputNotificationResponse)?.userText
@@ -3989,27 +4024,27 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
                 // actor retain the route while AppModel restores protected/account-bound state.
                 // The synchronous opaque write closes the termination gap before this callback.
                 MessageNotificationActionDispatcher.persistBeforeCompletingSystemResponse(action)
-                completionHandler()
+                completion.complete()
                 Task { await MessageNotificationActionDispatcher.shared.dispatch(action) }
                 return
             }
             Task {
                 await MessageNotificationActionDispatcher.shared.dispatch(action)
-                completionHandler()
+                completion.complete()
             }
         case .claim(let action):
             ClaimablePaymentNotificationActionDispatcher
                 .persistBeforeCompletingSystemResponse(action)
-            completionHandler()
+            completion.complete()
             Task { await ClaimablePaymentNotificationActionDispatcher.shared.dispatch(action) }
         case .opaqueWake:
             NotificationCenter.default.post(
                 name: .kitRemoteWakeReceived,
                 object: content.userInfo
             )
-            completionHandler()
+            completion.complete()
         case .ignore:
-            completionHandler()
+            completion.complete()
         }
     }
 
