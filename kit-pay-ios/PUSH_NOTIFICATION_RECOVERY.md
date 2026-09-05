@@ -1,7 +1,7 @@
 # Notification delivery and recovery
 
-Build 67 advertises `1.0.16-r67` in the authenticated device record and
-`ios/1.0.16-r67` request header. The server enables the new visible encrypted-message
+Build 68 advertises `1.0.16-r68` in the authenticated device record and
+`ios/1.0.16-r68` request header. The server enables the new visible encrypted-message
 fallback only for a compatible client whose current device/enrollment preferences
 enable alerts and do not mute the message's conversation. A separate rollout flag
 defaults to false and must remain false until old workers have drained. Older
@@ -49,7 +49,7 @@ Foreground, reconnect, successful messaging sync, and durable local mute changes
 trigger preference reconciliation. Transient failures retry after 30 seconds;
 server `Retry-After` delays can extend this to at most one hour.
 HTTP 404, 405, or 501 waits for the next foreground/reconnect or a one-hour cooldown
-before ordinary sync callbacks may retry. This keeps build 67 compatible with a
+before ordinary sync callbacks may retry. This keeps build 68 compatible with a
 server that has not deployed the preference endpoint yet.
 
 The authenticated unread notification inbox recovers missed calls and ordinary
