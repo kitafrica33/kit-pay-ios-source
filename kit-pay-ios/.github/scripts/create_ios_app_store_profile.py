@@ -295,7 +295,10 @@ def _matching_bundle_ids(client: object, bundle_id: str) -> list[str]:
         query={
             "filter[identifier]": bundle_id,
             "fields[bundleIds]": "identifier,platform",
-            "limit": "2",
+            # Apple's identifier filter also returns prefix matches, including
+            # the app's share and broadcast extensions. Keep the response
+            # bounded and require completeness before selecting the exact ID.
+            "limit": "200",
         },
         expected_status=200,
         operation="bundle ID lookup",

@@ -257,6 +257,13 @@ readiness.
    video, Bluetooth routing, and Picture in Picture cannot be exercised in the Simulator or in CI.
    `PARITY.md` carries the acceptance script.
 
+Before signing, associate `africa.kit.pay.ios`, `africa.kit.pay.ios.share`, and
+`africa.kit.pay.ios.broadcast` with the existing `group.africa.kit.pay.ios` App Group in the Apple
+Developer portal. Enabling `APP_GROUPS` through App Store Connect alone does not make this
+association; generated profiles must pass the existing exact App Group entitlement validation.
+The bounded 200-result bundle-ID prefix lookup still rejects incomplete responses and requires
+a unique exact iOS-capable identifier.
+
 Publication workflows are manual. Ordinary pushes and pull requests do not start quality jobs,
 Mac builds, or Simulators. Use **Build iOS Simulator** only when an explicit diagnostic build is
 needed; a release does not depend on that separate run.

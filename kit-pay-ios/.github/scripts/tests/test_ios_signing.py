@@ -795,6 +795,64 @@ class PrepareIOSSigningTests(unittest.TestCase):
 
 
 class AppStoreProfileGeneratorTests(unittest.TestCase):
+    def test_bundle_lookup_selects_exact_main_from_three_prefix_matches(self) -> None:
+        resources = [
+            bundle_resource("UNIVERSAL", resource_id="499G4424Z5"),
+            {
+                "type": "bundleIds",
+                "id": "9M92M88X47",
+                "attributes": {"identifier": SHARE_BUNDLE, "platform": "UNIVERSAL"},
+            },
+            {
+                "type": "bundleIds",
+                "id": "D92SJLZT9X",
+                "attributes": {
+                    "identifier": BUNDLE + ".broadcast",
+                    "platform": "UNIVERSAL",
+                },
+            },
+        ]
+
+        class PrefixMatchingClient(FakeAppStoreConnectClient):
+            def request(self, method: str, path: str, **kwargs: object) -> object:
+                if method != "GET" or path != "/v1/bundleIds":
+                    raise AssertionError("Bundle lookup must not mutate identifiers")
+                limit = int(kwargs["query"]["limit"])
+                response = api_collection(ordered_resources[:limit])
+                response["meta"] = {
+                    "paging": {"total": len(ordered_resources), "limit": limit}
+                }
+                if limit < len(ordered_resources):
+                    response["links"]["next"] = (
+                        "https://api.appstoreconnect.apple.com/v1/bundleIds?cursor=next"
+                    )
+                self.responses.append(response)
+                return super().request(method, path, **kwargs)
+
+        for ordered_resources in (resources, list(reversed(resources))):
+            with self.subTest(first_resource=ordered_resources[0]["id"]):
+                client = PrefixMatchingClient([])
+
+                result = PROFILE_GENERATOR._ensure_bundle_id(client, BUNDLE, "Kit Pay")
+
+                self.assertEqual(result, "499G4424Z5")
+                self.assertEqual([call["method"] for call in client.calls], ["GET"])
+
+    def test_bundle_lookup_rejects_next_page_even_when_exact_match_is_present(self) -> None:
+        response = api_collection([bundle_resource("UNIVERSAL")])
+        response["links"]["next"] = (
+            "https://api.appstoreconnect.apple.com/v1/bundleIds?cursor=next"
+        )
+        client = FakeAppStoreConnectClient([response])
+
+        with self.assertRaisesRegex(
+            PROFILE_GENERATOR.ProvisioningError,
+            "incomplete bundle ID collection",
+        ):
+            PROFILE_GENERATOR._ensure_bundle_id(client, BUNDLE, "Kit Pay")
+
+        self.assertEqual([call["method"] for call in client.calls], ["GET"])
+
     def test_bundle_lookup_accepts_exact_ios_and_universal_bundle(self) -> None:
         for platform in ("IOS", "UNIVERSAL"):
             with self.subTest(platform=platform):
@@ -810,7 +868,7 @@ class AppStoreProfileGeneratorTests(unittest.TestCase):
                     {
                         "filter[identifier]": BUNDLE,
                         "fields[bundleIds]": "identifier,platform",
-                        "limit": "2",
+                        "limit": "200",
                     },
                 )
 
@@ -1570,12 +1628,12 @@ class SigningConfigurationTests(unittest.TestCase):
         readme = (ROOT / "README.md").read_text()
 
         self.assertIn("default: 1.0.16", workflow)
-        self.assertIn('default: "68"', workflow)
-        self.assertIn("v1.0.16-build68", workflow)
+        self.assertIn('default: "69"', workflow)
+        self.assertIn("v1.0.16-build69", workflow)
         # Six each: Debug and Release of the app and both extensions. iOS refuses to
         # install an app whose extension carries a different version, so they move together.
         self.assertEqual(project.count("MARKETING_VERSION = 1.0.16;"), 6)
-        self.assertEqual(project.count("CURRENT_PROJECT_VERSION = 68;"), 6)
+        self.assertEqual(project.count("CURRENT_PROJECT_VERSION = 69;"), 6)
         self.assertNotIn("MARKETING_VERSION = 1.0.1;", project)
         self.assertIn("1.0.16-r39", readme)
         self.assertIn("group_payment_request.{created,contributed,completed,cancelled,expired}", readme)
