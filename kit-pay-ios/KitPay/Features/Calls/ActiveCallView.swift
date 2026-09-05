@@ -805,16 +805,7 @@ struct ActiveCallView: View {
                 }
             }
             .task(id: autoHideGeneration) {
-                guard shouldAutoHideControls else { return }
-                do {
-                    try await Task.sleep(
-                        nanoseconds: CallControlsVisibilityPolicy.autoHideDelayNanoseconds
-                    )
-                } catch {
-                    return
-                }
-                guard !Task.isCancelled, shouldAutoHideControls else { return }
-                updateControlsVisibility(false)
+                await autoHideControlsIfNeeded()
             }
             .sheet(isPresented: $showsAddParticipant) {
                 if let activeCall = coordinator.activeCall {
@@ -1247,6 +1238,20 @@ struct ActiveCallView: View {
                 isSpeaking: participant.isSpeaking
             )
         }
+    }
+
+    @MainActor
+    private func autoHideControlsIfNeeded() async {
+        guard shouldAutoHideControls else { return }
+        do {
+            try await Task<Never, Never>.sleep(
+                nanoseconds: CallControlsVisibilityPolicy.autoHideDelayNanoseconds
+            )
+        } catch {
+            return
+        }
+        guard !Task<Never, Never>.isCancelled, shouldAutoHideControls else { return }
+        updateControlsVisibility(false)
     }
 
     private func revealControls() {

@@ -957,9 +957,10 @@ enum GalleryVideoActivationPolicy {
     @MainActor
     static func cachedPoster(
         forKey contentKey: String,
-        in store: ChatMediaThumbnailStore = .shared
+        in store: ChatMediaThumbnailStore? = nil
     ) -> UIImage? {
-        store.cachedThumbnail(forKey: contentKey, maxPixel: galleryPosterMaxPixel)
+        let store = store ?? .shared
+        return store.cachedThumbnail(forKey: contentKey, maxPixel: galleryPosterMaxPixel)
             ?? store.cachedThumbnail(forKey: contentKey, maxPixel: conversationPosterMaxPixel)
     }
 }

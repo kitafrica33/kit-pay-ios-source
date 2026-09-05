@@ -1065,7 +1065,7 @@ private final class SharedInboxDestinationCell: UITableViewCell {
         }.value
     }
 
-    private static func downsampleAvatar(_ data: Data) -> UIImage? {
+    nonisolated private static func downsampleAvatar(_ data: Data) -> UIImage? {
         let sourceOptions: [CFString: Any] = [kCGImageSourceShouldCache: false]
         guard let source = CGImageSourceCreateWithData(
             data as CFData,
