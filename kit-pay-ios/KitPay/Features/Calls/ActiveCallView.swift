@@ -2148,93 +2148,7 @@ struct MinimizedCallView: View {
         let barFrame = CallBannerMetrics.contentFrame(
             container: geometry.frame(in: .global), topInset: topInset
         )
-        return ZStack(alignment: .bottom) {
-            Button(action: reopen) {
-                Color.clear
-                    .frame(maxWidth: .infinity)
-                    .frame(height: barContentHeight)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Return to call with \(call.participantName)")
-            .accessibilityValue(compactStatus(for: call))
-
-            HStack(spacing: 10) {
-                HStack(spacing: 10) {
-                    CallParticipantAvatarView(
-                        name: call.participantName,
-                        avatarURL: call.participantAvatarURL,
-                        size: 38
-                    )
-                    VStack(alignment: .leading, spacing: 2) {
-                        VerifiedAccountNameLabel(
-                            designation: call.participantVerification,
-                            badgeDiameter: 13
-                        ) {
-                            Text(call.participantName)
-                                .font(.subheadline.bold())
-                                .foregroundStyle(.primary)
-                                .lineLimit(1)
-                        }
-                        HStack(spacing: 5) {
-                            Circle()
-                                .fill(KitColor.green)
-                                .frame(width: 7, height: 7)
-                            TimelineView(.periodic(from: .now, by: 1)) { timeline in
-                                Text(compactStatus(for: call, at: timeline.date))
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                    .monospacedDigit()
-                                    .lineLimit(1)
-                            }
-                        }
-                    }
-                    Spacer(minLength: 6)
-                    CallBannerVoiceWave(
-                        level: max(media.localVoiceLevel, media.remoteVoiceLevel),
-                        isConnected: coordinator.state == .connected,
-                        animated: !reduceMotion
-                    )
-                    .frame(width: 52, height: 22)
-                }
-                .contentShape(Rectangle())
-                .allowsHitTesting(false)
-
-                minimizedControl(
-                    icon: media.isMicrophoneEnabled ? "mic.fill" : "mic.slash.fill",
-                    label: media.isMicrophoneEnabled ? "Mute" : "Unmute",
-                    foreground: media.isMicrophoneEnabled ? KitColor.primaryText : .white,
-                    background: media.isMicrophoneEnabled
-                        ? AnyShapeStyle(.thinMaterial)
-                        : AnyShapeStyle(KitColor.navy),
-                    enabled: CallControlAvailabilityPolicy.microphoneControlIsEnabled(
-                        isConnected: coordinator.state == .connected,
-                        isReconnecting: coordinator.state == .reconnecting
-                    )
-                ) {
-                    coordinator.requestMuted(media.isMicrophoneEnabled)
-                }
-                .accessibilityIdentifier("call.banner.mute")
-                minimizedControl(
-                    icon: "phone.down.fill",
-                    label: "End call",
-                    foreground: .white,
-                    background: AnyShapeStyle(Color(red: 0.98, green: 0.02, blue: 0.25)),
-                    enabled: coordinator.state != .ending
-                ) {
-                    coordinator.requestEnd()
-                }
-                .accessibilityIdentifier("call.banner.end")
-            }
-            .padding(.leading, max(14, windowSafeAreaInsets.leading + 8))
-            .padding(.trailing, max(14, windowSafeAreaInsets.trailing + 8))
-            .frame(height: barContentHeight)
-            .accessibilityElement(children: .contain)
-            .accessibilityIdentifier("call.banner.row")
-            // SwiftUI otherwise exposes only the union of the 44pt controls as this group's
-            // accessibility frame. The row and its return-to-call surface are both 56pt tall.
-            .accessibilityFrame(barFrame)
-        }
+        return staticAudioCallRow(for: call)
         .frame(height: topInset + barContentHeight, alignment: .bottom)
         .frame(maxWidth: .infinity)
         .background {
@@ -2266,6 +2180,104 @@ struct MinimizedCallView: View {
         .accessibilityValue(compactStatus(for: call))
         .onAppear { onSurfaceFrameChange?(barFrame) }
         .onChange(of: barFrame) { _, frame in onSurfaceFrameChange?(frame) }
+    }
+
+    private func staticAudioCallRow(for call: ActiveCallPresentation) -> some View {
+        ZStack(alignment: .bottom) {
+            staticAudioCallReturnButton(for: call)
+
+            HStack(spacing: 10) {
+                staticAudioCallParticipantContent(for: call)
+
+                minimizedControl(
+                    icon: media.isMicrophoneEnabled ? "mic.fill" : "mic.slash.fill",
+                    label: media.isMicrophoneEnabled ? "Mute" : "Unmute",
+                    foreground: media.isMicrophoneEnabled ? KitColor.primaryText : .white,
+                    background: media.isMicrophoneEnabled
+                        ? AnyShapeStyle(.thinMaterial)
+                        : AnyShapeStyle(KitColor.navy),
+                    enabled: CallControlAvailabilityPolicy.microphoneControlIsEnabled(
+                        isConnected: coordinator.state == .connected,
+                        isReconnecting: coordinator.state == .reconnecting
+                    )
+                ) {
+                    coordinator.requestMuted(media.isMicrophoneEnabled)
+                }
+                .accessibilityIdentifier("call.banner.mute")
+                minimizedControl(
+                    icon: "phone.down.fill",
+                    label: "End call",
+                    foreground: .white,
+                    background: AnyShapeStyle(Color(red: 0.98, green: 0.02, blue: 0.25)),
+                    enabled: coordinator.state != .ending
+                ) {
+                    coordinator.requestEnd()
+                }
+                .accessibilityIdentifier("call.banner.end")
+            }
+            .padding(.leading, max(14, windowSafeAreaInsets.leading + 8))
+            .padding(.trailing, max(14, windowSafeAreaInsets.trailing + 8))
+            .frame(height: CallBannerMetrics.contentHeight)
+        }
+        .frame(height: CallBannerMetrics.contentHeight)
+        // Include the full return surface in the row's accessibility container. Grouping only
+        // the foreground content reduces its reported bounds to the 44pt inline controls.
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("call.banner.row")
+    }
+
+    private func staticAudioCallReturnButton(for call: ActiveCallPresentation) -> some View {
+        Button(action: reopen) {
+            Color.clear
+                .frame(maxWidth: .infinity)
+                .frame(height: CallBannerMetrics.contentHeight)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Return to call with \(call.participantName)")
+        .accessibilityValue(compactStatus(for: call))
+    }
+
+    private func staticAudioCallParticipantContent(for call: ActiveCallPresentation) -> some View {
+        HStack(spacing: 10) {
+            CallParticipantAvatarView(
+                name: call.participantName,
+                avatarURL: call.participantAvatarURL,
+                size: 38
+            )
+            VStack(alignment: .leading, spacing: 2) {
+                VerifiedAccountNameLabel(
+                    designation: call.participantVerification,
+                    badgeDiameter: 13
+                ) {
+                    Text(call.participantName)
+                        .font(.subheadline.bold())
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                }
+                HStack(spacing: 5) {
+                    Circle()
+                        .fill(KitColor.green)
+                        .frame(width: 7, height: 7)
+                    TimelineView(.periodic(from: .now, by: 1)) { timeline in
+                        Text(compactStatus(for: call, at: timeline.date))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                            .lineLimit(1)
+                    }
+                }
+            }
+            Spacer(minLength: 6)
+            CallBannerVoiceWave(
+                level: max(media.localVoiceLevel, media.remoteVoiceLevel),
+                isConnected: coordinator.state == .connected,
+                animated: !reduceMotion
+            )
+            .frame(width: 52, height: 22)
+        }
+        .contentShape(Rectangle())
+        .allowsHitTesting(false)
     }
 
     private func minimizedDragGesture(
