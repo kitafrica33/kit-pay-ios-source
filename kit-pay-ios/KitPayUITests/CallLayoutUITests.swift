@@ -37,6 +37,18 @@ final class CallLayoutUITests: XCTestCase {
 
         let reopen = app.buttons["Return to call with Amina Demo"]
         XCTAssertTrue(reopen.exists)
+        let geometryDescription = """
+        row=\(row.frame)
+        return=\(reopen.frame)
+        end=\(end.frame)
+        mute=\(mute.frame)
+        navigation=\(navigation.frame)
+        """
+        print("[KitPayCallBannerGeometry] \(geometryDescription)")
+        let geometryAttachment = XCTAttachment(string: geometryDescription)
+        geometryAttachment.name = "active-call-banner-geometry"
+        geometryAttachment.lifetime = .keepAlways
+        add(geometryAttachment)
         XCTAssertEqual(reopen.frame.height, 56, accuracy: 1,
                        "The actual return-to-call surface must fill the entire banner row")
         XCTAssertEqual(row.frame.height, 56, accuracy: 1)

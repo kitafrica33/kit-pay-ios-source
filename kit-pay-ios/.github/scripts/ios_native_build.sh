@@ -30,12 +30,16 @@ case "$mode" in
     xcodebuild "${common[@]}" \
       -resultBundlePath "$RUNNER_TEMP/KitPay-opening-camera.xcresult" \
       -only-testing:KitPayTests/ConversationNativeOpeningTests \
+      -only-testing:KitPayTests/ChatMediaPolicyTests/testReceivedVideoPlaysToEndAndReplaysAfterParentFileCleanup \
+      -only-testing:KitPayTests/ChatMediaPolicyTests/testGalleryScrubbingRejectsInvalidTimesAndPreservesPauseIntent \
       -only-testing:KitPayUITests/AppStoreScreenshotUITests/testChatBottomPullOpensCameraOnlyAfterADeliberateRelease \
       -only-testing:KitPayUITests/CallLayoutUITests \
       test-without-building
     xcodebuild "${common[@]}" \
       -resultBundlePath "$RUNNER_TEMP/KitPay-quality.xcresult" \
       -skip-testing:KitPayTests/ConversationNativeOpeningTests \
+      -skip-testing:KitPayTests/ChatMediaPolicyTests/testReceivedVideoPlaysToEndAndReplaysAfterParentFileCleanup \
+      -skip-testing:KitPayTests/ChatMediaPolicyTests/testGalleryScrubbingRejectsInvalidTimesAndPreservesPauseIntent \
       -skip-testing:KitPayUITests/CallLayoutUITests \
       -skip-testing:KitPayUITests/AppStoreScreenshotUITests/testCaptureAppStoreScreenshots \
       -skip-testing:KitPayUITests/AppStoreScreenshotUITests/testChatBottomPullOpensCameraOnlyAfterADeliberateRelease \

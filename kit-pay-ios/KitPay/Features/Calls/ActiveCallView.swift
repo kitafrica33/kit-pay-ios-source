@@ -2148,7 +2148,15 @@ struct MinimizedCallView: View {
         let barFrame = CallBannerMetrics.contentFrame(
             container: geometry.frame(in: .global), topInset: topInset
         )
-        return staticAudioCallRow(for: call)
+        return VStack(spacing: 0) {
+            // This spacing belongs to the decorative status-area background, not the
+            // accessible row. Applying its height or containment to the row merges their bounds.
+            Color.clear
+                .frame(height: topInset)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+            staticAudioCallRow(for: call)
+        }
         .frame(height: topInset + barContentHeight, alignment: .bottom)
         .frame(maxWidth: .infinity)
         .background {
@@ -2175,9 +2183,6 @@ struct MinimizedCallView: View {
             .ignoresSafeArea(edges: .top)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel("Active call with \(call.participantName)")
-        .accessibilityValue(compactStatus(for: call))
         .onAppear { onSurfaceFrameChange?(barFrame) }
         .onChange(of: barFrame) { _, frame in onSurfaceFrameChange?(frame) }
     }
@@ -2224,6 +2229,8 @@ struct MinimizedCallView: View {
         // the foreground content reduces its reported bounds to the 44pt inline controls.
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("call.banner.row")
+        .accessibilityLabel("Active call with \(call.participantName)")
+        .accessibilityValue(compactStatus(for: call))
     }
 
     private func staticAudioCallReturnButton(for call: ActiveCallPresentation) -> some View {

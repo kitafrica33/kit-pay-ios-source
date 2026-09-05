@@ -151,7 +151,23 @@ final class AppStoreScreenshotUITests: XCTestCase {
                 }
             }
         }
-        if app.alerts["Camera"].exists { app.alerts["Camera"].buttons["OK"].tap() }
+        // Session configuration starts asynchronously after the microphone prompt. The
+        // Simulator's no-device alert can arrive after the permission UI has disappeared;
+        // an immediate `exists` snapshot misses it and leaves Close camera obstructed.
+        let cameraAlert = app.alerts["Camera"]
+        if cameraAlert.waitForExistence(timeout: 10) {
+            XCTAssertTrue(
+                cameraAlert.staticTexts["The camera is not available on this device."].exists,
+                "Camera startup produced an unexpected error"
+            )
+            tap(cameraAlert.buttons["OK"], in: app, message: "Camera availability alert could not close")
+        }
+        let cameraReady = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == true AND hittable == true"),
+            object: closeCamera
+        )
+        XCTAssertEqual(XCTWaiter.wait(for: [cameraReady], timeout: 10), .completed,
+                       "Close camera must be tappable after permission and startup alerts settle")
         retainHierarchy(app, named: "camera-pull-after-deliberate-release")
         tap(closeCamera, in: app, message: "A deliberate bottom pull did not open the real camera")
         require(timeline, in: app, message: "Closing camera did not restore the chat")

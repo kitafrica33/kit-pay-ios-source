@@ -160,6 +160,13 @@ if os.environ.get('KITPAY_FAIL_FOCUSED') == '1' and any(a.startswith('-only-test
         self.assertIn("-only-testing:KitPayUITests/CallLayoutUITests", calls[0])
         self.assertIn("-skip-testing:KitPayUITests/CallLayoutUITests", calls[1])
         self.assertIn("-skip-testing:KitPayUITests/AppStoreScreenshotUITests/testCaptureAppStoreScreenshots", calls[1])
+        for test in (
+            "testReceivedVideoPlaysToEndAndReplaysAfterParentFileCleanup",
+            "testGalleryScrubbingRejectsInvalidTimesAndPreservesPauseIntent",
+        ):
+            selector = "KitPayTests/ChatMediaPolicyTests/" + test
+            self.assertEqual(calls[0].count("-only-testing:" + selector), 1)
+            self.assertEqual(calls[1].count("-skip-testing:" + selector), 1)
 
     def test_both_marketing_devices_use_existing_products(self):
         for mode in ("marketing-iphone", "marketing-ipad"):
