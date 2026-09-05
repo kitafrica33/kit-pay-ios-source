@@ -51,7 +51,7 @@ private final class LiveKitScreenSharePublisher: CallScreenSharePublishing {
         preparedTrack = track
         // Create the receiver only after both system consent and named-call confirmation.
         // Publishing starts capture; canceled system pickers never allocate an IPC listener.
-        let publication = try await room.localParticipant.publishVideoTrack(track: track)
+        let publication = try await room.localParticipant.publish(videoTrack: track)
         guard publication.track != nil, !publication.isMuted
         else { throw CallScreenSharingError.publicationFailed }
     }
@@ -60,7 +60,7 @@ private final class LiveKitScreenSharePublisher: CallScreenSharePublishing {
         // Stop the local IPC capture before waiting for signalling to unpublish it.
         try? await preparedTrack?.stop()
         preparedTrack = nil
-        try? await room.localParticipant.setScreenShare(enabled: false)
+        _ = try? await room.localParticipant.setScreenShare(enabled: false)
     }
 }
 
