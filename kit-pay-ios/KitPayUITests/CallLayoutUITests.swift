@@ -35,7 +35,13 @@ final class CallLayoutUITests: XCTestCase {
         expectation(for: settled, evaluatedWith: app)
         waitForExpectations(timeout: 5)
 
+        let reopen = app.buttons["Return to call with Amina Demo"]
+        XCTAssertTrue(reopen.exists)
+        XCTAssertEqual(reopen.frame.height, 56, accuracy: 1,
+                       "The actual return-to-call surface must fill the entire banner row")
         XCTAssertEqual(row.frame.height, 56, accuracy: 1)
+        XCTAssertEqual(row.frame.minY, reopen.frame.minY, accuracy: 1)
+        XCTAssertEqual(row.frame.maxY, reopen.frame.maxY, accuracy: 1)
         XCTAssertEqual(end.frame.height, 44, accuracy: 1)
         XCTAssertEqual(mute.frame.height, 44, accuracy: 1)
         XCTAssertEqual(end.frame.midY, row.frame.midY, accuracy: 1)
@@ -57,8 +63,6 @@ final class CallLayoutUITests: XCTestCase {
         attachment.lifetime = .keepAlways
         add(attachment)
 
-        let reopen = app.buttons["Return to call with Amina Demo"]
-        XCTAssertTrue(reopen.exists)
         reopen.tap()
         XCTAssertTrue(minimize.waitForExistence(timeout: 10))
         XCTAssertFalse(end.exists)

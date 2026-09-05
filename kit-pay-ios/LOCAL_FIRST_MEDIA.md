@@ -46,6 +46,15 @@ This document is the release contract for the iOS messaging-media pipeline.
 - Passive image surfaces use bounded ImageIO downsampling, and video bubbles reuse a bounded
   in-memory poster cache. User-initiated full export remains separate from scrolling/rendering so
   a large compressed image cannot force an unbounded decode on the conversation path.
+- Received-video playback owns a private protected file link until its player and observers are
+  detached. Removing a gallery parent's temporary source cannot truncate a playing video. Native
+  regressions play MP4 and QuickTime content labelled MP4 to the end, then replay the same item
+  after that source has been removed. These small generated fixtures do not establish physical
+  decoder, large-file, or device-lock performance.
+- The gallery pauses during scrubbing, clamps finite seek positions to the actual asset duration,
+  and resumes only after the latest seek completes if the user still intends to play. Queued
+  progress, end, and seek callbacks cannot rewind a new position or undo a later pause. Completion
+  keeps the last frame and full progress visible; the next Play tap starts an explicit replay.
 
 ## Durable states and retry
 

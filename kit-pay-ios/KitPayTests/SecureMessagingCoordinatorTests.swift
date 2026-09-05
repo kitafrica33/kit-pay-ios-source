@@ -2527,6 +2527,71 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
         ] as [AnyHashable: Any]))
     }
 
+    func testVisibleMessagingWakeAdmitsOnlyTheRecipientBoundGenericEnvelope() throws {
+        let recipient = "10000000-0000-4000-8000-000000000001"
+        let exact: [AnyHashable: Any] = [
+            "type": "messaging.message_available", "scope": "messaging",
+            "notification_id": "20000000-0000-4000-8000-000000000001",
+            "message_id": "30000000-0000-4000-8000-000000000001",
+            "recipient_user_id": recipient,
+            "aps": ["alert": ["title": "Kit Pay", "body": "You have a new message."],
+                    "sound": "default", "content-available": 1] as [String: Any],
+        ]
+        let wake = try XCTUnwrap(SecureMessagingRemoteWake(exact))
+        XCTAssertNotNil(wake.messageAvailable)
+        var firebaseEnvelope = exact
+        firebaseEnvelope["gcm.message_id"] = "transport-message"
+        firebaseEnvelope["google.c.sender.id"] = "transport-sender"
+        firebaseEnvelope["google.c.fid"] = "installation"
+        firebaseEnvelope["google.c.a.e"] = "1"
+        XCTAssertEqual(SecureMessagingRemoteWake(firebaseEnvelope)?.messageAvailable, wake.messageAvailable)
+        firebaseEnvelope["google.c.a.e"] = ["unexpected": "nested-data"]
+        XCTAssertNil(SecureMessagingRemoteWake(firebaseEnvelope))
+        XCTAssertTrue(wake.permitsSync(userID: recipient.uppercased(), sessionAccountID: recipient))
+        XCTAssertFalse(wake.permitsSync(userID: recipient, sessionAccountID: nil))
+        XCTAssertFalse(wake.permitsSync(userID: recipient, sessionAccountID: UUID().uuidString))
+        XCTAssertFalse(wake.permitsSync(userID: UUID().uuidString, sessionAccountID: recipient))
+        let anotherUser = UUID().uuidString
+        XCTAssertFalse(wake.permitsSync(userID: anotherUser, sessionAccountID: anotherUser))
+        for field in ["message_id", "recipient_user_id", "notification_id"] {
+            var malformed = exact
+            malformed[field] = "invalid"
+            XCTAssertNil(SecureMessagingRemoteWake(malformed), field)
+        }
+        for field in ["sender_name", "conversation_id", "ciphertext", "body"] {
+            var leaked = exact
+            leaked[field] = "unexpected"
+            XCTAssertNil(SecureMessagingRemoteWake(leaked), field)
+        }
+        for aps: [String: Any] in [
+            ["alert": ["title": "Kit Pay", "body": "Sender text"], "sound": "default"],
+            ["alert": ["title": "Kit Pay", "body": "You have a new message."], "sound": "other"],
+            ["alert": ["title": "Kit Pay", "body": "You have a new message."],
+             "sound": "default", "badge": 1],
+            ["alert": ["title": "Kit Pay", "body": "You have a new message."],
+             "sound": "default", "content-available": 1.5],
+        ] {
+            var malformed = exact
+            malformed["aps"] = aps
+            XCTAssertNil(SecureMessagingRemoteWake(malformed))
+        }
+        var legacyWorker = exact
+        legacyWorker["aps"] = [
+            "alert": ["title": "Kit Pay", "body": "You have a new message."],
+            "sound": "default",
+        ] as [String: Any]
+        XCTAssertEqual(SecureMessagingRemoteWake(legacyWorker)?.messageAvailable, wake.messageAvailable)
+        var repeated = exact
+        repeated["notification_id"] = UUID().uuidString
+        XCTAssertEqual(
+            SecureMessagingRemoteWake(repeated)?.messageAvailable?.deduplicationKey,
+            wake.messageAvailable?.deduplicationKey
+        )
+        var wronglyRetyped = exact
+        wronglyRetyped["type"] = "messaging.sync"
+        XCTAssertNil(SecureMessagingRemoteWake(wronglyRetyped), "The silent contract remains exact")
+    }
+
     func testMessagingCapabilityRequiresTheExactReviewedSuite() {
         XCTAssertTrue(MessagingProtocolCapabilityDTO(
             ready: true,

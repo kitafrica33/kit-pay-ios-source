@@ -3124,8 +3124,9 @@ final class ChatMediaPolicyTests: XCTestCase {
                       "An old end notification must not pause, rewind or close the new player")
 
         controller.handlePlaybackEnded(item: replacementItem)
-        XCTAssertFalse(controller.isPlaying)
-        XCTAssertEqual(controller.currentTime, 0)
+        XCTAssertTrue(controller.isPlaying,
+                      "A queued end callback cannot finish an item that is now near its start")
+        controller.pause()
 
         ChatMediaAccountLifetime.invalidate()
         controller.togglePlayback()
@@ -3138,6 +3139,158 @@ final class ChatMediaPolicyTests: XCTestCase {
             restoreFromPictureInPicture: { _ in XCTFail("Retired account restored PiP") }
         )
         XCTAssertFalse(stalePrepared)
+    }
+
+    @MainActor
+    func testReceivedVideoPlaysToEndAndReplaysAfterParentFileCleanup() async throws {
+        for fileType in [AVFileType.mp4, .mov] {
+            let generated = try await makePlayableVideo(
+                fileType: fileType, pathExtension: fileType == .mp4 ? "mp4" : "mov",
+                frameCount: 72, framesPerSecond: 24
+            )
+            defer { try? FileManager.default.removeItem(at: generated) }
+            // Some Android providers label QuickTime bytes as MP4. Exercise the same protected
+            // received-file boundary for both containers, including that historical mismatch.
+            let received = try ChatMediaTempFiles.copyTemporaryFile(
+                from: generated, mediaType: "video/mp4"
+            )
+            defer { ChatMediaTempFiles.removeTemporaryFile(received) }
+            let controller = GalleryVideoController()
+            defer { controller.teardown(allowsPictureInPictureRetention: false) }
+            let prepared = await controller.prepare(
+                fileURL: received, ownsFile: false, protectedOriginalLease: nil,
+                mediaType: "video/mp4", expectedByteCount: try fileByteCount(received),
+                contentKey: UUID().uuidString, mediaID: UUID(), isOutgoing: false,
+                galleryIdentity: .init(messageID: UUID(), itemIndex: 1),
+                restoreFromPictureInPicture: { _ in }
+            )
+            XCTAssertTrue(prepared)
+            let player = try XCTUnwrap(controller.player)
+            let item = try XCTUnwrap(player.currentItem)
+            let playbackURL = try XCTUnwrap(controller.playbackURL)
+            let decodedFrames = VideoDecodeProbe()
+            item.add(decodedFrames.output)
+            let frameObserver = player.addPeriodicTimeObserver(
+                forInterval: CMTime(value: 1, timescale: 24), queue: .main
+            ) { time in
+                Task { @MainActor in decodedFrames.consume(at: time) }
+            }
+            defer {
+                player.removeTimeObserver(frameObserver)
+                item.remove(decodedFrames.output)
+            }
+            XCTAssertEqual(controller.duration, 3, accuracy: 0.1)
+            controller.toggleMute()
+            ChatMediaTempFiles.removeTemporaryFile(received)
+            try FileManager.default.removeItem(at: generated)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: received.path))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: playbackURL.path))
+
+            for _ in 0 ..< 2 {
+                let previousFrameCount = decodedFrames.count
+                let ended = expectation(
+                    forNotification: .AVPlayerItemDidPlayToEndTime, object: item
+                )
+                controller.togglePlayback()
+                await fulfillment(of: [ended], timeout: 12)
+                let completed = try await waitForVideoCondition { controller.hasReachedEnd }
+                XCTAssertTrue(completed)
+                XCTAssertFalse(controller.isPlaying)
+                XCTAssertNil(controller.errorMessage)
+                XCTAssertNil(item.error)
+                XCTAssertGreaterThan(decodedFrames.count, previousFrameCount,
+                                     "Playback must decode frames, not only advance a timeline")
+                XCTAssertEqual(controller.currentTime, controller.duration, accuracy: 0.1)
+                XCTAssertGreaterThanOrEqual(item.currentTime().seconds, controller.duration - 0.1,
+                                            "Completion must leave the final frame visible")
+                controller.receivePlaybackTime(.zero, from: item)
+                XCTAssertEqual(controller.currentTime, controller.duration,
+                               "A queued progress callback cannot reset completed progress")
+            }
+            controller.teardown(allowsPictureInPictureRetention: false)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: playbackURL.path))
+        }
+    }
+
+    @MainActor
+    func testGalleryScrubbingRejectsInvalidTimesAndPreservesPauseIntent() async throws {
+        let source = try await makePlayableVideo(
+            fileType: .mp4, pathExtension: "mp4", frameCount: 72, framesPerSecond: 24
+        )
+        defer { try? FileManager.default.removeItem(at: source) }
+        let controller = GalleryVideoController()
+        defer { controller.teardown(allowsPictureInPictureRetention: false) }
+        let prepared = await controller.prepare(
+            fileURL: source, ownsFile: false, protectedOriginalLease: nil,
+            mediaType: "video/mp4", expectedByteCount: try fileByteCount(source),
+            contentKey: UUID().uuidString, mediaID: UUID(), isOutgoing: false,
+            galleryIdentity: .init(messageID: UUID(), itemIndex: nil),
+            restoreFromPictureInPicture: { _ in }
+        )
+        XCTAssertTrue(prepared)
+        let player = try XCTUnwrap(controller.player)
+        let item = try XCTUnwrap(player.currentItem)
+        controller.toggleMute()
+        controller.togglePlayback()
+        controller.setScrubbing(true)
+        controller.scrub(to: 1)
+        XCTAssertEqual(player.rate, 0, "Scrubbing must suspend decoding at playback speed")
+        for invalid in [Double.nan, .infinity, -.infinity] {
+            controller.scrub(to: invalid)
+            XCTAssertEqual(controller.currentTime, 1)
+        }
+        controller.scrub(to: -1)
+        XCTAssertEqual(controller.currentTime, 0)
+        controller.scrub(to: .greatestFiniteMagnitude)
+        XCTAssertEqual(controller.currentTime, controller.duration)
+        controller.scrub(to: 1)
+        controller.receivePlaybackTime(CMTime(seconds: 2, preferredTimescale: 600), from: item)
+        controller.handlePlaybackEnded(item: item)
+        XCTAssertEqual(controller.currentTime, 1)
+        XCTAssertTrue(controller.isPlaying)
+        XCTAssertFalse(controller.hasReachedEnd)
+        controller.setScrubbing(false)
+        controller.pause()
+        let sought = try await waitForVideoCondition {
+            abs(item.currentTime().seconds - 1) < 0.1
+        }
+        XCTAssertTrue(sought)
+        XCTAssertFalse(controller.isPlaying, "Seek completion cannot undo an explicit pause")
+        XCTAssertEqual(player.rate, 0)
+
+        // VoiceOver changes Slider values without starting a drag. It must seek the real item.
+        controller.scrub(to: 2)
+        let accessibleSeek = try await waitForVideoCondition {
+            abs(item.currentTime().seconds - 2) < 0.1
+        }
+        XCTAssertTrue(accessibleSeek)
+        XCTAssertFalse(controller.isPlaying)
+        XCTAssertEqual(player.rate, 0)
+    }
+
+    @MainActor
+    private final class VideoDecodeProbe {
+        let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
+            kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
+        ])
+        private(set) var count = 0
+
+        func consume(at time: CMTime) {
+            guard output.hasNewPixelBuffer(forItemTime: time),
+                  output.copyPixelBuffer(forItemTime: time, itemTimeForDisplay: nil) != nil
+            else { return }
+            count += 1
+        }
+    }
+
+    @MainActor
+    private func waitForVideoCondition(_ condition: () -> Bool) async throws -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(3))
+        while !condition(), clock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        return condition()
     }
 
     @MainActor
@@ -3422,7 +3575,9 @@ final class ChatMediaPolicyTests: XCTestCase {
 
     private func makePlayableVideo(
         fileType: AVFileType,
-        pathExtension: String
+        pathExtension: String,
+        frameCount: Int = 2,
+        framesPerSecond: Int32 = 1
     ) async throws -> URL {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(
             "kit-playback-probe-\(UUID().uuidString).\(pathExtension)"
@@ -3464,13 +3619,20 @@ final class ChatMediaPolicyTests: XCTestCase {
             memset(base, 0, CVPixelBufferGetDataSize(buffer))
         }
         CVPixelBufferUnlockBaseAddress(buffer, [])
-        guard input.isReadyForMoreMediaData,
-              adaptor.append(buffer, withPresentationTime: .zero),
-              adaptor.append(
-                  buffer,
-                  withPresentationTime: CMTime(seconds: 1, preferredTimescale: 600)
-              )
-        else { throw writer.error ?? ChatVideoPlaybackPreparationError.unsupportedVideo }
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(5))
+        for frame in 0 ..< frameCount {
+            while !input.isReadyForMoreMediaData, writer.status == .writing, clock.now < deadline {
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            guard input.isReadyForMoreMediaData,
+                  adaptor.append(
+                      buffer,
+                      withPresentationTime: CMTime(value: Int64(frame), timescale: framesPerSecond)
+                  )
+            else { throw writer.error ?? ChatVideoPlaybackPreparationError.unsupportedVideo }
+        }
+        writer.endSession(atSourceTime: CMTime(value: Int64(frameCount), timescale: framesPerSecond))
         input.markAsFinished()
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             writer.finishWriting { continuation.resume() }

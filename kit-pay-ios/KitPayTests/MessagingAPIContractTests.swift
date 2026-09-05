@@ -8,6 +8,395 @@ final class MessagingAPIContractTests: XCTestCase {
     private let messageId = "33333333-3333-4333-8333-333333333333"
     private let rosterRevision = "v1:sha256:" + String(repeating: "a", count: 64)
 
+    func testNotificationPreferencesDecodeExactSnapshotAndRejectMalformedFields() throws {
+        let object = notificationPreferenceObject()
+        let snapshot = try decode(NotificationPreferenceSnapshot.self, object: object)
+        XCTAssertEqual(snapshot.enrollmentEpoch, 5)
+        XCTAssertEqual(snapshot.revision, 8)
+        XCTAssertTrue(snapshot.encryptedMessageAlerts)
+        XCTAssertEqual(snapshot.mutedConversationIDs, [conversationId])
+        XCTAssertTrue(snapshot.isValid)
+
+        let mutations: [(String, Any?)] = [
+            ("enrollment_epoch", nil), ("enrollment_epoch", NSNull()), ("enrollment_epoch", "5"),
+            ("revision", nil), ("revision", 0.5), ("encrypted_message_alerts", nil),
+            ("encrypted_message_alerts", NSNull()), ("encrypted_message_alerts", "true"),
+            ("encrypted_message_alerts", 1), ("muted_conversation_ids", nil),
+            ("muted_conversation_ids", NSNull()), ("muted_conversation_ids", [42]),
+        ]
+        for (key, value) in mutations {
+            XCTAssertThrowsError(try decode(NotificationPreferenceSnapshot.self,
+                                           object: replacing(object, at: [key], with: value)),
+                                 "Malformed preference field \(key) must not decode")
+        }
+    }
+
+    func testNotificationPreferencesReadUsesCurrentAuthenticatedDevice() async throws {
+        let object = notificationPreferenceObject()
+        try await withNotificationInboxTransport(response: ["ok": true, "data": object]) { api, transport in
+            let snapshot = try await api.notificationPreferences()
+            XCTAssertEqual(snapshot.revision, 8)
+            XCTAssertEqual(snapshot.mutedConversationIDs, [conversationId])
+            XCTAssertEqual(transport.requests.count, 1)
+            let request = try XCTUnwrap(transport.requests.first)
+            XCTAssertEqual(request.url?.path, "/api/kit-wallet/v1/notifications/preferences")
+            XCTAssertNil(request.url?.query)
+            XCTAssertEqual(request.httpMethod, "GET")
+            XCTAssertNil(request.httpBody)
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer inbox-test-token")
+            XCTAssertNotNil(request.value(forHTTPHeaderField: "X-Kit-Wallet-Session-ID"))
+        }
+    }
+
+    func testNotificationPreferencesUpdateSendsEpochRevisionAndCompleteMuteSnapshot() async throws {
+        let object = notificationPreferenceObject()
+        try await withNotificationInboxTransport(response: ["ok": true, "data": object]) { api, transport in
+            let snapshot = try await api.updateNotificationPreferences(
+                expectedEnrollmentEpoch: 5, expectedRevision: 7,
+                encryptedMessageAlerts: true, mutedConversationIDs: [conversationId]
+            )
+            XCTAssertEqual(snapshot.enrollmentEpoch, 5)
+            XCTAssertEqual(snapshot.revision, 8)
+            XCTAssertEqual(transport.requests.count, 1)
+            let request = try XCTUnwrap(transport.requests.first)
+            XCTAssertEqual(request.url?.path, "/api/kit-wallet/v1/notifications/preferences")
+            XCTAssertEqual(request.httpMethod, "PUT")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer inbox-test-token")
+            let body = try XCTUnwrap(transport.requestBodies.first)
+            let json = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+            XCTAssertEqual(Set(json.keys), Set([
+                "expected_enrollment_epoch", "expected_revision", "encrypted_message_alerts", "muted_conversation_ids",
+            ]))
+            XCTAssertEqual(json["expected_enrollment_epoch"] as? Int, 5)
+            XCTAssertEqual(json["expected_revision"] as? Int, 7)
+            XCTAssertEqual(json["encrypted_message_alerts"] as? Bool, true)
+            XCTAssertEqual(json["muted_conversation_ids"] as? [String], [conversationId])
+        }
+    }
+
+    func testNotificationPreferencesRejectInvalidInputBeforeNetworkAndMalformedReadSnapshots() async throws {
+        let invalid: [(Int, Int, [String])] = [
+            (-1, 0, []), (0, 0, []), (9_007_199_254_740_992, 0, []),
+            (1, -1, []), (1, 9_007_199_254_740_992, []),
+            (1, 0, ["not-a-uuid"]), (1, 0, [conversationId, conversationId]),
+            (1, 0, ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".uppercased()]),
+            (1, 0, (0..<2_049).map(notificationPreferenceConversationID)),
+        ]
+        for (epoch, revision, muted) in invalid {
+            let object: [String: Any] = [
+                "enrollment_epoch": epoch, "revision": revision,
+                "encrypted_message_alerts": true, "muted_conversation_ids": muted,
+            ]
+            try await withNotificationInboxTransport(response: ["ok": true, "data": object]) { api, transport in
+                do {
+                    _ = try await api.updateNotificationPreferences(
+                        expectedEnrollmentEpoch: epoch, expectedRevision: revision,
+                        encryptedMessageAlerts: true, mutedConversationIDs: muted
+                    )
+                    XCTFail("Invalid preference inputs must fail before transport")
+                } catch APIClientError.invalidResponse {}
+                XCTAssertTrue(transport.requests.isEmpty)
+                do {
+                    _ = try await api.notificationPreferences()
+                    XCTFail("Malformed server preference state must not become an acknowledgement")
+                } catch APIClientError.invalidResponse {}
+                XCTAssertEqual(transport.requests.count, 1)
+            }
+        }
+    }
+
+    func testNotificationPreferencesAcceptMaximumMuteSnapshotAndExplicitDisabledFallback() async throws {
+        let maximum = (0..<2_048).map(notificationPreferenceConversationID)
+        for (enabled, muted) in [(true, maximum), (false, [String]())] {
+            var object = notificationPreferenceObject()
+            object["encrypted_message_alerts"] = enabled
+            object["muted_conversation_ids"] = muted
+            try await withNotificationInboxTransport(response: ["ok": true, "data": object]) { api, transport in
+                let result = try await api.updateNotificationPreferences(
+                    expectedEnrollmentEpoch: 5, expectedRevision: 7,
+                    encryptedMessageAlerts: enabled, mutedConversationIDs: muted
+                )
+                XCTAssertEqual(result.encryptedMessageAlerts, enabled)
+                XCTAssertEqual(result.mutedConversationIDs, muted)
+                XCTAssertEqual(transport.requests.count, 1)
+            }
+        }
+    }
+
+    func testNotificationPreferenceRevisionBoundsPermitLastSafeIncrement() async throws {
+        var object = notificationPreferenceObject()
+        object["revision"] = 9_007_199_254_740_991
+        try await withNotificationInboxTransport(response: ["ok": true, "data": object]) { api, transport in
+            let result = try await api.updateNotificationPreferences(
+                expectedEnrollmentEpoch: 5, expectedRevision: 9_007_199_254_740_990,
+                encryptedMessageAlerts: true, mutedConversationIDs: [conversationId]
+            )
+            XCTAssertEqual(result.revision, 9_007_199_254_740_991)
+            for unsupported in [9_007_199_254_740_991, Int.max] {
+                do {
+                    _ = try await api.updateNotificationPreferences(
+                        expectedEnrollmentEpoch: 5, expectedRevision: unsupported,
+                        encryptedMessageAlerts: true, mutedConversationIDs: [conversationId]
+                    )
+                    XCTFail("Revisions outside the wire contract must fail before sending")
+                } catch APIClientError.invalidResponse {}
+            }
+            XCTAssertEqual(transport.requests.count, 1)
+        }
+    }
+
+    func testNotificationPreferenceUpdateRejectsMismatchedAcknowledgement() async throws {
+        let valid = notificationPreferenceObject()
+        let mutations: [(String, Any)] = [
+            ("enrollment_epoch", 6), ("revision", 7), ("revision", 9),
+            ("encrypted_message_alerts", false), ("muted_conversation_ids", [String]()),
+            ("muted_conversation_ids", [recipientDeviceId]),
+        ]
+        for (key, value) in mutations {
+            let object = replacing(valid, at: [key], with: value)
+            try await withNotificationInboxTransport(response: ["ok": true, "data": object]) { api, _ in
+                do {
+                    _ = try await api.updateNotificationPreferences(
+                        expectedEnrollmentEpoch: 5, expectedRevision: 7,
+                        encryptedMessageAlerts: true, mutedConversationIDs: [conversationId]
+                    )
+                    XCTFail("A successful PUT must acknowledge the exact epoch and requested mute state")
+                } catch APIClientError.invalidResponse {}
+            }
+        }
+    }
+
+    private func notificationPreferenceObject() -> [String: Any] {
+        ["enrollment_epoch": 5, "revision": 8, "encrypted_message_alerts": true,
+         "muted_conversation_ids": [conversationId]]
+    }
+
+    private func notificationPreferenceConversationID(_ value: Int) -> String {
+        String(format: "70000000-0000-4000-8000-%012d", value)
+    }
+
+    func testNotificationInboxDecodesMixedDurableEntriesAndNullablePayloadFields() throws {
+        var missed = notificationInboxItem(type: "call.missed")
+        missed["data"] = [
+            "call_id": conversationId, "recipient_user_id": recipientDeviceId,
+            "state": "missed", "missed_call_alert": true,
+        ]
+        var payment = notificationInboxItem(type: "payment.settled")
+        payment["data"] = ["amount": "1250.00", "currency": "UGX", "call_id": NSNull()]
+        var support = notificationInboxItem(type: "support.ticket")
+        support["data"] = [String: Any]()
+        support["read_at"] = "2026-09-05T10:00:00Z"
+        var silent = notificationInboxItem(type: "call.ended")
+        silent["silent"] = true
+        let envelope = try decode(APIEnvelope<NotificationInboxItems>.self, object:
+            notificationInboxEnvelope(items: [missed, payment, support, silent]))
+        let items = try XCTUnwrap(envelope.data?.items)
+
+        XCTAssertEqual(items.map(\.type), ["call.missed", "payment.settled", "support.ticket", "call.ended"])
+        XCTAssertEqual(items[0].data.callID, conversationId)
+        XCTAssertEqual(items[0].data.recipientUserID, recipientDeviceId)
+        XCTAssertEqual(items[0].data.state, "missed")
+        XCTAssertEqual(items[0].data.missedCallAlert, true)
+        XCTAssertNil(items[0].readAt)
+        XCTAssertNil(items[1].data.callID)
+        XCTAssertNil(items[2].data.recipientUserID)
+        XCTAssertEqual(items[2].readAt, "2026-09-05T10:00:00Z")
+        XCTAssertTrue(items[3].silent)
+        XCTAssertEqual(envelope.meta?.hasMore, false)
+        XCTAssertNil(envelope.meta?.nextCursor)
+    }
+
+    func testNotificationInboxRejectsMalformedRequiredFieldsAndPayloadTypes() throws {
+        let valid = notificationInboxItem(type: "call.missed")
+        let mutations: [([String], Any?)] = [
+            (["id"], nil), (["id"], 42), (["type"], NSNull()),
+            (["silent"], nil), (["silent"], "false"), (["silent"], 0),
+            (["created_at"], nil), (["created_at"], 42), (["read_at"], false),
+            (["data"], NSNull()), (["data"], [Any]()),
+            (["data", "call_id"], 42), (["data", "recipient_user_id"], ["private"]),
+            (["data", "state"], false), (["data", "missed_call_alert"], "true"),
+        ]
+        for (path, value) in mutations {
+            let malformed = replacing(valid, at: path, with: value)
+            XCTAssertThrowsError(try decode(NotificationInboxItems.self, object: ["items": [malformed]]),
+                                 "Malformed inbox field \(path.joined(separator: ".")) must not decode")
+        }
+    }
+
+    func testNotificationInboxSendsAuthenticatedReadOnlyPaginationWithoutChangingCursor() async throws {
+        // These reserved characters must remain cursor data, never become extra query parameters.
+        let cursor = "older+/=&?%# page 🚀"
+        let nextCursor = String(repeating: "a", count: 2_048)
+        let response = notificationInboxEnvelope(items: [notificationInboxItem()], meta: [
+            "has_more": true, "next_cursor": nextCursor, "unread_count": 101,
+        ])
+        try await withNotificationInboxTransport(response: response) { api, transport in
+            let page = try await api.notificationInbox(cursor: cursor)
+            XCTAssertEqual(page.items.count, 1)
+            XCTAssertEqual(page.nextCursor, nextCursor)
+            XCTAssertEqual(transport.requests.count, 1)
+            let request = try XCTUnwrap(transport.requests.first)
+            let url = try XCTUnwrap(request.url)
+            let components = try XCTUnwrap(URLComponents(url: url, resolvingAgainstBaseURL: false))
+            XCTAssertEqual(components.path, "/api/kit-wallet/v1/notifications")
+            XCTAssertEqual(components.queryItems, [
+                URLQueryItem(name: "limit", value: "100"),
+                URLQueryItem(name: "unread_only", value: "true"),
+                URLQueryItem(name: "cursor", value: cursor),
+            ])
+            XCTAssertNil(components.fragment)
+            XCTAssertEqual(request.httpMethod, "GET")
+            XCTAssertNil(request.httpBody)
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer inbox-test-token")
+            XCTAssertNotNil(request.value(forHTTPHeaderField: "X-Kit-Wallet-Session-ID"))
+        }
+    }
+
+    func testNotificationInboxAcceptsFullAndEmptyFinalPages() async throws {
+        for count in [0, 100] {
+            let response = notificationInboxEnvelope(items: (0..<count).map { _ in notificationInboxItem() })
+            try await withNotificationInboxTransport(response: response) { api, transport in
+                let page = try await api.notificationInbox()
+                XCTAssertEqual(page.items.count, count)
+                XCTAssertNil(page.nextCursor)
+                XCTAssertEqual(transport.requests.count, 1)
+                let url = try XCTUnwrap(transport.requests.first?.url)
+                let query = try XCTUnwrap(URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems)
+                XCTAssertEqual(Set(query.map(\.name)), Set(["limit", "unread_only"]))
+            }
+        }
+    }
+
+    func testNotificationInboxRejectsMissingContradictoryOrOversizedPagination() async throws {
+        let metadata: [[String: Any]?] = [
+            nil, [:], ["has_more": NSNull()], ["has_more": true],
+            ["has_more": true, "next_cursor": NSNull()],
+            ["has_more": true, "next_cursor": ""],
+            ["has_more": true, "next_cursor": String(repeating: "a", count: 2_049)],
+            ["has_more": true, "next_cursor": String(repeating: "é", count: 1_025)],
+            ["has_more": false, "next_cursor": "unexpected"],
+            ["has_more": false, "next_cursor": ""],
+        ]
+        for meta in metadata {
+            var response = notificationInboxEnvelope(items: [])
+            response["meta"] = meta
+            try await withNotificationInboxTransport(response: response) { api, _ in
+                do {
+                    _ = try await api.notificationInbox()
+                    XCTFail("An invalid pagination contract must not advance the recovery checkpoint")
+                } catch APIClientError.invalidResponse {
+                    // Expected: well-typed JSON that violates the endpoint contract.
+                }
+            }
+        }
+        let oversized = notificationInboxEnvelope(items: (0..<101).map { _ in notificationInboxItem() })
+        try await withNotificationInboxTransport(response: oversized) { api, _ in
+            do {
+                _ = try await api.notificationInbox()
+                XCTFail("The server must not bypass the bounded recovery page size")
+            } catch APIClientError.invalidResponse {}
+        }
+    }
+
+    func testNotificationInboxTransportRejectsMalformedSuccessEnvelope() async throws {
+        let valid = notificationInboxEnvelope(items: [notificationInboxItem()])
+        let malformed = [
+            replacing(valid, at: ["meta", "has_more"], with: "false"),
+            replacing(valid, at: ["meta", "next_cursor"], with: 123),
+            replacing(valid, at: ["data", "items"], with: NSNull()),
+            replacing(valid, at: ["data", "items"], with: ["id": messageId]),
+        ]
+        for response in malformed {
+            try await withNotificationInboxTransport(response: response) { api, _ in
+                do {
+                    _ = try await api.notificationInbox()
+                    XCTFail("Malformed success JSON must fail closed")
+                } catch APIClientError.invalidPayload(let status) {
+                    XCTAssertEqual(status, 200)
+                }
+            }
+        }
+    }
+
+    func testNotificationInboxRejectsInvalidCursorsBeforeSending() async throws {
+        try await withNotificationInboxTransport(response: notificationInboxEnvelope(items: [])) { api, transport in
+            for cursor in ["", String(repeating: "a", count: 2_049), String(repeating: "é", count: 1_025)] {
+                do {
+                    _ = try await api.notificationInbox(cursor: cursor)
+                    XCTFail("Invalid cursor must fail before transport")
+                } catch APIClientError.invalidResponse {}
+            }
+            XCTAssertTrue(transport.requests.isEmpty)
+            let page = try await api.notificationInbox(cursor: String(repeating: "é", count: 1_024))
+            XCTAssertTrue(page.items.isEmpty, "The cursor limit is UTF-8 bytes, including its exact boundary")
+            XCTAssertEqual(transport.requests.count, 1)
+        }
+    }
+
+    func testNotificationInboxRequiresCurrentAndTaskBoundSessionBeforeSending() async throws {
+        let response = notificationInboxEnvelope(items: [])
+        try await withNotificationInboxTransport(response: response, signedIn: false) { api, transport in
+            do {
+                _ = try await api.notificationInbox()
+                XCTFail("Inbox contents require an authenticated session")
+            } catch APIClientError.signedOut {}
+            XCTAssertTrue(transport.requests.isEmpty)
+        }
+        try await withNotificationInboxTransport(response: response) { api, transport in
+            try await APIClientSessionBinding.$sessionID.withValue(UUID().uuidString) {
+                do {
+                    _ = try await api.notificationInbox()
+                    XCTFail("Stale recovery cannot borrow the replacement session's credentials")
+                } catch APIClientError.signedOut {}
+            }
+            XCTAssertTrue(transport.requests.isEmpty)
+        }
+    }
+
+    private func notificationInboxItem(type: String = "support.ticket") -> [String: Any] {
+        [
+            "id": messageId, "type": type, "data": [String: Any](), "silent": false,
+            "title": NSNull(), "body": NSNull(), "priority": "normal", "status": "delivered",
+            "scheduled_for": NSNull(), "delivered_at": "2026-09-05T09:00:00Z",
+            "read_at": NSNull(), "created_at": "2026-09-05T09:00:00Z",
+        ]
+    }
+
+    private func notificationInboxEnvelope(
+        items: [[String: Any]],
+        meta: [String: Any] = ["has_more": false, "next_cursor": NSNull(), "unread_count": 0]
+    ) -> [String: Any] {
+        ["ok": true, "data": ["items": items], "meta": meta]
+    }
+
+    private func withNotificationInboxTransport<Value>(
+        response: [String: Any], signedIn: Bool = true,
+        operation: (APIClient, NotificationInboxTransportState) async throws -> Value
+    ) async throws -> Value {
+        let namespace = "kit-inbox-transport-test-\(UUID().uuidString)"
+        let sessionID = UUID().uuidString.lowercased()
+        let transport = NotificationInboxTransportState(response: try JSONSerialization.data(withJSONObject: response))
+        NotificationInboxURLProtocol.register(transport, sessionID: sessionID)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [NotificationInboxURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer {
+            session.invalidateAndCancel()
+            NotificationInboxURLProtocol.unregister(sessionID: sessionID)
+            try? KeychainStore.remove(namespace)
+            try? KeychainStore.remove(namespace + "-refresh")
+        }
+        let store = SessionStore(account: namespace, refreshAttemptAccount: namespace + "-refresh")
+        if signedIn {
+            try await store.save(SessionTokens(
+                accessToken: "inbox-test-token", refreshToken: "inbox-test-refresh", tokenType: "Bearer",
+                accessExpiresAt: nil, refreshExpiresAt: nil, sessionId: sessionID
+            ))
+        }
+        return try await operation(APIClient(sessionStore: store, session: session), transport)
+    }
+
     @MainActor
     func testLaunchPreparationConstructsItsSessionOffMainOnTheDelegateQueue() async {
         let initialized = expectation(description: "Background session constructed off main")
@@ -3445,6 +3834,76 @@ final class MessagingAPIContractTests: XCTestCase {
     private func jsonObject<Value: Encodable>(_ value: Value) throws -> [String: Any] {
         let data = try JSONEncoder().encode(value)
         return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    }
+}
+
+/// Each URLSession is routed by its unique test session ID, so parallel tests never share a
+/// mutable response handler. Unexpected requests fail locally and cannot reach the live service.
+private final class NotificationInboxURLProtocol: URLProtocol, @unchecked Sendable {
+    private final class Registry: @unchecked Sendable {
+        let lock = NSLock()
+        var states: [String: NotificationInboxTransportState] = [:]
+    }
+    private static let registry = Registry()
+
+    static func register(_ state: NotificationInboxTransportState, sessionID: String) {
+        registry.lock.withLock { registry.states[sessionID] = state }
+    }
+
+    static func unregister(sessionID: String) {
+        _ = registry.lock.withLock { registry.states.removeValue(forKey: sessionID) }
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let sessionID = request.value(forHTTPHeaderField: "X-Kit-Wallet-Session-ID"),
+              let state = Self.registry.lock.withLock({ Self.registry.states[sessionID] }),
+              let url = request.url,
+              let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1",
+                                             headerFields: ["Content-Type": "application/json"])
+        else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+            return
+        }
+        state.record(request)
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: state.response)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
+private final class NotificationInboxTransportState: @unchecked Sendable {
+    let response: Data
+    private let lock = NSLock()
+    private var recorded: [URLRequest] = []
+    private var bodies: [Data] = []
+
+    init(response: Data) { self.response = response }
+    var requests: [URLRequest] { lock.withLock { recorded } }
+    var requestBodies: [Data] { lock.withLock { bodies } }
+
+    func record(_ request: URLRequest) {
+        // URLSession can expose an encoded PUT as an InputStream in URLProtocol even when the
+        // APIClient set httpBody. Capture it while the request is active for wire assertions.
+        var body = request.httpBody ?? Data()
+        if body.isEmpty, let stream = request.httpBodyStream {
+            stream.open()
+            defer { stream.close() }
+            var buffer = [UInt8](repeating: 0, count: 4_096)
+            while body.count <= 256 * 1_024 {
+                let count = stream.read(&buffer, maxLength: buffer.count)
+                guard count > 0 else { break }
+                body.append(contentsOf: buffer.prefix(count))
+            }
+        }
+        lock.withLock {
+            recorded.append(request)
+            bodies.append(body)
+        }
     }
 }
 

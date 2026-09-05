@@ -1236,6 +1236,13 @@ final class AppModel: ObservableObject {
     private var didRequestContactsAtLaunch = false
     private var isApplyingAccountDiscoveryChoice = false
     private var activeConversationID: String?
+    private var notificationInboxRecoveryTask: Task<Void, Never>?
+    private var notificationInboxRecoveryTaskID: UUID?
+    private var notificationInboxRecoveryEpoch: UUID?
+    private var notificationPreferenceSyncTask: Task<Void, Never>?
+    private var notificationPreferenceSyncTaskID: UUID?
+    private var notificationPreferenceSyncEpoch: UUID?
+    private var notificationPreferenceUnsupported: (accountEpoch: UUID, until: Date)?
     private var visibleConversationSyncTask: Task<Void, Never>?
     private var visibleConversationSleepTask: Task<Void, Never>?
     private var visibleConversationSyncWakePending = false
@@ -1477,8 +1484,11 @@ final class AppModel: ObservableObject {
                     }
                     NotificationCoordinator.shared.retryRemoteRegistrationIfNeeded()
                     NotificationCoordinator.shared.replayCurrentPushTokens()
+                    self.scheduleNotificationInboxRecovery()
+                    self.scheduleNotificationPreferenceSync(retryUnsupportedServer: true)
                     await MessageNotificationActionDispatcher.shared.replayPending()
                     await ClaimablePaymentNotificationActionDispatcher.shared.replayPending()
+                    await NotificationInboxTapDispatcher.shared.replayPending()
                     self.scheduleEphemeralCallCancellationDrain()
                     if AuthenticatedProjectionRefreshPolicy.permits(
                         isSigningOut: self.isSigningOut,
@@ -1516,6 +1526,8 @@ final class AppModel: ObservableObject {
                             // was missing during the first recovery replay.
                             await MessageNotificationActionDispatcher.shared.replayPending()
                             await ClaimablePaymentNotificationActionDispatcher.shared.replayPending()
+                            await NotificationInboxTapDispatcher.shared.replayPending()
+                            self.scheduleNotificationPreferenceSync()
                         }
                     } else if self.isSignedIn {
                         // Incomplete accounts do not enter the full session-resume path, but
@@ -1655,11 +1667,25 @@ final class AppModel: ObservableObject {
                 }
                 Task { @MainActor in
                     guard let self else { return }
-                    if SecureMessagingRemoteWake(notification.object) != nil {
-                        await self.syncSecureMessagingIfPermitted(
-                            presentsVisibleMessageNotifications: true
-                        )
+                    if let wake = SecureMessagingRemoteWake(notification.object, isSystemAlertDelivery: true) {
+                        // A notification tap refers to an alert the system has already shown.
+                        _ = await self.handleSecureMessagingWake(wake)
+                    } else if SecureMessagingRemoteWake.isMessageAvailable(notification.object) {
+                        return
                     } else {
+                        if let payload = notification.object as? [AnyHashable: Any],
+                           payload["recipient_user_id"] != nil {
+                            guard let session = await self.sessions.current(),
+                                  session.accountId?.caseInsensitiveCompare(self.profile?.id ?? "")
+                                    == .orderedSame,
+                                  RecipientBoundRemoteNotificationPolicy.permits(
+                                      payload,
+                                      ownerFingerprint: MessageNotificationContract.accountFingerprint(
+                                          for: self.profile?.id
+                                      )
+                                  )
+                            else { return }
+                        }
                         await self.refresh()
                     }
                 }
@@ -1677,13 +1703,19 @@ final class AppModel: ObservableObject {
         )
 
         Task { [weak self] in
-            await SecureMessagingWakeDispatcher.shared.install { [weak self] _ in
+            await SecureMessagingWakeDispatcher.shared.install { [weak self] wake in
                 guard let self else { return .failed }
-                return await self.handleSecureMessagingWake()
+                return await self.handleSecureMessagingWake(wake)
             }
         }
 
         restoreTask = Task { [weak self] in await self?.restore() }
+        Task { [weak self] in
+            await NotificationInboxTapDispatcher.shared.install { [weak self] tap in
+                guard let self else { return .retry }
+                return await self.handleNotificationInboxTap(tap)
+            }
+        }
         Task { [weak self] in
             await MessageNotificationActionDispatcher.shared.install { [weak self] action in
                 guard let self else { return .retry }
@@ -1699,21 +1731,75 @@ final class AppModel: ObservableObject {
         NotificationCoordinator.shared.replayPendingCallEvents()
     }
 
-    private func handleSecureMessagingWake() async -> UIBackgroundFetchResult {
+    private func handleSecureMessagingWake(_ wake: SecureMessagingRemoteWake) async -> UIBackgroundFetchResult {
         if let restoreTask { await restoreTask.value }
+        guard let userID = profile?.id,
+              let session = await sessions.current(),
+              communicationAccessGranted,
+              !isSubmittingAccountDeletion, !acceptedAccountDeletionCleanupBlocked,
+              !protectedLocalStateRecoveryBlocked, !unresolvedAccountDeletionAttemptBlocked,
+              wake.permitsSync(userID: userID, sessionAccountID: session.accountId)
+        else { return .noData }
+        let context = AuthenticatedSecurityContext(
+            accountEpoch: accountEpoch, userID: userID, sessionID: session.sessionId
+        )
+        guard await authenticatedSecurityContextIsCurrent(context) else { return .noData }
+        if wake.isSystemAlertDelivery, let notice = wake.messageAvailable {
+            await VisibleMessageNotificationCoordinator.shared.recordSystemAlert(
+                notice, ownerUserID: userID
+            )
+        }
+        guard await authenticatedSecurityContextIsCurrent(context) else { return .noData }
         // Local transforms must not become a process-wide gate. Commands whose own media still
         // needs preprocessing are parked by `awaitingMediaPreprocessing`; every other
         // conversation can sync and drain immediately. The preprocessing task schedules a
         // second wake/flush after it publishes each finished representation.
         schedulePendingMediaPreprocessing()
         let result = await syncSecureMessagingIfPermitted(
-            presentsVisibleMessageNotifications: true
+            presentsVisibleMessageNotifications: true,
+            expectedContext: context
         )
+        guard await authenticatedSecurityContextIsCurrent(context) else { return .noData }
+        if wake.requestsForegroundMessageAlert, let notice = wake.messageAvailable {
+            // A background callback may have synced this same message just before willPresent
+            // suppresses the generic alert. Reconsider this exact durable message independently
+            // of receivedMessages so neither callback ordering can lose the foreground alert.
+            let descriptors = VisibleMessageNotificationPolicy.descriptors(
+                previousServerMessageIDs: [],
+                messages: state.messages.filter {
+                    MessageNotificationContract.canonicalUUID($0.serverMessageId) == notice.messageID
+                },
+                suppressedConversationID: UIApplication.shared.applicationState == .active
+                    ? activeConversationID : nil,
+                ownerUserID: userID,
+                mutedConversationIDs: Set(state.mutedConversationIds ?? [])
+            )
+            await VisibleMessageNotificationCoordinator.shared.schedule(descriptors)
+        }
+        guard await authenticatedSecurityContextIsCurrent(context) else { return .noData }
+        if wake.isUserTap, let notice = wake.messageAvailable {
+            let matches = state.messages.filter {
+                MessageNotificationContract.canonicalUUID($0.serverMessageId) == notice.messageID
+                    && !$0.isOutgoing
+            }
+            if matches.count == 1, let message = matches.first,
+               requestConversationNavigation(conversationID: message.conversationId, messageID: message.id) {
+                await NotificationCoordinator.shared.clearMessageNotifications(
+                    accountFingerprint: notice.accountFingerprint,
+                    conversationID: message.conversationId,
+                    messageIDs: [notice.messageID]
+                )
+            } else {
+                selectedTab = MainTabIndex.messages
+            }
+        }
         await drainReadyOutbox()
         return result
     }
 
     deinit {
+        notificationPreferenceSyncTask?.cancel()
+        notificationInboxRecoveryTask?.cancel()
         contactSyncTask?.cancel()
         contactChangeDebounceTask?.cancel()
         restoreTask?.cancel()
@@ -6378,6 +6464,9 @@ final class AppModel: ObservableObject {
         NotificationCoordinator.shared.replayCurrentPushTokens()
         await MessageNotificationActionDispatcher.shared.replayPending()
         await ClaimablePaymentNotificationActionDispatcher.shared.replayPending()
+        await NotificationInboxTapDispatcher.shared.replayPending()
+        scheduleNotificationInboxRecovery()
+        scheduleNotificationPreferenceSync(retryUnsupportedServer: true)
         scheduleForegroundAuthoritativeRefreshIfNeeded()
     }
 
@@ -8306,6 +8395,8 @@ final class AppModel: ObservableObject {
             )
             await MessageNotificationActionDispatcher.shared.replayPending()
             await ClaimablePaymentNotificationActionDispatcher.shared.replayPending()
+            await NotificationInboxTapDispatcher.shared.replayPending()
+            scheduleNotificationPreferenceSync()
             isLoading = false
             return
         }
@@ -8387,6 +8478,8 @@ final class AppModel: ObservableObject {
         ) else { return }
         await MessageNotificationActionDispatcher.shared.replayPending()
         await ClaimablePaymentNotificationActionDispatcher.shared.replayPending()
+        await NotificationInboxTapDispatcher.shared.replayPending()
+        scheduleNotificationPreferenceSync()
         isLoading = false
         scheduleAutomaticContactSync()
         Task { [weak self] in
@@ -8481,6 +8574,8 @@ final class AppModel: ObservableObject {
         let expectedAccountEpoch = accountEpoch
         let foregroundGenerationAtStart =
             foregroundAuthoritativeRefreshGate.backgroundGeneration
+        scheduleNotificationInboxRecovery()
+        scheduleNotificationPreferenceSync()
         authenticatedRefreshCount += 1
         if state.pendingProfileAvatarAttachment != nil {
             profileAvatarResumeRequestedAfterRefresh = true
@@ -9049,10 +9144,19 @@ final class AppModel: ObservableObject {
                 syncAttempt,
                 visibleMessage: lastError
             )
+            guard await authenticatedSecurityContextIsCurrent(context) else { return .noData }
+            scheduleNotificationPreferenceSync()
+            let suppressedConversationID = UIApplication.shared.applicationState == .active
+                ? activeConversationID
+                : nil
+            await VisibleMessageNotificationCoordinator.shared.reconcileRemoteNotifications(
+                messages: latestState.messages,
+                ownerUserID: userID,
+                suppressedConversationID: suppressedConversationID,
+                mutedConversationIDs: Set(latestState.mutedConversationIds ?? [])
+            )
+            guard await authenticatedSecurityContextIsCurrent(context) else { return .noData }
             if presentsVisibleMessageNotifications, result.receivedMessages > 0 {
-                let suppressedConversationID = UIApplication.shared.applicationState == .active
-                    ? activeConversationID
-                    : nil
                 let descriptors = VisibleMessageNotificationPolicy.descriptors(
                     previousServerMessageIDs: previousServerMessageIDs,
                     messages: latestState.messages,
@@ -9103,7 +9207,10 @@ final class AppModel: ObservableObject {
             Task {
                 await NotificationCoordinator.shared.clearMessageNotifications(
                     accountFingerprint: accountFingerprint,
-                    conversationID: canonical
+                    conversationID: canonical,
+                    messageIDs: state.messages.filter {
+                        $0.conversationId.caseInsensitiveCompare(canonical) == .orderedSame
+                    }.compactMap(\.serverMessageId)
                 )
             }
         } else if activeConversationID == canonical {
@@ -9654,7 +9761,10 @@ final class AppModel: ObservableObject {
         // launch remains retryable and cannot consume another account's delivered notification.
         await NotificationCoordinator.shared.clearMessageNotifications(
             accountFingerprint: action.accountFingerprint,
-            conversationID: action.conversationID
+            conversationID: action.conversationID,
+            messageIDs: state.messages.filter {
+                $0.conversationId.caseInsensitiveCompare(action.conversationID) == .orderedSame
+            }.compactMap(\.serverMessageId)
         )
         return true
     }
@@ -9945,7 +10055,10 @@ final class AppModel: ObservableObject {
             }
             await NotificationCoordinator.shared.clearMessageNotifications(
                 accountFingerprint: action.accountFingerprint,
-                conversationID: conversation.id
+                conversationID: conversation.id,
+                messageIDs: queuedState.messages.filter {
+                    $0.conversationId.caseInsensitiveCompare(conversation.id) == .orderedSame
+                }.compactMap(\.serverMessageId)
             )
             Task { @MainActor [weak self] in
                 await self?.reconcileNotificationReplyAfterRestore(
@@ -9992,6 +10105,173 @@ final class AppModel: ObservableObject {
               !isSubmittingAccountDeletion
         else { return }
         if isOnline { await flushOutbox() }
+    }
+
+    private func scheduleNotificationPreferenceSync(force: Bool = false, retryUnsupportedServer: Bool = false) {
+        guard isSignedIn, !isSigningOut, accountSetupStep == nil,
+              communicationAccessGranted, appReviewDemoMutationsAllowed, let userID = profile?.id else { return }
+        refreshNotificationPreferencePendingStatus(ownerUserID: userID)
+        if retryUnsupportedServer { notificationPreferenceUnsupported = nil }
+        if let unsupported = notificationPreferenceUnsupported,
+           unsupported.accountEpoch == accountEpoch, unsupported.until > Date() { return }
+        if notificationPreferenceSyncTask != nil, notificationPreferenceSyncEpoch == accountEpoch, !force { return }
+        notificationPreferenceSyncTask?.cancel()
+        guard isOnline else {
+            notificationPreferenceSyncTask = nil
+            notificationPreferenceSyncTaskID = nil
+            return
+        }
+        let taskID = UUID()
+        let epoch = accountEpoch
+        notificationPreferenceSyncTaskID = taskID
+        notificationPreferenceSyncEpoch = epoch
+        notificationPreferenceSyncTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                if self.notificationPreferenceSyncTaskID == taskID {
+                    self.notificationPreferenceSyncTask = nil
+                    self.notificationPreferenceSyncTaskID = nil
+                }
+            }
+            if let restoreTask = self.restoreTask { await restoreTask.value }
+            guard let session = await self.sessions.current() else { return }
+            let context = AuthenticatedSecurityContext(accountEpoch: epoch, userID: userID, sessionID: session.sessionId)
+            while !Task.isCancelled {
+                guard self.isOnline, self.communicationAccessGranted,
+                      await self.authenticatedSecurityContextIsCurrent(context) else { return }
+                let synchronized = await NotificationPreferenceSynchronizer.shared.synchronize(
+                    ownerUserID: userID,
+                    isCurrent: { [weak self] in
+                        guard let self, self.isOnline, !Task.isCancelled,
+                              self.communicationAccessGranted,
+                              !self.isSubmittingAccountDeletion,
+                              !self.acceptedAccountDeletionCleanupBlocked,
+                              !self.protectedLocalStateRecoveryBlocked,
+                              !self.unresolvedAccountDeletionAttemptBlocked else { return false }
+                        return await self.authenticatedSecurityContextIsCurrent(context)
+                    },
+                    latestLocalMuteIDs: { [weak self] in
+                        guard let self, await self.authenticatedSecurityContextIsCurrent(context) else { return nil }
+                        let snapshot = await self.store.snapshot()
+                        guard snapshot.profile?.id.caseInsensitiveCompare(userID) == .orderedSame,
+                              snapshot.communicationOwnerUserID?.caseInsensitiveCompare(userID) == .orderedSame
+                        else { return nil }
+                        return Set(snapshot.mutedConversationIds ?? [])
+                    },
+                    fetch: { [api = self.api] in
+                        try await APIClientSessionBinding.$sessionID.withValue(context.sessionID) {
+                            try await api.notificationPreferences()
+                        }
+                    },
+                    update: { [api = self.api] desired in
+                        try await APIClientSessionBinding.$sessionID.withValue(context.sessionID) {
+                            try await api.updateNotificationPreferences(
+                                expectedEnrollmentEpoch: desired.expectedEnrollmentEpoch,
+                                expectedRevision: desired.expectedRevision,
+                                encryptedMessageAlerts: desired.encryptedMessageAlerts,
+                                mutedConversationIDs: desired.mutedConversationIDs
+                            )
+                        }
+                    }
+                )
+                guard !Task.isCancelled, await self.authenticatedSecurityContextIsCurrent(context) else { return }
+                if synchronized == .synchronized {
+                    self.notificationPreferenceUnsupported = nil
+                    if self.lastError == NotificationPreferenceSynchronizer.pendingMessage { self.lastError = nil }
+                    return
+                }
+                self.refreshNotificationPreferencePendingStatus(ownerUserID: userID)
+                if synchronized == .unsupportedServer {
+                    // Older deployments do not expose this route. Ordinary sync callbacks may
+                    // run often, so wait an hour or an explicit foreground/reconnect signal.
+                    self.notificationPreferenceUnsupported = (epoch, Date().addingTimeInterval(3_600))
+                    return
+                }
+                let delay: TimeInterval
+                if case .retryAfter(let serverDelay) = synchronized { delay = serverDelay }
+                else { delay = 30 }
+                do { try await Task.sleep(for: .seconds(delay)) } catch { return }
+            }
+        }
+    }
+
+    private func refreshNotificationPreferencePendingStatus(ownerUserID: String) {
+        if NotificationPreferenceSynchronizer.shared.needsPendingStatus(
+            ownerUserID: ownerUserID, localMutedConversationIDs: mutedConversationIds
+        ) {
+            if lastError == nil || lastError == NotificationPreferenceSynchronizer.pendingMessage {
+                lastError = NotificationPreferenceSynchronizer.pendingMessage
+            }
+        } else if lastError == NotificationPreferenceSynchronizer.pendingMessage {
+            lastError = nil
+        }
+    }
+
+    private func scheduleNotificationInboxRecovery() {
+        guard isSignedIn, isOnline, !isSigningOut, accountSetupStep == nil,
+              appReviewDemoMutationsAllowed, let userID = profile?.id else { return }
+        if notificationInboxRecoveryTask != nil, notificationInboxRecoveryEpoch == accountEpoch { return }
+        notificationInboxRecoveryTask?.cancel()
+        let taskID = UUID()
+        notificationInboxRecoveryTaskID = taskID
+        notificationInboxRecoveryEpoch = accountEpoch
+        let epoch = accountEpoch
+        notificationInboxRecoveryTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                if self.notificationInboxRecoveryTaskID == taskID {
+                    self.notificationInboxRecoveryTask = nil
+                    self.notificationInboxRecoveryTaskID = nil
+                }
+            }
+            if let restoreTask = self.restoreTask { await restoreTask.value }
+            guard let session = await self.sessions.current() else { return }
+            let context = AuthenticatedSecurityContext(accountEpoch: epoch, userID: userID, sessionID: session.sessionId)
+            while !Task.isCancelled {
+                guard self.isOnline, await self.authenticatedSecurityContextIsCurrent(context) else { return }
+                let more = await NotificationInboxRecoveryCoordinator.shared.recover(
+                    ownerUserID: userID,
+                    isCurrent: { [weak self] in
+                        guard let self, self.isOnline, !Task.isCancelled,
+                              !self.isSubmittingAccountDeletion,
+                              !self.acceptedAccountDeletionCleanupBlocked,
+                              !self.protectedLocalStateRecoveryBlocked,
+                              !self.unresolvedAccountDeletionAttemptBlocked
+                        else { return false }
+                        return await self.authenticatedSecurityContextIsCurrent(context)
+                    },
+                    fetch: { [api = self.api] cursor in
+                        try await APIClientSessionBinding.$sessionID.withValue(context.sessionID) {
+                            try await api.notificationInbox(cursor: cursor)
+                        }
+                    }
+                )
+                guard more else { return }
+                do { try await Task.sleep(for: .seconds(30)) } catch { return }
+            }
+        }
+    }
+
+    private func handleNotificationInboxTap(_ tap: NotificationInboxTap) async -> MessageNotificationActionHandlingResult {
+        if let restoreTask { await restoreTask.value }
+        guard isSignedIn, let userID = profile?.id, let session = await sessions.current() else { return .retry }
+        guard MessageNotificationContract.canonicalUUID(userID) == tap.recipientUserID,
+              MessageNotificationContract.canonicalUUID(session.accountId) == tap.recipientUserID else { return .invalidated }
+        guard !isSigningOut, !isSubmittingAccountDeletion, accountSetupStep == nil,
+              !acceptedAccountDeletionCleanupBlocked, !protectedLocalStateRecoveryBlocked,
+              !unresolvedAccountDeletionAttemptBlocked else { return .retry }
+        let context = AuthenticatedSecurityContext(accountEpoch: accountEpoch, userID: userID, sessionID: session.sessionId)
+        guard await authenticatedSecurityContextIsCurrent(context) else { return .retry }
+        switch tap.destination {
+        case .calls:
+            guard callsFeatureEnabled, communicationAccessGranted else { return .retry }
+            selectedTab = MainTabIndex.calls
+            scheduleVisibleConversationCallHistoryRefresh()
+            scheduleCompleteCallHistoryBackfillIfNeeded()
+        case .home:
+            selectedTab = MainTabIndex.home
+        }
+        return .completed
     }
 
     private func scheduleVisibleConversationCallHistoryRefresh() {
@@ -11197,6 +11477,8 @@ final class AppModel: ObservableObject {
             // The accepted, session-bound response is the authoritative wake for that durable
             // route; replay now instead of waiting for another foreground or connectivity event.
             await ClaimablePaymentNotificationActionDispatcher.shared.replayPending()
+            await NotificationInboxTapDispatcher.shared.replayPending()
+            scheduleNotificationPreferenceSync()
             return true
         } catch {
             guard await capabilitiesContextIsCurrent(
@@ -16786,6 +17068,7 @@ final class AppModel: ObservableObject {
                 )
             }
             await publishLatestState()
+            scheduleNotificationPreferenceSync(force: true)
         } catch {
             lastError = error.localizedDescription
         }
@@ -21802,6 +22085,7 @@ private enum KitBiometricPurpose {
 private enum MainTabIndex {
     static let home = 0
     static let messages = 1
+    static let calls = 2
 }
 
 /// A reviewable build-time latch in addition to server protocol discovery. Build 5 enables the
@@ -21823,8 +22107,35 @@ enum SecureMessagingLocalQueueReleasePolicy {
 
 struct SecureMessagingRemoteWake: Sendable {
     let notificationID: UUID
+    let messageAvailable: RemoteMessageAvailableNotification?
+    let isSystemAlertDelivery: Bool
+    let requestsForegroundMessageAlert: Bool
+    let isUserTap: Bool
 
-    init?(_ object: Any?) {
+    static func isMessageAvailable(_ object: Any?) -> Bool {
+        (object as? [AnyHashable: Any])?["type"] as? String
+            == RemoteMessageAvailableNotification.type
+    }
+
+    func permitsSync(userID: String?, sessionAccountID: String?) -> Bool {
+        guard let userID = MessageNotificationContract.canonicalUUID(userID),
+              userID == MessageNotificationContract.canonicalUUID(sessionAccountID)
+        else { return false }
+        return messageAvailable == nil || messageAvailable?.recipientUserID == userID
+    }
+
+    init?(
+        _ object: Any?, isSystemAlertDelivery: Bool = false,
+        requestsForegroundMessageAlert: Bool = false, isUserTap: Bool = false
+    ) {
+        self.isSystemAlertDelivery = isSystemAlertDelivery
+        self.requestsForegroundMessageAlert = requestsForegroundMessageAlert
+        self.isUserTap = isUserTap
+        if let notice = RemoteMessageAvailableNotification(object) {
+            notificationID = notice.notificationID
+            messageAvailable = notice
+            return
+        }
         guard let payload = object as? [AnyHashable: Any],
               payload["type"] as? String == "messaging.sync",
               payload["scope"] as? String == "messaging",
@@ -21840,6 +22151,7 @@ struct SecureMessagingRemoteWake: Sendable {
               ])
         else { return nil }
         self.notificationID = notificationID
+        messageAvailable = nil
     }
 }
 

@@ -1151,6 +1151,7 @@ final class GalleryVideoController: ObservableObject {
     @Published private(set) var isPlaying = false
     @Published private(set) var isMuted = false
     @Published private(set) var hasStartedPlayback = false
+    @Published private(set) var hasReachedEnd = false
     @Published private(set) var isPreparing = false
     @Published private(set) var errorMessage: String?
     @Published var duration: Double = 0
@@ -1159,6 +1160,7 @@ final class GalleryVideoController: ObservableObject {
     private(set) var playbackURL: URL?
 
     private var isScrubbing = false
+    private var seekID: UUID?
     private var sourceFileURL: URL?
     private var playbackFileLease: ChatVideoPlaybackFileLease?
     private var ownsFileURL = false
@@ -1325,7 +1327,7 @@ final class GalleryVideoController: ObservableObject {
     /// AVFoundation's callbacks hop to the main actor. Removing an observer cannot recall an
     /// already-enqueued callback, so its item identity must still match after that hop.
     func receivePlaybackTime(_ time: CMTime, from item: AVPlayerItem) {
-        guard playerItem === item, !isScrubbing else { return }
+        guard playerItem === item, !isScrubbing, seekID == nil, !hasReachedEnd else { return }
         let seconds = time.seconds
         guard seconds.isFinite else { return }
         currentTime = max(0, min(seconds, duration))
@@ -1364,12 +1366,14 @@ final class GalleryVideoController: ObservableObject {
 
     private func releaseResources() {
         preparationID = nil
+        seekID = nil
         isPreparing = false
         if let timeObserver { player?.removeTimeObserver(timeObserver) }
         timeObserver = nil
         removePlaybackItemObservers()
         let retainedPlayer = player
         retainedPlayer?.pause()
+        playerItem?.cancelPendingSeeks()
         retainedPlayer?.replaceCurrentItem(with: nil)
         player = nil
         playerItem = nil
@@ -1378,6 +1382,7 @@ final class GalleryVideoController: ObservableObject {
         isPlaying = false
         isScrubbing = false
         hasStartedPlayback = false
+        hasReachedEnd = false
         currentTime = 0
         duration = 0
         playbackFileLease?.release()
@@ -1399,15 +1404,20 @@ final class GalleryVideoController: ObservableObject {
 
     func togglePlayback() {
         guard mediaAccountLifetime == ChatMediaAccountLifetime.current else { return }
-        guard let player else { return }
+        guard let player, errorMessage == nil else { return }
         if isPlaying {
-            player.pause()
-            isPlaying = false
+            pause()
         } else {
-            player.play()
             isPlaying = true
             hasStartedPlayback = true
-            armPictureInPicture()
+            if hasReachedEnd || currentTime >= duration {
+                hasReachedEnd = false
+                currentTime = 0
+                seek(to: 0)
+            } else if !isScrubbing, seekID == nil {
+                player.play()
+                armPictureInPicture()
+            }
         }
     }
 
@@ -1435,24 +1445,57 @@ final class GalleryVideoController: ObservableObject {
     }
 
     func setScrubbing(_ scrubbing: Bool) {
+        guard mediaAccountLifetime == ChatMediaAccountLifetime.current,
+              player != nil, errorMessage == nil, scrubbing != isScrubbing else { return }
         isScrubbing = scrubbing
-        if !scrubbing {
-            player?.seek(
-                to: CMTime(seconds: currentTime, preferredTimescale: 600),
-                toleranceBefore: .zero,
-                toleranceAfter: .zero
-            )
+        if scrubbing {
+            // Preserve the user's play/pause intent while the decoder seeks. Playing through a
+            // drag lets an end callback rewind the item underneath the thumb.
+            player?.pause()
+            seekID = nil
+            playerItem?.cancelPendingSeeks()
+        } else {
+            seek(to: currentTime)
         }
     }
 
     func scrub(to seconds: Double) {
-        currentTime = seconds
-        if isScrubbing {
-            player?.seek(
-                to: CMTime(seconds: seconds, preferredTimescale: 600),
-                toleranceBefore: .zero,
-                toleranceAfter: .zero
-            )
+        guard mediaAccountLifetime == ChatMediaAccountLifetime.current,
+              player != nil, errorMessage == nil,
+              seconds.isFinite, duration.isFinite, duration > 0 else { return }
+        currentTime = max(0, min(seconds, duration))
+        hasReachedEnd = false
+        // Accessibility adjustments can change the Slider without a drag/editing callback.
+        seek(to: currentTime)
+    }
+
+    private func seek(to seconds: Double) {
+        guard let player, let item = playerItem else { return }
+        let identifier = UUID()
+        seekID = identifier
+        player.pause()
+        item.cancelPendingSeeks()
+        player.seek(
+            to: CMTime(seconds: seconds, preferredTimescale: 600),
+            toleranceBefore: .zero,
+            toleranceAfter: .zero
+        ) { [weak self, weak item] finished in
+            Task { @MainActor in
+                guard let self, let item,
+                      self.mediaAccountLifetime == ChatMediaAccountLifetime.current,
+                      self.playerItem === item,
+                      self.seekID == identifier else { return }
+                self.seekID = nil
+                guard finished else {
+                    self.isPlaying = false
+                    return
+                }
+                // A later pause, new drag, replacement item, or teardown wins over this seek.
+                if self.isPlaying, !self.isScrubbing {
+                    self.player?.play()
+                    self.armPictureInPicture()
+                }
+            }
         }
     }
 
@@ -1570,19 +1613,28 @@ final class GalleryVideoController: ObservableObject {
         )
         isPlaying = false
         player?.pause()
+        seekID = nil
+        item.cancelPendingSeeks()
         errorMessage = "This video could not be played completely.\nReference: \(diagnostic.supportReference)"
         ChatVideoPictureInPicture.shared.stopForPlaybackEnd(owner: self)
     }
 
     func handlePlaybackEnded(item: AVPlayerItem) {
-        guard playerItem === item, isPlaying else { return }
+        guard playerItem === item, isPlaying, !isScrubbing, seekID == nil,
+              !hasReachedEnd else { return }
         let position = item.currentTime().seconds
+        // An end notification can already be queued when the user seeks within this same item.
+        // Item identity alone cannot distinguish it from completion of the new play position.
+        guard position.isFinite, duration > 0,
+              position >= duration - min(0.25, duration / 2) else { return }
         recordPlaybackStartedIfNeeded(position: position)
         recordPlayback(.completed, position: position)
         isPlaying = false
         didRecordPlaybackStart = false
-        currentTime = 0
-        player?.seek(to: .zero)
+        hasReachedEnd = true
+        currentTime = duration
+        // Keep the last frame and completed progress visible. Rewind only after an explicit
+        // replay tap, and wait for that seek before playing again.
         // Nothing left to watch: the floating window closes itself rather than sitting on the
         // user's screen showing a frozen last frame.
         ChatVideoPictureInPicture.shared.stopForPlaybackEnd(owner: self)

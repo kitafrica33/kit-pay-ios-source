@@ -36,6 +36,654 @@ struct MessageNotificationVersion: Equatable, Comparable, Sendable {
     }
 }
 
+/// An OS-rendered fallback for new encrypted content. No sender, conversation or message body
+/// crosses APNs; authenticated sync supplies those only after the exact recipient is restored.
+struct RemoteMessageAvailableNotification: Equatable, Sendable {
+    static let type = "messaging.message_available"
+    let notificationID: UUID
+    let recipientUserID: String
+    let messageID: String
+
+    var accountFingerprint: String {
+        MessageNotificationContract.accountFingerprint(for: recipientUserID)!
+    }
+
+    var messageDigest: String {
+        MessageNotificationContract.messageDigest(for: messageID)!
+    }
+
+    var deduplicationKey: String { "\(accountFingerprint):\(messageDigest)" }
+
+    init?(_ object: Any?) {
+        guard let envelope = object as? [AnyHashable: Any], envelope.count <= 24 else { return nil }
+        // Firebase adds transport/analytics metadata around the APNs payload. Strip only its
+        // documented scalar metadata namespace; the application data contract stays exact.
+        let payload = envelope.filter { key, value in
+            guard let key = key as? String,
+                  key == "gcm.message_id" || key == "google.c.sender.id"
+                    || key == "google.c.fid" || key.hasPrefix("google.c.a."),
+                  (value as? String).map({ $0.utf8.count <= 512 }) == true || value is NSNumber
+            else { return true }
+            return false
+        }
+        guard
+              payload["type"] as? String == Self.type,
+              payload["scope"] as? String == "messaging",
+              let rawNotificationID = payload["notification_id"] as? String,
+              let notificationID = UUID(uuidString: rawNotificationID),
+              let recipient = MessageNotificationContract.canonicalUUID(
+                  payload["recipient_user_id"] as? String
+              ),
+              let message = MessageNotificationContract.canonicalUUID(
+                  payload["message_id"] as? String
+              ),
+              payload.count == 6,
+              Set(payload.keys.compactMap { $0 as? String }) == Set([
+                  "type", "scope", "notification_id", "message_id", "recipient_user_id", "aps",
+              ]),
+              let aps = payload["aps"] as? [AnyHashable: Any],
+              (aps.count == 2 || aps.count == 3),
+              (aps["content-available"] == nil
+                  || (aps["content-available"] as? NSNumber)?.doubleValue == 1),
+              Set(aps.keys.compactMap { $0 as? String }).isSubset(of: [
+                  "alert", "sound", "content-available",
+              ]),
+              aps["sound"] as? String == "default",
+              let alert = aps["alert"] as? [AnyHashable: Any],
+              alert.count == 2,
+              alert["title"] as? String == "Kit Pay",
+              alert["body"] as? String == "You have a new message."
+        else { return nil }
+        self.notificationID = notificationID
+        recipientUserID = recipient
+        messageID = message
+    }
+}
+
+struct RemoteMessageNotificationRecord: Equatable, Sendable {
+    let requestIdentifier: String
+    let notice: RemoteMessageAvailableNotification
+}
+
+struct NotificationInboxItems: Decodable, Sendable {
+    let items: [NotificationInboxItem]
+}
+
+struct NotificationPreferenceSnapshot: Codable, Equatable, Sendable {
+    static let maximumWireInteger = 9_007_199_254_740_991
+    static let maximumExpectedRevision = maximumWireInteger - 1
+    let enrollmentEpoch: Int
+    let revision: Int
+    let encryptedMessageAlerts: Bool
+    let mutedConversationIDs: [String]
+    enum CodingKeys: String, CodingKey {
+        case enrollmentEpoch = "enrollment_epoch", revision
+        case encryptedMessageAlerts = "encrypted_message_alerts"
+        case mutedConversationIDs = "muted_conversation_ids"
+    }
+
+    var isValid: Bool {
+        (1...Self.maximumWireInteger).contains(enrollmentEpoch)
+            && (0...Self.maximumWireInteger).contains(revision)
+            && mutedConversationIDs.count <= 2_048
+            && Set(mutedConversationIDs).count == mutedConversationIDs.count
+            && mutedConversationIDs.allSatisfy { MessageNotificationContract.canonicalUUID($0) == $0 }
+    }
+}
+
+struct NotificationPreferenceUpdate: Encodable, Sendable {
+    let expectedEnrollmentEpoch: Int
+    let expectedRevision: Int
+    let encryptedMessageAlerts: Bool
+    let mutedConversationIDs: [String]
+    enum CodingKeys: String, CodingKey {
+        case expectedEnrollmentEpoch = "expected_enrollment_epoch"
+        case expectedRevision = "expected_revision"
+        case encryptedMessageAlerts = "encrypted_message_alerts"
+        case mutedConversationIDs = "muted_conversation_ids"
+    }
+}
+
+struct DesiredNotificationPreferences: Equatable, Sendable {
+    let encryptedMessageAlerts: Bool
+    let mutedConversationIDs: [String]
+
+    init(localMutedConversationIDs: Set<String>) {
+        let canonical = Set(localMutedConversationIDs.compactMap(MessageNotificationContract.canonicalUUID))
+        let valid = canonical.count == localMutedConversationIDs.count && canonical.count <= 2_048
+        encryptedMessageAlerts = valid
+        mutedConversationIDs = valid ? canonical.sorted() : []
+    }
+
+    func matches(_ snapshot: NotificationPreferenceSnapshot) -> Bool {
+        snapshot.isValid && encryptedMessageAlerts == snapshot.encryptedMessageAlerts
+            && Set(mutedConversationIDs) == Set(snapshot.mutedConversationIDs)
+    }
+
+    var fingerprint: String {
+        MessageNotificationContract.deterministicUUID(
+            scope: "notification-preferences",
+            values: [encryptedMessageAlerts ? "enabled" : "disabled"] + mutedConversationIDs
+        ).uuidString.lowercased()
+    }
+}
+
+@MainActor
+final class NotificationPreferenceSynchronizer {
+    enum Outcome: Equatable { case synchronized, retry, retryAfter(TimeInterval), unsupportedServer }
+    static let shared = NotificationPreferenceSynchronizer()
+    static let pendingMessage = "Notification preference change is waiting to sync."
+    private let defaults: UserDefaults
+    private struct PossiblyEnabled: Codable {
+        let enrollmentEpoch: Int
+        let expectedRevision: Int
+        let desiredFingerprint: String
+
+        var isValid: Bool {
+            (1...NotificationPreferenceSnapshot.maximumWireInteger).contains(enrollmentEpoch)
+                && (0...NotificationPreferenceSnapshot.maximumExpectedRevision).contains(expectedRevision)
+                && MessageNotificationContract.canonicalUUID(desiredFingerprint) == desiredFingerprint
+        }
+    }
+
+    init(defaults: UserDefaults = .standard) { self.defaults = defaults }
+
+    func needsPendingStatus(ownerUserID: String, localMutedConversationIDs: Set<String>) -> Bool {
+        guard let key = storageKey(ownerUserID) else { return false }
+        let desired = DesiredNotificationPreferences(localMutedConversationIDs: localMutedConversationIDs)
+        if let bytes = defaults.data(forKey: key + ".possibly-enabled"), bytes.count <= 1_024,
+           let pending = try? JSONDecoder().decode(PossiblyEnabled.self, from: bytes),
+           pending.isValid {
+            return !localMutedConversationIDs.isEmpty || desired.fingerprint != pending.desiredFingerprint
+        }
+        guard let data = defaults.data(forKey: key), data.count <= 100 * 1_024,
+              let acknowledged = try? JSONDecoder().decode(NotificationPreferenceSnapshot.self, from: data),
+              acknowledged.isValid, acknowledged.encryptedMessageAlerts else { return false }
+        return !desired.matches(acknowledged)
+    }
+
+    func synchronize(
+        ownerUserID: String,
+        isCurrent: @MainActor () async -> Bool,
+        latestLocalMuteIDs: @MainActor () async -> Set<String>?,
+        fetch: @MainActor () async throws -> NotificationPreferenceSnapshot,
+        update: @MainActor (NotificationPreferenceUpdate) async throws -> NotificationPreferenceSnapshot
+    ) async -> Outcome {
+        guard let key = storageKey(ownerUserID), !Task.isCancelled, await isCurrent() else { return .retry }
+        do {
+            let remote = try await fetch()
+            guard remote.isValid, !Task.isCancelled, await isCurrent(),
+                  let latest = await latestLocalMuteIDs(),
+                  !Task.isCancelled, await isCurrent() else { return .retry }
+            let desired = DesiredNotificationPreferences(localMutedConversationIDs: latest)
+            let pending = defaults.data(forKey: key + ".possibly-enabled").flatMap { data -> PossiblyEnabled? in
+                guard data.count <= 1_024,
+                      let pending = try? JSONDecoder().decode(PossiblyEnabled.self, from: data),
+                      pending.isValid else { return nil }
+                return pending
+            }
+            // A GET at the same revision cannot rule out a delayed enabling PUT. Advance the
+            // revision even for an equal desired value so the server rejects that obsolete write.
+            let needsWriteFence = pending?.enrollmentEpoch == remote.enrollmentEpoch
+                && pending?.expectedRevision == remote.revision
+            let acknowledged: NotificationPreferenceSnapshot
+            if desired.matches(remote), !needsWriteFence {
+                acknowledged = remote
+            } else {
+                guard remote.revision <= NotificationPreferenceSnapshot.maximumExpectedRevision,
+                      !Task.isCancelled, await isCurrent() else { return .retry }
+                if desired.encryptedMessageAlerts {
+                    // A timed-out PUT may still commit on the server. Persist uncertainty before
+                    // sending it so a later offline mute cannot falsely promise background silence.
+                    guard let bytes = try? JSONEncoder().encode(PossiblyEnabled(
+                        enrollmentEpoch: remote.enrollmentEpoch, expectedRevision: remote.revision,
+                        desiredFingerprint: desired.fingerprint
+                    )) else { return .retry }
+                    defaults.set(bytes, forKey: key + ".possibly-enabled")
+                }
+                acknowledged = try await update(NotificationPreferenceUpdate(
+                    expectedEnrollmentEpoch: remote.enrollmentEpoch, expectedRevision: remote.revision,
+                    encryptedMessageAlerts: desired.encryptedMessageAlerts,
+                    mutedConversationIDs: desired.mutedConversationIDs
+                ))
+                guard acknowledged.enrollmentEpoch == remote.enrollmentEpoch,
+                      acknowledged.revision == remote.revision + 1 else { return .retry }
+            }
+            guard desired.matches(acknowledged), !Task.isCancelled, await isCurrent(),
+                  let after = await latestLocalMuteIDs(),
+                  DesiredNotificationPreferences(localMutedConversationIDs: after) == desired,
+                  !Task.isCancelled, await isCurrent(),
+                  let data = try? JSONEncoder().encode(acknowledged) else { return .retry }
+            defaults.set(data, forKey: key)
+            defaults.removeObject(forKey: key + ".possibly-enabled")
+            return .synchronized
+        } catch {
+            // A timeout may have committed. The next pass must GET a fresh epoch/revision and
+            // read the latest local state, never replay this possibly obsolete PUT snapshot.
+            if Self.isUnsupportedServer(error) { return .unsupportedServer }
+            if let delay = Self.serverRetryDelay(error), delay.isFinite, delay > 0 {
+                return .retryAfter(min(3_600, max(30, delay)))
+            }
+            return .retry
+        }
+    }
+
+    private static func serverRetryDelay(_ error: Error) -> TimeInterval? {
+        if let payload = error as? APIErrorPayload { return payload.retryAfter }
+        if let client = error as? APIClientError,
+           case .httpResponse(_, let delay) = client { return delay }
+        return nil
+    }
+
+    private static func isUnsupportedServer(_ error: Error) -> Bool {
+        let status: Int?
+        if let payload = error as? APIErrorPayload {
+            status = payload.httpStatus
+        } else if let client = error as? APIClientError {
+            switch client {
+            case .invalidPayload(let value), .httpStatus(let value), .httpResponse(let value, _):
+                status = value
+            default: status = nil
+            }
+        } else { status = nil }
+        return status.map { [404, 405, 501].contains($0) } ?? false
+    }
+
+    private func storageKey(_ ownerUserID: String) -> String? {
+        MessageNotificationContract.accountFingerprint(for: ownerUserID).map {
+            "kit.notification-preferences-ack.v1.\($0)"
+        }
+    }
+}
+
+struct NotificationInboxPage: Sendable {
+    let items: [NotificationInboxItem]
+    let nextCursor: String?
+}
+
+struct NotificationInboxItem: Decodable, Sendable {
+    struct Payload: Decodable, Sendable {
+        let callID: String?
+        let recipientUserID: String?
+        let state: String?
+        let missedCallAlert: Bool?
+        enum CodingKeys: String, CodingKey {
+            case callID = "call_id", recipientUserID = "recipient_user_id"
+            case state, missedCallAlert = "missed_call_alert"
+        }
+    }
+    let id: String
+    let type: String
+    let data: Payload
+    let silent: Bool
+    let readAt: String?
+    let createdAt: String
+    enum CodingKeys: String, CodingKey {
+        case id, type, data, silent
+        case readAt = "read_at", createdAt = "created_at"
+    }
+}
+
+struct NotificationInboxAlertRecord: Sendable {
+    let requestIdentifier: String
+    let notificationID: String
+    let callID: String?
+    let ownerFingerprint: String?
+    let isRecovered: Bool
+    let createdAt: Date
+    let location: VisibleMessageNotificationRecord.Location
+}
+
+struct NotificationInboxTap: Codable, Equatable, Sendable {
+    enum Destination: String, Codable, Sendable { case calls, home }
+    let notificationID: String
+    let recipientUserID: String
+    let destination: Destination
+
+    var key: String { "\(recipientUserID):\(notificationID)" }
+
+    init?(_ payload: [AnyHashable: Any]) {
+        guard let id = MessageNotificationContract.canonicalUUID(payload["notification_id"] as? String),
+              let recipient = MessageNotificationContract.canonicalUUID(payload["recipient_user_id"] as? String),
+              let type = payload["type"] as? String
+        else { return nil }
+        if type == "call.missed" {
+            guard payload["missed_call_alert"] as? Bool == true,
+                  payload["state"] as? String == "missed",
+                  MessageNotificationContract.canonicalUUID(payload["call_id"] as? String) != nil
+            else { return nil }
+            destination = .calls
+        } else if type == NotificationInboxRecoveryPolicy.localType {
+            if payload["original_type"] as? String == "call.missed" {
+                guard MessageNotificationContract.canonicalUUID(payload["call_id"] as? String) != nil else { return nil }
+                destination = .calls
+            } else { destination = .home }
+        } else { return nil }
+        notificationID = id
+        recipientUserID = recipient
+    }
+}
+
+struct NotificationInboxTapStore: @unchecked Sendable {
+    private static let lock = NSLock()
+    static let storageKey = "kit.notification-inbox-taps.v1"
+    private let defaults: UserDefaults
+
+    init(defaults: UserDefaults = .standard) { self.defaults = defaults }
+
+    func append(_ tap: NotificationInboxTap) {
+        Self.lock.lock()
+        defer { Self.lock.unlock() }
+        var pending = loadUnlocked()
+        pending.removeAll { $0.key == tap.key }
+        pending.append(tap)
+        if let data = try? JSONEncoder().encode(Array(pending.suffix(16))) {
+            defaults.set(data, forKey: Self.storageKey)
+        }
+    }
+
+    func remove(key: String) {
+        Self.lock.lock()
+        defer { Self.lock.unlock() }
+        let remaining = loadUnlocked().filter { $0.key != key }
+        if let data = try? JSONEncoder().encode(remaining) {
+            defaults.set(data, forKey: Self.storageKey)
+        }
+    }
+
+    func actions() -> [NotificationInboxTap] {
+        Self.lock.lock()
+        defer { Self.lock.unlock() }
+        return loadUnlocked()
+    }
+
+    private func loadUnlocked() -> [NotificationInboxTap] {
+        guard let data = defaults.data(forKey: Self.storageKey), data.count <= 16_384,
+              let taps = try? JSONDecoder().decode([NotificationInboxTap].self, from: data),
+              taps.count <= 16
+        else { return [] }
+        return taps.filter {
+            MessageNotificationContract.canonicalUUID($0.recipientUserID) != nil
+                && MessageNotificationContract.canonicalUUID($0.notificationID) != nil
+        }
+    }
+}
+
+actor NotificationInboxTapDispatcher {
+    typealias Handler = @Sendable (NotificationInboxTap) async -> MessageNotificationActionHandlingResult
+    static let shared = NotificationInboxTapDispatcher()
+    private let store: NotificationInboxTapStore
+    private var handler: Handler?
+    private var replaying = false
+
+    init(store: NotificationInboxTapStore = .init()) { self.store = store }
+
+    static func persistBeforeCompletingSystemResponse(
+        _ tap: NotificationInboxTap, store: NotificationInboxTapStore = .init()
+    ) {
+        store.append(tap)
+    }
+
+    func install(_ handler: @escaping Handler) async {
+        self.handler = handler
+        await replayPending()
+    }
+
+    func replayPending() async {
+        guard !replaying, let handler else { return }
+        replaying = true
+        defer { replaying = false }
+        var attempted: Set<String> = []
+        while let tap = store.actions().first(where: { !attempted.contains($0.key) }) {
+            attempted.insert(tap.key)
+            let result = await handler(tap)
+            guard result != .retry else { continue }
+            // Merge with taps that arrived while restoration/routing suspended.
+            store.remove(key: tap.key)
+        }
+    }
+}
+
+enum NotificationInboxRecoveryPolicy {
+    static let localType = "notification.recovered"
+    static let maximumActiveAlerts = 12
+    static let maximumOlderPagesPerPass = 3
+
+    static func identity(for item: NotificationInboxItem, ownerUserID: String) -> String? {
+        guard !item.silent, item.readAt == nil,
+              let id = MessageNotificationContract.canonicalUUID(item.id),
+              !item.type.hasPrefix("messaging."), !item.type.hasPrefix("message.")
+        else { return nil }
+        if item.type.hasPrefix("call.") {
+            guard item.type == "call.missed", item.data.missedCallAlert == true,
+                  item.data.state == "missed",
+                  MessageNotificationContract.canonicalUUID(item.data.recipientUserID)
+                    == MessageNotificationContract.canonicalUUID(ownerUserID),
+                  let callID = MessageNotificationContract.canonicalUUID(item.data.callID)
+            else { return nil }
+            return "call.missed:\(MessageNotificationContract.messageDigest(for: callID)!)"
+        }
+        return "notification:\(MessageNotificationContract.messageDigest(for: id)!)"
+    }
+
+    static func alreadyPresented(
+        _ item: NotificationInboxItem, ownerFingerprint: String,
+        active: [NotificationInboxAlertRecord]
+    ) -> Bool {
+        active.contains { record in
+            if record.notificationID == MessageNotificationContract.canonicalUUID(item.id) { return true }
+            return item.type == "call.missed" && record.ownerFingerprint == ownerFingerprint
+                && record.callID != nil
+                && record.callID == MessageNotificationContract.canonicalUUID(item.data.callID)
+        }
+    }
+}
+
+/// The unread inbox is the durable recovery source when an OS push was dropped. Receipts are
+/// local presentation acknowledgements, never server read receipts. Cursors walk older pages;
+/// every pass also revisits the head because an old scheduled row can become visible later.
+@MainActor
+final class NotificationInboxRecoveryCoordinator {
+    static let shared = NotificationInboxRecoveryCoordinator()
+    private let center: any VisibleMessageNotificationCenter
+    private let defaults: UserDefaults
+    private var ownerFingerprint: String?
+    private var generation: UInt64 = 0
+    private var runningGeneration: UInt64?
+    private struct Checkpoint: Codable {
+        var receipts: Set<String> = []
+        var seenDuringScan: Set<String> = []
+        var cursor: String?
+    }
+
+    init(center: (any VisibleMessageNotificationCenter)? = nil, defaults: UserDefaults = .standard) {
+        self.center = center ?? SystemVisibleMessageNotificationCenter()
+        self.defaults = defaults
+    }
+
+    func quarantine() {
+        generation &+= 1
+        ownerFingerprint = nil
+        runningGeneration = nil
+    }
+
+    func resume(for ownerUserID: String) {
+        generation &+= 1
+        ownerFingerprint = MessageNotificationContract.accountFingerprint(for: ownerUserID)
+    }
+
+    func recover(
+        ownerUserID: String,
+        isCurrent: @MainActor () async -> Bool,
+        fetch: @MainActor (String?) async throws -> NotificationInboxPage
+    ) async -> Bool {
+        guard let owner = MessageNotificationContract.accountFingerprint(for: ownerUserID),
+              ownerFingerprint == owner, runningGeneration == nil,
+              await isCurrent()
+        else { return false }
+        let expectedGeneration = generation
+        runningGeneration = expectedGeneration
+        defer { if runningGeneration == expectedGeneration { runningGeneration = nil } }
+        let key = "kit.notification-inbox.v1.\(owner)"
+        var checkpoint = defaults.data(forKey: key).flatMap {
+            try? JSONDecoder().decode(Checkpoint.self, from: $0)
+        } ?? Checkpoint()
+        if checkpoint.cursor == nil { checkpoint.seenDuringScan.removeAll() }
+        do {
+            let head = try await fetch(nil)
+            guard try await process(head, ownerUserID: ownerUserID, owner: owner, key: key,
+                                checkpoint: &checkpoint, generation: expectedGeneration,
+                                isCurrent: isCurrent) else { return false }
+            var cursor = head.nextCursor == nil ? nil : (checkpoint.cursor ?? head.nextCursor)
+            checkpoint.cursor = cursor
+            guard generation == expectedGeneration, await isCurrent(),
+                  save(checkpoint, key: key, generation: expectedGeneration) else { return false }
+            var visited: Set<String> = []
+            for _ in 0..<NotificationInboxRecoveryPolicy.maximumOlderPagesPerPass {
+                guard let next = cursor else { break }
+                guard !next.isEmpty, next.utf8.count <= 2_048,
+                      visited.insert(next).inserted,
+                      generation == expectedGeneration, await isCurrent()
+                else { return false }
+                let page = try await fetch(next)
+                guard try await process(page, ownerUserID: ownerUserID, owner: owner, key: key,
+                                    checkpoint: &checkpoint, generation: expectedGeneration,
+                                    isCurrent: isCurrent) else { return false }
+                cursor = page.nextCursor
+                guard cursor != next else { return false }
+                checkpoint.cursor = cursor
+                guard await isCurrent(), save(checkpoint, key: key, generation: expectedGeneration)
+                else { return false }
+            }
+            checkpoint.cursor = cursor
+            if cursor == nil {
+                // Prune only after an entire authenticated unread scan. An age/size eviction
+                // would repeatedly alert for old unread rows after a long offline interval.
+                checkpoint.receipts.formIntersection(checkpoint.seenDuringScan)
+                checkpoint.seenDuringScan.removeAll()
+            }
+            guard generation == expectedGeneration, await isCurrent(),
+                  save(checkpoint, key: key, generation: expectedGeneration) else { return false }
+            return cursor != nil
+        } catch {
+            // Leave both unread state and the last completely handled page intact for recovery.
+            guard generation == expectedGeneration else { return false }
+            return await isCurrent()
+        }
+    }
+
+    private func process(
+        _ page: NotificationInboxPage, ownerUserID: String, owner: String, key: String,
+        checkpoint: inout Checkpoint, generation expectedGeneration: UInt64,
+        isCurrent: @MainActor () async -> Bool
+    ) async throws -> Bool {
+        guard page.items.count <= 100, generation == expectedGeneration, await isCurrent()
+        else { return false }
+        let authorization = await center.authorization()
+        var active = await center.activeInboxNotifications()
+        guard generation == expectedGeneration, await isCurrent() else { return false }
+        for item in page.items {
+            guard generation == expectedGeneration, await isCurrent() else { return false }
+            guard let identity = NotificationInboxRecoveryPolicy.identity(for: item, ownerUserID: ownerUserID),
+                  let createdAt = CallLifecyclePolicy.serverTimestamp(item.createdAt)
+            else { continue }
+            checkpoint.seenDuringScan.insert(identity)
+            if checkpoint.receipts.contains(identity) { continue }
+            if NotificationInboxRecoveryPolicy.alreadyPresented(item, ownerFingerprint: owner, active: active) {
+                checkpoint.receipts.insert(identity)
+                guard save(checkpoint, key: key, generation: expectedGeneration) else { return false }
+                continue
+            }
+            guard authorization.permitsVisibleAlerts else { continue }
+            let owned = active.filter { $0.isRecovered && $0.ownerFingerprint == owner }
+            var eviction: NotificationInboxAlertRecord?
+            if owned.count >= NotificationInboxRecoveryPolicy.maximumActiveAlerts {
+                guard let oldest = owned.min(by: { $0.createdAt < $1.createdAt }),
+                      createdAt > oldest.createdAt else { continue }
+                eviction = oldest
+            }
+            let content = UNMutableNotificationContent()
+            content.title = item.type == "call.missed" ? "Missed call" : "Kit Pay update"
+            content.body = item.type == "call.missed"
+                ? "Open Kit Pay to view your calls." : "Open Kit Pay to view your updates."
+            content.sound = .default
+            content.userInfo = ["type": NotificationInboxRecoveryPolicy.localType,
+                                "notification_id": item.id, "recipient_user_id": ownerUserID,
+                                "original_type": item.type, "created_at": item.createdAt]
+            if item.type == "call.missed", let callID = item.data.callID { content.userInfo["call_id"] = callID }
+            let request = UNNotificationRequest(
+                identifier: "kit.inbox.\(owner).\(identity)", content: content, trigger: nil
+            )
+            try await center.add(request)
+            guard generation == expectedGeneration, await isCurrent() else {
+                center.removePendingRequests(withIdentifiers: [request.identifier])
+                center.removeDeliveredNotifications(withIdentifiers: [request.identifier])
+                return false
+            }
+            if let eviction {
+                center.removePendingRequests(withIdentifiers: [eviction.requestIdentifier])
+                center.removeDeliveredNotifications(withIdentifiers: [eviction.requestIdentifier])
+                active.removeAll { $0.requestIdentifier == eviction.requestIdentifier }
+            }
+            checkpoint.receipts.insert(identity)
+            guard save(checkpoint, key: key, generation: expectedGeneration) else { return false }
+            active.append(NotificationInboxAlertRecord(
+                requestIdentifier: request.identifier, notificationID: item.id,
+                callID: item.type == "call.missed" ? item.data.callID : nil,
+                ownerFingerprint: owner, isRecovered: true, createdAt: createdAt, location: .pending
+            ))
+        }
+        return true
+    }
+
+    private func save(_ checkpoint: Checkpoint, key: String, generation expectedGeneration: UInt64) -> Bool {
+        guard generation == expectedGeneration,
+              let bytes = try? JSONEncoder().encode(checkpoint) else { return false }
+        defaults.set(bytes, forKey: key)
+        return true
+    }
+}
+
+enum RecipientBoundRemoteNotificationPolicy {
+    static func permits(_ payload: [AnyHashable: Any], ownerFingerprint: String?) -> Bool {
+        guard let recipient = payload["recipient_user_id"] as? String,
+              let fingerprint = MessageNotificationContract.accountFingerprint(for: recipient),
+              let ownerFingerprint
+        else { return false }
+        return fingerprint == ownerFingerprint
+    }
+}
+
+enum RemoteMessageNotificationReconciliationPolicy {
+    static func identifiersToRemove(
+        records: [RemoteMessageNotificationRecord],
+        messages: [LocalMessage],
+        ownerUserID: String,
+        suppressedConversationID: String?,
+        mutedConversationIDs: Set<String>
+    ) -> [String] {
+        guard let owner = MessageNotificationContract.canonicalUUID(ownerUserID) else { return [] }
+        let suppressed = MessageNotificationContract.canonicalUUID(suppressedConversationID)
+        let muted = Set(mutedConversationIDs.compactMap { MessageNotificationContract.canonicalUUID($0) })
+        let clearedMessageIDs = Set(messages.compactMap { message -> String? in
+            guard !message.isOutgoing,
+                  let conversation = MessageNotificationContract.canonicalUUID(message.conversationId),
+                  conversation == suppressed || muted.contains(conversation)
+            else { return nil }
+            return MessageNotificationContract.canonicalUUID(message.serverMessageId)
+        })
+        var retainedKeys: Set<String> = []
+        return records.sorted { $0.requestIdentifier < $1.requestIdentifier }.compactMap { record in
+            guard record.notice.recipientUserID == owner else { return nil }
+            if clearedMessageIDs.contains(record.notice.messageID)
+                || !retainedKeys.insert(record.notice.deduplicationKey).inserted {
+                return record.requestIdentifier
+            }
+            return nil
+        }
+    }
+}
+
 enum MessageNotificationContract {
     static let categoryIdentifier = "africa.kit.pay.message"
     static let replyActionIdentifier = "africa.kit.pay.message.reply"
@@ -1712,6 +2360,8 @@ enum VisibleMessageNotificationPublicationPolicy {
 protocol VisibleMessageNotificationCenter: AnyObject {
     func authorization() async -> VisibleMessageNotificationAuthorization
     func activeMessageNotifications() async -> [VisibleMessageNotificationRecord]
+    func deliveredRemoteMessageNotifications() async -> [RemoteMessageNotificationRecord]
+    func activeInboxNotifications() async -> [NotificationInboxAlertRecord]
     func removePendingRequests(withIdentifiers identifiers: [String])
     func removeDeliveredNotifications(withIdentifiers identifiers: [String])
     func add(_ request: UNNotificationRequest) async throws
@@ -1756,6 +2406,51 @@ final class SystemVisibleMessageNotificationCenter: VisibleMessageNotificationCe
         center.removePendingNotificationRequests(withIdentifiers: identifiers)
     }
 
+    func deliveredRemoteMessageNotifications() async -> [RemoteMessageNotificationRecord] {
+        await center.deliveredNotifications().compactMap { notification in
+            guard let notice = RemoteMessageAvailableNotification(
+                notification.request.content.userInfo
+            ) else { return nil }
+            return RemoteMessageNotificationRecord(
+                requestIdentifier: notification.request.identifier, notice: notice
+            )
+        }
+    }
+
+    func activeInboxNotifications() async -> [NotificationInboxAlertRecord] {
+        async let pending = center.pendingNotificationRequests()
+        async let delivered = center.deliveredNotifications()
+        let (requests, notifications) = await (pending, delivered)
+        return requests.compactMap {
+            inboxRecord($0, location: .pending, deliveredAt: nil)
+        } + notifications.compactMap {
+            inboxRecord($0.request, location: .delivered, deliveredAt: $0.date)
+        }
+    }
+
+    private func inboxRecord(
+        _ request: UNNotificationRequest,
+        location: VisibleMessageNotificationRecord.Location, deliveredAt: Date?
+    ) -> NotificationInboxAlertRecord? {
+        let payload = request.content.userInfo
+        guard let type = payload["type"] as? String,
+              !type.hasPrefix("messaging."), !type.hasPrefix("message."),
+              !type.hasPrefix("call.") || type == "call.missed",
+              let id = MessageNotificationContract.canonicalUUID(payload["notification_id"] as? String)
+        else { return nil }
+        let isRecovered = type == NotificationInboxRecoveryPolicy.localType
+        let missed = type == "call.missed" || (isRecovered && payload["original_type"] as? String == "call.missed")
+        return NotificationInboxAlertRecord(
+            requestIdentifier: request.identifier, notificationID: id,
+            callID: missed ? MessageNotificationContract.canonicalUUID(payload["call_id"] as? String) : nil,
+            ownerFingerprint: MessageNotificationContract.accountFingerprint(for: payload["recipient_user_id"] as? String),
+            isRecovered: isRecovered,
+            createdAt: (payload["created_at"] as? String).flatMap { CallLifecyclePolicy.serverTimestamp($0) }
+                ?? deliveredAt ?? .distantPast,
+            location: location
+        )
+    }
+
     func removeDeliveredNotifications(withIdentifiers identifiers: [String]) {
         center.removeDeliveredNotifications(withIdentifiers: identifiers)
     }
@@ -1798,6 +2493,11 @@ final class VisibleMessageNotificationCoordinator {
     private var schedulingTail: Task<Int, Never>?
     private var publicationGeneration: UInt64 = 0
     private var publicationEnabled = true
+    private var publicationOwnerFingerprint: String?
+    // Closes the gap before the OS exposes a just-delivered remote alert in its delivered list.
+    // The delivered list is the durable source across process death; this cache is bounded.
+    private var systemAlertKeys: [String] = []
+    private var foregroundAlertKeys: [String] = []
 
     init(
         center: (any VisibleMessageNotificationCenter)? = nil,
@@ -1810,6 +2510,10 @@ final class VisibleMessageNotificationCoordinator {
     @discardableResult
     func schedule(_ descriptors: [VisibleMessageNotificationDescriptor]) async -> Int {
         guard !descriptors.isEmpty, publicationEnabled else { return 0 }
+        let descriptors = descriptors.filter {
+            publicationOwnerFingerprint == nil || $0.accountFingerprint == publicationOwnerFingerprint
+        }
+        guard !descriptors.isEmpty else { return 0 }
         let expectedGeneration = publicationGeneration
         let previous = schedulingTail
         let operation = Task { @MainActor [weak self] in
@@ -1833,17 +2537,28 @@ final class VisibleMessageNotificationCoordinator {
         guard publicationIsPermitted(expectedGeneration), !Task.isCancelled else { return 0 }
 
         let activeNotifications = await center.activeMessageNotifications()
+        let remoteNotifications = await center.deliveredRemoteMessageNotifications()
         // The system-center read suspends. Ownership may enter quarantine while it is in flight;
         // a stale plan must not remove notifications that now belong to a recovered account.
         guard publicationIsPermitted(expectedGeneration), !Task.isCancelled else { return 0 }
+        let incomingOwners = Set(descriptors.map(\.accountFingerprint))
+        let remoteKeys = Set(remoteNotifications.filter {
+            incomingOwners.contains($0.notice.accountFingerprint)
+        }.map { $0.notice.deduplicationKey }).union(systemAlertKeys)
+        let duplicateLocalRecords = activeNotifications.filter { record in
+            guard incomingOwners.contains(record.accountFingerprint),
+                  let version = record.version else { return false }
+            return remoteKeys.contains("\(record.accountFingerprint):\(version.messageDigest)")
+        }
         let plan = VisibleMessageNotificationPublicationPolicy.plan(
-            active: activeNotifications,
+            active: activeNotifications.filter { !duplicateLocalRecords.contains($0) },
             incoming: descriptors
         )
-        let pendingIdentifiers = Set(plan.recordsToRemove.compactMap {
+        let recordsToRemove = plan.recordsToRemove + duplicateLocalRecords
+        let pendingIdentifiers = Set(recordsToRemove.compactMap {
             $0.location == .pending ? $0.requestIdentifier : nil
         }).sorted()
-        let deliveredIdentifiers = Set(plan.recordsToRemove.compactMap {
+        let deliveredIdentifiers = Set(recordsToRemove.compactMap {
             $0.location == .delivered ? $0.requestIdentifier : nil
         }).sorted()
         if !pendingIdentifiers.isEmpty {
@@ -1857,6 +2572,10 @@ final class VisibleMessageNotificationCoordinator {
         for descriptor in plan.descriptorsToPublish {
             guard publicationIsPermitted(expectedGeneration), !Task.isCancelled else {
                 return scheduledCount
+            }
+            let remoteKey = "\(descriptor.accountFingerprint):\(descriptor.version.messageDigest)"
+            if systemAlertKeys.contains(remoteKey) || remoteKeys.contains(remoteKey) {
+                continue
             }
             let content = UNMutableNotificationContent()
             content.title = VisibleMessageNotificationPolicy.title
@@ -1891,7 +2610,8 @@ final class VisibleMessageNotificationCoordinator {
             )
             do {
                 try await center.add(request)
-                guard publicationIsPermitted(expectedGeneration), !Task.isCancelled else {
+                guard publicationIsPermitted(expectedGeneration), !Task.isCancelled,
+                      !systemAlertKeys.contains(remoteKey) else {
                     center.removePendingRequests(withIdentifiers: [request.identifier])
                     center.removeDeliveredNotifications(withIdentifiers: [request.identifier])
                     return scheduledCount
@@ -1905,15 +2625,81 @@ final class VisibleMessageNotificationCoordinator {
         return scheduledCount
     }
 
+    func recordSystemAlert(_ notice: RemoteMessageAvailableNotification, ownerUserID: String) async {
+        guard publicationEnabled,
+              notice.recipientUserID == MessageNotificationContract.canonicalUUID(ownerUserID),
+              publicationOwnerFingerprint == nil || notice.accountFingerprint == publicationOwnerFingerprint
+        else { return }
+        let generation = publicationGeneration
+        let key = notice.deduplicationKey
+        guard !foregroundAlertKeys.contains(key) else { return }
+        systemAlertKeys.removeAll { $0 == key }
+        systemAlertKeys.append(key)
+        if systemAlertKeys.count > 256 { systemAlertKeys.removeFirst(systemAlertKeys.count - 256) }
+        await removeLocalCopies(of: [key], generation: generation)
+    }
+
+    func recordForegroundDelivery(_ notice: RemoteMessageAvailableNotification) {
+        let key = notice.deduplicationKey
+        systemAlertKeys.removeAll { $0 == key }
+        foregroundAlertKeys.removeAll { $0 == key }
+        foregroundAlertKeys.append(key)
+        if foregroundAlertKeys.count > 256 {
+            foregroundAlertKeys.removeFirst(foregroundAlertKeys.count - 256)
+        }
+    }
+
+    private func removeLocalCopies(of keys: Set<String>, generation: UInt64) async {
+        let active = await center.activeMessageNotifications()
+        guard publicationIsPermitted(generation) else { return }
+        let duplicates = active.filter {
+            guard let version = $0.version else { return false }
+            return keys.contains("\($0.accountFingerprint):\(version.messageDigest)")
+        }
+        center.removePendingRequests(withIdentifiers: duplicates.filter {
+            $0.location == .pending
+        }.map(\.requestIdentifier))
+        center.removeDeliveredNotifications(withIdentifiers: duplicates.filter {
+            $0.location == .delivered
+        }.map(\.requestIdentifier))
+    }
+
+    func reconcileRemoteNotifications(
+        messages: [LocalMessage], ownerUserID: String,
+        suppressedConversationID: String?, mutedConversationIDs: Set<String>
+    ) async {
+        guard publicationEnabled,
+              publicationOwnerFingerprint == nil
+                || MessageNotificationContract.accountFingerprint(for: ownerUserID) == publicationOwnerFingerprint
+        else { return }
+        let generation = publicationGeneration
+        let records = await center.deliveredRemoteMessageNotifications()
+        guard publicationIsPermitted(generation) else { return }
+        let identifiers = RemoteMessageNotificationReconciliationPolicy.identifiersToRemove(
+            records: records, messages: messages, ownerUserID: ownerUserID,
+            suppressedConversationID: suppressedConversationID,
+            mutedConversationIDs: mutedConversationIDs
+        )
+        if !identifiers.isEmpty { center.removeDeliveredNotifications(withIdentifiers: identifiers) }
+        let ownedKeys = Set(records.filter {
+            $0.notice.recipientUserID == MessageNotificationContract.canonicalUUID(ownerUserID)
+        }.map { $0.notice.deduplicationKey })
+        if !ownedKeys.isEmpty { await removeLocalCopies(of: ownedKeys, generation: generation) }
+    }
+
     func beginPrivacyQuarantine() {
         publicationGeneration &+= 1
         publicationEnabled = false
+        publicationOwnerFingerprint = nil
+        systemAlertKeys.removeAll()
+        foregroundAlertKeys.removeAll()
         schedulingTail?.cancel()
         schedulingTail = nil
     }
 
-    func resumeAfterOwnershipRecovery() {
+    func resumeAfterOwnershipRecovery(for ownerUserID: String? = nil) {
         publicationGeneration &+= 1
+        publicationOwnerFingerprint = MessageNotificationContract.accountFingerprint(for: ownerUserID)
         publicationEnabled = true
     }
 
@@ -2842,6 +3628,7 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
         communicationOwnerFingerprint = nil
         ProtectedCommunicationAdmissionGate.shared.quarantine()
         VisibleMessageNotificationCoordinator.shared.beginPrivacyQuarantine()
+        NotificationInboxRecoveryCoordinator.shared.quarantine()
         suppressPushTokenInvalidation = false
         ensureVoIPRegistry()
         UIApplication.shared.registerForRemoteNotifications()
@@ -2879,7 +3666,8 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
         registrationEnabled = true
         communicationOwnerFingerprint = recoveredFingerprint
         ProtectedCommunicationAdmissionGate.shared.restore(forAccountID: accountID)
-        VisibleMessageNotificationCoordinator.shared.resumeAfterOwnershipRecovery()
+        VisibleMessageNotificationCoordinator.shared.resumeAfterOwnershipRecovery(for: accountID)
+        NotificationInboxRecoveryCoordinator.shared.resume(for: accountID)
         suppressPushTokenInvalidation = false
         ensureVoIPRegistry()
         if reusesAuthenticatedCalls {
@@ -2938,6 +3726,7 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
         communicationOwnerFingerprint = nil
         ProtectedCommunicationAdmissionGate.shared.quarantine()
         VisibleMessageNotificationCoordinator.shared.beginPrivacyQuarantine()
+        NotificationInboxRecoveryCoordinator.shared.quarantine()
         suppressPushTokenInvalidation = true
         UIApplication.shared.unregisterForRemoteNotifications()
         voipRegistry?.desiredPushTypes = []
@@ -2960,6 +3749,7 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
         invalidateCallActionOwnership()
         ProtectedCommunicationAdmissionGate.shared.quarantine()
         VisibleMessageNotificationCoordinator.shared.beginPrivacyQuarantine()
+        NotificationInboxRecoveryCoordinator.shared.quarantine()
         callRegistryGeneration &+= 1
         invalidateCallKitAudio(resetSounds: true)
         let activeCalls = backendCallIds
@@ -3004,6 +3794,7 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
         invalidateCallKitAudio(resetSounds: true)
         ProtectedCommunicationAdmissionGate.shared.quarantine()
         VisibleMessageNotificationCoordinator.shared.beginPrivacyQuarantine()
+        NotificationInboxRecoveryCoordinator.shared.quarantine()
         callRegistryGeneration &+= 1
         verificationRetryTasks.values.forEach { $0.cancel() }
         verificationRetryTasks.removeAll()
@@ -3962,7 +4753,27 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
     ) {
         Task { @MainActor in
+            let payload = notification.request.content.userInfo
+            if SecureMessagingRemoteWake.isMessageAvailable(payload) {
+                // Foreground delivery uses the authenticated per-conversation local policy,
+                // which can honor an open or muted thread. It does not render the generic alert.
+                completionHandler([])
+                if let wake = SecureMessagingRemoteWake(payload, requestsForegroundMessageAlert: true) {
+                    if let notice = wake.messageAvailable {
+                        VisibleMessageNotificationCoordinator.shared.recordForegroundDelivery(notice)
+                    }
+                    _ = await SecureMessagingWakeDispatcher.shared.dispatch(wake)
+                }
+                return
+            }
             guard registrationEnabled, !privacyQuarantineActive else {
+                completionHandler([])
+                return
+            }
+            if payload["recipient_user_id"] != nil,
+               !RecipientBoundRemoteNotificationPolicy.permits(
+                   payload, ownerFingerprint: communicationOwnerFingerprint
+               ) {
                 completionHandler([])
                 return
             }
@@ -3987,6 +4798,30 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
         completion: NotificationSystemResponseCompletion
     ) {
         let content = response.notification.request.content
+        if SecureMessagingRemoteWake.isMessageAvailable(content.userInfo) {
+            completion.complete()
+            if let wake = SecureMessagingRemoteWake(
+                content.userInfo, isSystemAlertDelivery: true, isUserTap: true
+            ) {
+                Task { _ = await SecureMessagingWakeDispatcher.shared.dispatch(wake) }
+            }
+            return
+        }
+        if content.userInfo["recipient_user_id"] != nil,
+           let communicationOwnerFingerprint,
+           !RecipientBoundRemoteNotificationPolicy.permits(
+               content.userInfo, ownerFingerprint: communicationOwnerFingerprint
+           ) {
+            completion.complete()
+            return
+        }
+        if response.actionIdentifier == UNNotificationDefaultActionIdentifier,
+           let tap = NotificationInboxTap(content.userInfo) {
+            NotificationInboxTapDispatcher.persistBeforeCompletingSystemResponse(tap)
+            completion.complete()
+            Task { await NotificationInboxTapDispatcher.shared.replayPending() }
+            return
+        }
         let userText = (response as? UNTextInputNotificationResponse)?.userText
         let messageAction = MessageNotificationResponsePolicy.action(
             actionIdentifier: response.actionIdentifier,
@@ -4051,7 +4886,8 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
     @MainActor
     func clearMessageNotifications(
         accountFingerprint: String? = nil,
-        conversationID: String? = nil
+        conversationID: String? = nil,
+        messageIDs: [String] = []
     ) async {
         if let accountFingerprint,
            !MessageNotificationContract.isIdentifierDigest(accountFingerprint) {
@@ -4069,7 +4905,8 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
                 requestIdentifier: request.identifier,
                 content: request.content,
                 accountFingerprint: accountFingerprint,
-                conversationID: canonicalConversationID
+                conversationID: canonicalConversationID,
+                messageIDs: messageIDs
             ) ? request.identifier : nil
         }
         if !pendingIdentifiers.isEmpty {
@@ -4083,7 +4920,8 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
                 requestIdentifier: request.identifier,
                 content: request.content,
                 accountFingerprint: accountFingerprint,
-                conversationID: canonicalConversationID
+                conversationID: canonicalConversationID,
+                messageIDs: messageIDs
             ) ? request.identifier : nil
         }
         if !deliveredIdentifiers.isEmpty {
@@ -4124,8 +4962,29 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
         requestIdentifier: String,
         content: UNNotificationContent,
         accountFingerprint: String?,
-        conversationID: String?
+        conversationID: String?,
+        messageIDs: [String]
     ) -> Bool {
+        if SecureMessagingRemoteWake.isMessageAvailable(content.userInfo) {
+            guard let notice = RemoteMessageAvailableNotification(content.userInfo) else {
+                return conversationID == nil
+            }
+            if let accountFingerprint, notice.accountFingerprint != accountFingerprint {
+                return false
+            }
+            // The remote envelope intentionally has no conversation ID. Only the caller's
+            // authenticated local projection can prove that this message belongs to a thread.
+            return conversationID == nil || messageIDs.contains(where: {
+                MessageNotificationContract.canonicalUUID($0) == notice.messageID
+            })
+        }
+        if ["call.missed", NotificationInboxRecoveryPolicy.localType].contains(content.userInfo["type"] as? String ?? ""),
+           content.userInfo["recipient_user_id"] != nil,
+           conversationID == nil {
+            return accountFingerprint == nil || RecipientBoundRemoteNotificationPolicy.permits(
+                content.userInfo, ownerFingerprint: accountFingerprint
+            )
+        }
         guard content.categoryIdentifier == MessageNotificationContract.categoryIdentifier else {
             return false
         }
@@ -4753,12 +5612,18 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         didReceiveRemoteNotification userInfo: [AnyHashable: Any],
         fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void
     ) {
-        if let wake = SecureMessagingRemoteWake(userInfo) {
+        if let wake = SecureMessagingRemoteWake(
+            userInfo, isSystemAlertDelivery: application.applicationState != .active
+        ) {
             Task {
                 completionHandler(
                     await SecureMessagingWakeDispatcher.shared.dispatch(wake)
                 )
             }
+            return
+        }
+        if SecureMessagingRemoteWake.isMessageAvailable(userInfo) {
+            completionHandler(.noData)
             return
         }
         if let terminalCall = CallTerminalPush(payload: userInfo) {

@@ -2231,6 +2231,9 @@ struct MinimizedCallView: View {
             .frame(height: barContentHeight)
             .accessibilityElement(children: .contain)
             .accessibilityIdentifier("call.banner.row")
+            // SwiftUI otherwise exposes only the union of the 44pt controls as this group's
+            // accessibility frame. The row and its return-to-call surface are both 56pt tall.
+            .accessibilityFrame(barFrame)
         }
         .frame(height: topInset + barContentHeight, alignment: .bottom)
         .frame(maxWidth: .infinity)

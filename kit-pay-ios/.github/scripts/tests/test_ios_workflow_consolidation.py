@@ -157,6 +157,8 @@ if os.environ.get('KITPAY_FAIL_FOCUSED') == '1' and any(a.startswith('-only-test
             self.assertEqual(call[-1], "test-without-building")
             self.assertIn("-disableAutomaticPackageResolution", call)
         self.assertIn("-skip-testing:KitPayTests/ConversationNativeOpeningTests", calls[1])
+        self.assertIn("-only-testing:KitPayUITests/CallLayoutUITests", calls[0])
+        self.assertIn("-skip-testing:KitPayUITests/CallLayoutUITests", calls[1])
         self.assertIn("-skip-testing:KitPayUITests/AppStoreScreenshotUITests/testCaptureAppStoreScreenshots", calls[1])
 
     def test_both_marketing_devices_use_existing_products(self):

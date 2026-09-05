@@ -36,8 +36,12 @@ workflow never recompiles them. Certificate import, both extension profiles, and
 all entitlement checks remain mandatory. Physical-device acceptance remains as
 documented in PARITY.md; Simulator evidence does not establish it.
 
+The focused native phase runs chat opening, pull-to-camera, and call-banner layout
+before the remaining suite. A failure stops that run early. Each focused check is
+excluded from the remaining phase, so this ordering adds no compilation or test runs.
+
 Workflow conditions and native command selection are exercised by
 `test_ios_workflow_consolidation.py`. The tests check the target/screenshot-reuse
-matrix, no automatic triggers, fail-fast camera checks, one test compilation,
+matrix, no automatic triggers, early camera/banner checks, one test compilation,
 artifact-only upload, Linux processing, and real temporary signing-key validation.
 Run all cheap checks with `python3 -m unittest discover -s .github/scripts/tests`.

@@ -723,6 +723,58 @@ actor APIClient {
         )
     }
 
+    func notificationInbox(cursor: String? = nil) async throws -> NotificationInboxPage {
+        guard cursor.map({ !$0.isEmpty && $0.utf8.count <= 2_048 }) ?? true else {
+            throw APIClientError.invalidResponse
+        }
+        var query = [URLQueryItem(name: "limit", value: "100"),
+                     URLQueryItem(name: "unread_only", value: "true")]
+        if let cursor { query.append(URLQueryItem(name: "cursor", value: cursor)) }
+        let (data, meta): (NotificationInboxItems, APIMeta?) = try await sendWithMeta(
+            path: "notifications", method: "GET", body: EmptyBody(), queryItems: query
+        )
+        guard let hasMore = meta?.hasMore,
+              data.items.count <= 100,
+              hasMore ? (meta?.nextCursor.map { !$0.isEmpty && $0.utf8.count <= 2_048 } == true)
+                : meta?.nextCursor == nil
+        else { throw APIClientError.invalidResponse }
+        return NotificationInboxPage(items: data.items, nextCursor: meta?.nextCursor)
+    }
+
+    func notificationPreferences() async throws -> NotificationPreferenceSnapshot {
+        let snapshot: NotificationPreferenceSnapshot = try await send(
+            path: "notifications/preferences", method: "GET", body: EmptyBody()
+        )
+        guard snapshot.isValid else { throw APIClientError.invalidResponse }
+        return snapshot
+    }
+
+    func updateNotificationPreferences(
+        expectedEnrollmentEpoch: Int, expectedRevision: Int,
+        encryptedMessageAlerts: Bool, mutedConversationIDs: [String]
+    ) async throws -> NotificationPreferenceSnapshot {
+        let validation = NotificationPreferenceSnapshot(
+            enrollmentEpoch: expectedEnrollmentEpoch, revision: expectedRevision,
+            encryptedMessageAlerts: encryptedMessageAlerts, mutedConversationIDs: mutedConversationIDs
+        )
+        guard validation.isValid,
+              expectedRevision <= NotificationPreferenceSnapshot.maximumExpectedRevision
+        else { throw APIClientError.invalidResponse }
+        let snapshot: NotificationPreferenceSnapshot = try await send(
+            path: "notifications/preferences", method: "PUT",
+            body: NotificationPreferenceUpdate(
+                expectedEnrollmentEpoch: expectedEnrollmentEpoch, expectedRevision: expectedRevision,
+                encryptedMessageAlerts: encryptedMessageAlerts, mutedConversationIDs: mutedConversationIDs
+            )
+        )
+        guard snapshot.isValid, snapshot.enrollmentEpoch == expectedEnrollmentEpoch,
+              snapshot.revision == expectedRevision + 1,
+              snapshot.encryptedMessageAlerts == encryptedMessageAlerts,
+              Set(snapshot.mutedConversationIDs) == Set(mutedConversationIDs)
+        else { throw APIClientError.invalidResponse }
+        return snapshot
+    }
+
     func startCall(
         recipientUserIds: [String],
         video: Bool,

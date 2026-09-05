@@ -175,6 +175,28 @@ final class CallAnswerSignalTests: XCTestCase {
         XCTAssertEqual(missed.disposition.publicationRetirement, .naturallyExpired)
     }
 
+    func testVisibleMissedCallKeepsTerminalSemanticsAcrossWorkerEnvelopeVersions() throws {
+        let recipient = "10000000-0000-4000-8000-000000000001"
+        for includesBackgroundFlag in [false, true] {
+            var payload = terminalPushPayload(type: "call.missed", state: "missed")
+            payload["recipient_user_id"] = recipient
+            payload["missed_call_alert"] = true
+            var aps: [String: Any] = [
+                "alert": ["title": "Missed call", "body": "Open Kit Pay to view your calls."],
+                "sound": "default",
+            ]
+            if includesBackgroundFlag { aps["content-available"] = 1 }
+            payload["aps"] = aps
+            let missed = try XCTUnwrap(CallTerminalPush(payload: payload))
+            XCTAssertEqual(missed.disposition, .unanswered)
+            XCTAssertEqual(missed.disposition.publicationRetirement, .naturallyExpired)
+            XCTAssertTrue(RecipientBoundRemoteNotificationPolicy.permits(
+                payload, ownerFingerprint: MessageNotificationContract.accountFingerprint(for: recipient)
+            ))
+            XCTAssertFalse(RecipientBoundRemoteNotificationPolicy.permits(payload, ownerFingerprint: nil))
+        }
+    }
+
     func testTerminalPushRejectsNonterminalOrContradictoryLifecyclePayloads() {
         XCTAssertNil(CallTerminalPush(payload: terminalPushPayload(
             type: "call.declined",

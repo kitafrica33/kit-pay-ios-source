@@ -1951,6 +1951,599 @@ final class ConversationSoundTests: XCTestCase {
         })
     }
 
+    @MainActor
+    func testBackgroundRemoteAlertSuppressesLocalDuplicateBeforeSystemListUpdates() async throws {
+        let incoming = descriptor(conversationOrdinal: 1, messageOrdinal: 1, sentAt: visibleAt)
+        let center = FakeVisibleMessageNotificationCenter(
+            authorization: .init(status: .authorized, alertSetting: .enabled)
+        )
+        let coordinator = VisibleMessageNotificationCoordinator(center: center)
+        let notice = try remoteNotice(messageOrdinal: 1)
+        await coordinator.recordSystemAlert(notice, ownerUserID: ownerUserID)
+        let duplicateCount = await coordinator.schedule([incoming])
+        XCTAssertEqual(duplicateCount, 0)
+        XCTAssertTrue(center.requests.isEmpty)
+
+        let newer = descriptor(conversationOrdinal: 1, messageOrdinal: 2, sentAt: visibleAt.addingTimeInterval(1))
+        let newerCount = await coordinator.schedule([newer])
+        XCTAssertEqual(newerCount, 1, "A different recovered message still needs its alert")
+    }
+
+    @MainActor
+    func testRemoteAlertDedupSurvivesCoordinatorRestartUsingDeliveredNotifications() async throws {
+        let incoming = descriptor(conversationOrdinal: 1, messageOrdinal: 1, sentAt: visibleAt)
+        let center = FakeVisibleMessageNotificationCenter(
+            authorization: .init(status: .authorized, alertSetting: .enabled),
+            remoteRecords: [.init(requestIdentifier: "remote", notice: try remoteNotice(messageOrdinal: 1))]
+        )
+        for _ in 0..<2 {
+            let count = await VisibleMessageNotificationCoordinator(center: center).schedule([incoming])
+            XCTAssertEqual(count, 0)
+        }
+        XCTAssertTrue(center.requests.isEmpty)
+    }
+
+    @MainActor
+    func testRemoteAlertDedupIsRecipientBoundAndPrivacyGenerationBound() async throws {
+        let incoming = descriptor(conversationOrdinal: 1, messageOrdinal: 1, sentAt: visibleAt)
+        let otherUser = "90000000-0000-4000-8000-000000000009"
+        let notice = try remoteNotice(messageOrdinal: 1)
+        let center = FakeVisibleMessageNotificationCenter(
+            authorization: .init(status: .authorized, alertSetting: .enabled),
+            remoteRecords: [.init(requestIdentifier: "other-account", notice: try remoteNotice(
+                messageOrdinal: 1, recipient: otherUser
+            ))]
+        )
+        let coordinator = VisibleMessageNotificationCoordinator(center: center)
+        coordinator.resumeAfterOwnershipRecovery(for: ownerUserID)
+        await coordinator.recordSystemAlert(notice, ownerUserID: otherUser)
+        let firstCount = await coordinator.schedule([incoming])
+        XCTAssertEqual(firstCount, 1, "Another account's notice cannot suppress this account")
+        coordinator.beginPrivacyQuarantine()
+        coordinator.resumeAfterOwnershipRecovery(for: otherUser)
+        await coordinator.recordSystemAlert(notice, ownerUserID: ownerUserID)
+        let staleCount = await coordinator.schedule([incoming])
+        XCTAssertEqual(staleCount, 0, "An old sync cannot publish after account recovery changes owner")
+        XCTAssertTrue(center.removedPendingIdentifiers.isEmpty)
+        XCTAssertTrue(center.removedDeliveredIdentifiers.isEmpty)
+    }
+
+    @MainActor
+    func testRemoteAlertRetiresSameMessageLocalCopiesWithoutTouchingOtherMessages() async throws {
+        let same = descriptor(conversationOrdinal: 1, messageOrdinal: 1, sentAt: visibleAt)
+        let different = descriptor(conversationOrdinal: 2, messageOrdinal: 2, sentAt: visibleAt)
+        let center = FakeVisibleMessageNotificationCenter(
+            authorization: .init(status: .authorized, alertSetting: .enabled),
+            activeRecords: [notificationRecord(same, location: .pending),
+                            notificationRecord(same, location: .delivered),
+                            notificationRecord(different, location: .delivered)]
+        )
+        await VisibleMessageNotificationCoordinator(center: center).recordSystemAlert(
+            try remoteNotice(messageOrdinal: 1), ownerUserID: ownerUserID
+        )
+        XCTAssertEqual(center.activeRecords, [notificationRecord(different, location: .delivered)])
+        XCTAssertEqual(center.removedPendingIdentifiers, [same.requestIdentifier])
+        XCTAssertEqual(center.removedDeliveredIdentifiers, [same.requestIdentifier])
+    }
+
+    @MainActor
+    func testRemoteAlertDuringSuspendedLocalSchedulingCannotProduceDuplicate() async throws {
+        let incoming = descriptor(conversationOrdinal: 1, messageOrdinal: 1, sentAt: visibleAt)
+        let center = FakeVisibleMessageNotificationCenter(
+            authorization: .init(status: .authorized, alertSetting: .enabled)
+        )
+        let coordinator = VisibleMessageNotificationCoordinator(center: center)
+        center.suspendNextActiveLookup()
+        let scheduling = Task { await coordinator.schedule([incoming]) }
+        await center.waitForSuspendedActiveLookup()
+        await coordinator.recordSystemAlert(try remoteNotice(messageOrdinal: 1), ownerUserID: ownerUserID)
+        center.resumeSuspendedActiveLookup()
+        let count = await scheduling.value
+        XCTAssertEqual(count, 0)
+        XCTAssertTrue(center.requests.isEmpty)
+    }
+
+    @MainActor
+    func testRemoteRecoveryClearsOnlyAuthenticatedOpenOrMutedThreadsAndDuplicateEvents() async throws {
+        let open = message(id: 1, createdAt: visibleAt,
+                           serverMessageID: "30000000-0000-4000-8000-000000000001")
+        let mutedConversation = "10000000-0000-4000-8000-000000000002"
+        let muted = message(id: 2, conversationID: mutedConversation, createdAt: visibleAt,
+                            serverMessageID: "30000000-0000-4000-8000-000000000002")
+        let otherUser = "90000000-0000-4000-8000-000000000009"
+        let center = FakeVisibleMessageNotificationCenter(
+            authorization: .init(status: .denied, alertSetting: .disabled),
+            remoteRecords: [
+                .init(requestIdentifier: "open", notice: try remoteNotice(messageOrdinal: 1)),
+                .init(requestIdentifier: "muted", notice: try remoteNotice(messageOrdinal: 2)),
+                .init(requestIdentifier: "other", notice: try remoteNotice(messageOrdinal: 1, recipient: otherUser)),
+                .init(requestIdentifier: "a-unread", notice: try remoteNotice(messageOrdinal: 3)),
+                .init(requestIdentifier: "b-duplicate", notice: try remoteNotice(messageOrdinal: 3)),
+            ]
+        )
+        await VisibleMessageNotificationCoordinator(center: center).reconcileRemoteNotifications(
+            messages: [open, muted], ownerUserID: ownerUserID,
+            suppressedConversationID: conversationID, mutedConversationIDs: [mutedConversation]
+        )
+        XCTAssertEqual(Set(center.removedDeliveredIdentifiers), ["open", "muted", "b-duplicate"])
+        XCTAssertEqual(Set(center.remoteRecords.map(\.requestIdentifier)), ["other", "a-unread"])
+    }
+
+    func testRecipientBoundMissedCallPresentationRejectsMissingOrDifferentOwner() {
+        let payload: [AnyHashable: Any] = ["type": "call.missed", "recipient_user_id": ownerUserID]
+        let fingerprint = MessageNotificationContract.accountFingerprint(for: ownerUserID)
+        XCTAssertTrue(RecipientBoundRemoteNotificationPolicy.permits(payload, ownerFingerprint: fingerprint))
+        XCTAssertFalse(RecipientBoundRemoteNotificationPolicy.permits(payload, ownerFingerprint: nil))
+        XCTAssertFalse(RecipientBoundRemoteNotificationPolicy.permits(
+            payload, ownerFingerprint: MessageNotificationContract.accountFingerprint(for: UUID().uuidString)
+        ))
+        XCTAssertFalse(RecipientBoundRemoteNotificationPolicy.permits(
+            ["recipient_user_id": "malformed"], ownerFingerprint: fingerprint
+        ))
+    }
+
+    private func remoteNotice(messageOrdinal: Int, recipient: String? = nil) throws -> RemoteMessageAvailableNotification {
+        try XCTUnwrap(RemoteMessageAvailableNotification([
+            "type": "messaging.message_available", "scope": "messaging",
+            "notification_id": UUID().uuidString,
+            "message_id": String(format: "30000000-0000-4000-8000-%012d", messageOrdinal),
+            "recipient_user_id": recipient ?? ownerUserID,
+            "aps": ["alert": ["title": "Kit Pay", "body": "You have a new message."],
+                    "sound": "default", "content-available": 1] as [String: Any],
+        ] as [AnyHashable: Any]))
+    }
+
+    @MainActor
+    func testForegroundPresentationOverridesAssumedBackgroundDeliveryInBothOrders() async throws {
+        let incoming = descriptor(conversationOrdinal: 1, messageOrdinal: 1, sentAt: visibleAt)
+        for foregroundFirst in [false, true] {
+            for allowed in [false, true] {
+                let center = FakeVisibleMessageNotificationCenter(
+                    authorization: .init(status: allowed ? .authorized : .denied,
+                                         alertSetting: allowed ? .enabled : .disabled)
+                )
+                let coordinator = VisibleMessageNotificationCoordinator(center: center)
+                let notice = try remoteNotice(messageOrdinal: 1)
+                if foregroundFirst { coordinator.recordForegroundDelivery(notice) }
+                await coordinator.recordSystemAlert(notice, ownerUserID: ownerUserID)
+                if !foregroundFirst { coordinator.recordForegroundDelivery(notice) }
+                let count = await coordinator.schedule([incoming])
+                XCTAssertEqual(count, allowed ? 1 : 0)
+                let replayCount = await coordinator.schedule([incoming])
+                XCTAssertEqual(replayCount, 0, "A foreground fallback still deduplicates the durable message")
+            }
+        }
+    }
+
+    @MainActor
+    func testMessageDuplicateCleanupCannotRemoveAnotherAccountsLocalNotification() async throws {
+        let incoming = descriptor(conversationOrdinal: 1, messageOrdinal: 1, sentAt: visibleAt)
+        let template = descriptor(conversationOrdinal: 2, messageOrdinal: 2, sentAt: visibleAt)
+        let otherUser = "90000000-0000-4000-8000-000000000009"
+        let other = VisibleMessageNotificationDescriptor(
+            requestIdentifier: template.requestIdentifier, threadIdentifier: template.threadIdentifier,
+            conversationID: template.conversationID,
+            accountFingerprint: MessageNotificationContract.accountFingerprint(for: otherUser)!,
+            version: template.version
+        )
+        let record = notificationRecord(other, location: .delivered)
+        let center = FakeVisibleMessageNotificationCenter(
+            authorization: .init(status: .authorized, alertSetting: .enabled), activeRecords: [record],
+            remoteRecords: [.init(requestIdentifier: "other-remote", notice: try remoteNotice(messageOrdinal: 2, recipient: otherUser))]
+        )
+        let coordinator = VisibleMessageNotificationCoordinator(center: center)
+        coordinator.resumeAfterOwnershipRecovery(for: ownerUserID)
+        let count = await coordinator.schedule([incoming])
+        XCTAssertEqual(count, 1)
+        XCTAssertTrue(center.activeRecords.contains(record))
+        XCTAssertTrue(center.removedDeliveredIdentifiers.isEmpty)
+    }
+
+    @MainActor
+    func testInboxRecoveryRevisitsHeadResumesOlderPagesAndPersistsReceiptsAcrossRestart() async {
+        let suite = "InboxRecovery.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let center = FakeVisibleMessageNotificationCenter(authorization: .init(status: .authorized, alertSetting: .enabled))
+        let first = NotificationInboxRecoveryCoordinator(center: center, defaults: defaults)
+        first.resume(for: ownerUserID)
+        var requested: [String?] = []
+        let more = await first.recover(ownerUserID: ownerUserID, isCurrent: { true }) { cursor in
+            requested.append(cursor)
+            let ordinal = cursor.flatMap(Int.init) ?? 0
+            return NotificationInboxPage(items: [self.inboxItem(ordinal)], nextCursor: String(ordinal + 1))
+        }
+        XCTAssertTrue(more)
+        XCTAssertEqual(requested, [nil, "1", "2", "3"])
+        XCTAssertEqual(center.requests.count, 4)
+        let restarted = NotificationInboxRecoveryCoordinator(center: center, defaults: defaults)
+        restarted.resume(for: ownerUserID)
+        requested = []
+        let finalMore = await restarted.recover(ownerUserID: ownerUserID, isCurrent: { true }) { cursor in
+            requested.append(cursor)
+            return NotificationInboxPage(items: [self.inboxItem(cursor == nil ? 0 : 4)], nextCursor: cursor == nil ? "1" : nil)
+        }
+        XCTAssertFalse(finalMore)
+        XCTAssertEqual(requested, [nil, "4"])
+        XCTAssertEqual(center.requests.count, 5)
+        // Simulate the user dismissing every alert: persisted receipts still prevent replay.
+        center.removePendingRequests(withIdentifiers: center.requests.map(\.identifier))
+        _ = await restarted.recover(ownerUserID: ownerUserID, isCurrent: { true }) { _ in
+            NotificationInboxPage(items: [self.inboxItem(0), self.inboxItem(4)], nextCursor: nil)
+        }
+        XCTAssertEqual(center.requests.count, 5)
+    }
+
+    @MainActor
+    func testInboxDeniedAlertsAndOwnershipLossDoNotConsumeRecoveryReceipts() async {
+        let suite = "InboxRecovery.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let denied = FakeVisibleMessageNotificationCenter(authorization: .init(status: .denied, alertSetting: .disabled))
+        let first = NotificationInboxRecoveryCoordinator(center: denied, defaults: defaults)
+        first.resume(for: ownerUserID)
+        var fetched = false
+        _ = await first.recover(ownerUserID: ownerUserID, isCurrent: { true }) { _ in
+            fetched = true
+            return NotificationInboxPage(items: [self.inboxItem(1)], nextCursor: nil)
+        }
+        XCTAssertTrue(fetched, "Permission denial must not block authenticated inbox synchronization")
+        XCTAssertTrue(denied.requests.isEmpty)
+        let allowed = FakeVisibleMessageNotificationCenter(authorization: .init(status: .authorized, alertSetting: .enabled))
+        let restarted = NotificationInboxRecoveryCoordinator(center: allowed, defaults: defaults)
+        restarted.resume(for: ownerUserID)
+        _ = await restarted.recover(ownerUserID: ownerUserID, isCurrent: { true }) { _ in
+            restarted.quarantine()
+            return NotificationInboxPage(items: [self.inboxItem(1)], nextCursor: nil)
+        }
+        XCTAssertTrue(allowed.requests.isEmpty)
+        restarted.resume(for: ownerUserID)
+        _ = await restarted.recover(ownerUserID: ownerUserID, isCurrent: { true }) { _ in
+            NotificationInboxPage(items: [self.inboxItem(1)], nextCursor: nil)
+        }
+        XCTAssertEqual(allowed.requests.count, 1)
+    }
+
+    @MainActor
+    func testInboxMissedCallsRequireRecipientAndDeduplicateRemoteCallIdentity() async {
+        let missed = inboxItem(1, type: "call.missed", missed: true)
+        XCTAssertNotNil(NotificationInboxRecoveryPolicy.identity(for: missed, ownerUserID: ownerUserID))
+        XCTAssertNil(NotificationInboxRecoveryPolicy.identity(for: missed, ownerUserID: UUID().uuidString))
+        XCTAssertNil(NotificationInboxRecoveryPolicy.identity(for: inboxItem(2, type: "call.missed"), ownerUserID: ownerUserID))
+        XCTAssertNil(NotificationInboxRecoveryPolicy.identity(for: inboxItem(3, type: "call.ringing"), ownerUserID: ownerUserID))
+        XCTAssertNil(NotificationInboxRecoveryPolicy.identity(for: inboxItem(4, type: "messaging.sync"), ownerUserID: ownerUserID))
+        let suite = "InboxRecovery.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let center = FakeVisibleMessageNotificationCenter(
+            authorization: .init(status: .authorized, alertSetting: .enabled),
+            inboxRecords: [.init(requestIdentifier: "remote-call", notificationID: UUID().uuidString,
+                                 callID: missed.data.callID,
+                                 ownerFingerprint: MessageNotificationContract.accountFingerprint(for: ownerUserID),
+                                 isRecovered: false, createdAt: visibleAt, location: .delivered)]
+        )
+        let coordinator = NotificationInboxRecoveryCoordinator(center: center, defaults: defaults)
+        coordinator.resume(for: ownerUserID)
+        _ = await coordinator.recover(ownerUserID: ownerUserID, isCurrent: { true }) { _ in
+            NotificationInboxPage(items: [missed, self.inboxItem(2)], nextCursor: nil)
+        }
+        XCTAssertEqual(center.requests.count, 1)
+        XCTAssertEqual(center.requests.first?.content.title, "Kit Pay update")
+    }
+
+    private func inboxItem(_ ordinal: Int, type: String = "payment.received", missed: Bool = false) -> NotificationInboxItem {
+        NotificationInboxItem(
+            id: String(format: "70000000-0000-4000-8000-%012d", ordinal), type: type,
+            data: .init(callID: missed ? String(format: "80000000-0000-4000-8000-%012d", ordinal) : nil,
+                        recipientUserID: missed ? ownerUserID : nil, state: missed ? "missed" : nil,
+                        missedCallAlert: missed ? true : nil),
+            silent: false, readAt: nil,
+            createdAt: ISO8601DateFormatter().string(from: visibleAt.addingTimeInterval(Double(ordinal)))
+        )
+    }
+
+    @MainActor
+    func testInboxPublicationFailureKeepsOlderPageForTheScheduledRetry() async {
+        let suite = "InboxRecovery.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let center = FakeVisibleMessageNotificationCenter(authorization: .init(status: .authorized, alertSetting: .enabled))
+        let coordinator = NotificationInboxRecoveryCoordinator(center: center, defaults: defaults)
+        coordinator.resume(for: ownerUserID)
+        var failOlderOnce = true
+        var cursors: [String?] = []
+        let fetch: @MainActor (String?) async throws -> NotificationInboxPage = { cursor in
+            cursors.append(cursor)
+            if cursor != nil, failOlderOnce {
+                center.failNextAdd = true
+                failOlderOnce = false
+            }
+            return NotificationInboxPage(items: [self.inboxItem(cursor == nil ? 0 : 1)], nextCursor: cursor == nil ? "older" : nil)
+        }
+        let retry = await coordinator.recover(ownerUserID: ownerUserID, isCurrent: { true }, fetch: fetch)
+        XCTAssertTrue(retry)
+        XCTAssertEqual(center.requests.count, 1)
+        let finished = await coordinator.recover(ownerUserID: ownerUserID, isCurrent: { true }, fetch: fetch)
+        XCTAssertFalse(finished)
+        XCTAssertEqual(cursors, [nil, "older", nil, "older"])
+        XCTAssertEqual(center.requests.count, 2)
+    }
+
+    @MainActor
+    func testInboxQuotaPreservesFreshAlertsAndLeavesBlockedOlderRowsRetryable() async {
+        let suite = "InboxRecovery.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let center = FakeVisibleMessageNotificationCenter(authorization: .init(status: .authorized, alertSetting: .enabled))
+        let coordinator = NotificationInboxRecoveryCoordinator(center: center, defaults: defaults)
+        coordinator.resume(for: ownerUserID)
+        _ = await coordinator.recover(ownerUserID: ownerUserID, isCurrent: { true }) { _ in
+            NotificationInboxPage(items: (1...12).map { self.inboxItem($0) }, nextCursor: nil)
+        }
+        XCTAssertEqual(center.inboxRecords.count, 12)
+        _ = await coordinator.recover(ownerUserID: ownerUserID, isCurrent: { true }) { _ in
+            NotificationInboxPage(items: [self.inboxItem(0), self.inboxItem(13)], nextCursor: nil)
+        }
+        XCTAssertEqual(center.inboxRecords.count, 12)
+        XCTAssertEqual(center.requests.count, 13, "Only the newer head alert may replace an older active alert")
+        center.removePendingRequests(withIdentifiers: center.inboxRecords.map(\.requestIdentifier))
+        _ = await coordinator.recover(ownerUserID: ownerUserID, isCurrent: { true }) { _ in
+            NotificationInboxPage(items: [self.inboxItem(0)], nextCursor: nil)
+        }
+        XCTAssertEqual(center.requests.count, 14, "Quota blocking cannot consume a presentation receipt")
+    }
+
+    @MainActor
+    func testMissedCallTapSurvivesColdRestoreAndDispatcherRecreation() async throws {
+        let suite = "InboxTap.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let tap = try XCTUnwrap(NotificationInboxTap([
+            "type": "call.missed", "state": "missed", "missed_call_alert": true,
+            "recipient_user_id": ownerUserID,
+            "notification_id": "70000000-0000-4000-8000-000000000001",
+            "call_id": "80000000-0000-4000-8000-000000000001",
+        ]))
+        XCTAssertEqual(tap.destination, .calls)
+        let tapStore = NotificationInboxTapStore(defaults: defaults)
+        NotificationInboxTapDispatcher.persistBeforeCompletingSystemResponse(tap, store: tapStore)
+        let cold = NotificationInboxTapDispatcher(store: tapStore)
+        await cold.replayPending()
+        await cold.install { _ in .retry }
+        let probe = InboxTapProbe()
+        let restored = NotificationInboxTapDispatcher(store: tapStore)
+        await restored.install { received in
+            await MainActor.run { probe.taps.append(received) }
+            return .completed
+        }
+        await restored.replayPending()
+        XCTAssertEqual(probe.taps, [tap])
+        XCTAssertNil(NotificationInboxTap([
+            "type": "call.ringing", "recipient_user_id": ownerUserID,
+            "notification_id": "70000000-0000-4000-8000-000000000001",
+        ]), "A notification tap is never authority to answer or dial")
+    }
+
+    @MainActor
+    func testInboxTapStoreSerializesAppendAcknowledgementAndBoundsPersistedInput() async throws {
+        let suite = "InboxTapStore.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = NotificationInboxTapStore(defaults: defaults)
+        let taps = try (0..<9).map { ordinal in
+            try XCTUnwrap(NotificationInboxTap([
+                "type": NotificationInboxRecoveryPolicy.localType,
+                "original_type": "payment.received", "recipient_user_id": ownerUserID,
+                "notification_id": String(format: "70000000-0000-4000-8000-%012d", ordinal),
+            ]))
+        }
+        store.append(taps[0])
+        await withTaskGroup(of: Void.self) { group in
+            for tap in taps.dropFirst() { group.addTask { store.append(tap) } }
+            group.addTask { store.remove(key: taps[0].key) }
+        }
+        XCTAssertEqual(Set(store.actions().map(\.key)), Set(taps.dropFirst().map(\.key)))
+        defaults.set(Data(repeating: 0, count: 16_385), forKey: NotificationInboxTapStore.storageKey)
+        XCTAssertTrue(store.actions().isEmpty)
+        defaults.set(try JSONEncoder().encode(Array(repeating: taps[0], count: 17)),
+                     forKey: NotificationInboxTapStore.storageKey)
+        XCTAssertTrue(store.actions().isEmpty)
+    }
+
+    @MainActor
+    func testPreferenceSyncUsesLatestLocalStateAndDoesNotAcknowledgeAnObsoleteWrite() async {
+        let suite = "NotificationPreferences.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let sync = NotificationPreferenceSynchronizer(defaults: defaults)
+        let first = "10000000-0000-4000-8000-000000000001"
+        let second = "10000000-0000-4000-8000-000000000002"
+        var local: Set<String> = []
+        var remote = preferenceSnapshot(epoch: 4, revision: 0, enabled: false)
+        var writes: [NotificationPreferenceUpdate] = []
+        let obsolete = await sync.synchronize(
+            ownerUserID: ownerUserID, isCurrent: { true }, latestLocalMuteIDs: { local },
+            fetch: { local = [first]; return remote },
+            update: { update in
+                writes.append(update)
+                remote = self.preferenceSnapshot(epoch: 4, revision: 1, enabled: true, muted: [first])
+                local = [second]
+                return remote
+            }
+        )
+        XCTAssertEqual(obsolete, .retry)
+        XCTAssertEqual(writes.first?.mutedConversationIDs, [first], "Read local state after GET finishes")
+        XCTAssertTrue(sync.needsPendingStatus(ownerUserID: ownerUserID, localMutedConversationIDs: local))
+        let current = await sync.synchronize(
+            ownerUserID: ownerUserID, isCurrent: { true }, latestLocalMuteIDs: { local }, fetch: { remote },
+            update: { update in
+                writes.append(update)
+                return self.preferenceSnapshot(epoch: 4, revision: 2, enabled: true, muted: [second])
+            }
+        )
+        XCTAssertEqual(current, .synchronized)
+        XCTAssertEqual(writes.last?.expectedRevision, 1)
+        XCTAssertEqual(writes.last?.mutedConversationIDs, [second])
+        XCTAssertFalse(sync.needsPendingStatus(ownerUserID: ownerUserID, localMutedConversationIDs: local))
+    }
+
+    @MainActor
+    func testUncertainFirstEnablePersistsPendingStatusForALaterOfflineMute() async {
+        let suite = "NotificationPreferences.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let sync = NotificationPreferenceSynchronizer(defaults: defaults)
+        var remote = preferenceSnapshot(epoch: 2, revision: 0, enabled: false)
+        let timedOut = await sync.synchronize(
+            ownerUserID: ownerUserID, isCurrent: { true }, latestLocalMuteIDs: { [] }, fetch: { remote },
+            update: { _ in
+                remote = self.preferenceSnapshot(epoch: 2, revision: 1, enabled: true)
+                throw URLError(.timedOut)
+            }
+        )
+        XCTAssertEqual(timedOut, .retry)
+        let muted: Set<String> = [conversationID]
+        let restarted = NotificationPreferenceSynchronizer(defaults: defaults)
+        XCTAssertTrue(restarted.needsPendingStatus(ownerUserID: ownerUserID, localMutedConversationIDs: muted))
+        let resolved = await restarted.synchronize(
+            ownerUserID: ownerUserID, isCurrent: { true }, latestLocalMuteIDs: { muted }, fetch: { remote },
+            update: { update in
+                XCTAssertEqual(update.expectedEnrollmentEpoch, 2)
+                XCTAssertEqual(update.expectedRevision, 1)
+                return self.preferenceSnapshot(epoch: 2, revision: 2, enabled: true, muted: muted)
+            }
+        )
+        XCTAssertEqual(resolved, .synchronized)
+        XCTAssertFalse(restarted.needsPendingStatus(ownerUserID: ownerUserID, localMutedConversationIDs: muted))
+    }
+
+    @MainActor
+    func testDisabledPreferenceCASFencesAStillPendingEnableAtTheSameRevision() async {
+        let suite = "NotificationPreferences.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let sync = NotificationPreferenceSynchronizer(defaults: defaults)
+        let remote = preferenceSnapshot(epoch: 3, revision: 0, enabled: false)
+        _ = await sync.synchronize(
+            ownerUserID: ownerUserID, isCurrent: { true }, latestLocalMuteIDs: { [] }, fetch: { remote },
+            update: { _ in throw URLError(.timedOut) }
+        )
+        let overLimit = Set((0...2_048).map { String(format: "10000000-0000-4000-8000-%012d", $0) })
+        var fenced = false
+        let synchronized = await sync.synchronize(
+            ownerUserID: ownerUserID, isCurrent: { true }, latestLocalMuteIDs: { overLimit }, fetch: { remote },
+            update: { update in
+                fenced = true
+                XCTAssertFalse(update.encryptedMessageAlerts)
+                XCTAssertTrue(update.mutedConversationIDs.isEmpty)
+                XCTAssertEqual(update.expectedRevision, 0)
+                return self.preferenceSnapshot(epoch: 3, revision: 1, enabled: false)
+            }
+        )
+        XCTAssertEqual(synchronized, .synchronized)
+        XCTAssertTrue(fenced, "A plain GET cannot invalidate the delayed enabling PUT")
+        XCTAssertFalse(sync.needsPendingStatus(ownerUserID: ownerUserID, localMutedConversationIDs: overLimit))
+        XCTAssertFalse(DesiredNotificationPreferences(localMutedConversationIDs: ["invalid"]).encryptedMessageAlerts)
+    }
+
+    @MainActor
+    func testPreferenceSyncRejectsOwnershipLossAndMismatchedAcknowledgement() async {
+        let suite = "NotificationPreferences.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let sync = NotificationPreferenceSynchronizer(defaults: defaults)
+        let remote = preferenceSnapshot(epoch: 1, revision: 0, enabled: false)
+        var current = true
+        var wrote = false
+        let lost = await sync.synchronize(
+            ownerUserID: ownerUserID, isCurrent: { current }, latestLocalMuteIDs: { [self.conversationID] },
+            fetch: { current = false; return remote },
+            update: { _ in wrote = true; return remote }
+        )
+        XCTAssertEqual(lost, .retry)
+        XCTAssertFalse(wrote)
+        let mismatched = await sync.synchronize(
+            ownerUserID: ownerUserID, isCurrent: { true }, latestLocalMuteIDs: { [self.conversationID] }, fetch: { remote },
+            update: { _ in self.preferenceSnapshot(epoch: 2, revision: 1, enabled: true, muted: [self.conversationID]) }
+        )
+        XCTAssertEqual(mismatched, .retry)
+        XCTAssertTrue(sync.needsPendingStatus(ownerUserID: ownerUserID, localMutedConversationIDs: [conversationID]))
+    }
+
+    @MainActor
+    func testUnsupportedPreferenceServerDefersRetryWithoutDiscardingUncertainMuteStatus() async {
+        let suite = "NotificationPreferences.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let sync = NotificationPreferenceSynchronizer(defaults: defaults)
+        let remote = preferenceSnapshot(epoch: 1, revision: 0, enabled: false)
+        _ = await sync.synchronize(
+            ownerUserID: ownerUserID, isCurrent: { true }, latestLocalMuteIDs: { [] }, fetch: { remote },
+            update: { _ in throw URLError(.timedOut) }
+        )
+        let failures: [Error] = [
+            APIClientError.httpResponse(status: 404, retryAfter: nil),
+            APIClientError.httpStatus(405),
+            APIErrorPayload(code: "NOT_IMPLEMENTED", message: "Unavailable", httpStatus: 501),
+        ]
+        for failure in failures {
+            let outcome = await sync.synchronize(
+                ownerUserID: ownerUserID, isCurrent: { true }, latestLocalMuteIDs: { [self.conversationID] },
+                fetch: { throw failure }, update: { _ in XCTFail("Unsupported GET must not issue a PUT"); return remote }
+            )
+            XCTAssertEqual(outcome, .unsupportedServer)
+            XCTAssertTrue(sync.needsPendingStatus(ownerUserID: ownerUserID, localMutedConversationIDs: [conversationID]))
+        }
+        let transient = await sync.synchronize(
+            ownerUserID: ownerUserID, isCurrent: { true }, latestLocalMuteIDs: { [self.conversationID] },
+            fetch: { throw APIClientError.httpResponse(status: 503, retryAfter: nil) }, update: { _ in remote }
+        )
+        XCTAssertEqual(transient, .retry)
+        let featureDisabled = await sync.synchronize(
+            ownerUserID: ownerUserID, isCurrent: { true }, latestLocalMuteIDs: { [self.conversationID] },
+            fetch: {
+                throw APIErrorPayload(code: "FEATURE_UNAVAILABLE", message: "Unavailable", httpStatus: 503, retryAfter: 60)
+            }, update: { _ in remote }
+        )
+        XCTAssertEqual(featureDisabled, .retryAfter(60))
+        XCTAssertTrue(sync.needsPendingStatus(ownerUserID: ownerUserID, localMutedConversationIDs: [conversationID]))
+    }
+
+    @MainActor
+    func testPreferenceSyncReenrollmentUsesNewEpochAndConfirmsCurrentMutes() async {
+        let suite = "NotificationPreferences.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let sync = NotificationPreferenceSynchronizer(defaults: defaults)
+        let first = await sync.synchronize(
+            ownerUserID: ownerUserID, isCurrent: { true }, latestLocalMuteIDs: { [self.conversationID] },
+            fetch: { self.preferenceSnapshot(epoch: 4, revision: 7, enabled: false) },
+            update: { _ in throw URLError(.timedOut) }
+        )
+        XCTAssertEqual(first, .retry)
+        var wroteCurrentEpoch = false
+        let reenrolled = await sync.synchronize(
+            ownerUserID: ownerUserID, isCurrent: { true }, latestLocalMuteIDs: { [self.conversationID] },
+            fetch: { self.preferenceSnapshot(epoch: 5, revision: 0, enabled: false) },
+            update: { update in
+                wroteCurrentEpoch = true
+                XCTAssertEqual(update.expectedEnrollmentEpoch, 5)
+                XCTAssertEqual(update.expectedRevision, 0)
+                return self.preferenceSnapshot(epoch: 5, revision: 1, enabled: true, muted: [self.conversationID])
+            }
+        )
+        XCTAssertTrue(wroteCurrentEpoch)
+        XCTAssertEqual(reenrolled, .synchronized)
+        XCTAssertFalse(sync.needsPendingStatus(ownerUserID: ownerUserID, localMutedConversationIDs: [conversationID]))
+    }
+
+    private func preferenceSnapshot(
+        epoch: Int, revision: Int, enabled: Bool, muted: Set<String> = []
+    ) -> NotificationPreferenceSnapshot {
+        .init(enrollmentEpoch: epoch, revision: revision, encryptedMessageAlerts: enabled,
+              mutedConversationIDs: muted.sorted())
+    }
+
     func testBundledNotificationSoundIsShortLinearPCMCAF() async throws {
         XCTAssertNil(VisibleMessageNotificationPolicy.bundledCustomSoundName(
             in: Bundle(for: ConversationSoundTests.self)
@@ -2350,9 +2943,17 @@ private final class MessageNotificationActionProbe {
 }
 
 @MainActor
+private final class InboxTapProbe {
+    var taps: [NotificationInboxTap] = []
+}
+
+@MainActor
 private final class FakeVisibleMessageNotificationCenter: VisibleMessageNotificationCenter {
+    var failNextAdd = false
     let authorizationSnapshot: VisibleMessageNotificationAuthorization
     private(set) var activeRecords: [VisibleMessageNotificationRecord]
+    private(set) var remoteRecords: [RemoteMessageNotificationRecord]
+    private(set) var inboxRecords: [NotificationInboxAlertRecord]
     private(set) var requests: [UNNotificationRequest] = []
     private(set) var removedPendingIdentifiers: [String] = []
     private(set) var removedDeliveredIdentifiers: [String] = []
@@ -2363,15 +2964,25 @@ private final class FakeVisibleMessageNotificationCenter: VisibleMessageNotifica
 
     init(
         authorization: VisibleMessageNotificationAuthorization,
-        activeRecords: [VisibleMessageNotificationRecord] = []
+        activeRecords: [VisibleMessageNotificationRecord] = [],
+        remoteRecords: [RemoteMessageNotificationRecord] = [],
+        inboxRecords: [NotificationInboxAlertRecord] = []
     ) {
         authorizationSnapshot = authorization
         self.activeRecords = activeRecords
+        self.remoteRecords = remoteRecords
+        self.inboxRecords = inboxRecords
     }
 
     func authorization() async -> VisibleMessageNotificationAuthorization {
         authorizationSnapshot
     }
+
+    func deliveredRemoteMessageNotifications() async -> [RemoteMessageNotificationRecord] {
+        remoteRecords
+    }
+
+    func activeInboxNotifications() async -> [NotificationInboxAlertRecord] { inboxRecords }
 
     func activeMessageNotifications() async -> [VisibleMessageNotificationRecord] {
         guard shouldSuspendNextActiveLookup else { return activeRecords }
@@ -2408,6 +3019,7 @@ private final class FakeVisibleMessageNotificationCenter: VisibleMessageNotifica
         activeRecords.removeAll {
             $0.location == .pending && identifiers.contains($0.requestIdentifier)
         }
+        inboxRecords.removeAll { $0.location == .pending && identifiers.contains($0.requestIdentifier) }
     }
 
     func removeDeliveredNotifications(withIdentifiers identifiers: [String]) {
@@ -2416,10 +3028,28 @@ private final class FakeVisibleMessageNotificationCenter: VisibleMessageNotifica
         activeRecords.removeAll {
             $0.location == .delivered && identifiers.contains($0.requestIdentifier)
         }
+        remoteRecords.removeAll { identifiers.contains($0.requestIdentifier) }
+        inboxRecords.removeAll { $0.location == .delivered && identifiers.contains($0.requestIdentifier) }
     }
 
     func add(_ request: UNNotificationRequest) async throws {
+        if failNextAdd {
+            failNextAdd = false
+            throw NSError(domain: "NotificationTest", code: 1)
+        }
         requests.append(request)
+        if request.content.userInfo["type"] as? String == NotificationInboxRecoveryPolicy.localType {
+            let info = request.content.userInfo
+            inboxRecords.append(NotificationInboxAlertRecord(
+                requestIdentifier: request.identifier,
+                notificationID: info["notification_id"] as! String,
+                callID: info["call_id"] as? String,
+                ownerFingerprint: MessageNotificationContract.accountFingerprint(for: info["recipient_user_id"] as? String),
+                isRecovered: true,
+                createdAt: CallLifecyclePolicy.serverTimestamp(info["created_at"] as? String)!, location: .pending
+            ))
+            return
+        }
         activeRecords.removeAll {
             $0.location == .pending && $0.requestIdentifier == request.identifier
         }
