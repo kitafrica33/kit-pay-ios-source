@@ -234,6 +234,20 @@ Open `KitPay.xcodeproj` in Xcode 26 or later. Select the Apple development team,
 aligned with the backend APNs topic, and use a physical device for APNs, PushKit, CallKit, camera,
 microphone, and background-delivery validation.
 
+Conversation scrolling keeps native pan state outside the message view's render dependencies.
+Ordinary history drags skip camera eligibility work; admitted camera pulls update only their
+indicator. The latest-message button and staged voice playback also observe their own small
+views. Each render resolves the conversation ID once, shares album message/reaction lookups,
+and evaluates quoted history only for an actual reply. These changes avoid repeated history
+filtering, edit folds and sorting while the finger moves, without caching stale messages.
+Native regression tests cover both scroll directions, feedback publication, cancellation,
+eligibility changes, conversation replacement and current reply text. Real-device acceptance
+must still check responsiveness with long histories and active media playback.
+The opt-in `--kit-chat-long-history-scroll-fixture-v1` argument adds 100 conversations and 2,000
+synthetic text messages only when the Debug screenshot fixture is also enabled. Its UI regression
+drags from incoming and outgoing bubbles and records UIKit scrolling metrics in the existing
+native test run; it does not change the marketing fixture or create new store screenshots.
+
 ## App Store submission prerequisites
 
 Complete these checks before submission; a green build alone does not establish release

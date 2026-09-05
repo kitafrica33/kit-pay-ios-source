@@ -1,3 +1,4 @@
+import Combine
 import XCTest
 import UIKit
 @testable import KitPay
@@ -135,6 +136,124 @@ final class ConversationNativeOpeningTests: XCTestCase {
         await drainMainQueue()
 
         XCTAssertEqual(gestureCallbacks, 0)
+    }
+
+    func testNativeHistoryPansSkipCameraEligibilityAndPublishNoRenderUpdates() {
+        let interaction = ConversationScrollInteraction()
+        var publications = 0
+        var eligibilityChecks = 0
+        var progressCallbacks = 0
+        var cameraOpens = 0
+        let observation = interaction.objectWillChange.sink { publications += 1 }
+        defer { observation.cancel() }
+        func isEligible() -> Bool {
+            eligibilityChecks += 1
+            return true
+        }
+        let harness = NativeOpeningHarness(
+            shouldKeepOpening: { false }, shouldFollowLayout: { false },
+            onPositioned: {},
+            onBegin: { geometry, distance in
+                interaction.beginCameraPull(
+                    conversationID: "direct-chat", geometry: geometry,
+                    distanceFromLatest: distance, isEligible: true
+                )
+            },
+            onProgress: { progress in
+                progressCallbacks += 1
+                _ = interaction.updateCameraPull(progress: progress, isEligible: isEligible())
+            },
+            onCancel: { interaction.cancelCameraPull() },
+            onEnd: { cancelled in
+                if interaction.finishCameraPull(cancelled: cancelled, isEligible: isEligible()) {
+                    cameraOpens += 1
+                }
+            }
+        )
+        defer { harness.close() }
+        harness.attach()
+
+        for direction in [CGFloat(-1), CGFloat(1)] {
+            harness.scroll.contentOffset.y = 225
+            let pan = OpeningTestPan()
+            harness.coordinator.panChanged(pan)
+            XCTAssertTrue(interaction.isInteracting)
+            XCTAssertFalse(interaction.isTrackingCameraPull)
+
+            pan.reportedState = .changed
+            for step in 1 ... 120 {
+                let displacement = CGFloat(step) * 4 * direction
+                harness.scroll.contentOffset.y = 225 + displacement
+                pan.reportedTranslation = CGPoint(x: 0, y: -displacement)
+                harness.coordinator.panChanged(pan)
+            }
+            pan.reportedState = .ended
+            harness.coordinator.panChanged(pan)
+            XCTAssertFalse(interaction.isInteracting)
+        }
+
+        XCTAssertEqual(progressCallbacks, 240, "Exercise every native pan update in both directions")
+        XCTAssertEqual(eligibilityChecks, 0,
+                       "Scrolling history, even past the bottom, must never enter camera work")
+        XCTAssertEqual(publications, 0,
+                       "Native drag bookkeeping must not invalidate any observing view")
+        XCTAssertEqual(cameraOpens, 0)
+        XCTAssertTrue(interaction.latestPositionPolicy.hasPositioned(conversationID: "direct-chat"))
+    }
+
+    func testNativeGeometryCancellationKeepsScrollOwnershipUntilPanEnds() async {
+        let interaction = ConversationScrollInteraction()
+        var cancellations = 0
+        var cameraOpens = 0
+        let harness = NativeOpeningHarness(
+            onPositioned: {},
+            onBegin: { geometry, distance in
+                interaction.beginCameraPull(
+                    conversationID: "direct-chat", geometry: geometry,
+                    distanceFromLatest: distance, isEligible: true
+                )
+            },
+            onProgress: { progress in
+                _ = interaction.updateCameraPull(progress: progress, isEligible: true)
+            },
+            onCancel: {
+                cancellations += 1
+                interaction.cancelCameraPull()
+            },
+            onEnd: { cancelled in
+                if interaction.finishCameraPull(cancelled: cancelled, isEligible: true) {
+                    cameraOpens += 1
+                }
+            }
+        )
+        defer { harness.close() }
+        harness.attach()
+        await drainMainQueue()
+
+        let pan = OpeningTestPan()
+        harness.coordinator.panChanged(pan)
+        harness.scroll.contentOffset.y += ConversationCameraPullPolicy.triggerDistance
+        pan.reportedState = .changed
+        pan.reportedTranslation = CGPoint(x: 0, y: -150)
+        harness.coordinator.panChanged(pan)
+        XCTAssertTrue(interaction.cameraFeedback.isArmed)
+
+        harness.scroll.contentSize.height += 100
+        harness.coordinator.panChanged(pan)
+        XCTAssertEqual(cancellations, 1)
+        XCTAssertEqual(interaction.cameraFeedback, .init())
+        XCTAssertFalse(interaction.isTrackingCameraPull)
+        XCTAssertTrue(interaction.isInteracting,
+                      "A resized timeline cancels camera admission, not the finger's scroll ownership")
+        XCTAssertFalse(ConversationLatestPositionPolicy.shouldFollowOutgoingMessage(
+            hasPositionedCurrentConversation: true, latestMessageIsOutgoing: true,
+            isInteracting: interaction.isInteracting
+        ))
+
+        pan.reportedState = .ended
+        harness.coordinator.panChanged(pan)
+        XCTAssertFalse(interaction.isInteracting)
+        XCTAssertEqual(cameraOpens, 0)
     }
 
     func testNativeCameraAdmissionReplacesMissingOrStaleViewGeometry() async {
@@ -477,6 +596,164 @@ private final class OpeningTestPan: UIPanGestureRecognizer {
     }
 
     override func translation(in view: UIView?) -> CGPoint { reportedTranslation }
+}
+
+@MainActor
+final class ConversationScrollInteractionTests: XCTestCase {
+    private let geometry = ConversationCameraPullGeometry(
+        contentHeight: 1_000, viewportHeight: 600, viewportWidth: 320,
+        topInset: 20, bottomInset: 50
+    )
+
+    func testCameraFeedbackPublishesOnlyVisibleChangesAndMatchesTheRelease() {
+        let interaction = ConversationScrollInteraction()
+        var feedback: [ConversationScrollInteraction.CameraFeedback] = []
+        let observation = interaction.$cameraFeedback.dropFirst().sink { feedback.append($0) }
+        defer { observation.cancel() }
+        interaction.beginCameraPull(
+            conversationID: "direct-chat", geometry: geometry,
+            distanceFromLatest: 0, isEligible: true
+        )
+        let trigger = ConversationCameraPullPolicy.triggerDistance
+
+        for _ in 0 ..< 120 {
+            XCTAssertFalse(interaction.updateCameraPull(progress: 0, isEligible: true))
+        }
+        XCTAssertTrue(feedback.isEmpty,
+                      "An admitted pan with no overscroll must not repeatedly redraw its observers")
+        XCTAssertFalse(interaction.updateCameraPull(progress: trigger - 1, isEligible: true))
+        XCTAssertTrue(interaction.updateCameraPull(progress: trigger, isEligible: true))
+        for _ in 0 ..< 120 {
+            XCTAssertFalse(interaction.updateCameraPull(progress: trigger, isEligible: true))
+        }
+        XCTAssertFalse(interaction.updateCameraPull(progress: trigger - 1, isEligible: true))
+        XCTAssertFalse(interaction.updateCameraPull(progress: trigger, isEligible: true),
+                       "Re-crossing the threshold must not repeat its haptic")
+        XCTAssertTrue(interaction.finishCameraPull(cancelled: false, isEligible: true))
+        XCTAssertFalse(interaction.finishCameraPull(cancelled: false, isEligible: true))
+        XCTAssertFalse(interaction.isInteracting)
+
+        XCTAssertEqual(feedback, [
+            .init(progress: trigger - 1, isArmed: false),
+            .init(progress: trigger, isArmed: true),
+            .init(progress: trigger - 1, isArmed: false),
+            .init(progress: trigger, isArmed: true),
+            .init(),
+        ], "Progress and arming must arrive together; repeated samples and releases add no update")
+    }
+
+    func testLosingEligibilityCancelsThePullWithoutReadmittingTheSamePan() {
+        let interaction = ConversationScrollInteraction()
+        interaction.beginCameraPull(
+            conversationID: "direct-chat", geometry: geometry,
+            distanceFromLatest: 0, isEligible: true
+        )
+        let trigger = ConversationCameraPullPolicy.triggerDistance
+        XCTAssertTrue(interaction.updateCameraPull(progress: trigger, isEligible: true))
+        var eligibilityChecks = 0
+        func eligibility(_ value: Bool) -> Bool {
+            eligibilityChecks += 1
+            return value
+        }
+
+        XCTAssertFalse(interaction.updateCameraPull(
+            progress: trigger, isEligible: eligibility(false)
+        ))
+        XCTAssertEqual(interaction.cameraFeedback, .init())
+        XCTAssertFalse(interaction.isTrackingCameraPull)
+        XCTAssertTrue(interaction.isInteracting)
+        for _ in 0 ..< 120 {
+            XCTAssertFalse(interaction.updateCameraPull(
+                progress: trigger, isEligible: eligibility(true)
+            ))
+        }
+        XCTAssertFalse(interaction.finishCameraPull(
+            cancelled: false, isEligible: eligibility(true)
+        ))
+        XCTAssertEqual(eligibilityChecks, 1,
+                       "Restoring eligibility during a canceled drag must not restart camera work")
+        XCTAssertFalse(interaction.isInteracting)
+    }
+
+    func testArmedReleaseRechecksEligibilityAndCancelledReleaseSkipsIt() {
+        for cancelled in [false, true] {
+            let interaction = ConversationScrollInteraction()
+            interaction.beginCameraPull(
+                conversationID: "direct-chat", geometry: geometry,
+                distanceFromLatest: 0, isEligible: true
+            )
+            XCTAssertTrue(interaction.updateCameraPull(
+                progress: ConversationCameraPullPolicy.triggerDistance, isEligible: true
+            ))
+            var eligibilityChecks = 0
+            func isEligible() -> Bool {
+                eligibilityChecks += 1
+                return false
+            }
+
+            XCTAssertFalse(interaction.finishCameraPull(
+                cancelled: cancelled, isEligible: isEligible()
+            ))
+            XCTAssertEqual(eligibilityChecks, cancelled ? 0 : 1)
+            XCTAssertEqual(interaction.cameraFeedback, .init())
+            XCTAssertFalse(interaction.isTrackingCameraPull)
+            XCTAssertFalse(interaction.isInteracting)
+        }
+    }
+
+    func testInvalidPanProgressClearsFeedbackWithoutEndingNativeInteraction() {
+        for invalidProgress in [CGFloat.nan, .infinity, -1] {
+            let interaction = ConversationScrollInteraction()
+            interaction.beginCameraPull(
+                conversationID: "direct-chat", geometry: geometry,
+                distanceFromLatest: 0, isEligible: true
+            )
+            XCTAssertTrue(interaction.updateCameraPull(
+                progress: ConversationCameraPullPolicy.triggerDistance, isEligible: true
+            ))
+
+            XCTAssertFalse(interaction.updateCameraPull(progress: invalidProgress, isEligible: true))
+            XCTAssertEqual(interaction.cameraFeedback, .init())
+            XCTAssertFalse(interaction.isTrackingCameraPull)
+            XCTAssertTrue(interaction.isInteracting)
+            XCTAssertFalse(interaction.finishCameraPull(cancelled: false, isEligible: true))
+            XCTAssertFalse(interaction.isInteracting)
+        }
+    }
+
+    func testLeavingOrReplacingConversationDropsTheArmedPullAndStartsFresh() {
+        let interaction = ConversationScrollInteraction()
+        let trigger = ConversationCameraPullPolicy.triggerDistance
+        interaction.beginCameraPull(
+            conversationID: "direct-chat", geometry: geometry,
+            distanceFromLatest: 0, isEligible: true
+        )
+        XCTAssertTrue(interaction.updateCameraPull(progress: trigger, isEligible: true))
+
+        interaction.endInteraction()
+        XCTAssertFalse(interaction.isInteracting)
+        XCTAssertFalse(interaction.isTrackingCameraPull)
+        XCTAssertEqual(interaction.cameraFeedback, .init())
+        XCTAssertFalse(interaction.updateCameraPull(progress: trigger, isEligible: true))
+        XCTAssertFalse(interaction.finishCameraPull(cancelled: false, isEligible: true))
+
+        interaction.beginCameraPull(
+            conversationID: "other-chat", geometry: geometry,
+            distanceFromLatest: 200, isEligible: true
+        )
+        XCTAssertTrue(interaction.latestPositionPolicy.hasPositioned(conversationID: "other-chat"))
+        XCTAssertFalse(interaction.updateCameraPull(progress: trigger, isEligible: true))
+        XCTAssertFalse(interaction.finishCameraPull(cancelled: false, isEligible: true),
+                       "An arm from the prior conversation cannot survive an ordinary history pan")
+
+        interaction.beginCameraPull(
+            conversationID: "other-chat", geometry: geometry,
+            distanceFromLatest: 0, isEligible: true
+        )
+        XCTAssertTrue(interaction.updateCameraPull(progress: trigger, isEligible: true))
+        XCTAssertTrue(interaction.finishCameraPull(cancelled: false, isEligible: true),
+                      "A fresh deliberate pull still works after the old conversation is left")
+    }
 }
 
 final class ConversationInteractionPolicyTests: XCTestCase {

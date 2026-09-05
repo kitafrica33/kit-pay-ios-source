@@ -1697,12 +1697,12 @@ class SigningConfigurationTests(unittest.TestCase):
         readme = (ROOT / "README.md").read_text()
 
         self.assertIn("default: 1.0.16", workflow)
-        self.assertIn('default: "70"', workflow)
-        self.assertIn("v1.0.16-build70", workflow)
+        self.assertIn('default: "71"', workflow)
+        self.assertIn("v1.0.16-build71", workflow)
         # Six each: Debug and Release of the app and both extensions. iOS refuses to
         # install an app whose extension carries a different version, so they move together.
         self.assertEqual(project.count("MARKETING_VERSION = 1.0.16;"), 6)
-        self.assertEqual(project.count("CURRENT_PROJECT_VERSION = 70;"), 6)
+        self.assertEqual(project.count("CURRENT_PROJECT_VERSION = 71;"), 6)
         self.assertNotIn("MARKETING_VERSION = 1.0.1;", project)
         self.assertIn("1.0.16-r39", readme)
         self.assertIn("group_payment_request.{created,contributed,completed,cancelled,expired}", readme)

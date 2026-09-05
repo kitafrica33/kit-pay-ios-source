@@ -157,15 +157,16 @@ enum MessageReplyQuotePolicy {
     /// an answer, or when the message it answers is not on this device — history from before
     /// this installation, or a page that has not been loaded yet. A missing target leaves the
     /// answer plain rather than inventing a quote for it.
+    /// History is evaluated only for a valid reply, so ordinary bubbles do not rebuild it.
     static func quote(
         for message: LocalMessage,
-        in conversation: [LocalMessage],
+        in conversation: @autoclosure () -> [LocalMessage],
         currentUserID: String?,
         displayName: (String) -> String?
     ) -> MessageReplyQuote? {
         guard let targetID = targetServerMessageID(of: message) else { return nil }
         guard message.serverMessageId?.lowercased() != targetID else { return nil }
-        guard let target = conversation.first(where: {
+        guard let target = conversation().first(where: {
             $0.serverMessageId?.lowercased() == targetID
                 && $0.conversationId == message.conversationId
         }) else { return nil }

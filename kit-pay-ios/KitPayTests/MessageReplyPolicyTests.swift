@@ -278,6 +278,52 @@ final class MessageReplyPolicyTests: XCTestCase {
 
     // MARK: Quotes
 
+    func testOrdinaryMetadataAndSelfRepliesNeverEvaluateHistory() {
+        var historyReads = 0
+        func history() -> [LocalMessage] {
+            historyReads += 1
+            return []
+        }
+        let rows = [
+            message("Ordinary message"),
+            message("Self reference", serverMessageID: targetID,
+                    replyToServerMessageID: targetID.uppercased()),
+            message("Metadata", serverMessageID: targetID,
+                    historyKind: .encryptedReaction, historyReplyToMessageID: targetID),
+        ]
+        for _ in 0 ..< 100 {
+            for row in rows {
+                XCTAssertNil(MessageReplyQuotePolicy.quote(
+                    for: row, in: history(), currentUserID: me, displayName: { _ in nil }
+                ))
+            }
+        }
+        XCTAssertEqual(historyReads, 0,
+                       "Rendering non-replies must not project or search conversation history")
+    }
+
+    func testReplyEvaluatesHistoryOnceAndReflectsSubsequentEdits() {
+        var target = message("Before correction", serverMessageID: targetID)
+        let answer = message("Answer", replyToServerMessageID: targetID)
+        var historyReads = 0
+        func history() -> [LocalMessage] {
+            historyReads += 1
+            return [target, answer]
+        }
+        let first = MessageReplyQuotePolicy.quote(
+            for: answer, in: history(), currentUserID: me, displayName: { _ in "Amina" }
+        )
+        XCTAssertEqual(first?.preview, "Before correction")
+        XCTAssertEqual(historyReads, 1)
+
+        target.body = "Corrected wording"
+        let corrected = MessageReplyQuotePolicy.quote(
+            for: answer, in: history(), currentUserID: me, displayName: { _ in "Amina" }
+        )
+        XCTAssertEqual(corrected?.preview, "Corrected wording")
+        XCTAssertEqual(historyReads, 2, "Lazy evaluation must not cache stale quoted text")
+    }
+
     func testQuoteNamesTheAuthorOfTheAnsweredMessage() {
         let target = message("Bring the receipt", serverMessageID: targetID)
         let answer = message(

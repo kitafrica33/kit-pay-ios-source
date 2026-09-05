@@ -1524,21 +1524,9 @@ struct ConversationView: View {
     @State private var showDeleteMessagesConfirmation = false
     @State private var forwardItems: [ForwardPayloadItem] = []
     @State private var showForwardSheet = false
-    @State private var isNearLatestMessage = true
-    @State private var unseenIncomingCount = 0
-    /// Claims the one non-animated jump each conversation needs after its lazy timeline has
-    /// appeared. `defaultScrollAnchor` alone runs before restored messages and hydrated payment
-    /// cards have necessarily reached their final size.
-    @State private var latestPositionPolicy = ConversationLatestPositionPolicy()
-    @State private var cameraPullProgress: CGFloat = 0
-    @State private var cameraPull = ConversationCameraPullGesture()
-    /// Captured from the native scroll view at pan begin. SwiftUI preferences may still be zero
-    /// or stale even after the timeline is visible; they cannot admit or reject a native pull.
-    @State private var cameraPullGeometry: ConversationCameraPullGeometry?
-    /// Whether a finger is currently on the thread, as reported by the scroll view itself.
-    /// Only the scroll view knows this once it has taken the drag over, which it always does.
-    @State private var isConversationScrollInteracting = false
-    @State private var conversationViewportHeight: CGFloat = 0
+    /// Native scrolling must not invalidate the message projection. Only the small overlay
+    /// views observe this object's published feedback; the conversation retains its identity.
+    @State private var scrollInteraction = ConversationScrollInteraction()
     @State private var pendingScrollTargetMessageID: UUID?
     /// A notification, global result, or floating player can address one exact local message.
     /// The short-lived treatment confirms arrival without leaving a permanent selected state.
@@ -1595,7 +1583,7 @@ struct ConversationView: View {
     @State private var groupPaymentRequestContribution: GroupPaymentRequestContributionTarget?
     @State private var groupPaymentRequestCancellation: GroupPaymentRequestCancellationTarget?
     @StateObject private var voiceRecorder: VoiceNoteRecorder
-    @ObservedObject private var stagedVoicePlayer = VoiceNotePlayer.shared
+    private let stagedVoicePlayer = VoiceNotePlayer.shared
     @FocusState private var isComposerFocused: Bool
 
     init(conversation: Conversation) {
@@ -1631,8 +1619,9 @@ struct ConversationView: View {
         // A Send Later message is shown in its own section under the timeline, not inline: it has
         // not happened yet, and a bubble sitting among sent messages would read as if it had.
         let waiting = scheduledMessageIDs
+        let conversationID = currentConversation.id
         let visible = model.state.messages.filter {
-            $0.conversationId == currentConversation.id && !waiting.contains($0.id)
+            $0.conversationId == conversationID && !waiting.contains($0.id)
         }
         let corrections = MessageEditAggregationPolicy.appliedEdits(in: visible)
         let instructions = MessageEditAggregationPolicy.suppressedMessageIDs(in: visible)
@@ -1825,21 +1814,21 @@ struct ConversationView: View {
             && (hasAttachment || !trimmedDraft.isEmpty)
     }
 
-    private var cameraPullIsEligible: Bool {
-        !isReadOnlyAppReviewPreview && conversationMessagingAvailable
-            && !timelineItems.isEmpty
+    private func cameraPullIsAvailable(hasTimelineContent: Bool) -> Bool {
+        // The caller already rendered this snapshot. Rebuilding timelineItems here used to
+        // filter, parse and sort history on every native pan update, even for ordinary scrolls.
+        hasTimelineContent && !isReadOnlyAppReviewPreview && conversationMessagingAvailable
             && scenePhase == .active
             && !showCameraCapture && !showVideoNoteCamera
             && galleryTarget == nil && editorSession == nil
             && !showContactProfile && !showGroupProfile && !showGroupMediaLibrary
             && pendingScrollTargetMessageID == nil
-            && ConversationCameraPullPolicy.isEligible(
-            geometry: cameraPullGeometry,
-            isSelectingMessages: isSelectingMessages,
-            isSearchingMessages: isSearchingMessages,
-            hasVoiceNoteDraft: voiceRecorder.hasDraft,
-            isEditingMessage: editTarget != nil
-        )
+            && ConversationCameraPullPolicy.interactionIsEligible(
+                isSelectingMessages: isSelectingMessages,
+                isSearchingMessages: isSearchingMessages,
+                hasVoiceNoteDraft: voiceRecorder.hasDraft,
+                isEditingMessage: editTarget != nil
+            )
     }
 
     private var paymentRequestPolicy: PaymentRequestPolicy {
@@ -2650,9 +2639,17 @@ struct ConversationView: View {
         let projection = correctedProjection
         let timelineSnapshot = projection.messages
         let renderedTimeline = makeTimelineItems(messages: timelineSnapshot)
+        let hasTimelineContent = !renderedTimeline.isEmpty
+        let cameraAvailable = cameraPullIsAvailable(hasTimelineContent: hasTimelineContent)
         let correctionDates = projection.editedAt
         let albumMembership: [UUID: ChatMediaAlbumMembership] =
             isSelectingMessages ? [:] : ChatMediaAlbumPolicy.membership(for: timelineSnapshot)
+        // Album cells share this render's corrected rows. Text-only histories need no index.
+        // Keep the first duplicate, matching the previous first(where:) lookup semantics.
+        let messagesByID: [UUID: LocalMessage] = albumMembership.isEmpty ? [:] : Dictionary(
+            timelineSnapshot.lazy.map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
         let suppressedReactionIDs = MessageReactionAggregationPolicy.suppressedMessageIDs(
             in: timelineSnapshot
         )
@@ -2721,6 +2718,8 @@ struct ConversationView: View {
                                 } else if case .leader(let album) = albumMembership[message.id] {
                                     albumBubble(
                                         album,
+                                        messagesByID: messagesByID,
+                                        reactionTallies: hoistedTallies,
                                         senderName: namedSenderMessageIDs.contains(message.id)
                                             ? participantDisplayName(for: message.senderId)
                                             : nil
@@ -2852,30 +2851,47 @@ struct ConversationView: View {
                         ConversationScrollPanReporter(
                             conversationID: conversation.id,
                             shouldKeepOpeningAtBottom: {
-                                latestPositionPolicy.shouldApplyNativeOpeningAnchor(
+                                scrollInteraction.latestPositionPolicy.shouldApplyNativeOpeningAnchor(
                                     conversationID: conversation.id,
                                     hasTimelineContent: !renderedTimeline.isEmpty,
                                     hasExplicitTarget: pendingScrollTargetMessageID != nil,
-                                    isInteracting: isConversationScrollInteracting
+                                    isInteracting: scrollInteraction.isInteracting
                                 )
                             },
                             shouldFollowLayoutChanges: {
                                 pendingScrollTargetMessageID == nil
-                                    && !isConversationScrollInteracting
+                                    && !scrollInteraction.isInteracting
                             },
                             onOpeningPositioned: {
-                                guard !latestPositionPolicy.hasPositioned(
+                                guard !scrollInteraction.latestPositionPolicy.hasPositioned(
                                     conversationID: conversation.id
                                 ) else { return }
-                                _ = latestPositionPolicy.claimOpening(
+                                _ = scrollInteraction.latestPositionPolicy.claimOpening(
                                     conversationID: conversation.id,
                                     hasTimelineContent: !renderedTimeline.isEmpty
                                 )
                             },
-                            onBegin: beginCameraPull,
-                            onProgress: updateCameraPull,
+                            onBegin: { geometry, distance in
+                                scrollInteraction.beginCameraPull(
+                                    conversationID: conversation.id,
+                                    geometry: geometry,
+                                    distanceFromLatest: distance,
+                                    isEligible: cameraPullIsAvailable(
+                                        hasTimelineContent: hasTimelineContent
+                                    )
+                                )
+                            },
+                            onProgress: { progress in
+                                updateCameraPull(
+                                    progress: progress, hasTimelineContent: hasTimelineContent
+                                )
+                            },
                             onCancel: cancelCameraPull,
-                            onEnd: finishCameraPull
+                            onEnd: { cancelled in
+                                finishCameraPull(
+                                    cancelled: cancelled, hasTimelineContent: hasTimelineContent
+                                )
+                            }
                         )
                     )
                 }
@@ -2888,29 +2904,29 @@ struct ConversationView: View {
                     GeometryReader { viewportGeometry in
                         Color.clear
                             .onAppear {
-                                conversationViewportHeight = viewportGeometry.size.height
+                                scrollInteraction.viewportHeight = viewportGeometry.size.height
                             }
                             .onChange(of: viewportGeometry.size.height) { _, height in
-                                conversationViewportHeight = height
+                                scrollInteraction.viewportHeight = height
                             }
                     }
                 )
                 .onPreferenceChange(ConversationScrollMetricsKey.self) { metrics in
                     handleScrollMetrics(metrics)
                 }
-                .onChange(of: cameraPullIsEligible) { _, eligible in
+                .onChange(of: cameraAvailable) { _, eligible in
                     if !eligible { cancelCameraPull() }
                 }
-                .onChange(of: conversation.id) { _, _ in cancelCameraPull() }
+                .onChange(of: conversation.id) { _, _ in scrollInteraction.endInteraction() }
                 .onChange(of: renderedTimeline.last?.id) { _, _ in
                     // Own sends explicitly jump to latest. Incoming rows and hydrated cards
                     // follow only from a previously near-bottom native geometry/offset sample.
                     if ConversationLatestPositionPolicy.shouldFollowOutgoingMessage(
-                        hasPositionedCurrentConversation: latestPositionPolicy.hasPositioned(
+                        hasPositionedCurrentConversation: scrollInteraction.latestPositionPolicy.hasPositioned(
                             conversationID: conversation.id
                         ),
-                        latestMessageIsOutgoing: latestTimelineMessageIsOutgoing,
-                        isInteracting: isConversationScrollInteracting,
+                        latestMessageIsOutgoing: latestTimelineMessageIsOutgoing(in: renderedTimeline),
+                        isInteracting: scrollInteraction.isInteracting,
                         hasExplicitTarget: pendingScrollTargetMessageID != nil
                     ) {
                         scrollToBottom(using: scrollProxy)
@@ -2919,7 +2935,7 @@ struct ConversationView: View {
                 .onChange(of: pendingScrollTargetMessageID) { _, target in
                     guard let target else { return }
                     cancelCameraPull()
-                    latestPositionPolicy.userDidChoosePosition(conversationID: conversation.id)
+                    scrollInteraction.latestPositionPolicy.userDidChoosePosition(conversationID: conversation.id)
                     withAnimation(.easeOut(duration: 0.25)) {
                         scrollProxy.scrollTo(
                             "message:\(target.uuidString.lowercased())",
@@ -2929,16 +2945,15 @@ struct ConversationView: View {
                     pendingScrollTargetMessageID = nil
                 }
                 .overlay(alignment: .bottom) {
-                    if cameraPullIsEligible, cameraPullProgress > 2 {
-                        cameraPullIndicator
-                    }
+                    ConversationCameraPullIndicator(
+                        interaction: scrollInteraction, isAvailable: cameraAvailable
+                    )
                 }
                 .overlay(alignment: .bottomTrailing) {
-                    if !isNearLatestMessage {
-                        jumpToLatestButton(scrollProxy)
+                    ConversationJumpToLatestButton(interaction: scrollInteraction) {
+                        scrollToBottom(using: scrollProxy)
                     }
                 }
-                .animation(.snappy(duration: 0.2), value: isNearLatestMessage)
                 // Playing a bubble's media would tear the audio session out from under the
                 // live recorder and destroy the in-progress note.
                 .allowsHitTesting(!voiceRecorder.isRecording)
@@ -3933,12 +3948,12 @@ struct ConversationView: View {
                 // refresh); acting on stale IDs must be impossible.
                 selectedMessageIDs.formIntersection(Set(updatedMessages.map(\.id)))
             }
-            if !isNearLatestMessage {
+            if !scrollInteraction.isNearLatestMessage {
                 let previousIDs = Set(previousMessages.map(\.id))
                 let arrived = updatedMessages.filter {
                     !$0.isOutgoing && !previousIDs.contains($0.id)
                 }.count
-                if arrived > 0 { unseenIncomingCount += arrived }
+                if arrived > 0 { scrollInteraction.unseenIncomingCount += arrived }
             }
             if incomingSoundPolicy.consume(
                 updatedMessages,
@@ -3991,8 +4006,7 @@ struct ConversationView: View {
             stopReadOnlyGroupInteractions()
         }
         .onDisappear {
-            cancelCameraPull()
-            isConversationScrollInteracting = false
+            scrollInteraction.endInteraction()
             incomingSoundPolicy.endVisibility()
             if !isReadOnlyAppReviewPreview {
                 model.setConversationVisible(conversation.id, visible: false)
@@ -4030,8 +4044,8 @@ struct ConversationView: View {
             }
             incomingSoundPolicy = VisibleConversationSoundPolicy(conversationID: promoted.id)
             incomingSoundPolicy.beginVisibility(with: model.state.messages)
-            latestPositionPolicy = ConversationLatestPositionPolicy()
-            unseenIncomingCount = 0
+            scrollInteraction.latestPositionPolicy = ConversationLatestPositionPolicy()
+            scrollInteraction.unseenIncomingCount = 0
         }
         conversation = promoted
         if promoted.id != previousID,
@@ -4619,14 +4633,9 @@ struct ConversationView: View {
                         .frame(width: 62, height: 62)
                         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                 } else {
-                    Image(systemName: stagedVoicePlayer.playingID == attachment.id
-                        && !stagedVoicePlayer.isPaused
-                        ? "pause.fill"
-                        : attachment.kind.symbolName)
-                        .font(.system(size: 22, weight: .semibold))
-                        .foregroundStyle(KitColor.green)
-                        .frame(width: 62, height: 62)
-                        .background(KitColor.paleGreen.opacity(0.4), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    StagedVoiceAttachmentSymbol(
+                        attachmentID: attachment.id, fallbackSymbol: attachment.kind.symbolName
+                    )
                 }
             }
             .contentShape(Rectangle())
@@ -5209,12 +5218,17 @@ struct ConversationView: View {
     /// One grid bubble for a run of consecutive captionless photos/videos. Tapping any cell
     /// opens the shared gallery at that item.
     /// `senderName` is non-nil only when this album heads a run of that member's messages.
-    private func albumBubble(_ album: ChatMediaAlbum, senderName: String?) -> some View {
+    private func albumBubble(
+        _ album: ChatMediaAlbum,
+        messagesByID: [UUID: LocalMessage],
+        reactionTallies: [String: [MessageReactionTally]],
+        senderName: String?
+    ) -> some View {
         let isOutgoing = album.items[0].isOutgoing
-        let closingMessage = messages.first { $0.id == album.items[album.items.count - 1].messageID }
+        let closingMessage = messagesByID[album.items[album.items.count - 1].messageID]
         // Swiping the whole run answers the photo it opens with; a single photo inside the run
         // can still be answered on its own from its long-press menu.
-        let leadMessage = messages.first { $0.id == album.items[0].messageID }
+        let leadMessage = messagesByID[album.items[0].messageID]
         return SwipeToReplyContainer(
             isEnabled: leadMessage.map { canReply(to: $0) } ?? false,
             onReply: { leadMessage.map { beginReply(to: $0) } }
@@ -5234,12 +5248,12 @@ struct ConversationView: View {
                     isOutgoing: isOutgoing,
                     onTap: { item in openGallery(at: item.messageID) },
                     cellMenu: { item in
-                        guard let message = messages.first(where: { $0.id == item.messageID })
+                        guard let message = messagesByID[item.messageID]
                         else { return AnyView(EmptyView()) }
                         return AnyView(messageContextMenu(message))
                     },
                     cellBadge: { item in
-                        guard let message = messages.first(where: { $0.id == item.messageID }),
+                        guard let message = messagesByID[item.messageID],
                               let serverID = message.serverMessageId?.lowercased(),
                               let tallies = reactionTallies[serverID],
                               !tallies.isEmpty
@@ -8591,8 +8605,8 @@ struct ConversationView: View {
         }
     }
 
-    private var latestTimelineMessageIsOutgoing: Bool {
-        guard let item = timelineItems.last else { return false }
+    private func latestTimelineMessageIsOutgoing(in timeline: [ConversationTimelineItem]) -> Bool {
+        guard let item = timeline.last else { return false }
         switch item {
         case .message(let message),
              .payment(let message, _),
@@ -8610,7 +8624,7 @@ struct ConversationView: View {
 
     private func scrollToBottom(using proxy: ScrollViewProxy, animated: Bool = true) {
         cancelCameraPull()
-        unseenIncomingCount = 0
+        scrollInteraction.unseenIncomingCount = 0
         let position = {
             proxy.scrollTo(ConversationScrollAnchor.bottom, anchor: .bottom)
         }
@@ -8624,87 +8638,146 @@ struct ConversationView: View {
     // MARK: Reading position, jump-to-latest, and the pull-past-the-end camera
 
     private func handleScrollMetrics(_ metrics: ConversationScrollMetrics) {
-        guard conversationViewportHeight > 0 else { return }
-        let distanceFromLatest = metrics.contentMaxY - conversationViewportHeight
+        guard scrollInteraction.viewportHeight > 0 else { return }
+        let distanceFromLatest = metrics.contentMaxY - scrollInteraction.viewportHeight
         let nearLatest = distanceFromLatest < ConversationCameraPullPolicy.nearLatestDistance
-        if nearLatest != isNearLatestMessage {
-            isNearLatestMessage = nearLatest
-            if nearLatest { unseenIncomingCount = 0 }
+        if nearLatest != scrollInteraction.isNearLatestMessage {
+            scrollInteraction.isNearLatestMessage = nearLatest
+            if nearLatest { scrollInteraction.unseenIncomingCount = 0 }
         }
     }
 
-    private func beginCameraPull(
-        geometry: ConversationCameraPullGeometry, distanceFromLatest: CGFloat
-    ) {
-        isConversationScrollInteracting = true
-        latestPositionPolicy.userDidChoosePosition(conversationID: conversation.id)
-        cameraPullGeometry = geometry
-        cameraPull.begin(
-            isEligible: cameraPullIsEligible,
-            distanceFromLatest: distanceFromLatest
-        )
-        ConversationCameraPullDiagnostics.log(
-            "begin eligible=\(cameraPullIsEligible) admitted=\(cameraPull.isTracking)"
-                + " distance=\(distanceFromLatest) review=\(isReadOnlyAppReviewPreview)"
-                + " messaging=\(conversationMessagingAvailable) active=\(scenePhase == .active)"
-                + " content=\(geometry.contentHeight) viewport=\(geometry.viewportHeight)"
-                + " nativeGeometryValid=\(geometry.isValid)"
-                + " selecting=\(isSelectingMessages) searching=\(isSearchingMessages)"
-                + " voiceDraft=\(voiceRecorder.hasDraft) editing=\(editTarget != nil)"
-        )
-        if cameraPullProgress != 0 { cameraPullProgress = 0 }
-    }
-
-    private func updateCameraPull(progress: CGFloat) {
-        ConversationCameraPullDiagnostics.log(
-            "progress value=\(progress) eligible=\(cameraPullIsEligible)"
-                + " tracking=\(cameraPull.isTracking) armed=\(cameraPull.isArmed)"
-        )
-        guard cameraPullIsEligible, cameraPull.isTracking else {
-            cancelCameraPull()
-            return
-        }
-        cameraPull.dragged(progress: progress)
-        if cameraPullProgress != progress { cameraPullProgress = progress }
-        if cameraPull.overscrolled(to: progress) {
-            ConversationCameraPullDiagnostics.log("armed value=\(progress)")
+    private func updateCameraPull(progress: CGFloat, hasTimelineContent: Bool) {
+        if scrollInteraction.updateCameraPull(
+            progress: progress,
+            isEligible: cameraPullIsAvailable(hasTimelineContent: hasTimelineContent)
+        ) {
             UIImpactFeedbackGenerator(style: .medium).impactOccurred()
             UIAccessibility.post(notification: .announcement,
                                  argument: "Release to open camera")
         }
     }
 
-    private func finishCameraPull(cancelled: Bool) {
-        ConversationCameraPullDiagnostics.log(
-            "release cancelled=\(cancelled) eligible=\(cameraPullIsEligible)"
-                + " tracking=\(cameraPull.isTracking) armed=\(cameraPull.isArmed)"
-        )
-        isConversationScrollInteracting = false
-        if cancelled {
-            cancelCameraPull()
-            return
-        }
-        let shouldOpen = cameraPull.released() && cameraPullIsEligible
-        cameraPullGeometry = nil
-        ConversationCameraPullDiagnostics.log("release opens=\(shouldOpen)")
-        if cameraPullProgress != 0 { cameraPullProgress = 0 }
-        if shouldOpen {
+    private func finishCameraPull(cancelled: Bool, hasTimelineContent: Bool) {
+        if scrollInteraction.finishCameraPull(
+            cancelled: cancelled,
+            isEligible: cameraPullIsAvailable(hasTimelineContent: hasTimelineContent)
+        ) {
             isComposerFocused = false
             showCameraCapture = true
         }
     }
 
     private func cancelCameraPull() {
-        if cameraPull.isTracking || cameraPull.isArmed {
-            ConversationCameraPullDiagnostics.log("cancel activeGesture=true")
-        }
-        if cameraPull.isTracking || cameraPull.isArmed { cameraPull.cancel() }
-        if cameraPullGeometry != nil { cameraPullGeometry = nil }
-        if cameraPullProgress != 0 { cameraPullProgress = 0 }
+        scrollInteraction.cancelCameraPull()
+    }
+}
+
+/// Keeps native drag bookkeeping out of ConversationView's render dependencies. Retain this
+/// with State; only the small overlay views observe its published presentation values.
+@MainActor
+final class ConversationScrollInteraction: ObservableObject {
+    struct CameraFeedback: Equatable {
+        var progress: CGFloat = 0
+        var isArmed = false
     }
 
-    private var cameraPullIndicator: some View {
-        let progress = min(1, cameraPullProgress / ConversationCameraPullPolicy.triggerDistance)
+    var latestPositionPolicy = ConversationLatestPositionPolicy()
+    var isInteracting = false
+    var viewportHeight: CGFloat = 0
+    @Published var isNearLatestMessage = true
+    @Published var unseenIncomingCount = 0
+    @Published private(set) var cameraFeedback = CameraFeedback()
+    private var cameraPull = ConversationCameraPullGesture()
+
+    var isTrackingCameraPull: Bool { cameraPull.isTracking }
+
+    func beginCameraPull(
+        conversationID: String,
+        geometry: ConversationCameraPullGeometry,
+        distanceFromLatest: CGFloat,
+        isEligible: Bool
+    ) {
+        isInteracting = true
+        latestPositionPolicy.userDidChoosePosition(conversationID: conversationID)
+        cameraPull.begin(
+            isEligible: isEligible && geometry.isValid,
+            distanceFromLatest: distanceFromLatest
+        )
+        setCameraFeedback(CameraFeedback())
+    }
+
+    /// Ordinary scrolling never evaluates eligibility or publishes a render update. Admitted
+    /// pulls publish only when their visible feedback actually changes.
+    func updateCameraPull(progress: CGFloat, isEligible: @autoclosure () -> Bool) -> Bool {
+        guard cameraPull.isTracking else { return false }
+        guard isEligible(), progress.isFinite, progress >= 0 else {
+            cancelCameraPull()
+            return false
+        }
+        cameraPull.dragged(progress: progress)
+        let shouldHaptic = cameraPull.overscrolled(to: progress)
+        setCameraFeedback(CameraFeedback(progress: progress, isArmed: cameraPull.isArmed))
+        return shouldHaptic
+    }
+
+    func finishCameraPull(cancelled: Bool, isEligible: @autoclosure () -> Bool) -> Bool {
+        isInteracting = false
+        defer { cancelCameraPull() }
+        guard !cancelled, cameraPull.released() else { return false }
+        return isEligible()
+    }
+
+    /// Cancelling a camera pull does not end the user's native scroll. Geometry, keyboard and
+    /// eligibility changes must continue to fence automatic positioning until pan end.
+    func cancelCameraPull() {
+        cameraPull.cancel()
+        setCameraFeedback(CameraFeedback())
+    }
+
+    /// Leaving or replacing the conversation ends its native interaction as well as its pull.
+    func endInteraction() {
+        isInteracting = false
+        cancelCameraPull()
+    }
+
+    private func setCameraFeedback(_ feedback: CameraFeedback) {
+        if cameraFeedback != feedback { cameraFeedback = feedback }
+    }
+}
+
+/// Playback progress is frequent; only the staged control needs to observe the shared player.
+private struct StagedVoiceAttachmentSymbol: View {
+    let attachmentID: UUID
+    let fallbackSymbol: String
+    @ObservedObject private var player = VoiceNotePlayer.shared
+
+    var body: some View {
+        Image(systemName: player.playingID == attachmentID && !player.isPaused
+            ? "pause.fill" : fallbackSymbol)
+            .font(.system(size: 22, weight: .semibold))
+            .foregroundStyle(KitColor.green)
+            .frame(width: 62, height: 62)
+            .background(
+                KitColor.paleGreen.opacity(0.4),
+                in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+            )
+    }
+}
+
+private struct ConversationCameraPullIndicator: View {
+    @ObservedObject var interaction: ConversationScrollInteraction
+    let isAvailable: Bool
+
+    var body: some View {
+        if isAvailable, interaction.cameraFeedback.progress > 2 {
+            indicator
+        }
+    }
+
+    private var indicator: some View {
+        let feedback = interaction.cameraFeedback
+        let progress = min(1, feedback.progress / ConversationCameraPullPolicy.triggerDistance)
         return VStack(spacing: 6) {
             Image(systemName: "camera.fill")
                 .font(.system(size: 19, weight: .semibold))
@@ -8718,7 +8791,7 @@ struct ConversationView: View {
                         .rotationEffect(.degrees(-90))
                 }
                 .scaleEffect(0.6 + 0.4 * progress)
-            Text(cameraPull.isArmed ? "Release to open camera" : "Pull further to open camera")
+            Text(feedback.isArmed ? "Release to open camera" : "Pull further to open camera")
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(KitColor.secondaryText)
         }
@@ -8727,14 +8800,24 @@ struct ConversationView: View {
         .allowsHitTesting(false)
         .accessibilityHidden(true)
     }
+}
 
-    private func jumpToLatestButton(_ proxy: ScrollViewProxy) -> some View {
-        Button {
-            scrollToBottom(using: proxy)
-        } label: {
+private struct ConversationJumpToLatestButton: View {
+    @ObservedObject var interaction: ConversationScrollInteraction
+    let onJump: () -> Void
+
+    var body: some View {
+        Group {
+            if !interaction.isNearLatestMessage { button }
+        }
+        .animation(.snappy(duration: 0.2), value: interaction.isNearLatestMessage)
+    }
+
+    private var button: some View {
+        Button(action: onJump) {
             HStack(spacing: 6) {
-                if unseenIncomingCount > 0 {
-                    Text("\(unseenIncomingCount)")
+                if interaction.unseenIncomingCount > 0 {
+                    Text("\(interaction.unseenIncomingCount)")
                         .font(.caption.bold())
                         .foregroundStyle(.white)
                         .padding(.horizontal, 7)
@@ -8758,8 +8841,8 @@ struct ConversationView: View {
         .padding(.trailing, 14)
         .padding(.bottom, 10)
         .accessibilityLabel(
-            unseenIncomingCount > 0
-                ? "\(unseenIncomingCount) new messages, jump to latest"
+            interaction.unseenIncomingCount > 0
+                ? "\(interaction.unseenIncomingCount) new messages, jump to latest"
                 : "Jump to latest message"
         )
         .transition(.opacity.combined(with: .scale(scale: 0.86)))
@@ -9236,7 +9319,21 @@ enum ConversationCameraPullPolicy {
         isEditingMessage: Bool
     ) -> Bool {
         geometry?.isValid == true
-            && !isSelectingMessages
+            && interactionIsEligible(
+                isSelectingMessages: isSelectingMessages,
+                isSearchingMessages: isSearchingMessages,
+                hasVoiceNoteDraft: hasVoiceNoteDraft,
+                isEditingMessage: isEditingMessage
+            )
+    }
+
+    static func interactionIsEligible(
+        isSelectingMessages: Bool,
+        isSearchingMessages: Bool,
+        hasVoiceNoteDraft: Bool,
+        isEditingMessage: Bool
+    ) -> Bool {
+        !isSelectingMessages
             && !isSearchingMessages
             && !hasVoiceNoteDraft
             && !isEditingMessage

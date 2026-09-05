@@ -783,7 +783,7 @@ class MediaMessageV2SourceContract(unittest.TestCase):
         self.assertIn("guard didRestoreDraft", send)
         self.assertIn("guard didRestoreDraft", voice)
         can_send_start = messages.index("private var canSendMessage: Bool")
-        can_send_end = messages.index("private var cameraPullIsEligible", can_send_start)
+        can_send_end = messages.index("private func cameraPullIsAvailable", can_send_start)
         self.assertIn("&& didRestoreDraft", messages[can_send_start:can_send_end])
         restore_start = messages.index("let restored = await model.restoredConversationDraftMedia(")
         restore_end = messages.index(

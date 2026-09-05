@@ -6,6 +6,7 @@ import Foundation
 /// build and still requires an explicit launch argument, so an ordinary Debug run cannot enter it.
 enum AppStoreScreenshotFixture {
     static let launchArgument = "--kit-app-store-screenshot-fixture-v1"
+    static let longHistoryLaunchArgument = "--kit-chat-long-history-scroll-fixture-v1"
     static let compiledFixtureMarker = "KITPAY_APP_STORE_SCREENSHOT_FIXTURE_V1"
     static let presentationNow = timestamp("2026-08-24T09:41:00Z")
 
@@ -151,7 +152,66 @@ enum AppStoreScreenshotFixture {
             pqLastResortPreKeySHA256: String(repeating: "c", count: 64)
         )
         fixture.secureMessaging = secureMessaging
+        if isActive && ProcessInfo.processInfo.arguments.contains(longHistoryLaunchArgument) {
+            populateLongHistory(in: &fixture)
+        }
         return fixture
+    }
+
+    /// An opt-in scrolling workload, independent of the eight-conversation marketing artwork.
+    /// All 2,000 messages are local text with stable identities; no media or network is needed.
+    private static func populateLongHistory(in fixture: inout PersistedState) {
+        var workloadContacts: [WalletContactDTO] = []
+        var workloadConversations: [Conversation] = []
+        var workloadMessages: [LocalMessage] = []
+        workloadContacts.reserveCapacity(100)
+        workloadConversations.reserveCapacity(100)
+        workloadMessages.reserveCapacity(2_000)
+
+        for thread in 0 ..< 100 {
+            let conversationID = thread == 0 ? primaryConversationID
+                : String(format: "30000000-0000-4000-8000-%012d", thread)
+            let peerID = thread == 0 ? aminaID
+                : String(format: "31000000-0000-4000-8000-%012d", thread)
+            let name = thread == 0 ? "Amina Demo" : String(format: "History contact %03d", thread)
+            let newestDate = presentationNow.addingTimeInterval(-Double(thread * 60))
+            workloadContacts.append(contact(
+                peerID, name,
+                thread == 0 ? "+256 700 000 001" : String(format: "+2567001%05d", thread),
+                String(format: "history_contact_%03d", thread)
+            ))
+            workloadConversations.append(Conversation(
+                id: conversationID,
+                title: name,
+                participantUserIds: [ownerID, peerID],
+                unreadCount: 0,
+                updatedAt: newestDate
+            ))
+            // 300 primary + 17 threads of 18 + 82 threads of 17 = 2,000 messages.
+            let rowCount = thread == 0 ? 300 : (thread <= 17 ? 18 : 17)
+            for row in 1 ... rowCount {
+                let identity = thread * 1_000 + row
+                let outgoing = row.isMultiple(of: 2)
+                let date = newestDate.addingTimeInterval(-Double((rowCount - row) * 60))
+                workloadMessages.append(LocalMessage(
+                    id: UUID(uuidString: String(format: "32000000-0000-4000-8000-%012d", identity))!,
+                    serverMessageId: String(format: "33000000-0000-4000-8000-%012d", identity),
+                    conversationId: conversationID,
+                    senderId: outgoing ? ownerID : peerID,
+                    body: thread == 0 ? String(format: "Long history %03d", row)
+                        : String(format: "Background thread %03d message %03d", thread, row),
+                    createdAt: date,
+                    sentAt: date,
+                    state: outgoing ? .read : .received,
+                    failureReason: nil,
+                    isOutgoing: outgoing
+                ))
+            }
+        }
+        fixture.contacts = workloadContacts
+        fixture.conversations = workloadConversations
+        fixture.messages = workloadMessages
+        fixture.calls = []
     }
 
     static var communicationPreferences: CommunicationPreferencesDTO {
