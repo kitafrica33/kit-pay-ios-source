@@ -245,6 +245,10 @@ final class AppStoreScreenshotUITests: XCTestCase {
                        withVelocity: readingDragVelocity, thenHoldForDuration: stationaryReleaseDuration)
             let outgoingAfter = outgoing.frame
             print("[KitPayLongHistoryGeometry] Outgoing before/after: \(outgoingBefore) -> \(outgoingAfter)")
+            if outgoingAfter.minY - outgoingBefore.minY <= distance * 0.5 {
+                retainHierarchy(app, named: "long-history-vertical-drag-failure")
+                capture(app, named: "long-history-vertical-drag-failure")
+            }
             XCTAssertGreaterThan(outgoingAfter.minY - outgoingBefore.minY, distance * 0.5,
                                  "Dragging down from inside a bubble must reveal older messages")
             XCTAssertFalse(newest.isHittable, "Reading older messages must leave the latest position")
@@ -299,6 +303,35 @@ final class AppStoreScreenshotUITests: XCTestCase {
         require(newest, in: app, message: "Newest row is missing after reopening")
         XCTAssertTrue(newest.isHittable, "Reopening long history must preserve latest-message opening")
         XCTAssertFalse(app.buttons["Cancel reply"].exists)
+        XCTAssertFalse(app.buttons["Close camera"].exists)
+
+        // Exercise actual UIKit/SwiftUI gesture arbitration, including the opposite direction
+        // and a stationary long press. Policy-only tests cannot prove which recognizer wins.
+        for (label, horizontalDistance) in [("Long history 296", CGFloat(-120)),
+                                             ("Long history 295", CGFloat(120))] {
+            let bubble = timeline.staticTexts[label].firstMatch
+            requireHittable(bubble, in: app, message: "Reply gesture anchor is unavailable")
+            let start = bubble.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+            start.press(forDuration: 0.01,
+                        thenDragTo: start.withOffset(CGVector(dx: horizontalDistance, dy: 0)),
+                        withVelocity: readingDragVelocity,
+                        thenHoldForDuration: stationaryReleaseDuration)
+            tap(app.buttons["Cancel reply"], in: app,
+                message: "A deliberate horizontal swipe must select a reply")
+            XCTAssertFalse(app.buttons["Cancel reply"].exists)
+            // Reopening also dismisses the reply keyboard before the next gesture.
+            tap(app.navigationBars.buttons.element(boundBy: 0), in: app,
+                message: "Chat has no back button after cancelling reply")
+            openFixtureConversation(in: app)
+            XCTAssertTrue(newest.isHittable)
+        }
+        let menuAnchor = timeline.staticTexts["Long history 296"].firstMatch
+        requireHittable(menuAnchor, in: app, message: "Context menu anchor is unavailable")
+        menuAnchor.press(forDuration: 1)
+        tap(app.buttons["Reply"], in: app,
+            message: "A stationary long press must retain the message context menu")
+        tap(app.buttons["Cancel reply"], in: app,
+            message: "The context menu must still select the quoted message")
         XCTAssertFalse(app.buttons["Close camera"].exists)
     }
 

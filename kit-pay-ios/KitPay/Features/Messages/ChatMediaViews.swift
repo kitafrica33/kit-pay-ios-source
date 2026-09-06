@@ -1542,6 +1542,7 @@ struct VoiceNoteBubbleView: View {
                 // Runs *alongside* the thread's scroll rather than replacing it: a mostly-vertical
                 // drag that starts on the waveform is someone scrolling past, and is left alone.
                 .simultaneousGesture(seekGesture)
+                .background(SwipeToReplyGestureExclusion())
                 .accessibilityElement()
                 .accessibilityLabel("\(displayKind.previewLabel) position")
                 .accessibilityValue(

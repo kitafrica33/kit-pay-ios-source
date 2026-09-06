@@ -5,46 +5,29 @@ import Foundation
 /// tested without a simulator. The numbers are the same ones the Android build uses, so the
 /// gesture arms at the same place in the drag on both platforms.
 enum SwipeToReplyPolicy {
-    enum DragAxis: Equatable {
-        case undecided
-        case horizontal
-        case vertical
-    }
-
     /// How far the bubble is ever allowed to travel under the finger.
     static let maximumTravel: CGFloat = 68
     /// How far the drag has to reach before letting go composes an answer.
     static let replyTrigger: CGFloat = 52
-    /// Let the scroll view's ten-point pan recognizer establish vertical movement before a
-    /// message row considers adopting the same touch for reply.
+    /// Visible reply movement begins here. Native recognition uses UIKit's own threshold and
+    /// rejects a vertical direction before beginning, independently of this visual threshold.
     static let activationDistance: CGFloat = 20
     /// A diagonal drag belongs to reading history. Reply adopts only a deliberately sideways
     /// gesture, and the first direction decision stays locked until that finger lifts.
     static let horizontalDominance: CGFloat = 1.5
 
+    /// UIKit asks shouldBegin at its own movement threshold. Returning false cannot defer a
+    /// decision until twenty points; it fails that gesture. Admit only a finite horizontal
+    /// displacement here, then retain activationDistance for visible movement and haptics.
+    static func nativePanShouldBegin(translation: CGSize) -> Bool {
+        translation.width.isFinite && translation.height.isFinite
+            && abs(translation.width) > abs(translation.height) * horizontalDominance
+    }
+
     /// Past `maximumTravel` the bubble keeps moving, but only barely — enough that the drag
     /// still feels alive under the finger without sliding the whole conversation sideways.
     private static let overshootRate: CGFloat = 0.18
     private static let maximumOvershoot: CGFloat = 1.2
-
-    /// Classifies and permanently locks one drag's intent. A vertical decision is sticky: a
-    /// scrolling finger that curves sideways later must never wake a row gesture halfway through
-    /// the scroll. Once the threshold is crossed, every ambiguous diagonal is treated as vertical
-    /// so reading history always wins over an accidental reply.
-    static func lockedAxis(
-        current: DragAxis,
-        translation: CGSize,
-        minimumDistance: CGFloat = activationDistance,
-        horizontalRatio: CGFloat = horizontalDominance
-    ) -> DragAxis {
-        guard current == .undecided else { return current }
-        guard minimumDistance >= 0, horizontalRatio > 1 else { return .vertical }
-
-        let horizontal = abs(translation.width)
-        let vertical = abs(translation.height)
-        guard max(horizontal, vertical) >= minimumDistance else { return .undecided }
-        return horizontal > vertical * horizontalRatio ? .horizontal : .vertical
-    }
 
     /// Where the bubble sits for a given raw finger displacement. One-for-one up to the limit,
     /// then heavily damped, and never past `maximumTravel * maximumOvershoot`.

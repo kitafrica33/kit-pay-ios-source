@@ -244,6 +244,9 @@ elif sys.argv[1:3] == ['simctl', 'privacy'] and os.environ.get('KITPAY_FAIL_CONT
         self.assertEqual(registration["phase"], "contacts-ready")
         self.assertEqual(registration["installationOwner"], "xcodebuild")
         self.assertIn("-skip-testing:KitPayTests/ConversationNativeOpeningTests", calls[1])
+        reply_gestures = "KitPayTests/SwipeToReplyNativeGestureTests"
+        self.assertEqual(calls[0].count("-only-testing:" + reply_gestures), 1)
+        self.assertEqual(calls[1].count("-skip-testing:" + reply_gestures), 1)
         self.assertIn("-only-testing:KitPayUITests/CallLayoutUITests", calls[0])
         self.assertIn("-skip-testing:KitPayUITests/CallLayoutUITests", calls[1])
         self.assertIn("-skip-testing:KitPayUITests/AppStoreScreenshotUITests/testCaptureAppStoreScreenshots", calls[1])

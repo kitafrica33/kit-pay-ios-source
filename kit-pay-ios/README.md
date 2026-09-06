@@ -254,79 +254,27 @@ select a different history. The first-open and reopened newest-row checks remain
 The long-history regression runs in the existing early native phase and is excluded from the
 remaining phase, so a navigation or scrolling failure stops validation sooner without duplicate tests.
 
-Build 73 passed exact-chat selection and both drag-movement assertions, then failed the partial-return
-reading-position check. The native pan ended 122.33 points from the bottom, but subsequent row frames
-matched their initial latest position. Residual momentum and automatic positioning remain possible
-causes; neither has been established. Build 74 added a 0.5-second stationary hold before finger lift,
-intermediate frame geometry before assertions can fail, and Debug fixture position logs. Its archive
-failed before compilation or native tests when the fresh Simulator's cold-boot readiness wait reached
-300 seconds, after data migration progressed to waiting for the system app. There is no native build 74
-result for the scrolling change.
+Build 81 replaces each row's SwiftUI reply drag with one native directional recognizer per
+conversation scroll view. Vertical and ambiguous diagonal movement fail reply recognition before
+it begins; only the selected row receives horizontal progress. Non-interactive row probes track
+lazy row attachment, and media seek controls keep their own touch regions. The reply distance,
+haptics, cancellation, context menus and iOS 17 support remain part of the interaction contract.
+The existing two-pass slow vertical drag regression retains its distances, stationary holds,
+reading-position assertions, Jump button and reopen checks, and now also exercises replies in both
+directions and the long-press menu. Failed first drags retain a screenshot and accessibility tree.
 
-Build 75 extends only that initial bootstatus wait to 600 seconds, preserving the fresh pinned
-Simulator, single boot sequence and other 60-second command limits. It retains build 74's scrolling
-workload, metrics and assertions, and adds Debug screenshot-fixture logs for explicit SwiftUI bottom
-and message-target positioning. Those logs contain static labels and the bottom-scroll animation flag;
-release scrolling behavior is unchanged. Native validation remains required; no product fix or
-physical-device performance result is established.
+Build 80 compiled and passed 26 of 27 first-group cases, including received-video end/replay,
+media scrubbing, native reading-position, camera and call-banner checks. Its slow vertical bubble
+drag moved zero points. The retained native log contains no pan start or automatic repositioning
+during that gesture; the cause of recognizer arbitration is not conclusively established.
+Build 81 native validation remains required. No Simulator check establishes physical touch latency;
+real iPhones still need responsiveness and Instruments checks with long histories and active media.
 
-Build 75's first native phase passed 22 of 23 checks. The stationary long-history drag remained
-122.33 points from latest after release and passed the reading-position assertions, but the Jump
-button was absent from all three final accessibility queries. The second native phase did not run.
-Build 76 derives Jump visibility and unread clearing from the scroll view's validated content,
-viewport, adjusted insets and offset, replacing the separate SwiftUI preference measurements.
-Reports coalesce on the main queue, reread the current position after automatic positioning, and
-expire when the scroll view or conversation changes. Same-side samples leave overlay observers
-quiet. Native UIScrollView regressions cover the retained reading distance, threshold crossings,
-unread clearing, geometry changes and deferred callback ownership. The existing long-history UI
-assertions and build 75's 600-second initial boot wait remain intact.
-
-Build 76's first native phase passed 26 of 27 checks, including all four new native reading-position
-regressions. Both long-history drag iterations completed their movement, stopped-reading, Jump
-visibility and idle-position assertions. XCTest then raised an internal exception while harvesting
-the combined scrolling/deceleration signpost metric. That exception prevented the final aggregate
-attachment and Jump/reopen assertions from running; the second native phase also did not run.
-Build 77 tried Apple's app-scoped `XCTHitchMetric` on iOS 26 or later, retaining the combined
-metric for iOS 17–25. It also passed 26 of 27 first-phase checks and both functional drag blocks,
-then hit the same internal `MXMOSSignpostMetric` collection exception on the pinned Simulator.
-The final aggregate attachment, Jump/reopen checks and second native phase were again not reached.
-These failures do not establish why XCTest metric collection failed.
-
-Build 78 runs two explicit functional drag passes without XCTest performance collection. It
-preserves the stationary gestures, movement and reading-position assertions, intermediate and
-aggregate attachments, exact selectors, and final Jump/back/reopen checks. Application runtime
-and native unit-test sources are unchanged from build 76.
-Physical-device acceptance must still check touch responsiveness and capture scrolling hitches
-with Instruments on real iPhones, including long histories and active media; this Simulator
-regression supplies neither timing measurements nor physical-device performance acceptance.
-
-Build 78 compiled successfully, but its first native invocation launched no unit tests: the
-Simulator rejected the unit host as installing or uninstalling. The camera and banner UI checks
-passed. The second long-history return failed after UIKit continued decelerating from 122.67
-points away to the bottom; the retained pan log records a release velocity of -256.44 points per
-second despite the requested 0.5-second hold. The log does not establish why velocity remained,
-and records no automatic repositioning during that return. The second native invocation and
-signing did not run.
-
-Build 79 uses a 60-pixel-per-second test gesture, retaining both passes, distances, the stationary
-hold, all movement/reading-position assertions and final Jump/back/reopen checks. Application
-runtime is unchanged. Native tests now use a derivative of Xcode's generated `.xctestrun` plan
-with `UseDestinationArtifacts`, so XCTest uses the app and runner already installed on the
-selected Simulator. Generated environments and test selections remain intact; neither native
-invocation reinstalls the products. Installed-app visibility still does not prove FrontBoard
-readiness. Build 79 compiled, but Xcode 26.6 rejected both native targets before any test case:
-`UseDestinationArtifacts` requires a physical iOS device and is unsupported on Simulator.
-Neither signing nor upload ran.
-
-Build 80 validates and uses the original generated `.xctestrun` without changing its contents.
-XCTest owns Simulator installation and launch; the workflow performs no manual app or runner
-installs. After the first native group succeeds, it observes the installed identities and grants
-Contacts before the real-launch tests in the second group. Unit hosts and the first group's UI
-fixtures already suppress that prompt. The selected marketing fixture also needs no manual
-Contacts grant. Both disjoint serial test groups, one compilation, the selected Simulator, and
-all build 79 scrolling gestures/assertions remain unchanged. This removes manual installation
-overlap; it does not establish the cause of build 78's Busy error. Native build 80 validation and
-physical-device responsiveness remain unverified.
+Native tests use Xcode's original generated `.xctestrun` unchanged. XCTest owns installation and
+launch. Product identity and plan validation precede the first group; installed identity observation
+and the Contacts grant follow its success and precede real-launch tests in the second group.
+Both groups use one compilation and one prepared Simulator, with disjoint selections and no retry.
+Selected marketing capture reuses that plan and its prompt-free synthetic fixture.
 
 ## App Store submission prerequisites
 

@@ -1,4 +1,6 @@
 import XCTest
+import UIKit
+import SwiftUI
 @testable import KitPay
 
 final class MessageReplyPolicyTests: XCTestCase {
@@ -61,49 +63,24 @@ final class MessageReplyPolicyTests: XCTestCase {
 
     // MARK: Gesture geometry
 
-    func testSwipeReplyLocksVerticalScrollingAndNeverChangesItsMind() {
-        let vertical = SwipeToReplyPolicy.lockedAxis(
-            current: .undecided,
-            translation: CGSize(width: 3, height: -24)
-        )
-        XCTAssertEqual(vertical, .vertical)
-        XCTAssertEqual(
-            SwipeToReplyPolicy.lockedAxis(
-                current: vertical,
-                translation: CGSize(width: 90, height: -30)
-            ),
-            .vertical
-        )
-    }
-
-    func testSwipeReplyAdoptsOnlyDecisivelyHorizontalMovement() {
-        XCTAssertEqual(
-            SwipeToReplyPolicy.lockedAxis(
-                current: .undecided,
-                translation: CGSize(width: 24, height: 4)
-            ),
-            .horizontal
-        )
-        XCTAssertEqual(
-            SwipeToReplyPolicy.lockedAxis(
-                current: .undecided,
-                translation: CGSize(width: 24, height: 19)
-            ),
-            .vertical
-        )
-        XCTAssertEqual(
-            SwipeToReplyPolicy.lockedAxis(
-                current: .undecided,
-                translation: CGSize(width: 7, height: 8)
-            ),
-            .undecided
-        )
-    }
-
-    func testSwipeReplyDirectionThresholdLeavesScrollViewFirstRefusal() {
-        XCTAssertGreaterThan(SwipeToReplyPolicy.activationDistance, 10)
+    func testSwipeReplyVisualThresholdRemainsBelowTheReplyTrigger() {
+        XCTAssertGreaterThan(SwipeToReplyPolicy.activationDistance, 0)
         XCTAssertLessThan(SwipeToReplyPolicy.activationDistance, SwipeToReplyPolicy.replyTrigger)
         XCTAssertGreaterThan(SwipeToReplyPolicy.horizontalDominance, 1)
+    }
+
+    func testNativePanAdmissionRejectsVerticalAmbiguousAndNonfiniteDisplacements() {
+        for translation in [
+            CGSize.zero, CGSize(width: 0, height: 12), CGSize(width: 0, height: -180),
+            CGSize(width: 12, height: 8), CGSize(width: -12, height: -8),
+            CGSize(width: CGFloat.nan, height: 0), CGSize(width: 50, height: CGFloat.infinity),
+        ] {
+            XCTAssertFalse(SwipeToReplyPolicy.nativePanShouldBegin(translation: translation))
+        }
+        for translation in [CGSize(width: 9, height: 1), CGSize(width: -9, height: -1)] {
+            XCTAssertTrue(SwipeToReplyPolicy.nativePanShouldBegin(translation: translation),
+                          "UIKit admission must not wait for the later visual threshold")
+        }
     }
 
     func testTravelFollowsTheFingerOneForOneWithinTheLimit() {
@@ -427,5 +404,320 @@ final class MessageReplyPolicyTests: XCTestCase {
         XCTAssertEqual(quote?.preview, "Outside the shop")
         XCTAssertNil(quote?.authorName)
         XCTAssertFalse(quote?.authorIsSelf ?? true)
+    }
+}
+
+/// Exercises the actual UIKit delegate, shared registration and native-view lifecycle. Touch
+/// arbitration itself still requires the unchanged slow-drag UI regression on Simulator.
+@MainActor
+final class SwipeToReplyNativeGestureTests: XCTestCase {
+    func testSwiftUIBackgroundProbesMatchRowAndWaveformBounds() async {
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 320, height: 600))
+        let host = UIHostingController(rootView: ScrollView {
+            VStack {
+                SwipeToReplyContainer(isEnabled: true, onReply: {}) {
+                    Color.blue.frame(width: 240, height: 80)
+                }
+                Color.clear.frame(width: 120, height: 22)
+                    .background(SwipeToReplyGestureExclusion())
+            }
+        })
+        window.rootViewController = host
+        window.isHidden = false
+        defer {
+            host.view.removeFromSuperview()
+            window.rootViewController = nil
+            window.isHidden = true
+        }
+        for _ in 0..<3 {
+            window.layoutIfNeeded()
+            host.view.layoutIfNeeded()
+            await drainMainQueue()
+        }
+        func probes(in view: UIView) -> [SwipeToReplyGestureProbe] {
+            (view as? SwipeToReplyGestureProbe).map { [$0] } ?? view.subviews.flatMap { probes(in: $0) }
+        }
+        let regions = probes(in: host.view)
+        XCTAssertEqual(regions.count, 2)
+        let row = regions.first { !$0.excludesReply }
+        let waveform = regions.first { $0.excludesReply }
+        XCTAssertEqual(row?.bounds.size, CGSize(width: 240, height: 80))
+        XCTAssertEqual(waveform?.bounds.size, CGSize(width: 120, height: 22))
+        XCTAssertNotNil(row?.coordinator)
+        XCTAssertTrue(row?.coordinator === waveform?.coordinator)
+        XCTAssertTrue(regions.allSatisfy { !$0.isUserInteractionEnabled })
+    }
+
+    func testVerticalAndDiagonalDelegateAdmissionNeverStartsReply() {
+        let harness = Harness()
+        defer { harness.close() }
+        let events = Events()
+        let row = harness.row(y: 40, events: events)
+        let owner = row.coordinator!
+        for translation in [CGPoint(x: 0, y: 12), CGPoint(x: 0, y: -180), CGPoint(x: 12, y: 8)] {
+            XCTAssertTrue(harness.select(row))
+            owner.pan.setTranslation(translation, in: harness.window)
+            XCTAssertFalse(owner.gestureRecognizerShouldBegin(owner.pan))
+            owner.handle(state: .began, translation: translation.x)
+            owner.handle(state: .ended, translation: 120)
+        }
+        XCTAssertTrue(events.changes.isEmpty)
+        XCTAssertTrue(events.ends.isEmpty)
+        XCTAssertEqual(events.cancellations, 0)
+    }
+
+    func testHorizontalDelegateAdmissionPrecedesTwentyPointVisibleActivation() {
+        let harness = Harness()
+        defer { harness.close() }
+        let events = Events()
+        let row = harness.row(y: 40, events: events)
+        let owner = row.coordinator!
+        for direction in [CGFloat(1), CGFloat(-1)] {
+            XCTAssertTrue(harness.select(row))
+            owner.pan.setTranslation(CGPoint(x: direction * 9, y: 1), in: harness.window)
+            XCTAssertTrue(owner.gestureRecognizerShouldBegin(owner.pan))
+            let previous = events.changes.count
+            owner.handle(state: .began, translation: direction * 9)
+            owner.handle(state: .changed, translation: direction * 19)
+            XCTAssertEqual(events.changes.count, previous)
+            owner.handle(state: .changed, translation: direction * 20)
+            XCTAssertEqual(events.changes.last, direction * 20)
+            owner.handle(state: .ended, translation: direction * 60)
+            owner.handle(state: .ended, translation: direction * 60)
+        }
+        XCTAssertEqual(events.ends, [60, -60], "Final displacement is delivered exactly once")
+    }
+
+    func testOnePanRoutesOnlyTheSelectedRowAndUsesUpdatedCallbacks() {
+        let harness = Harness()
+        defer { harness.close() }
+        let firstEvents = Events(), secondEvents = Events(), updatedEvents = Events()
+        let first = harness.row(y: 40, events: firstEvents)
+        let second = harness.row(y: 140, events: secondEvents)
+        let owner = first.coordinator!
+        XCTAssertTrue(owner === second.coordinator)
+        XCTAssertEqual(harness.scroll.gestureRecognizers?.filter { $0 === owner.pan }.count, 1)
+        XCTAssertFalse(first.isUserInteractionEnabled)
+        XCTAssertTrue(harness.begin(second))
+        owner.handle(state: .changed, translation: 30)
+        second.configure(identity: second.identity, callbacks: updatedEvents.callbacks)
+        owner.handle(state: .changed, translation: 55)
+        owner.handle(state: .ended, translation: 65)
+        XCTAssertTrue(firstEvents.changes.isEmpty)
+        XCTAssertTrue(firstEvents.ends.isEmpty)
+        XCTAssertEqual(secondEvents.changes, [30])
+        XCTAssertTrue(secondEvents.ends.isEmpty, "An edited row must not commit a stale callback")
+        XCTAssertEqual(updatedEvents.changes, [55])
+        XCTAssertEqual(updatedEvents.ends, [65])
+    }
+
+    func testWaveformControlsAndNestedScrollsAreExcludedAtAdmission() {
+        let harness = Harness()
+        defer { harness.close() }
+        let row = harness.row(y: 40, events: Events())
+        let owner = row.coordinator!
+        let exclusion = SwipeToReplyGestureProbe(frame: CGRect(x: 80, y: 55, width: 100, height: 25))
+        exclusion.configure(identity: nil, callbacks: nil, excludesReply: true)
+        harness.scroll.addSubview(exclusion)
+        XCTAssertFalse(exclusion.isUserInteractionEnabled)
+        XCTAssertTrue(exclusion.coordinator === owner)
+        XCTAssertFalse(owner.selectRow(at: CGPoint(x: 100, y: 65), hitView: harness.scroll))
+        XCTAssertTrue(owner.selectRow(at: CGPoint(x: 30, y: 65), hitView: harness.scroll))
+        let control = UISlider(frame: CGRect(x: 20, y: 50, width: 40, height: 20))
+        harness.scroll.addSubview(control)
+        XCTAssertFalse(owner.selectRow(at: CGPoint(x: 30, y: 65), hitView: control))
+        let nested = UIScrollView(frame: CGRect(x: 20, y: 50, width: 40, height: 20))
+        harness.scroll.addSubview(nested)
+        XCTAssertFalse(owner.selectRow(at: CGPoint(x: 30, y: 65), hitView: nested))
+        XCTAssertFalse(owner.pan.cancelsTouchesInView)
+        XCTAssertFalse(owner.pan.delaysTouchesBegan)
+        XCTAssertFalse(owner.pan.delaysTouchesEnded)
+        XCTAssertEqual(owner.pan.maximumNumberOfTouches, 1)
+    }
+
+    func testSimultaneousRecognitionIsLimitedToTheEnclosingScrollPan() {
+        let harness = Harness()
+        defer { harness.close() }
+        let owner = harness.row(y: 40, events: Events()).coordinator!
+        XCTAssertTrue(owner.gestureRecognizer(owner.pan,
+            shouldRecognizeSimultaneouslyWith: harness.scroll.panGestureRecognizer))
+        let competitors: [UIGestureRecognizer] = [
+            UIPanGestureRecognizer(), UITapGestureRecognizer(), UILongPressGestureRecognizer(),
+        ]
+        for other in competitors {
+            XCTAssertFalse(owner.gestureRecognizer(owner.pan, shouldRecognizeSimultaneouslyWith: other))
+        }
+    }
+
+    func testDisableIdentityChangeAndDetachCancelWithoutCompletingReply() async {
+        for mutation in 0..<3 {
+            let harness = Harness()
+            let events = Events()
+            let row = harness.row(y: 40, events: events)
+            let owner = row.coordinator!
+            XCTAssertTrue(harness.begin(row))
+            owner.handle(state: .changed, translation: 60)
+            switch mutation {
+            case 0: row.configure(identity: row.identity, callbacks: nil)
+            case 1: row.configure(identity: UUID(), callbacks: events.callbacks)
+            default: row.removeFromSuperview()
+            }
+            owner.handle(state: .ended, translation: 120)
+            await drainMainQueue()
+            XCTAssertTrue(events.ends.isEmpty)
+            XCTAssertEqual(events.cancellations, 1)
+            harness.close()
+        }
+    }
+
+    func testReparentingCancelsOldHostAndRegistersOnlyWithTheNewScroll() async {
+        let harness = Harness()
+        defer { harness.close() }
+        let events = Events()
+        let row = harness.row(y: 40, events: events)
+        let original = row.coordinator!
+        XCTAssertTrue(harness.begin(row))
+        original.handle(state: .changed, translation: 60)
+        let replacement = UIScrollView(frame: harness.scroll.frame)
+        harness.window.addSubview(replacement)
+        replacement.addSubview(row)
+        let rebound = row.coordinator!
+        XCTAssertFalse(original === rebound)
+        XCTAssertTrue(rebound.scrollView === replacement)
+        XCTAssertFalse(harness.scroll.gestureRecognizers?.contains { $0 === original.pan } ?? false)
+        original.handle(state: .ended, translation: 120)
+        await drainMainQueue()
+        XCTAssertTrue(events.ends.isEmpty)
+        XCTAssertEqual(events.cancellations, 1)
+        row.removeFromSuperview()
+        XCTAssertFalse(replacement.gestureRecognizers?.contains { $0 === rebound.pan } ?? false)
+        replacement.removeFromSuperview()
+    }
+
+    func testDeferredCancellationCannotEraseAReplacementProbesNewGesture() async {
+        let harness = Harness()
+        defer { harness.close() }
+        let oldEvents = Events(), newEvents = Events()
+        let lifetime = SwipeToReplyGestureLifetime()
+        var row: SwipeToReplyGestureProbe? = harness.row(y: 40, events: oldEvents, lifetime: lifetime)
+        let owner = row!.coordinator!
+        // Keep this scroll's shared owner alive while the selected lazy row is replaced.
+        _ = harness.row(y: 140, events: Events())
+        XCTAssertTrue(harness.begin(row!))
+        owner.handle(state: .changed, translation: 60)
+        row!.removeFromSuperview()
+        weak var retired = row
+        row = nil
+        XCTAssertNil(retired)
+        let replacement = harness.row(y: 40, events: newEvents, lifetime: lifetime)
+        XCTAssertTrue(harness.begin(replacement))
+        owner.handle(state: .changed, translation: -55)
+        await drainMainQueue()
+        XCTAssertTrue(oldEvents.ends.isEmpty)
+        XCTAssertEqual(newEvents.cancellations, 0)
+        XCTAssertEqual(newEvents.changes, [0, -55], "Pending old feedback resets before new movement")
+        owner.handle(state: .ended, translation: -65)
+        XCTAssertEqual(newEvents.ends, [-65])
+    }
+
+    func testProbeDeallocationStillResetsTheSurvivingRowsFeedback() async {
+        let harness = Harness()
+        defer { harness.close() }
+        let events = Events()
+        let lifetime = SwipeToReplyGestureLifetime()
+        var row: SwipeToReplyGestureProbe? = harness.row(y: 40, events: events, lifetime: lifetime)
+        let owner = row!.coordinator!
+        XCTAssertTrue(harness.begin(row!))
+        owner.handle(state: .changed, translation: 60)
+        row!.removeFromSuperview()
+        weak var retired = row
+        row = nil
+        XCTAssertNil(retired)
+        await drainMainQueue()
+        XCTAssertTrue(events.ends.isEmpty)
+        XCTAssertEqual(events.cancellations, 1)
+        XCTAssertNil(lifetime.feedbackToken)
+    }
+
+    func testCancelledPanAndLastProbeRemovalPreserveNativeScrollOwnership() {
+        let harness = Harness()
+        defer { harness.close() }
+        let events = Events()
+        let row = harness.row(y: 40, events: events)
+        let owner = row.coordinator!
+        let nativePan = harness.scroll.panGestureRecognizer
+        let nativeDelegate = nativePan.delegate
+        let offset = harness.scroll.contentOffset
+        XCTAssertTrue(harness.begin(row))
+        owner.handle(state: .changed, translation: -60)
+        owner.handle(state: .cancelled, translation: -60)
+        owner.handle(state: .ended, translation: -120)
+        XCTAssertEqual(events.cancellations, 1)
+        XCTAssertTrue(events.ends.isEmpty)
+        row.removeFromSuperview()
+        XCTAssertFalse(harness.scroll.gestureRecognizers?.contains { $0 === owner.pan } ?? false)
+        XCTAssertTrue(harness.scroll.panGestureRecognizer === nativePan)
+        XCTAssertTrue(nativePan.delegate === nativeDelegate)
+        XCTAssertTrue(nativePan.isEnabled)
+        XCTAssertEqual(harness.scroll.contentOffset, offset)
+    }
+
+    private func drainMainQueue() async {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async { continuation.resume() }
+        }
+    }
+
+    private final class Events {
+        var changes: [CGFloat] = []
+        var ends: [CGFloat] = []
+        var cancellations = 0
+        var callbacks: SwipeToReplyGestureCallbacks {
+            SwipeToReplyGestureCallbacks(
+                changed: { self.changes.append($0) },
+                ended: { self.ends.append($0) },
+                cancelled: { self.cancellations += 1 }
+            )
+        }
+    }
+
+    @MainActor
+    private final class Harness {
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 320, height: 600))
+        let scroll = UIScrollView(frame: CGRect(x: 0, y: 0, width: 320, height: 600))
+
+        init() {
+            scroll.contentInsetAdjustmentBehavior = .never
+            scroll.contentSize = CGSize(width: 320, height: 1_000)
+            window.addSubview(scroll)
+            window.isHidden = false
+        }
+
+        func row(
+            y: CGFloat, events: Events, lifetime: SwipeToReplyGestureLifetime? = nil
+        ) -> SwipeToReplyGestureProbe {
+            let probe = SwipeToReplyGestureProbe(frame: CGRect(x: 10, y: y, width: 300, height: 80))
+            probe.configure(identity: lifetime?.identity ?? UUID(), callbacks: events.callbacks, lifetime: lifetime)
+            scroll.addSubview(probe)
+            return probe
+        }
+
+        func select(_ row: SwipeToReplyGestureProbe) -> Bool {
+            let point = row.convert(CGPoint(x: row.bounds.midX, y: row.bounds.midY), to: scroll)
+            return row.coordinator?.selectRow(at: point, hitView: scroll) ?? false
+        }
+
+        func begin(_ row: SwipeToReplyGestureProbe) -> Bool {
+            guard select(row), let owner = row.coordinator else { return false }
+            owner.pan.setTranslation(CGPoint(x: 9, y: 0), in: window)
+            guard owner.gestureRecognizerShouldBegin(owner.pan) else { return false }
+            owner.handle(state: .began, translation: 9)
+            return true
+        }
+
+        func close() {
+            for view in scroll.subviews { view.removeFromSuperview() }
+            window.isHidden = true
+        }
     }
 }

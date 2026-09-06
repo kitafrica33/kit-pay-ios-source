@@ -40,6 +40,7 @@ case "$mode" in
     xcodebuild "${test_common[@]}" \
       -resultBundlePath "$RUNNER_TEMP/KitPay-opening-camera.xcresult" \
       -only-testing:KitPayTests/ConversationNativeOpeningTests \
+      -only-testing:KitPayTests/SwipeToReplyNativeGestureTests \
       -only-testing:KitPayTests/ChatMediaPolicyTests/testReceivedVideoPlaysToEndAndReplaysAfterParentFileCleanup \
       -only-testing:KitPayTests/ChatMediaPolicyTests/testGalleryScrubbingRejectsInvalidTimesAndPreservesPauseIntent \
       -only-testing:KitPayUITests/AppStoreScreenshotUITests/testChatBottomPullOpensCameraOnlyAfterADeliberateRelease \
@@ -52,6 +53,7 @@ case "$mode" in
     xcodebuild "${test_common[@]}" \
       -resultBundlePath "$RUNNER_TEMP/KitPay-quality.xcresult" \
       -skip-testing:KitPayTests/ConversationNativeOpeningTests \
+      -skip-testing:KitPayTests/SwipeToReplyNativeGestureTests \
       -skip-testing:KitPayTests/ChatMediaPolicyTests/testReceivedVideoPlaysToEndAndReplaysAfterParentFileCleanup \
       -skip-testing:KitPayTests/ChatMediaPolicyTests/testGalleryScrubbingRejectsInvalidTimesAndPreservesPauseIntent \
       -skip-testing:KitPayUITests/CallLayoutUITests \

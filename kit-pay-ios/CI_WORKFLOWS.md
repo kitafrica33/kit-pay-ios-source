@@ -40,75 +40,24 @@ The focused native phase runs chat opening, pull-to-camera, long-history scrolli
 and call-banner layout before the remaining suite. A failure stops that run early. Each focused check is
 excluded from the remaining phase, so this ordering adds no compilation or test runs.
 
-Build 73 stopped in this first phase after the long-history reading-position assertion failed.
-Its pan log ended away from the bottom, while later row frames returned to their opening positions;
-the evidence does not yet distinguish momentum from automatic positioning. Build 74 retained the same
-workload, test inventory and assertions, added a 0.5-second stationary hold before finger lift, and
-retained intermediate geometry plus Debug fixture positioning logs. Its archive failed during fresh
-Simulator preparation: the 300-second bootstatus deadline expired after cold-boot data migration
-progressed to waiting for the system app. Compilation and native tests were skipped, so build 74
-produced no native result for the scrolling change.
+Native tests use the original generated `.xctestrun` unchanged. XCTest installs and launches
+its own products; Simulator does not support `UseDestinationArtifacts`. Exact compiled product
+and plan validation precede the first group. After it succeeds, installed-app observation and
+the Contacts grant prepare real-launch checks in the second group. Marketing uses validate-only
+checks with the same generated plan and its prompt-free fixture. No manual installs, test retries,
+extra compilations or additional Simulators are introduced. The fresh pinned Simulator has one
+boot sequence with a 600-second initial readiness limit; other simctl operations retain their
+60-second limits.
 
-Build 75 raises only the initial bootstatus wait to 600 seconds. Fresh pinned iOS 26.5/iPhone 17 Pro
-creation, one boot sequence, successful readiness and all other 60-second simctl limits remain required.
-It retains build 74's native tests and adds static SwiftUI positioning logs only for the active Debug
-screenshot fixture; the bottom-scroll log also records its animation flag. Runtime scrolling anchors
-are unchanged. Native validation remains required; no physical-device acceptance or latency result is claimed.
-
-Build 75 completed simulator setup and 22 of 23 first-phase checks passed. The stationary history
-remained 122.33 points from latest; its reading-position assertions passed, then the required Jump
-button was absent in all three final accessibility queries. The second native phase did not run.
-Build 76 replaces the separate SwiftUI reading-position measurements with coalesced reports from
-the existing validated native scroll samples. UIScrollView tests exercise adjusted insets, threshold
-crossings, unread clearing, geometry changes and callback cancellation on detach or conversation
-replacement. Opening and layout-follow corrections precede reading reports. The existing UI workload,
-exact Jump selector, assertions, two-phase ordering and 600-second initial boot wait are unchanged.
-Build 76's first phase passed 26 of 27 checks, including all four new native reading-position cases.
-The long-history test completed both drag blocks and their functional assertions, then XCTest raised
-an internal exception while harvesting the combined scrolling/deceleration metric. The final aggregate
-attachment, Jump/reopen checks and second native phase were not reached.
-
-Build 77 tried `XCTHitchMetric(application:)` on iOS 26 or later with the same workload and
-measurement boundaries. It passed 26 of 27 first-phase checks, including both functional drag
-blocks, then raised the same internal `MXMOSSignpostMetric` collection exception on the pinned
-Simulator. The final aggregate attachment, Jump/reopen checks and remaining native phase were
-not reached. Why XCTest metric collection failed remains unproven.
-
-Build 78 keeps the required long-history regression independent of XCTest performance collection.
-Two explicit functional passes preserve first-pass and repeated-state coverage, all stationary
-gestures, assertions, attachments and final Jump/back/reopen checks. It collects frame geometry
-without timing or hitch measurements. The test inventory, early/remaining phase selectors and
-single compilation are unchanged; no test is skipped or marked as an expected failure.
-Physical touch responsiveness and scrolling hitches still require real-device acceptance and
-Instruments captures as documented in README.md.
+Build 80 compiled, then passed 26 of 27 first-group cases. The slow vertical bubble drag did not
+move, so validation stopped before the second group, signing or upload. Build 81 changes reply
+gesture arbitration and retains the failed slow gesture and all reading-position assertions.
+The same regression also checks both horizontal reply directions and the long-press menu, and
+retains first-drag failure evidence without a separate capture job. Frame geometry is functional
+evidence only; physical responsiveness and scrolling hitches require device acceptance.
 
 Workflow conditions and native command selection are exercised by
 `test_ios_workflow_consolidation.py`. The tests check the target/screenshot-reuse
 matrix, no automatic triggers, early camera/banner checks, one test compilation,
 artifact-only upload, Linux processing, and real temporary signing-key validation.
 Run all cheap checks with `python3 -m unittest discover -s .github/scripts/tests`.
-
-Build 78 compiled but failed native validation: no unit cases launched because the Simulator
-reported the unit host busy installing/uninstalling, and the second long-history return coasted
-to latest after a nonzero native release velocity. The camera and banner UI tests passed;
-no second invocation, signing or upload occurred. This does not prove the cause of the Simulator
-installation state or of its retained velocity.
-
-Build 79 retains all functional scrolling assertions and slows only the synthetic reading drags
-to 60 pixels per second. It installs the compiled app and UI runner once per selected Simulator
-and uses Xcode's documented `UseDestinationArtifacts` plan fields for subsequent native and
-selected marketing invocations. The derivative remains beside the original generated plan so
-`__TESTROOT__` keeps its meaning; generated environments, destination, serial execution, both
-disjoint native selections and failure handling are preserved. No test retry, extra compilation,
-new Simulator or optional screenshot capture is added. Native and physical acceptance remain
-required.
-
-Build 79 compiled, then Xcode rejected both targets because `UseDestinationArtifacts` requires
-an iOS device and cannot be used with Simulator. No native cases, signing or upload ran.
-Build 80 keeps the generated plan unchanged and lets XCTest install and launch its own products.
-Compiled product and plan validation happen before the first native group; installed-app
-visibility and the existing Contacts grant happen after that group succeeds and before the
-second group. Real-launch checks keep their permission setup. Selected marketing runs use the
-same original plan and their existing prompt-free synthetic fixture. There are no manual
-Simulator installs, destination-artifact overrides, test retries, extra builds or new screenshots.
-Native and physical acceptance remain required.
