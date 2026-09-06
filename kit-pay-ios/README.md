@@ -295,10 +295,26 @@ These failures do not establish why XCTest metric collection failed.
 Build 78 runs two explicit functional drag passes without XCTest performance collection. It
 preserves the stationary gestures, movement and reading-position assertions, intermediate and
 aggregate attachments, exact selectors, and final Jump/back/reopen checks. Application runtime
-and native unit-test sources are unchanged from build 76. Native build 78 validation remains pending.
+and native unit-test sources are unchanged from build 76.
 Physical-device acceptance must still check touch responsiveness and capture scrolling hitches
 with Instruments on real iPhones, including long histories and active media; this Simulator
 regression supplies neither timing measurements nor physical-device performance acceptance.
+
+Build 78 compiled successfully, but its first native invocation launched no unit tests: the
+Simulator rejected the unit host as installing or uninstalling. The camera and banner UI checks
+passed. The second long-history return failed after UIKit continued decelerating from 122.67
+points away to the bottom; the retained pan log records a release velocity of -256.44 points per
+second despite the requested 0.5-second hold. The log does not establish why velocity remained,
+and records no automatic repositioning during that return. The second native invocation and
+signing did not run.
+
+Build 79 uses a 60-pixel-per-second test gesture, retaining both passes, distances, the stationary
+hold, all movement/reading-position assertions and final Jump/back/reopen checks. Application
+runtime is unchanged. Native tests now use a derivative of Xcode's generated `.xctestrun` plan
+with `UseDestinationArtifacts`, so XCTest uses the app and runner already installed on the
+selected Simulator. Generated environments and test selections remain intact; neither native
+invocation reinstalls the products. Installed-app visibility still does not prove FrontBoard
+readiness. Native build 79 validation and physical-device responsiveness remain unverified.
 
 ## App Store submission prerequisites
 

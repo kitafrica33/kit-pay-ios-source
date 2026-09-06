@@ -80,10 +80,25 @@ gestures, assertions, attachments and final Jump/back/reopen checks. It collects
 without timing or hitch measurements. The test inventory, early/remaining phase selectors and
 single compilation are unchanged; no test is skipped or marked as an expected failure.
 Physical touch responsiveness and scrolling hitches still require real-device acceptance and
-Instruments captures as documented in README.md. Native build 78 validation remains pending.
+Instruments captures as documented in README.md.
 
 Workflow conditions and native command selection are exercised by
 `test_ios_workflow_consolidation.py`. The tests check the target/screenshot-reuse
 matrix, no automatic triggers, early camera/banner checks, one test compilation,
 artifact-only upload, Linux processing, and real temporary signing-key validation.
 Run all cheap checks with `python3 -m unittest discover -s .github/scripts/tests`.
+
+Build 78 compiled but failed native validation: no unit cases launched because the Simulator
+reported the unit host busy installing/uninstalling, and the second long-history return coasted
+to latest after a nonzero native release velocity. The camera and banner UI tests passed;
+no second invocation, signing or upload occurred. This does not prove the cause of the Simulator
+installation state or of its retained velocity.
+
+Build 79 retains all functional scrolling assertions and slows only the synthetic reading drags
+to 60 pixels per second. It installs the compiled app and UI runner once per selected Simulator
+and uses Xcode's documented `UseDestinationArtifacts` plan fields for subsequent native and
+selected marketing invocations. The derivative remains beside the original generated plan so
+`__TESTROOT__` keeps its meaning; generated environments, destination, serial execution, both
+disjoint native selections and failure handling are preserved. No test retry, extra compilation,
+new Simulator or optional screenshot capture is added. Native and physical acceptance remain
+required.

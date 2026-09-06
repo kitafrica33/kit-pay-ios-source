@@ -5,13 +5,14 @@ import base64
 import json
 import os
 from pathlib import Path
-import plistlib
 import re
 import subprocess
 import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+
+from ios_native_test_fixture import write_native_products
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -140,17 +141,7 @@ with open(os.environ['KITPAY_TEST_COMMAND_LOG'], 'a') as f: f.write(json.dumps(s
 if os.environ.get('KITPAY_FAIL_FOCUSED') == '1' and any(a.startswith('-only-testing:KitPayTests/ConversationNativeOpeningTests') for a in sys.argv): sys.exit(65)
 """)
             executable.chmod(0o755)
-            products = root / "KitPay-quality-derived/Build/Products/Debug-iphonesimulator"
-            product_ids = {"KitPay.app": "africa.kit.pay.ios",
-                           "KitPayUITests-Runner.app": "africa.kit.pay.ios.uitests.xctrunner"}
-            for name, identifier in product_ids.items():
-                bundle = products / name
-                bundle.mkdir(parents=True)
-                (bundle / "Info.plist").write_bytes(plistlib.dumps({
-                    "CFBundleIdentifier": identifier, "CFBundleExecutable": "fixture",
-                    "CFBundleSupportedPlatforms": ["iPhoneSimulator"],
-                }))
-                (bundle / "fixture").write_bytes(b"fixture")
+            write_native_products(root)
             (root / "xcrun").write_text("""#!/usr/bin/env python3
 import json, os, sys
 from pathlib import Path
@@ -168,6 +159,11 @@ elif sys.argv[1:3] == ['simctl', 'get_app_container']:
             env = {**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"],
                    "RUNNER_TEMP": str(root), "KITPAY_TEST_DEVICE_ID": "fixture-device",
                    "KITPAY_TEST_COMMAND_LOG": str(log), "KITPAY_FAIL_FOCUSED": "1" if fail_focused else "0"}
+            if mode == "marketing-iphone":
+                # The real workflow prepares this same device before its two native invocations.
+                prepared = subprocess.run([sys.executable, str(SCRIPTS / "install_ios_test_products.py")],
+                                          env=env, text=True, capture_output=True)
+                self.assertEqual(prepared.returncode, 0, prepared.stderr)
             result = subprocess.run(["bash", str(SCRIPTS / "ios_native_build.sh"), mode],
                                     env=env, text=True, capture_output=True)
             calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
@@ -193,7 +189,14 @@ elif sys.argv[1:3] == ['simctl', 'get_app_container']:
         self.assertEqual(len(calls), 2)
         for call in calls:
             self.assertEqual(call[-1], "test-without-building")
-            self.assertIn("-disableAutomaticPackageResolution", call)
+            self.assertIn("-xctestrun", call)
+            self.assertTrue(call[call.index("-xctestrun") + 1].endswith("/KitPay-installed-tests.xctestrun"))
+            self.assertNotIn("-workspace", call)
+            self.assertNotIn("-project", call)
+            self.assertNotIn("-scheme", call)
+            self.assertEqual(call[call.index("-parallel-testing-enabled") + 1], "NO")
+        self.assertEqual(calls[0][calls[0].index("-xctestrun") + 1],
+                         calls[1][calls[1].index("-xctestrun") + 1])
         self.assertIn("-skip-testing:KitPayTests/ConversationNativeOpeningTests", calls[1])
         self.assertIn("-only-testing:KitPayUITests/CallLayoutUITests", calls[0])
         self.assertIn("-skip-testing:KitPayUITests/CallLayoutUITests", calls[1])
@@ -216,6 +219,8 @@ elif sys.argv[1:3] == ['simctl', 'get_app_container']:
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(len(calls), 1)
                 self.assertEqual(calls[0][-1], "test-without-building")
+                self.assertIn("-xctestrun", calls[0])
+                self.assertNotIn("-workspace", calls[0])
         _, calls = self.execute("marketing-iphone")
         self.assertIn("-only-testing:KitPayUITests/AppStoreScreenshotUITests/testCaptureAppStoreScreenshots", calls[0])
         _, calls = self.execute("marketing-ipad")

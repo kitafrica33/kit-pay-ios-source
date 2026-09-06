@@ -216,8 +216,10 @@ final class AppStoreScreenshotUITests: XCTestCase {
         var geometry = ["Synthetic workload: 100 conversations, 2,000 text messages, 300 primary rows.",
                         "Two functional drag passes and frame geometry; no timing or hitch measurements.",
                         "Simulator results do not establish physical-device latency."]
-        // These are deliberate drags to a reading position, not flicks. Give UIKit a
-        // stationary interval before lifting so residual velocity cannot finish the return.
+        // Build 78 retained native momentum after the requested stationary hold. Use a
+        // low input velocity so the partial return leaves room for UIKit's deceleration;
+        // keep the reading-position and idle-layout assertions unchanged.
+        let readingDragVelocity = XCUIGestureVelocity(rawValue: 60)
         let stationaryReleaseDuration: TimeInterval = 0.5
         // Preserve first-pass and repeated-state coverage independently of XCTest's
         // metric collector, which raised an internal exception in both builds 76 and 77.
@@ -240,7 +242,7 @@ final class AppStoreScreenshotUITests: XCTestCase {
             outgoing.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
                 .press(forDuration: 0.01, thenDragTo: app.coordinate(withNormalizedOffset: .zero)
                     .withOffset(CGVector(dx: olderDestination.x, dy: olderDestination.y)),
-                       withVelocity: .slow, thenHoldForDuration: stationaryReleaseDuration)
+                       withVelocity: readingDragVelocity, thenHoldForDuration: stationaryReleaseDuration)
             let outgoingAfter = outgoing.frame
             print("[KitPayLongHistoryGeometry] Outgoing before/after: \(outgoingBefore) -> \(outgoingAfter)")
             XCTAssertGreaterThan(outgoingAfter.minY - outgoingBefore.minY, distance * 0.5,
@@ -258,7 +260,7 @@ final class AppStoreScreenshotUITests: XCTestCase {
             incoming.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
                 .press(forDuration: 0.01, thenDragTo: app.coordinate(withNormalizedOffset: .zero)
                     .withOffset(CGVector(dx: newerDestination.x, dy: newerDestination.y)),
-                       withVelocity: .slow, thenHoldForDuration: stationaryReleaseDuration)
+                       withVelocity: readingDragVelocity, thenHoldForDuration: stationaryReleaseDuration)
             let incomingAfter = incoming.frame
             let dragGeometry = "Outgoing before/after: \(outgoingBefore) -> \(outgoingAfter)\n"
                 + "Incoming before/after: \(incomingBefore) -> \(incomingAfter)"
