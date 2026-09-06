@@ -42,10 +42,18 @@ excluded from the remaining phase, so this ordering adds no compilation or test 
 
 Build 73 stopped in this first phase after the long-history reading-position assertion failed.
 Its pan log ended away from the bottom, while later row frames returned to their opening positions;
-the evidence does not yet distinguish momentum from automatic positioning. Build 74 keeps the same
-workload, test inventory and assertions, holds each drag stationary for 0.5 seconds before finger lift,
-and retains intermediate geometry plus Debug fixture positioning logs for that distinction. Native
-validation of this follow-up remains required; no physical-device acceptance or latency result is claimed.
+the evidence does not yet distinguish momentum from automatic positioning. Build 74 retained the same
+workload, test inventory and assertions, added a 0.5-second stationary hold before finger lift, and
+retained intermediate geometry plus Debug fixture positioning logs. Its archive failed during fresh
+Simulator preparation: the 300-second bootstatus deadline expired after cold-boot data migration
+progressed to waiting for the system app. Compilation and native tests were skipped, so build 74
+produced no native result for the scrolling change.
+
+Build 75 raises only the initial bootstatus wait to 600 seconds. Fresh pinned iOS 26.5/iPhone 17 Pro
+creation, one boot sequence, successful readiness and all other 60-second simctl limits remain required.
+It retains build 74's native tests and adds static SwiftUI positioning logs only for the active Debug
+screenshot fixture; the bottom-scroll log also records its animation flag. Runtime scrolling anchors
+are unchanged. Native validation remains required; no physical-device acceptance or latency result is claimed.
 
 Workflow conditions and native command selection are exercised by
 `test_ios_workflow_consolidation.py`. The tests check the target/screenshot-reuse

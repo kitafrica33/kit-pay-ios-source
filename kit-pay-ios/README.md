@@ -256,11 +256,18 @@ remaining phase, so a navigation or scrolling failure stops validation sooner wi
 Build 73 passed exact-chat selection and both drag-movement assertions, then failed the partial-return
 reading-position check. The native pan ended 122.33 points from the bottom, but subsequent row frames
 matched their initial latest position. Residual momentum and automatic positioning remain possible
-causes; neither has been established. The build 74 follow-up holds the touch stationary for 0.5 seconds
-before release and retains intermediate frame geometry before assertions can fail. Debug fixture
-position logs help trace movement after release. All existing movement, latest-position, idle-stability,
-jump/reopen, camera and reply assertions remain required; this diagnostic change establishes no product
-fix or physical-device performance result.
+causes; neither has been established. Build 74 added a 0.5-second stationary hold before finger lift,
+intermediate frame geometry before assertions can fail, and Debug fixture position logs. Its archive
+failed before compilation or native tests when the fresh Simulator's cold-boot readiness wait reached
+300 seconds, after data migration progressed to waiting for the system app. There is no native build 74
+result for the scrolling change.
+
+Build 75 extends only that initial bootstatus wait to 600 seconds, preserving the fresh pinned
+Simulator, single boot sequence and other 60-second command limits. It retains build 74's scrolling
+workload, metrics and assertions, and adds Debug screenshot-fixture logs for explicit SwiftUI bottom
+and message-target positioning. Those logs contain static labels and the bottom-scroll animation flag;
+release scrolling behavior is unchanged. Native validation remains required; no product fix or
+physical-device performance result is established.
 
 ## App Store submission prerequisites
 

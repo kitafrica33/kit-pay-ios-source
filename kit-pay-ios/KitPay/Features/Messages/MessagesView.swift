@@ -2939,6 +2939,9 @@ struct ConversationView: View {
                     cancelCameraPull()
                     scrollInteraction.latestPositionPolicy.userDidChoosePosition(conversationID: conversation.id)
                     withAnimation(.easeOut(duration: 0.25)) {
+#if DEBUG && APP_STORE_SCREENSHOTS
+                        ConversationCameraPullDiagnostics.log("position SwiftUI explicit target")
+#endif
                         scrollProxy.scrollTo(
                             "message:\(target.uuidString.lowercased())",
                             anchor: .center
@@ -8625,6 +8628,9 @@ struct ConversationView: View {
     }
 
     private func scrollToBottom(using proxy: ScrollViewProxy, animated: Bool = true) {
+#if DEBUG && APP_STORE_SCREENSHOTS
+        ConversationCameraPullDiagnostics.log("position SwiftUI bottom animated=\(animated)")
+#endif
         cancelCameraPull()
         scrollInteraction.unseenIncomingCount = 0
         let position = {

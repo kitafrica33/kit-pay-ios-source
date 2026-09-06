@@ -46,7 +46,7 @@ class PrepareSimulatorTests(unittest.TestCase):
         self.assertIs(options["check"], True)
         arguments = command[2:]
         self.calls.append(arguments)
-        self.assertEqual(options["timeout"], 300 if arguments[0] == "bootstatus" else 60)
+        self.assertEqual(options["timeout"], 600 if arguments[0] == "bootstatus" else 60)
         if arguments[0] == self.timeout:
             raise subprocess.TimeoutExpired(command, options["timeout"])
         if arguments[0] == self.failure:
@@ -192,7 +192,7 @@ class PrepareSimulatorTests(unittest.TestCase):
                 self.calls.clear()
                 with self.assertRaises(subprocess.TimeoutExpired) as raised:
                     SIMULATOR.prepare(self.env)
-                self.assertEqual(raised.exception.timeout, 300 if command == "bootstatus" else 60)
+                self.assertEqual(raised.exception.timeout, 600 if command == "bootstatus" else 60)
                 self.assertEqual(self.calls[-1][0], command)
                 self.assertEqual(sum(call[0] == command for call in self.calls), 1)
                 if command in {"boot", "bootstatus"}:

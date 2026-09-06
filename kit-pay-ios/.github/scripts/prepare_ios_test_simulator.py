@@ -25,7 +25,7 @@ def simctl(*arguments, capture=False):
     return subprocess.run(
         ["xcrun", "simctl", *arguments], check=True, text=True,
         stdout=subprocess.PIPE if capture else None,
-        timeout=300 if arguments[0] == "bootstatus" else 60,
+        timeout=600 if arguments[0] == "bootstatus" else 60,
     ).stdout
 
 
