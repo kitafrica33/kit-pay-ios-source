@@ -253,6 +253,15 @@ select a different history. The first-open and reopened newest-row checks remain
 The long-history regression runs in the existing early native phase and is excluded from the
 remaining phase, so a navigation or scrolling failure stops validation sooner without duplicate tests.
 
+Build 73 passed exact-chat selection and both drag-movement assertions, then failed the partial-return
+reading-position check. The native pan ended 122.33 points from the bottom, but subsequent row frames
+matched their initial latest position. Residual momentum and automatic positioning remain possible
+causes; neither has been established. The build 74 follow-up holds the touch stationary for 0.5 seconds
+before release and retains intermediate frame geometry before assertions can fail. Debug fixture
+position logs help trace movement after release. All existing movement, latest-position, idle-stability,
+jump/reopen, camera and reply assertions remain required; this diagnostic change establishes no product
+fix or physical-device performance result.
+
 ## App Store submission prerequisites
 
 Complete these checks before submission; a green build alone does not establish release

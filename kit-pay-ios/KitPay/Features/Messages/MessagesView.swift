@@ -9100,6 +9100,17 @@ struct ConversationScrollPanReporter: UIViewRepresentable {
             let sample = NativeSample(scroll)
             let previous = previousNativeSample
             previousNativeSample = sample
+#if DEBUG && APP_STORE_SCREENSHOTS
+            if previous != sample {
+                ConversationCameraPullDiagnostics.log(
+                    "position sample native=\(ObjectIdentifier(scroll))"
+                        + " content=\(sample.geometry.contentHeight) viewport=\(sample.geometry.viewportHeight)"
+                        + " offset=\(sample.offset.y) rest=\(sample.geometry.bottomOffset)"
+                        + " pan=\(panIsActive) tracking=\(scroll.isTracking) dragging=\(scroll.isDragging)"
+                        + " decelerating=\(scroll.isDecelerating) applying=\(isApplyingPosition)"
+                )
+            }
+#endif
             guard !isApplyingPosition else { return }
 
             let originChanged = previous.map { $0.offset != sample.offset } ?? false
@@ -9158,6 +9169,12 @@ struct ConversationScrollPanReporter: UIViewRepresentable {
                 ), geometry.bottomOffset.isFinite else { return }
                 self.isApplyingPosition = true
                 if abs(scroll.contentOffset.y - geometry.bottomOffset) > 0.5 {
+#if DEBUG && APP_STORE_SCREENSHOTS
+                    ConversationCameraPullDiagnostics.log(
+                        "position apply kind=\(request.kind) native=\(ObjectIdentifier(scroll))"
+                            + " offset=\(scroll.contentOffset.y) target=\(geometry.bottomOffset)"
+                    )
+#endif
                     scroll.setContentOffset(
                         CGPoint(x: scroll.contentOffset.x, y: geometry.bottomOffset), animated: false
                     )
@@ -9239,6 +9256,15 @@ struct ConversationScrollPanReporter: UIViewRepresentable {
                     + " bottom=\(geometry.bottomInset) offset=\(scrollView.contentOffset.y)"
                     + " rest=\(geometry.bottomOffset) tx=\(translation.x) ty=\(translation.y)"
             )
+#if DEBUG && APP_STORE_SCREENSHOTS
+            if pan.state == .ended || pan.state == .cancelled || pan.state == .failed {
+                ConversationCameraPullDiagnostics.log(
+                    "pan release velocityY=\(pan.velocity(in: scrollView).y)"
+                        + " tracking=\(scrollView.isTracking) dragging=\(scrollView.isDragging)"
+                        + " decelerating=\(scrollView.isDecelerating)"
+                )
+            }
+#endif
             switch pan.state {
             case .began:
                 // Fence a queued opening callback before SwiftUI processes its State update.

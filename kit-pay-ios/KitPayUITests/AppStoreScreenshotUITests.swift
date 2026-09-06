@@ -219,6 +219,9 @@ final class AppStoreScreenshotUITests: XCTestCase {
         let options = XCTMeasureOptions()
         options.iterationCount = 1
         options.invocationOptions = [.manuallyStart]
+        // These are deliberate drags to a reading position, not flicks. Give UIKit a
+        // stationary interval before lifting so residual velocity cannot finish the return.
+        let stationaryReleaseDuration: TimeInterval = 0.5
         measure(metrics: [XCTOSSignpostMetric.scrollingAndDecelerationMetric], options: options) {
             // Also restore the starting position if XCTest performs a warm-up invocation.
             let jump = app.buttons["Jump to latest message"]
@@ -239,8 +242,9 @@ final class AppStoreScreenshotUITests: XCTestCase {
             outgoing.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
                 .press(forDuration: 0.01, thenDragTo: app.coordinate(withNormalizedOffset: .zero)
                     .withOffset(CGVector(dx: olderDestination.x, dy: olderDestination.y)),
-                       withVelocity: .slow, thenHoldForDuration: 0.1)
+                       withVelocity: .slow, thenHoldForDuration: stationaryReleaseDuration)
             let outgoingAfter = outgoing.frame
+            print("[KitPayLongHistoryGeometry] Outgoing before/after: \(outgoingBefore) -> \(outgoingAfter)")
             XCTAssertGreaterThan(outgoingAfter.minY - outgoingBefore.minY, distance * 0.5,
                                  "Dragging down from inside a bubble must reveal older messages")
             XCTAssertFalse(newest.isHittable, "Reading older messages must leave the latest position")
@@ -256,12 +260,24 @@ final class AppStoreScreenshotUITests: XCTestCase {
             incoming.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
                 .press(forDuration: 0.01, thenDragTo: app.coordinate(withNormalizedOffset: .zero)
                     .withOffset(CGVector(dx: newerDestination.x, dy: newerDestination.y)),
-                       withVelocity: .slow, thenHoldForDuration: 0.1)
+                       withVelocity: .slow, thenHoldForDuration: stationaryReleaseDuration)
             stopMeasuring()
 
             let incomingAfter = incoming.frame
+            let dragGeometry = "Outgoing before/after: \(outgoingBefore) -> \(outgoingAfter)\n"
+                + "Incoming before/after: \(incomingBefore) -> \(incomingAfter)"
+            print("[KitPayLongHistoryGeometry] Incoming before/after: \(incomingBefore) -> \(incomingAfter)")
+            // Retain the observed frames before assertions can abort this test.
+            let returnAttachment = XCTAttachment(string: dragGeometry)
+            returnAttachment.name = "long-history-scroll-after-return"
+            returnAttachment.lifetime = .keepAlways
+            add(returnAttachment)
             XCTAssertLessThan(incomingAfter.minY - incomingBefore.minY, -returnDistance * 0.5,
                               "Dragging up from inside a bubble must move back toward newer messages")
+            let distanceStillInHistory = (outgoingAfter.minY - outgoingBefore.minY)
+                - (incomingBefore.minY - incomingAfter.minY)
+            XCTAssertGreaterThan(distanceStillInHistory, 56,
+                                 "The stopped return must remain beyond the near-latest distance")
             XCTAssertFalse(app.buttons["Cancel reply"].exists, "Vertical scrolling must not select a reply")
             XCTAssertFalse(app.buttons["Close camera"].waitForExistence(timeout: 1),
                            "Ordinary history scrolling must not open the camera")

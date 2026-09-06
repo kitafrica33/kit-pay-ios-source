@@ -40,6 +40,13 @@ The focused native phase runs chat opening, pull-to-camera, long-history scrolli
 and call-banner layout before the remaining suite. A failure stops that run early. Each focused check is
 excluded from the remaining phase, so this ordering adds no compilation or test runs.
 
+Build 73 stopped in this first phase after the long-history reading-position assertion failed.
+Its pan log ended away from the bottom, while later row frames returned to their opening positions;
+the evidence does not yet distinguish momentum from automatic positioning. Build 74 keeps the same
+workload, test inventory and assertions, holds each drag stationary for 0.5 seconds before finger lift,
+and retains intermediate geometry plus Debug fixture positioning logs for that distinction. Native
+validation of this follow-up remains required; no physical-device acceptance or latency result is claimed.
+
 Workflow conditions and native command selection are exercised by
 `test_ios_workflow_consolidation.py`. The tests check the target/screenshot-reuse
 matrix, no automatic triggers, early camera/banner checks, one test compilation,
