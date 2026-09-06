@@ -36,8 +36,8 @@ workflow never recompiles them. Certificate import, both extension profiles, and
 all entitlement checks remain mandatory. Physical-device acceptance remains as
 documented in PARITY.md; Simulator evidence does not establish it.
 
-The focused native phase runs chat opening, pull-to-camera, and call-banner layout
-before the remaining suite. A failure stops that run early. Each focused check is
+The focused native phase runs chat opening, pull-to-camera, long-history scrolling,
+and call-banner layout before the remaining suite. A failure stops that run early. Each focused check is
 excluded from the remaining phase, so this ordering adds no compilation or test runs.
 
 Workflow conditions and native command selection are exercised by

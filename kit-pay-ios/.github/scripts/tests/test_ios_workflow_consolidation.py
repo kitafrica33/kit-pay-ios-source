@@ -198,6 +198,9 @@ elif sys.argv[1:3] == ['simctl', 'get_app_container']:
         self.assertIn("-only-testing:KitPayUITests/CallLayoutUITests", calls[0])
         self.assertIn("-skip-testing:KitPayUITests/CallLayoutUITests", calls[1])
         self.assertIn("-skip-testing:KitPayUITests/AppStoreScreenshotUITests/testCaptureAppStoreScreenshots", calls[1])
+        scrolling = "KitPayUITests/AppStoreScreenshotUITests/testLongHistoryVerticalBubbleDragsPreserveReadingPosition"
+        self.assertEqual(calls[0].count("-only-testing:" + scrolling), 1)
+        self.assertEqual(calls[1].count("-skip-testing:" + scrolling), 1)
         for test in (
             "testReceivedVideoPlaysToEndAndReplaysAfterParentFileCleanup",
             "testGalleryScrubbingRejectsInvalidTimesAndPreservesPauseIntent",

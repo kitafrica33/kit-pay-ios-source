@@ -332,6 +332,7 @@ struct MessagesView: View {
                 .padding(.bottom, RootTabBarLayoutPolicy.pageBottomPadding)
             }
             .rootTabBarScrollClearance()
+            .accessibilityIdentifier("conversation-list")
         }
     }
 
@@ -580,6 +581,7 @@ struct MessagesView: View {
                 chatRowContent(conversation, context: context)
             }
             .buttonStyle(.plain)
+            .accessibilityIdentifier("conversation-row:\(conversation.id.lowercased())")
             .accessibilityHint(
                 context.activeCallLabel == nil
                     ? "Opens this conversation"

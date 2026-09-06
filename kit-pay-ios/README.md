@@ -247,6 +247,11 @@ The opt-in `--kit-chat-long-history-scroll-fixture-v1` argument adds 100 convers
 synthetic text messages only when the Debug screenshot fixture is also enabled. Its UI regression
 drags from incoming and outgoing bubbles and records UIKit scrolling metrics in the existing
 native test run; it does not change the marketing fixture or create new store screenshots.
+Chat navigation in this regression selects the exact conversation UUID inside the chat list
+and verifies the opened profile control before measuring; repeated names on other tabs cannot
+select a different history. The first-open and reopened newest-row checks remain mandatory.
+The long-history regression runs in the existing early native phase and is excluded from the
+remaining phase, so a navigation or scrolling failure stops validation sooner without duplicate tests.
 
 ## App Store submission prerequisites
 

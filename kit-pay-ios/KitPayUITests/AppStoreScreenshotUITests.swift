@@ -5,6 +5,7 @@ import XCTest
 final class AppStoreScreenshotUITests: XCTestCase {
     private let fixtureArgument = "--kit-app-store-screenshot-fixture-v1"
     private let fixtureContactName = "Amina Demo"
+    private let fixtureConversationID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
     override func setUp() {
         super.setUp()
@@ -205,9 +206,7 @@ final class AppStoreScreenshotUITests: XCTestCase {
         app.launch()
         require(app.staticTexts["Wallet balance"], in: app, message: "Long-history fixture did not load")
         tap(app.buttons["Messages"], in: app, message: "Messages tab is unavailable")
-        let conversation = app.staticTexts[fixtureContactName].firstMatch
-        require(conversation, in: app, message: "Long-history conversation is missing")
-        conversation.tap()
+        openFixtureConversation(in: app)
         let timeline = app.scrollViews["conversation-timeline"]
         require(timeline, in: app, message: "Long-history timeline did not appear")
         let newest = timeline.staticTexts["Long history 300"].firstMatch
@@ -282,13 +281,47 @@ final class AppStoreScreenshotUITests: XCTestCase {
         XCTAssertTrue(newest.isHittable, "Jump to latest must reveal row 300")
         tap(app.navigationBars.buttons.element(boundBy: 0), in: app, message: "Chat has no back button")
         require(app.navigationBars["Chats"], in: app, message: "Chats did not return")
-        let reopenedConversation = app.staticTexts[fixtureContactName].firstMatch
-        require(reopenedConversation, in: app, message: "Long-history conversation disappeared")
-        reopenedConversation.tap()
+        openFixtureConversation(in: app)
         require(newest, in: app, message: "Newest row is missing after reopening")
         XCTAssertTrue(newest.isHittable, "Reopening long history must preserve latest-message opening")
         XCTAssertFalse(app.buttons["Cancel reply"].exists)
         XCTAssertFalse(app.buttons["Close camera"].exists)
+    }
+
+    private func openFixtureConversation(in app: XCUIApplication) {
+        require(app.navigationBars["Chats"], in: app, message: "Chats did not open")
+        let lists = app.scrollViews.matching(identifier: "conversation-list")
+        let list = lists.firstMatch
+        require(list, in: app, message: "Conversation list is missing")
+        XCTAssertEqual(lists.count, 1, "The conversation list must be unique")
+
+        // Inactive tabs can still appear in XCTest's hierarchy. Select the navigation Button
+        // by conversation identity inside the chat list, never a global display-name match.
+        let rows = list.buttons.matching(identifier: "conversation-row:\(fixtureConversationID)")
+        let row = rows.firstMatch
+        requireHittable(row, in: app, message: "The primary fixture conversation is not tappable")
+        XCTAssertEqual(rows.count, 1, "The primary fixture conversation row must be unique")
+        require(row.staticTexts[fixtureContactName], in: app,
+                message: "The primary fixture conversation has an unexpected title")
+        row.tap()
+
+        requireHittable(
+            app.navigationBars.buttons["Open \(fixtureContactName)'s profile"].firstMatch,
+            in: app,
+            message: "Navigation did not open the primary fixture conversation"
+        )
+    }
+
+    private func requireHittable(_ element: XCUIElement, in app: XCUIApplication, message: String) {
+        let ready = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == true AND hittable == true"),
+            object: element
+        )
+        guard XCTWaiter.wait(for: [ready], timeout: 30) == .completed else {
+            retainHierarchy(app, named: "fixture-conversation-navigation-failure")
+            XCTFail(message)
+            return
+        }
     }
 
     private func tap(
