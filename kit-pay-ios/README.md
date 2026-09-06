@@ -314,7 +314,19 @@ runtime is unchanged. Native tests now use a derivative of Xcode's generated `.x
 with `UseDestinationArtifacts`, so XCTest uses the app and runner already installed on the
 selected Simulator. Generated environments and test selections remain intact; neither native
 invocation reinstalls the products. Installed-app visibility still does not prove FrontBoard
-readiness. Native build 79 validation and physical-device responsiveness remain unverified.
+readiness. Build 79 compiled, but Xcode 26.6 rejected both native targets before any test case:
+`UseDestinationArtifacts` requires a physical iOS device and is unsupported on Simulator.
+Neither signing nor upload ran.
+
+Build 80 validates and uses the original generated `.xctestrun` without changing its contents.
+XCTest owns Simulator installation and launch; the workflow performs no manual app or runner
+installs. After the first native group succeeds, it observes the installed identities and grants
+Contacts before the real-launch tests in the second group. Unit hosts and the first group's UI
+fixtures already suppress that prompt. The selected marketing fixture also needs no manual
+Contacts grant. Both disjoint serial test groups, one compilation, the selected Simulator, and
+all build 79 scrolling gestures/assertions remain unchanged. This removes manual installation
+overlap; it does not establish the cause of build 78's Busy error. Native build 80 validation and
+physical-device responsiveness remain unverified.
 
 ## App Store submission prerequisites
 
@@ -362,12 +374,13 @@ not signing material or compiled app products.
 
 When new screenshots are not needed, native validation uses one clean iPhone 17
 Pro Simulator on the pinned iOS 26.5 (23F77) runtime; new screenshot runs reuse
-their required iPhone 14 Plus. After one compilation, it installs the existing app and UI test
-runner and checks their installed-app entries and containers before XCTest starts.
-Registration checks have a deadline and never reinstall or rerun failed tests.
-These entries do not prove FrontBoard launch readiness; successful UI execution
-remains required. Preparation and registration receipts are retained with native
-evidence, and cleanup deletes only Simulators created by this run. When new
+their required iPhone 14 Plus. After one compilation, the workflow validates the original
+generated test plan and compiled products, then lets XCTest install and launch them.
+After the first native group succeeds, it checks installed-app entries and containers and
+grants Contacts before the remaining real-launch tests. Registration checks have a deadline;
+there are no manual installs or failed-test retries. These entries do not prove FrontBoard
+launch readiness; successful UI execution remains required. Preparation and registration
+receipts are retained with native evidence, and cleanup deletes only Simulators created by this run. When new
 marketing screenshots are requested, the iPad runs only screenshot capture using
 the existing compiled products.
 

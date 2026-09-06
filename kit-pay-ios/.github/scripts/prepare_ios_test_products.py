@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
-"""Install existing products once and prepare XCTest to reuse those installations.
+"""Validate compiled products and observe XCTest-owned Simulator installations.
 
-This checks installed-app visibility, not FrontBoard launch readiness. XCTest
-remains responsible for launching the runner; tests and installs are never retried.
+Preparation never installs or launches an app and never rewrites Xcode's plan.
+After the first native invocation succeeds, registration observes visibility and
+grants Contacts for the remaining real-app launch tests. Visibility alone does
+not prove FrontBoard readiness or native test success.
 """
 from __future__ import annotations
 
-import copy
 import hashlib
 import json
 import os
 from pathlib import Path
 import plistlib
 import subprocess
+import sys
 import time
 
 
@@ -24,7 +26,6 @@ TEST_TARGETS = {
     "KitPayTests": ("KitPay.app", "africa.kit.pay.ios.tests"),
     "KitPayUITests": ("KitPayUITests-Runner.app", "africa.kit.pay.ios.uitests"),
 }
-DESTINATION_RUN = "KitPay-installed-tests.xctestrun"
 
 
 def validate_bundle(bundle: Path, identifier: str):
@@ -43,14 +44,9 @@ def validate_bundle(bundle: Path, identifier: str):
     return executable
 
 
-def destination_test_run(products_root: Path):
-    """Derive a sibling plan using the documented xcodebuild.xctestrun(5) fields.
-
-    Keep the generated file and its __TESTROOT__ unchanged. UseDestinationArtifacts
-    prevents xcodebuild from installing either test host again during testing.
-    """
-    destination = products_root / DESTINATION_RUN
-    generated = [path for path in products_root.glob("*.xctestrun") if path != destination]
+def generated_test_run(products_root: Path):
+    """Validate the original generated plan without changing any of its bytes."""
+    generated = list(products_root.glob("*.xctestrun"))
     if (len(generated) != 1 or not generated[0].is_file() or generated[0].is_symlink()
             or not 0 < generated[0].stat().st_size <= 4 * 1024 * 1024):
         raise RuntimeError("Exactly one generated XCTest run configuration is required")
@@ -74,9 +70,8 @@ def destination_test_run(products_root: Path):
             or sorted(target.get("BlueprintName", "") for target in targets) != sorted(TEST_TARGETS)):
         raise RuntimeError("Expected exactly the KitPay unit and UI test targets")
 
-    derived = copy.deepcopy(plan)
     target_bindings = {}
-    for target in derived["TestConfigurations"][0]["TestTargets"]:
+    for target in targets:
         name = target["BlueprintName"]
         host_name, _ = TEST_TARGETS[name]
         host = products_root / "Debug-iphonesimulator" / host_name
@@ -86,51 +81,42 @@ def destination_test_run(products_root: Path):
 
         def require_path(key, *expected, optional=False):
             if optional and key not in target:
-                return
+                return None
             value = target.get(key)
             if not isinstance(value, str):
                 raise RuntimeError("Missing generated " + key + " for " + name)
             expanded = value.replace("__TESTROOT__", str(products_root)).replace("__TESTHOST__", str(host))
-            if Path(expanded).resolve() not in {path.resolve() for path in expected}:
+            resolved = Path(expanded).resolve()
+            if resolved not in {path.resolve() for path in expected}:
                 raise RuntimeError("Unexpected generated " + key + " for " + name)
+            return str(resolved)
 
-        require_path("TestHostPath", host, host_executable)
-        require_path("TestBundlePath", bundle)
-        require_path("UITargetAppPath", app, optional=name == "KitPayTests")
+        host_path = require_path("TestHostPath", host, host_executable)
+        bundle_path = require_path("TestBundlePath", bundle)
+        ui_app_path = require_path("UITargetAppPath", app, optional=name == "KitPayTests")
         environment = target.get("TestingEnvironmentVariables")
         if (not isinstance(environment, dict)
                 or any(not isinstance(key, str) or not isinstance(value, str)
                        for key, value in environment.items())):
             raise RuntimeError("Missing generated testing environment for " + name)
         if target.get("UseDestinationArtifacts", False) is not False:
-            raise RuntimeError("Expected an unmodified generated XCTest target")
+            raise RuntimeError("UseDestinationArtifacts is unsupported for Simulator tests")
         bindings = {
-            "UseDestinationArtifacts": True,
+            "UseDestinationArtifacts": False,
             "TestHostBundleIdentifier": PRODUCTS[host_name],
-            "TestBundleDestinationRelativePath": "__TESTHOST__/PlugIns/" + name + ".xctest",
+            "TestHostPath": host_path,
+            "TestBundlePath": bundle_path,
             "UITargetAppBundleIdentifier": PRODUCTS["KitPay.app"],
         }
         for key in ("TestHostBundleIdentifier", "UITargetAppBundleIdentifier"):
             if key in target and target[key] != bindings[key]:
                 raise RuntimeError("Unexpected generated " + key + " for " + name)
-        for key in ("TestBundlePath", "TestHostPath", "UITargetAppPath"):
-            target.pop(key, None)
-        target.update(bindings)
+        if ui_app_path is not None:
+            bindings["UITargetAppPath"] = ui_app_path
         target_bindings[name] = bindings
 
-    prepared = plistlib.dumps(derived, sort_keys=False)
-    if destination.exists() or destination.is_symlink():
-        if (not destination.is_file() or destination.is_symlink()
-                or destination.stat().st_size != len(prepared)
-                or destination.read_bytes() != prepared):
-            raise RuntimeError("Existing installed-product XCTest configuration does not match")
-    else:
-        with destination.open("xb") as stream:
-            stream.write(prepared)
-        destination.chmod(0o600)
     return {
         "generatedPath": str(source), "generatedSHA256": hashlib.sha256(original).hexdigest(),
-        "preparedPath": str(destination), "preparedSHA256": hashlib.sha256(prepared).hexdigest(),
         "targets": target_bindings,
     }
 
@@ -140,35 +126,81 @@ def checked(arguments, *, data=None, timeout=90):
                           timeout=timeout).stdout
 
 
-def prepare(device: str, runner_temp: Path, *, clock=time.monotonic, pause=time.sleep):
+def validate(runner_temp: Path):
     products = runner_temp / "KitPay-quality-derived/Build/Products/Debug-iphonesimulator"
     selected = []
     for name, identifier in PRODUCTS.items():
         bundle = products / name
-        validate_bundle(bundle, identifier)
-        selected.append((bundle, identifier))
+        executable = validate_bundle(bundle, identifier)
+        selected.append({"bundleId": identifier, "source": str(bundle), "executable": executable})
     for name, (host_name, identifier) in TEST_TARGETS.items():
-        validate_bundle(products / host_name / "PlugIns" / (name + ".xctest"), identifier)
+        bundle = products / host_name / "PlugIns" / (name + ".xctest")
+        executable = validate_bundle(bundle, identifier)
+        selected.append({"bundleId": identifier, "source": str(bundle), "executable": executable})
+    return selected, generated_test_run(products.parent)
 
-    receipt = runner_temp / ("KitPay-test-product-registration-" + device + ".json")
-    evidence = {"deviceId": device, "installs": [], "observations": [],
-                "installedApplicationsVisible": False, "frontBoardReadinessProven": False,
-                "testInvocations": 0}
-    # A failed or completed preparation for this device must never trigger another install.
+
+def receipt_path(device: str, runner_temp: Path):
+    return runner_temp / ("KitPay-test-product-registration-" + device + ".json")
+
+
+def retain_failure(evidence, error, phase):
+    failure = {"type": type(error).__name__, "message": str(error)[:4096]}
+    if isinstance(error, (subprocess.CalledProcessError, subprocess.TimeoutExpired)):
+        failure["command"] = error.cmd
+        failure["returnCode"] = getattr(error, "returncode", None)
+        failure["timeoutSeconds"] = getattr(error, "timeout", None)
+        for key in ("stdout", "stderr"):
+            value = getattr(error, key, None)
+            if isinstance(value, bytes):
+                value = value.decode(errors="replace")
+            if isinstance(value, str):
+                failure[key] = value[-4096:]
+    evidence["phase"] = phase
+    evidence["failure"] = failure
+
+
+def prepare(device: str, runner_temp: Path):
+    receipt = receipt_path(device, runner_temp)
+    evidence = {"deviceId": device, "installationOwner": "xcodebuild", "phase": "preparing",
+                "products": [], "observations": [], "installedApplicationsVisible": False,
+                "frontBoardReadinessProven": False}
+    # A failed or completed preparation for this device must never be repeated.
     with receipt.open("x") as stream:
         stream.write(json.dumps(evidence, indent=2) + "\n")
     receipt.chmod(0o600)
+    try:
+        evidence["products"], evidence["testRunConfiguration"] = validate(runner_temp)
+        evidence["phase"] = "prepared"
+    except Exception as error:
+        retain_failure(evidence, error, "preparation-failed")
+        raise
+    finally:
+        receipt.write_text(json.dumps(evidence, indent=2) + "\n")
+    return evidence
+
+
+def register_after_first_native(device: str, runner_temp: Path, *, clock=time.monotonic, pause=time.sleep):
+    receipt = receipt_path(device, runner_temp)
+    if (not receipt.is_file() or receipt.is_symlink() or not 0 < receipt.stat().st_size <= 256 * 1024):
+        raise RuntimeError("The native preparation receipt is missing or unexpected")
+    evidence = json.loads(receipt.read_text())
+    if (not isinstance(evidence, dict) or evidence.get("deviceId") != device
+            or evidence.get("installationOwner") != "xcodebuild" or evidence.get("phase") != "prepared"
+            or evidence.get("observations") != [] or evidence.get("installedApplicationsVisible") is not False
+            or evidence.get("frontBoardReadinessProven") is not False or "failure" in evidence
+            or "contactsPermissionGranted" in evidence):
+        raise RuntimeError("Registration requires one successful, unused native preparation")
 
     def retain():
         receipt.write_text(json.dumps(evidence, indent=2) + "\n")
 
     try:
-        evidence["testRunConfiguration"] = destination_test_run(products.parent)
+        selected, configuration = validate(runner_temp)
+        if evidence.get("products") != selected or evidence.get("testRunConfiguration") != configuration:
+            raise RuntimeError("Compiled product bindings or generated XCTest configuration changed after preparation")
+        evidence["phase"] = "registering-after-first-native"
         retain()
-        for bundle, identifier in selected:
-            checked(["xcrun", "simctl", "install", device, str(bundle)])
-            evidence["installs"].append({"bundleId": identifier, "source": str(bundle)})
-            retain()
         deadline = clock() + 30
 
         def query(arguments, *, data=None):
@@ -183,7 +215,7 @@ def prepare(device: str, runner_temp: Path, *, clock=time.monotonic, pause=time.
             if not isinstance(apps, dict):
                 raise RuntimeError("Simulator installed-app listing is not an object")
             observation = {}
-            for _, identifier in selected:
+            for identifier in PRODUCTS.values():
                 attributes = apps.get(identifier)
                 details = ({key: attributes.get(key) for key in
                             ("CFBundleIdentifier", "ApplicationType", "IsPlaceholder", "Path", "Bundle")}
@@ -205,31 +237,31 @@ def prepare(device: str, runner_temp: Path, *, clock=time.monotonic, pause=time.
             evidence["installedApplicationsVisible"] = all(item["visible"] for item in observation.values())
             retain()
             if evidence["installedApplicationsVisible"]:
-                # The real app must be installed before assigning its Contacts permission.
+                # The first native invocation has let XCTest install and launch the app.
+                # The second invocation includes real AppLaunchUITests without the fixture.
                 checked(["xcrun", "simctl", "privacy", device, "grant", "contacts", "africa.kit.pay.ios"])
                 evidence["contactsPermissionGranted"] = True
+                evidence["phase"] = "contacts-ready"
                 retain()
-                print("Existing app and UI test runner are installed and visible on the selected Simulator.")
+                print("XCTest-installed app and runner are visible; Contacts is granted for the remaining native tests.")
                 return evidence
             if clock() >= deadline:
                 raise RuntimeError("Simulator application registration did not become visible within 30 seconds")
             pause(1)
     except Exception as error:
-        failure = {"type": type(error).__name__, "message": str(error)[:4096]}
-        if isinstance(error, (subprocess.CalledProcessError, subprocess.TimeoutExpired)):
-            failure["command"] = error.cmd
-            failure["returnCode"] = getattr(error, "returncode", None)
-            failure["timeoutSeconds"] = getattr(error, "timeout", None)
-            for key in ("stdout", "stderr"):
-                value = getattr(error, key, None)
-                if isinstance(value, bytes):
-                    value = value.decode(errors="replace")
-                if isinstance(value, str):
-                    failure[key] = value[-4096:]
-        evidence["failure"] = failure
+        retain_failure(evidence, error, "registration-failed")
         retain()
         raise
 
 
 if __name__ == "__main__":
-    prepare(os.environ["KITPAY_TEST_DEVICE_ID"], Path(os.environ["RUNNER_TEMP"]))
+    mode = sys.argv[1] if len(sys.argv) == 2 else ""
+    root = Path(os.environ["RUNNER_TEMP"])
+    if mode == "prepare":
+        print(prepare(os.environ["KITPAY_TEST_DEVICE_ID"], root)["testRunConfiguration"]["generatedPath"])
+    elif mode == "validate":
+        print(validate(root)[1]["generatedPath"])
+    elif mode == "register":
+        register_after_first_native(os.environ["KITPAY_TEST_DEVICE_ID"], root)
+    else:
+        raise SystemExit("Select prepare, validate, or register")

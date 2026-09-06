@@ -5,6 +5,7 @@ import base64
 import json
 import os
 from pathlib import Path
+import plistlib
 import re
 import subprocess
 import sys
@@ -131,26 +132,39 @@ if os.environ['KITPAY_CHANGE_PIN'] == '1':
                 self.assertEqual(result.returncode == 0, not mutate, result.stderr)
                 self.assertEqual(json.loads(source.read_text()), payload)
 
-    def execute(self, mode, *, fail_focused=False):
+    def execute(self, mode, *, fail_focused=False, fail_contacts=False, unsupported_mode=False):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             executable = root / "xcodebuild"
             executable.write_text("""#!/usr/bin/env python3
 import json, os, sys
-with open(os.environ['KITPAY_TEST_COMMAND_LOG'], 'a') as f: f.write(json.dumps(sys.argv[1:])+'\\n')
+from pathlib import Path
+with open(os.environ['KITPAY_TEST_COMMAND_LOG'], 'a') as f: f.write(json.dumps(['xcodebuild', *sys.argv[1:]])+'\\n')
 if os.environ.get('KITPAY_FAIL_FOCUSED') == '1' and any(a.startswith('-only-testing:KitPayTests/ConversationNativeOpeningTests') for a in sys.argv): sys.exit(65)
+if 'test-without-building' in sys.argv:
+    (Path(os.environ['RUNNER_TEMP']) / 'xctest-installed-apps').write_text('installed by XCTest')
 """)
             executable.chmod(0o755)
-            write_native_products(root)
+            generated, plan = write_native_products(root, generated_name="Original-Xcode-Generated-Plan.xctestrun")
+            if unsupported_mode:
+                plan["TestConfigurations"][0]["TestTargets"][0]["UseDestinationArtifacts"] = True
+                generated.write_bytes(plistlib.dumps(plan))
+            original = generated.read_bytes()
+            previous = generated.stat().st_mtime_ns
             (root / "xcrun").write_text("""#!/usr/bin/env python3
 import json, os, sys
 from pathlib import Path
+with open(os.environ['KITPAY_TEST_COMMAND_LOG'], 'a') as f: f.write(json.dumps(['xcrun', *sys.argv[1:]])+'\\n')
+if sys.argv[1:3] in (['simctl', 'listapps'], ['simctl', 'privacy']):
+    if not (Path(os.environ['RUNNER_TEMP']) / 'xctest-installed-apps').is_file(): sys.exit(73)
 if sys.argv[1:3] == ['simctl', 'listapps']:
     print(json.dumps({identifier: {'CFBundleIdentifier': identifier, 'ApplicationType': 'User',
         'Path': str(Path(os.environ['RUNNER_TEMP']) / 'installed' / identifier)}
         for identifier in ('africa.kit.pay.ios', 'africa.kit.pay.ios.uitests.xctrunner')}))
 elif sys.argv[1:3] == ['simctl', 'get_app_container']:
     print(Path(os.environ['RUNNER_TEMP']) / 'installed' / sys.argv[4])
+elif sys.argv[1:3] == ['simctl', 'privacy'] and os.environ.get('KITPAY_FAIL_CONTACTS') == '1':
+    sys.exit(74)
 """)
             (root / "xcrun").chmod(0o755)
             (root / "plutil").write_text("#!/usr/bin/env python3\nimport sys\nsys.stdout.buffer.write(sys.stdin.buffer.read())\n")
@@ -158,45 +172,77 @@ elif sys.argv[1:3] == ['simctl', 'get_app_container']:
             log = root / "commands.jsonl"
             env = {**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"],
                    "RUNNER_TEMP": str(root), "KITPAY_TEST_DEVICE_ID": "fixture-device",
-                   "KITPAY_TEST_COMMAND_LOG": str(log), "KITPAY_FAIL_FOCUSED": "1" if fail_focused else "0"}
-            if mode == "marketing-iphone":
-                # The real workflow prepares this same device before its two native invocations.
-                prepared = subprocess.run([sys.executable, str(SCRIPTS / "install_ios_test_products.py")],
-                                          env=env, text=True, capture_output=True)
-                self.assertEqual(prepared.returncode, 0, prepared.stderr)
+                   "KITPAY_TEST_COMMAND_LOG": str(log), "KITPAY_FAIL_FOCUSED": "1" if fail_focused else "0",
+                   "KITPAY_FAIL_CONTACTS": "1" if fail_contacts else "0"}
             result = subprocess.run(["bash", str(SCRIPTS / "ios_native_build.sh"), mode],
                                     env=env, text=True, capture_output=True)
-            calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
-            return result, calls
+            actions = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+            calls = [action[1:] for action in actions if action[0] == "xcodebuild"]
+            receipt = root / "KitPay-test-product-registration-fixture-device.json"
+            registration = json.loads(receipt.read_text()) if receipt.exists() else None
+            self.assertEqual(generated.read_bytes(), original)
+            self.assertEqual(generated.stat().st_mtime_ns, previous)
+            self.assertEqual(list(generated.parent.glob("*.xctestrun")), [generated])
+            self.assertFalse(any(action[:3] == ["xcrun", "simctl", "install"] for action in actions))
+            return result, calls, actions, registration
 
     def test_test_products_compile_once_and_keep_keychain_entitlements(self):
-        result, calls = self.execute("build")
+        result, calls, actions, registration = self.execute("build")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][-1], "build-for-testing")
         self.assertIn("CODE_SIGN_IDENTITY=-", calls[0])
         self.assertIn("ONLY_ACTIVE_ARCH=YES", calls[0])
         self.assertIn("-disableAutomaticPackageResolution", calls[0])
+        self.assertEqual(len(actions), 1)
+        self.assertIsNone(registration)
 
     def test_focused_failure_stops_remaining_tests(self):
-        result, calls = self.execute("test", fail_focused=True)
+        result, calls, actions, registration = self.execute("test", fail_focused=True)
         self.assertEqual(result.returncode, 65)
         self.assertEqual(len(calls), 1)
+        self.assertEqual(registration["phase"], "prepared")
+        self.assertEqual(registration["observations"], [])
+        self.assertFalse(any(action[:3] == ["xcrun", "simctl", "privacy"] for action in actions))
+
+    def test_contacts_failure_stops_remaining_tests(self):
+        result, calls, actions, registration = self.execute("test", fail_contacts=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(registration["phase"], "registration-failed")
+        self.assertEqual(sum(action[:3] == ["xcrun", "simctl", "privacy"] for action in actions), 1)
+
+    def test_unsupported_destination_artifacts_stop_before_native_invocation(self):
+        result, calls, actions, registration = self.execute("test", unsupported_mode=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(actions, [])
+        self.assertEqual(calls, [])
+        self.assertEqual(registration["phase"], "preparation-failed")
 
     def test_focused_and_remaining_tests_reuse_the_same_products(self):
-        result, calls = self.execute("test")
+        result, calls, actions, registration = self.execute("test")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(calls), 2)
         for call in calls:
             self.assertEqual(call[-1], "test-without-building")
             self.assertIn("-xctestrun", call)
-            self.assertTrue(call[call.index("-xctestrun") + 1].endswith("/KitPay-installed-tests.xctestrun"))
+            self.assertTrue(call[call.index("-xctestrun") + 1].endswith("/Original-Xcode-Generated-Plan.xctestrun"))
             self.assertNotIn("-workspace", call)
             self.assertNotIn("-project", call)
             self.assertNotIn("-scheme", call)
             self.assertEqual(call[call.index("-parallel-testing-enabled") + 1], "NO")
         self.assertEqual(calls[0][calls[0].index("-xctestrun") + 1],
                          calls[1][calls[1].index("-xctestrun") + 1])
+        native_indices = [index for index, action in enumerate(actions) if action[0] == "xcodebuild"]
+        privacy_indices = [index for index, action in enumerate(actions)
+                           if action[:3] == ["xcrun", "simctl", "privacy"]]
+        self.assertEqual(len(privacy_indices), 1)
+        self.assertLess(native_indices[0], privacy_indices[0])
+        self.assertLess(privacy_indices[0], native_indices[1])
+        self.assertEqual(actions[privacy_indices[0]][3:],
+                         ["fixture-device", "grant", "contacts", "africa.kit.pay.ios"])
+        self.assertEqual(registration["phase"], "contacts-ready")
+        self.assertEqual(registration["installationOwner"], "xcodebuild")
         self.assertIn("-skip-testing:KitPayTests/ConversationNativeOpeningTests", calls[1])
         self.assertIn("-only-testing:KitPayUITests/CallLayoutUITests", calls[0])
         self.assertIn("-skip-testing:KitPayUITests/CallLayoutUITests", calls[1])
@@ -215,17 +261,16 @@ elif sys.argv[1:3] == ['simctl', 'get_app_container']:
     def test_both_marketing_devices_use_existing_products(self):
         for mode in ("marketing-iphone", "marketing-ipad"):
             with self.subTest(mode=mode):
-                result, calls = self.execute(mode)
+                result, calls, actions, registration = self.execute(mode)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(len(calls), 1)
                 self.assertEqual(calls[0][-1], "test-without-building")
                 self.assertIn("-xctestrun", calls[0])
                 self.assertNotIn("-workspace", calls[0])
-        _, calls = self.execute("marketing-iphone")
-        self.assertIn("-only-testing:KitPayUITests/AppStoreScreenshotUITests/testCaptureAppStoreScreenshots", calls[0])
-        _, calls = self.execute("marketing-ipad")
-        self.assertIn("-only-testing:KitPayUITests/AppStoreScreenshotUITests/testCaptureAppStoreScreenshots", calls[0])
-        self.assertNotIn("-only-testing:KitPayUITests/AppStoreScreenshotUITests", calls[0])
+                self.assertIn("-only-testing:KitPayUITests/AppStoreScreenshotUITests/testCaptureAppStoreScreenshots", calls[0])
+                self.assertNotIn("-only-testing:KitPayUITests/AppStoreScreenshotUITests", calls[0])
+                self.assertEqual(len(actions), 1)
+                self.assertIsNone(registration)
 
 
 class ReadinessTests(unittest.TestCase):

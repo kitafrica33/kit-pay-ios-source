@@ -3,7 +3,7 @@ from pathlib import Path
 import plistlib
 
 
-def write_native_products(runner_temp: Path):
+def write_native_products(runner_temp: Path, *, generated_name="KitPay_iphonesimulator26.5-arm64.xctestrun"):
     products_root = runner_temp / "KitPay-quality-derived/Build/Products"
     products = products_root / "Debug-iphonesimulator"
     identities = {
@@ -45,6 +45,6 @@ def write_native_products(runner_temp: Path):
         "TestConfigurations": [{"Name": "Default", "IsEnabled": True, "TestTargets": targets}],
         "CodeCoverageBuildableInfos": [{"Name": "KitPay", "IncludeInReport": True}],
     }
-    generated = products_root / "KitPay_iphonesimulator26.5-arm64.xctestrun"
+    generated = products_root / generated_name
     generated.write_bytes(plistlib.dumps(plan))
     return generated, plan

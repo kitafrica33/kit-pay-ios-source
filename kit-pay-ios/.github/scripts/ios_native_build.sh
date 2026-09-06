@@ -15,19 +15,22 @@ common=(
   ONLY_ACTIVE_ARCH=YES SWIFT_ENABLE_EXPLICIT_MODULES=NO
   CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual PROVISIONING_PROFILE_SPECIFIER= DEVELOPMENT_TEAM=
 )
-installed_test_run="$RUNNER_TEMP/KitPay-quality-derived/Build/Products/KitPay-installed-tests.xctestrun"
-test_common=(
-  -xctestrun "$installed_test_run"
-  -destination "platform=iOS Simulator,id=$KITPAY_TEST_DEVICE_ID,arch=arm64"
-  -parallel-testing-enabled NO
-)
+select_test_run() {
+  local generated_test_run
+  generated_test_run="$(python3 .github/scripts/prepare_ios_test_products.py "$1")"
+  test_common=(
+    -xctestrun "$generated_test_run"
+    -destination "platform=iOS Simulator,id=$KITPAY_TEST_DEVICE_ID,arch=arm64"
+    -parallel-testing-enabled NO
+  )
+}
 
 case "$mode" in
   build)
     xcodebuild "${common[@]}" build-for-testing
     ;;
   test)
-    python3 .github/scripts/install_ios_test_products.py
+    select_test_run prepare
     xcrun simctl spawn "$KITPAY_TEST_DEVICE_ID" log stream \
       --style compact --level debug \
       --predicate 'eventMessage CONTAINS "[KitPayCameraPull]"' \
@@ -43,6 +46,9 @@ case "$mode" in
       -only-testing:KitPayUITests/AppStoreScreenshotUITests/testLongHistoryVerticalBubbleDragsPreserveReadingPosition \
       -only-testing:KitPayUITests/CallLayoutUITests \
       test-without-building
+    # XCTest owns installation. The first invocation uses unit hosts and UI
+    # fixtures that skip Contacts; real AppLaunchUITests run in the second.
+    python3 .github/scripts/prepare_ios_test_products.py register
     xcodebuild "${test_common[@]}" \
       -resultBundlePath "$RUNNER_TEMP/KitPay-quality.xcresult" \
       -skip-testing:KitPayTests/ConversationNativeOpeningTests \
@@ -56,14 +62,13 @@ case "$mode" in
     ;;
   marketing-iphone)
     # This iPhone has already passed camera/opening and the complete native suite.
-    test -f "$installed_test_run"
-    test ! -L "$installed_test_run"
+    select_test_run validate
     xcodebuild "${test_common[@]}" -resultBundlePath "$RUNNER_TEMP/KitPay-iPhone.xcresult" \
       -only-testing:KitPayUITests/AppStoreScreenshotUITests/testCaptureAppStoreScreenshots \
       test-without-building
     ;;
   marketing-ipad)
-    python3 .github/scripts/install_ios_test_products.py
+    select_test_run validate
     xcodebuild "${test_common[@]}" -resultBundlePath "$RUNNER_TEMP/KitPay-iPad.xcresult" \
       -only-testing:KitPayUITests/AppStoreScreenshotUITests/testCaptureAppStoreScreenshots \
       test-without-building

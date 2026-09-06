@@ -102,3 +102,13 @@ selected marketing invocations. The derivative remains beside the original gener
 disjoint native selections and failure handling are preserved. No test retry, extra compilation,
 new Simulator or optional screenshot capture is added. Native and physical acceptance remain
 required.
+
+Build 79 compiled, then Xcode rejected both targets because `UseDestinationArtifacts` requires
+an iOS device and cannot be used with Simulator. No native cases, signing or upload ran.
+Build 80 keeps the generated plan unchanged and lets XCTest install and launch its own products.
+Compiled product and plan validation happen before the first native group; installed-app
+visibility and the existing Contacts grant happen after that group succeeds and before the
+second group. Real-launch checks keep their permission setup. Selected marketing runs use the
+same original plan and their existing prompt-free synthetic fixture. There are no manual
+Simulator installs, destination-artifact overrides, test retries, extra builds or new screenshots.
+Native and physical acceptance remain required.
