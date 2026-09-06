@@ -213,8 +213,17 @@ final class AppStoreScreenshotUITests: XCTestCase {
         require(newest, in: app, message: "Long-history fixture has no newest row")
         XCTAssertTrue(newest.isHittable, "First opening must reveal row 300, not the start of history")
 
+        let metrics: [XCTMetric]
+        let measurementDescription: String
+        if #available(iOS 26.0, *) {
+            metrics = [XCTHitchMetric(application: app)]
+            measurementDescription = "UI hitch measurements during scrolling and frame geometry; no wall-clock threshold."
+        } else {
+            metrics = [XCTOSSignpostMetric.scrollingAndDecelerationMetric]
+            measurementDescription = "UIKit scrolling signposts and frame geometry; no wall-clock threshold."
+        }
         var geometry = ["Synthetic workload: 100 conversations, 2,000 text messages, 300 primary rows.",
-                        "UIKit scrolling signposts and frame geometry; no wall-clock threshold.",
+                        measurementDescription,
                         "Simulator results do not establish physical-device latency."]
         let options = XCTMeasureOptions()
         options.iterationCount = 1
@@ -222,7 +231,7 @@ final class AppStoreScreenshotUITests: XCTestCase {
         // These are deliberate drags to a reading position, not flicks. Give UIKit a
         // stationary interval before lifting so residual velocity cannot finish the return.
         let stationaryReleaseDuration: TimeInterval = 0.5
-        measure(metrics: [XCTOSSignpostMetric.scrollingAndDecelerationMetric], options: options) {
+        measure(metrics: metrics, options: options) {
             // Also restore the starting position if XCTest performs a warm-up invocation.
             let jump = app.buttons["Jump to latest message"]
             if jump.exists { jump.tap() }

@@ -63,7 +63,17 @@ the existing validated native scroll samples. UIScrollView tests exercise adjust
 crossings, unread clearing, geometry changes and callback cancellation on detach or conversation
 replacement. Opening and layout-follow corrections precede reading reports. The existing UI workload,
 exact Jump selector, assertions, two-phase ordering and 600-second initial boot wait are unchanged.
-Native build 76 validation remains pending.
+Build 76's first phase passed 26 of 27 checks, including all four new native reading-position cases.
+The long-history test completed both drag blocks and their functional assertions, then XCTest raised
+an internal exception while harvesting the combined scrolling/deceleration metric. The final aggregate
+attachment, Jump/reopen checks and second native phase were not reached.
+
+Build 77 measures UI hitches during the same scrolling workload with `XCTHitchMetric(application:)`
+on iOS 26 or later. The availability branch retains the existing combined signpost metric for
+iOS 17–25. Manual measurement boundaries, the measured block, one measured iteration plus warm-up,
+functional assertions, attachments and native command selection are unchanged. This is scrolling
+hitch evidence, not an input-latency or physical-device performance claim. Native build 77 validation
+remains pending, including the final Jump/reopen checks.
 
 Workflow conditions and native command selection are exercised by
 `test_ios_workflow_consolidation.py`. The tests check the target/screenshot-reuse
