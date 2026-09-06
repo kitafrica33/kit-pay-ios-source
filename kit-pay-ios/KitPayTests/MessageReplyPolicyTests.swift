@@ -407,8 +407,10 @@ final class MessageReplyPolicyTests: XCTestCase {
     }
 }
 
-/// Exercises the actual UIKit delegate, shared registration and native-view lifecycle. Touch
-/// arbitration itself still requires the unchanged slow-drag UI regression on Simulator.
+/// Exercises the native coordinator's admission decision, shared registration and view lifecycle.
+/// A real idle pan recognizer has no synthetic touch stream, so admission receives explicit
+/// translation through the same method the UIKit delegate calls. Real touch arbitration is
+/// covered by the slow vertical and horizontal-reply UI regression on Simulator.
 @MainActor
 final class SwipeToReplyNativeGestureTests: XCTestCase {
     func testSwiftUIBackgroundProbesMatchRowAndWaveformBounds() async {
@@ -448,7 +450,7 @@ final class SwipeToReplyNativeGestureTests: XCTestCase {
         XCTAssertTrue(regions.allSatisfy { !$0.isUserInteractionEnabled })
     }
 
-    func testVerticalAndDiagonalDelegateAdmissionNeverStartsReply() {
+    func testVerticalAndDiagonalAdmissionNeverStartsReply() {
         let harness = Harness()
         defer { harness.close() }
         let events = Events()
@@ -456,8 +458,7 @@ final class SwipeToReplyNativeGestureTests: XCTestCase {
         let owner = row.coordinator!
         for translation in [CGPoint(x: 0, y: 12), CGPoint(x: 0, y: -180), CGPoint(x: 12, y: 8)] {
             XCTAssertTrue(harness.select(row))
-            owner.pan.setTranslation(translation, in: harness.window)
-            XCTAssertFalse(owner.gestureRecognizerShouldBegin(owner.pan))
+            XCTAssertFalse(owner.shouldBegin(translation: CGSize(width: translation.x, height: translation.y)))
             owner.handle(state: .began, translation: translation.x)
             owner.handle(state: .ended, translation: 120)
         }
@@ -466,7 +467,7 @@ final class SwipeToReplyNativeGestureTests: XCTestCase {
         XCTAssertEqual(events.cancellations, 0)
     }
 
-    func testHorizontalDelegateAdmissionPrecedesTwentyPointVisibleActivation() {
+    func testHorizontalAdmissionPrecedesTwentyPointVisibleActivation() {
         let harness = Harness()
         defer { harness.close() }
         let events = Events()
@@ -474,8 +475,7 @@ final class SwipeToReplyNativeGestureTests: XCTestCase {
         let owner = row.coordinator!
         for direction in [CGFloat(1), CGFloat(-1)] {
             XCTAssertTrue(harness.select(row))
-            owner.pan.setTranslation(CGPoint(x: direction * 9, y: 1), in: harness.window)
-            XCTAssertTrue(owner.gestureRecognizerShouldBegin(owner.pan))
+            XCTAssertTrue(owner.shouldBegin(translation: CGSize(width: direction * 9, height: 1)))
             let previous = events.changes.count
             owner.handle(state: .began, translation: direction * 9)
             owner.handle(state: .changed, translation: direction * 19)
@@ -599,15 +599,18 @@ final class SwipeToReplyNativeGestureTests: XCTestCase {
         defer { harness.close() }
         let oldEvents = Events(), newEvents = Events()
         let lifetime = SwipeToReplyGestureLifetime()
-        var row: SwipeToReplyGestureProbe? = harness.row(y: 40, events: oldEvents, lifetime: lifetime)
-        let owner = row!.coordinator!
         // Keep this scroll's shared owner alive while the selected lazy row is replaced.
-        _ = harness.row(y: 140, events: Events())
-        XCTAssertTrue(harness.begin(row!))
-        owner.handle(state: .changed, translation: 60)
-        row!.removeFromSuperview()
-        weak var retired = row
-        row = nil
+        let retainedRow = harness.row(y: 140, events: Events())
+        let owner = retainedRow.coordinator!
+        weak var retired: SwipeToReplyGestureProbe?
+        // Drain UIKit's temporary references without running the deferred cancellation.
+        autoreleasepool {
+            let row = harness.row(y: 40, events: oldEvents, lifetime: lifetime)
+            XCTAssertTrue(harness.begin(row))
+            owner.handle(state: .changed, translation: 60)
+            retired = row
+            row.removeFromSuperview()
+        }
         XCTAssertNil(retired)
         let replacement = harness.row(y: 40, events: newEvents, lifetime: lifetime)
         XCTAssertTrue(harness.begin(replacement))
@@ -625,13 +628,15 @@ final class SwipeToReplyNativeGestureTests: XCTestCase {
         defer { harness.close() }
         let events = Events()
         let lifetime = SwipeToReplyGestureLifetime()
-        var row: SwipeToReplyGestureProbe? = harness.row(y: 40, events: events, lifetime: lifetime)
-        let owner = row!.coordinator!
-        XCTAssertTrue(harness.begin(row!))
-        owner.handle(state: .changed, translation: 60)
-        row!.removeFromSuperview()
-        weak var retired = row
-        row = nil
+        weak var retired: SwipeToReplyGestureProbe?
+        autoreleasepool {
+            let row = harness.row(y: 40, events: events, lifetime: lifetime)
+            let owner = row.coordinator!
+            XCTAssertTrue(harness.begin(row))
+            owner.handle(state: .changed, translation: 60)
+            retired = row
+            row.removeFromSuperview()
+        }
         XCTAssertNil(retired)
         await drainMainQueue()
         XCTAssertTrue(events.ends.isEmpty)
@@ -709,8 +714,7 @@ final class SwipeToReplyNativeGestureTests: XCTestCase {
 
         func begin(_ row: SwipeToReplyGestureProbe) -> Bool {
             guard select(row), let owner = row.coordinator else { return false }
-            owner.pan.setTranslation(CGPoint(x: 9, y: 0), in: window)
-            guard owner.gestureRecognizerShouldBegin(owner.pan) else { return false }
+            guard owner.shouldBegin(translation: CGSize(width: 9, height: 0)) else { return false }
             owner.handle(state: .began, translation: 9)
             return true
         }

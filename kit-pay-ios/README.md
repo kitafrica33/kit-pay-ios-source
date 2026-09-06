@@ -263,12 +263,20 @@ The existing two-pass slow vertical drag regression retains its distances, stati
 reading-position assertions, Jump button and reopen checks, and now also exercises replies in both
 directions and the long-press menu. Failed first drags retain a screenshot and accessibility tree.
 
-Build 80 compiled and passed 26 of 27 first-group cases, including received-video end/replay,
-media scrubbing, native reading-position, camera and call-banner checks. Its slow vertical bubble
-drag moved zero points. The retained native log contains no pan start or automatic repositioning
-during that gesture; the cause of recognizer arbitration is not conclusively established.
-Build 81 native validation remains required. No Simulator check establishes physical touch latency;
-real iPhones still need responsiveness and Instruments checks with long histories and active media.
+Build 80's slow vertical bubble drag moved zero points. Build 81 passed the complete scrolling
+and reply UI regression: both passes moved the outgoing bubble 170 points down and the incoming
+bubble 50 points up. Camera, call-banner, received-video end/replay and media scrubbing checks
+also passed. Its first group passed 31 of 38 cases, but seven new gesture unit cases failed;
+the second group, signing and upload did not run.
+
+Build 82 corrects those unit fixtures without changing the app's gesture implementation or UI
+regression. Admission tests supply explicit movement to the same coordinator method used by the
+UIKit delegate instead of setting translation on an idle recognizer without a touch stream.
+Deallocation tests drain temporary UIKit references inside a synchronous autorelease pool before
+checking weak references, while still starting replacement gestures before deferred cancellation.
+All direction, threshold, callback and lifecycle assertions remain required. Build 82 native
+validation is pending. No Simulator check establishes physical touch latency; real iPhones still
+need responsiveness and Instruments checks with long histories and active media.
 
 Native tests use Xcode's original generated `.xctestrun` unchanged. XCTest owns installation and
 launch. Product identity and plan validation precede the first group; installed identity observation

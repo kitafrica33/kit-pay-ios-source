@@ -49,12 +49,14 @@ extra compilations or additional Simulators are introduced. The fresh pinned Sim
 boot sequence with a 600-second initial readiness limit; other simctl operations retain their
 60-second limits.
 
-Build 80 compiled, then passed 26 of 27 first-group cases. The slow vertical bubble drag did not
-move, so validation stopped before the second group, signing or upload. Build 81 changes reply
-gesture arbitration and retains the failed slow gesture and all reading-position assertions.
-The same regression also checks both horizontal reply directions and the long-press menu, and
-retains first-drag failure evidence without a separate capture job. Frame geometry is functional
-evidence only; physical responsiveness and scrolling hitches require device acceptance.
+Build 80's slow vertical bubble drag did not move. Build 81's native reply recognizer passed
+both slow vertical passes, reading-position checks, horizontal replies and the long-press menu.
+Its first group passed 31 of 38 cases; seven new unit-fixture cases failed before the second group,
+signing or upload. Build 82 corrects the fixtures' idle-recognizer input and immediate-deallocation
+assumptions while preserving all admission, callback, threshold and lifecycle assertions. It adds
+no jobs or test invocations and does not change the passing UI regression or app implementation.
+Native validation of build 82 is pending. Frame geometry is functional evidence only; physical
+responsiveness and scrolling hitches require device acceptance.
 
 Workflow conditions and native command selection are exercised by
 `test_ios_workflow_consolidation.py`. The tests check the target/screenshot-reuse
