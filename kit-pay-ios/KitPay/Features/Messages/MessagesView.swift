@@ -2839,17 +2839,6 @@ struct ConversationView: View {
                     .padding(.horizontal, 14)
                     .padding(.top, 12)
                     .background(
-                        GeometryReader { contentGeometry in
-                            Color.clear.preference(
-                                key: ConversationScrollMetricsKey.self,
-                                value: ConversationScrollMetrics(
-                                    contentMaxY: contentGeometry
-                                        .frame(in: .named("conversationScroll")).maxY
-                                )
-                            )
-                        }
-                    )
-                    .background(
                         ConversationScrollPanReporter(
                             conversationID: conversation.id,
                             shouldKeepOpeningAtBottom: {
@@ -2872,6 +2861,9 @@ struct ConversationView: View {
                                     conversationID: conversation.id,
                                     hasTimelineContent: !renderedTimeline.isEmpty
                                 )
+                            },
+                            onReadingPosition: { nearLatest in
+                                scrollInteraction.updateReadingPosition(isNearLatest: nearLatest)
                             },
                             onBegin: { geometry, distance in
                                 scrollInteraction.beginCameraPull(
@@ -2897,25 +2889,10 @@ struct ConversationView: View {
                         )
                     )
                 }
-                .coordinateSpace(name: "conversationScroll")
                 .accessibilityIdentifier("conversation-timeline")
                 .defaultScrollAnchor(.bottom)
                 .scrollBounceBehavior(.always)
                 .scrollDismissesKeyboard(.interactively)
-                .background(
-                    GeometryReader { viewportGeometry in
-                        Color.clear
-                            .onAppear {
-                                scrollInteraction.viewportHeight = viewportGeometry.size.height
-                            }
-                            .onChange(of: viewportGeometry.size.height) { _, height in
-                                scrollInteraction.viewportHeight = height
-                            }
-                    }
-                )
-                .onPreferenceChange(ConversationScrollMetricsKey.self) { metrics in
-                    handleScrollMetrics(metrics)
-                }
                 .onChange(of: cameraAvailable) { _, eligible in
                     if !eligible { cancelCameraPull() }
                 }
@@ -8632,7 +8609,6 @@ struct ConversationView: View {
         ConversationCameraPullDiagnostics.log("position SwiftUI bottom animated=\(animated)")
 #endif
         cancelCameraPull()
-        scrollInteraction.unseenIncomingCount = 0
         let position = {
             proxy.scrollTo(ConversationScrollAnchor.bottom, anchor: .bottom)
         }
@@ -8644,16 +8620,6 @@ struct ConversationView: View {
     }
 
     // MARK: Reading position, jump-to-latest, and the pull-past-the-end camera
-
-    private func handleScrollMetrics(_ metrics: ConversationScrollMetrics) {
-        guard scrollInteraction.viewportHeight > 0 else { return }
-        let distanceFromLatest = metrics.contentMaxY - scrollInteraction.viewportHeight
-        let nearLatest = distanceFromLatest < ConversationCameraPullPolicy.nearLatestDistance
-        if nearLatest != scrollInteraction.isNearLatestMessage {
-            scrollInteraction.isNearLatestMessage = nearLatest
-            if nearLatest { scrollInteraction.unseenIncomingCount = 0 }
-        }
-    }
 
     private func updateCameraPull(progress: CGFloat, hasTimelineContent: Bool) {
         if scrollInteraction.updateCameraPull(
@@ -8692,13 +8658,19 @@ final class ConversationScrollInteraction: ObservableObject {
 
     var latestPositionPolicy = ConversationLatestPositionPolicy()
     var isInteracting = false
-    var viewportHeight: CGFloat = 0
-    @Published var isNearLatestMessage = true
+    @Published private(set) var isNearLatestMessage = true
     @Published var unseenIncomingCount = 0
     @Published private(set) var cameraFeedback = CameraFeedback()
     private var cameraPull = ConversationCameraPullGesture()
 
     var isTrackingCameraPull: Bool { cameraPull.isTracking }
+
+    /// Native position reports are deferred beyond layout. Ordinary samples on the same side
+    /// of the latest threshold must not redraw the overlay or repeatedly clear its count.
+    func updateReadingPosition(isNearLatest: Bool) {
+        if isNearLatestMessage != isNearLatest { isNearLatestMessage = isNearLatest }
+        if isNearLatest, unseenIncomingCount != 0 { unseenIncomingCount = 0 }
+    }
 
     func beginCameraPull(
         conversationID: String,
@@ -8942,6 +8914,7 @@ struct ConversationScrollPanReporter: UIViewRepresentable {
     let shouldKeepOpeningAtBottom: () -> Bool
     let shouldFollowLayoutChanges: () -> Bool
     let onOpeningPositioned: () -> Void
+    let onReadingPosition: (Bool) -> Void
     let onBegin: (ConversationCameraPullGeometry, CGFloat) -> Void
     let onProgress: (CGFloat) -> Void
     let onCancel: () -> Void
@@ -8990,6 +8963,7 @@ struct ConversationScrollPanReporter: UIViewRepresentable {
         private var acknowledgedConversationID: String?
         private var previousNativeSample: NativeSample?
         private var positionRequest: PositionRequest?
+        private var readingPositionRequestID: UUID?
         private var isApplyingPosition = false
 #if DEBUG && APP_STORE_SCREENSHOTS
         private var lastUnattachedHierarchy: String?
@@ -9011,10 +8985,14 @@ struct ConversationScrollPanReporter: UIViewRepresentable {
                 offset = scroll.contentOffset
             }
 
+            var distanceFromLatest: CGFloat? {
+                guard geometry.isValid, offset.x.isFinite, offset.y.isFinite else { return nil }
+                let distance = geometry.bottomOffset - offset.y
+                return distance.isFinite ? max(0, distance) : nil
+            }
+
             var isNearBottom: Bool {
-                geometry.bottomOffset.isFinite && offset.y.isFinite
-                    && max(0, geometry.bottomOffset - offset.y)
-                        < ConversationCameraPullPolicy.nearLatestDistance
+                distanceFromLatest.map { $0 < ConversationCameraPullPolicy.nearLatestDistance } ?? false
             }
         }
 
@@ -9034,6 +9012,7 @@ struct ConversationScrollPanReporter: UIViewRepresentable {
         func updateCallbacks(_ callbacks: ConversationScrollPanReporter) {
             if self.callbacks.conversationID.lowercased() != callbacks.conversationID.lowercased() {
                 positionRequest = nil
+                readingPositionRequestID = nil
                 previousNativeSample = nil
                 acknowledgedConversationID = nil
                 interactionConversationID = nil
@@ -9118,6 +9097,9 @@ struct ConversationScrollPanReporter: UIViewRepresentable {
             }
 #endif
             guard !isApplyingPosition else { return }
+            // Queue after any opening/layout correction, so estimated pre-correction offsets
+            // cannot flash the Jump button. KVO and Probe callbacks can run inside SwiftUI layout.
+            defer { scheduleReadingPosition(in: scroll) }
 
             let originChanged = previous.map { $0.offset != sample.offset } ?? false
             if originChanged, case .layoutFollow = positionRequest?.kind {
@@ -9141,6 +9123,28 @@ struct ConversationScrollPanReporter: UIViewRepresentable {
             }
             guard previous.isNearBottom else { return }
             schedulePosition(.layoutFollow(expectedOffset: sample.offset), in: scroll)
+        }
+
+        private func scheduleReadingPosition(in scroll: UIScrollView) {
+            guard readingPositionRequestID == nil else { return }
+            let requestID = UUID()
+            let conversationID = callbacks.conversationID.lowercased()
+            readingPositionRequestID = requestID
+            DispatchQueue.main.async { [weak self, weak scroll] in
+                guard let self, self.readingPositionRequestID == requestID else { return }
+                self.readingPositionRequestID = nil
+                guard let scroll, self.scrollView === scroll, scroll.window != nil,
+                      self.callbacks.conversationID.lowercased() == conversationID
+                else { return }
+                if self.positionRequest != nil {
+                    self.scheduleReadingPosition(in: scroll)
+                    return
+                }
+                guard !self.canOwnOpening(conversationID: conversationID),
+                      let distance = NativeSample(scroll).distanceFromLatest
+                else { return }
+                self.callbacks.onReadingPosition(distance < ConversationCameraPullPolicy.nearLatestDistance)
+            }
         }
 
         private func canOwnOpening(conversationID: String) -> Bool {
@@ -9237,6 +9241,7 @@ struct ConversationScrollPanReporter: UIViewRepresentable {
 
         func detach() {
             positionRequest = nil
+            readingPositionRequestID = nil
             previousNativeSample = nil
             geometryObservations.removeAll()
             scrollView?.panGestureRecognizer.removeTarget(self, action: #selector(panChanged(_:)))
@@ -9429,20 +9434,6 @@ struct ConversationCameraPullGesture: Equatable {
         isArmed = false
         isTracking = false
         didCrossThreshold = false
-    }
-}
-
-private struct ConversationScrollMetrics: Equatable {
-    var contentMaxY: CGFloat = 0
-}
-
-private struct ConversationScrollMetricsKey: PreferenceKey {
-    static var defaultValue = ConversationScrollMetrics()
-    static func reduce(
-        value: inout ConversationScrollMetrics,
-        nextValue: () -> ConversationScrollMetrics
-    ) {
-        value = nextValue()
     }
 }
 

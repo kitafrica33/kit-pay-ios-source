@@ -269,6 +269,18 @@ and message-target positioning. Those logs contain static labels and the bottom-
 release scrolling behavior is unchanged. Native validation remains required; no product fix or
 physical-device performance result is established.
 
+Build 75's first native phase passed 22 of 23 checks. The stationary long-history drag remained
+122.33 points from latest after release and passed the reading-position assertions, but the Jump
+button was absent from all three final accessibility queries. The second native phase did not run.
+Build 76 derives Jump visibility and unread clearing from the scroll view's validated content,
+viewport, adjusted insets and offset, replacing the separate SwiftUI preference measurements.
+Reports coalesce on the main queue, reread the current position after automatic positioning, and
+expire when the scroll view or conversation changes. Same-side samples leave overlay observers
+quiet. Native UIScrollView regressions cover the retained reading distance, threshold crossings,
+unread clearing, geometry changes and deferred callback ownership. The existing long-history UI
+assertions and build 75's 600-second initial boot wait remain intact. Native validation is pending;
+no physical-device responsiveness or release acceptance is established.
+
 ## App Store submission prerequisites
 
 Complete these checks before submission; a green build alone does not establish release

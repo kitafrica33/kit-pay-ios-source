@@ -55,6 +55,16 @@ It retains build 74's native tests and adds static SwiftUI positioning logs only
 screenshot fixture; the bottom-scroll log also records its animation flag. Runtime scrolling anchors
 are unchanged. Native validation remains required; no physical-device acceptance or latency result is claimed.
 
+Build 75 completed simulator setup and 22 of 23 first-phase checks passed. The stationary history
+remained 122.33 points from latest; its reading-position assertions passed, then the required Jump
+button was absent in all three final accessibility queries. The second native phase did not run.
+Build 76 replaces the separate SwiftUI reading-position measurements with coalesced reports from
+the existing validated native scroll samples. UIScrollView tests exercise adjusted insets, threshold
+crossings, unread clearing, geometry changes and callback cancellation on detach or conversation
+replacement. Opening and layout-follow corrections precede reading reports. The existing UI workload,
+exact Jump selector, assertions, two-phase ordering and 600-second initial boot wait are unchanged.
+Native build 76 validation remains pending.
+
 Workflow conditions and native command selection are exercised by
 `test_ios_workflow_consolidation.py`. The tests check the target/screenshot-reuse
 matrix, no automatic triggers, early camera/banner checks, one test compilation,

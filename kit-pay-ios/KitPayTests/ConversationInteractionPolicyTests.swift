@@ -8,23 +8,214 @@ final class ConversationNativeOpeningTests: XCTestCase {
     func testNativeOpeningUsesObservedBottomOffsetForLongAndShortContent() async {
         for contentHeight in [CGFloat(1_000), CGFloat(200)] {
             var acknowledgements = 0
-            let harness = NativeOpeningHarness(onPositioned: { acknowledgements += 1 })
+            var readingPositions: [Bool] = []
+            let harness = NativeOpeningHarness(
+                onPositioned: { acknowledgements += 1 },
+                onReadingPosition: { readingPositions.append($0) }
+            )
             defer { harness.close() }
             harness.scroll.contentSize.height = contentHeight
             harness.attach()
             XCTAssertEqual(acknowledgements, 0, "Enqueuing work is not a positioning receipt")
+            XCTAssertTrue(readingPositions.isEmpty, "Attach must not publish during SwiftUI layout")
 
             await drainMainQueue()
 
             let expectedOffset = max(-20, contentHeight - 600 + 50)
             XCTAssertEqual(harness.scroll.contentOffset.y, expectedOffset, accuracy: 1)
             XCTAssertEqual(acknowledgements, 1)
+            XCTAssertEqual(readingPositions.last, true)
+            XCTAssertFalse(readingPositions.contains(false), "Estimated opening offsets must not flash Jump")
         }
+    }
+
+    func testNativeReadingPositionKeepsJumpAvailableDuringQuietHistoryPansAndClearsUnreadOnReturn() async {
+        let interaction = ConversationScrollInteraction()
+        interaction.unseenIncomingCount = 3
+        var publications = 0
+        var readingReports = 0
+        let observation = interaction.objectWillChange.sink { publications += 1 }
+        defer { observation.cancel() }
+        let harness = NativeOpeningHarness(
+            shouldKeepOpening: { false }, shouldFollowLayout: { false }, onPositioned: {},
+            onReadingPosition: {
+                readingReports += 1
+                interaction.updateReadingPosition(isNearLatest: $0)
+            },
+            onBegin: { geometry, distance in
+                interaction.beginCameraPull(
+                    conversationID: "direct-chat", geometry: geometry,
+                    distanceFromLatest: distance, isEligible: true
+                )
+            },
+            onProgress: { _ = interaction.updateCameraPull(progress: $0, isEligible: true) },
+            onEnd: { _ = interaction.finishCameraPull(cancelled: $0, isEligible: true) }
+        )
+        defer { harness.close() }
+        harness.scroll.frame.size.height = 774
+        harness.scroll.contentInset = UIEdgeInsets(top: 116, left: 0, bottom: 0, right: 0)
+        harness.scroll.contentSize.height = 20_072
+        harness.scroll.contentOffset.y = 19_175 + 2.0 / 3.0
+        harness.attach()
+        XCTAssertEqual(harness.scroll.adjustedContentInset.top, 116)
+        XCTAssertEqual(harness.scroll.bounds.height, 774)
+        XCTAssertEqual(readingReports, 0)
+        XCTAssertEqual(publications, 0)
+
+        await drainMainQueue()
+
+        XCTAssertFalse(interaction.isNearLatestMessage,
+                       "The retained 122.33-point native reading distance must expose Jump")
+        XCTAssertEqual(interaction.unseenIncomingCount, 3)
+        XCTAssertEqual(publications, 1)
+        let pan = OpeningTestPan()
+        harness.coordinator.panChanged(pan)
+        pan.reportedState = .changed
+        for distance in [CGFloat(180), 240, 180, 122 + 1.0 / 3.0] {
+            harness.scroll.contentOffset.y = 19_298 - distance
+            pan.reportedTranslation.y = distance - 122
+            harness.coordinator.panChanged(pan)
+            await drainMainQueue()
+            XCTAssertFalse(interaction.isNearLatestMessage)
+            XCTAssertEqual(publications, 1, "Same-side native pan samples must leave observers quiet")
+        }
+        pan.reportedState = .ended
+        harness.coordinator.panChanged(pan)
+        await drainMainQueue()
+        XCTAssertFalse(interaction.isInteracting)
+        XCTAssertFalse(interaction.isTrackingCameraPull)
+        XCTAssertEqual(interaction.cameraFeedback, .init())
+        XCTAssertEqual(publications, 1)
+
+        harness.scroll.contentOffset.y = 19_298 - 55
+        await drainMainQueue()
+        XCTAssertTrue(interaction.isNearLatestMessage)
+        XCTAssertEqual(interaction.unseenIncomingCount, 0)
+        XCTAssertEqual(publications, 3, "Returning near latest changes the boolean and unread count once")
+
+        let reportsBeforeCoalescing = readingReports
+        harness.scroll.contentOffset.y = 19_298 - 100
+        harness.scroll.contentOffset.y = 19_298 - 10
+        harness.attach()
+        XCTAssertEqual(readingReports, reportsBeforeCoalescing,
+                       "Native callbacks must not publish synchronously")
+        await drainMainQueue()
+        XCTAssertEqual(readingReports, reportsBeforeCoalescing + 1,
+                       "One queued report must reread the final native position")
+        XCTAssertEqual(publications, 3, "An obsolete intermediate history sample must not flash Jump")
+
+        harness.scroll.contentOffset.y = 19_298 - 56
+        await drainMainQueue()
+        XCTAssertFalse(interaction.isNearLatestMessage, "The existing threshold remains strict")
+        XCTAssertEqual(publications, 4)
+        harness.scroll.contentOffset.y = 19_298
+        await drainMainQueue()
+        XCTAssertTrue(interaction.isNearLatestMessage)
+        XCTAssertEqual(publications, 5, "An already empty unread count must not publish again")
+    }
+
+    func testNativeReadingPositionRefreshesForContentViewportAndInsetsAndIgnoresEmptyLayout() async {
+        var readingPositions: [Bool] = []
+        let harness = NativeOpeningHarness(
+            shouldKeepOpening: { false }, shouldFollowLayout: { false }, onPositioned: {},
+            onReadingPosition: { readingPositions.append($0) }
+        )
+        defer { harness.close() }
+        harness.scroll.contentSize.height = 0
+        harness.attach()
+        await drainMainQueue()
+        XCTAssertTrue(readingPositions.isEmpty, "An empty estimated layout is not a reading position")
+        harness.scroll.contentSize.height = 1_000
+        harness.scroll.frame.size.height = 0
+        await drainMainQueue()
+        XCTAssertTrue(readingPositions.isEmpty, "A zero viewport cannot clear unread or decide Jump visibility")
+
+        harness.scroll.frame.size.height = 600
+        harness.scroll.contentOffset.y = 450
+        await drainMainQueue()
+        XCTAssertEqual(readingPositions.last, true)
+        harness.scroll.contentSize.height = 1_100
+        await drainMainQueue()
+        XCTAssertEqual(readingPositions.last, false)
+        harness.scroll.frame.size.height = 700
+        await drainMainQueue()
+        XCTAssertEqual(readingPositions.last, true)
+        harness.scroll.contentInset.bottom = 150
+        await drainMainQueue()
+        XCTAssertEqual(readingPositions.last, false)
+        harness.scroll.contentInset.bottom = 50
+        await drainMainQueue()
+        XCTAssertEqual(readingPositions.last, true)
+        XCTAssertEqual(harness.scroll.contentOffset.y, 450, accuracy: 1,
+                       "Reporting native geometry must not move a reader when following is disabled")
+
+        harness.scroll.contentSize.height = 200
+        harness.scroll.contentInset.top = 116
+        harness.scroll.contentOffset.y = -116
+        await drainMainQueue()
+        XCTAssertEqual(readingPositions.last, true, "Short histories rest at the adjusted top inset")
+        // Hold short-content geometry fixed: inset changes can also make UIKit compensate offset.
+        harness.scroll.contentOffset.y = -180
+        await drainMainQueue()
+        XCTAssertEqual(harness.scroll.adjustedContentInset.top, 116)
+        XCTAssertEqual(harness.scroll.contentOffset.y, -180, accuracy: 0.5)
+        XCTAssertEqual(readingPositions.last, false, "A short-history position 64 points from rest must expose Jump")
+    }
+
+    func testDeferredReadingPositionDropsDetachedSamplesAndReadsOnlyTheReplacementScrollView() async {
+        var readingPositions: [Bool] = []
+        let harness = NativeOpeningHarness(
+            shouldKeepOpening: { false }, shouldFollowLayout: { false }, onPositioned: {},
+            onReadingPosition: { readingPositions.append($0) }
+        )
+        defer { harness.close() }
+        harness.attach()
+        harness.coordinator.detach()
+        await drainMainQueue()
+        XCTAssertTrue(readingPositions.isEmpty)
+
+        harness.attach()
+        harness.coordinator.detach()
+        let replacement = UIScrollView(frame: harness.scroll.frame)
+        replacement.contentInsetAdjustmentBehavior = .never
+        replacement.contentSize = CGSize(width: 320, height: 1_000)
+        replacement.contentOffset.y = 400
+        harness.window.addSubview(replacement)
+        replacement.addSubview(harness.probe)
+        harness.coordinator.attach(from: harness.probe)
+        await drainMainQueue()
+
+        XCTAssertEqual(readingPositions, [true], "An old far-from-latest report cannot survive reattachment")
+    }
+
+    func testConversationReplacementDropsItsQueuedReadingReport() async {
+        var oldReadingPositions: [Bool] = []
+        var newReadingPositions: [Bool] = []
+        let harness = NativeOpeningHarness(
+            shouldKeepOpening: { false }, shouldFollowLayout: { false }, onPositioned: {},
+            onReadingPosition: { oldReadingPositions.append($0) }
+        )
+        defer { harness.close() }
+        harness.attach()
+        harness.coordinator.updateCallbacks(NativeOpeningHarness.reporter(
+            conversationID: "other-chat", shouldKeepOpening: { false }, shouldFollowLayout: { false },
+            onPositioned: {}, onReadingPosition: { newReadingPositions.append($0) }
+        ))
+        harness.scroll.contentOffset.y = 450
+        harness.attach()
+        await drainMainQueue()
+
+        XCTAssertTrue(oldReadingPositions.isEmpty)
+        XCTAssertEqual(newReadingPositions, [true])
     }
 
     func testNativeOpeningRetriesEmptyLayoutAndLaterContentOrInsetGrowth() async {
         var acknowledgements = 0
-        let harness = NativeOpeningHarness(onPositioned: { acknowledgements += 1 })
+        var readingPositions: [Bool] = []
+        let harness = NativeOpeningHarness(
+            onPositioned: { acknowledgements += 1 },
+            onReadingPosition: { readingPositions.append($0) }
+        )
         defer { harness.close() }
         harness.scroll.contentSize.height = 0
         harness.attach()
@@ -37,10 +228,14 @@ final class ConversationNativeOpeningTests: XCTestCase {
         XCTAssertEqual(harness.scroll.contentOffset.y, 450, accuracy: 1)
         XCTAssertEqual(acknowledgements, 1)
 
+        readingPositions.removeAll()
+        // Queue a reading report first, then a layout follow. FIFO delivery must wait for follow.
+        harness.attach()
         harness.scroll.contentSize.height = 1_240
         harness.scroll.contentInset.bottom = 90
         await drainMainQueue()
         XCTAssertEqual(harness.scroll.contentOffset.y, 730, accuracy: 1)
+        XCTAssertEqual(readingPositions, [true], "Pending reading reports must wait for later queued following")
 
         harness.scroll.frame.size.height = 500
         await drainMainQueue()
@@ -481,7 +676,11 @@ final class ConversationNativeOpeningTests: XCTestCase {
 
     func testRejectedNativeOffsetDoesNotClaimOpeningSuccess() async {
         var acknowledgements = 0
-        let harness = NativeOpeningHarness(onPositioned: { acknowledgements += 1 })
+        var readingPositions: [Bool] = []
+        let harness = NativeOpeningHarness(
+            onPositioned: { acknowledgements += 1 },
+            onReadingPosition: { readingPositions.append($0) }
+        )
         defer { harness.close() }
         harness.scroll.refusesOffset = true
         harness.attach()
@@ -491,6 +690,12 @@ final class ConversationNativeOpeningTests: XCTestCase {
         XCTAssertEqual(harness.scroll.contentOffset.y, 0, accuracy: 1)
         XCTAssertEqual(acknowledgements, 0,
                        "An unobserved or ignored scroll request must leave opening unclaimed")
+        XCTAssertTrue(readingPositions.isEmpty, "Unacknowledged opening estimates must not flash Jump")
+        let rejectedRequests = harness.scroll.positionRequests
+        XCTAssertGreaterThan(rejectedRequests, 0)
+        await drainMainQueue()
+        XCTAssertEqual(harness.scroll.positionRequests, rejectedRequests,
+                       "Neither opening nor reading reports may spin on an unchanged rejected offset")
     }
 
     private func drainMainQueue() async {
@@ -514,6 +719,7 @@ private final class NativeOpeningHarness {
         shouldKeepOpening: @escaping () -> Bool = { true },
         shouldFollowLayout: @escaping () -> Bool = { true },
         onPositioned: @escaping () -> Void,
+        onReadingPosition: @escaping (Bool) -> Void = { _ in },
         onGesture: @escaping () -> Void = {},
         onBegin: @escaping (ConversationCameraPullGeometry, CGFloat) -> Void = { _, _ in },
         onProgress: @escaping (CGFloat) -> Void = { _ in },
@@ -531,6 +737,7 @@ private final class NativeOpeningHarness {
         coordinator = ConversationScrollPanReporter.Coordinator(Self.reporter(
             conversationID: "direct-chat", shouldKeepOpening: shouldKeepOpening,
             shouldFollowLayout: shouldFollowLayout, onPositioned: onPositioned,
+            onReadingPosition: onReadingPosition,
             onGesture: onGesture, onBegin: onBegin, onProgress: onProgress,
             onCancel: onCancel, onEnd: onEnd
         ))
@@ -545,6 +752,7 @@ private final class NativeOpeningHarness {
         shouldKeepOpening: @escaping () -> Bool,
         shouldFollowLayout: @escaping () -> Bool = { true },
         onPositioned: @escaping () -> Void,
+        onReadingPosition: @escaping (Bool) -> Void = { _ in },
         onGesture: @escaping () -> Void = {},
         onBegin: @escaping (ConversationCameraPullGeometry, CGFloat) -> Void = { _, _ in },
         onProgress: @escaping (CGFloat) -> Void = { _ in },
@@ -555,6 +763,7 @@ private final class NativeOpeningHarness {
             conversationID: conversationID, shouldKeepOpeningAtBottom: shouldKeepOpening,
             shouldFollowLayoutChanges: shouldFollowLayout,
             onOpeningPositioned: onPositioned,
+            onReadingPosition: onReadingPosition,
             onBegin: { geometry, distance in onGesture(); onBegin(geometry, distance) },
             onProgress: { progress in onGesture(); onProgress(progress) },
             onCancel: { onGesture(); onCancel() },
@@ -573,8 +782,10 @@ private final class NativeOpeningHarness {
 private final class OpeningTestScrollView: UIScrollView {
     var refusesOffset = false
     var onNextLayout: (() -> Void)?
+    private(set) var positionRequests = 0
 
     override func setContentOffset(_ contentOffset: CGPoint, animated: Bool) {
+        positionRequests += 1
         if !refusesOffset { super.setContentOffset(contentOffset, animated: animated) }
     }
 
