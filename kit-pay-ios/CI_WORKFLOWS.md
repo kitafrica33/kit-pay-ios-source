@@ -68,12 +68,19 @@ The long-history test completed both drag blocks and their functional assertions
 an internal exception while harvesting the combined scrolling/deceleration metric. The final aggregate
 attachment, Jump/reopen checks and second native phase were not reached.
 
-Build 77 measures UI hitches during the same scrolling workload with `XCTHitchMetric(application:)`
-on iOS 26 or later. The availability branch retains the existing combined signpost metric for
-iOS 17–25. Manual measurement boundaries, the measured block, one measured iteration plus warm-up,
-functional assertions, attachments and native command selection are unchanged. This is scrolling
-hitch evidence, not an input-latency or physical-device performance claim. Native build 77 validation
-remains pending, including the final Jump/reopen checks.
+Build 77 tried `XCTHitchMetric(application:)` on iOS 26 or later with the same workload and
+measurement boundaries. It passed 26 of 27 first-phase checks, including both functional drag
+blocks, then raised the same internal `MXMOSSignpostMetric` collection exception on the pinned
+Simulator. The final aggregate attachment, Jump/reopen checks and remaining native phase were
+not reached. Why XCTest metric collection failed remains unproven.
+
+Build 78 keeps the required long-history regression independent of XCTest performance collection.
+Two explicit functional passes preserve first-pass and repeated-state coverage, all stationary
+gestures, assertions, attachments and final Jump/back/reopen checks. It collects frame geometry
+without timing or hitch measurements. The test inventory, early/remaining phase selectors and
+single compilation are unchanged; no test is skipped or marked as an expected failure.
+Physical touch responsiveness and scrolling hitches still require real-device acceptance and
+Instruments captures as documented in README.md. Native build 78 validation remains pending.
 
 Workflow conditions and native command selection are exercised by
 `test_ios_workflow_consolidation.py`. The tests check the target/screenshot-reuse

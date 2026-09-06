@@ -245,11 +245,11 @@ eligibility changes, conversation replacement and current reply text. Real-devic
 must still check responsiveness with long histories and active media playback.
 The opt-in `--kit-chat-long-history-scroll-fixture-v1` argument adds 100 conversations and 2,000
 synthetic text messages only when the Debug screenshot fixture is also enabled. Its UI regression
-drags from incoming and outgoing bubbles and records UI hitch measurements during scrolling on
-iOS 26 or later, with UIKit scrolling signposts on earlier supported versions, in the existing
-native test run; it does not change the marketing fixture or create new store screenshots.
+drags from incoming and outgoing bubbles twice and records frame geometry in the existing
+native test run. This functional regression collects no timing or hitch measurements; it does
+not change the marketing fixture or create new store screenshots.
 Chat navigation in this regression selects the exact conversation UUID inside the chat list
-and verifies the opened profile control before measuring; repeated names on other tabs cannot
+and verifies the opened profile control before dragging; repeated names on other tabs cannot
 select a different history. The first-open and reopened newest-row checks remain mandatory.
 The long-history regression runs in the existing early native phase and is excluded from the
 remaining phase, so a navigation or scrolling failure stops validation sooner without duplicate tests.
@@ -286,12 +286,19 @@ regressions. Both long-history drag iterations completed their movement, stopped
 visibility and idle-position assertions. XCTest then raised an internal exception while harvesting
 the combined scrolling/deceleration signpost metric. That exception prevented the final aggregate
 attachment and Jump/reopen assertions from running; the second native phase also did not run.
-Build 77 uses Apple's app-scoped `XCTHitchMetric` on iOS 26 or later, retaining the existing combined
-metric for iOS 17–25. It preserves the complete measured block, stationary gestures, manual start/stop,
-one measured iteration plus XCTest's warm-up, selectors, assertions and attachments. The metric records
-UI hitches during scrolling; it does not measure input latency. Native build 77 validation remains
-pending, including the final Jump/reopen checks. No physical-device performance or release acceptance
-is established.
+Build 77 tried Apple's app-scoped `XCTHitchMetric` on iOS 26 or later, retaining the combined
+metric for iOS 17–25. It also passed 26 of 27 first-phase checks and both functional drag blocks,
+then hit the same internal `MXMOSSignpostMetric` collection exception on the pinned Simulator.
+The final aggregate attachment, Jump/reopen checks and second native phase were again not reached.
+These failures do not establish why XCTest metric collection failed.
+
+Build 78 runs two explicit functional drag passes without XCTest performance collection. It
+preserves the stationary gestures, movement and reading-position assertions, intermediate and
+aggregate attachments, exact selectors, and final Jump/back/reopen checks. Application runtime
+and native unit-test sources are unchanged from build 76. Native build 78 validation remains pending.
+Physical-device acceptance must still check touch responsiveness and capture scrolling hitches
+with Instruments on real iPhones, including long histories and active media; this Simulator
+regression supplies neither timing measurements nor physical-device performance acceptance.
 
 ## App Store submission prerequisites
 

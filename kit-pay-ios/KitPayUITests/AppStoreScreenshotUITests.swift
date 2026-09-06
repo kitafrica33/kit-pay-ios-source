@@ -213,29 +213,19 @@ final class AppStoreScreenshotUITests: XCTestCase {
         require(newest, in: app, message: "Long-history fixture has no newest row")
         XCTAssertTrue(newest.isHittable, "First opening must reveal row 300, not the start of history")
 
-        let metrics: [XCTMetric]
-        let measurementDescription: String
-        if #available(iOS 26.0, *) {
-            metrics = [XCTHitchMetric(application: app)]
-            measurementDescription = "UI hitch measurements during scrolling and frame geometry; no wall-clock threshold."
-        } else {
-            metrics = [XCTOSSignpostMetric.scrollingAndDecelerationMetric]
-            measurementDescription = "UIKit scrolling signposts and frame geometry; no wall-clock threshold."
-        }
         var geometry = ["Synthetic workload: 100 conversations, 2,000 text messages, 300 primary rows.",
-                        measurementDescription,
+                        "Two functional drag passes and frame geometry; no timing or hitch measurements.",
                         "Simulator results do not establish physical-device latency."]
-        let options = XCTMeasureOptions()
-        options.iterationCount = 1
-        options.invocationOptions = [.manuallyStart]
         // These are deliberate drags to a reading position, not flicks. Give UIKit a
         // stationary interval before lifting so residual velocity cannot finish the return.
         let stationaryReleaseDuration: TimeInterval = 0.5
-        measure(metrics: metrics, options: options) {
-            // Also restore the starting position if XCTest performs a warm-up invocation.
+        // Preserve first-pass and repeated-state coverage independently of XCTest's
+        // metric collector, which raised an internal exception in both builds 76 and 77.
+        for _ in 0..<2 {
+            // Restore the starting position before the repeated drag pair.
             let jump = app.buttons["Jump to latest message"]
             if jump.exists { jump.tap() }
-            XCTAssertTrue(newest.isHittable, "Each measured drag pair starts at the newest row")
+            XCTAssertTrue(newest.isHittable, "Each drag pair starts at the newest row")
             let viewport = timeline.frame.insetBy(dx: 2, dy: 20)
             // Short, plain-text bubbles keep these anchors visible on the screenshot iPhone.
             // Row 296 is outgoing; row 295 is incoming, so both bubble gesture owners are used.
@@ -247,7 +237,6 @@ final class AppStoreScreenshotUITests: XCTestCase {
             let olderDestination = CGPoint(x: outgoingBefore.midX, y: outgoingBefore.midY + distance)
             XCTAssertTrue(viewport.contains(olderDestination), "Older drag must stay inside the timeline")
 
-            startMeasuring()
             outgoing.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
                 .press(forDuration: 0.01, thenDragTo: app.coordinate(withNormalizedOffset: .zero)
                     .withOffset(CGVector(dx: olderDestination.x, dy: olderDestination.y)),
@@ -270,8 +259,6 @@ final class AppStoreScreenshotUITests: XCTestCase {
                 .press(forDuration: 0.01, thenDragTo: app.coordinate(withNormalizedOffset: .zero)
                     .withOffset(CGVector(dx: newerDestination.x, dy: newerDestination.y)),
                        withVelocity: .slow, thenHoldForDuration: stationaryReleaseDuration)
-            stopMeasuring()
-
             let incomingAfter = incoming.frame
             let dragGeometry = "Outgoing before/after: \(outgoingBefore) -> \(outgoingAfter)\n"
                 + "Incoming before/after: \(incomingBefore) -> \(incomingAfter)"
