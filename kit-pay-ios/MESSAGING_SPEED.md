@@ -98,3 +98,8 @@ app/share sends, locked sharing, account replacement and uncertain-response retr
 Build 86 stopped during native compilation because the video-trim audio overlap call omitted
 the Apple CoreMedia `otherRange:` argument label. Build 87 corrects that call without changing
 its validation behavior. Build 86 ran no native tests and produced no signed archive.
+
+Build 87 passed its 226 preflight checks but stopped during native compilation when the
+expanded active-call view exceeded Swift's expression type-checking limit. Build 88 separates
+that view into smaller expressions while preserving its layout, controls and event handling.
+Build 87 ran no native tests and produced no signed archive.

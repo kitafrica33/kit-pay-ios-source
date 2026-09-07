@@ -612,164 +612,209 @@ struct ActiveCallView: View {
 
     var body: some View {
         GeometryReader { geometry in
-            let compactLandscape = CallFloatingSurfaceLayoutPolicy.usesCompactLandscape(
-                container: geometry.size
-            )
-            let headerClearance = CallFloatingSurfaceLayoutPolicy.resolvedActiveCallHeaderClearance(
-                container: geometry.size
-            )
-            let controlsClearance = CallFloatingSurfaceLayoutPolicy.resolvedActiveCallControlsClearance(
-                container: geometry.size
-            )
-            ZStack {
-                callBackground(in: geometry)
-
-                Rectangle()
-                    .fill(.clear)
-                    .contentShape(Rectangle())
-                    .onTapGesture(perform: toggleControls)
-                    .allowsHitTesting(!hasRemoteParticipantGrid)
-
-                if media.remoteVideoTrack == nil,
-                   !hasRemoteParticipantGrid,
-                   let call = coordinator.activeCall {
-                    let avatarSize = CallFloatingSurfaceLayoutPolicy.activeCallAvatarSize(
-                        container: geometry.size
-                    )
-                    VStack(spacing: compactLandscape ? 0 : 16) {
-                        ZStack {
-                            KitVoicePulseRings(
-                                avatarSize: avatarSize,
-                                remoteLevel: media.remoteVoiceLevel,
-                                localLevel: media.localVoiceLevel,
-                                isConnected: coordinator.state == .connected,
-                                reduceMotion: reduceMotion
-                            )
-                            CallParticipantAvatarView(
-                                name: call.participantName,
-                                avatarURL: call.participantAvatarURL,
-                                size: avatarSize
-                            )
-                        }
-                        if !compactLandscape {
-                            VerifiedAccountNameLabel(
-                                designation: call.participantVerification
-                            ) {
-                                Text(call.participantName)
-                                    .font(.title2.bold())
-                                    .foregroundStyle(callForeground)
-                                    .multilineTextAlignment(.center)
-                                    .lineLimit(2)
-                                    .minimumScaleFactor(0.76)
-                            }
-                            .padding(.horizontal, 28)
-                        }
+            callSurfaceWithControlUpdates(in: geometry)
+                .sheet(isPresented: $showsAddParticipant) {
+                    if let activeCall = coordinator.activeCall {
+                        ActiveCallParticipantSheet(activeCall: activeCall)
+                            .environmentObject(model)
                     }
-                    .shadow(color: .black.opacity(0.34), radius: 28, y: 14)
-                    .allowsHitTesting(false)
-                    .accessibilityHidden(true)
                 }
-
-                if controlsAreVisible {
-                    VStack(spacing: 12) {
-                        if let waitingCall = model.waitingCall {
-                            CallWaitingGlassBanner(
-                                callerName: waitingCall.name,
-                                isVideo: waitingCall.video,
-                                isMerging: model.isMergingWaitingCall || model.isSwitchingCalls,
-                                decline: {
-                                    revealControls()
-                                    model.declineWaitingCall()
-                                },
-                                merge: {
-                                    guard !model.isMergingWaitingCall else { return }
-                                    revealControls()
-                                    NotificationCoordinator.shared.requestHoldAndAnswer(callID: waitingCall.callID)
-                                }
-                            )
-                            .transition(.move(edge: .top).combined(with: .opacity))
-                        }
-                        if coordinator.isHeld || coordinator.otherHeldCall != nil {
-                            heldCallBanner
-                        }
-                        callHeader(compactLandscape: compactLandscape)
-                        Spacer(minLength: 24)
-                        if screenSharing.phase != .idle {
-                            screenSharingStatus
-                        }
-                        controlsPanel
+                .sheet(isPresented: $showsInvitationLink) {
+                    if let activeCall = coordinator.activeCall {
+                        ActiveCallInviteLinkSheet(activeCall: activeCall).environmentObject(model)
                     }
-                    .padding(
-                        .leading,
-                        CallFloatingSurfaceLayoutPolicy.activeCallHorizontalPadding(
-                            safeAreaInset: geometry.safeAreaInsets.leading
-                        )
-                    )
-                    .padding(
-                        .trailing,
-                        CallFloatingSurfaceLayoutPolicy.activeCallHorizontalPadding(
-                            safeAreaInset: geometry.safeAreaInsets.trailing
-                        )
-                    )
-                    .padding(.top, max(12, geometry.safeAreaInsets.top + 4))
-                    .padding(.bottom, max(14, geometry.safeAreaInsets.bottom + 8))
-                    .transition(.opacity)
-                    .zIndex(3)
                 }
+        }
+        .preferredColorScheme(hasVideoBackdrop ? .dark : nil)
+        .alert("Share your screen with \(coordinator.activeCall?.participantName ?? "this call")?", isPresented: $confirmsScreenSharing) {
+            Button("Share screen") { coordinator.confirmScreenSharing() }
+            Button("Cancel", role: .cancel) { coordinator.stopScreenSharing() }
+        } message: {
+            Text("Everyone in this call can see your screen, including notifications. Your microphone still follows the call’s Mute control.")
+        }
+    }
 
-                if media.isCameraEnabled,
-                   let localTrack = media.localVideoTrack {
-                    DraggableLocalVideoPreview(
-                        track: localTrack,
-                        isFrontCamera: media.isFrontCamera,
-                        canSwitchCamera: media.canSwitchCamera,
-                        controlsAreVisible: controlsAreVisible,
-                        activeHeaderClearance: headerClearance,
-                        activeControlsClearance: controlsClearance,
-                        corner: $localPreviewCorner,
-                        isDragging: $localPreviewIsDragging,
-                        onTap: toggleControls,
-                        switchCamera: { await coordinator.switchCamera() }
-                    )
-                    .zIndex(model.waitingCall == nil ? 4 : 2)
-                }
+    // Opaque helper boundaries keep each layout and modifier expression small while preserving
+    // the original view hierarchy and the order in which its event handlers are attached.
+    private func callSurface(in geometry: GeometryProxy) -> some View {
+        let compactLandscape = CallFloatingSurfaceLayoutPolicy.usesCompactLandscape(
+            container: geometry.size
+        )
+        let headerClearance = CallFloatingSurfaceLayoutPolicy.resolvedActiveCallHeaderClearance(
+            container: geometry.size
+        )
+        let controlsClearance = CallFloatingSurfaceLayoutPolicy.resolvedActiveCallControlsClearance(
+            container: geometry.size
+        )
+        return ZStack {
+            callBackground(in: geometry)
 
-                if showsMoreControls {
-                    MoreCallControlsOverlay(
-                        selectedMode: media.microphoneMode,
-                        screenSharingPhase: screenSharing.phase,
-                        canStartScreenSharing: isConnected,
-                        isHeld: coordinator.isHeld,
-                        showsInvitationLink: model.capabilities?.supportsFeature("calls_invite_links") == true,
-                        canShareInvitation: model.canManageLiveCallInviteLink(for: coordinator.activeCall),
-                        shareInvitation: {
-                            dismissMoreControls()
-                            showsInvitationLink = true
-                        },
-                        changeHold: {
-                            guard let callID = coordinator.activeCall?.id else { return }
-                            dismissMoreControls()
-                            NotificationCoordinator.shared.requestHeld(!coordinator.isHeld, callID: callID)
-                        },
-                        shareScreen: {
-                            dismissMoreControls()
-                            coordinator.requestScreenSharing()
-                        },
-                        stopScreenSharing: coordinator.stopScreenSharing,
-                        selectMode: { mode in
-                            coordinator.setMicrophoneMode(mode)
-                            dismissMoreControls()
-                        },
-                        dismiss: dismissMoreControls
-                    )
-                    .transition(.opacity.combined(with: .move(edge: .bottom)))
-                    .zIndex(10)
-                }
+            Rectangle()
+                .fill(.clear)
+                .contentShape(Rectangle())
+                .onTapGesture(perform: toggleControls)
+                .allowsHitTesting(!hasRemoteParticipantGrid)
+
+            if media.remoteVideoTrack == nil,
+               !hasRemoteParticipantGrid,
+               let call = coordinator.activeCall {
+                callAvatar(for: call, in: geometry, compactLandscape: compactLandscape)
             }
-            // The backdrop deliberately extends beneath the status area, Dynamic Island/notch,
-            // rounded screen corners, and home indicator. Clipping here would trim every
-            // `ignoresSafeArea` background back to the modal's safe content rectangle.
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            if controlsAreVisible {
+                callControls(in: geometry, compactLandscape: compactLandscape)
+            }
+
+            if media.isCameraEnabled,
+               let localTrack = media.localVideoTrack {
+                DraggableLocalVideoPreview(
+                    track: localTrack,
+                    isFrontCamera: media.isFrontCamera,
+                    canSwitchCamera: media.canSwitchCamera,
+                    controlsAreVisible: controlsAreVisible,
+                    activeHeaderClearance: headerClearance,
+                    activeControlsClearance: controlsClearance,
+                    corner: $localPreviewCorner,
+                    isDragging: $localPreviewIsDragging,
+                    onTap: toggleControls,
+                    switchCamera: { await coordinator.switchCamera() }
+                )
+                .zIndex(model.waitingCall == nil ? 4 : 2)
+            }
+
+            if showsMoreControls {
+                moreControlsOverlay
+            }
+        }
+        // The backdrop deliberately extends beneath the status area, Dynamic Island/notch,
+        // rounded screen corners, and home indicator. Clipping here would trim every
+        // `ignoresSafeArea` background back to the modal's safe content rectangle.
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func callAvatar(
+        for call: ActiveCallPresentation,
+        in geometry: GeometryProxy,
+        compactLandscape: Bool
+    ) -> some View {
+        let avatarSize = CallFloatingSurfaceLayoutPolicy.activeCallAvatarSize(
+            container: geometry.size
+        )
+        return VStack(spacing: compactLandscape ? 0 : 16) {
+            ZStack {
+                KitVoicePulseRings(
+                    avatarSize: avatarSize,
+                    remoteLevel: media.remoteVoiceLevel,
+                    localLevel: media.localVoiceLevel,
+                    isConnected: coordinator.state == .connected,
+                    reduceMotion: reduceMotion
+                )
+                CallParticipantAvatarView(
+                    name: call.participantName,
+                    avatarURL: call.participantAvatarURL,
+                    size: avatarSize
+                )
+            }
+            if !compactLandscape {
+                VerifiedAccountNameLabel(
+                    designation: call.participantVerification
+                ) {
+                    Text(call.participantName)
+                        .font(.title2.bold())
+                        .foregroundStyle(callForeground)
+                        .multilineTextAlignment(.center)
+                        .lineLimit(2)
+                        .minimumScaleFactor(0.76)
+                }
+                .padding(.horizontal, 28)
+            }
+        }
+        .shadow(color: .black.opacity(0.34), radius: 28, y: 14)
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+
+    private func callControls(in geometry: GeometryProxy, compactLandscape: Bool) -> some View {
+        VStack(spacing: 12) {
+            if let waitingCall = model.waitingCall {
+                CallWaitingGlassBanner(
+                    callerName: waitingCall.name,
+                    isVideo: waitingCall.video,
+                    isMerging: model.isMergingWaitingCall || model.isSwitchingCalls,
+                    decline: {
+                        revealControls()
+                        model.declineWaitingCall()
+                    },
+                    merge: {
+                        guard !model.isMergingWaitingCall else { return }
+                        revealControls()
+                        NotificationCoordinator.shared.requestHoldAndAnswer(callID: waitingCall.callID)
+                    }
+                )
+                .transition(.move(edge: .top).combined(with: .opacity))
+            }
+            if coordinator.isHeld || coordinator.otherHeldCall != nil {
+                heldCallBanner
+            }
+            callHeader(compactLandscape: compactLandscape)
+            Spacer(minLength: 24)
+            if screenSharing.phase != .idle {
+                screenSharingStatus
+            }
+            controlsPanel
+        }
+        .padding(
+            .leading,
+            CallFloatingSurfaceLayoutPolicy.activeCallHorizontalPadding(
+                safeAreaInset: geometry.safeAreaInsets.leading
+            )
+        )
+        .padding(
+            .trailing,
+            CallFloatingSurfaceLayoutPolicy.activeCallHorizontalPadding(
+                safeAreaInset: geometry.safeAreaInsets.trailing
+            )
+        )
+        .padding(.top, max(12, geometry.safeAreaInsets.top + 4))
+        .padding(.bottom, max(14, geometry.safeAreaInsets.bottom + 8))
+        .transition(.opacity)
+        .zIndex(3)
+    }
+
+    private var moreControlsOverlay: some View {
+        MoreCallControlsOverlay(
+            selectedMode: media.microphoneMode,
+            screenSharingPhase: screenSharing.phase,
+            canStartScreenSharing: isConnected,
+            isHeld: coordinator.isHeld,
+            showsInvitationLink: model.capabilities?.supportsFeature("calls_invite_links") == true,
+            canShareInvitation: model.canManageLiveCallInviteLink(for: coordinator.activeCall),
+            shareInvitation: {
+                dismissMoreControls()
+                showsInvitationLink = true
+            },
+            changeHold: {
+                guard let callID = coordinator.activeCall?.id else { return }
+                dismissMoreControls()
+                NotificationCoordinator.shared.requestHeld(!coordinator.isHeld, callID: callID)
+            },
+            shareScreen: {
+                dismissMoreControls()
+                coordinator.requestScreenSharing()
+            },
+            stopScreenSharing: coordinator.stopScreenSharing,
+            selectMode: { mode in
+                coordinator.setMicrophoneMode(mode)
+                dismissMoreControls()
+            },
+            dismiss: dismissMoreControls
+        )
+        .transition(.opacity.combined(with: .move(edge: .bottom)))
+        .zIndex(10)
+    }
+
+    private func callSurfaceWithMediaUpdates(in geometry: GeometryProxy) -> some View {
+        callSurface(in: geometry)
             .onAppear {
                 revealControls()
                 if screenSharing.phase == .awaitingConfirmation { confirmsScreenSharing = true }
@@ -786,6 +831,10 @@ struct ActiveCallView: View {
             // Plugging in headphones or connecting a car kit changes what the audio control means.
             // Surface the chrome so the new route is visible instead of changing under hidden UI.
             .onChange(of: media.audioRoute) { _, _ in revealControls() }
+    }
+
+    private func callSurfaceWithEnvironmentUpdates(in geometry: GeometryProxy) -> some View {
+        callSurfaceWithMediaUpdates(in: geometry)
             .onChange(of: scenePhase) { _, phase in
                 if phase == .active {
                     revealControls()
@@ -805,6 +854,10 @@ struct ActiveCallView: View {
                 revealControls()
             }
             .onChange(of: model.isMergingWaitingCall) { _, _ in revealControls() }
+    }
+
+    private func callSurfaceWithControlUpdates(in geometry: GeometryProxy) -> some View {
+        callSurfaceWithEnvironmentUpdates(in: geometry)
             .onChange(of: showsAddParticipant) { _, isPresented in
                 if isPresented {
                     autoHideGeneration &+= 1
@@ -827,25 +880,6 @@ struct ActiveCallView: View {
             .task(id: autoHideGeneration) {
                 await autoHideControlsIfNeeded()
             }
-            .sheet(isPresented: $showsAddParticipant) {
-                if let activeCall = coordinator.activeCall {
-                    ActiveCallParticipantSheet(activeCall: activeCall)
-                        .environmentObject(model)
-                }
-            }
-            .sheet(isPresented: $showsInvitationLink) {
-                if let activeCall = coordinator.activeCall {
-                    ActiveCallInviteLinkSheet(activeCall: activeCall).environmentObject(model)
-                }
-            }
-        }
-        .preferredColorScheme(hasVideoBackdrop ? .dark : nil)
-        .alert("Share your screen with \(coordinator.activeCall?.participantName ?? "this call")?", isPresented: $confirmsScreenSharing) {
-            Button("Share screen") { coordinator.confirmScreenSharing() }
-            Button("Cancel", role: .cancel) { coordinator.stopScreenSharing() }
-        } message: {
-            Text("Everyone in this call can see your screen, including notifications. Your microphone still follows the call’s Mute control.")
-        }
     }
 
     @ViewBuilder
