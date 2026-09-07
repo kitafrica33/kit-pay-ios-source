@@ -109,3 +109,9 @@ stopped at the simulator messaging-entitlement check before running tests. Xcode
 simulator signing prefix and embeds simulated entitlements in the executable. Build 89 corrects
 that validation while retaining the exact private/shared messaging isolation and distribution
 signing requirements. Build 88 produced no signed distribution archive or upload.
+
+Build 89 passed native compilation and the corrected simulator entitlement check. Its focused
+native invocation passed 37 of 38 tests; the received-video test failed while generating a
+synthetic input. Build 90 stabilizes that test input while retaining
+full-length playback, decoded-frame, replay and file-lifetime assertions. The remaining native
+suite, signed archive and upload did not run for build 89.

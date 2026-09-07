@@ -3647,73 +3647,203 @@ final class ChatMediaPolicyTests: XCTestCase {
         }.map(\.path))
     }
 
+    // Playback fixtures are encoded offline so this test does not depend on a Simulator
+    // encoder becoming ready. The callers still use real AVPlayer decoding, completion,
+    // replay, seeking and leased-file cleanup. Each invocation gets its own writable file.
     private func makePlayableVideo(
         fileType: AVFileType,
         pathExtension: String,
         frameCount: Int = 2,
         framesPerSecond: Int32 = 1
     ) async throws -> URL {
+        guard (fileType == .mp4 && pathExtension == "mp4")
+                || (fileType == .mov && pathExtension == "mov")
+        else { throw PlayableVideoFixtureError.unsupportedConfiguration }
+        let encoded: String
+        switch (frameCount, framesPerSecond) {
+        case (2, 1):
+            encoded = fileType == .mp4 ? Self.twoFrameMP4 : Self.twoFrameMOV
+        case (72, 24):
+            encoded = fileType == .mp4 ? Self.threeSecondMP4 : Self.threeSecondMOV
+        default:
+            throw PlayableVideoFixtureError.unsupportedConfiguration
+        }
+        guard let data = Data(base64Encoded: encoded.filter { !$0.isWhitespace }) else {
+            throw PlayableVideoFixtureError.corruptEmbeddedData
+        }
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(
             "kit-playback-probe-\(UUID().uuidString).\(pathExtension)"
         )
-        let writer = try AVAssetWriter(outputURL: url, fileType: fileType)
-        let input = AVAssetWriterInput(
-            mediaType: .video,
-            outputSettings: [
-                AVVideoCodecKey: AVVideoCodecType.h264,
-                AVVideoWidthKey: 16,
-                AVVideoHeightKey: 16,
-            ]
-        )
-        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
-            assetWriterInput: input,
-            sourcePixelBufferAttributes: [
-                kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
-                kCVPixelBufferWidthKey as String: 16,
-                kCVPixelBufferHeightKey as String: 16,
-            ]
-        )
-        guard writer.canAdd(input) else {
-            throw ChatVideoPlaybackPreparationError.unsupportedVideo
-        }
-        writer.add(input)
-        guard writer.startWriting() else {
-            throw writer.error ?? ChatVideoPlaybackPreparationError.unsupportedVideo
-        }
-        writer.startSession(atSourceTime: .zero)
-        guard let pool = adaptor.pixelBufferPool else {
-            throw ChatVideoPlaybackPreparationError.unsupportedVideo
-        }
-        var buffer: CVPixelBuffer?
-        guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &buffer) == kCVReturnSuccess,
-              let buffer
-        else { throw ChatVideoPlaybackPreparationError.unsupportedVideo }
-        CVPixelBufferLockBaseAddress(buffer, [])
-        if let base = CVPixelBufferGetBaseAddress(buffer) {
-            memset(base, 0, CVPixelBufferGetDataSize(buffer))
-        }
-        CVPixelBufferUnlockBaseAddress(buffer, [])
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: .seconds(5))
-        for frame in 0 ..< frameCount {
-            while !input.isReadyForMoreMediaData, writer.status == .writing, clock.now < deadline {
-                try await Task.sleep(for: .milliseconds(5))
-            }
-            guard input.isReadyForMoreMediaData,
-                  adaptor.append(
-                      buffer,
-                      withPresentationTime: CMTime(value: Int64(frame), timescale: framesPerSecond)
-                  )
-            else { throw writer.error ?? ChatVideoPlaybackPreparationError.unsupportedVideo }
-        }
-        writer.endSession(atSourceTime: CMTime(value: Int64(frameCount), timescale: framesPerSecond))
-        input.markAsFinished()
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            writer.finishWriting { continuation.resume() }
-        }
-        guard writer.status == .completed else {
-            throw writer.error ?? ChatVideoPlaybackPreparationError.unsupportedVideo
-        }
+        try data.write(to: url, options: .atomic)
         return url
     }
+
+    private enum PlayableVideoFixtureError: Error {
+        case unsupportedConfiguration
+        case corruptEmbeddedData
+    }
+
+    // Synthetic 64x64 grayscale ramps, H.264 Constrained Baseline / yuv420p, no audio
+    // or B frames. Full frame decoding and timestamps were verified with ffprobe/ffmpeg.
+    // The MP4 major brand is isom; MOV is qt, preserving the mislabeled-QuickTime cases.
+    // Generated offline with ffmpeg/libx264, -preset veryslow -tune zerolatency
+    // -profile:v baseline -level:v 1.0 -crf 20 -threads 1 -movflags +faststart;
+    // source: color=c=black:s=64x64:r=RATE,geq=lum=16+N*2:cb=128:cr=128.
+
+    // gray-ramp-2frames-1fps.mp4; SHA256 956b94ff9f508d70649fbe264a6999b89888af86da553f9269e654ccbc1b2f8e
+    private static let twoFrameMP4 = """
+        AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAALybW9vdgAAAGxtdmhkAAAAAAAAAAAAAAAAAAAD6AAAB9AAAQAAAQAA
+        AAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAA
+        AkF0cmFrAAAAXHRraGQAAAADAAAAAAAAAAAAAAABAAAAAAAAB9AAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAA
+        AAAAAAAAAAAAAABAAAAAAEAAAABAAAAAAAAkZWR0cwAAABxlbHN0AAAAAAAAAAEAAAfQAAAAAAABAAAAAAG5bWRpYQAAACBtZGhk
+        AAAAAAAAAAAAAAAAAABdwAAAu4BVxAAAAAAALWhkbHIAAAAAAAAAAHZpZGUAAAAAAAAAAAAAAABWaWRlb0hhbmRsZXIAAAABZG1p
+        bmYAAAAUdm1oZAAAAAEAAAAAAAAAAAAAACRkaW5mAAAAHGRyZWYAAAAAAAAAAQAAAAx1cmwgAAAAAQAAASRzdGJsAAAAuHN0c2QA
+        AAAAAAAAAQAAAKhhdmMxAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAEAAQABIAAAASAAAAAAAAAABDExhdmMgbGlieDI2NAAAAAAA
+        AAAAAAAAAAAAAAAAAAAAGP//AAAALmF2Y0MBQsAK/+EAFmdCwArcQmwEQAAAAwBAAAADAKPEieABAAVozgbLIAAAABBwYXNwAAAA
+        AQAAAAEAAAAUYnRydAAAAAAAAAp8AAAKfAAAABhzdHRzAAAAAAAAAAEAAAACAABdwAAAABxzdHNjAAAAAAAAAAEAAAABAAAAAgAA
+        AAEAAAAcc3RzegAAAAAAAAAAAAAAAgAAAoEAAAAeAAAAFHN0Y28AAAAAAAAAAQAAAyIAAAA9dWR0YQAAADVtZXRhAAAAAAAAACFo
+        ZGxyAAAAAAAAAABtZGlyYXBwbAAAAAAAAAAAAAAAAAhpbHN0AAAACGZyZWUAAAKnbWRhdAAAAl8GBf//W9xF6b3m2Ui3lizYINkj
+        7u94MjY0IC0gY29yZSAxNjQgcjMxMDggMzFlMTlmOSAtIEguMjY0L01QRUctNCBBVkMgY29kZWMgLSBDb3B5bGVmdCAyMDAzLTIw
+        MjMgLSBodHRwOi8vd3d3LnZpZGVvbGFuLm9yZy94MjY0Lmh0bWwgLSBvcHRpb25zOiBjYWJhYz0wIHJlZj0xIGRlYmxvY2s9MTow
+        OjAgYW5hbHlzZT0weDE6MHgxMzEgbWU9dW1oIHN1Ym1lPTEwIHBzeT0xIHBzeV9yZD0xLjAwOjAuMDAgbWl4ZWRfcmVmPTAgbWVf
+        cmFuZ2U9MjQgY2hyb21hX21lPTEgdHJlbGxpcz0yIDh4OGRjdD0wIGNxbT0wIGRlYWR6b25lPTIxLDExIGZhc3RfcHNraXA9MSBj
+        aHJvbWFfcXBfb2Zmc2V0PS0yIHRocmVhZHM9MSBsb29rYWhlYWRfdGhyZWFkcz0xIHNsaWNlZF90aHJlYWRzPTAgbnI9MCBkZWNp
+        bWF0ZT0xIGludGVybGFjZWQ9MCBibHVyYXlfY29tcGF0PTAgY29uc3RyYWluZWRfaW50cmE9MCBiZnJhbWVzPTAgd2VpZ2h0cD0w
+        IGtleWludD0xIGtleWludF9taW49MSBzY2VuZWN1dD00MCBpbnRyYV9yZWZyZXNoPTAgcmM9Y3JmIG1idHJlZT0wIGNyZj0yMC4w
+        IHFjb21wPTAuNjAgcXBtaW49MCBxcG1heD02OSBxcHN0ZXA9NCBpcF9yYXRpbz0xLjQwIGFxPTE6MS4wMACAAAAAGmWIhAS///8P
+        RQABQt8nJyddddddddddddeAAAAAGmWIggFP///D0UAAVX/JycnXXXXXXXXXXXXg
+        """
+
+    // gray-ramp-2frames-1fps.mov; SHA256 34814e3490722d5ae259806f6c6cdbd30aee5a49f6cce0e6dc8abc09d26bb6b9
+    private static let twoFrameMOV = """
+        AAAAFGZ0eXBxdCAgAAACAHF0ICAAAALNbW9vdgAAAGxtdmhkAAAAAAAAAAAAAAAAAAAD6AAAB9AAAQAAAQAAAAAAAAAAAAAAAAEA
+        AAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAAll0cmFrAAAAXHRr
+        aGQAAAADAAAAAAAAAAAAAAABAAAAAAAAB9AAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABA
+        AAAAAEAAAABAAAAAAAAkZWR0cwAAABxlbHN0AAAAAAAAAAEAAAfQAAAAAAABAAAAAAHRbWRpYQAAACBtZGhkAAAAAAAAAAAAAAAA
+        AABdwAAAu4B//wAAAAAALWhkbHIAAAAAbWhscnZpZGUAAAAAAAAAAAAAAAAMVmlkZW9IYW5kbGVyAAABfG1pbmYAAAAUdm1oZAAA
+        AAEAAAAAAAAAAAAAACxoZGxyAAAAAGRobHJ1cmwgAAAAAAAAAAAAAAAAC0RhdGFIYW5kbGVyAAAAJGRpbmYAAAAcZHJlZgAAAAAA
+        AAABAAAADHVybCAAAAABAAABEHN0YmwAAACkc3RzZAAAAAAAAAABAAAAlGF2YzEAAAAAAAAAAQAAAABGRk1QAAACAAAAAgAAQABA
+        AEgAAABIAAAAAAAAAAEMTGF2YyBsaWJ4MjY0AAAAAAAAAAAAAAAAAAAAAAAAAAAY//8AAAAuYXZjQwFCwAr/4QAWZ0LACtxCbARA
+        AAADAEAAAAMAo8SJ4AEABWjOBssgAAAAEHBhc3AAAAABAAAAAQAAABhzdHRzAAAAAAAAAAEAAAACAABdwAAAABxzdHNjAAAAAAAA
+        AAEAAAABAAAAAgAAAAEAAAAcc3RzegAAAAAAAAAAAAAAAgAAAoEAAAAeAAAAFHN0Y28AAAAAAAAAAQAAAvEAAAAId2lkZQAAAqdt
+        ZGF0AAACXwYF//9b3EXpvebZSLeWLNgg2SPu73gyNjQgLSBjb3JlIDE2NCByMzEwOCAzMWUxOWY5IC0gSC4yNjQvTVBFRy00IEFW
+        QyBjb2RlYyAtIENvcHlsZWZ0IDIwMDMtMjAyMyAtIGh0dHA6Ly93d3cudmlkZW9sYW4ub3JnL3gyNjQuaHRtbCAtIG9wdGlvbnM6
+        IGNhYmFjPTAgcmVmPTEgZGVibG9jaz0xOjA6MCBhbmFseXNlPTB4MToweDEzMSBtZT11bWggc3VibWU9MTAgcHN5PTEgcHN5X3Jk
+        PTEuMDA6MC4wMCBtaXhlZF9yZWY9MCBtZV9yYW5nZT0yNCBjaHJvbWFfbWU9MSB0cmVsbGlzPTIgOHg4ZGN0PTAgY3FtPTAgZGVh
+        ZHpvbmU9MjEsMTEgZmFzdF9wc2tpcD0xIGNocm9tYV9xcF9vZmZzZXQ9LTIgdGhyZWFkcz0xIGxvb2thaGVhZF90aHJlYWRzPTEg
+        c2xpY2VkX3RocmVhZHM9MCBucj0wIGRlY2ltYXRlPTEgaW50ZXJsYWNlZD0wIGJsdXJheV9jb21wYXQ9MCBjb25zdHJhaW5lZF9p
+        bnRyYT0wIGJmcmFtZXM9MCB3ZWlnaHRwPTAga2V5aW50PTEga2V5aW50X21pbj0xIHNjZW5lY3V0PTQwIGludHJhX3JlZnJlc2g9
+        MCByYz1jcmYgbWJ0cmVlPTAgY3JmPTIwLjAgcWNvbXA9MC42MCBxcG1pbj0wIHFwbWF4PTY5IHFwc3RlcD00IGlwX3JhdGlvPTEu
+        NDAgYXE9MToxLjAwAIAAAAAaZYiEBL///w9FAAFC3ycnJ1111111111114AAAAAaZYiCAU///8PRQABVf8nJyddddddddddddeA=
+        """
+
+    // gray-ramp-72frames-24fps.mp4; SHA256 c2cda5cb57a6234c915c9ed45851047e4f68929721b82f96404f1d98d04dda05
+    private static let threeSecondMP4 = """
+        AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAStbW9vdgAAAGxtdmhkAAAAAAAAAAAAAAAAAAAD6AAAC7gAAQAAAQAA
+        AAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAA
+        A/x0cmFrAAAAXHRraGQAAAADAAAAAAAAAAAAAAABAAAAAAAAC7gAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAA
+        AAAAAAAAAAAAAABAAAAAAEAAAABAAAAAAAAkZWR0cwAAABxlbHN0AAAAAAAAAAEAAAu4AAAAAAABAAAAAAN0bWRpYQAAACBtZGhk
+        AAAAAAAAAAAAAAAAAABdwAABGUBVxAAAAAAALWhkbHIAAAAAAAAAAHZpZGUAAAAAAAAAAAAAAABWaWRlb0hhbmRsZXIAAAADH21p
+        bmYAAAAUdm1oZAAAAAEAAAAAAAAAAAAAACRkaW5mAAAAHGRyZWYAAAAAAAAAAQAAAAx1cmwgAAAAAQAAAt9zdGJsAAAAu3N0c2QA
+        AAAAAAAAAQAAAKthdmMxAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAEAAQABIAAAASAAAAAAAAAABDExhdmMgbGlieDI2NAAAAAAA
+        AAAAAAAAAAAAAAAAAAAAGP//AAAAMWF2Y0MBQsAK/+EAGGdCwAqmERCbARAAAAMAEAAAAwMI8SJhGAEABmjIQgbLIAAAABBwYXNw
+        AAAAAQAAAAEAAAAUYnRydAAAAAAAABq1AAAatQAAABhzdHRzAAAAAAAAAAEAAABIAAAD6AAAAKBzdHNzAAAAAAAAACQAAAABAAAA
+        AwAAAAUAAAAHAAAACQAAAAsAAAANAAAADwAAABEAAAATAAAAFQAAABcAAAAZAAAAGwAAAB0AAAAfAAAAIQAAACMAAAAlAAAAJwAA
+        ACkAAAArAAAALQAAAC8AAAAxAAAAMwAAADUAAAA3AAAAOQAAADsAAAA9AAAAPwAAAEEAAABDAAAARQAAAEcAAAAcc3RzYwAAAAAA
+        AAABAAAAAQAAAEgAAAABAAABNHN0c3oAAAAAAAAAAAAAAEgAAAKDAAAAHQAAAB4AAAAdAAAAHgAAAB0AAAAeAAAAHQAAAB4AAAAd
+        AAAAHgAAAB0AAAAeAAAAHQAAAB4AAAAdAAAAGwAAABoAAAAbAAAAGgAAABsAAAAaAAAAGwAAABoAAAAbAAAAGgAAABsAAAAaAAAA
+        GwAAABoAAAAbAAAAGgAAABsAAAAaAAAAGwAAABoAAAAbAAAAGgAAABsAAAAaAAAAGwAAABoAAAAbAAAAGgAAABsAAAAaAAAAGwAA
+        ABoAAAAbAAAAGgAAABsAAAAaAAAAGwAAABoAAAAbAAAAGgAAABYAAAAaAAAAGwAAABoAAAAbAAAAGgAAABsAAAAaAAAAGwAAABoA
+        AAAbAAAAGgAAABsAAAAaAAAAGwAAABoAAAAUc3RjbwAAAAAAAAABAAAE3QAAAD11ZHRhAAAANW1ldGEAAAAAAAAAIWhkbHIAAAAA
+        AAAAAG1kaXJhcHBsAAAAAAAAAAAAAAAACGlsc3QAAAAIZnJlZQAACgxtZGF0AAACYQYF//9d3EXpvebZSLeWLNgg2SPu73gyNjQg
+        LSBjb3JlIDE2NCByMzEwOCAzMWUxOWY5IC0gSC4yNjQvTVBFRy00IEFWQyBjb2RlYyAtIENvcHlsZWZ0IDIwMDMtMjAyMyAtIGh0
+        dHA6Ly93d3cudmlkZW9sYW4ub3JnL3gyNjQuaHRtbCAtIG9wdGlvbnM6IGNhYmFjPTAgcmVmPTE2IGRlYmxvY2s9MTowOjAgYW5h
+        bHlzZT0weDE6MHgxMzEgbWU9dW1oIHN1Ym1lPTEwIHBzeT0xIHBzeV9yZD0xLjAwOjAuMDAgbWl4ZWRfcmVmPTEgbWVfcmFuZ2U9
+        MjQgY2hyb21hX21lPTEgdHJlbGxpcz0yIDh4OGRjdD0wIGNxbT0wIGRlYWR6b25lPTIxLDExIGZhc3RfcHNraXA9MSBjaHJvbWFf
+        cXBfb2Zmc2V0PS0yIHRocmVhZHM9MSBsb29rYWhlYWRfdGhyZWFkcz0xIHNsaWNlZF90aHJlYWRzPTAgbnI9MCBkZWNpbWF0ZT0x
+        IGludGVybGFjZWQ9MCBibHVyYXlfY29tcGF0PTAgY29uc3RyYWluZWRfaW50cmE9MCBiZnJhbWVzPTAgd2VpZ2h0cD0wIGtleWlu
+        dD0yNCBrZXlpbnRfbWluPTIgc2NlbmVjdXQ9NDAgaW50cmFfcmVmcmVzaD0wIHJjPWNyZiBtYnRyZWU9MCBjcmY9MjAuMCBxY29t
+        cD0wLjYwIHFwbWluPTAgcXBtYXg9NjkgcXBzdGVwPTQgaXBfcmF0aW89MS40MCBhcT0xOjEuMDAAgAAAABpliIICX///h6KAAKFv
+        k5OTrrrrrrrrrrrrwAAAABlBiIQKf//+HooAAqv+Tk5OuuuuuuuuuuuvAAAAGmWIgQCn///h6KAAKovk5OTrrrrrrrrrrrrwAAAA
+        GUGIhAp///4eigACpX5OTk6666666666668AAAAaZYiCAp///4eigACoj5OTk6666666666668AAAAAZQYiECn///h6KAAKfPk5O
+        TrrrrrrrrrrrrwAAABpliIEAp///4eigACm/5OTk6666666666668AAAABlBiIQKf//+HooAApi+Tk5OuuuuuuuuuuuvAAAAGmWI
+        ggKf//+HooAApV+Tk5OuuuuuuuuuuuvAAAAAGUGIhAp///4eigACkj5OTk6666666666668AAAAaZYiBAKf//+HooAAo8+Tk5Ouu
+        uuuuuuuuuvAAAAAZQYiECn///h6KAAKL/k5OTrrrrrrrrrrrrwAAABpliIICn///h6KAAKIvk5OTrrrrrrrrrrrrwAAAABlBiIQK
+        f//+HooAAoV+Tk5OuuuuuuuuuuuvAAAAGmWIgQCn///h6KAAKCPk5OTrrrrrrrrrrrrwAAAAGUGIhAp///4eigACfz5OTk666666
+        6666668AAAAXZYiCAp5MUAAf35OTk6666666666668AAAAAWQYiECnkxQAB95k5OTrrrrrrrrrrrrwAAABdliIEAp5MUAAfE5OTk
+        6666666666668AAAABZBiIQKeTFAAHquTk5OuuuuuuuuuuuvAAAAF2WIggKeTFAAHkWTk5OuuuuuuuuuuuvAAAAAFkGIhAp5MUAA
+        d35OTk6666666666668AAAAXZYiBAKeTFAAHXmTk5OuuuuuuuuuuuvAAAAAWQYiECnkxQAB0Tk5OTrrrrrrrrrrrrwAAABdliIIC
+        nkxQAByrk5OTrrrrrrrrrrrrwAAAABZBiIQKeTFAAHEWTk5OuuuuuuuuuuuvAAAAF2WIgQCnkxQABvfk5OTrrrrrrrrrrrrwAAAA
+        FkGIhAp5MUAAbeZOTk6666666666668AAAAXZYiCAp5MUAAbE5OTk6666666666668AAAAAWQYiECnkxQABqrk5OTrrrrrrrrrrr
+        rwAAABdliIEAp5MUAAaRZOTk6666666666668AAAABZBiIQKeTFAAGd+Tk5OuuuuuuuuuuuvAAAAF2WIggKeTFAAGXmTk5Ouuuuu
+        uuuuuuvAAAAAFkGIhAp5MUAAZE5OTk6666666666668AAAAXZYiBAKeTFAAGKuTk5OuuuuuuuuuuuvAAAAAWQYiECnkxQABhFk5O
+        TrrrrrrrrrrrrwAAABdliIICnkxQABffk5OTrrrrrrrrrrrrwAAAABZBiIQKeTFAAF3mTk5OuuuuuuuuuuuvAAAAF2WIgQCnkxQA
+        BcTk5OTrrrrrrrrrrrrwAAAAFkGIhAp5MUAAWq5OTk6666666666668AAAAXZYiCAp5MUAAWRZOTk6666666666668AAAAAWQYiE
+        CnkxQABXfk5OTrrrrrrrrrrrrwAAABdliIEAp5MUAAVeZOTk6666666666668AAAABZBiIQKeTFAAFROTk5OuuuuuuuuuuuvAAAA
+        F2WIggKeTFAAFKuTk5OuuuuuuuuuuuvAAAAAFkGIhAp5MUAAURZOTk6666666666668AAAAXZYiBAKeTFAAE9+Tk5Ouuuuuuuuuu
+        uvAAAAAWQYiECnkxQABN5k5OTrrrrrrrrrrrrwAAABdliIICnkxQABMTk5OTrrrrrrrrrrrrwAAAABZBiIQKeTFAAEquTk5Ouuuu
+        uuuuuuuvAAAAF2WIgQCnkxQABJFk5OTrrrrrrrrrrrrwAAAAFkGIhAp5MUAAR35OTk6666666666668AAAAXZYiCAp5MUAAReZOT
+        k6666666666668AAAAAWQYiECnkxQABETk5OTrrrrrrrrrrrrwAAABdliIEAp5MUAAQq5OTk6666666666668AAAABZBiIQKeTFA
+        AEEWTk5OuuuuuuuuuuuvAAAAEmWIggKeTk5OTrrrrrrrrrrrrwAAABZBiIQKeTFAAEESTk5OuuuuuuuuuuuvAAAAF2WIgQCnkxQA
+        BCqk5OTrrrrrrrrrrrrwAAAAFkGIhAp5MUAAREpOTk6666666666668AAAAXZYiCAp5MUAAReJOTk6666666666668AAAAAWQYiE
+        CnkxQABHek5OTrrrrrrrrrrrrwAAABdliIEAp5MUAASRJOTk6666666666668AAAABZBiIQKeTFAAEqqTk5OuuuuuuuuuuuvAAAA
+        F2WIggKeTFAAExKTk5OuuuuuuuuuuuvAAAAAFkGIhAp5MUAATeJOTk6666666666668AAAAXZYiBAKeTFAAE96Tk5Ouuuuuuuuuu
+        uvAAAAAWQYiECnkxQABREk5OTrrrrrrrrrrrrwAAABdliIICnkxQABSqk5OTrrrrrrrrrrrrwAAAABZBiIQKeTFAAFRKTk5Ouuuu
+        uuuuuuuvAAAAF2WIgQCnkxQABV4k5OTrrrrrrrrrrrrwAAAAFkGIhAp5MUAAV3pOTk6666666666668=
+        """
+
+    // gray-ramp-72frames-24fps.mov; SHA256 43f0da8c65f103018fe4a0f76a1c730ce320838462cedb26ef2156a650227861
+    private static let threeSecondMOV = """
+        AAAAFGZ0eXBxdCAgAAACAHF0ICAAAASIbW9vdgAAAGxtdmhkAAAAAAAAAAAAAAAAAAAD6AAAC7gAAQAAAQAAAAAAAAAAAAAAAAEA
+        AAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAABBR0cmFrAAAAXHRr
+        aGQAAAADAAAAAAAAAAAAAAABAAAAAAAAC7gAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABA
+        AAAAAEAAAABAAAAAAAAkZWR0cwAAABxlbHN0AAAAAAAAAAEAAAu4AAAAAAABAAAAAAOMbWRpYQAAACBtZGhkAAAAAAAAAAAAAAAA
+        AABdwAABGUB//wAAAAAALWhkbHIAAAAAbWhscnZpZGUAAAAAAAAAAAAAAAAMVmlkZW9IYW5kbGVyAAADN21pbmYAAAAUdm1oZAAA
+        AAEAAAAAAAAAAAAAACxoZGxyAAAAAGRobHJ1cmwgAAAAAAAAAAAAAAAAC0RhdGFIYW5kbGVyAAAAJGRpbmYAAAAcZHJlZgAAAAAA
+        AAABAAAADHVybCAAAAABAAACy3N0YmwAAACnc3RzZAAAAAAAAAABAAAAl2F2YzEAAAAAAAAAAQAAAABGRk1QAAACAAAAAgAAQABA
+        AEgAAABIAAAAAAAAAAEMTGF2YyBsaWJ4MjY0AAAAAAAAAAAAAAAAAAAAAAAAAAAY//8AAAAxYXZjQwFCwAr/4QAYZ0LACqYREJsB
+        EAAAAwAQAAADAwjxImEYAQAGaMhCBssgAAAAEHBhc3AAAAABAAAAAQAAABhzdHRzAAAAAAAAAAEAAABIAAAD6AAAAKBzdHNzAAAA
+        AAAAACQAAAABAAAAAwAAAAUAAAAHAAAACQAAAAsAAAANAAAADwAAABEAAAATAAAAFQAAABcAAAAZAAAAGwAAAB0AAAAfAAAAIQAA
+        ACMAAAAlAAAAJwAAACkAAAArAAAALQAAAC8AAAAxAAAAMwAAADUAAAA3AAAAOQAAADsAAAA9AAAAPwAAAEEAAABDAAAARQAAAEcA
+        AAAcc3RzYwAAAAAAAAABAAAAAQAAAEgAAAABAAABNHN0c3oAAAAAAAAAAAAAAEgAAAKDAAAAHQAAAB4AAAAdAAAAHgAAAB0AAAAe
+        AAAAHQAAAB4AAAAdAAAAHgAAAB0AAAAeAAAAHQAAAB4AAAAdAAAAGwAAABoAAAAbAAAAGgAAABsAAAAaAAAAGwAAABoAAAAbAAAA
+        GgAAABsAAAAaAAAAGwAAABoAAAAbAAAAGgAAABsAAAAaAAAAGwAAABoAAAAbAAAAGgAAABsAAAAaAAAAGwAAABoAAAAbAAAAGgAA
+        ABsAAAAaAAAAGwAAABoAAAAbAAAAGgAAABsAAAAaAAAAGwAAABoAAAAbAAAAGgAAABYAAAAaAAAAGwAAABoAAAAbAAAAGgAAABsA
+        AAAaAAAAGwAAABoAAAAbAAAAGgAAABsAAAAaAAAAGwAAABoAAAAUc3RjbwAAAAAAAAABAAAErAAAAAh3aWRlAAAKDG1kYXQAAAJh
+        BgX//13cRem95tlIt5Ys2CDZI+7veDI2NCAtIGNvcmUgMTY0IHIzMTA4IDMxZTE5ZjkgLSBILjI2NC9NUEVHLTQgQVZDIGNvZGVj
+        IC0gQ29weWxlZnQgMjAwMy0yMDIzIC0gaHR0cDovL3d3dy52aWRlb2xhbi5vcmcveDI2NC5odG1sIC0gb3B0aW9uczogY2FiYWM9
+        MCByZWY9MTYgZGVibG9jaz0xOjA6MCBhbmFseXNlPTB4MToweDEzMSBtZT11bWggc3VibWU9MTAgcHN5PTEgcHN5X3JkPTEuMDA6
+        MC4wMCBtaXhlZF9yZWY9MSBtZV9yYW5nZT0yNCBjaHJvbWFfbWU9MSB0cmVsbGlzPTIgOHg4ZGN0PTAgY3FtPTAgZGVhZHpvbmU9
+        MjEsMTEgZmFzdF9wc2tpcD0xIGNocm9tYV9xcF9vZmZzZXQ9LTIgdGhyZWFkcz0xIGxvb2thaGVhZF90aHJlYWRzPTEgc2xpY2Vk
+        X3RocmVhZHM9MCBucj0wIGRlY2ltYXRlPTEgaW50ZXJsYWNlZD0wIGJsdXJheV9jb21wYXQ9MCBjb25zdHJhaW5lZF9pbnRyYT0w
+        IGJmcmFtZXM9MCB3ZWlnaHRwPTAga2V5aW50PTI0IGtleWludF9taW49MiBzY2VuZWN1dD00MCBpbnRyYV9yZWZyZXNoPTAgcmM9
+        Y3JmIG1idHJlZT0wIGNyZj0yMC4wIHFjb21wPTAuNjAgcXBtaW49MCBxcG1heD02OSBxcHN0ZXA9NCBpcF9yYXRpbz0xLjQwIGFx
+        PTE6MS4wMACAAAAAGmWIggJf//+HooAAoW+Tk5OuuuuuuuuuuuvAAAAAGUGIhAp///4eigACq/5OTk6666666666668AAAAaZYiB
+        AKf//+HooAAqi+Tk5OuuuuuuuuuuuvAAAAAZQYiECn///h6KAAKlfk5OTrrrrrrrrrrrrwAAABpliIICn///h6KAAKiPk5OTrrrr
+        rrrrrrrrwAAAABlBiIQKf//+HooAAp8+Tk5OuuuuuuuuuuuvAAAAGmWIgQCn///h6KAAKb/k5OTrrrrrrrrrrrrwAAAAGUGIhAp/
+        //4eigACmL5OTk6666666666668AAAAaZYiCAp///4eigAClX5OTk6666666666668AAAAAZQYiECn///h6KAAKSPk5OTrrrrrrr
+        rrrrrwAAABpliIEAp///4eigACjz5OTk6666666666668AAAABlBiIQKf//+HooAAov+Tk5OuuuuuuuuuuuvAAAAGmWIggKf//+H
+        ooAAoi+Tk5OuuuuuuuuuuuvAAAAAGUGIhAp///4eigAChX5OTk6666666666668AAAAaZYiBAKf//+HooAAoI+Tk5Ouuuuuuuuuu
+        uvAAAAAZQYiECn///h6KAAJ/Pk5OTrrrrrrrrrrrrwAAABdliIICnkxQAB/fk5OTrrrrrrrrrrrrwAAAABZBiIQKeTFAAH3mTk5O
+        uuuuuuuuuuuvAAAAF2WIgQCnkxQAB8Tk5OTrrrrrrrrrrrrwAAAAFkGIhAp5MUAAeq5OTk6666666666668AAAAXZYiCAp5MUAAe
+        RZOTk6666666666668AAAAAWQYiECnkxQAB3fk5OTrrrrrrrrrrrrwAAABdliIEAp5MUAAdeZOTk6666666666668AAAABZBiIQK
+        eTFAAHROTk5OuuuuuuuuuuuvAAAAF2WIggKeTFAAHKuTk5OuuuuuuuuuuuvAAAAAFkGIhAp5MUAAcRZOTk6666666666668AAAAX
+        ZYiBAKeTFAAG9+Tk5OuuuuuuuuuuuvAAAAAWQYiECnkxQABt5k5OTrrrrrrrrrrrrwAAABdliIICnkxQABsTk5OTrrrrrrrrrrrr
+        wAAAABZBiIQKeTFAAGquTk5OuuuuuuuuuuuvAAAAF2WIgQCnkxQABpFk5OTrrrrrrrrrrrrwAAAAFkGIhAp5MUAAZ35OTk666666
+        6666668AAAAXZYiCAp5MUAAZeZOTk6666666666668AAAAAWQYiECnkxQABkTk5OTrrrrrrrrrrrrwAAABdliIEAp5MUAAYq5OTk
+        6666666666668AAAABZBiIQKeTFAAGEWTk5OuuuuuuuuuuuvAAAAF2WIggKeTFAAF9+Tk5OuuuuuuuuuuuvAAAAAFkGIhAp5MUAA
+        XeZOTk6666666666668AAAAXZYiBAKeTFAAFxOTk5OuuuuuuuuuuuvAAAAAWQYiECnkxQABark5OTrrrrrrrrrrrrwAAABdliIIC
+        nkxQABZFk5OTrrrrrrrrrrrrwAAAABZBiIQKeTFAAFd+Tk5OuuuuuuuuuuuvAAAAF2WIgQCnkxQABV5k5OTrrrrrrrrrrrrwAAAA
+        FkGIhAp5MUAAVE5OTk6666666666668AAAAXZYiCAp5MUAAUq5OTk6666666666668AAAAAWQYiECnkxQABRFk5OTrrrrrrrrrrr
+        rwAAABdliIEAp5MUAAT35OTk6666666666668AAAABZBiIQKeTFAAE3mTk5OuuuuuuuuuuuvAAAAF2WIggKeTFAAExOTk5Ouuuuu
+        uuuuuuvAAAAAFkGIhAp5MUAASq5OTk6666666666668AAAAXZYiBAKeTFAAEkWTk5OuuuuuuuuuuuvAAAAAWQYiECnkxQABHfk5O
+        TrrrrrrrrrrrrwAAABdliIICnkxQABF5k5OTrrrrrrrrrrrrwAAAABZBiIQKeTFAAEROTk5OuuuuuuuuuuuvAAAAF2WIgQCnkxQA
+        BCrk5OTrrrrrrrrrrrrwAAAAFkGIhAp5MUAAQRZOTk6666666666668AAAASZYiCAp5OTk5OuuuuuuuuuuuvAAAAFkGIhAp5MUAA
+        QRJOTk6666666666668AAAAXZYiBAKeTFAAEKqTk5OuuuuuuuuuuuvAAAAAWQYiECnkxQABESk5OTrrrrrrrrrrrrwAAABdliIIC
+        nkxQABF4k5OTrrrrrrrrrrrrwAAAABZBiIQKeTFAAEd6Tk5OuuuuuuuuuuuvAAAAF2WIgQCnkxQABJEk5OTrrrrrrrrrrrrwAAAA
+        FkGIhAp5MUAASqpOTk6666666666668AAAAXZYiCAp5MUAATEpOTk6666666666668AAAAAWQYiECnkxQABN4k5OTrrrrrrrrrrr
+        rwAAABdliIEAp5MUAAT3pOTk6666666666668AAAABZBiIQKeTFAAFESTk5OuuuuuuuuuuuvAAAAF2WIggKeTFAAFKqTk5Ouuuuu
+        uuuuuuvAAAAAFkGIhAp5MUAAVEpOTk6666666666668AAAAXZYiBAKeTFAAFXiTk5OuuuuuuuuuuuvAAAAAWQYiECnkxQABXek5O
+        Trrrrrrrrrrrrw==
+        """
 }
