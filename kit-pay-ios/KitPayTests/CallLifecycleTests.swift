@@ -1408,8 +1408,15 @@ final class CallLifecycleTests: XCTestCase {
             try await driver.connect(replacement)
         }
         await transport.waitUntilReplacementDisconnectStarts()
-        await driver.reset()
+        var resetSubmitted = false
+        let resetTask = Task { @MainActor in
+            resetSubmitted = true
+            await driver.reset()
+        }
+        while !resetSubmitted { await Task.yield() }
+        XCTAssertEqual(transport.disconnectCount, 1, "Reset waits for the old teardown")
         transport.resumeReplacementDisconnect()
+        await resetTask.value
 
         do {
             try await replacementTask.value
@@ -1422,6 +1429,134 @@ final class CallLifecycleTests: XCTestCase {
         XCTAssertNil(driver.activeCallId)
         XCTAssertEqual(transport.connectedCallIds, [first.callId])
         XCTAssertEqual(transport.disconnectCount, 2)
+    }
+
+    @MainActor
+    func testMediaSessionDriverReplacementWaitsForExplicitDisconnectToReleaseDevices() async throws {
+        let transport = SuspendingReplacementDisconnectCallMediaTransport()
+        let driver = CallMediaSessionDriver(transport: transport)
+        let first = try mediaHandoff(id: "550e8400-e29b-41d4-a716-446655440070", direction: "outgoing")
+        let second = try mediaHandoff(id: "550e8400-e29b-41d4-a716-446655440071", direction: "incoming")
+        try await driver.connect(first)
+        let disconnectTask = Task { @MainActor in await driver.disconnect(callId: first.callId) }
+        await transport.waitUntilReplacementDisconnectStarts()
+
+        var replacementSubmitted = false
+        let replacementTask = Task { @MainActor in
+            replacementSubmitted = true
+            try await driver.connect(second)
+        }
+        while !replacementSubmitted { await Task.yield() }
+        XCTAssertEqual(transport.connectedCallIds, [first.callId], "New capture waits for device release")
+
+        transport.resumeReplacementDisconnect()
+        await disconnectTask.value
+        try await replacementTask.value
+        XCTAssertEqual(driver.activeCallId, second.callId)
+        XCTAssertEqual(transport.connectedCallIds, [first.callId, second.callId])
+        XCTAssertEqual(transport.disconnectCount, 1)
+    }
+
+    @MainActor
+    func testMediaSessionDriverCancelledReplacementDoesNotRetireCurrentCall() async throws {
+        let transport = FakeCallMediaTransport()
+        let driver = CallMediaSessionDriver(transport: transport)
+        let first = try mediaHandoff(id: "550e8400-e29b-41d4-a716-446655440079", direction: "outgoing")
+        let replacement = try mediaHandoff(id: "550e8400-e29b-41d4-a716-446655440080", direction: "incoming")
+        try await driver.connect(first)
+        let replacementTask = Task { @MainActor in try await driver.connect(replacement) }
+        replacementTask.cancel()
+        do {
+            try await replacementTask.value
+            XCTFail("A cancelled replacement must not retire the active call")
+        } catch is CancellationError { }
+        XCTAssertEqual(driver.activeCallId, first.callId)
+        XCTAssertEqual(transport.connectedCallIds, [first.callId])
+        XCTAssertEqual(transport.disconnectCount, 0)
+    }
+
+    @MainActor
+    func testMediaSessionDriverNewestReplacementWinsWhileTeardownIsPending() async throws {
+        let transport = SuspendingReplacementDisconnectCallMediaTransport()
+        let driver = CallMediaSessionDriver(transport: transport)
+        let first = try mediaHandoff(id: "550e8400-e29b-41d4-a716-446655440072", direction: "outgoing")
+        let superseded = try mediaHandoff(id: "550e8400-e29b-41d4-a716-446655440073", direction: "incoming")
+        let latest = try mediaHandoff(id: "550e8400-e29b-41d4-a716-446655440074", direction: "incoming")
+        try await driver.connect(first)
+        let supersededTask = Task { @MainActor in try await driver.connect(superseded) }
+        await transport.waitUntilReplacementDisconnectStarts()
+        var latestSubmitted = false
+        let latestTask = Task { @MainActor in
+            latestSubmitted = true
+            try await driver.connect(latest)
+        }
+        while !latestSubmitted { await Task.yield() }
+        XCTAssertEqual(transport.connectedCallIds, [first.callId])
+        transport.resumeReplacementDisconnect()
+        do {
+            try await supersededTask.value
+            XCTFail("A newer replacement must invalidate the older pending connect")
+        } catch is CancellationError { }
+        try await latestTask.value
+        XCTAssertEqual(driver.activeCallId, latest.callId)
+        XCTAssertEqual(transport.connectedCallIds, [first.callId, latest.callId])
+        XCTAssertEqual(transport.disconnectCount, 1)
+    }
+
+    @MainActor
+    func testMediaSessionDriverEndCancelsReplacementBeforeItsTransportStarts() async throws {
+        let transport = SuspendingReplacementDisconnectCallMediaTransport()
+        let driver = CallMediaSessionDriver(transport: transport)
+        let first = try mediaHandoff(id: "550e8400-e29b-41d4-a716-446655440075", direction: "outgoing")
+        let replacement = try mediaHandoff(id: "550e8400-e29b-41d4-a716-446655440076", direction: "incoming")
+        try await driver.connect(first)
+        let replacementTask = Task { @MainActor in try await driver.connect(replacement) }
+        await transport.waitUntilReplacementDisconnectStarts()
+        var endSubmitted = false
+        let endTask = Task { @MainActor in
+            endSubmitted = true
+            await driver.disconnect(callId: replacement.callId)
+        }
+        while !endSubmitted { await Task.yield() }
+        transport.resumeReplacementDisconnect()
+        await endTask.value
+        do {
+            try await replacementTask.value
+            XCTFail("End must invalidate a replacement still waiting for device release")
+        } catch is CancellationError { }
+        XCTAssertNil(driver.activeCallId)
+        XCTAssertEqual(transport.connectedCallIds, [first.callId])
+        XCTAssertEqual(transport.disconnectCount, 1)
+    }
+
+    @MainActor
+    func testStaleSuccessfulConnectCannotQueueTeardownBehindPendingReplacement() async throws {
+        let stale = try mediaHandoff(id: "550e8400-e29b-41d4-a716-446655440077", direction: "outgoing")
+        let replacement = try mediaHandoff(id: "550e8400-e29b-41d4-a716-446655440078", direction: "incoming")
+        let transport = OverlappingCallMediaTransport(suspendingCallID: stale.callId, suspendFirstDisconnect: true)
+        let driver = CallMediaSessionDriver(transport: transport)
+        var staleCompleted = false
+        let staleTask = Task { @MainActor in
+            defer { staleCompleted = true }
+            try await driver.connect(stale)
+        }
+        await transport.waitUntilSuspendedConnectStarts()
+        let replacementTask = Task { @MainActor in try await driver.connect(replacement) }
+        await transport.waitUntilDisconnectStarts()
+        transport.resumeSuspendedConnectSuccessfully()
+        // Let the stale completion run while the replacement is still waiting. Always release
+        // teardown even if the implementation regresses and queues stale cleanup behind it.
+        for _ in 0..<50 where !staleCompleted { await Task.yield() }
+        XCTAssertTrue(staleCompleted, "A stale connect must not wait on new-owner teardown")
+        transport.resumeDisconnect()
+        do {
+            try await staleTask.value
+            XCTFail("The old connect must remain stale")
+        } catch is CancellationError { }
+        try await replacementTask.value
+        XCTAssertEqual(driver.activeCallId, replacement.callId)
+        XCTAssertEqual(transport.disconnectCount, 1, "Stale completion must not append another teardown")
+        XCTAssertEqual(transport.connectedCallIds, [stale.callId, replacement.callId])
     }
 
     @MainActor
@@ -1752,7 +1887,7 @@ final class CallLifecycleTests: XCTestCase {
         )
     }
 
-    func testCallKitAnswerRoutesDifferentAuthenticatedCallToMergeOnlyDuringLiveMedia() {
+    func testCallKitAnswerRoutesDifferentAuthenticatedCallToHoldAndAnswerDuringLiveMedia() {
         let activeCallID = "550e8400-e29b-41d4-a716-446655440000"
         let waitingCallID = "550e8400-e29b-41d4-a716-446655440001"
 
@@ -1764,7 +1899,7 @@ final class CallLifecycleTests: XCTestCase {
                     activeCallID: activeCallID.uppercased(),
                     mediaState: mediaState
                 ),
-                .mergeWaiting
+                .holdAndAnswer
             )
             XCTAssertEqual(
                 CallKitAnswerActionPolicy.disposition(
@@ -4662,6 +4797,33 @@ final class CallLifecycleTests: XCTestCase {
         XCTAssertNil(identity.verification)
     }
 
+    func testReviewedInvitationUsesSystemStartWithoutChangingAcceptedRoomOrAnswerTime() throws {
+        let original = try CallMediaHandoff(
+            call: CallDTO(
+                id: "550e8400-e29b-41d4-a716-446655440000", conversationId: nil,
+                name: "Alice", participantUserIds: ["550e8400-e29b-41d4-a716-446655440001"],
+                direction: "incoming", type: "video", video: true, state: "active",
+                startedAt: "2026-08-18T12:00:00Z", answeredAt: "2026-08-18T12:00:01Z",
+                endedAt: nil, ringExpiresAt: nil
+            ),
+            rtc: rtcDetails(url: "wss://calls.example.test", token: "accepted-token", room: "accepted-room",
+                            expiresAt: "2026-08-18T12:05:00Z"),
+            participantVerification: .officialSupport,
+            serverTime: "2026-08-18T12:00:02Z"
+        )
+        let joined = try original.asUserInitiatedJoin()
+        XCTAssertEqual(joined.direction, "outgoing")
+        XCTAssertEqual(joined.callId, original.callId)
+        XCTAssertEqual(joined.room, original.room)
+        XCTAssertEqual(joined.token, original.token)
+        XCTAssertEqual(joined.url, original.url)
+        XCTAssertEqual(joined.expiresAt, original.expiresAt)
+        XCTAssertEqual(joined.answeredAt, original.answeredAt)
+        XCTAssertEqual(joined.serverTime, original.serverTime)
+        XCTAssertEqual(joined.participantVerification, original.participantVerification)
+        XCTAssertTrue(joined.video)
+    }
+
     func testMediaHandoffRefreshesOnlyRTCForTheSameRoom() throws {
         let callId = "550e8400-e29b-41d4-a716-446655440000"
         let conversationId = "550e8400-e29b-41d4-a716-446655440099"
@@ -5837,13 +5999,17 @@ private final class SuspendingReplacementDisconnectCallMediaTransport: CallMedia
 @MainActor
 private final class OverlappingCallMediaTransport: CallMediaTransport {
     private let suspendingCallID: String
+    private let suspendFirstDisconnect: Bool
     private var connectContinuation: CheckedContinuation<Void, Never>?
     private var connectStartWaiters: [CheckedContinuation<Void, Never>] = []
+    private var disconnectContinuation: CheckedContinuation<Void, Never>?
+    private var disconnectStartWaiters: [CheckedContinuation<Void, Never>] = []
     private(set) var connectedCallIds: [String] = []
     private(set) var disconnectCount = 0
 
-    init(suspendingCallID: String) {
+    init(suspendingCallID: String, suspendFirstDisconnect: Bool = false) {
         self.suspendingCallID = suspendingCallID.lowercased()
+        self.suspendFirstDisconnect = suspendFirstDisconnect
     }
 
     func connect(_ handoff: CallMediaHandoff) async throws {
@@ -5861,6 +6027,24 @@ private final class OverlappingCallMediaTransport: CallMediaTransport {
 
     func disconnect() async {
         disconnectCount += 1
+        guard suspendFirstDisconnect, disconnectCount == 1 else { return }
+        await withCheckedContinuation { continuation in
+            disconnectContinuation = continuation
+            let waiters = disconnectStartWaiters
+            disconnectStartWaiters.removeAll()
+            waiters.forEach { $0.resume() }
+        }
+    }
+
+    func waitUntilDisconnectStarts() async {
+        guard disconnectContinuation == nil else { return }
+        await withCheckedContinuation { disconnectStartWaiters.append($0) }
+    }
+
+    func resumeDisconnect() {
+        let continuation = disconnectContinuation
+        disconnectContinuation = nil
+        continuation?.resume()
     }
 
     func waitUntilSuspendedConnectStarts() async {
@@ -6404,5 +6588,128 @@ final class TransientTransportErrorPolicyTests: XCTestCase {
             UIColor.systemTeal.setFill()
             context.fill(CGRect(origin: .zero, size: size))
         }
+    }
+}
+
+final class CallHoldResumeTests: XCTestCase {
+    func testOnlyInterruptionHoldsAutoResumeAfterAudioReturns() {
+        for reason in [CallHoldReason.manual, .waiting, .system, .interruption] {
+            XCTAssertEqual(CallHoldResumePolicy.shouldAutomaticallyResume(
+                reason: reason, externalCallIsConnected: false,
+                systemAudioIsAvailable: true, anotherKitCallIsActive: false
+            ), reason == .interruption)
+        }
+    }
+
+    func testOtherCallEndDoesNotGrantAudioOwnership() {
+        XCTAssertFalse(CallHoldResumePolicy.shouldAutomaticallyResume(
+            reason: .interruption, externalCallIsConnected: false,
+            systemAudioIsAvailable: false, anotherKitCallIsActive: false))
+    }
+
+    func testOverlappingExternalCallsAndOtherKitCallPreventResume() {
+        for external in [true, false] {
+            XCTAssertFalse(CallHoldResumePolicy.shouldAutomaticallyResume(
+                reason: .interruption, externalCallIsConnected: external,
+                systemAudioIsAvailable: true, anotherKitCallIsActive: true))
+        }
+        XCTAssertFalse(CallHoldResumePolicy.shouldAutomaticallyResume(
+            reason: .interruption, externalCallIsConnected: true,
+            systemAudioIsAvailable: true, anotherKitCallIsActive: false))
+    }
+
+    func testObserverOrderingNeverConvertsAManualHoldToAnAutomaticHold() {
+        XCTAssertEqual(CallHoldResumePolicy.reasonAfterExternalCallConnected(.manual), .manual)
+        XCTAssertEqual(CallHoldResumePolicy.reasonAfterExternalCallConnected(.waiting), .waiting)
+        XCTAssertEqual(CallHoldResumePolicy.reasonAfterExternalCallConnected(.system), .interruption)
+    }
+
+    func testCallAcceptanceExplicitlyAdvertisesCompatibilityAndAtomicHold() throws {
+        let request = CallAcceptanceRequest(holdCallId: "550e8400-e29b-41d4-a716-446655440000")
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(request)) as? [String: Any])
+        XCTAssertEqual(json["supports_hold"] as? Bool, true)
+        XCTAssertEqual(json["hold_call_id"] as? String, "550e8400-e29b-41d4-a716-446655440000")
+    }
+}
+
+final class CallInvitationAcceptanceGateTests: XCTestCase {
+    private let firstCallID = "550e8400-e29b-41d4-a716-446655440000"
+    private let secondCallID = "550e8400-e29b-41d4-a716-446655440001"
+
+    func testCanonicalIdentityRejectsDuplicateAcceptance() throws {
+        var gate = CallInvitationAcceptanceGate()
+        let ticket = try XCTUnwrap(gate.begin(callID: firstCallID.uppercased(), generation: 3))
+        XCTAssertEqual(ticket.callID, firstCallID)
+        XCTAssertTrue(gate.accepts(ticket))
+        XCTAssertTrue(gate.contains(callID: firstCallID.uppercased(), generation: 3))
+        XCTAssertNil(gate.begin(callID: firstCallID, generation: 3))
+        XCTAssertFalse(gate.contains(callID: firstCallID, generation: 4))
+    }
+
+    func testMalformedIdentityDoesNotRetireValidPendingAcceptance() throws {
+        var gate = CallInvitationAcceptanceGate()
+        let ticket = try XCTUnwrap(gate.begin(callID: firstCallID, generation: 1))
+        for invalid in ["", "not-a-call", firstCallID + "/extra", " " + firstCallID] {
+            XCTAssertNil(gate.begin(callID: invalid, generation: 2))
+            XCTAssertFalse(gate.contains(callID: invalid, generation: 1))
+            gate.remove(callID: invalid)
+        }
+        XCTAssertTrue(gate.accepts(ticket))
+    }
+
+    func testExactCompletionDoesNotRetireAnotherCall() throws {
+        var gate = CallInvitationAcceptanceGate()
+        let first = try XCTUnwrap(gate.begin(callID: firstCallID, generation: 2))
+        let second = try XCTUnwrap(gate.begin(callID: secondCallID, generation: 2))
+        gate.finish(first)
+        XCTAssertFalse(gate.accepts(first))
+        XCTAssertFalse(gate.contains(callID: firstCallID, generation: 2))
+        XCTAssertTrue(gate.accepts(second))
+    }
+
+    func testLateCompletionCannotRemoveReplacementAttempt() throws {
+        var gate = CallInvitationAcceptanceGate()
+        let old = try XCTUnwrap(gate.begin(callID: firstCallID, generation: 2))
+        gate.remove(callID: firstCallID.uppercased())
+        let replacement = try XCTUnwrap(gate.begin(callID: firstCallID, generation: 2))
+        XCTAssertNotEqual(old.id, replacement.id)
+        gate.finish(old)
+        XCTAssertFalse(gate.accepts(old))
+        XCTAssertTrue(gate.accepts(replacement))
+    }
+
+    func testNewAccountGenerationRevokesAllPriorAcceptances() throws {
+        var gate = CallInvitationAcceptanceGate()
+        let first = try XCTUnwrap(gate.begin(callID: firstCallID, generation: 5))
+        let second = try XCTUnwrap(gate.begin(callID: secondCallID, generation: 5))
+        let replacement = try XCTUnwrap(gate.begin(callID: firstCallID, generation: 6))
+        XCTAssertFalse(gate.accepts(first))
+        XCTAssertFalse(gate.accepts(second))
+        XCTAssertFalse(gate.contains(callID: secondCallID, generation: 5))
+        gate.finish(first)
+        XCTAssertTrue(gate.accepts(replacement))
+        XCTAssertNil(gate.begin(callID: secondCallID, generation: 5))
+    }
+
+    func testInvalidationRevokesTicketsAndPreservesGenerationFence() throws {
+        var gate = CallInvitationAcceptanceGate()
+        let old = try XCTUnwrap(gate.begin(callID: firstCallID, generation: 7))
+        gate.invalidate()
+        XCTAssertFalse(gate.accepts(old))
+        XCTAssertFalse(gate.contains(callID: firstCallID, generation: 7))
+        XCTAssertNil(gate.begin(callID: secondCallID, generation: 6))
+        let replacement = try XCTUnwrap(gate.begin(callID: firstCallID, generation: 7))
+        gate.finish(old)
+        XCTAssertTrue(gate.accepts(replacement))
+    }
+
+    func testForgedCompletionCannotRemoveExactPendingTicket() throws {
+        var gate = CallInvitationAcceptanceGate()
+        let ticket = try XCTUnwrap(gate.begin(callID: firstCallID, generation: 1))
+        let mismatched = CallInvitationAcceptanceGate.Ticket(
+            callID: ticket.callID, id: UUID(), generation: ticket.generation)
+        XCTAssertFalse(gate.accepts(mismatched))
+        gate.finish(mismatched)
+        XCTAssertTrue(gate.accepts(ticket))
     }
 }

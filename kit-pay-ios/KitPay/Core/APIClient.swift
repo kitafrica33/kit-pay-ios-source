@@ -2264,12 +2264,14 @@ struct StartCallRequest: Encodable {
     let type: String
     let conversationId: String?
     let clientCallId: String
+    let supportsHold = true
 
     enum CodingKeys: String, CodingKey {
         case recipientUserIds = "recipient_user_ids"
         case type
         case conversationId = "conversation_id"
         case clientCallId = "client_call_id"
+        case supportsHold = "supports_hold"
     }
 }
 
@@ -2338,7 +2340,7 @@ private struct WalletTransferRequest: Encodable {
     }
 }
 
-struct RTCDetails: Decodable {
+struct RTCDetails: Decodable, Sendable {
     let provider: String
     let url: String
     let token: String
@@ -2353,7 +2355,7 @@ struct RTCDetails: Decodable {
     }
 }
 
-struct RTCIceServer: Decodable {
+struct RTCIceServer: Decodable, Sendable {
     let urls: [String]
     let username: String?
     let credential: String?
@@ -2365,9 +2367,10 @@ struct RTCIceServer: Decodable {
     }
 }
 
-struct CallSessionDTO: Decodable {
+struct CallSessionDTO: Decodable, Sendable {
     let call: CallDTO
     let rtc: RTCDetails
+    var heldCall: CallDTO? = nil
     /// The server instant this response was built. Present on accept: paired with the call's
     /// `answered_at` it gives the call's true age at delivery, so the answering device can
     /// anchor its timer without trusting its own wall clock.
@@ -2375,6 +2378,7 @@ struct CallSessionDTO: Decodable {
 
     enum CodingKeys: String, CodingKey {
         case call, rtc
+        case heldCall = "held_call"
         case serverTime = "server_time"
     }
 }

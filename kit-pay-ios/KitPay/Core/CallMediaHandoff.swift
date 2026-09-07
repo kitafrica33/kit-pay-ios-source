@@ -22,6 +22,8 @@ struct CallMediaHandoff: Sendable {
     let token: String
     let room: String
     let expiresAt: String
+    let canHold: Bool
+    let holdRevision: Int?
     /// The server's answer instant and its own send clock, verbatim from the response that
     /// carried this handoff. Present only on an accept — the answering device already holds
     /// the authoritative anchor and must not wait for a frame or a push to learn it. A start
@@ -60,7 +62,9 @@ struct CallMediaHandoff: Sendable {
             video: call.isVideoCall,
             rtc: rtc,
             answeredAt: call.answeredAt,
-            serverTime: serverTime
+            serverTime: serverTime,
+            canHold: call.canHold,
+            holdRevision: call.holdRevision
         )
     }
 
@@ -79,7 +83,23 @@ struct CallMediaHandoff: Sendable {
             rtc: rtc,
             answeredAt: answeredAt,
             serverTime: serverTime,
-            expectedRoom: room
+            expectedRoom: room,
+            canHold: canHold,
+            holdRevision: holdRevision
+        )
+    }
+
+    /// A reviewed invitation is an explicit user join. CallKit must admit that join through a
+    /// Start (or an existing ring's Answer) before media attaches, even for a server-incoming call.
+    func asUserInitiatedJoin() throws -> CallMediaHandoff {
+        try CallMediaHandoff(
+            callId: callId, conversationId: conversationId, participantName: participantName,
+            participantAvatarURL: participantAvatarURL, participantVerification: participantVerification,
+            direction: "outgoing", video: video,
+            rtc: RTCDetails(provider: "livekit", url: url.absoluteString, token: token,
+                            room: room, iceServers: nil, expiresAt: expiresAt),
+            answeredAt: answeredAt, serverTime: serverTime, expectedRoom: room,
+            canHold: canHold, holdRevision: holdRevision
         )
     }
 
@@ -94,7 +114,9 @@ struct CallMediaHandoff: Sendable {
         rtc: RTCDetails,
         answeredAt: String? = nil,
         serverTime: String? = nil,
-        expectedRoom: String? = nil
+        expectedRoom: String? = nil,
+        canHold: Bool = false,
+        holdRevision: Int? = nil
     ) throws {
         guard UUID(uuidString: callId) != nil,
               rtc.provider.lowercased() == "livekit",
@@ -125,6 +147,8 @@ struct CallMediaHandoff: Sendable {
         expiresAt = rtc.expiresAt
         self.answeredAt = answeredAt
         self.serverTime = serverTime
+        self.canHold = canHold
+        self.holdRevision = holdRevision
     }
 }
 
@@ -268,21 +292,33 @@ final class CallMediaSessionDriver {
     private let transport: any CallMediaTransport
     private(set) var activeCallId: String?
     private var generation: UInt64 = 0
+    private var pendingConnect: (generation: UInt64, callId: String)?
+    private var teardownTask: Task<Void, Never>?
+    private var teardownGeneration: UInt64 = 0
 
     init(transport: any CallMediaTransport) {
         self.transport = transport
     }
 
     func connect(_ handoff: CallMediaHandoff) async throws {
+        try Task.checkCancellation()
         let callId = handoff.callId.lowercased()
         generation &+= 1
         let connectGeneration = generation
+        // A replacement owns its intent before waiting for the old devices to be released.
+        // An older connect completing in that gap must not enqueue teardown behind it.
+        pendingConnect = (connectGeneration, callId)
+        defer {
+            if pendingConnect?.generation == connectGeneration { pendingConnect = nil }
+        }
         if activeCallId != nil {
             activeCallId = nil
-            await transport.disconnect()
-            guard generation == connectGeneration else {
-                throw CancellationError()
-            }
+            await enqueueTeardown().value
+        } else {
+            await teardownTask?.value
+        }
+        guard generation == connectGeneration, !Task.isCancelled else {
+            throw CancellationError()
         }
 
         activeCallId = callId
@@ -302,23 +338,38 @@ final class CallMediaSessionDriver {
         guard generation == connectGeneration,
               activeCallId?.caseInsensitiveCompare(callId) == .orderedSame
         else {
-            // A newer connect owns the shared transport once it has published an active id.
-            // Only an idle/reset state may be torn down by this stale completion.
-            if activeCallId == nil {
-                await transport.disconnect()
+            // Pending replacements count as owners even before their prior teardown finishes.
+            // Only a fully idle state may append cleanup for this stale successful connection.
+            if activeCallId == nil, pendingConnect == nil {
+                await enqueueTeardown().value
             }
+            throw CancellationError()
+        }
+        if Task.isCancelled {
+            activeCallId = nil
+            await enqueueTeardown().value
             throw CancellationError()
         }
     }
 
     func disconnect(callId: String? = nil) async {
-        if let callId, activeCallId?.caseInsensitiveCompare(callId) != .orderedSame {
+        if let callId,
+           activeCallId?.caseInsensitiveCompare(callId) != .orderedSame,
+           pendingConnect?.callId.caseInsensitiveCompare(callId) != .orderedSame {
             return
         }
-        guard activeCallId != nil else { return }
+        guard activeCallId != nil || pendingConnect != nil else { return }
+        let hadActiveTransport = activeCallId != nil
         generation &+= 1
         activeCallId = nil
-        await transport.disconnect()
+        pendingConnect = nil
+        if hadActiveTransport {
+            await enqueueTeardown().value
+        } else {
+            // A cancelled replacement had not entered transport.connect yet. Its predecessor's
+            // teardown already owns device retirement, so wait without another disconnect.
+            await teardownTask?.value
+        }
     }
 
     /// Account revocation must invalidate a transport even when a suspended connect has not yet
@@ -326,13 +377,30 @@ final class CallMediaSessionDriver {
     func reset() async {
         generation &+= 1
         activeCallId = nil
-        await transport.disconnect()
+        pendingConnect = nil
+        await enqueueTeardown().value
     }
 
     func didDisconnect(callId: String) {
         guard activeCallId?.caseInsensitiveCompare(callId) == .orderedSame else { return }
         generation &+= 1
         activeCallId = nil
+        pendingConnect = nil
+    }
+
+    /// Device release may suspend. Every new connection waits for all previously requested
+    /// teardowns, including resets that arrived while an earlier disconnect was still running.
+    private func enqueueTeardown() -> Task<Void, Never> {
+        let previous = teardownTask
+        teardownGeneration &+= 1
+        let expected = teardownGeneration
+        let task = Task { @MainActor [self] in
+            await previous?.value
+            await transport.disconnect()
+            if teardownGeneration == expected { teardownTask = nil }
+        }
+        teardownTask = task
+        return task
     }
 }
 

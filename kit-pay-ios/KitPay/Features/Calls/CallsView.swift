@@ -3,6 +3,7 @@ import SwiftUI
 struct CallsView: View {
     @EnvironmentObject private var model: AppModel
     @State private var showNewCall = false
+    @State private var showScheduledCalls = false
     @State private var missedOnly = false
 
     /// Opening the picker is itself the recovery route for a missing capability/privacy
@@ -81,11 +82,20 @@ struct CallsView: View {
                         .accessibilityLabel("New call")
                         .accessibilityHint("Choose a Kit Pay contact for an audio or video call")
                 }
+                if model.capabilities?.supportsFeature("calls_scheduling") == true {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        GlassIconButton(systemName: "calendar", inBar: true) { showScheduledCalls = true }
+                            .accessibilityLabel("Scheduled calls")
+                    }
+                }
             }
             .refreshable { await model.refresh(userInitiated: true) }
             .sheet(isPresented: $showNewCall) {
                 NewCallSheet()
                     .environmentObject(model)
+            }
+            .sheet(isPresented: $showScheduledCalls) {
+                ScheduledCallsView().environmentObject(model)
             }
         }
     }
@@ -171,6 +181,7 @@ private struct NewCallSheet: View {
     @State private var directorySearchID: UUID?
     @State private var directorySearchQuery: String?
     @State private var isRecoveringReadiness = false
+    @State private var showGroupCall = false
 
     var body: some View {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -201,6 +212,12 @@ private struct NewCallSheet: View {
 
         NavigationStack {
             Form {
+                Section {
+                    Button { showGroupCall = true } label: {
+                        Label("Group call", systemImage: "person.2")
+                    }
+                    .disabled(!model.callReadinessPickerAvailable)
+                }
                 Section {
                     TextField("Search contacts", text: $query)
                         .textInputAutocapitalization(.never)
@@ -291,6 +308,7 @@ private struct NewCallSheet: View {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
             }
             .task { await model.loadCallContacts() }
+            .sheet(isPresented: $showGroupCall) { GroupCallSheet().environmentObject(model) }
             .task(id: CallKitUserSearchTaskKey(query: query, isOnline: model.isOnline)) {
                 await searchDirectory()
             }

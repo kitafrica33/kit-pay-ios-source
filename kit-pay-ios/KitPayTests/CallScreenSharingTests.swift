@@ -4,6 +4,33 @@ import XCTest
 
 @MainActor
 final class CallScreenSharingTests: XCTestCase {
+    func testHoldWaitsForSuspendedPublicationToBeStopped() async throws {
+        let harness = Harness()
+        let publisher = Publisher()
+        publisher.suspendsStart = true
+        harness.controller.bind(publisher: publisher, callID: "call")
+        try harness.controller.requestStart(callID: "call", applicationIsActive: true)
+        await drain()
+        harness.broadcast(true)
+        await drain()
+        try harness.controller.confirmSharing(callID: "call")
+        await drain()
+        var holdCompleted = false
+        let hold = Task { @MainActor in
+            await harness.controller.stopAndWait()
+            holdCompleted = true
+        }
+        await drain()
+        XCTAssertFalse(holdCompleted)
+        XCTAssertEqual(publisher.stops, 0)
+        publisher.completeStart()
+        await hold.value
+        XCTAssertTrue(holdCompleted)
+        XCTAssertEqual(publisher.stops, 1)
+        XCTAssertThrowsError(try harness.controller.confirmSharing(callID: "call"))
+        harness.broadcast(false)
+    }
+
     func testSystemConsentIsRequiredBeforePublishingAndStoppingRetiresTrack() async throws {
         let harness = Harness()
         let publisher = Publisher()

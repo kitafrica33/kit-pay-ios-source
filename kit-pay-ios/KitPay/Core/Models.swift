@@ -6279,7 +6279,7 @@ struct CallParticipantDTO: Decodable, Equatable, Sendable {
     }
 }
 
-struct CallDTO: Decodable {
+struct CallDTO: Decodable, Sendable {
     let id: String
     let conversationId: String?
     let name: String?
@@ -6294,6 +6294,11 @@ struct CallDTO: Decodable {
     let ringExpiresAt: String?
     let serverTime: String?
     let participants: [CallParticipantDTO]?
+    let canHold: Bool
+    let isHeld: Bool
+    let holdRevision: Int?
+    let participantState: String?
+    let scheduledCallId: String?
 
     enum CodingKeys: String, CodingKey {
         case id, name, direction, type, video, state
@@ -6305,6 +6310,11 @@ struct CallDTO: Decodable {
         case ringExpiresAt = "ring_expires_at"
         case serverTime = "server_time"
         case participants
+        case canHold = "can_hold"
+        case isHeld = "is_held"
+        case holdRevision = "hold_revision"
+        case participantState = "participant_state"
+        case scheduledCallId = "scheduled_call_id"
     }
 
     init(
@@ -6321,7 +6331,12 @@ struct CallDTO: Decodable {
         endedAt: String?,
         ringExpiresAt: String?,
         serverTime: String? = nil,
-        participants: [CallParticipantDTO]? = nil
+        participants: [CallParticipantDTO]? = nil,
+        canHold: Bool = false,
+        isHeld: Bool = false,
+        holdRevision: Int? = nil,
+        participantState: String? = nil,
+        scheduledCallId: String? = nil
     ) {
         self.id = id
         self.conversationId = conversationId
@@ -6337,6 +6352,11 @@ struct CallDTO: Decodable {
         self.ringExpiresAt = ringExpiresAt
         self.serverTime = serverTime
         self.participants = participants
+        self.canHold = canHold
+        self.isHeld = isHeld
+        self.holdRevision = holdRevision
+        self.participantState = participantState
+        self.scheduledCallId = scheduledCallId
     }
 
     init(from decoder: Decoder) throws {
@@ -6357,6 +6377,11 @@ struct CallDTO: Decodable {
         // This is additive presentation metadata. A malformed optional projection must not hide
         // an otherwise valid call; validation below simply declines to grant it identity data.
         participants = try? values.decode([CallParticipantDTO].self, forKey: .participants)
+        canHold = (try? values.decode(Bool.self, forKey: .canHold)) == true
+        isHeld = (try? values.decode(Bool.self, forKey: .isHeld)) == true
+        holdRevision = try values.decodeIfPresent(Int.self, forKey: .holdRevision)
+        participantState = try values.decodeIfPresent(String.self, forKey: .participantState)
+        scheduledCallId = try values.decodeIfPresent(String.self, forKey: .scheduledCallId)
     }
 
     var isVideoCall: Bool {

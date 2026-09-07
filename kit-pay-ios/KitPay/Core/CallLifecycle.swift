@@ -1,5 +1,98 @@
 import Foundation
 
+enum CallHoldReason: String, Sendable, Equatable {
+    case manual
+    case interruption
+    case waiting
+    /// CallKit may deliver Hold before the observer identifies the other call.
+    case system
+}
+
+enum CallHoldResumePolicy {
+    static func shouldAutomaticallyResume(
+        reason: CallHoldReason?,
+        externalCallIsConnected: Bool,
+        systemAudioIsAvailable: Bool,
+        anotherKitCallIsActive: Bool
+    ) -> Bool {
+        reason == .interruption && !externalCallIsConnected
+            && systemAudioIsAvailable && !anotherKitCallIsActive
+    }
+
+    static func reasonAfterExternalCallConnected(_ reason: CallHoldReason) -> CallHoldReason {
+        reason == .system ? .interruption : reason
+    }
+}
+
+/// An explicit invitation join owns only its exact in-flight acceptance. A late response cannot
+/// release a newer attempt or regain authority after the CallKit account registry changes.
+struct CallInvitationAcceptanceGate: Sendable {
+    struct Ticket: Equatable, Sendable {
+        let callID: String
+        let id: UUID
+        let generation: UInt64
+    }
+
+    private var currentGeneration: UInt64?
+    private var pending: [String: Ticket] = [:]
+
+    mutating func begin(callID: String, generation: UInt64) -> Ticket? {
+        guard let key = UUID(uuidString: callID)?.uuidString.lowercased(),
+              currentGeneration.map({ generation >= $0 }) ?? true else { return nil }
+        if currentGeneration != generation {
+            pending.removeAll()
+            currentGeneration = generation
+        }
+        guard pending[key] == nil else { return nil }
+        let ticket = Ticket(callID: key, id: UUID(), generation: generation)
+        pending[key] = ticket
+        return ticket
+    }
+
+    func contains(callID: String, generation: UInt64) -> Bool {
+        guard currentGeneration == generation,
+              let key = UUID(uuidString: callID)?.uuidString.lowercased(),
+              let ticket = pending[key] else { return false }
+        return ticket.generation == generation
+    }
+
+    func accepts(_ ticket: Ticket) -> Bool {
+        currentGeneration == ticket.generation && pending[ticket.callID] == ticket
+    }
+
+    mutating func finish(_ ticket: Ticket) {
+        guard accepts(ticket) else { return }
+        pending.removeValue(forKey: ticket.callID)
+    }
+
+    mutating func remove(callID: String) {
+        guard let key = UUID(uuidString: callID)?.uuidString.lowercased() else { return }
+        pending.removeValue(forKey: key)
+    }
+
+    mutating func invalidate() {
+        pending.removeAll()
+        // Retain the generation watermark: an older account's delayed begin must stay stale.
+    }
+}
+
+/// In-memory dispatch only: hold/resume must never replay against a replacement login.
+@MainActor
+final class CallHoldActionDispatcher {
+    static let shared = CallHoldActionDispatcher()
+    enum Request {
+        case hold(String, CallHoldReason)
+        case resume(String)
+        case answerWaiting(String)
+    }
+    private var handler: ((Request) async -> Bool)?
+    func install(_ handler: @escaping (Request) async -> Bool) { self.handler = handler }
+    func dispatch(_ request: Request) async -> Bool {
+        guard let handler else { return false }
+        return await handler(request)
+    }
+}
+
 enum CallTerminationKind: String, Codable, Hashable {
     case decline
     case end
@@ -22,7 +115,9 @@ struct EphemeralOutgoingCallAttempt: Equatable, Sendable {
     let conversationID: String?
     let createdAt: Date
     let lease: CallMediaAccountLease
+    var groupRecipientUserIDs: [String]? = nil
 
+    var recipientUserIDs: [String] { groupRecipientUserIDs ?? [recipientUserID] }
     var clientCallIDString: String { clientCallID.uuidString.lowercased() }
 }
 

@@ -599,6 +599,7 @@ struct ActiveCallView: View {
     @State private var localPreviewCorner: CallFloatingCorner = .bottomTrailing
     @State private var localPreviewIsDragging = false
     @State private var showsAddParticipant = false
+    @State private var showsInvitationLink = false
     @State private var isOpeningConversation = false
     private let onMinimize: () -> Void
 
@@ -675,7 +676,7 @@ struct ActiveCallView: View {
                             CallWaitingGlassBanner(
                                 callerName: waitingCall.name,
                                 isVideo: waitingCall.video,
-                                isMerging: model.isMergingWaitingCall,
+                                isMerging: model.isMergingWaitingCall || model.isSwitchingCalls,
                                 decline: {
                                     revealControls()
                                     model.declineWaitingCall()
@@ -683,10 +684,13 @@ struct ActiveCallView: View {
                                 merge: {
                                     guard !model.isMergingWaitingCall else { return }
                                     revealControls()
-                                    Task { await model.mergeWaitingCall() }
+                                    NotificationCoordinator.shared.requestHoldAndAnswer(callID: waitingCall.callID)
                                 }
                             )
                             .transition(.move(edge: .top).combined(with: .opacity))
+                        }
+                        if coordinator.isHeld || coordinator.otherHeldCall != nil {
+                            heldCallBanner
                         }
                         callHeader(compactLandscape: compactLandscape)
                         Spacer(minLength: 24)
@@ -734,7 +738,19 @@ struct ActiveCallView: View {
                     MoreCallControlsOverlay(
                         selectedMode: media.microphoneMode,
                         screenSharingPhase: screenSharing.phase,
-                        canStartScreenSharing: coordinator.state == .connected,
+                        canStartScreenSharing: isConnected,
+                        isHeld: coordinator.isHeld,
+                        showsInvitationLink: model.capabilities?.supportsFeature("calls_invite_links") == true,
+                        canShareInvitation: model.canManageLiveCallInviteLink(for: coordinator.activeCall),
+                        shareInvitation: {
+                            dismissMoreControls()
+                            showsInvitationLink = true
+                        },
+                        changeHold: {
+                            guard let callID = coordinator.activeCall?.id else { return }
+                            dismissMoreControls()
+                            NotificationCoordinator.shared.requestHeld(!coordinator.isHeld, callID: callID)
+                        },
                         shareScreen: {
                             dismissMoreControls()
                             coordinator.requestScreenSharing()
@@ -781,6 +797,7 @@ struct ActiveCallView: View {
             .onChange(of: model.waitingCall?.callID) { _, waitingCallID in
                 if waitingCallID != nil {
                     showsAddParticipant = false
+                    showsInvitationLink = false
                     withAnimation(reduceMotion ? nil : .snappy) {
                         showsMoreControls = false
                     }
@@ -794,6 +811,9 @@ struct ActiveCallView: View {
                 } else {
                     revealControls()
                 }
+            }
+            .onChange(of: showsInvitationLink) { _, isPresented in
+                if isPresented { autoHideGeneration &+= 1 } else { revealControls() }
             }
             .onChange(of: localPreviewIsDragging) { _, dragging in
                 if dragging {
@@ -811,6 +831,11 @@ struct ActiveCallView: View {
                 if let activeCall = coordinator.activeCall {
                     ActiveCallParticipantSheet(activeCall: activeCall)
                         .environmentObject(model)
+                }
+            }
+            .sheet(isPresented: $showsInvitationLink) {
+                if let activeCall = coordinator.activeCall {
+                    ActiveCallInviteLinkSheet(activeCall: activeCall).environmentObject(model)
                 }
             }
         }
@@ -1013,6 +1038,38 @@ struct ActiveCallView: View {
         .accessibilityIdentifier("call.screen-sharing.status")
     }
 
+    private var heldCallBanner: some View {
+        VStack(spacing: 6) {
+            if let held = coordinator.activeHold { heldCallRow(held, isOther: false) }
+            if let held = coordinator.otherHeldCall { heldCallRow(held, isOther: true) }
+        }
+    }
+
+    private func heldCallRow(_ held: HeldCallPresentation, isOther: Bool) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: "pause.circle.fill")
+            VStack(alignment: .leading, spacing: 3) {
+                Text(held.name).font(.subheadline.weight(.semibold))
+                Text(coordinator.externalCallIsConnected ? "On hold while your other call is active" : "On hold")
+                    .font(.caption)
+            }
+            Spacer(minLength: 4)
+            if !coordinator.externalCallIsConnected {
+                Button(isOther && !coordinator.isHeld ? "Swap" : "Resume") {
+                    NotificationCoordinator.shared.requestSwap(to: held.id)
+                }
+                .font(.subheadline.bold())
+                .frame(minWidth: 44, minHeight: 44)
+                .disabled(model.isSwitchingCalls)
+                .accessibilityLabel("Resume call with \(held.name)")
+            }
+        }
+        .padding(.horizontal, 14)
+        .foregroundStyle(callForeground)
+        .kitGlass(cornerRadius: 22, tint: panelTint, tintStrength: 1)
+        .accessibilityIdentifier("call.hold.status")
+    }
+
     private var controlsPanel: some View {
         HStack(spacing: 3) {
             callControl(
@@ -1170,9 +1227,9 @@ struct ActiveCallView: View {
         )
     }
 
-    private var isConnected: Bool { coordinator.state == .connected }
+    private var isConnected: Bool { coordinator.state == .connected && !coordinator.isHeld }
 
-    private var isReconnecting: Bool { coordinator.state == .reconnecting }
+    private var isReconnecting: Bool { coordinator.state == .reconnecting && !coordinator.isHeld }
 
     private var shouldAutoHideControls: Bool {
         CallControlsVisibilityPolicy.shouldAutoHide(
@@ -1181,7 +1238,7 @@ struct ActiveCallView: View {
             hasVideoSurface: hasRemoteParticipantGrid
                 || media.remoteVideoTrack != nil
                 || (media.isCameraEnabled && media.localVideoTrack != nil),
-            isAdditionalControlsPresented: showsMoreControls || showsAddParticipant
+            isAdditionalControlsPresented: showsMoreControls || showsAddParticipant || showsInvitationLink
                 || confirmsScreenSharing || screenSharing.phase != .idle,
             hasWaitingCall: model.waitingCall != nil,
             isFloatingSurfaceInteracting: localPreviewIsDragging,
@@ -1442,12 +1499,12 @@ private struct CallWaitingGlassBanner: View {
                 foreground: .white,
                 useFlexibleWidth: useFlexibleWidth,
                 enabled: !isMerging,
-                disabledAccessibilityValue: "Unavailable while merging",
+                disabledAccessibilityValue: "Call switch in progress",
                 action: decline
             )
 
             waitingActionButton(
-                title: isMerging ? "Merging…" : "Merge",
+                title: isMerging ? "Answering…" : "Hold & Answer",
                 systemImage: "person.2.fill",
                 color: KitColor.green,
                 foreground: KitColor.deepNavy,
@@ -1699,6 +1756,79 @@ private struct ActiveCallParticipantSearchTaskKey: Hashable {
     let query: String
     let isOnline: Bool
     let participantIDs: Set<String>
+}
+
+private struct ActiveCallInviteLinkSheet: View {
+    @EnvironmentObject private var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject private var coordinator = CallMediaCoordinator.shared
+    let activeCall: ActiveCallPresentation
+    @State private var link: CallInviteLinkDTO?
+    @State private var busy = false
+    @State private var errorMessage: String?
+
+    private var isAuthorized: Bool {
+        !coordinator.isHeld && model.canManageLiveCallInviteLink(for: activeCall)
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                if isAuthorized {
+                    Section {
+                        Text(activeCall.participantName).font(.headline)
+                        Text("Only people already invited to this call can use the link. Add a participant first to invite someone new.")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
+                    Section {
+                        if let link, let url = link.validatedShareURL {
+                            ShareLink(item: url) { Label("Share invitation", systemImage: "square.and.arrow.up") }
+                            Button("Revoke invitation link", role: .destructive) { Task { await revoke(link) } }
+                        } else {
+                            Button("Create invitation link") { Task { await create() } }
+                        }
+                    }
+                    .disabled(busy)
+                    if busy { ProgressView() }
+                    if let errorMessage { Text(errorMessage).foregroundStyle(.red) }
+                } else {
+                    Text("Invitation links are available while you are connected to this call.").foregroundStyle(.secondary)
+                }
+            }
+            .navigationTitle("Call invitation link")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } } }
+            .onChange(of: isAuthorized) { _, authorized in
+                if !authorized { link = nil; dismiss() }
+            }
+            .onChange(of: model.profile?.id) { _, _ in link = nil; dismiss() }
+            .onDisappear { link = nil }
+        }
+    }
+
+    @MainActor private func create() async {
+        guard isAuthorized, !busy else { return }
+        busy = true; errorMessage = nil
+        defer { busy = false }
+        do {
+            let created = try await model.createLiveCallInviteLink(for: activeCall)
+            guard isAuthorized else { return }
+            link = created
+        } catch is CancellationError { return }
+        catch { if isAuthorized { errorMessage = error.localizedDescription } }
+    }
+
+    @MainActor private func revoke(_ existing: CallInviteLinkDTO) async {
+        guard isAuthorized, !busy else { return }
+        busy = true; errorMessage = nil
+        defer { busy = false }
+        do {
+            try await model.revokeLiveCallInviteLink(id: existing.id, for: activeCall)
+            guard isAuthorized else { return }
+            link = nil
+        } catch is CancellationError { return }
+        catch { if isAuthorized { errorMessage = error.localizedDescription } }
+    }
 }
 
 /// Matches Android's connected-call people picker while retaining iOS contact ordering and tag
@@ -2990,6 +3120,11 @@ private struct MoreCallControlsOverlay: View {
     let selectedMode: KitMicrophoneMode
     let screenSharingPhase: CallScreenSharingPhase
     let canStartScreenSharing: Bool
+    let isHeld: Bool
+    let showsInvitationLink: Bool
+    let canShareInvitation: Bool
+    let shareInvitation: () -> Void
+    let changeHold: () -> Void
     let shareScreen: () -> Void
     let stopScreenSharing: () -> Void
     let selectMode: (KitMicrophoneMode) -> Void
@@ -3054,6 +3189,14 @@ private struct MoreCallControlsOverlay: View {
                 .accessibilityLabel("Close microphone modes")
             }
 
+            Button(action: changeHold) {
+                Label(isHeld ? "Resume call" : "Hold call", systemImage: isHeld ? "play.fill" : "pause.fill")
+                    .font(.subheadline.weight(.semibold))
+                    .frame(maxWidth: .infinity, minHeight: 48, alignment: .leading)
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("call.hold.control")
+
             Button(action: screenSharingPhase == .idle ? shareScreen : stopScreenSharing) {
                 Label(screenSharingPhase == .idle ? "Share screen" : "Stop screen sharing",
                       systemImage: "rectangle.on.rectangle")
@@ -3064,6 +3207,16 @@ private struct MoreCallControlsOverlay: View {
             .buttonStyle(.plain)
             .disabled(screenSharingPhase == .idle ? !canStartScreenSharing : !screenSharingPhase.canStop)
             .accessibilityIdentifier("call.screen-sharing.control")
+            if showsInvitationLink {
+                Button(action: shareInvitation) {
+                    Label("Share call invitation", systemImage: "link")
+                        .font(.subheadline.weight(.semibold))
+                        .frame(maxWidth: .infinity, minHeight: 48, alignment: .leading)
+                }
+                .buttonStyle(.plain)
+                .disabled(!canShareInvitation)
+                .accessibilityIdentifier("call.invitation-link.control")
+            }
             Divider()
 
             ForEach(KitMicrophoneMode.allCases) { mode in

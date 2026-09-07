@@ -105,8 +105,20 @@ extension APIClient {
         try await send(path: "calls/\(id)", method: "GET", body: CallEmptyBody())
     }
 
-    func acceptCall(id: String) async throws -> CallSessionDTO {
-        try await send(path: "calls/\(id)/accept", method: "POST", body: CallEmptyBody())
+    func acceptCall(id: String, holdCallID: String? = nil, holdCallRevision: Int? = nil) async throws -> CallSessionDTO {
+        try await send(path: "calls/\(id)/accept", method: "POST",
+                       body: CallAcceptanceRequest(holdCallId: holdCallID, holdCallRevision: holdCallRevision))
+    }
+
+    func holdCall(id: String, revision: Int?, reason: CallHoldReason) async throws -> CallDTO {
+        try await send(path: "calls/\(id)/hold", method: "POST",
+                       body: CallHoldRequest(holdRevision: revision,
+                           holdReason: reason == .interruption ? "interruption" : "manual"))
+    }
+
+    func resumeCall(id: String, holdCallID: String? = nil, revision: Int? = nil, holdCallRevision: Int? = nil) async throws -> CallSessionDTO {
+        try await send(path: "calls/\(id)/resume", method: "POST",
+                       body: CallResumeRequest(holdCallId: holdCallID, holdRevision: revision, holdCallRevision: holdCallRevision))
     }
 
     func declineCall(id: String) async throws -> CallDTO {
@@ -148,6 +160,37 @@ extension APIClient {
 }
 
 private struct CallEmptyBody: Encodable {}
+
+struct CallAcceptanceRequest: Encodable {
+    let holdCallId: String?
+    var holdCallRevision: Int? = nil
+    let supportsHold = true
+    enum CodingKeys: String, CodingKey {
+        case holdCallId = "hold_call_id"
+        case holdCallRevision = "hold_call_revision"
+        case supportsHold = "supports_hold"
+    }
+}
+
+struct CallHoldRequest: Encodable {
+    let holdRevision: Int?
+    let holdReason: String
+    enum CodingKeys: String, CodingKey {
+        case holdRevision = "hold_revision"
+        case holdReason = "hold_reason"
+    }
+}
+
+struct CallResumeRequest: Encodable {
+    let holdCallId: String?
+    let holdRevision: Int?
+    var holdCallRevision: Int? = nil
+    enum CodingKeys: String, CodingKey {
+        case holdCallId = "hold_call_id"
+        case holdCallRevision = "hold_call_revision"
+        case holdRevision = "hold_revision"
+    }
+}
 
 struct EndCallRequest: Encodable, Equatable {
     let reason: String

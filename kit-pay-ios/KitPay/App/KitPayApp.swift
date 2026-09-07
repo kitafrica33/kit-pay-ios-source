@@ -7,6 +7,7 @@ struct KitPayApp: App {
     @StateObject private var model = AppModel()
     @StateObject private var callMedia = CallMediaCoordinator.shared
     @State private var isCallPresented = false
+    @State private var callInvitationInbox = CallInvitationInbox()
 
     init() {
         // Camera/editor outputs are plaintext only while being reviewed or staged. A crash can
@@ -82,14 +83,50 @@ struct KitPayApp: App {
                     syncMinimizedCallSurface()
                 }
                 .onChange(of: model.communicationSurfacesConcealed) { _, concealed in
-                    if concealed { isCallPresented = false }
+                    if concealed {
+                        isCallPresented = false
+                        callInvitationInbox.clear()
+                    }
                     syncMinimizedCallSurface()
+                }
+                .sheet(item: Binding(
+                    get: {
+                        model.callInvitationUIReady && callInvitationInbox.pending?.accountID == model.profile?.id.lowercased()
+                            ? callInvitationInbox.pending : nil
+                    },
+                    set: { if $0 == nil { callInvitationInbox.clear() } }
+                )) { intent in
+                    CallInvitationReviewView(intent: intent).environmentObject(model)
+                }
+                .onChange(of: model.isSignedIn) { previous, current in
+                    if previous && !current { callInvitationInbox.clear() }
+                    prepareCallInvitationReview()
+                }
+                .onChange(of: model.profile?.id) { previous, current in
+                    if let previous, previous.caseInsensitiveCompare(current ?? "") != .orderedSame {
+                        callInvitationInbox.clear()
+                    }
+                    prepareCallInvitationReview()
+                }
+                .onChange(of: model.callInvitationUIReady) { _, ready in
+                    if ready { prepareCallInvitationReview() }
+                }
+                .onChange(of: model.requiresBiometricSignIn) { _, required in
+                    if required && callInvitationInbox.pending?.accountID != nil { callInvitationInbox.clear() }
                 }
                 .onOpenURL { url in
                     // Retain the no-payload share route for pre-picker development builds. The
                     // shipping share extension does not try to launch its containing app.
                     if KitShareHandoffLink.matches(url) {
                         model.refreshSharedInbox()
+                    } else if let token = CallInvitationLink.token(from: url) {
+                        guard !model.communicationSurfacesConcealed else { return }
+                        callInvitationInbox.receive(token: token, accountID: model.isSignedIn ? model.profile?.id : nil)
+                        prepareCallInvitationReview()
+                    } else if url.scheme?.lowercased() == "kitpay", url.host?.lowercased() == "call-invites" {
+                        // Malformed invitation routes are discarded. Existing kitwallet auth
+                        // links still reach the established signed-out authentication handler.
+                        return
                     } else {
                         model.handleDeepLink(url)
                     }
@@ -151,6 +188,13 @@ struct KitPayApp: App {
             String(model.requiresBiometricSignIn),
             String(model.accountSetupStep == nil),
         ].joined(separator: ":")
+    }
+
+    @MainActor
+    private func prepareCallInvitationReview() {
+        guard model.callInvitationUIReady, let accountID = model.profile?.id else { return }
+        callInvitationInbox.bind(to: accountID)
+        if callInvitationInbox.pending != nil { isCallPresented = false }
     }
 
     @MainActor

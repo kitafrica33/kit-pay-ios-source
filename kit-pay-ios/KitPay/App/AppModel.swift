@@ -1295,6 +1295,8 @@ final class AppModel: ObservableObject {
     private var callHistoryBackfillRetryNotBefore: Date?
     private var queuedCallEvents: [CallLifecycleEvent] = []
     private var callSystemEventDrainTask: Task<Void, Never>?
+    @Published private(set) var isSwitchingCalls = false
+    private var callSwitchOperationID: UUID?
     private var outboxWakeTask: Task<Void, Never>?
     private struct OutboxMediaPreparationFlight {
         let token: UUID
@@ -1390,6 +1392,10 @@ final class AppModel: ObservableObject {
         self.acceptedAccountDeletionPurges = acceptedAccountDeletionPurges
         self.accountDeletionAttempts = accountDeletionAttempts
         self.contactSource = contactSource
+        CallHoldActionDispatcher.shared.install { [weak self] request in
+            guard let self else { return false }
+            return await handleCallHoldRequest(request)
+        }
 
 #if DEBUG && APP_STORE_SCREENSHOTS
         if AppStoreScreenshotFixture.isActive {
@@ -1525,6 +1531,7 @@ final class AppModel: ObservableObject {
                                   self.capabilities != nil
                             else { return }
                             self.resumeEphemeralOutgoingCallIfPossible()
+                            CallMediaCoordinator.shared.retryInterruptedCallResumeIfPossible()
                             await self.flushOutbox()
                             self.scheduleAutomaticContactSync()
                             _ = await self.runAutomaticMessageBackupIfDue()
@@ -5248,6 +5255,10 @@ final class AppModel: ObservableObject {
         let provisionalCallID = ephemeralOutgoingCallGate.attempt?.clientCallIDString
         let activeBackendCallID = CallMediaCoordinator.shared.activeCall?.id
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        let heldCallsToEndOnSignOut = Set(CallMediaCoordinator.shared.heldCalls.values
+            .filter { $0.lease == revokedMediaLease }
+            .flatMap { [$0.id, $0.pendingAcceptanceCallID].compactMap { $0 } })
+            .subtracting([activeBackendCallID?.lowercased()].compactMap { $0 })
         let callToEndOnSignOut: String?
         if let activeBackendCallID,
            UUID(uuidString: activeBackendCallID) != nil,
@@ -5322,6 +5333,13 @@ final class AppModel: ObservableObject {
                 revokedMediaLease.sessionID
             ) {
                 try await api.endCall(id: callToEndOnSignOut, reason: "cancelled")
+            }
+        }
+        if !isAcceptedDeletion, let revokedMediaLease, isOnline {
+            for heldCallID in heldCallsToEndOnSignOut {
+                _ = try? await APIClientSessionBinding.$sessionID.withValue(revokedMediaLease.sessionID) {
+                    try await api.endCall(id: heldCallID, reason: "cancelled")
+                }
             }
         }
         if !isAcceptedDeletion, let cancelledOutgoingAttempt {
@@ -10450,7 +10468,8 @@ final class AppModel: ObservableObject {
         monotonicNow: TimeInterval = CallMonotonicClock.now()
     ) {
         guard let waiting = callWaitingState.waitingCall else { return }
-        if waiting.ringDeadline.isExpired(at: monotonicNow) {
+        if waiting.ringDeadline.isExpired(at: monotonicNow),
+           !NotificationCoordinator.shared.hasPendingCallAcceptance(callID: waiting.callID) {
             _ = clearWaitingCallForLifecycle(callID: waiting.callID)
             NotificationCoordinator.shared.reportCallEnded(waiting.callUUID, reason: .unanswered)
             return
@@ -10464,7 +10483,8 @@ final class AppModel: ObservableObject {
             case .queued, .ringing:
                 reason = nil
             case .active:
-                reason = .answeredElsewhere
+                reason = NotificationCoordinator.shared.hasPendingCallAcceptance(callID: waiting.callID)
+                    ? nil : .answeredElsewhere
             case .missed:
                 reason = .unanswered
             case .declined:
@@ -10493,7 +10513,7 @@ final class AppModel: ObservableObject {
     /// Every call this process is currently hosting: the presented media session, the provisional
     /// outgoing attempt, and the CallKit waiting record. A record named here is live by definition.
     private func hostedCallIDs() -> Set<String> {
-        var identifiers: Set<String> = []
+        var identifiers = Set(CallMediaCoordinator.shared.heldCalls.keys)
         if let activeCallID = CallMediaCoordinator.shared.activeCall?.id {
             identifiers.insert(canonicalCallID(activeCallID) ?? activeCallID.lowercased())
         }
@@ -17563,7 +17583,21 @@ final class AppModel: ObservableObject {
         name: String,
         video: Bool
     ) async {
-        let rawRecipientId = recipientId.trimmingCharacters(in: .whitespacesAndNewlines)
+        await queueGroupCall(recipientIDs: [recipientId], name: name, video: video)
+    }
+
+    func queueGroupCall(recipientIDs: [String], name: String, video: Bool) async {
+        let canonicalRecipients = recipientIDs.compactMap {
+            UUID(uuidString: $0.trimmingCharacters(in: .whitespacesAndNewlines))?.uuidString.lowercased()
+        }
+        guard (1...20).contains(recipientIDs.count),
+              canonicalRecipients.count == recipientIDs.count,
+              Set(canonicalRecipients).count == canonicalRecipients.count,
+              !canonicalRecipients.contains(profile?.id.lowercased() ?? ""),
+              let rawRecipientId = canonicalRecipients.first else {
+            lastError = "Choose between 1 and 20 different Kit Pay contacts."
+            return
+        }
         let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !AppReviewDemoMutationPolicy.peerIsReadOnly(
             rawRecipientId,
@@ -17587,10 +17621,10 @@ final class AppModel: ObservableObject {
            (callCapabilityNeedsRecovery || !hasUsableCommunicationPrivacyProjection) {
             await retryCommunicationReadiness()
         }
-        if let denial = communicationPrivacyDenialMessage(
-            for: cleanRecipientId,
-            blockedMessage: "Unblock this account before starting a call."
-        ) {
+        if let denial = canonicalRecipients.compactMap({ recipient in
+            communicationPrivacyDenialMessage(for: recipient,
+                blockedMessage: "Unblock this account before starting a call.")
+        }).first {
             lastError = denial
             return
         }
@@ -17644,7 +17678,8 @@ final class AppModel: ObservableObject {
             // still resolve the original peer deterministically from the authenticated roster.
             conversationID: nil,
             createdAt: Date(),
-            lease: lease
+            lease: lease,
+            groupRecipientUserIDs: canonicalRecipients
         )
         guard ephemeralOutgoingCallGate.begin(attempt) else {
             lastError = "Finish or cancel the current call attempt before starting another."
@@ -17918,6 +17953,37 @@ final class AppModel: ObservableObject {
 
     func canInviteParticipant(to activeCall: ActiveCallPresentation?) -> Bool {
         authorizedCallInvitationContext(for: activeCall)?.canInviteAnotherParticipant == true
+    }
+
+    func canManageLiveCallInviteLink(for activeCall: ActiveCallPresentation?) -> Bool {
+        capabilities?.supportsFeature("calls_invite_links") == true
+            && !requiresBiometricSignIn && !communicationSurfacesConcealed
+            && !isSwitchingCalls && !CallMediaCoordinator.shared.isHeld
+            && authorizedCallInvitationContext(for: activeCall) != nil
+    }
+
+    func createLiveCallInviteLink(for activeCall: ActiveCallPresentation) async throws -> CallInviteLinkDTO {
+        guard canManageLiveCallInviteLink(for: activeCall),
+              let context = authorizedCallInvitationContext(for: activeCall) else { throw CancellationError() }
+        let callID = context.callID
+        let link = try await withCallAccountSession(feature: "calls_invite_links") { api in
+            let call = try await api.call(id: callID)
+            guard call.id.caseInsensitiveCompare(callID) == .orderedSame,
+                  call.participantState == "joined", !call.isHeld else { throw CancellationError() }
+            return try await api.createCallInviteLink(id: callID)
+        }
+        guard canManageLiveCallInviteLink(for: activeCall),
+              authorizedCallInvitationContext(for: activeCall)?.callID == callID,
+              link.validatedShareURL != nil else { throw CancellationError() }
+        return link
+    }
+
+    func revokeLiveCallInviteLink(id: String, for activeCall: ActiveCallPresentation) async throws {
+        guard canManageLiveCallInviteLink(for: activeCall),
+              let context = authorizedCallInvitationContext(for: activeCall) else { throw CancellationError() }
+        try await withCallAccountSession(feature: "calls_invite_links") { try await $0.revokeCallInviteLink(id: id) }
+        guard canManageLiveCallInviteLink(for: activeCall),
+              authorizedCallInvitationContext(for: activeCall)?.callID == context.callID else { throw CancellationError() }
     }
 
     func participantUserIDs(for activeCall: ActiveCallPresentation?) -> Set<String> {
@@ -18794,6 +18860,14 @@ final class AppModel: ObservableObject {
                 ephemeralOutgoingCallGate.suspendSubmission()
                 return
             }
+            guard attempt.recipientUserIDs.allSatisfy({ recipient in
+                !AppReviewDemoMutationPolicy.peerIsReadOnly(recipient, isDemoActive: appReviewDemoIsActive)
+                    && communicationPrivacyDenialMessage(for: recipient,
+                        blockedMessage: "Unblock this account before starting a call.") == nil
+            }) else {
+                cancelEphemeralOutgoingCall(clientCallID: attempt.clientCallIDString, dismissPresentation: true)
+                return
+            }
             guard outgoingCallRingDeadlineGate.permitsSubmission(for: attempt) else {
                 cancelEphemeralOutgoingCall(
                     clientCallID: attempt.clientCallIDString,
@@ -18808,7 +18882,7 @@ final class AppModel: ObservableObject {
                     attempt.lease.sessionID
                 ) {
                     try await api.startCall(
-                        recipientUserIds: [attempt.recipientUserID],
+                        recipientUserIds: attempt.recipientUserIDs,
                         video: attempt.video,
                         conversationId: attempt.conversationID,
                         clientCallId: attempt.clientCallIDString
@@ -20869,11 +20943,7 @@ final class AppModel: ObservableObject {
         case .answer:
             if callActionTargetsDifferentActiveMediaCall(action) {
                 await ingestQueuedAuthenticatedIncomingCall(callID: action.callId)
-                if connectedMediaPermitsCallWaitingMerge {
-                    await handleWaitingCallSystemAction(action)
-                } else {
-                    await rejectUnmergeableSecondaryCall(action)
-                }
+                _ = await holdAndAnswerWaitingCall(callID: action.callId)
                 return
             }
             let expectedAccountEpoch = accountEpoch
@@ -20903,11 +20973,7 @@ final class AppModel: ObservableObject {
             // action is allowed to alter the connecting presentation.
             if callActionTargetsDifferentActiveMediaCall(action) {
                 await ingestQueuedAuthenticatedIncomingCall(callID: action.callId)
-                if connectedMediaPermitsCallWaitingMerge {
-                    await handleWaitingCallSystemAction(action)
-                } else {
-                    await rejectUnmergeableSecondaryCall(action)
-                }
+                _ = await holdAndAnswerWaitingCall(callID: action.callId)
                 return
             }
             CallMediaCoordinator.shared.presentConnecting(
@@ -22324,6 +22390,384 @@ struct SecureMessagingRemoteWake: Sendable {
         else { return nil }
         self.notificationID = notificationID
         messageAvailable = nil
+    }
+}
+
+extension AppModel {
+    func withCallAccountSession<T: Sendable>(
+        feature: String,
+        _ operation: @Sendable (APIClient) async throws -> T
+    ) async throws -> T {
+        guard capabilities?.supportsFeature(feature) == true,
+              callsFeatureEnabled, communicationAccessGranted,
+              let lease = await currentCallHoldLease() else { throw CancellationError() }
+        let value = try await APIClientSessionBinding.$sessionID.withValue(lease.sessionID) {
+            try await operation(api)
+        }
+        guard await callHoldLeaseIsCurrent(lease),
+              capabilities?.supportsFeature(feature) == true,
+              communicationAccessGranted else { throw CancellationError() }
+        return value
+    }
+
+    private func currentCallHoldLease() async -> CallMediaAccountLease? {
+        guard appReviewDemoMutationsAllowed, !isSigningOut, isSignedIn,
+              !isSubmittingAccountDeletion, !acceptedAccountDeletionCleanupBlocked,
+              !protectedLocalStateRecoveryBlocked, !unresolvedAccountDeletionAttemptBlocked,
+              let lease = callMediaAccountLease, await callHoldLeaseIsCurrent(lease)
+        else { return nil }
+        return lease
+    }
+
+    private func callHoldLeaseIsCurrent(_ lease: CallMediaAccountLease) async -> Bool {
+        guard !Task.isCancelled, callMediaAccountLease == lease,
+              accountEpoch == lease.accountEpoch, !isSigningOut,
+              profile?.id.caseInsensitiveCompare(lease.userID) == .orderedSame
+        else { return false }
+        return await outboxContextIsCurrent(accountEpoch: lease.accountEpoch,
+                                           userID: lease.userID, sessionID: lease.sessionID)
+    }
+
+    private func handleCallHoldRequest(_ request: CallHoldActionDispatcher.Request) async -> Bool {
+        switch request {
+        case .hold(let callID, let reason):
+            guard await currentCallHoldLease() != nil else { return false }
+            return await CallMediaCoordinator.shared.holdLocally(callID: callID, reason: reason)
+        case .resume(let callID):
+            return await resumeHeldCall(callID: callID)
+        case .answerWaiting(let callID):
+            return await holdAndAnswerWaitingCall(callID: callID)
+        }
+    }
+
+    /// The invitation screen has already shown the authenticated audience and call. Opening a
+    /// link alone never reaches this method; the explicit Join button owns permissions/admission.
+    func joinCallInvitation(
+        expectedCallID: String,
+        video: Bool,
+        redeem: @escaping @Sendable (APIClient, String?, Int?) async throws -> CallSessionDTO
+    ) async -> Bool {
+        let media = CallMediaCoordinator.shared
+        guard let uuid = UUID(uuidString: expectedCallID), !isSwitchingCalls,
+              capabilities?.supportsFeature("calls_invite_links") == true,
+              callsFeatureEnabled, communicationAccessGranted,
+              UIApplication.shared.applicationState == .active,
+              let lease = await currentCallHoldLease() else { return false }
+        let callID = uuid.uuidString.lowercased()
+        guard !media.externalCallIsConnected, ephemeralOutgoingCallGate.attempt == nil else {
+            lastError = "Finish the other call before joining this invitation."
+            return false
+        }
+        if media.activeCall?.id.lowercased() == callID {
+            if media.isHeld { NotificationCoordinator.shared.requestHeld(false, callID: callID) }
+            return true
+        }
+        do { try await media.preparePermissions(video: video) }
+        catch { lastError = error.localizedDescription; return false }
+        guard await callHoldLeaseIsCurrent(lease),
+              UIApplication.shared.applicationState == .active else { return false }
+        guard let ticket = NotificationCoordinator.shared.beginInvitationAcceptance(callID: callID) else { return false }
+        defer { NotificationCoordinator.shared.finishInvitationAcceptance(ticket) }
+        let guardedRedemption: @Sendable (APIClient, String?, Int?) async throws -> CallSessionDTO = { api, heldID, revision in
+            let session = try await redeem(api, heldID, revision)
+            guard await NotificationCoordinator.shared.invitationAcceptanceIsCurrent(ticket) else {
+                throw CancellationError()
+            }
+            return session
+        }
+        if media.activeCall != nil {
+            return await holdAndAnswerWaitingCall(callID: callID, redeemInvitation: guardedRedemption)
+        }
+        guard !isSwitchingCalls, media.heldCalls.isEmpty,
+              !locallyTerminatedCallIds.contains(callID) else { return false }
+        let operationID = UUID()
+        callSwitchOperationID = operationID
+        isSwitchingCalls = true
+        defer {
+            if callSwitchOperationID == operationID {
+                callSwitchOperationID = nil
+                isSwitchingCalls = false
+                media.retryInterruptedCallResumeIfPossible()
+            }
+        }
+        do {
+            let accepted = try await APIClientSessionBinding.$sessionID.withValue(lease.sessionID) {
+                try await guardedRedemption(api, nil, nil)
+            }
+            guard accepted.call.id.caseInsensitiveCompare(callID) == .orderedSame,
+                  accepted.call.state == "active", accepted.call.participantState == "joined",
+                  !accepted.call.isHeld, accepted.heldCall == nil,
+                  await callHoldLeaseIsCurrent(lease), media.activeCall == nil,
+                  !locallyTerminatedCallIds.contains(callID) else { throw CancellationError() }
+            let handoff = try CallMediaHandoff(session: accepted).asUserInitiatedJoin()
+            guard handoff.answeredAt != nil else { throw CallQueueError.invalidRTC }
+            await media.consumeAuthenticated(AuthenticatedCallMediaHandoff(lease: lease, handoff: handoff))
+            await persistAnsweredCall(mapCall(accepted.call, stateOverride: .active),
+                accountEpoch: lease.accountEpoch, userID: lease.userID, sessionID: lease.sessionID)
+            return await callHoldLeaseIsCurrent(lease)
+        } catch {
+            if await callHoldLeaseIsCurrent(lease) {
+                // Also decline a still-invited membership when a response was lost. This fences
+                // a delayed redemption from resurrecting the call after the user saw failure.
+                do {
+                    _ = try await APIClientSessionBinding.$sessionID.withValue(lease.sessionID) {
+                        try await api.endCall(id: callID, reason: "cancelled")
+                    }
+                } catch {
+                    await enqueueTermination(callId: callID, kind: .end, reason: "cancelled",
+                        accountEpoch: lease.accountEpoch, userID: lease.userID, sessionID: lease.sessionID)
+                }
+                lastError = error.localizedDescription
+            }
+            return false
+        }
+    }
+
+    func holdAndAnswerWaitingCall(
+        callID: String,
+        redeemInvitation: (@Sendable (APIClient, String?, Int?) async throws -> CallSessionDTO)? = nil
+    ) async -> Bool {
+        let media = CallMediaCoordinator.shared
+        guard !isSwitchingCalls, !isMergingWaitingCall,
+              let lease = await currentCallHoldLease(),
+              let activeID = media.activeCall?.id,
+              activeID.caseInsensitiveCompare(callID) != .orderedSame,
+              media.canHoldAndAnswer else { return false }
+        let operationID = UUID()
+        callSwitchOperationID = operationID
+        isSwitchingCalls = true
+        var acceptWasAttempted = false
+        let preservesManualHold = media.activeHold?.reason == .manual
+        defer {
+            if callSwitchOperationID == operationID {
+                callSwitchOperationID = nil
+                isSwitchingCalls = false
+                media.retryInterruptedCallResumeIfPossible()
+            }
+            if !acceptWasAttempted,
+               let held = media.heldCalls[activeID.lowercased()], held.lease == lease,
+               held.reason == .waiting, !held.requiresFreshRTC {
+                NotificationCoordinator.shared.requestHeld(false, callID: activeID)
+            }
+        }
+        if redeemInvitation == nil { await ingestQueuedAuthenticatedIncomingCall(callID: callID) }
+        guard (redeemInvitation != nil || waitingCall?.callID.caseInsensitiveCompare(callID) == .orderedSame),
+              await callHoldLeaseIsCurrent(lease) else { return false }
+        do {
+            let active = try await APIClientSessionBinding.$sessionID.withValue(lease.sessionID) {
+                try await api.call(id: activeID)
+            }
+            guard active.id.caseInsensitiveCompare(activeID) == .orderedSame, active.canHold, active.holdRevision != nil,
+                  media.activeCall?.id == activeID, !media.externalCallIsConnected,
+                  await callHoldLeaseIsCurrent(lease) else {
+                lastError = "Hold & Answer is not available for everyone in this call yet."
+                return false
+            }
+            guard await media.holdLocally(callID: activeID, reason: .waiting),
+                  await callHoldLeaseIsCurrent(lease),
+                  !locallyTerminatedCallIds.contains(callID.lowercased()) else { return false }
+            acceptWasAttempted = true
+            media.markHoldTransitionSubmitted(callID: activeID, pendingAcceptanceCallID: callID)
+            let accepted = try await APIClientSessionBinding.$sessionID.withValue(lease.sessionID) {
+                if let redeemInvitation {
+                    return try await redeemInvitation(api, activeID, active.holdRevision)
+                }
+                return try await api.acceptCall(id: callID, holdCallID: activeID, holdCallRevision: active.holdRevision)
+            }
+            guard accepted.call.id.caseInsensitiveCompare(callID) == .orderedSame,
+                  accepted.call.state == "active", !accepted.call.isHeld,
+                  let heldDTO = accepted.heldCall,
+                  heldDTO.id.caseInsensitiveCompare(activeID) == .orderedSame,
+                  heldDTO.isHeld, heldDTO.holdRevision != nil,
+                  await callHoldLeaseIsCurrent(lease),
+                  !locallyTerminatedCallIds.contains(callID.lowercased()),
+                  media.heldCalls[activeID.lowercased()]?.lease == lease else {
+                throw CancellationError()
+            }
+            guard redeemInvitation != nil || NotificationCoordinator.shared.completeHeldAnswer(callID: callID) else {
+                throw CancellationError()
+            }
+            media.clearPendingAcceptance(callID: activeID)
+            await media.detachHeldCall(callID: activeID, revision: heldDTO.holdRevision)
+            guard await callHoldLeaseIsCurrent(lease),
+                  !locallyTerminatedCallIds.contains(callID.lowercased()) else {
+                throw CancellationError()
+            }
+            _ = clearWaitingCallForLifecycle(callID: callID)
+            let handoff = try CallMediaHandoff(session: accepted)
+            if redeemInvitation != nil {
+                guard handoff.answeredAt != nil else { throw CallQueueError.invalidRTC }
+                await media.consumeAuthenticated(AuthenticatedCallMediaHandoff(
+                    lease: lease, handoff: try handoff.asUserInitiatedJoin()))
+            } else {
+                try await media.connectAuthenticated(AuthenticatedCallMediaHandoff(lease: lease, handoff: handoff))
+            }
+            await persistAnsweredCall(mapCall(accepted.call, stateOverride: .active),
+                accountEpoch: lease.accountEpoch, userID: lease.userID, sessionID: lease.sessionID)
+            return true
+        } catch {
+            // Cancel B first: /end also tombstones a still-invited membership. Whether a delayed
+            // accept wins or loses that race, it cannot subsequently hold A after compensation.
+            if acceptWasAttempted, await callHoldLeaseIsCurrent(lease) {
+                if let uuid = UUID(uuidString: callID) {
+                    NotificationCoordinator.shared.reportCallEnded(uuid, reason: .failed)
+                }
+                _ = clearWaitingCallForLifecycle(callID: callID)
+                await media.disconnectFromCallKit(callId: callID)
+                var cancellationConfirmed = false
+                do {
+                    let cancelled = try await APIClientSessionBinding.$sessionID.withValue(lease.sessionID) {
+                        try await api.endCall(id: callID, reason: "cancelled")
+                    }
+                    guard cancelled.id.caseInsensitiveCompare(callID) == .orderedSame,
+                          await callHoldLeaseIsCurrent(lease) else {
+                        throw CancellationError()
+                    }
+                    cancellationConfirmed = true
+                    media.clearPendingAcceptance(callID: activeID)
+                    guard media.heldCalls[activeID.lowercased()]?.lease == lease,
+                          !locallyTerminatedCallIds.contains(activeID.lowercased()) else { return false }
+                    if preservesManualHold {
+                        await media.disconnectFromCallKit(callId: callID)
+                        lastError = error.localizedDescription
+                        return false
+                    }
+                    let original = try await APIClientSessionBinding.$sessionID.withValue(lease.sessionID) {
+                        try await api.call(id: activeID)
+                    }
+                    guard original.id.caseInsensitiveCompare(activeID) == .orderedSame,
+                          original.state == "active", await callHoldLeaseIsCurrent(lease) else {
+                        throw CancellationError()
+                    }
+                    if original.isHeld || media.heldCalls[activeID.lowercased()]?.requiresFreshRTC == true {
+                        let restored = try await APIClientSessionBinding.$sessionID.withValue(lease.sessionID) {
+                            try await api.resumeCall(id: activeID, revision: original.holdRevision)
+                        }
+                        guard await callHoldLeaseIsCurrent(lease),
+                              !locallyTerminatedCallIds.contains(activeID.lowercased()),
+                              restored.call.id.caseInsensitiveCompare(activeID) == .orderedSame,
+                              restored.call.state == "active", !restored.call.isHeld else {
+                            throw CancellationError()
+                        }
+                        await media.disconnectFromCallKit(callId: callID)
+                        await media.detachHeldCall(callID: activeID)
+                        NotificationCoordinator.shared.claimResumedCallAudio(callID: activeID)
+                        try await media.resumeHeldCall(AuthenticatedCallMediaHandoff(
+                            lease: lease, handoff: try CallMediaHandoff(session: restored)))
+                    }
+                    NotificationCoordinator.shared.requestHeld(false, callID: activeID)
+                } catch {
+                    // Retain cancellation across transient outages; Resume must confirm this
+                    // barrier before the original call can publish again.
+                    if !cancellationConfirmed {
+                        await enqueueTermination(callId: callID, kind: .end, reason: "cancelled",
+                            accountEpoch: lease.accountEpoch, userID: lease.userID, sessionID: lease.sessionID)
+                    }
+                }
+            }
+            if await callHoldLeaseIsCurrent(lease) { lastError = error.localizedDescription }
+            return false
+        }
+    }
+
+    @discardableResult
+    func resumeHeldCall(callID: String) async -> Bool {
+        let media = CallMediaCoordinator.shared
+        guard !isSwitchingCalls, let lease = await currentCallHoldLease(),
+              var held = media.heldCalls[callID.lowercased()], held.lease == lease,
+              !media.externalCallIsConnected, media.systemAudioIsAvailable,
+              !locallyTerminatedCallIds.contains(callID.lowercased()) else { return false }
+        let operationID = UUID()
+        callSwitchOperationID = operationID
+        isSwitchingCalls = true
+        defer {
+            if callSwitchOperationID == operationID {
+                isSwitchingCalls = false
+                callSwitchOperationID = nil
+            }
+        }
+        do {
+            if let pendingID = held.pendingAcceptanceCallID {
+                let cancelled = try await APIClientSessionBinding.$sessionID.withValue(lease.sessionID) {
+                    try await api.endCall(id: pendingID, reason: "cancelled")
+                }
+                guard cancelled.id.caseInsensitiveCompare(pendingID) == .orderedSame,
+                      await callHoldLeaseIsCurrent(lease) else { throw CancellationError() }
+                media.clearPendingAcceptance(callID: callID)
+                if let uuid = UUID(uuidString: pendingID) {
+                    NotificationCoordinator.shared.reportCallEnded(uuid, reason: .failed)
+                }
+                _ = clearWaitingCallForLifecycle(callID: pendingID)
+            }
+
+            if !held.requiresFreshRTC {
+                if try await media.resumeLocalCall(callID: callID) { return true }
+                guard let refreshed = media.heldCalls[callID.lowercased()], refreshed.lease == lease,
+                      await callHoldLeaseIsCurrent(lease) else { return false }
+                held = refreshed
+            }
+            let otherID = media.activeCall?.id.lowercased() == callID.lowercased()
+                ? nil : media.activeCall?.id
+            if let otherID {
+                guard await media.holdLocally(callID: otherID, reason: .waiting),
+                      await callHoldLeaseIsCurrent(lease) else { return false }
+            }
+            let handoff: CallMediaHandoff
+            var heldOtherRevision: Int?
+            let before = try await APIClientSessionBinding.$sessionID.withValue(lease.sessionID) {
+                try await api.call(id: callID)
+            }
+            guard before.id.caseInsensitiveCompare(callID) == .orderedSame,
+                  before.state == "active", await callHoldLeaseIsCurrent(lease) else {
+                throw APIClientError.invalidResponse
+            }
+            if held.serverHeld || before.isHeld || otherID != nil {
+                guard let revision = before.holdRevision else { throw APIClientError.invalidResponse }
+                let otherRevision: Int?
+                if let otherID {
+                    let other = try await APIClientSessionBinding.$sessionID.withValue(lease.sessionID) {
+                        try await api.call(id: otherID)
+                    }
+                    guard other.id.caseInsensitiveCompare(otherID) == .orderedSame,
+                          other.canHold, let revision = other.holdRevision else {
+                        throw APIClientError.invalidResponse
+                    }
+                    otherRevision = revision
+                } else { otherRevision = nil }
+                guard await callHoldLeaseIsCurrent(lease) else { throw CancellationError() }
+                if let otherID { media.markHoldTransitionSubmitted(callID: otherID) }
+                let resumed = try await APIClientSessionBinding.$sessionID.withValue(lease.sessionID) {
+                    try await api.resumeCall(id: callID, holdCallID: otherID,
+                        revision: revision, holdCallRevision: otherRevision)
+                }
+                guard resumed.call.id.caseInsensitiveCompare(callID) == .orderedSame,
+                      resumed.call.state == "active", !resumed.call.isHeld else {
+                    throw APIClientError.invalidResponse
+                }
+                if let otherID {
+                    guard let other = resumed.heldCall,
+                          other.id.caseInsensitiveCompare(otherID) == .orderedSame,
+                          other.isHeld, other.holdRevision != nil else { throw APIClientError.invalidResponse }
+                    heldOtherRevision = other.holdRevision
+                }
+                handoff = try CallMediaHandoff(session: resumed)
+            } else {
+                let rtc = try await APIClientSessionBinding.$sessionID.withValue(lease.sessionID) {
+                    try await api.callToken(id: callID)
+                }
+                handoff = try held.handoff.refreshingRTC(rtc)
+            }
+            guard await callHoldLeaseIsCurrent(lease),
+                  media.heldCalls[callID.lowercased()]?.lease == lease,
+                  !locallyTerminatedCallIds.contains(callID.lowercased()) else { return false }
+            if let otherID { await media.detachHeldCall(callID: otherID, revision: heldOtherRevision) }
+            NotificationCoordinator.shared.claimResumedCallAudio(callID: callID)
+            try await media.resumeHeldCall(AuthenticatedCallMediaHandoff(lease: lease, handoff: handoff))
+            return true
+        } catch {
+            if await callHoldLeaseIsCurrent(lease) { lastError = error.localizedDescription }
+            return false
+        }
     }
 }
 

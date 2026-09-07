@@ -586,6 +586,8 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
     var onAudioSessionConfigurationFailed: (@Sendable (String) -> Void)?
 
     private var room: Room?
+    private var captureOperationTask: Task<Void, Never>?
+    private var isCaptureSuspended = false
     private var connectedCallId: String?
     private var mediaIntentCallId: String?
     private var mediaIntent = CallMediaIntentState(video: false)
@@ -723,7 +725,7 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
             CallMediaPrewarmer.shared.rememberConnectedMediaURL(handoff.url)
             updateRemoteParticipantPresence(in: connectionRoom)
             refreshRemoteParticipantSurfaces(in: connectionRoom)
-            isMicrophoneEnabled = appliedIntent.microphoneEnabled
+            isMicrophoneEnabled = appliedIntent.microphoneEnabled && !isCaptureSuspended
             isFrontCamera = appliedIntent.frontCamera
             // The camera has not been published yet. Reporting it as on before the preview exists
             // would show the user a video control that does not match what is being sent.
@@ -764,10 +766,7 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
         while true {
             let intended = mediaIntent
             let intendedRevision = mediaIntentRevision
-            let microphonePublication = try await connectionRoom.localParticipant.setMicrophone(
-                enabled: intended.microphoneEnabled,
-                captureOptions: microphoneMode.captureOptions
-            )
+            let microphonePublication = try await publishRoomMicrophone(in: connectionRoom, enabled: intended.microphoneEnabled)
             guard connectionGeneration == expectedGeneration,
                   room === connectionRoom
             else { throw LiveKitCallMediaError.mediaUnavailable }
@@ -784,7 +783,7 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
     @MainActor
     func publishPendingInitialCamera(callId: String) async throws -> Bool {
         let canonicalCallID = callId.lowercased()
-        guard pendingInitialCameraCallId?.caseInsensitiveCompare(canonicalCallID) == .orderedSame,
+        guard !isCaptureSuspended, pendingInitialCameraCallId?.caseInsensitiveCompare(canonicalCallID) == .orderedSame,
               mediaIntentCallId?.caseInsensitiveCompare(canonicalCallID) == .orderedSame,
               connectedCallId?.caseInsensitiveCompare(canonicalCallID) == .orderedSame
         else { return false }
@@ -796,7 +795,7 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
 
     @MainActor
     func disconnect() async {
-        screenSharing.unbind()
+        let screenCleanup = screenSharing.unbind()
         connectionGeneration &+= 1
         let disconnectingRoom = room
         room = nil
@@ -807,6 +806,7 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
         if let disconnectingRoom {
             await disconnectingRoom.disconnect()
         }
+        await screenCleanup?.value
     }
 
     @MainActor
@@ -852,7 +852,7 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
 
     @MainActor
     func setMicrophone(enabled: Bool) async throws {
-        guard mediaIntentCallId != nil else { throw LiveKitCallMediaError.mediaUnavailable }
+        guard let expectedCallId = mediaIntentCallId else { throw LiveKitCallMediaError.mediaUnavailable }
         let previousIntent = mediaIntent.microphoneEnabled
         if mediaIntent.microphoneEnabled != enabled {
             mediaIntent.setMicrophoneEnabled(enabled)
@@ -861,23 +861,27 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
         guard let liveRoom = room, connectedCallId != nil else {
             // The old room has gone away and the reconnect loop owns replacement. Reflect and retain
             // the requested state now; `applyMediaIntent` publishes it before exposing the new room.
-            isMicrophoneEnabled = enabled
+            isMicrophoneEnabled = enabled && !isCaptureSuspended
             return
         }
         do {
-            let publication = try await liveRoom.localParticipant.setMicrophone(enabled: enabled)
+            let publication = try await publishRoomMicrophone(in: liveRoom, enabled: enabled)
             guard room === liveRoom, connectedCallId != nil else {
-                isMicrophoneEnabled = enabled
+                if mediaIntentCallId == expectedCallId {
+                    isMicrophoneEnabled = enabled && !isCaptureSuspended
+                }
                 return
             }
             if let track = publication?.track as? LocalAudioTrack {
                 localAudioTrack = track
                 try? applyMicrophoneMode(to: track)
             }
-            isMicrophoneEnabled = enabled
+            isMicrophoneEnabled = enabled && !isCaptureSuspended
         } catch {
             guard room === liveRoom, connectedCallId != nil else {
-                isMicrophoneEnabled = enabled
+                if mediaIntentCallId == expectedCallId {
+                    isMicrophoneEnabled = enabled && !isCaptureSuspended
+                }
                 return
             }
             if mediaIntent.microphoneEnabled == enabled,
@@ -899,7 +903,7 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
                 callId: callId.lowercased(),
                 enabled: enabled
             )
-            isMicrophoneEnabled = enabled
+            isMicrophoneEnabled = enabled && !isCaptureSuspended
             return
         }
         guard mediaIntentCallId.caseInsensitiveCompare(callId) == .orderedSame else {
@@ -942,7 +946,7 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
             mediaIntentRevision &+= 1
         }
         guard let liveRoom = room, connectedCallId != nil else {
-            isCameraEnabled = enabled
+            isCameraEnabled = enabled && !isCaptureSuspended
             canSwitchCamera = false
             return
         }
@@ -950,16 +954,20 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
             ? CameraCaptureOptions(position: mediaIntent.frontCamera ? .front : .back)
             : nil
         do {
-            try await liveRoom.localParticipant.setCamera(
-                enabled: enabled,
-                captureOptions: captureOptions
-            )
+            try await serializeCapture { [self] in
+                guard room === liveRoom else { throw CancellationError() }
+                return try await liveRoom.localParticipant.setCamera(
+                    enabled: enabled && !isCaptureSuspended, captureOptions: captureOptions
+                )
+            }
             guard room === liveRoom, connectedCallId != nil else {
-                isCameraEnabled = enabled
-                canSwitchCamera = false
+                if mediaIntentCallId == expectedCallId {
+                    isCameraEnabled = enabled && !isCaptureSuspended
+                    canSwitchCamera = false
+                }
                 return
             }
-            isCameraEnabled = enabled
+            isCameraEnabled = enabled && !isCaptureSuspended
             if !enabled { localVideoTrack = nil }
             canSwitchCamera = enabled
                 ? ((try? await CameraCapturer.canSwitchPosition()) ?? false)
@@ -967,8 +975,10 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
             updateCameraPosition()
         } catch {
             guard room === liveRoom, connectedCallId != nil else {
-                isCameraEnabled = enabled
-                canSwitchCamera = false
+                if mediaIntentCallId == expectedCallId {
+                    isCameraEnabled = enabled && !isCaptureSuspended
+                    canSwitchCamera = false
+                }
                 return
             }
             if mediaIntent.cameraEnabled == enabled,
@@ -1032,7 +1042,7 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
         }
         do {
             try applyAudioCategory(session: session, video: video, speaker: wantsSpeaker)
-            try AudioManager.shared.setEngineAvailability(.default)
+            try AudioManager.shared.setEngineAvailability(isCaptureSuspended ? .none : .default)
             audioSessionIsActive = true
             audioLogger.info(
                 "call_audio_engine_available video=\(video, privacy: .public) speaker=\(self.wantsSpeaker, privacy: .public)"
@@ -1065,8 +1075,12 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
     }
 
     @MainActor
-    func deactivateAudioSession() throws {
+    func deactivateAudioSession(preservingPreferences: Bool = false) throws {
         audioSessionIsActive = false
+        if preservingPreferences {
+            try AudioManager.shared.setEngineAvailability(.none)
+            return
+        }
         // The next call starts from the platform default again, not this call's speaker choice.
         wantsSpeaker = false
         hasExplicitSpeakerPreference = false
@@ -1160,6 +1174,8 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
 
     @MainActor
     private func resetMediaIntent() {
+        // Teardown changes rooms, not OS audio ownership. The coordinator explicitly grants
+        // capture to the next connection after checking its hold and interruption state.
         mediaIntentCallId = nil
         mediaIntent = CallMediaIntentState(video: false)
         deferredInitialCameraCallId = nil
@@ -1219,6 +1235,12 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
     @MainActor
     private func refreshRemoteParticipantSurfaces(in observedRoom: Room) {
         guard room === observedRoom else { return }
+        guard !isCaptureSuspended else {
+            remoteVideoTrack = nil
+            remoteParticipantSurfaces = []
+            remoteVideoIsScreenShare = false
+            return
+        }
 
         var surfaces: [LiveKitRemoteParticipantSurface] = []
         for (roomIdentity, participant) in observedRoom.remoteParticipants {
@@ -1504,6 +1526,364 @@ final class LiveKitCallMediaTransport: NSObject, ObservableObject, CallMediaTran
 }
 
 @MainActor
+fileprivate extension LiveKitCallMediaTransport {
+    var holdIntent: CallMediaIntentState {
+        var intent = mediaIntent
+        if deferredInitialCameraCallId != nil || pendingInitialCameraCallId != nil {
+            intent.setCameraEnabled(true)
+        }
+        return intent
+    }
+    var holdSpeaker: Bool { wantsSpeaker }
+
+    func holdIntent(for handoff: CallMediaHandoff) -> CallMediaIntentState {
+        mediaIntentCallId == handoff.callId ? holdIntent : CallMediaIntentState(video: handoff.video)
+    }
+
+    func prepareCaptureForConnection(suspended: Bool) { isCaptureSuspended = suspended }
+
+    func serializeCapture<T: Sendable>(
+        _ operation: @escaping @MainActor () async throws -> T
+    ) async throws -> T {
+        let previous = captureOperationTask
+        let task = Task { @MainActor in
+            await previous?.value
+            return try await operation()
+        }
+        captureOperationTask = Task { _ = try? await task.value }
+        return try await task.value
+    }
+
+    func publishRoomMicrophone(in target: Room, enabled: Bool) async throws -> LocalTrackPublication? {
+        try await serializeCapture { [self] in
+            guard room === target else { throw CancellationError() }
+            return try await target.localParticipant.setMicrophone(
+                enabled: enabled && !isCaptureSuspended,
+                captureOptions: microphoneMode.captureOptions
+            )
+        }
+    }
+
+    func suspendNewCapturePublications() { isCaptureSuspended = true }
+
+    func suspendCaptureForHold() async throws {
+        // Fence new publishers before the first suspension. Drain older publishers before
+        // confirming Hold so a delayed Camera or Screen Share cannot revive capture afterward.
+        isCaptureSuspended = true
+        try deactivateAudioSession(preservingPreferences: true)
+        let target = room
+        let screenCleanup = screenSharing.stopRetainingCleanup()
+        await captureOperationTask?.value
+        var suspensionError: Error?
+        if let target, room === target {
+            do { _ = try await target.localParticipant.setMicrophone(enabled: false) }
+            catch { suspensionError = error }
+            do { _ = try await target.localParticipant.setCamera(enabled: false) }
+            catch { suspensionError = error }
+            if room === target {
+                isMicrophoneEnabled = false
+                isCameraEnabled = false
+                localVideoTrack = nil
+                remoteVideoTrack = nil
+                remoteParticipantSurfaces = []
+                canSwitchCamera = false
+            }
+        }
+        await screenCleanup?.value
+        if let suspensionError { throw suspensionError }
+    }
+
+    func restoreIntent(_ intent: CallMediaIntentState, callID: String, speaker: Bool) {
+        mediaIntentCallId = callID.lowercased()
+        mediaIntent = intent
+        if intent.cameraEnabled && UIApplication.shared.applicationState != .active {
+            mediaIntent.setCameraEnabled(false)
+            deferredInitialCameraCallId = callID.lowercased()
+        }
+        mediaIntentRevision &+= 1
+        wantsSpeaker = speaker
+        hasExplicitSpeakerPreference = true
+        isCaptureSuspended = false
+    }
+
+    func resumeCaptureAfterHold() async throws {
+        let expectedCallID = mediaIntentCallId
+        let expectedGeneration = connectionGeneration
+        isCaptureSuspended = false
+        let intent = mediaIntent
+        try await setMicrophone(enabled: intent.microphoneEnabled)
+        guard mediaIntentCallId == expectedCallID, connectionGeneration == expectedGeneration,
+              !isCaptureSuspended else { throw CancellationError() }
+        if intent.cameraEnabled && UIApplication.shared.applicationState == .active {
+            try await setCamera(enabled: true)
+        } else if intent.cameraEnabled {
+            deferredInitialCameraCallId = mediaIntentCallId
+        }
+        if let room { refreshRemoteParticipantSurfaces(in: room) }
+        // Screen sharing always requires a new explicit grant for this call.
+    }
+}
+
+struct HeldCallPresentation: Identifiable {
+    var id: String { handoff.callId }
+    let handoff: CallMediaHandoff
+    let lease: CallMediaAccountLease
+    var intent: CallMediaIntentState
+    let speaker: Bool
+    let durationAnchor: CallDurationAnchor?
+    var reason: CallHoldReason
+    var serverHeld = false
+    var requiresFreshRTC = false
+    var revision: Int?
+    var pendingAcceptanceCallID: String? = nil
+    var name: String { handoff.participantName }
+}
+
+@MainActor
+extension CallMediaCoordinator {
+    var activeHold: HeldCallPresentation? {
+        activeCall.flatMap { heldCalls[$0.id.lowercased()] }
+    }
+    var isHeld: Bool { activeHold != nil }
+    var canHoldAndAnswer: Bool {
+        activeHandoff != nil && otherHeldCall == nil
+            && !externalCallIsConnected && (state == .connected || state == .reconnecting)
+    }
+    var otherHeldCall: HeldCallPresentation? {
+        heldCalls.values.first { $0.id.caseInsensitiveCompare(activeCall?.id ?? "") != .orderedSame }
+    }
+
+    @discardableResult
+    func holdLocally(callID: String, reason: CallHoldReason) async -> Bool {
+        let key = callID.lowercased()
+        guard prepareLocalHold(callID: key, reason: reason), let held = heldCalls[key] else { return false }
+        await localHoldTasks[key]?.value
+        localHoldTasks[key] = nil
+        return heldCalls[key]?.lease == held.lease && accountLeaseGate.accepts(held.lease)
+    }
+
+    private func prepareLocalHold(callID key: String, reason: CallHoldReason) -> Bool {
+        if var existing = heldCalls[key] {
+            if activeCall?.id.lowercased() == key { media.suspendNewCapturePublications() }
+            if reason == .manual {
+                existing.reason = .manual
+                if requestedResumeCallID == key { requestedResumeCallID = nil }
+            }
+            if reason == .waiting && existing.reason != .manual { existing.reason = .waiting }
+            if reason == .interruption {
+                existing.reason = CallHoldResumePolicy.reasonAfterExternalCallConnected(existing.reason)
+            }
+            heldCalls[key] = existing
+            return accountLeaseGate.accepts(existing.lease)
+        }
+        guard let handoff = activeHandoff, handoff.callId == key,
+              let lease = activeAccountLease, accountLeaseGate.accepts(lease),
+              state != .idle, state != .ending
+        else { return false }
+        heldCalls[key] = HeldCallPresentation(
+            handoff: handoff, lease: lease, intent: media.holdIntent(for: handoff),
+            speaker: media.holdSpeaker, durationAnchor: durationAnchor, reason: reason,
+            revision: handoff.holdRevision
+        )
+        invalidateReconnect()
+        media.suspendNewCapturePublications()
+        let task = Task { @MainActor [weak self] in
+            guard let self, !Task.isCancelled, accountLeaseGate.accepts(lease),
+                  heldCalls[key]?.lease == lease else { return }
+            do { try await media.suspendCaptureForHold() }
+            catch {
+                // A failed SDK mute never grants permission to leave capture running.
+                guard accountLeaseGate.accepts(lease), heldCalls[key]?.lease == lease else { return }
+                await session.disconnect(callId: key)
+                if heldCalls[key]?.lease == lease { heldCalls[key]?.requiresFreshRTC = true }
+            }
+        }
+        localHoldTasks[key] = task
+        return true
+    }
+
+    func revokeSystemAudioOwnership() {
+        systemAudioIsAvailable = false
+        if let callID = activeCall?.id {
+            _ = prepareLocalHold(callID: callID.lowercased(), reason: .system)
+        }
+    }
+
+    func detachHeldCall(callID: String, revision: Int? = nil) async {
+        let key = callID.lowercased()
+        guard var held = heldCalls[key], accountLeaseGate.accepts(held.lease) else { return }
+        held.serverHeld = true
+        held.requiresFreshRTC = true
+        held.revision = revision ?? held.revision
+        heldCalls[key] = held
+        await session.disconnect(callId: key)
+        guard heldCalls[key]?.lease == held.lease,
+              activeCall?.id.lowercased() == key else { return }
+        // Keep a controllable held presentation until the replacement actually takes ownership.
+        // Backgrounding or an external call during this gap must not leave both calls invisible.
+        state = .connected
+    }
+
+    func markHoldTransitionSubmitted(callID: String, pendingAcceptanceCallID: String? = nil) {
+        // The server may retire this RTC generation even if the HTTP response never arrives.
+        // A later Resume must re-read membership and obtain fresh credentials.
+        heldCalls[callID.lowercased()]?.requiresFreshRTC = true
+        if let pendingAcceptanceCallID {
+            heldCalls[callID.lowercased()]?.pendingAcceptanceCallID = pendingAcceptanceCallID.lowercased()
+        }
+    }
+
+    func clearPendingAcceptance(callID: String) {
+        heldCalls[callID.lowercased()]?.pendingAcceptanceCallID = nil
+    }
+
+    func resumeLocalCall(callID: String) async throws -> Bool {
+        let key = callID.lowercased()
+        guard let held = heldCalls[key], !held.requiresFreshRTC,
+              accountLeaseGate.accepts(held.lease), activeAccountLease == held.lease,
+              activeCall?.id.lowercased() == key,
+              systemAudioIsAvailable, !externalCallIsConnected
+        else { return false }
+        await localHoldTasks[key]?.value
+        guard let currentHeld = heldCalls[key], currentHeld.lease == held.lease,
+              !currentHeld.requiresFreshRTC, session.activeCallId == key,
+              accountLeaseGate.accepts(held.lease),
+              activeCall?.id.lowercased() == key,
+              systemAudioIsAvailable, !externalCallIsConnected else { return false }
+        heldCalls[key] = nil
+        do {
+            try await media.resumeCaptureAfterHold()
+            try NotificationCoordinator.shared.reconcileCallKitAudioSessionIfNeeded(callId: key)
+            return true
+        } catch {
+            if accountLeaseGate.accepts(currentHeld.lease), activeCall?.id.lowercased() == key {
+                if heldCalls[key] == nil { heldCalls[key] = currentHeld }
+                media.suspendNewCapturePublications()
+                do { try await media.suspendCaptureForHold() }
+                catch {
+                    await session.disconnect(callId: key)
+                    heldCalls[key]?.requiresFreshRTC = true
+                }
+            }
+            throw error
+        }
+    }
+
+    func resumeHeldCall(_ request: AuthenticatedCallMediaHandoff) async throws {
+        let key = request.handoff.callId
+        guard let held = heldCalls[key], held.lease == request.lease,
+              accountLeaseGate.accepts(held.lease),
+              activeCall == nil || activeCall?.id.lowercased() == key
+                || (activeHold != nil && session.activeCallId == nil)
+        else { throw CancellationError() }
+        guard systemAudioIsAvailable, !externalCallIsConnected else {
+            requestedResumeCallID = key
+            throw CancellationError()
+        }
+        await session.disconnect(callId: key)
+        guard accountLeaseGate.accepts(held.lease), heldCalls[key]?.lease == held.lease,
+              !externalCallIsConnected, systemAudioIsAvailable else {
+            if heldCalls[key]?.lease == held.lease { requestedResumeCallID = key }
+            throw CancellationError()
+        }
+        heldCalls[key] = nil
+        media.restoreIntent(held.intent, callID: key, speaker: held.speaker)
+        activeCall = ActiveCallPresentation(request.handoff)
+        durationAnchor = held.durationAnchor
+        answeredCallId = key
+        heldResumeAttempts[key] = held
+        defer { heldResumeAttempts[key] = nil }
+        try await connectAuthenticated(request, retainingOnFailure: held)
+        if isHeld { requestedResumeCallID = key }
+    }
+
+    func systemAudioAvailabilityChanged(_ available: Bool) async {
+        systemAudioIsAvailable = available
+        if !available, let callID = activeCall?.id, state != .ending {
+            _ = await holdLocally(callID: callID, reason: .system)
+            if externalCallIsConnected, let reason = heldCalls[callID.lowercased()]?.reason {
+                heldCalls[callID.lowercased()]?.reason = CallHoldResumePolicy.reasonAfterExternalCallConnected(reason)
+            }
+        }
+        resumeAfterInterruptionIfPossible()
+        resumeExplicitRequestIfPossible()
+    }
+
+    func systemInterruptionBegan() async {
+        systemAudioIsAvailable = false
+        if let callID = activeCall?.id {
+            _ = await holdLocally(callID: callID, reason: .interruption)
+        }
+    }
+
+    func externalCallConnectionChanged(_ connected: Bool) async {
+        let wasConnected = externalCallIsConnected
+        externalCallIsConnected = connected
+        if connected, let callID = activeCall?.id {
+            _ = await holdLocally(callID: callID, reason: .interruption)
+        }
+        if wasConnected && !connected { requestSystemResumeAfterInterruption() }
+        resumeAfterInterruptionIfPossible()
+        resumeExplicitRequestIfPossible()
+    }
+
+    func requestSystemResumeAfterInterruption() {
+        guard !externalCallIsConnected, let held = activeHold, held.reason == .interruption,
+              accountLeaseGate.accepts(held.lease) else { return }
+        // Requesting CallKit Unhold allows iOS to return audio ownership. This request does
+        // not itself enable a microphone: capture still waits for didActivate below.
+        NotificationCoordinator.shared.requestHeld(false, callID: held.id)
+    }
+
+    func requestResumeWhenAudioIsAvailable(callID: String) {
+        guard heldCalls[callID.lowercased()] != nil else { return }
+        requestedResumeCallID = callID.lowercased()
+        resumeExplicitRequestIfPossible()
+    }
+
+    private func resumeExplicitRequestIfPossible() {
+        guard systemAudioIsAvailable, !externalCallIsConnected,
+              let callID = requestedResumeCallID, let held = heldCalls[callID],
+              accountLeaseGate.accepts(held.lease) else { return }
+        Task { @MainActor in
+            if await CallHoldActionDispatcher.shared.dispatch(.resume(callID)),
+               requestedResumeCallID == callID { requestedResumeCallID = nil }
+        }
+    }
+
+    private func resumeAfterInterruptionIfPossible() {
+        guard automaticResumeTask == nil,
+              let held = activeHold,
+              CallHoldResumePolicy.shouldAutomaticallyResume(
+                reason: held.reason, externalCallIsConnected: externalCallIsConnected,
+                systemAudioIsAvailable: systemAudioIsAvailable, anotherKitCallIsActive: false
+              ) else { return }
+        automaticResumeTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { automaticResumeTask = nil }
+            for seconds in [0, 1, 3, 7] {
+                if seconds > 0 {
+                    do { try await Task.sleep(for: .seconds(seconds)) }
+                    catch { return }
+                }
+                guard !Task.isCancelled, activeHold?.id == held.id,
+                      activeHold?.lease == held.lease,
+                      CallHoldResumePolicy.shouldAutomaticallyResume(
+                        reason: activeHold?.reason, externalCallIsConnected: externalCallIsConnected,
+                        systemAudioIsAvailable: systemAudioIsAvailable, anotherKitCallIsActive: false
+                      ) else { return }
+                if await CallHoldActionDispatcher.shared.dispatch(.resume(held.id)) { return }
+            }
+        }
+    }
+
+    func retryInterruptedCallResumeIfPossible() {
+        resumeAfterInterruptionIfPossible()
+        resumeExplicitRequestIfPossible()
+    }
+}
+
+@MainActor
 final class CallMediaCoordinator: ObservableObject {
     enum State: Equatable {
         case idle, preparing, connecting, reconnecting, connected, ending
@@ -1511,13 +1891,16 @@ final class CallMediaCoordinator: ObservableObject {
 
     static let shared = CallMediaCoordinator()
 
-    /// How long a connected call waits for the remote participant to return before ending
-    /// cleanly instead of running forever after a hang-up that never tore down the room.
-    static let remoteAbsenceGraceNanoseconds: UInt64 = 20_000_000_000
-
     @Published private(set) var activeCall: ActiveCallPresentation?
     @Published private(set) var state: State = .idle
     @Published private(set) var controlError: String?
+    @Published private(set) var heldCalls: [String: HeldCallPresentation] = [:]
+    @Published private(set) var externalCallIsConnected = false
+    @Published private(set) var systemAudioIsAvailable = false
+    private var automaticResumeTask: Task<Void, Never>?
+    private var requestedResumeCallID: String?
+    private var heldResumeAttempts: [String: HeldCallPresentation] = [:]
+    private var localHoldTasks: [String: Task<Void, Never>] = [:]
     /// The presented call this device has seen a validated answer for, whichever route
     /// carried it — the accept response, the socket frame, or the push. Exact-id fenced,
     /// so a signal about any other call never silences or advances this one.
@@ -1538,7 +1921,6 @@ final class CallMediaCoordinator: ObservableObject {
     private var reconnectStabilityTask: Task<Void, Never>?
     private var reconnectGeneration: UInt64 = 0
     private var reconnectAttemptsRemaining = CallMediaReconnectPolicy.retryDelaysNanoseconds.count
-    private var remoteAbsenceTask: Task<Void, Never>?
     private var remotePresenceCancellable: AnyCancellable?
     private var screenSharingCancellable: AnyCancellable?
     private var callKitAudioErrorRecovery = CallKitAudioSessionErrorRecoveryState()
@@ -1599,7 +1981,6 @@ final class CallMediaCoordinator: ObservableObject {
     deinit {
         reconnectTask?.cancel()
         reconnectStabilityTask?.cancel()
-        remoteAbsenceTask?.cancel()
     }
 
 #if DEBUG && APP_STORE_SCREENSHOTS
@@ -1619,7 +2000,10 @@ final class CallMediaCoordinator: ObservableObject {
 #endif
 
     var statusText: String {
-        switch state {
+        if let reason = activeHold?.reason {
+            return reason == .interruption ? "On hold · another call" : "On hold"
+        }
+        return switch state {
         case .idle: "Call ended"
         case .preparing: "Preparing secure media…"
         case .connecting: "Connecting…"
@@ -1711,6 +2095,13 @@ final class CallMediaCoordinator: ObservableObject {
             return
         }
         accountLeaseGate.revoke(lease)
+        automaticResumeTask?.cancel()
+        automaticResumeTask = nil
+        requestedResumeCallID = nil
+        heldCalls.removeAll()
+        heldResumeAttempts.removeAll()
+        localHoldTasks.values.forEach { $0.cancel() }
+        localHoldTasks.removeAll()
         let disconnectedCallID = activeCall?.id ?? session.activeCallId
         activeAccountLease = nil
         activeHandoff = nil
@@ -1763,7 +2154,10 @@ final class CallMediaCoordinator: ObservableObject {
         }
     }
 
-    func connectAuthenticated(_ request: AuthenticatedCallMediaHandoff) async throws {
+    func connectAuthenticated(
+        _ request: AuthenticatedCallMediaHandoff,
+        retainingOnFailure held: HeldCallPresentation? = nil
+    ) async throws {
         guard accountLeaseGate.accepts(request.lease) else { throw CancellationError() }
         let handoff = request.handoff
         invalidateReconnect()
@@ -1777,6 +2171,12 @@ final class CallMediaCoordinator: ObservableObject {
         // replacement call starts from nothing it did not earn.
         alignAnswerState(toCallId: handoff.callId)
         applyHandoffAnswer(handoff)
+        if !systemAudioIsAvailable || externalCallIsConnected {
+            _ = prepareLocalHold(callID: handoff.callId,
+                                 reason: externalCallIsConnected ? .interruption : .system)
+            if activeHold?.reason == .system { requestedResumeCallID = handoff.callId }
+        }
+        media.prepareCaptureForConnection(suspended: isHeld || !systemAudioIsAvailable || externalCallIsConnected)
         do {
             try await session.connect(handoff)
             guard accountLeaseGate.accepts(request.lease),
@@ -1792,14 +2192,47 @@ final class CallMediaCoordinator: ObservableObject {
                 callId: handoff.callId
             )
             state = .connected
-            startPendingInitialCamera(callId: handoff.callId)
+            if isHeld {
+                // The preconnect fence already made this room's publications silent. Drain the
+                // original hold only: repeating SDK mute here could run after reconciliation
+                // queues Resume and silence the newly resumed call.
+                await localHoldTasks[handoff.callId]?.value
+                guard accountLeaseGate.accepts(request.lease), activeAccountLease == request.lease,
+                      activeCall?.id == handoff.callId else { throw CancellationError() }
+            } else {
+                startPendingInitialCamera(callId: handoff.callId)
+            }
+            retryInterruptedCallResumeIfPossible()
         } catch is CancellationError {
+            if let held, await retainFailedResume(held, handoff: handoff) {
+                throw CancellationError()
+            }
             clearPresentation(callId: handoff.callId)
             throw CancellationError()
         } catch {
+            if let held, await retainFailedResume(held, handoff: handoff) {
+                controlError = "The call is still on hold. Try Resume again."
+                throw error
+            }
             await fail(callId: handoff.callId, error: error, lease: request.lease)
             throw error
         }
+    }
+
+    private func retainFailedResume(_ held: HeldCallPresentation, handoff: CallMediaHandoff) async -> Bool {
+        guard accountLeaseGate.accepts(held.lease), activeAccountLease == held.lease,
+              activeCall?.id.lowercased() == held.id, state != .ending else { return false }
+        await session.disconnect(callId: held.id)
+        guard accountLeaseGate.accepts(held.lease), activeAccountLease == held.lease,
+              activeCall?.id.lowercased() == held.id, state != .ending else { return false }
+        var retained = heldCalls[held.id] ?? heldResumeAttempts[held.id] ?? held
+        retained.requiresFreshRTC = true
+        heldCalls[held.id] = retained
+        activeHandoff = handoff
+        durationAnchor = held.durationAnchor
+        state = .connected
+        NotificationCenter.default.post(name: .kitRemoteWakeReceived, object: nil)
+        return true
     }
 
     func preparePermissions(video: Bool) async throws {
@@ -1837,7 +2270,7 @@ final class CallMediaCoordinator: ObservableObject {
     /// Completes a video answer that intentionally joined audio-first while iOS could not show its
     /// initial camera permission prompt in the background.
     func resumeDeferredInitialCameraIfPossible() async {
-        guard let activeCall,
+        guard !isHeld, systemAudioIsAvailable, let activeCall,
               activeCall.video,
               state != .idle,
               state != .ending
@@ -1958,6 +2391,7 @@ final class CallMediaCoordinator: ObservableObject {
     }
 
     func disconnectFromCallKit(callId: String) async {
+        heldCalls.removeValue(forKey: callId.lowercased())
         let presentationMatches = activeCall?.id.caseInsensitiveCompare(callId) == .orderedSame
         let sessionMatches = session.activeCallId?.caseInsensitiveCompare(callId) == .orderedSame
         guard presentationMatches || sessionMatches else {
@@ -1988,7 +2422,7 @@ final class CallMediaCoordinator: ObservableObject {
         let message = error.localizedDescription
         callKitAudioErrorRecovery.recordFailure(callID: callId, message: message)
         controlError = message
-        guard state == .connected || state == .reconnecting,
+        guard !isHeld, state == .connected || state == .reconnecting,
               let lease = activeAccountLease,
               accountLeaseGate.accepts(lease)
         else { return }
@@ -1998,11 +2432,15 @@ final class CallMediaCoordinator: ObservableObject {
     /// Clears only the transient audio-configuration error owned by this call. A control failure
     /// raised after it remains visible, and a late success from an old call cannot touch the new one.
     func callKitAudioSessionConfigurationSucceeded(callId: String) {
+        // This callback follows the exact CallKit owner's configured ticket, including an
+        // activation which arrived before its Answer/Start owner or before the room attached.
+        systemAudioIsAvailable = true
         guard activeCall?.id.caseInsensitiveCompare(callId) == .orderedSame else { return }
         controlError = callKitAudioErrorRecovery.recoveredControlError(
             callID: callId,
             currentControlError: controlError
         )
+        retryInterruptedCallResumeIfPossible()
     }
 
     func requestEnd() {
@@ -2074,6 +2512,16 @@ final class CallMediaCoordinator: ObservableObject {
     /// System-UI (CallKit) mute: succeeds by buffering the intent while the room is not yet
     /// connected instead of bouncing the toggle back with `.mediaUnavailable`.
     func applyCallKitMute(_ muted: Bool, callId: String) async throws {
+        let key = callId.lowercased()
+        if var resuming = heldResumeAttempts[key] {
+            resuming.intent.setMicrophoneEnabled(!muted)
+            heldResumeAttempts[key] = resuming
+        }
+        if var held = heldCalls[key] {
+            held.intent.setMicrophoneEnabled(!muted)
+            heldCalls[key] = held
+            guard activeCall?.id.lowercased() == key, !held.requiresFreshRTC else { return }
+        }
         do {
             try await media.applyCallKitMute(muted, callId: callId)
             controlError = nil
@@ -2084,6 +2532,7 @@ final class CallMediaCoordinator: ObservableObject {
     }
 
     func toggleCamera() async {
+        guard !isHeld else { return }
         let enabling = !media.isCameraEnabled
         do {
             try await media.setCamera(enabled: enabling)
@@ -2107,6 +2556,7 @@ final class CallMediaCoordinator: ObservableObject {
     }
 
     func requestScreenSharing() {
+        guard !isHeld else { return }
         guard let callID = activeCall?.id, state == .connected,
               activeAccountLease.map({ accountLeaseGate.accepts($0) }) == true else { return }
         do {
@@ -2120,6 +2570,7 @@ final class CallMediaCoordinator: ObservableObject {
     }
 
     func confirmScreenSharing() {
+        guard !isHeld else { return }
         guard let callID = activeCall?.id, state == .connected,
               activeAccountLease.map({ accountLeaseGate.accepts($0) }) == true else {
             media.screenSharing.stop()
@@ -2196,7 +2647,7 @@ final class CallMediaCoordinator: ObservableObject {
     }
 
     func deactivateAudioSession() throws {
-        try media.deactivateAudioSession()
+        try media.deactivateAudioSession(preservingPreferences: activeCall != nil)
     }
 
     private func fail(
@@ -2229,6 +2680,12 @@ final class CallMediaCoordinator: ObservableObject {
         event: CallMediaDisconnectEvent
     ) async {
         session.didDisconnect(callId: callId)
+        if let held = heldCalls[callId.lowercased()] ?? heldResumeAttempts[callId.lowercased()],
+           accountLeaseGate.accepts(held.lease) {
+            heldCalls[callId.lowercased()]?.requiresFreshRTC = true
+            NotificationCenter.default.post(name: .kitRemoteWakeReceived, object: nil)
+            return
+        }
         guard let lease = activeAccountLease,
               accountLeaseGate.accepts(lease),
               activeCall?.id.caseInsensitiveCompare(callId) == .orderedSame,
@@ -2284,14 +2741,13 @@ final class CallMediaCoordinator: ObservableObject {
             if reconnectAttemptsRemaining < CallMediaReconnectPolicy.retryDelaysNanoseconds.count {
                 scheduleReconnectBudgetReset(callId: callId)
             }
-            // If the remote hung up during the outage, re-arm the empty-room grace timer —
-            // the presence publisher won't fire again for a value that never changed.
+            // Refresh authoritative lifecycle after an outage; room emptiness alone is not an end.
             handleRemotePresenceChanged(media.hasRemoteParticipant)
         }
     }
 
     private func beginReconnect(callId: String, initialError: Error?) async {
-        guard reconnectTask == nil,
+        guard !isHeld, reconnectTask == nil,
               let handoff = activeHandoff,
               let lease = activeAccountLease,
               accountLeaseGate.accepts(lease),
@@ -2395,6 +2851,7 @@ final class CallMediaCoordinator: ObservableObject {
         generation: UInt64
     ) -> Bool {
         !Task.isCancelled
+            && !isHeld
             && reconnectGeneration == generation
             && accountLeaseGate.accepts(lease)
             && activeAccountLease == lease
@@ -2402,39 +2859,11 @@ final class CallMediaCoordinator: ObservableObject {
             && activeCall?.id.caseInsensitiveCompare(callId) == .orderedSame
     }
 
-    /// Ends the call after `remoteAbsenceGraceNanoseconds` if the remote participant left a
-    /// still-connected room and never returned — a remote hang-up that skipped room teardown
-    /// must not leave capture running forever.
+    /// RTC presence is not call lifecycle authority: held peers and network reconnections
+    /// can legitimately leave a room empty. Ask for authenticated state instead of hanging up.
     private func handleRemotePresenceChanged(_ isPresent: Bool) {
-        if isPresent {
-            remoteAbsenceTask?.cancel()
-            remoteAbsenceTask = nil
-            return
-        }
-        guard state == .connected,
-              let callID = activeCall?.id,
-              let lease = activeAccountLease,
-              accountLeaseGate.accepts(lease),
-              media.remoteParticipantConnectedAt != nil
-        else { return }
-        remoteAbsenceTask?.cancel()
-        remoteAbsenceTask = Task { @MainActor [weak self] in
-            do {
-                try await Task.sleep(nanoseconds: Self.remoteAbsenceGraceNanoseconds)
-            } catch {
-                return
-            }
-            guard let self,
-                  !Task.isCancelled,
-                  self.state == .connected,
-                  self.accountLeaseGate.accepts(lease),
-                  self.activeAccountLease == lease,
-                  self.activeCall?.id.caseInsensitiveCompare(callID) == .orderedSame,
-                  !self.media.hasRemoteParticipant
-            else { return }
-            self.remoteAbsenceTask = nil
-            self.requestEnd()
-        }
+        guard !isPresent, state == .connected, !isHeld else { return }
+        NotificationCenter.default.post(name: .kitRemoteWakeReceived, object: nil)
     }
 
     private func invalidateReconnect() {
@@ -2443,8 +2872,6 @@ final class CallMediaCoordinator: ObservableObject {
         reconnectTask = nil
         reconnectStabilityTask?.cancel()
         reconnectStabilityTask = nil
-        remoteAbsenceTask?.cancel()
-        remoteAbsenceTask = nil
     }
 
     private func resetReconnectBudget() {
@@ -2474,6 +2901,14 @@ final class CallMediaCoordinator: ObservableObject {
     /// Reconciles an already-connected media room with the authoritative backend call state.
     /// A terminal call must not leave capture or playback running while the UI shows it ended.
     func reconcileBackendCalls(_ calls: [CallRecord]) async {
+        for held in Array(heldCalls.values) {
+            guard let record = calls.first(where: { $0.id.lowercased() == held.id }),
+                  [.completed, .missed, .declined, .failed].contains(record.state) else { continue }
+            heldCalls[held.id] = nil
+            if activeCall?.id.lowercased() != held.id, let uuid = UUID(uuidString: held.id) {
+                NotificationCoordinator.shared.reportCallEnded(uuid, reason: .remoteEnded)
+            }
+        }
         guard let activeCall,
               let record = calls.first(where: {
                   $0.id.caseInsensitiveCompare(activeCall.id) == .orderedSame
@@ -2515,6 +2950,7 @@ final class CallMediaCoordinator: ObservableObject {
     private func clearPresentation(callId: String) {
         guard activeCall?.id.caseInsensitiveCompare(callId) == .orderedSame else { return }
         invalidateReconnect()
+        heldCalls.removeValue(forKey: callId.lowercased())
         if pendingOutgoingClientCallID?.caseInsensitiveCompare(callId) == .orderedSame {
             pendingOutgoingClientCallID = nil
         }
@@ -2527,5 +2963,20 @@ final class CallMediaCoordinator: ObservableObject {
         controlError = nil
         callKitAudioErrorRecovery.reset()
         retireCallPresentationSurfaces()
+        presentRemainingHeldCall()
+    }
+
+    private func presentRemainingHeldCall() {
+        guard activeCall == nil, let held = heldCalls.values.first,
+              accountLeaseGate.accepts(held.lease) else { return }
+        activeCall = ActiveCallPresentation(held.handoff)
+        activeHandoff = held.handoff
+        activeAccountLease = held.lease
+        durationAnchor = held.durationAnchor
+        answeredCallId = held.id
+        state = .connected
+        if held.reason == .waiting, !externalCallIsConnected {
+            NotificationCoordinator.shared.requestHeld(false, callID: held.id)
+        }
     }
 }

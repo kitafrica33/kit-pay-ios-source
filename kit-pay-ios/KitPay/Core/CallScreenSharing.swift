@@ -130,9 +130,28 @@ final class CallScreenSharingController: ObservableObject {
         binding = Binding(callID: callID.lowercased(), publisher: publisher)
     }
 
-    func unbind() {
+    @discardableResult
+    func unbind() -> Task<Void, Never>? {
         stop()
         binding = nil
+        return cleanupTask
+    }
+
+    /// A hold cannot finish while an earlier screen publication is still being retired.
+    func stopAndWait() async {
+        let pendingCleanup = stopRetainingCleanup()
+        await pendingCleanup?.value
+    }
+
+    /// Capture the exact cleanup before another room or account can bind while awaiting it.
+    func stopRetainingCleanup() -> Task<Void, Never>? {
+        stop()
+        return cleanupTask
+    }
+
+    func unbindAndWait() async {
+        let pendingCleanup = unbind()
+        await pendingCleanup?.value
     }
 
     func requestStart(callID: String, applicationIsActive: Bool) throws {

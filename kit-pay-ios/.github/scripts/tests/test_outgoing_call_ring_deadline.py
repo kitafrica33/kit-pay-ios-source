@@ -43,7 +43,9 @@ class OutgoingCallRingDeadlineSourceContractTests(unittest.TestCase):
 
     def test_attempt_arms_before_presentation_and_response_binds_before_promotion(self) -> None:
         app_model = ROOT / "KitPay/App/AppModel.swift"
-        queue = declaration_body(app_model, "    func queueCall(")
+        one_to_one = declaration_body(app_model, "    func queueCall(")
+        self.assertIn("await queueGroupCall(recipientIDs: [recipientId]", one_to_one)
+        queue = declaration_body(app_model, "    func queueGroupCall(")
         self.assertLess(
             queue.index("outgoingCallRingDeadlineGate.begin(attempt)"),
             queue.index("presentPendingOutgoing("),

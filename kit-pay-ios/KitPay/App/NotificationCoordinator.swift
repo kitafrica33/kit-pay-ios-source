@@ -3326,7 +3326,7 @@ actor SecureMessagingWakeDispatcher {
 
 enum CallKitAnswerActionDisposition: Equatable {
     case answerPrimary
-    case mergeWaiting
+    case holdAndAnswer
     case reject
 }
 
@@ -3349,8 +3349,8 @@ enum CallKitActiveEndActionPolicy {
 }
 
 /// Keeps the CallKit answer boundary independent from media setup. A different authenticated call
-/// may be translated to Android-parity Merge only while one exact media call is already connected;
-/// malformed or contradictory ownership fails closed instead of replacing that media session.
+/// uses Hold & Answer only while one exact media call is already connected; malformed or
+/// contradictory ownership fails closed instead of replacing that media session.
 enum CallKitAnswerActionPolicy {
     static func disposition(
         actionCallID: String,
@@ -3366,7 +3366,7 @@ enum CallKitAnswerActionPolicy {
             return .answerPrimary
         }
         guard let activeCallID = canonicalUUID(activeCallID) else { return .reject }
-        return activeCallID == actionCallID ? .answerPrimary : .mergeWaiting
+        return activeCallID == actionCallID ? .answerPrimary : .holdAndAnswer
     }
 
     private static func canonicalUUID(_ value: String?) -> String? {
@@ -3454,6 +3454,9 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
 
     private let callProvider: CXProvider
     private let callController = CXCallController()
+    private let callObserver = CXCallObserver()
+    private var requestedHoldReasons: [UUID: CallHoldReason] = [:]
+    private var interruptionObserver: NSObjectProtocol?
     private let callAudioLogger = Logger(
         subsystem: "africa.kit.pay.ios",
         category: "CallKitAudio"
@@ -3500,6 +3503,10 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
     /// Caller identity, media credentials, and backend authority remain absent until promotion.
     private var deferredPrimaryAnswerGate = DeferredCallKitAnswerGate()
     private var deferredPrimaryAnswerActions: [UUID: CXAnswerCallAction] = [:]
+    /// Retains the exact second-call Answer until authenticated admission commits. Media setup
+    /// must not extend CallKit's answer deadline or fulfill an action which has already expired.
+    private var waitingAnswerActions: [UUID: CXAnswerCallAction] = [:]
+    private var invitationAcceptanceGate = CallInvitationAcceptanceGate()
     /// Owns the asynchronous gap between PushKit delivery and CallKit's report completion. A
     /// terminal signal revokes that exact publication synchronously, and its bounded tombstone
     /// prevents a duplicate VoIP push from recreating an already-finished ring.
@@ -3518,9 +3525,7 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
     override init() {
         let configuration = CXProviderConfiguration()
         configuration.supportsVideo = true
-        // One connected room plus one authenticated waiting call. Kit Pay deliberately does not
-        // expose hold/swap or two simultaneous media rooms; answering the waiting CallKit surface
-        // is translated into Android-parity invite-and-decline merge semantics below.
+        // One speaking call and one held or waiting call; media capture has a single owner.
         configuration.maximumCallGroups = 2
         configuration.maximumCallsPerCallGroup = 1
         configuration.supportedHandleTypes = [.generic]
@@ -3535,6 +3540,22 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
         ])
         notificationCenter.delegate = self
         callProvider.setDelegate(self, queue: .main)
+        callObserver.setDelegate(self, queue: .main)
+        interruptionObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: AVAudioSession.sharedInstance(), queue: .main
+        ) { notification in
+            guard let raw = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                  let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
+            Task { @MainActor in
+                let media = CallMediaCoordinator.shared
+                if type == .began {
+                    await media.systemInterruptionBegan()
+                } else {
+                    media.requestSystemResumeAfterInterruption()
+                }
+            }
+        }
     }
 
     private func invalidateCallActionOwnership(
@@ -3544,6 +3565,10 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
         waitingCallMergeUUIDs.removeAll(keepingCapacity: true)
         callKitAnswerMergeOwners.removeAll(keepingCapacity: true)
         pendingAuthenticatedMergeIntents.removeAll(keepingCapacity: true)
+        for action in waitingAnswerActions.values { action.fail() }
+        waitingAnswerActions.removeAll(keepingCapacity: true)
+        invitationAcceptanceGate.invalidate()
+        requestedHoldReasons.removeAll(keepingCapacity: true)
         if includingDeferredPrimaryAnswers {
             failDeferredPrimaryAnswers(
                 deferredPrimaryAnswerGate.invalidateAll()
@@ -3889,20 +3914,65 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
             }
             return
         }
+        let answersExistingRing = callAdmissionGenerations[callUUID] == callRegistryGeneration
+            && !answeredCalls.contains(callUUID)
+            && (incomingCalls[callUUID] != nil || quarantinedIncomingCalls[callUUID] != nil
+                || incomingCallPublicationGate.isPending(callUUID))
+        guard CallMediaCoordinator.shared.ownsAuthenticatedCall(callID: handoff.callId, lease: request.lease) else {
+            return
+        }
+        if answersExistingRing, handoff.answeredAt == nil {
+            Task { await CallMediaCoordinator.shared.callKitStartFailed(request, error: CallQueueError.invalidRTC) }
+            return
+        }
         backendCallIds[callUUID] = handoff.callId.lowercased()
         callAdmissionGenerations[callUUID] = callRegistryGeneration
-        outgoingCalls.insert(callUUID)
+        if !answersExistingRing { outgoingCalls.insert(callUUID) }
         callKitAudioSessionGate.claimOwner(callUUID)
         pendingOutgoingMedia[callUUID] = request
         videoCalls[callUUID] = handoff.video
         callDisplayNames[callUUID] = handoff.participantName
 
-        let handle = CXHandle(type: .generic, value: handoff.participantName)
-        let action = CXStartCallAction(call: callUUID, handle: handle)
-        action.isVideo = handoff.video
-        callController.request(CXTransaction(action: action)) { error in
+        if answersExistingRing {
+            // The accepted invitation is authenticated, but CallKit must finish publishing its
+            // existing generic ring before we can answer it. Its completion resumes this method.
+            if incomingCallPublicationGate.isPending(callUUID) { return }
+            quarantineExpiryTasks.removeValue(forKey: callUUID)?.cancel()
+            verificationRetryTasks.removeValue(forKey: callUUID)?.cancel()
+            if let pending = quarantinedIncomingCalls.removeValue(forKey: callUUID),
+               let eventID = pending.verificationEventID {
+                pendingCallEvents.acknowledge(eventID)
+            }
+            if let deferred = deferredPrimaryAnswerActions.removeValue(forKey: callUUID) {
+                deferredPrimaryAnswerGate.remove(callUUID: callUUID)
+                performAnswerCallAction(deferred)
+                return
+            }
+        }
+
+        var actions: [CXAction] = []
+        for held in CallMediaCoordinator.shared.heldCalls.values where held.id != handoff.callId {
+            if let uuid = UUID(uuidString: held.id), hasCurrentCallRegistryOwnership(uuid),
+               callObserver.calls.contains(where: { $0.uuid == uuid && !$0.hasEnded && !$0.isOnHold }) {
+                requestedHoldReasons[uuid] = .waiting
+                actions.append(CXSetHeldCallAction(call: uuid, onHold: true))
+            }
+        }
+        if answersExistingRing {
+            actions.append(CXAnswerCallAction(call: callUUID))
+        } else {
+            let action = CXStartCallAction(call: callUUID,
+                                           handle: CXHandle(type: .generic, value: handoff.participantName))
+            action.isVideo = handoff.video
+            actions.append(action)
+        }
+        let holdingCallUUIDs = actions.compactMap { ($0 as? CXSetHeldCallAction)?.callUUID }
+        callController.request(CXTransaction(actions: actions)) { error in
             guard let error else { return }
             Task { @MainActor in
+                for uuid in holdingCallUUIDs where NotificationCoordinator.shared.requestedHoldReasons[uuid] == .waiting {
+                    NotificationCoordinator.shared.requestedHoldReasons.removeValue(forKey: uuid)
+                }
                 NotificationCoordinator.shared.clearCall(callUUID)
                 await CallMediaCoordinator.shared.callKitStartFailed(request, error: error)
             }
@@ -4174,6 +4244,8 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
                       coordinator.incomingCalls[callUUID] != nil,
                       !coordinator.answeredCalls.contains(callUUID)
                 else { return }
+                let kind: CallSystemActionKind = coordinator.pendingOutgoingMedia[callUUID]?.handoff.answeredAt != nil
+                    ? .end : .decline
                 coordinator.clearCall(
                     callUUID,
                     publicationRetirement: .terminal(.declinedElsewhere)
@@ -4187,7 +4259,7 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
                     .systemAction(CallSystemAction(
                         callId: backendCallID,
                         callUUID: callUUID,
-                        kind: .decline
+                        kind: kind
                     ))
                 )
             }
@@ -4291,7 +4363,7 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
             hasPendingPublication: incomingCallPublicationGate.isPending(callUUID),
             hasQuarantinedIncomingCall: quarantinedIncomingCalls[callUUID] != nil,
             hasMatchingRevealedCall: hasMatchingRevealedCall,
-            isLocallyAnswered: answeredCalls.contains(callUUID),
+            isLocallyAnswered: answeredCalls.contains(callUUID) || hasPendingCallAcceptance(callID: callId),
             isOutgoing: outgoingCalls.contains(callUUID)
         ) {
         case .ignore:
@@ -4349,6 +4421,9 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
         incomingCallPublicationGate.retire(callUUID: callUUID, as: publicationRetirement)
         callSounds.callEnded(callID: callID)
         failDeferredPrimaryAnswer(for: callUUID)
+        waitingAnswerActions.removeValue(forKey: callUUID)?.fail()
+        invitationAcceptanceGate.remove(callID: callID)
+        requestedHoldReasons.removeValue(forKey: callUUID)
         explicitlyRequestedEndCallUUIDs.remove(callUUID)
         let authenticatedDependents = callKitAnswerMergeOwners.compactMap {
             waitingCallUUID, activeCallUUID in
@@ -4424,7 +4499,8 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
             } catch {
                 return
             }
-            guard let self, self.quarantinedIncomingCalls[callUUID] != nil else { return }
+            guard let self, self.quarantinedIncomingCalls[callUUID] != nil,
+                  !self.hasPendingCallAcceptance(callID: incoming.callId) else { return }
             self.clearCall(callUUID, publicationRetirement: .naturallyExpired)
             self.callProvider.reportCall(
                 with: callUUID,
@@ -4440,6 +4516,7 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
         for callUUID in Array(quarantinedIncomingCalls.keys) {
             guard var pending = quarantinedIncomingCalls[callUUID] else { continue }
             let incoming = pending.push
+            guard !hasPendingCallAcceptance(callID: incoming.callId) else { continue }
             let monotonicNow = CallMonotonicClock.now()
             guard !pending.deadline.isExpired(at: monotonicNow) else {
                 clearCall(callUUID, publicationRetirement: .naturallyExpired)
@@ -4480,6 +4557,7 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
         _ request: IncomingCallVerificationRequest
     ) -> Bool {
         guard registrationEnabled, !privacyQuarantineActive,
+              !hasPendingCallAcceptance(callID: request.push.callId),
               let pending = quarantinedIncomingCalls[request.push.callUUID]
         else { return false }
         return IncomingCallVerificationAdmissionPolicy.permits(
@@ -4680,7 +4758,7 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
     }
 
     private func configureCallCapabilities(_ update: CXCallUpdate) {
-        update.supportsHolding = false
+        update.supportsHolding = true
         update.supportsGrouping = false
         update.supportsUngrouping = false
         update.supportsDTMF = false
@@ -4729,7 +4807,7 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
                   self.backendCallIds[callUUID]?.caseInsensitiveCompare(callID) == .orderedSame,
                   !self.answeredCalls.contains(callUUID)
             else { return }
-            if self.waitingCallMergeUUIDs.contains(callUUID) {
+            if self.waitingCallMergeUUIDs.contains(callUUID) || self.hasPendingCallAcceptance(callID: callID) {
                 // The merge owns this exact waiting call. `finishWaitingCallMergeAttempt` restores
                 // the same absolute deadline if the invitation does not retire the CallKit record.
                 self.ringExpiryTasks.removeValue(forKey: callUUID)
@@ -5068,6 +5146,7 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
             generation: receivedGeneration,
             alreadyTracked: alreadyTracked,
             leaseExpired: incoming.callKitDisposition() == .reportAsUnanswered
+                && !hasPendingCallAcceptance(callID: incoming.callId)
         )
         if publicationDisposition == .authorized {
             // Claim this CallKit report before its asynchronous completion. End/answer-elsewhere
@@ -5098,7 +5177,10 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
                     // that handshake from the gap between answering and hearing the caller.
                     CallMediaPrewarmer.shared.prewarm()
                     coordinator.quarantine(incoming)
-                    if coordinator.registrationEnabled, !coordinator.privacyQuarantineActive {
+                    if let request = coordinator.pendingOutgoingMedia[uuid],
+                       request.handoff.answeredAt != nil {
+                        coordinator.requestStartOutgoingCall(request)
+                    } else if coordinator.registrationEnabled, !coordinator.privacyQuarantineActive {
                         coordinator.requestVerificationForQuarantinedIncomingCalls()
                     }
                 } else if error == nil,
@@ -5124,6 +5206,12 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
                        coordinator.quarantinedIncomingCalls[uuid] == nil,
                        coordinator.incomingCalls[uuid] == nil {
                         coordinator.callAdmissionGenerations.removeValue(forKey: uuid)
+                    }
+                    if let error, coordinator.callRegistryGeneration == receivedGeneration,
+                       let request = coordinator.pendingOutgoingMedia[uuid],
+                       request.handoff.answeredAt != nil {
+                        coordinator.reportCallEnded(uuid, reason: .failed)
+                        Task { await CallMediaCoordinator.shared.callKitStartFailed(request, error: error) }
                     }
                 }
                 NotificationCenter.default.post(
@@ -5151,7 +5239,8 @@ extension NotificationCoordinator: CXProviderDelegate {
         if registrationEnabled, !privacyQuarantineActive {
             for (callUUID, callId) in calls {
                 let kind: CallSystemActionKind = answeredCalls.contains(callUUID)
-                    || outgoingCalls.contains(callUUID) ? .end : .decline
+                    || outgoingCalls.contains(callUUID)
+                    || pendingOutgoingMedia[callUUID]?.handoff.answeredAt != nil ? .end : .decline
                 recordAndPublishCallEvent(
                     .systemAction(CallSystemAction(
                         callId: callId,
@@ -5215,9 +5304,9 @@ extension NotificationCoordinator: CXProviderDelegate {
         provider.reportOutgoingCall(with: action.callUUID, startedConnectingAt: Date())
         // The authenticated handoff exists only after the server accepted POST /calls. Keeping
         // this after CallKit admission ensures offline queued attempts can never ring locally.
-        callSounds.beginServerAcceptedOutgoingRinging(
-            callID: handoff.callId
-        )
+        if handoff.answeredAt == nil {
+            callSounds.beginServerAcceptedOutgoingRinging(callID: handoff.callId)
+        }
         action.fulfill()
         Task { @MainActor [weak self] in
             guard self?.backendCallIds[action.callUUID] != nil else { return }
@@ -5262,10 +5351,10 @@ extension NotificationCoordinator: CXProviderDelegate {
 
     @MainActor
     private func performAnswerCallAction(_ action: CXAnswerCallAction) {
-        if (quarantinedIncomingCalls[action.callUUID] != nil
-                || incomingCallPublicationGate.isPending(action.callUUID)),
-           callAdmissionGenerations[action.callUUID] == callRegistryGeneration,
-           connectedActiveMediaCallUUID() == nil {
+        if (incomingCallPublicationGate.isPending(action.callUUID)
+                || (quarantinedIncomingCalls[action.callUUID] != nil
+                    && pendingOutgoingMedia[action.callUUID] == nil)),
+           callAdmissionGenerations[action.callUUID] == callRegistryGeneration {
             guard deferredPrimaryAnswerGate.retain(
                 callUUID: action.callUUID,
                 admissionGeneration: callAdmissionGenerations[action.callUUID],
@@ -5285,25 +5374,58 @@ extension NotificationCoordinator: CXProviderDelegate {
             action.fail()
             return
         }
-        if quarantinedIncomingCalls[action.callUUID] != nil,
-           let activeCallUUID = connectedActiveMediaCallUUID(),
-           activeCallUUID != action.callUUID {
-            if let existingOwner = pendingAuthenticatedMergeIntents[action.callUUID],
-               existingOwner != activeCallUUID {
-                action.fail()
-                return
-            }
-            pendingAuthenticatedMergeIntents[action.callUUID] = activeCallUUID
-            action.fail()
-            return
-        }
-        guard let callId = backendCallIds[action.callUUID],
-              let incoming = incomingCalls[action.callUUID]
-        else {
+        guard let callId = backendCallIds[action.callUUID] else {
             action.fail()
             return
         }
 
+        if let request = pendingOutgoingMedia[action.callUUID] {
+            // A reviewed invitation can refer to a call already ringing on this device. Reuse
+            // that system call's Answer and the accepted credentials; never accept it twice.
+            guard request.handoff.callId.caseInsensitiveCompare(callId) == .orderedSame,
+                  CallMediaCoordinator.shared.ownsAuthenticatedCall(callID: callId, lease: request.lease),
+                  request.handoff.answeredAt != nil, action.timeoutDate > Date() else {
+                action.fail()
+                reportCallEnded(action.callUUID, reason: .failed)
+                recordAndPublishCallEvent(.systemAction(CallSystemAction(
+                    callId: callId, callUUID: action.callUUID, kind: .end
+                )))
+                Task { @MainActor in
+                    await CallMediaCoordinator.shared.disconnectFromCallKit(callId: callId)
+                }
+                return
+            }
+            pendingOutgoingMedia.removeValue(forKey: action.callUUID)
+            ringExpiryTasks.removeValue(forKey: action.callUUID)?.cancel()
+            let update = CXCallUpdate()
+            update.remoteHandle = CXHandle(type: .generic, value: request.handoff.participantName)
+            update.localizedCallerName = request.handoff.participantName
+            update.hasVideo = request.handoff.video
+            configureCallCapabilities(update)
+            callProvider.reportCall(with: action.callUUID, updated: update)
+            answeredCalls.insert(action.callUUID)
+            callKitAudioSessionGate.claimOwner(action.callUUID)
+            callSounds.incomingCallAnswered(callID: callId)
+            action.fulfill()
+            Task { @MainActor [weak self] in
+                guard let self, hasCurrentCallRegistryOwnership(action.callUUID) else { return }
+                do {
+                    try await CallMediaCoordinator.shared.connectAuthenticated(request)
+                    if !hasCurrentCallRegistryOwnership(action.callUUID) {
+                        await CallMediaCoordinator.shared.disconnectFromCallKit(callId: callId)
+                    }
+                } catch is CancellationError {
+                    // The exact End, account replacement or timeout owns cleanup.
+                } catch {
+                    if hasCurrentCallRegistryOwnership(action.callUUID) {
+                        reportCallEnded(action.callUUID, reason: .failed)
+                    }
+                }
+            }
+            return
+        }
+
+        guard let incoming = incomingCalls[action.callUUID] else { action.fail(); return }
         let mediaCoordinator = CallMediaCoordinator.shared
         let mediaState: CallWaitingMediaState
         switch mediaCoordinator.state {
@@ -5324,16 +5446,25 @@ extension NotificationCoordinator: CXProviderDelegate {
             action.fail()
             return
 
-        case .mergeWaiting:
-            // Fulfilling would tell CallKit that a second media call was answered. Fail that system
-            // operation honestly, retain its ringing record, and let AppModel perform the audited
-            // invite-current-plus-decline-waiting transaction before retiring the record.
-            action.fail()
-            if let activeCallUUID = connectedActiveMediaCallUUID() {
-                markAndPublishCallKitAnswerMergeIfNeeded(
-                    callUUID: action.callUUID,
-                    expectedActiveCallUUID: activeCallUUID
-                )
+        case .holdAndAnswer:
+            guard waitingAnswerActions[action.callUUID] == nil else {
+                action.fail()
+                return
+            }
+            waitingAnswerActions[action.callUUID] = action
+            let generation = callRegistryGeneration
+            Task { @MainActor [weak self] in
+                guard let self else { action.fail(); return }
+                _ = await CallHoldActionDispatcher.shared.dispatch(.answerWaiting(callId))
+                // Success removes and fulfills this action at the admission boundary. A timeout,
+                // reset or End may also remove it; none allows this late task to fulfill it again.
+                guard callRegistryGeneration == generation,
+                      waitingAnswerActions[action.callUUID] === action else { return }
+                waitingAnswerActions.removeValue(forKey: action.callUUID)
+                action.fail()
+                if let incoming = incomingCalls[action.callUUID], !answeredCalls.contains(action.callUUID) {
+                    scheduleRingExpiry(for: incoming)
+                }
             }
             return
 
@@ -5362,14 +5493,37 @@ extension NotificationCoordinator: CXProviderDelegate {
     }
 
     func provider(_ provider: CXProvider, timedOutPerforming action: CXAction) {
-        Task { @MainActor [weak self] in
-            if let answer = action as? CXAnswerCallAction,
-               let retained = self?.deferredPrimaryAnswerActions[answer.callUUID],
-               retained === answer {
-                self?.deferredPrimaryAnswerGate.remove(callUUID: answer.callUUID)
-                self?.deferredPrimaryAnswerActions.removeValue(forKey: answer.callUUID)
+        // The provider's delegate queue is main. Revoke ownership synchronously, before any
+        // suspended accept task can return and publish capture for this timed-out action.
+        MainActor.assumeIsolated {
+            if let callAction = action as? CXCallAction,
+               pendingOutgoingMedia[callAction.callUUID] != nil,
+               hasCurrentCallRegistryOwnership(callAction.callUUID),
+               let callID = backendCallIds[callAction.callUUID] {
+                clearCall(callAction.callUUID)
+                recordAndPublishCallEvent(.systemAction(CallSystemAction(
+                    callId: callID, callUUID: callAction.callUUID, kind: .end
+                )))
+                Task { @MainActor in
+                    await CallMediaCoordinator.shared.disconnectFromCallKit(callId: callID)
+                }
             }
-            action.fail()
+            guard let answer = action as? CXAnswerCallAction else { action.fail(); return }
+            if deferredPrimaryAnswerActions[answer.callUUID] === answer {
+                deferredPrimaryAnswerGate.remove(callUUID: answer.callUUID)
+                deferredPrimaryAnswerActions.removeValue(forKey: answer.callUUID)
+            }
+            if waitingAnswerActions[answer.callUUID] === answer {
+                waitingAnswerActions.removeValue(forKey: answer.callUUID)
+                if hasCurrentCallRegistryOwnership(answer.callUUID),
+                   let callID = backendCallIds[answer.callUUID] {
+                    clearCall(answer.callUUID)
+                    recordAndPublishCallEvent(.systemAction(CallSystemAction(
+                        callId: callID, callUUID: answer.callUUID, kind: .end
+                    )))
+                }
+            }
+            answer.fail()
         }
     }
 
@@ -5424,7 +5578,8 @@ extension NotificationCoordinator: CXProviderDelegate {
         let callId = backendCallIds[action.callUUID]
             ?? action.callUUID.uuidString.lowercased()
         let kind: CallSystemActionKind = outgoingCalls.contains(action.callUUID)
-            || answeredCalls.contains(action.callUUID) ? .end : .decline
+            || answeredCalls.contains(action.callUUID)
+            || pendingOutgoingMedia[action.callUUID]?.handoff.answeredAt != nil ? .end : .decline
         clearCall(action.callUUID)
         action.fulfill()
         Task { @MainActor in
@@ -5497,6 +5652,7 @@ extension NotificationCoordinator: CXProviderDelegate {
                     ticket: ticket,
                     source: "callkit-activation"
                 )
+                await CallMediaCoordinator.shared.systemAudioAvailabilityChanged(true)
             } catch {
                 guard self.callKitAudioSessionGate.accepts(ticket) else { return }
                 await CallMediaCoordinator.shared.callKitAudioSessionConfigurationFailed(
@@ -5508,6 +5664,7 @@ extension NotificationCoordinator: CXProviderDelegate {
     }
 
     func provider(_ provider: CXProvider, didDeactivate audioSession: AVAudioSession) {
+        MainActor.assumeIsolated { CallMediaCoordinator.shared.revokeSystemAudioOwnership() }
         callKitAudioSessionGate.deactivate()
         let transitionGeneration = callKitAudioSessionGate.generation
         callSounds.callKitAudioDidDeactivate()
@@ -5522,6 +5679,171 @@ extension NotificationCoordinator: CXProviderDelegate {
             } catch {
                 guard self.callKitAudioSessionGate.generation == transitionGeneration else { return }
                 CallMediaCoordinator.shared.recordControlError(error)
+            }
+            await CallMediaCoordinator.shared.systemAudioAvailabilityChanged(false)
+        }
+    }
+}
+
+extension NotificationCoordinator: CXCallObserverDelegate {
+    func callObserver(_ callObserver: CXCallObserver, callChanged call: CXCall) {
+        // Ringing alone must not silence Kit. Retain the interruption until every answered
+        // external call ends, including another app's call which is itself temporarily held.
+        let connected = callObserver.calls.contains {
+            $0.hasConnected && !$0.hasEnded && backendCallIds[$0.uuid] == nil
+        }
+        Task { @MainActor in
+            await CallMediaCoordinator.shared.externalCallConnectionChanged(connected)
+        }
+    }
+
+    @MainActor
+    func requestHeld(_ held: Bool, callID: String) {
+        guard let uuid = UUID(uuidString: callID), hasCurrentCallRegistryOwnership(uuid) else { return }
+        requestedHoldReasons[uuid] = .manual
+        callController.request(CXTransaction(action: CXSetHeldCallAction(call: uuid, onHold: held))) {
+            [weak self] error in
+            guard error != nil else { return }
+            Task { @MainActor in
+                self?.requestedHoldReasons[uuid] = nil
+                if held {
+                    _ = await CallHoldActionDispatcher.shared.dispatch(.hold(callID, .manual))
+                } else {
+                    _ = await CallHoldActionDispatcher.shared.dispatch(.resume(callID))
+                }
+            }
+        }
+    }
+
+    @MainActor
+    func requestSwap(to heldCallID: String) {
+        guard let held = UUID(uuidString: heldCallID), hasCurrentCallRegistryOwnership(held) else { return }
+        guard let activeID = CallMediaCoordinator.shared.activeCall?.id,
+              let active = UUID(uuidString: activeID), active != held else {
+            requestHeld(false, callID: heldCallID)
+            return
+        }
+        requestedHoldReasons[active] = .waiting
+        callController.request(CXTransaction(actions: [
+            CXSetHeldCallAction(call: active, onHold: true),
+            CXSetHeldCallAction(call: held, onHold: false)
+        ])) { error in
+            guard let error else { return }
+            Task { @MainActor in
+                if NotificationCoordinator.shared.requestedHoldReasons[active] == .waiting {
+                    NotificationCoordinator.shared.requestedHoldReasons.removeValue(forKey: active)
+                }
+                CallMediaCoordinator.shared.recordControlError(error)
+            }
+        }
+    }
+
+    @MainActor
+    func requestHoldAndAnswer(callID: String) {
+        guard let uuid = UUID(uuidString: callID),
+              authenticatedUnansweredIncomingCall(uuid, requiresUnexpiredRing: true) != nil,
+              let active = connectedActiveMediaCallUUID(), active != uuid else { return }
+        requestedHoldReasons[active] = .waiting
+        let transaction = CXTransaction(actions: [
+            CXSetHeldCallAction(call: active, onHold: true), CXAnswerCallAction(call: uuid)
+        ])
+        callController.request(transaction) { [weak self] error in
+            guard let error else { return }
+            Task { @MainActor in
+                self?.requestedHoldReasons[active] = nil
+                CallMediaCoordinator.shared.recordControlError(error)
+            }
+        }
+    }
+
+    @MainActor
+    func claimResumedCallAudio(callID: String) {
+        guard let uuid = UUID(uuidString: callID), hasCurrentCallRegistryOwnership(uuid) else { return }
+        callKitAudioSessionGate.claimOwner(uuid)
+    }
+
+    @MainActor
+    func hasPendingCallAcceptance(callID: String) -> Bool {
+        if invitationAcceptanceGate.contains(callID: callID, generation: callRegistryGeneration) { return true }
+        guard let uuid = UUID(uuidString: callID), hasCurrentCallRegistryOwnership(uuid) else { return false }
+        return waitingAnswerActions[uuid].map { $0.timeoutDate > Date() } == true
+            || pendingOutgoingMedia[uuid]?.handoff.answeredAt != nil
+    }
+
+    @MainActor
+    func beginInvitationAcceptance(callID: String) -> CallInvitationAcceptanceGate.Ticket? {
+        guard registrationEnabled, !privacyQuarantineActive else { return nil }
+        return invitationAcceptanceGate.begin(callID: callID, generation: callRegistryGeneration)
+    }
+
+    @MainActor
+    func invitationAcceptanceIsCurrent(_ ticket: CallInvitationAcceptanceGate.Ticket) -> Bool {
+        registrationEnabled && !privacyQuarantineActive && ticket.generation == callRegistryGeneration
+            && invitationAcceptanceGate.accepts(ticket)
+    }
+
+    @MainActor
+    func finishInvitationAcceptance(_ ticket: CallInvitationAcceptanceGate.Ticket) {
+        guard invitationAcceptanceGate.accepts(ticket) else { return }
+        invitationAcceptanceGate.finish(ticket)
+        if let uuid = UUID(uuidString: ticket.callID), let incoming = incomingCalls[uuid],
+           !answeredCalls.contains(uuid), !hasPendingCallAcceptance(callID: ticket.callID) {
+            scheduleRingExpiry(for: incoming)
+        }
+        if let uuid = UUID(uuidString: ticket.callID),
+           callAdmissionGenerations[uuid] == ticket.generation,
+           var pending = quarantinedIncomingCalls[uuid],
+           !hasPendingCallAcceptance(callID: ticket.callID) {
+            // A failed/revoked redemption releases the generic ring back to its original
+            // deadline and a fresh lookup; a suspended older lookup cannot decide its fate.
+            if let eventID = pending.verificationEventID { pendingCallEvents.acknowledge(eventID) }
+            pending.verificationEventID = nil
+            quarantinedIncomingCalls[uuid] = pending
+            requestVerificationForQuarantinedIncomingCalls()
+        }
+    }
+
+    @MainActor
+    func completeHeldAnswer(callID: String) -> Bool {
+        guard registrationEnabled, !privacyQuarantineActive,
+              let uuid = UUID(uuidString: callID), hasCurrentCallRegistryOwnership(uuid),
+              incomingCalls[uuid] != nil else { return false }
+        let action = waitingAnswerActions[uuid]
+        // An already fulfilled primary Answer can reach this path when another Kit call became
+        // active while its authenticated event was queued. It retains the same exact registry.
+        guard action != nil || answeredCalls.contains(uuid) else { return false }
+        if let action, action.timeoutDate <= Date() {
+            waitingAnswerActions.removeValue(forKey: uuid)
+            action.fail()
+            return false
+        }
+        waitingAnswerActions.removeValue(forKey: uuid)
+        ringExpiryTasks.removeValue(forKey: uuid)?.cancel()
+        answeredCalls.insert(uuid)
+        callKitAudioSessionGate.claimOwner(uuid)
+        callSounds.incomingCallAnswered(callID: callID)
+        action?.fulfill()
+        return true
+    }
+
+    func provider(_ provider: CXProvider, perform action: CXSetHeldCallAction) {
+        Task { @MainActor [weak self] in
+            guard let self, registrationEnabled, !privacyQuarantineActive,
+                  hasCurrentCallRegistryOwnership(action.callUUID),
+                  let callID = backendCallIds[action.callUUID] else { action.fail(); return }
+            let generation = callRegistryGeneration
+            let reason = requestedHoldReasons.removeValue(forKey: action.callUUID) ?? .system
+            if action.isOnHold {
+                let held = await CallHoldActionDispatcher.shared.dispatch(.hold(callID, reason))
+                guard held, callRegistryGeneration == generation,
+                      hasCurrentCallRegistryOwnership(action.callUUID) else { action.fail(); return }
+                action.fulfill()
+            } else {
+                // CallKit reactivates audio only after Unhold is fulfilled. Queue the intent,
+                // then restore capture from didActivate (or immediately if audio stayed active).
+                callKitAudioSessionGate.claimOwner(action.callUUID)
+                CallMediaCoordinator.shared.requestResumeWhenAudioIsAvailable(callID: callID)
+                action.fulfill()
             }
         }
     }
