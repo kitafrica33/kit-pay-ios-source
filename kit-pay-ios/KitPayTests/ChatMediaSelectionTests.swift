@@ -141,9 +141,25 @@ final class ChatMediaSelectionTests: XCTestCase {
         XCTAssertTrue(reusable)
         var oversized = jpeg
         oversized.append(Data(repeating: 0, count: KitChatMediaLimits.imageEncodeTargetBytes + 1 - jpeg.count))
+        XCTAssertEqual(oversized.count, KitChatMediaLimits.imageEncodeTargetBytes + 1)
         try oversized.write(to: outputURL)
+        let rewrittenByteCount = try Data(contentsOf: outputURL).count
+        XCTAssertEqual(rewrittenByteCount, oversized.count, "the regression must replace the actual file bytes")
+        print("[KitPayJPEGReuse] PNG: \(png.count); JPEG: \(jpeg.count); "
+              + "allowance: \(KitChatMediaLimits.imageEncodeTargetBytes); rewritten: \(rewrittenByteCount)")
         let acceptsOversized = await MediaPreprocessingPolicy.isValidPublishedOutput(at: outputURL, for: job)
         XCTAssertFalse(acceptsOversized, "restart reuse must obey the same reserved JPEG allowance")
+
+        let exactAllowance = Data(oversized.prefix(KitChatMediaLimits.imageEncodeTargetBytes))
+        try exactAllowance.write(to: outputURL)
+        XCTAssertEqual(try Data(contentsOf: outputURL).count, KitChatMediaLimits.imageEncodeTargetBytes)
+        let acceptsExactAllowance = await MediaPreprocessingPolicy.isValidPublishedOutput(at: outputURL, for: job)
+        XCTAssertTrue(acceptsExactAllowance, "a complete JPEG at the exact allowance must remain reusable")
+
+        try jpeg.write(to: outputURL)
+        XCTAssertEqual(try Data(contentsOf: outputURL), jpeg)
+        let acceptsRestored = await MediaPreprocessingPolicy.isValidPublishedOutput(at: outputURL, for: job)
+        XCTAssertTrue(acceptsRestored, "restoring valid bytes at the same URL must permit reuse again")
     }
 
     func testImageReservationRejectsAnAggregateThatCannotAccommodateJPEGGrowth() throws {

@@ -123,3 +123,11 @@ The remaining native suite, signing and upload did not run. Build 91 targets one
 validated visible label center with the same one-second press, records its geometry, and
 checks the exact quoted message. Production gestures are unchanged; native validation must
 establish the result of this test-targeting correction. Device timing remains unmeasured.
+
+Build 91 passed compilation, simulator verification and all 14 UI tests, including the
+explicit long-press target and exact reply check. It ran 1,964 native tests: 1,963 passed and
+one JPEG recovery size-limit assertion failed after the output file was rewritten. The
+direct-share recovery, messaging process broker, adaptive video and received-video checks
+passed. Signing and upload did not run. Build 92 validates prepared JPEG size and image
+content from one fresh, bounded file read while retaining the same encoding allowance.
+Native validation remains required, and physical delivery timing is unmeasured.

@@ -941,17 +941,12 @@ enum MediaPreprocessingPolicy {
             return await AdaptiveVideoPreparation.isValidPublishedOutput(at: fileURL, for: job)
         case .imageJPEG:
             return await Task.detached(priority: .utility) {
-                guard let byteCount = try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize,
-                      (1 ... KitChatMediaLimits.imageEncodeTargetBytes).contains(byteCount)
-                else { return false }
-                guard let handle = try? FileHandle(forReadingFrom: fileURL) else { return false }
-                defer { try? handle.close() }
-                guard let signature = try? handle.read(upToCount: 3),
-                      signature == Data([0xff, 0xd8, 0xff])
+                guard let bytes = boundedPublishedJPEGBytes(at: fileURL),
+                      bytes.prefix(3) == Data([0xff, 0xd8, 0xff])
                 else { return false }
                 let sourceOptions = [kCGImageSourceShouldCache: false] as CFDictionary
-                guard let source = CGImageSourceCreateWithURL(
-                          fileURL as CFURL,
+                guard let source = CGImageSourceCreateWithData(
+                          bytes as CFData,
                           sourceOptions
                       ),
                       CGImageSourceGetCount(source) > 0,
@@ -994,6 +989,35 @@ enum MediaPreprocessingPolicy {
             } catch {
                 return false
             }
+        }
+    }
+
+    /// Read one bounded snapshot of a prepared JPEG. URL resource values may retain the size
+    /// from an earlier validation after the same path is rewritten. Size, signature and ImageIO
+    /// must all describe the bytes read from this fresh handle. Provider originals stay file-backed.
+    private static func boundedPublishedJPEGBytes(at fileURL: URL) -> Data? {
+        guard let handle = try? FileHandle(forReadingFrom: fileURL) else { return nil }
+        defer { try? handle.close() }
+        do {
+            let expectedCount = try handle.seekToEnd()
+            guard expectedCount > 0,
+                  expectedCount <= UInt64(KitChatMediaLimits.imageEncodeTargetBytes)
+            else { return nil }
+            try handle.seek(toOffset: 0)
+            let readLimit = Int(expectedCount) + 1
+            var bytes = Data()
+            bytes.reserveCapacity(readLimit)
+            while bytes.count < readLimit {
+                guard let chunk = try handle.read(upToCount: readLimit - bytes.count),
+                      !chunk.isEmpty else { break }
+                bytes.append(chunk)
+            }
+            guard bytes.count == Int(expectedCount),
+                  try handle.seekToEnd() == expectedCount
+            else { return nil }
+            return bytes
+        } catch {
+            return nil
         }
     }
 
