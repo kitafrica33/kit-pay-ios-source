@@ -325,13 +325,55 @@ final class AppStoreScreenshotUITests: XCTestCase {
             openFixtureConversation(in: app)
             XCTAssertTrue(newest.isHittable)
         }
-        let menuAnchor = timeline.staticTexts["Long history 296"].firstMatch
+        let menuAnchors = timeline.staticTexts.matching(NSPredicate(format: "label == %@", "Long history 296"))
+        let menuAnchor = menuAnchors.firstMatch
         requireHittable(menuAnchor, in: app, message: "Context menu anchor is unavailable")
-        menuAnchor.press(forDuration: 1)
+        XCTAssertEqual(menuAnchors.count, 1, "The context menu must target one message")
+        XCTAssertFalse(app.keyboards.firstMatch.exists, "Reopening must dismiss the reply keyboard")
+        let anchorBeforePress = menuAnchor.frame
+        let applicationFrame = app.frame
+        let timelineFrame = timeline.frame.intersection(applicationFrame)
+        let chatNavigationBar = app.navigationBars.containing(
+            .button, identifier: "Open \(fixtureContactName)'s profile"
+        ).firstMatch
+        XCTAssertTrue(chatNavigationBar.exists, "The chat header must define the visible timeline")
+        let visibleTop = max(timelineFrame.minY, chatNavigationBar.frame.maxY)
+        let visibleTimeline = CGRect(x: timelineFrame.minX, y: visibleTop,
+                                     width: timelineFrame.width, height: timelineFrame.maxY - visibleTop)
+        let pressPoint = CGPoint(x: anchorBeforePress.midX, y: anchorBeforePress.midY)
+        XCTAssertTrue(visibleTimeline.insetBy(dx: 2, dy: 2).contains(anchorBeforePress),
+                      "The entire long-press label must be visible below the chat header")
+        let settledAnchor = menuAnchor.frame
+        XCTAssertEqual(settledAnchor.midX, pressPoint.x, accuracy: 1,
+                       "The message must not move horizontally before the stationary press")
+        XCTAssertEqual(settledAnchor.midY, pressPoint.y, accuracy: 1,
+                       "The message must not move vertically before the stationary press")
+        let beforePress = "Anchor: \(anchorBeforePress); settled: \(settledAnchor); "
+            + "visible timeline: \(visibleTimeline); press: \(pressPoint)"
+        print("[KitPayLongHistoryContextMenu] Before press: \(beforePress)")
+        // Use the validated label center, not XCTest's implicit element hit-point selection.
+        // Keep the same stationary one-second input; never retry a missed long press.
+        app.coordinate(withNormalizedOffset: .zero)
+            .withOffset(CGVector(dx: pressPoint.x - applicationFrame.minX,
+                                 dy: pressPoint.y - applicationFrame.minY))
+            .press(forDuration: 1)
+        let afterPress = "Anchor: \(menuAnchor.exists ? String(describing: menuAnchor.frame) : "not exposed"); "
+            + "timeline: \(timeline.exists ? String(describing: timeline.frame) : "not exposed")"
+        print("[KitPayLongHistoryContextMenu] After press: \(afterPress)")
+        let menuGeometry = XCTAttachment(string: "Before press: \(beforePress)\nAfter press: \(afterPress)")
+        menuGeometry.name = "long-history-context-menu-geometry"
+        menuGeometry.lifetime = .keepAlways
+        add(menuGeometry)
         tap(app.buttons["Reply"], in: app,
             message: "A stationary long press must retain the message context menu")
-        tap(app.buttons["Cancel reply"], in: app,
-            message: "The context menu must still select the quoted message")
+        let cancelReply = app.buttons["Cancel reply"]
+        require(cancelReply, in: app, message: "The context menu must still select the quoted message")
+        let quote = app.descendants(matching: .any).matching(
+            NSPredicate(format: "label == %@", "Replying to You: Long history 296")
+        ).firstMatch
+        XCTAssertTrue(quote.exists, "Reply must quote the exact message that received the long press")
+        XCTAssertTrue(cancelReply.isHittable, "The quoted message must remain cancellable")
+        cancelReply.tap()
         XCTAssertFalse(app.buttons["Close camera"].exists)
     }
 

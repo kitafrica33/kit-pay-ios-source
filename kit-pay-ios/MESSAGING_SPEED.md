@@ -115,3 +115,11 @@ native invocation passed 37 of 38 tests; the received-video test failed while ge
 synthetic input. Build 90 stabilizes that test input while retaining
 full-length playback, decoded-frame, replay and file-lifetime assertions. The remaining native
 suite, signed archive and upload did not run for build 89.
+
+Build 90 passed native compilation, simulator entitlement verification and all 35 focused
+unit tests, including received-video completion and replay. Two of three focused UI tests
+passed; the long-history test could not find the Reply action after a stationary long press.
+The remaining native suite, signing and upload did not run. Build 91 targets one explicit,
+validated visible label center with the same one-second press, records its geometry, and
+checks the exact quoted message. Production gestures are unchanged; native validation must
+establish the result of this test-targeting correction. Device timing remains unmeasured.
