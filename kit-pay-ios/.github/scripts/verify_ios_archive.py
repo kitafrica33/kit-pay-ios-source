@@ -14,6 +14,7 @@ import re
 from ios_profile_entitlements import (
     authorizes_cloudkit,
     authorizes_ios_platforms,
+    authorizes_keychain_group,
     authorizes_production_icloud,
 )
 
@@ -223,10 +224,25 @@ def main() -> None:
                     user_defaults_reasons.extend(reasons)
 
     expected_application_id = f"{args.team_id}.{args.bundle_id}"
+    messaging_keychain_group = expected_application_id + ".messaging"
     expected_icloud_container = f"iCloud.{args.bundle_id}"
     expected_icloud_containers = [expected_icloud_container]
     time_sensitive_key = "com.apple.developer.usernotifications.time-sensitive"
     checks = (
+        (
+            signed.get("keychain-access-groups")
+            == [expected_application_id, messaging_keychain_group],
+            "The app must keep its private Keychain group first and request only dedicated messaging access",
+        ),
+        (
+            all(authorizes_keychain_group(profile_entitlements.get("keychain-access-groups"), group, args.team_id)
+                for group in (expected_application_id, messaging_keychain_group)),
+            "The app profile must authorize its private and dedicated messaging Keychain groups",
+        ),
+        (
+            info.get("KitMessagingKeychainGroup") == messaging_keychain_group,
+            "The app messaging Keychain group must resolve to its signed group",
+        ),
         (info.get("CFBundleIdentifier") == args.bundle_id, "Unexpected signed bundle identifier"),
         (info.get("CFBundleShortVersionString") == args.version, "Unexpected marketing version"),
         (info.get("CFBundleVersion") == args.build_number, "Unexpected build number"),
@@ -432,8 +448,17 @@ def main() -> None:
             "The share extension profile must not authorize iCloud containers",
         ),
         (
-            "keychain-access-groups" not in extension_signed,
-            "The share extension must not be entitled to a shared keychain group",
+            extension_signed.get("keychain-access-groups") == [messaging_keychain_group],
+            "The share extension must request only the dedicated messaging Keychain group",
+        ),
+        (
+            authorizes_keychain_group(extension_profile_entitlements.get("keychain-access-groups"),
+                                     messaging_keychain_group, args.team_id),
+            "The share profile must authorize the dedicated messaging Keychain group",
+        ),
+        (
+            extension_info.get("KitMessagingKeychainGroup") == messaging_keychain_group,
+            "The share messaging Keychain group must resolve to its signed group",
         ),
     )
     for passed, message in extension_checks:

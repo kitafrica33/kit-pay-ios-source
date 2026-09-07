@@ -34,6 +34,9 @@ jobs:
             ~/Library/Caches/org.signal.libsignal
             ~/Library/Caches/org.swift.swiftpm
           key: ios-downloads-${{ runner.os }}-${{ runner.arch }}-xcode26.6-${{ hashFiles('Podfile', '**/Package.resolved') }}
+          # Reuse downloads when target wiring changes; pinned hashes are verified before use.
+          restore-keys: |
+            ios-downloads-${{ runner.os }}-${{ runner.arch }}-xcode26.6-
       - name: Resolve pinned native dependencies once
         run: bash .github/scripts/install_ios_dependencies.sh
       - name: Prepare native test Simulator

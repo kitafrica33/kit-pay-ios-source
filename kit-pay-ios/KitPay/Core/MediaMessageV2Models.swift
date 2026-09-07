@@ -523,6 +523,7 @@ struct MessagingMediaMessageProtocolCapabilityDTO: Decodable, Hashable, Sendable
 ///
 /// Each item's UPLOADED fields are persisted together in one checkpoint, so a crash resumes
 /// exactly at the first item that never durably finished — finished uploads are kept, per §7.
+#if !KIT_SHARE_EXTENSION
 struct KitMediaMessageV2OutboundBatch: Codable, Hashable, Sendable {
     struct Item: Codable, Hashable, Sendable {
         /// Fresh random canonical UUID minted at queue time. Also the §5 outer-row sort key.
@@ -827,3 +828,5 @@ struct KitMediaMessageV2OutboundBatch: Codable, Hashable, Sendable {
     /// 64 lowercase hex zeros — the exact encoded width of any real digest.
     static let placeholderCiphertextSHA256 = String(repeating: "0", count: 64)
 }
+
+#endif

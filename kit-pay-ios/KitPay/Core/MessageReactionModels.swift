@@ -1,9 +1,6 @@
 import Foundation
 
-enum KitMessageReactionOperation: String, Equatable, Sendable, CaseIterable {
-    case add
-    case remove
-}
+
 
 enum MessagingReactionCapabilityPolicy {
     /// The server advertises this only after every supported peer client understands the
@@ -47,125 +44,7 @@ enum MessagingReactionCapabilityPolicy {
 /// Like `KITPAY1`, its fixed field order and strict re-encoding form the `KITRXN1` wire
 /// contract shared with Android: any body that does not re-encode byte-for-byte is refused
 /// rather than repaired, so both platforms aggregate exactly the same reaction stream.
-struct KitMessageReaction: Equatable, Sendable {
-    static let prefix = "KITRXN1:"
-    static let maximumDescriptorLength = 256
-    static let maximumEmojiUTF8Bytes = 32
 
-    let operation: KitMessageReactionOperation
-    /// Canonical lowercase server message UUID of the message being reacted to. The server id
-    /// (not the client idempotency id) is the only identifier both participants share.
-    let targetServerMessageID: String
-    /// The reacted emoji, bounded but deliberately not validated as "is an emoji": ZWJ
-    /// sequences, skin-tone modifiers, and variation selectors evolve faster than any local
-    /// allowlist, so the contract only caps size and refuses whitespace.
-    let emoji: String
-
-    init?(
-        operation: KitMessageReactionOperation,
-        targetServerMessageID: String,
-        emoji: String
-    ) {
-        let canonicalEmoji = emoji.precomposedStringWithCanonicalMapping
-        guard Self.isCanonicalUUID(targetServerMessageID),
-              Self.isValidEmojiToken(canonicalEmoji)
-        else { return nil }
-        self.operation = operation
-        self.targetServerMessageID = targetServerMessageID
-        self.emoji = canonicalEmoji
-        guard encoded.utf16.count <= Self.maximumDescriptorLength else { return nil }
-    }
-
-    var encoded: String {
-        var value = Self.prefix
-        value += "v=1"
-        value += "&a=\(operation.rawValue)"
-        value += "&t=\(Self.percentEncode(targetServerMessageID))"
-        value += "&e=\(Self.percentEncode(emoji))"
-        return value
-    }
-
-    static func isReactionText(_ text: String) -> Bool {
-        text.hasPrefix(prefix)
-    }
-
-    static func parse(_ text: String) -> KitMessageReaction? {
-        guard text.hasPrefix(prefix), text.utf16.count <= maximumDescriptorLength else {
-            return nil
-        }
-
-        var fields: [String: String] = [:]
-        for pair in text.dropFirst(prefix.count).split(
-            separator: "&",
-            omittingEmptySubsequences: false
-        ) {
-            guard let separator = pair.firstIndex(of: "="), separator != pair.startIndex else {
-                return nil
-            }
-            let key = String(pair[..<separator])
-            let encodedValue = String(pair[pair.index(after: separator)...])
-            guard fields[key] == nil, let value = percentDecode(encodedValue) else { return nil }
-            fields[key] = value
-        }
-
-        // Exactly {v, a, t, e}: an unknown key is a newer or foreign descriptor and must fail
-        // closed instead of being partially honored.
-        guard fields.count == 4,
-              fields["v"] == "1",
-              let operation = fields["a"].flatMap(KitMessageReactionOperation.init(rawValue:)),
-              let targetServerMessageID = fields["t"],
-              let emoji = fields["e"],
-              let descriptor = KitMessageReaction(
-                  operation: operation,
-                  targetServerMessageID: targetServerMessageID,
-                  emoji: emoji
-              ),
-              descriptor.encoded == text
-        else { return nil }
-        return descriptor
-    }
-
-    /// A UTF-16 whitespace check is insufficient here; scalar-level filtering also refuses
-    /// separators that could visually pad a reaction chip.
-    private static func isValidEmojiToken(_ value: String) -> Bool {
-        !value.isEmpty
-            && value.utf8.count <= maximumEmojiUTF8Bytes
-            && value.unicodeScalars.count <= 4
-            && !value.unicodeScalars.contains(where: {
-                CharacterSet.whitespacesAndNewlines.contains($0)
-                    || $0.value == 0x0085
-            })
-    }
-
-    private static func isCanonicalUUID(_ value: String) -> Bool {
-        value.range(
-            of: #"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"#,
-            options: .regularExpression
-        ) != nil
-    }
-
-    /// Java `URLEncoder`'s safe byte set, with its `+` spaces canonicalized to `%20`.
-    private static func percentEncode(_ value: String) -> String {
-        let hex = Array("0123456789ABCDEF".utf8)
-        var encoded = ""
-        encoded.reserveCapacity(value.utf8.count * 3)
-        for byte in value.utf8 {
-            switch byte {
-            case 48 ... 57, 65 ... 90, 97 ... 122, 45, 46, 95, 42:
-                encoded.unicodeScalars.append(UnicodeScalar(byte))
-            default:
-                encoded.unicodeScalars.append("%")
-                encoded.unicodeScalars.append(UnicodeScalar(hex[Int(byte >> 4)]))
-                encoded.unicodeScalars.append(UnicodeScalar(hex[Int(byte & 0x0F)]))
-            }
-        }
-        return encoded
-    }
-
-    private static func percentDecode(_ value: String) -> String? {
-        value.replacingOccurrences(of: "+", with: "%20").removingPercentEncoding
-    }
-}
 
 /// One aggregated reaction chip under a message bubble.
 struct MessageReactionTally: Equatable, Identifiable {

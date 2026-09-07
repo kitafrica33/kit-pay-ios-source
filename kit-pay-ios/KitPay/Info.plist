@@ -26,17 +26,16 @@
 			<key>CFBundleURLName</key>
 			<string>africa.kit.pay</string>
 			<key>CFBundleURLSchemes</key>
-			<array><string>kitwallet</string><string>kitpay</string></array>
+			<array>
+				<string>kitwallet</string>
+				<string>kitpay</string>
+			</array>
 		</dict>
 	</array>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.finance</string>
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
-	<!-- AGPL-3.0-only corresponding-source offer for the exact shipped build. Empty in Debug and
-	     in unsigned builds; the release pipeline sets KIT_CORRESPONDING_SOURCE_URL once the
-	     matching tagged source release has actually been published. An empty or non-matching
-	     value is rejected by KitLegalURLPolicy and the app says so rather than linking nowhere. -->
 	<key>KitCorrespondingSourceURL</key>
 	<string>$(KIT_CORRESPONDING_SOURCE_URL)</string>
 	<key>NSCameraUsageDescription</key>
@@ -53,7 +52,8 @@
 	<string>Choose photos and videos to share in secure chats or set as your Kit Pay profile photo.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
-		<key>UIApplicationSupportsMultipleScenes</key><false/>
+		<key>UIApplicationSupportsMultipleScenes</key>
+		<false/>
 	</dict>
 	<key>BGTaskSchedulerPermittedIdentifiers</key>
 	<array>
@@ -69,7 +69,8 @@
 		<string>remote-notification</string>
 		<string>voip</string>
 	</array>
-	<key>UILaunchScreen</key><dict/>
+	<key>UILaunchScreen</key>
+	<dict/>
 	<key>UIRequiresFullScreen</key>
 	<true/>
 	<key>UISupportedInterfaceOrientations</key>
@@ -84,5 +85,7 @@
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
+	<key>KitMessagingKeychainGroup</key>
+	<string>$(AppIdentifierPrefix)africa.kit.pay.ios.messaging</string>
 </dict>
 </plist>

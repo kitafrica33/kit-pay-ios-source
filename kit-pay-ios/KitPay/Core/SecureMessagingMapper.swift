@@ -147,6 +147,7 @@ enum SecureMessagingHistoryBackfillCodec {
         return uuid.uuidString.lowercased()
     }
 
+    #if !KIT_SHARE_EXTENSION
     static func encode(
         transferClientMessageID: String,
         targetDeviceID: String,
@@ -213,6 +214,7 @@ enum SecureMessagingHistoryBackfillCodec {
         else { throw SecureMessagingCryptoError.invalidContent }
         return encoded
     }
+    #endif
 
     static func authenticate(
         _ descriptor: String,

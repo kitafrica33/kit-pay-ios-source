@@ -3,6 +3,17 @@
 from __future__ import annotations
 
 
+def authorizes_keychain_group(value: object, group: str, team_id: str) -> bool:
+    """A profile may carry Apple's team wildcard; signed bundles still request exact groups."""
+    return (
+        isinstance(value, list)
+        and bool(value)
+        and all(isinstance(candidate, str) for candidate in value)
+        and len(value) == len(set(value))
+        and (group in value or f"{team_id}.*" in value)
+    )
+
+
 def authorizes_ios_platforms(value: object) -> bool:
     """Require iOS in a unique list of the known Apple profile platforms."""
     if not isinstance(value, list) or not value:

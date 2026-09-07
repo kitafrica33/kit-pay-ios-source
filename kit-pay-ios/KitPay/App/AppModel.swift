@@ -937,8 +937,13 @@ enum MediaPreprocessingPolicy {
     ) async -> Bool {
         guard job.isStructurallyValid else { return false }
         switch job.kind {
+        case .video1080p:
+            return await AdaptiveVideoPreparation.isValidPublishedOutput(at: fileURL, for: job)
         case .imageJPEG:
             return await Task.detached(priority: .utility) {
+                guard let byteCount = try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+                      (1 ... KitChatMediaLimits.imageEncodeTargetBytes).contains(byteCount)
+                else { return false }
                 guard let handle = try? FileHandle(forReadingFrom: fileURL) else { return false }
                 defer { try? handle.close() }
                 guard let signature = try? handle.read(upToCount: 3),
@@ -1116,11 +1121,17 @@ final class AppModel: ObservableObject {
     /// before a suspension point must never roll back a newer publish (that was the root cause
     /// of sent bubbles, inbound messages, and freshly created conversations "disappearing").
     private var publishedStateRevision: UInt64 = 0
-    @Published private(set) var capabilities: CapabilitiesDTO?
-    @Published private(set) var isSignedIn = false
+    @Published private(set) var capabilities: CapabilitiesDTO? {
+        didSet { revokeSharedMessagingAccessIfUnavailable() }
+    }
+    @Published private(set) var isSignedIn = false {
+        didSet { if !isSignedIn { revokeSharedMessagingAccess() } }
+    }
     @Published private(set) var isOnline = false
     @Published private(set) var isLoading = true
-    @Published private(set) var accountSetupStep: AccountSetupStep?
+    @Published private(set) var accountSetupStep: AccountSetupStep? {
+        didSet { if accountSetupStep != nil { revokeSharedMessagingAccess() } }
+    }
     @Published private(set) var isCompletingAccountSetup = false
     @Published private(set) var isUpdatingProfile = false
     @Published var lastError: String?
@@ -1131,13 +1142,19 @@ final class AppModel: ObservableObject {
     @Published private(set) var pendingChallengeReceivedAt: Date?
     @Published var selectedTab = 0
     @Published private(set) var kycStatus: KYCStatus?
-    @Published private(set) var sessionAssurance: SessionAssuranceDTO?
+    @Published private(set) var sessionAssurance: SessionAssuranceDTO? {
+        didSet { if !communicationAccessGranted { revokeSharedMessagingAccess() } }
+    }
     @Published private(set) var callContacts: [CallableContact] = []
     @Published private(set) var callWaitingState = CallWaitingState()
     @Published private(set) var contactSyncState: AutomaticContactSyncState = .idle
     @Published private(set) var biometricKind: KitBiometricKind = .biometrics
-    @Published private(set) var biometricUnlockEnabled = false
-    @Published private(set) var biometricAccessState: KitBiometricGateState = .notRequired
+    @Published private(set) var biometricUnlockEnabled = false {
+        didSet { updateSharedMessagingLockState() }
+    }
+    @Published private(set) var biometricAccessState: KitBiometricGateState = .notRequired {
+        didSet { updateSharedMessagingLockState() }
+    }
     @Published private(set) var homeBiometricState: KitBiometricGateState = .notRequired
     @Published private(set) var isConfiguringBiometrics = false
     @Published private(set) var biometricErrorMessage: String?
@@ -1153,13 +1170,23 @@ final class AppModel: ObservableObject {
     @Published private(set) var isLoadingCommunicationPrivacy = false
     @Published private(set) var communicationPrivacyMutation: CommunicationPrivacyMutation?
     @Published private(set) var communicationPrivacyErrorMessage: String?
-    @Published private(set) var hasLoadedCommunicationPrivacy = false
+    @Published private(set) var hasLoadedCommunicationPrivacy = false {
+        didSet { if !hasLoadedCommunicationPrivacy { revokeSharedMessagingAccess() } }
+    }
     @Published private(set) var profileEmailOperation: ProfileEmailOperation?
-    @Published private(set) var isSubmittingAccountDeletion = false
-    @Published private(set) var acceptedAccountDeletionCleanupBlocked = false
-    @Published private(set) var protectedLocalStateRecoveryBlocked = false
+    @Published private(set) var isSubmittingAccountDeletion = false {
+        didSet { if isSubmittingAccountDeletion { revokeSharedMessagingAccess() } }
+    }
+    @Published private(set) var acceptedAccountDeletionCleanupBlocked = false {
+        didSet { if acceptedAccountDeletionCleanupBlocked { revokeSharedMessagingAccess() } }
+    }
+    @Published private(set) var protectedLocalStateRecoveryBlocked = false {
+        didSet { if protectedLocalStateRecoveryBlocked { revokeSharedMessagingAccess() } }
+    }
     @Published private(set) var protectedLocalStateRecoveryRequiresSupport = false
-    @Published private(set) var unresolvedAccountDeletionAttemptBlocked = false
+    @Published private(set) var unresolvedAccountDeletionAttemptBlocked = false {
+        didSet { if unresolvedAccountDeletionAttemptBlocked { revokeSharedMessagingAccess() } }
+    }
     @Published private(set) var messageConversationNavigationRequest:
         MessageConversationNavigationRequest?
     /// A validated payment-claim alert that belongs to this account but not to one exact local
@@ -1319,7 +1346,13 @@ final class AppModel: ObservableObject {
     private var receivedCallEventIds: Set<UUID> = []
     private var receivedCallEventOrder: [UUID] = []
     private var hasConnectivityStatus = false
-    private var isSigningOut = false
+    private var isSigningOut = false {
+        didSet { if isSigningOut { revokeSharedMessagingAccess() } }
+    }
+    private var directSharingAccountEpoch: UUID?
+    private var directShareResumeTask: Task<Void, Never>?
+    private var directShareResumeID: UUID?
+    private var shareSuggestionTask: Task<Void, Never>?
     /// Invalidates responses from an authentication request whose UI flow was abandoned while the
     /// network call was suspended. This value is process-local and contains no credential material.
     private var authenticationAttempt = UUID()
@@ -1532,6 +1565,7 @@ final class AppModel: ObservableObject {
                             else { return }
                             self.resumeEphemeralOutgoingCallIfPossible()
                             CallMediaCoordinator.shared.retryInterruptedCallResumeIfPossible()
+                            self.resumeDirectSharedSendsIfPossible()
                             await self.flushOutbox()
                             self.scheduleAutomaticContactSync()
                             _ = await self.runAutomaticMessageBackupIfDue()
@@ -2948,6 +2982,7 @@ final class AppModel: ObservableObject {
     /// conflicting owner's durable state. Recovery may reveal it only after the marker is safely
     /// resolved; every direct store snapshot remains empty in the meantime.
     private func concealUnresolvedAcceptedAccountDeletionProjection() async {
+        revokeSharedMessagingAccess()
         activeConversationID = nil
         stopVisibleConversationSync()
         await store.concealStateForUnresolvedAcceptedAccountDeletion()
@@ -2963,6 +2998,7 @@ final class AppModel: ObservableObject {
     }
 
     private func blockProtectedLocalStateRecovery(requiresSupport: Bool = false) async {
+        revokeSharedMessagingAccess()
         activeConversationID = nil
         stopVisibleConversationSync()
         await store.concealStateForProtectedStateRecovery()
@@ -2978,6 +3014,7 @@ final class AppModel: ObservableObject {
     }
 
     private func blockUnresolvedAccountDeletionAttempt() async {
+        revokeSharedMessagingAccess()
         activeConversationID = nil
         stopVisibleConversationSync()
         await store.concealStateForUnresolvedAcceptedAccountDeletion()
@@ -2994,6 +3031,7 @@ final class AppModel: ObservableObject {
     }
 
     private func enterCommunicationPrivacyQuarantine() async {
+        revokeSharedMessagingAccess()
         authenticatedAppReviewDemoOwnerID = nil
         let targetAccountID = privacyQuarantineTargetAccountID
         if targetAccountID == nil
@@ -3171,20 +3209,20 @@ final class AppModel: ObservableObject {
             return false
         }
 
-        if initialSessionDisposition == .exactTarget {
-            do {
-                guard try await sessions.clearAcceptedDeletionTarget(
-                    accountID: pending.accountID,
-                    sessionID: pending.sessionID
-                ) == .cleared
-                else {
-                    await concealUnresolvedAcceptedAccountDeletionProjection()
-                    return false
-                }
-            } catch {
+        // Revocation may already have removed the credential while a protected-file purge
+        // failed. Retry owner-bound receipt cleanup even when the session is already absent.
+        do {
+            guard try await sessions.clearAcceptedDeletionTarget(
+                accountID: pending.accountID,
+                sessionID: pending.sessionID
+            ) != .conflict
+            else {
                 await concealUnresolvedAcceptedAccountDeletionProjection()
                 return false
             }
+        } catch {
+            await concealUnresolvedAcceptedAccountDeletionProjection()
+            return false
         }
         do {
             guard try await sessions.acceptedDeletionDisposition(
@@ -4656,12 +4694,12 @@ final class AppModel: ObservableObject {
 
     /// Whether a share from another app can be offered a destination right now.
     ///
-    /// Everything the share extension stages belongs to whoever was signed in when they shared it.
-    /// A locked, half-set-up, or signing-out app has no chat to put it in and no business showing a
-    /// list of chats, so the batch simply waits — or, on sign-out, is destroyed.
+    /// Legacy staged shares enter the app only after its normal communication and unlock gates.
+    /// The extension's direct sender has its own scoped biometric unlock when the app is locked.
     private var canDeliverSharedContent: Bool {
         isSignedIn
             && accountSetupStep == nil
+            && communicationAccessGranted
             && !requiresBiometricSignIn
             && !isSigningOut
             && !isSubmittingAccountDeletion
@@ -4670,15 +4708,91 @@ final class AppModel: ObservableObject {
             && !protectedLocalStateRecoveryBlocked
     }
 
-    /// Gives the extension a small, account-bound address book it can render while this process is
-    /// suspended. It contains five recent chats followed by other eligible Kit Pay contacts and
-    /// groups. The extension receives no phone numbers, group roster, messages, credentials, or
-    /// key material; every opaque route UUID is revalidated here when the app becomes active.
+    /// A normal UI lock may be satisfied inside the share sheet. Every other missing authority
+    /// revokes sharing altogether, including the extension's temporary biometric lease.
+    private var sharedMessagingAccountEligible: Bool {
+        isSignedIn && accountSetupStep == nil && communicationAccessGranted
+            && !isSigningOut && !isSubmittingAccountDeletion
+            && !acceptedAccountDeletionCleanupBlocked && !unresolvedAccountDeletionAttemptBlocked
+            && !protectedLocalStateRecoveryBlocked && appReviewDemoMutationsAllowed
+            && secureMessagingAvailable && hasUsableCommunicationPrivacyProjection
+    }
+
+    private func cancelSharedMessagingPresentationWork(revokeSuggestions: Bool = true) {
+        directSharingAccountEpoch = nil
+        directShareResumeTask?.cancel()
+        directShareResumeTask = nil
+        directShareResumeID = nil
+        shareSuggestionTask?.cancel()
+        shareSuggestionTask = nil
+        if revokeSuggestions {
+            ShareSuggestions.shared.invalidate()
+        } else {
+            ShareSuggestions.shared.suspendRefresh()
+        }
+        SharedInboxStore.shared.clearDestinations()
+    }
+
+    private func revokeSharedMessagingAccess() {
+        // The independent denial marker is written before Keychain mutation. Clearing the
+        // directory also fails closed if protected storage has become unavailable.
+        try? MessagingProcessBroker.shared.setSharingEnabled(false, accountID: nil)
+        cancelSharedMessagingPresentationWork()
+    }
+
+    private func revokeSharedMessagingAccessIfUnavailable() {
+        if !sharedMessagingAccountEligible { revokeSharedMessagingAccess() }
+    }
+
+    private func updateSharedMessagingLockState() {
+        guard sharedMessagingAccountEligible else {
+            revokeSharedMessagingAccess()
+            return
+        }
+        guard requiresBiometricSignIn, let accountID = profile?.id else { return }
+        do {
+            try MessagingProcessBroker.shared.suspendSharingForBiometricLock(accountID: accountID)
+        } catch {
+            revokeSharedMessagingAccess()
+            return
+        }
+        // Recipient suggestions are useful while another app is foregrounded. An ordinary
+        // biometric UI lock retains them; the sheet still needs its own scoped authentication.
+        cancelSharedMessagingPresentationWork(revokeSuggestions: false)
+    }
+
+    private func resumeDirectSharedSendsIfPossible() {
+        guard canDeliverSharedContent, sharedMessagingAccountEligible,
+              directSharingAccountEpoch == accountEpoch, directShareResumeTask == nil,
+              isOnline
+        else { return }
+        let expectedEpoch = accountEpoch
+        let requestID = UUID()
+        directShareResumeID = requestID
+        directShareResumeTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                if self.directShareResumeID == requestID {
+                    self.directShareResumeTask = nil
+                    self.directShareResumeID = nil
+                }
+            }
+            guard !Task.isCancelled, self.accountEpoch == expectedEpoch,
+                  self.canDeliverSharedContent, self.sharedMessagingAccountEligible
+            else { return }
+            await DirectShareSendCoordinator.shared.resumePending()
+            guard !Task.isCancelled, self.accountEpoch == expectedEpoch,
+                  self.canDeliverSharedContent, self.sharedMessagingAccountEligible
+            else { return }
+            await self.publishLatestState()
+        }
+    }
+
+    /// Publishes approved recipient routes. The broker retains the directory encrypted for a
+    /// scoped share-sheet unlock; the ordinary directory is concealed on lock. Each send still
+    /// revalidates server membership, device enrollment, privacy and protocol capabilities.
     private func publishSharedDestinationsIfPossible() {
-        guard canDeliverSharedContent,
-              appReviewDemoMutationsAllowed,
-              secureMessagingAvailable,
-              hasUsableCommunicationPrivacyProjection,
+        guard sharedMessagingAccountEligible,
               let rawAccountID = profile?.id,
               let accountID = SharedInboxPolicy.canonicalAccountID(rawAccountID),
               SharedInboxStore.shared.setActiveAccountID(accountID)
@@ -4686,7 +4800,7 @@ final class AppModel: ObservableObject {
             // Recipient names are convenience data, not an entitlement to bypass the app's lock.
             // Keep the opaque account binding so a share can still wait safely, but expose no
             // directory while biometric/setup/privacy gates are closed.
-            SharedInboxStore.shared.clearDestinations()
+            revokeSharedMessagingAccess()
             return
         }
 
@@ -4771,13 +4885,55 @@ final class AppModel: ObservableObject {
             recentCandidates: recentCandidates,
             contacts: contactDestinations
         )
+        if requiresBiometricSignIn {
+            do {
+                // Cold launches can restore the authenticated account while its UI stays locked.
+                // An existing pin permits fresh Face ID inside sharing; this cannot create or
+                // replace a biometric enrollment or enable unprompted extension access.
+                try MessagingProcessBroker.shared.restoreBiometricSharingDestinations(
+                    destinations, accountID: accountID
+                )
+            } catch {
+                revokeSharedMessagingAccess()
+                return
+            }
+            cancelSharedMessagingPresentationWork(revokeSuggestions: false)
+            return
+        }
         guard SharedInboxStore.shared.setDestinations(
             destinations,
             forAccountID: accountID
         ) else {
-            SharedInboxStore.shared.clearDestinations()
+            revokeSharedMessagingAccess()
             return
         }
+        do {
+            try MessagingProcessBroker.shared.publishApprovedDestinations(
+                destinations, accountID: accountID, requiresBiometricUnlock: biometricUnlockEnabled
+            )
+            try MessagingProcessBroker.shared.setSharingEnabled(true, accountID: accountID)
+        } catch {
+            revokeSharedMessagingAccess()
+            return
+        }
+        let shouldResume = directSharingAccountEpoch != accountEpoch
+        directSharingAccountEpoch = accountEpoch
+        if let token = ShareSuggestions.shared.beginRefresh(accountID: accountID) {
+            let messages = state.messages.map {
+                ShareSuggestionMessage(
+                    id: $0.id, conversationID: $0.conversationId, sentAt: $0.sentAt,
+                    state: $0.state.rawValue, isOutgoing: $0.isOutgoing
+                )
+            }
+            shareSuggestionTask?.cancel()
+            shareSuggestionTask = Task(priority: .utility) {
+                _ = await ShareSuggestions.shared.refresh(
+                    accountID: accountID, destinations: destinations, messages: messages,
+                    requestToken: token
+                )
+            }
+        }
+        if shouldResume { resumeDirectSharedSendsIfPossible() }
     }
 
     /// Looks for anything the share sheet left in the app group container. Called on launch and on
@@ -4787,13 +4943,14 @@ final class AppModel: ObservableObject {
     /// they shared them, rather than one silently displacing the other.
     func refreshSharedInbox() {
         guard canDeliverSharedContent else {
-            SharedInboxStore.shared.clearDestinations()
+            updateSharedMessagingLockState()
             return
         }
         guard appReviewDemoMutationsAllowed else {
             // The read-only review account cannot send anything, so a staged share would sit in
             // front of a picker that refuses every choice.
             SharedInboxStore.shared.removeAll()
+            revokeSharedMessagingAccess()
             SharedInboxStore.shared.clearActiveAccount()
             return
         }
@@ -5189,6 +5346,7 @@ final class AppModel: ObservableObject {
 
     /// Nothing shared into the previous account may survive into the next one.
     private func purgeSharedInbox() {
+        revokeSharedMessagingAccess()
         resolvingSharedInboxBatchID = nil
         pendingSharedInboxBatch = nil
         sharedInboxDelivery = nil
@@ -6486,6 +6644,8 @@ final class AppModel: ObservableObject {
             await resumeAuthenticatedSessionIfNeeded()
         }
         applicationDidBecomeActive()
+        publishSharedDestinationsIfPossible()
+        resumeDirectSharedSendsIfPossible()
         // Re-arm process-death recovery without bypassing the durable push backoff. Notification
         // opens waiting for biometric/session restoration receive one account-fenced replay here.
         NotificationCoordinator.shared.replayCurrentPushTokens()
@@ -8424,6 +8584,8 @@ final class AppModel: ObservableObject {
             await ClaimablePaymentNotificationActionDispatcher.shared.replayPending()
             await NotificationInboxTapDispatcher.shared.replayPending()
             scheduleNotificationPreferenceSync()
+            publishSharedDestinationsIfPossible()
+            resumeDirectSharedSendsIfPossible()
             isLoading = false
             return
         }
@@ -9151,7 +9313,15 @@ final class AppModel: ObservableObject {
                 // Activating here as well added a second serial key-status request to each
                 // realtime hint before a received message could become visible.
                 return try await SecureMessagingExchangeCoordinator.shared.sync(
-                    forUserID: userID
+                    forUserID: userID,
+                    onPageCommitted: { @MainActor [weak self] in
+                        guard let self,
+                              await self.authenticatedSecurityContextIsCurrent(context),
+                              ProtectedCommunicationAdmissionGate.shared.permits(communicationAdmission)
+                        else { return }
+                        await self.publishLatestState()
+                        self.schedulePendingMediaHydration()
+                    }
                 )
             }
             let latestState = await store.snapshot()
@@ -15170,6 +15340,10 @@ final class AppModel: ObservableObject {
         ) else { throw CancellationError() }
         let outputURL: URL
         switch target.job.kind {
+        case .video1080p:
+            outputURL = try await AdaptiveVideoPreparation.optimize(
+                sourceURL: sourceURLs[0], job: target.job
+            )
         case .voiceAssembly:
             guard let assembled = await VoiceNoteSegmentAssembler.assembleToFile(sourceURLs)
             else { throw SecureMediaAttachmentError.invalidMedia }
@@ -15184,7 +15358,7 @@ final class AppModel: ObservableObject {
                     try AttachmentImageDecoder.secureJPEGFile(
                         from: sourceURLs[0],
                         to: candidate,
-                        maximumOutputBytes: target.job.sources[0].fileSize
+                        maximumOutputBytes: KitChatMediaLimits.imageEncodeTargetBytes
                     )
                 }.value
                 outputURL = candidate
@@ -19173,6 +19347,7 @@ final class AppModel: ObservableObject {
         else { return }
         guard flushingAccountEpoch != expectedAccountEpoch else { return }
         flushingAccountEpoch = expectedAccountEpoch
+        let sendDiagnosticsScope = LocalMediaPerformanceMonitor.shared.captureProducerScope()
         var encounteredUnavailableCommunicationPrivacy = false
         var encounteredMissingMessagingCapability = false
         defer {
@@ -19305,6 +19480,7 @@ final class AppModel: ObservableObject {
                     continue
                 }
                 do {
+                    var preparedDuringThisPass = false
                     if command.secureMessageFanout == nil {
                         if UIApplication.shared.applicationState == .active,
                            isUnpreparedOutboxMediaCommand(command) {
@@ -19331,15 +19507,12 @@ final class AppModel: ObservableObject {
                                 forUserID: expectedUserID
                             )
                         }
-                        guard await reloadOutboxStateIfCurrent(
-                            accountEpoch: expectedAccountEpoch,
-                            userID: expectedUserID,
-                            sessionID: expectedSessionID
-                        ) else { return }
-                        guard let preparedCommand = state.outbox.first(where: {
-                            $0.id == command.id && $0.kind == command.kind
-                        }) else { continue }
-                        activeCommand = preparedCommand
+                        preparedDuringThisPass = true
+                        if let messageID = command.messageId {
+                            LocalMediaPerformanceMonitor.shared.markTextSendStage(
+                                .encrypted, messageID: messageID, producerScope: sendDiagnosticsScope
+                            )
+                        }
                     }
                     // Another preparation worker may have sealed an older stream head. Load
                     // that durable state before the final privacy/capability admission below.
@@ -19348,6 +19521,12 @@ final class AppModel: ObservableObject {
                         userID: expectedUserID,
                         sessionID: expectedSessionID
                     ) else { return }
+                    if preparedDuringThisPass {
+                        guard let preparedCommand = state.outbox.first(where: {
+                            $0.id == command.id && $0.kind == command.kind
+                        }) else { continue }
+                        activeCommand = preparedCommand
+                    }
                     switch communicationPrivacyDecision(for: activeCommand) {
                     case .allowed:
                         break
@@ -19402,6 +19581,11 @@ final class AppModel: ObservableObject {
                     guard ProtectedCommunicationAdmissionGate.shared.permits(
                         communicationAdmission
                     ), !isSubmittingAccountDeletion else { return }
+                    if let messageID = command.messageId {
+                        LocalMediaPerformanceMonitor.shared.markTextSendStage(
+                            .requestStarted, messageID: messageID, producerScope: sendDiagnosticsScope
+                        )
+                    }
                     _ = try await SecureMessagingActivationBinding.withAuthenticatedScope(
                         accountGeneration: expectedAccountEpoch,
                         sessionID: expectedSessionID,
@@ -19410,6 +19594,11 @@ final class AppModel: ObservableObject {
                         try await SecureMessagingExchangeCoordinator.shared.sendQueuedMessage(
                             commandID: command.id,
                             forUserID: expectedUserID
+                        )
+                    }
+                    if let messageID = command.messageId {
+                        LocalMediaPerformanceMonitor.shared.markTextSendStage(
+                            .serverAccepted, messageID: messageID, producerScope: sendDiagnosticsScope
                         )
                     }
                     guard await reloadOutboxStateIfCurrent(

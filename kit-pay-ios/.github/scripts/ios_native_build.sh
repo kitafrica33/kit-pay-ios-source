@@ -14,6 +14,7 @@ common=(
   'SWIFT_ACTIVE_COMPILATION_CONDITIONS=$(inherited) APP_STORE_SCREENSHOTS'
   ONLY_ACTIVE_ARCH=YES SWIFT_ENABLE_EXPLICIT_MODULES=NO
   CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual PROVISIONING_PROFILE_SPECIFIER= DEVELOPMENT_TEAM=
+  AppIdentifierPrefix=KITSIM0001.
 )
 select_test_run() {
   local generated_test_run
@@ -28,6 +29,8 @@ select_test_run() {
 case "$mode" in
   build)
     xcodebuild "${common[@]}" build-for-testing
+    python3 .github/scripts/verify_ios_simulator_messaging.py \
+      "$RUNNER_TEMP/KitPay-quality-derived/Build/Products/Debug-iphonesimulator/KitPay.app"
     ;;
   test)
     select_test_run prepare

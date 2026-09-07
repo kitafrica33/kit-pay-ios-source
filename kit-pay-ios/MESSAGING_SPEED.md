@@ -8,18 +8,31 @@ not guarantees for iCloud originals, large videos, unavailable recipients or slo
 
 - Text enters the durable outbox without an additional serial draft write. A failed queue keeps
   the composer and immediately restores normal draft persistence.
+- For an established device, the fresh conversation, enrollment status and recipient-device
+  roster reads overlap. No authorization or roster result is cached across sends, uploads or
+  encryption-state retries. First enrollment keeps its required ordering.
 - Two bounded foreground media workers prepare uploads without holding later text behind an
   unsealed attachment. Sealed Signal envelopes retain FIFO and retry ordering; account/session,
   block-list, capability and recipient-roster checks still apply before publication.
 - New foreground encrypted uploads up to 4 MiB use the existing idempotent single-request
   endpoint. Larger uploads retain resumable checkpoints. A recovered upload retains its existing
   object/offset identity instead of creating a second transfer.
-- Active-app resumable chunks use a responsive foreground session. Before starting, the upload
-  owner checks both sessions and rejoins an existing transfer. Background recovery retains the
+- Active-app resumable chunks use a responsive foreground session. Recovery inventories both
+  sessions once and tracks subsequent task changes; each chunk no longer repeats that inventory.
+  An existing transfer is rejoined. Background recovery retains the
   background session and the same protected chunk/completion ledger. Task IDs are scoped to
   their session so overlapping foreground/background callbacks cannot mix their responses.
 - Each completed preprocessing job wakes its message immediately. Incoming synchronization
   activates once and schedules older-history repair separately from publishing new arrivals.
+- Established-device sync fetches its first encrypted page while enrollment is verified. A
+  changed device binding or cursor discards that read. Authenticated messages become visible
+  after their durable page commit, before the delivery-receipt HTTP response finishes.
+- Photos retain their 2048-pixel bound with a 2 MiB encoding target and one initial JPEG encode
+  at quality 0.82. Supported camera capture prefers 1080p. Large imported videos are optimized
+  only when metadata shows an unnecessarily large resolution or bitrate; the durable job
+  preserves the full duration and audio and reuses a verified completed output after interruption.
+  A failed or larger export falls back to the original bytes and container. Sending a document
+  as a file preserves its original representation.
 
 ## Picking and sharing
 
@@ -38,6 +51,27 @@ Send uses a paper-plane icon. No attachment is sent merely by selecting a recipi
 an editor. Local imports continue across media viewers, and a new share waits for the existing
 selection to finish rather than invalidating its pending files.
 
+The iOS share extension sends directly through the reviewed encrypted messaging protocol.
+Choosing a recipient and confirming Send no longer opens the containing app or creates a
+"Continue in Kit Pay" handoff. A successful dismissal follows a validated message receipt;
+interrupted or uncertain sends retain their exact encrypted request for retry in the sheet or
+authenticated app recovery. Closing an uncertain send does not claim delivery or guarantee
+that iOS will immediately grant background execution.
+
+The extension and app coordinate a single encrypted Signal state through a cross-process lock,
+compare-and-swap and durable commit journal. An uncertain POST reuses the committed ciphertext.
+The original wallet store and its key remain private to the app; only messaging state and the
+authenticated session needed for sending use the dedicated shared Keychain group. Logout,
+account replacement and privacy quarantine revoke extension authority before teardown awaits.
+When the app's UI is biometrically locked, the sheet authenticates locally against its existing
+account-bound biometric enrollment. That temporary authorization does not unlock the wallet.
+
+Successful outgoing conversations donate recipient suggestions to iOS without message bodies
+or attachments. An ordinary biometric UI lock retains those suggestions for sharing from other
+apps; the share sheet still authenticates separately before showing its recipient directory.
+Stale, blocked and concealed recipients are withdrawn; account changes also invalidate
+in-flight donations. iOS controls whether and where these suggestions appear.
+
 ## Validation
 
 Focused tests cover upload selection/checkpoint ownership, media/text ordering, account-scoped
@@ -45,9 +79,18 @@ history continuation, pending-preview durability, provider file ownership, and P
 export and cancellation. Native tests run in the existing consolidated iOS build workflow.
 Keep received-video playback-to-end, relaunch recovery and camera/scroll checks enabled.
 
+Text diagnostics now distinguish Send-to-local-commit, local-bubble display, encryption,
+request start and validated server acceptance using the same monotonic clock. Retries retain
+the original start. These bounded records contain no message/account identifiers or contents
+and are cleared at account boundaries. Server acceptance does not establish recipient display
+time. Export these records from Profile → Media diagnostics after a representative send.
+Existing media capture/upload measurements also include preparation time and are not a
+substitute for measuring the entire Send-to-delivery path.
+
 Measure from the actual Send tap to server acknowledgement and online-recipient visibility,
 and from picker acceptance to the first real thumbnail. Exercise text behind a large upload,
 multiple images, short/long voice notes, locally available/iCloud videos, edited shares,
 foreground-to-background transitions and retry after termination. Simulator checks do not
-establish real-device/network latency. The user's successful testing report applies to the
-previous iOS update; this new implementation needs its own validation.
+establish real-device/network latency. The reported iPhone 15 testing used TestFlight build 84;
+this combined candidate needs its own physical validation. Keep process-death, simultaneous
+app/share sends, locked sharing, account replacement and uncertain-response retries in that run.

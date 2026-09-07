@@ -103,6 +103,7 @@ def profile(aps_environment: str = "production") -> dict:
             "com.apple.developer.icloud-services": ["CloudKit"],
             ICLOUD_ENVIRONMENT_KEY: "Production",
             APP_GROUP_KEY: [APP_GROUP],
+            "keychain-access-groups": [f"{TEAM}.*", "com.apple.token"],
         },
     }
 
@@ -120,6 +121,7 @@ def share_profile() -> dict:
             "com.apple.developer.team-identifier": TEAM,
             "get-task-allow": False,
             APP_GROUP_KEY: [APP_GROUP],
+            "keychain-access-groups": [f"{TEAM}.*", "com.apple.token"],
         },
     }
 
@@ -1800,9 +1802,18 @@ class SigningConfigurationTests(unittest.TestCase):
         ).read_text())
 
         self.assertEqual(app_entitlements.get(APP_GROUP_KEY), [APP_GROUP])
-        # The extension's only reach is the app group. Nothing else: no keychain, no iCloud, no
-        # push — it stages files and hands off.
-        self.assertEqual(share_entitlements, {APP_GROUP_KEY: [APP_GROUP]})
+        # Only messaging credentials/ratchets are shared. Wallet keys retain the original first
+        # app group, which is deliberately absent from the extension's signed entitlements.
+        shared_keychain = "$(AppIdentifierPrefix)africa.kit.pay.ios.messaging"
+        self.assertEqual(app_entitlements["keychain-access-groups"],
+                         ["$(AppIdentifierPrefix)africa.kit.pay.ios", shared_keychain])
+        self.assertEqual(share_entitlements, {
+            APP_GROUP_KEY: [APP_GROUP], "keychain-access-groups": [shared_keychain],
+        })
+        self.assertEqual(share_info["KitMessagingKeychainGroup"], shared_keychain)
+        self.assertEqual(share_info["NSExtension"]["NSExtensionAttributes"]["IntentsSupported"],
+                         ["INSendMessageIntent"])
+        self.assertTrue(share_info["NSFaceIDUsageDescription"])
         self.assertEqual(
             share_info["NSExtension"]["NSExtensionPointIdentifier"],
             "com.apple.share-services",
@@ -2192,6 +2203,7 @@ class VerifyIOSArchiveTests(unittest.TestCase):
                 app / "Info.plist",
                 {
                     "CFBundleIdentifier": BUNDLE,
+                    "KitMessagingKeychainGroup": f"{TEAM}.{BUNDLE}.messaging",
                     "CFBundleExecutable": EXECUTABLE,
                     "CFBundleShortVersionString": "1.2.3",
                     "CFBundleVersion": "42",
@@ -2220,6 +2232,7 @@ class VerifyIOSArchiveTests(unittest.TestCase):
                 extension_path / "Info.plist",
                 {
                     "CFBundleIdentifier": SHARE_BUNDLE,
+                    "KitMessagingKeychainGroup": f"{TEAM}.{BUNDLE}.messaging",
                     "CFBundleShortVersionString": "1.2.3",
                     "CFBundleVersion": "42",
                     "NSExtension": {
@@ -2237,6 +2250,7 @@ class VerifyIOSArchiveTests(unittest.TestCase):
                 extension_signed,
                 {
                     "application-identifier": f"{TEAM}.{SHARE_BUNDLE}",
+                    "keychain-access-groups": [f"{TEAM}.{BUNDLE}.messaging"],
                     "com.apple.developer.team-identifier": TEAM,
                     "get-task-allow": False,
                     APP_GROUP_KEY: [APP_GROUP],
@@ -2284,6 +2298,7 @@ class VerifyIOSArchiveTests(unittest.TestCase):
                 signed,
                 {
                     "application-identifier": f"{TEAM}.{BUNDLE}",
+                    "keychain-access-groups": [f"{TEAM}.{BUNDLE}", f"{TEAM}.{BUNDLE}.messaging"],
                     "com.apple.developer.team-identifier": TEAM,
                     "aps-environment": "production",
                     TIME_SENSITIVE_NOTIFICATIONS_KEY: True,
@@ -2742,6 +2757,7 @@ class VerifyIOSArchiveTests(unittest.TestCase):
                 app / "Info.plist",
                 {
                     "CFBundleIdentifier": BUNDLE,
+                    "KitMessagingKeychainGroup": f"{TEAM}.{BUNDLE}.messaging",
                     "CFBundleExecutable": EXECUTABLE,
                     "CFBundleShortVersionString": "1.2.3",
                     "CFBundleVersion": "42",
@@ -2763,6 +2779,7 @@ class VerifyIOSArchiveTests(unittest.TestCase):
                 app / "Info.plist",
                 {
                     "CFBundleIdentifier": BUNDLE,
+                    "KitMessagingKeychainGroup": f"{TEAM}.{BUNDLE}.messaging",
                     "CFBundleExecutable": EXECUTABLE,
                     "CFBundleShortVersionString": "1.2.3",
                     "CFBundleVersion": "42",
@@ -2787,6 +2804,7 @@ class VerifyIOSArchiveTests(unittest.TestCase):
                 app / "Info.plist",
                 {
                     "CFBundleIdentifier": BUNDLE,
+                    "KitMessagingKeychainGroup": f"{TEAM}.{BUNDLE}.messaging",
                     "CFBundleExecutable": EXECUTABLE,
                     "CFBundleShortVersionString": "1.2.3",
                     "CFBundleVersion": "42",
@@ -2815,6 +2833,7 @@ class VerifyIOSArchiveTests(unittest.TestCase):
                 app / "Info.plist",
                 {
                     "CFBundleIdentifier": BUNDLE,
+                    "KitMessagingKeychainGroup": f"{TEAM}.{BUNDLE}.messaging",
                     "CFBundleExecutable": EXECUTABLE,
                     "CFBundleShortVersionString": "1.2.3",
                     "CFBundleVersion": "42",
@@ -2840,6 +2859,7 @@ class VerifyIOSArchiveTests(unittest.TestCase):
 
             info = {
                 "CFBundleIdentifier": BUNDLE,
+                    "KitMessagingKeychainGroup": f"{TEAM}.{BUNDLE}.messaging",
                 "CFBundleExecutable": EXECUTABLE,
                 "CFBundleShortVersionString": "1.2.3",
                 "CFBundleVersion": "42",
@@ -2883,6 +2903,7 @@ class VerifyIOSArchiveTests(unittest.TestCase):
                 signed,
                 {
                     "application-identifier": f"{TEAM}.{BUNDLE}",
+                    "keychain-access-groups": [f"{TEAM}.{BUNDLE}", f"{TEAM}.{BUNDLE}.messaging"],
                     "com.apple.developer.team-identifier": TEAM,
                     "aps-environment": "production",
                     TIME_SENSITIVE_NOTIFICATIONS_KEY: True,

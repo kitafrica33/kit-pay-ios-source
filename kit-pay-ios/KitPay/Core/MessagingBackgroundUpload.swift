@@ -226,7 +226,7 @@ final class MessagingBackgroundAttachmentUploader: NSObject, URLSessionDataDeleg
         let queue = OperationQueue()
         queue.name = "africa.kit.pay.ios.messaging-media-upload.delegate"
         queue.maxConcurrentOperationCount = 1
-        queue.qualityOfService = .utility
+        queue.qualityOfService = .userInitiated
         return queue
     }()
     private lazy var session: URLSession = {
@@ -253,6 +253,13 @@ final class MessagingBackgroundAttachmentUploader: NSObject, URLSessionDataDeleg
     private var transferSessionIDs: [String: ObjectIdentifier] = [:]
     private var waiters: [String: [UploadContinuation]] = [:]
     private var startsInFlight: [String: UUID] = [:]
+    /// The app exclusively owns this system session. The share extension must use its own
+    /// background identifier; foreground sessions are fresh and owned only by this process.
+    private var ownedTasks: [TaskKey: OwnedTask] = [:]
+    private var didRestoreTaskInventory = false
+    private var isRestoringTaskInventory = false
+    private var taskInventoryWaiters: [([OwnedTask]) -> Void] = []
+    private var completedBeforeRestoration: Set<TaskKey> = []
     private var revokedBindings: Set<String> = []
     private var backgroundEventsCompletionHandler: (() -> Void)?
     /// Installed by AppModel once protected account state can be restored. iOS may relaunch the
@@ -312,24 +319,37 @@ final class MessagingBackgroundAttachmentUploader: NSObject, URLSessionDataDeleg
         return created
     }
 
-    /// Enumerate both transports before allocating an attempt. A foreground retry always
-    /// rejoins an existing background owner of the same immutable offset, and vice versa.
-    /// Completion runs on the same serialized queue as ledger and task-context mutations.
+    /// Restore networkd's tasks once, before allocating any new attempt. Every task created by
+    /// this process is then registered synchronously on the same queue as its completion.
+    /// Foreground sessions cannot restore tasks, so they need no system enumeration. A retry
+    /// still rejoins the exact background/foreground owner without two IPC lookups per chunk.
     private func getAllUploadTasks(_ completion: @escaping ([OwnedTask]) -> Void) {
+        if didRestoreTaskInventory {
+            completion(Array(ownedTasks.values))
+            return
+        }
+        taskInventoryWaiters.append(completion)
+        guard !isRestoringTaskInventory else { return }
+        isRestoringTaskInventory = true
         session.getAllTasks { [weak self] tasks in
             self?.delegateQueue.addOperation { [weak self] in
                 guard let self else { return }
-                let background = tasks.map { OwnedTask(session: self.session, task: $0) }
-                guard let foreground = self.foregroundSession else {
-                    completion(background)
-                    return
+                for task in tasks {
+                    let owned = OwnedTask(session: self.session, task: task)
+                    // A completion can reach the delegate before this older snapshot. It must
+                    // not resurrect the old owner after its result has already been delivered.
+                    guard !self.completedBeforeRestoration.contains(owned.key) else { continue }
+                    self.ownedTasks[owned.key] = owned
                 }
-                foreground.getAllTasks { [weak self] foregroundTasks in
-                    self?.delegateQueue.addOperation {
-                        completion(background + foregroundTasks.map {
-                            OwnedTask(session: foreground, task: $0)
-                        })
-                    }
+                self.didRestoreTaskInventory = true
+                self.isRestoringTaskInventory = false
+                self.completedBeforeRestoration.removeAll()
+                let waiters = self.taskInventoryWaiters
+                self.taskInventoryWaiters.removeAll()
+                for waiter in waiters {
+                    // An earlier waiter may start or cancel a task. Later launch cleanup and
+                    // retries must see that updated ownership, never the stale system snapshot.
+                    waiter(Array(self.ownedTasks.values))
                 }
             }
         }
@@ -342,31 +362,31 @@ final class MessagingBackgroundAttachmentUploader: NSObject, URLSessionDataDeleg
         // the launch thread, and serialize its lazy initialization with upload/cancel requests.
         delegateQueue.addOperation { [weak self] in
             guard let self else { return }
-            self.session.getAllTasks { [weak self] tasks in
-                self?.delegateQueue.addOperation { [weak self] in
-                    guard let self else { return }
-                    var activeAttemptIDs: Set<String> = []
-                    for task in tasks {
-                        guard let context = MessagingBackgroundUploadContext.decode(
-                            taskDescription: task.taskDescription
-                        ) else {
-                            task.cancel()
-                            continue
-                        }
-                        guard !self.revokedBindings.contains(self.bindingKey(for: context)) else {
-                            task.cancel()
-                            continue
-                        }
-                        activeAttemptIDs.insert(context.attemptID)
-                        self.taskContexts[TaskKey(task, in: self.session)] = context
-                        task.resume()
+            self.getAllUploadTasks { [weak self] tasks in
+                guard let self else { return }
+                var activeAttemptIDs: Set<String> = []
+                for owned in tasks {
+                    let task = owned.task
+                    guard let context = MessagingBackgroundUploadContext.decode(
+                        taskDescription: task.taskDescription
+                    ) else {
+                        task.cancel()
+                        continue
                     }
-                    // A foreground enqueue may have completed after getAllTasks took its
-                    // snapshot. Its locally owned chunk must survive launch cleanup too.
-                    activeAttemptIDs.formUnion(self.taskContexts.values.map(\.attemptID))
-                    self.removeOrphanedChunkFiles(retaining: activeAttemptIDs)
-                    self.pruneDurableResults()
+                    guard !self.revokedBindings.contains(self.bindingKey(for: context)) else {
+                        if task.state != .canceling, task.state != .completed { task.cancel() }
+                        continue
+                    }
+                    guard task.state != .canceling, task.state != .completed else { continue }
+                    activeAttemptIDs.insert(context.attemptID)
+                    self.taskContexts[owned.key] = context
+                    if task.state == .suspended { task.resume() }
                 }
+                // A foreground enqueue may have completed after getAllTasks took its
+                // snapshot. Its locally owned chunk must survive launch cleanup too.
+                activeAttemptIDs.formUnion(self.taskContexts.values.map(\.attemptID))
+                self.removeOrphanedChunkFiles(retaining: activeAttemptIDs)
+                self.pruneDurableResults()
             }
         }
     }
@@ -448,7 +468,7 @@ final class MessagingBackgroundAttachmentUploader: NSObject, URLSessionDataDeleg
                         taskDescription: task.taskDescription
                     ), self.bindingKey(for: context) == binding
                     else { continue }
-                    task.cancel()
+                    if task.state != .canceling, task.state != .completed { task.cancel() }
                 }
             }
         }
@@ -518,6 +538,7 @@ final class MessagingBackgroundAttachmentUploader: NSObject, URLSessionDataDeleg
                     // Its completion may still be queued on this delegate queue. The new exact
                     // replay owns the waiter/file now; that late callback must not consume it.
                     self.ignoredDuplicateTaskIDs.insert(owned.key)
+                    self.ownedTasks.removeValue(forKey: owned.key)
                     return nil
                 }
                 return (owned, taskContext)
@@ -531,6 +552,7 @@ final class MessagingBackgroundAttachmentUploader: NSObject, URLSessionDataDeleg
             if let retained = matching.first {
                 for duplicate in matching.dropFirst() {
                     self.ignoredDuplicateTaskIDs.insert(duplicate.0.key)
+                    self.ownedTasks.removeValue(forKey: duplicate.0.key)
                     duplicate.0.task.cancel()
                 }
                 self.taskContexts[retained.0.key] = retained.1
@@ -549,7 +571,9 @@ final class MessagingBackgroundAttachmentUploader: NSObject, URLSessionDataDeleg
                 task.taskDescription = description
                 task.priority = prefersForeground ? URLSessionTask.highPriority
                     : URLSessionTask.defaultPriority
-                self.taskContexts[TaskKey(task, in: selectedSession)] = context
+                let owned = OwnedTask(session: selectedSession, task: task)
+                self.ownedTasks[owned.key] = owned
+                self.taskContexts[owned.key] = context
                 self.startsInFlight.removeValue(forKey: context.logicalTransferID)
                 task.resume()
             } catch {
@@ -597,6 +621,8 @@ final class MessagingBackgroundAttachmentUploader: NSObject, URLSessionDataDeleg
         didCompleteWithError error: Error?
     ) {
         let taskKey = TaskKey(task, in: session)
+        ownedTasks.removeValue(forKey: taskKey)
+        if !didRestoreTaskInventory { completedBeforeRestoration.insert(taskKey) }
         let body = responseBodies.removeValue(forKey: taskKey) ?? Data()
         let forcedError = forcedErrors.removeValue(forKey: taskKey)
         if ignoredDuplicateTaskIDs.remove(taskKey) != nil {

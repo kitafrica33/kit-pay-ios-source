@@ -3,20 +3,15 @@ import Dispatch
 import Foundation
 import OSLog
 
-/// Media/container metadata can be finite without fitting Swift's integer range. Formatting
-/// must never trap while a received clip, trim editor or voice note is being displayed.
-enum ChatMediaPlaybackClock {
-    static func label(_ interval: TimeInterval) -> String {
-        guard interval.isFinite, interval >= 0,
-              let seconds = Int(exactly: interval.rounded())
-        else { return "--:--" }
-        return "\(seconds / 60):\(String(format: "%02d", seconds % 60))"
-    }
-}
-
 enum LocalMediaDiagnosticDirection: String, Codable, Sendable {
     case outgoing
     case incoming
+}
+
+enum LocalTextSendStage: Sendable {
+    case encrypted
+    case requestStarted
+    case serverAccepted
 }
 
 enum LocalMediaPlaybackOutcome: String, Codable, Sendable {
@@ -152,6 +147,9 @@ private struct LocalMediaStoredDiagnosticRecord: Codable, Sendable {
     var playbackErrorLogDomain: LocalMediaPlaybackErrorDomain?
     var playbackErrorLogStatusCode: Int?
     var playbackErrorLogEventCount: Int?
+    var actionToEncryptedMilliseconds: Double? = nil
+    var actionToSendRequestMilliseconds: Double? = nil
+    var actionToServerAcceptedMilliseconds: Double? = nil
 
     private enum CodingKeys: String, CodingKey {
         case localCorrelationTokenSHA256
@@ -177,6 +175,9 @@ private struct LocalMediaStoredDiagnosticRecord: Codable, Sendable {
         case playbackErrorLogDomain
         case playbackErrorLogStatusCode
         case playbackErrorLogEventCount
+        case actionToEncryptedMilliseconds
+        case actionToSendRequestMilliseconds
+        case actionToServerAcceptedMilliseconds
     }
 }
 
@@ -374,6 +375,9 @@ final class LocalMediaPerformanceMonitor {
         let playbackErrorLogDomain: LocalMediaPlaybackErrorDomain?
         let playbackErrorLogStatusCode: Int?
         let playbackErrorLogEventCount: Int?
+        let actionToEncryptedMilliseconds: Double?
+        let actionToSendRequestMilliseconds: Double?
+        let actionToServerAcceptedMilliseconds: Double?
     }
 
     private struct ExportReport: Encodable {
@@ -399,6 +403,9 @@ final class LocalMediaPerformanceMonitor {
         let recordID: UUID
         var durableCommitAtUptimeNanoseconds: UInt64?
         var visibleBubbleAtUptimeNanoseconds: UInt64?
+        var encryptedAtUptimeNanoseconds: UInt64?
+        var requestStartedAtUptimeNanoseconds: UInt64?
+        var serverAcceptedAtUptimeNanoseconds: UInt64?
     }
 
     private let logger = Logger(subsystem: "africa.kit.pay.ios", category: "LocalFirstMedia")
@@ -822,6 +829,53 @@ final class LocalMediaPerformanceMonitor {
         persistRecords()
     }
 
+    /// Only the first observation of each stage counts, including retries. These values measure
+    /// this process's monotonic send timeline, not recipient display time. Recovered sends without
+    /// an observed Send tap cannot manufacture a sample, and account changes retire its authority.
+    @discardableResult
+    func markTextSendStage(
+        _ stage: LocalTextSendStage,
+        messageID: UUID,
+        atUptimeNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds,
+        producerScope: LocalMediaDiagnosticProducerScope?
+    ) -> Double? {
+        guard accepts(producerScope), var value = textSendMilestones[messageID],
+              let committedAt = value.durableCommitAtUptimeNanoseconds,
+              atUptimeNanoseconds >= committedAt,
+              let milliseconds = Self.monotonicMilliseconds(
+                  from: value.actionStartedAtUptimeNanoseconds,
+                  to: atUptimeNanoseconds
+              )
+        else { return nil }
+        switch stage {
+        case .encrypted:
+            guard value.encryptedAtUptimeNanoseconds == nil,
+                  value.requestStartedAtUptimeNanoseconds == nil
+            else { return nil }
+            value.encryptedAtUptimeNanoseconds = atUptimeNanoseconds
+        case .requestStarted:
+            guard value.requestStartedAtUptimeNanoseconds == nil,
+                  atUptimeNanoseconds >= (value.encryptedAtUptimeNanoseconds ?? committedAt)
+            else { return nil }
+            value.requestStartedAtUptimeNanoseconds = atUptimeNanoseconds
+        case .serverAccepted:
+            guard value.serverAcceptedAtUptimeNanoseconds == nil,
+                  let startedAt = value.requestStartedAtUptimeNanoseconds,
+                  atUptimeNanoseconds >= startedAt
+            else { return nil }
+            value.serverAcceptedAtUptimeNanoseconds = atUptimeNanoseconds
+        }
+        textSendMilestones[messageID] = value
+        updateTextSendTimingRecord(recordID: value.recordID) {
+            switch stage {
+            case .encrypted: $0.actionToEncryptedMilliseconds = milliseconds
+            case .requestStarted: $0.actionToSendRequestMilliseconds = milliseconds
+            case .serverAccepted: $0.actionToServerAcceptedMilliseconds = milliseconds
+            }
+        }
+        return milliseconds
+    }
+
     func exportReport() -> String {
         let info = Bundle.main.infoDictionary
         let exportedRecords = diagnosticRecords.map { record in
@@ -849,7 +903,10 @@ final class LocalMediaPerformanceMonitor {
                 playbackErrorCode: record.playbackErrorCode,
                 playbackErrorLogDomain: record.playbackErrorLogDomain,
                 playbackErrorLogStatusCode: record.playbackErrorLogStatusCode,
-                playbackErrorLogEventCount: record.playbackErrorLogEventCount
+                playbackErrorLogEventCount: record.playbackErrorLogEventCount,
+                actionToEncryptedMilliseconds: record.actionToEncryptedMilliseconds,
+                actionToSendRequestMilliseconds: record.actionToSendRequestMilliseconds,
+                actionToServerAcceptedMilliseconds: record.actionToServerAcceptedMilliseconds
             )
         }
         let report = ExportReport(
@@ -1163,93 +1220,6 @@ final class LocalMediaPerformanceMonitor {
 
     private func accepts(_ scope: LocalMediaDiagnosticProducerScope?) -> Bool {
         !isRecordingSuspended && scope?.generation == recordingGeneration
-    }
-}
-
-/// Classifies an end-to-end encrypted attachment by its wire MIME type.
-///
-/// The v1 `KITMEDIA1` descriptor deliberately carries no dedicated kind field, so the MIME type
-/// in `mt` is the single cross-platform source of truth for how a bubble should render.
-enum KitChatMediaKind: String, Codable, CaseIterable, Sendable {
-    case image
-    case voice
-    case audio
-    case video
-    case document
-
-    init(mediaType: String) {
-        let normalized = mediaType.lowercased()
-        if normalized.hasPrefix("image/") {
-            self = .image
-        } else if normalized == "audio/mp4" {
-            // Kit voice notes are recorded and assembled as canonical M4A. Other supported audio
-            // MIME types are imported files and must not be presented as microphone recordings.
-            self = .voice
-        } else if normalized.hasPrefix("audio/") {
-            self = .audio
-        } else if normalized.hasPrefix("video/") {
-            self = .video
-        } else {
-            self = .document
-        }
-    }
-
-    var symbolName: String {
-        switch self {
-        case .image: "photo.fill"
-        case .voice: "mic.fill"
-        case .audio: "music.note"
-        case .video: "video.fill"
-        case .document: "doc.fill"
-        }
-    }
-
-    var previewLabel: String {
-        switch self {
-        case .image: "Photo"
-        case .voice: "Voice note"
-        case .audio: "Audio"
-        case .video: "Video"
-        case .document: "Document"
-        }
-    }
-}
-
-/// Client-side limits for encrypted chat media. The cipher and wire caps in
-/// `SecureMessagingWire` are the hard bound; these values keep each media kind
-/// inside that bound with kind-appropriate ceilings.
-enum KitChatMediaLimits {
-    /// Hard per-file transfer cap shared by every media kind (matches the attachment cipher).
-    static let maximumTransferBytes = SecureMediaAttachmentCipher.maximumPlaintextBytes
-
-    /// Images are re-encoded before send, so they stay small for cheap offline history.
-    static let imageEncodeTargetBytes = 10 * 1_024 * 1_024
-
-    /// Plaintext blobs at or under this size may live inside the encrypted state file for
-    /// instant offline access. Anything larger goes to the encrypted media file cache so a
-    /// wallet-balance update never rewrites hundreds of megabytes.
-    static let maximumInlineCacheBytes = 4 * 1_024 * 1_024
-
-    static let maximumTransferLabel = "200 MB"
-
-    /// A local video may temporarily exceed the wire ceiling while the user trims it. Keeping
-    /// that source app-owned and protected preserves local-first editing; only the resulting clip
-    /// may enter a message/outbox record and it must still satisfy `maximumTransferBytes`.
-    static let maximumEditableLocalVideoBytes = 1_073_741_824
-
-    static func fits(_ byteCount: Int, kind _: KitChatMediaKind) -> Bool {
-        byteCount > 0 && byteCount <= maximumTransferBytes
-    }
-
-    static func fitsLocalOriginal(byteCount: Int, mediaType: String) -> Bool {
-        if mediaType.lowercased().hasPrefix("video/") {
-            return byteCount > 0 && byteCount <= maximumEditableLocalVideoBytes
-        }
-        return fits(byteCount, kind: KitChatMediaKind(mediaType: mediaType))
-    }
-
-    static func shouldCacheInline(byteCount: Int) -> Bool {
-        byteCount > 0 && byteCount <= maximumInlineCacheBytes
     }
 }
 

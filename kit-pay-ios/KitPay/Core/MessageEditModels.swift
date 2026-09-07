@@ -65,78 +65,7 @@ enum MessagingMessageEditCapabilityPolicy {
 /// typed, and the wording costs the wire no more than it did the first time. Android encodes the
 /// same bytes, and the length ceiling is counted in UTF-16 units so both platforms accept and
 /// refuse precisely the same corrections.
-struct KitMessageEdit: Equatable, Sendable {
-    static let prefix = "KITEDIT1:"
-    private static let header = prefix + "v=1&t="
-    private static let bodySeparator = "&b="
-    /// The same ceiling the ordinary text profile enforces, so a correction can be as long as the
-    /// message it replaces was allowed to be.
-    static let maximumDescriptorLength = 8_000
-    /// How long after sending its author may still replace the wording. The same figure the
-    /// server enforces, so "fifteen minutes to edit" means one thing on screen and another
-    /// nowhere.
-    static let editWindow: TimeInterval = 15 * 60
 
-    /// Canonical lowercase server message UUID of the message whose wording this replaces.
-    let targetServerMessageID: String
-    /// The replacement wording, already trimmed to what the composer would have sent.
-    let body: String
-
-    init?(targetServerMessageID: String, body: String) {
-        guard SecureMessagingWirePolicy.isCanonicalUUID(targetServerMessageID),
-              Self.isAcceptableBody(body)
-        else { return nil }
-        self.targetServerMessageID = targetServerMessageID
-        self.body = body
-        guard encoded.utf16.count <= Self.maximumDescriptorLength else { return nil }
-    }
-
-    var encoded: String {
-        Self.header + targetServerMessageID + Self.bodySeparator + body
-    }
-
-    static func isEditText(_ text: String) -> Bool {
-        text.hasPrefix(prefix)
-    }
-
-    /// Whether `body` is wording a correction may carry.
-    ///
-    /// It has to be something the composer could have sent in the first place: present, already
-    /// trimmed, within the text profile, and not itself a descriptor in one of Kit Pay's reserved
-    /// namespaces — otherwise editing would become a way to author content the composer refuses.
-    static func isAcceptableBody(_ body: String) -> Bool {
-        guard !body.isEmpty,
-              body == body.trimmingCharacters(in: .whitespacesAndNewlines),
-              header.utf16.count + 36 + bodySeparator.utf16.count + body.utf16.count
-                  <= maximumDescriptorLength,
-              // `allowsUserAuthoredText` already refuses this namespace along with every
-              // other reserved one, so a correction cannot smuggle in a descriptor either.
-              SecureMessageReservedPrefixPolicy.allowsUserAuthoredText(body)
-        else { return false }
-        return true
-    }
-
-    static func parse(_ text: String) -> KitMessageEdit? {
-        guard text.hasPrefix(header), text.utf16.count <= maximumDescriptorLength else {
-            return nil
-        }
-        let afterHeader = text.dropFirst(header.count)
-        guard afterHeader.count > 36 + bodySeparator.count else { return nil }
-        let targetServerMessageID = String(afterHeader.prefix(36))
-        let remainder = afterHeader.dropFirst(36)
-        guard remainder.hasPrefix(bodySeparator) else { return nil }
-        let body = String(remainder.dropFirst(bodySeparator.count))
-        guard let descriptor = KitMessageEdit(
-            targetServerMessageID: targetServerMessageID,
-            body: body
-        ),
-        // The authenticated descriptor has one canonical spelling, so a future parser cannot
-        // assign a second meaning to already-authenticated content.
-        descriptor.encoded == text
-        else { return nil }
-        return descriptor
-    }
-}
 
 /// One correction, resolved against the message it replaces.
 struct AppliedMessageEdit: Equatable, Sendable {

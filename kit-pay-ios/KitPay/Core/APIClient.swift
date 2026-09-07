@@ -1798,15 +1798,22 @@ actor APIClient {
         guard SessionRefreshPolicy.isValidSessionID(old.sessionId) else {
             throw APIClientError.signedOut
         }
-        let replayNonce = try await sessionStore.replayNonce(for: old)
-        let updated = try await performSessionRefresh(old, replayNonce: replayNonce)
-        guard let current = await sessionStore.current(),
-              current.sessionId.caseInsensitiveCompare(old.sessionId) == .orderedSame,
-              current.accessToken == old.accessToken,
-              current.refreshToken == old.refreshToken
-        else { throw APIClientError.signedOut }
-        try await sessionStore.saveAfterRefresh(updated)
-        return updated
+        do {
+            let replayNonce = try await sessionStore.replayNonce(for: old)
+            let updated = try await performSessionRefresh(old, replayNonce: replayNonce)
+            return try await sessionStore.adoptRefresh(updated, ifCurrent: old)
+        } catch {
+            // A sibling extension may finish the same replay-bound refresh while this request
+            // is in flight. Its exact account/session survives a stale failure or response.
+            if let current = await sessionStore.current(),
+               current.sessionId.caseInsensitiveCompare(old.sessionId) == .orderedSame,
+               current.accountId == old.accountId,
+               current.accessToken != old.accessToken,
+               current.refreshToken != old.refreshToken {
+                return current
+            }
+            throw error
+        }
     }
 
     private func performSessionRefresh(
@@ -1909,51 +1916,6 @@ enum APIEndpointPolicy {
     }
 }
 
-enum APIClientIdentity {
-    private static let fallbackVersion = "1.0.0"
-
-    static var currentHeader: String {
-        "ios/\(currentAppVersion)"
-    }
-
-    /// The backend stores this value on the authenticated Device row and uses its revision for
-    /// rich-media compatibility. Keep it identical to the version portion of the request header.
-    static var currentAppVersion: String {
-        appVersion(
-            marketingVersion: Bundle.main.object(
-                forInfoDictionaryKey: "CFBundleShortVersionString"
-            ) as? String,
-            buildNumber: Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
-        )
-    }
-
-    static func header(marketingVersion: String?, buildNumber: String?) -> String {
-        "ios/\(appVersion(marketingVersion: marketingVersion, buildNumber: buildNumber))"
-    }
-
-    static func appVersion(marketingVersion: String?, buildNumber: String?) -> String {
-        let rawVersion = marketingVersion?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let twoComponentPattern = #"\A(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\z"#
-        let threeComponentPattern = #"\A(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\z"#
-        let version: String
-        if rawVersion.range(of: threeComponentPattern, options: .regularExpression) != nil {
-            version = rawVersion
-        } else if rawVersion.range(of: twoComponentPattern, options: .regularExpression) != nil {
-            // App Store Connect permits a two-component marketing version, while the backend's
-            // installed-client contract is strict SemVer. Canonicalize 1.0 to 1.0.0 on the wire.
-            version = "\(rawVersion).0"
-        } else {
-            version = fallbackVersion
-        }
-
-        let rawBuild = buildNumber?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let validBuild = rawBuild.range(
-            of: #"\A(?:0|[1-9][0-9]*)\z"#,
-            options: .regularExpression
-        ) != nil
-        return validBuild ? "\(version)-r\(rawBuild)" : version
-    }
-}
 
 enum SessionRefreshPolicy {
     static func isValidSessionID(_ value: String) -> Bool {

@@ -12,6 +12,7 @@ import re
 from ios_profile_entitlements import (
     authorizes_cloudkit,
     authorizes_ios_platforms,
+    authorizes_keychain_group,
     authorizes_production_icloud,
 )
 
@@ -118,6 +119,11 @@ def main() -> None:
             "group to it, then run this workflow again."
         )
     if args.role == "app":
+        for group in (expected_application_id, expected_application_id + ".messaging"):
+            if not authorizes_keychain_group(
+                entitlements.get("keychain-access-groups"), group, args.team_id
+            ):
+                fail("The app profile must authorize its private and dedicated messaging Keychain groups")
         if entitlements.get("aps-environment") != "production":
             fail("The App Store profile must include aps-environment=production")
         if entitlements.get(TIME_SENSITIVE_NOTIFICATIONS_KEY) is not True:
@@ -139,6 +145,12 @@ def main() -> None:
         if not authorizes_production_icloud(icloud_environment):
             fail("The App Store profile must authorize the Production iCloud environment")
     else:
+        if args.bundle_id.endswith(".share") and not authorizes_keychain_group(
+            entitlements.get("keychain-access-groups"),
+            f"{args.team_id}.{args.bundle_id.removesuffix('.share')}.messaging",
+            args.team_id,
+        ):
+            fail("The share profile must authorize the dedicated messaging Keychain group")
         # The extension can neither receive a push nor reach CloudKit, and a profile that says it
         # can is a profile that was generated for the wrong App ID.
         if "aps-environment" in entitlements:

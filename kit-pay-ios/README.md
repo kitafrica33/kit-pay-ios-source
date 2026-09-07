@@ -83,8 +83,10 @@ and Apple Liquid Glass.
   broader rollout is blocked on the physical-device termination/relaunch matrix documented in
   [LOCAL_FIRST_MEDIA.md](LOCAL_FIRST_MEDIA.md).
 - Outgoing text and media use separate preparation lanes, with immediate selection feedback
-  and an explicit shared-media review/editor. See [MESSAGING_SPEED.md](MESSAGING_SPEED.md) for
-  the preserved recovery guarantees, PDF page selection and device latency targets.
+  and an explicit shared-media review/editor. External shares send encrypted messages from the
+  share sheet, with an account-bound recovery journal and local biometric unlock when needed.
+  Eligible sent conversations also provide private recipient suggestions to iOS. See
+  [MESSAGING_SPEED.md](MESSAGING_SPEED.md) for recovery, PDF page selection and device latency targets.
 - Kit Pay → Kit Pay transfers post a canonical encrypted `KITPAY1` event into the 1:1 chat. The
   cross-platform action set is `request|paid|declined|cancelled|transfer|sent|accepted|rejected|
   reversed|expired`; optional `note` precedes optional `rsn`, and older clients show a redacted

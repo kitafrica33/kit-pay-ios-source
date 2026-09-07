@@ -15,3 +15,10 @@ target 'KitPay' do
       git: 'https://github.com/signalapp/libsignal.git',
       commit: 'b5121d07c72f9e631f178d907ca892587f64f9e2'
 end
+
+# The extension uses the same reviewed Signal engine and pinned FFI archive as the main app.
+target 'KitPayShare' do
+  pod 'LibSignalClient',
+      git: 'https://github.com/signalapp/libsignal.git',
+      commit: 'b5121d07c72f9e631f178d907ca892587f64f9e2'
+end

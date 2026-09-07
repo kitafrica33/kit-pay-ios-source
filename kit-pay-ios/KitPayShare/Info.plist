@@ -37,11 +37,19 @@
 				<key>NSExtensionActivationSupportsWebURLWithMaxCount</key>
 				<integer>1</integer>
 			</dict>
+			<key>IntentsSupported</key>
+			<array>
+				<string>INSendMessageIntent</string>
+			</array>
 		</dict>
 		<key>NSExtensionPointIdentifier</key>
 		<string>com.apple.share-services</string>
 		<key>NSExtensionPrincipalClass</key>
 		<string>$(PRODUCT_MODULE_NAME).ShareViewController</string>
 	</dict>
+	<key>KitMessagingKeychainGroup</key>
+	<string>$(AppIdentifierPrefix)africa.kit.pay.ios.messaging</string>
+	<key>NSFaceIDUsageDescription</key>
+	<string>Use Face ID to send encrypted messages from the share sheet.</string>
 </dict>
 </plist>

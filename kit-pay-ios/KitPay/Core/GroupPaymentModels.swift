@@ -223,7 +223,7 @@ enum KitGroupPaymentMessageAction: String, Equatable, Sendable, CaseIterable {
 ///
 /// Its fixed field order and strict re-encoding match Android's `KITGRP1` wire contract.
 struct KitGroupPaymentMessage: Equatable, Sendable {
-    static let prefix = "KITGRP1:"
+    static let prefix = SecureMessagingReservedNamespace.groupPayment
     /// Larger than `KITPAY1` because the announcement may name who was paid. A send to more
     /// recipients than fit simply omits the roster and the app resolves names from the API.
     static let maximumDescriptorLength = 4_096
@@ -1514,7 +1514,7 @@ enum KitScheduledGroupPaymentOutcomeAction: String, Equatable, Sendable {
 /// group payment. It carries no amount, wallet or server failure text, so it cannot expose money
 /// data or turn an untrusted message into an action surface.
 struct KitScheduledGroupPaymentOutcomeMessage: Equatable, Sendable {
-    static let prefix = "KITSGRP1:"
+    static let prefix = SecureMessagingReservedNamespace.scheduledGroupPayment
     static let maximumDescriptorLength = 180
 
     let action: KitScheduledGroupPaymentOutcomeAction
@@ -2736,7 +2736,7 @@ enum KitGroupPaymentRequestMessageAction: String, Equatable, Sendable, CaseItera
 /// It intentionally carries no wallet or transaction identifiers. Every live action re-reads the
 /// API object; this descriptor can make a card discoverable, never make money move by itself.
 struct KitGroupPaymentRequestMessage: Equatable, Sendable {
-    static let prefix = "KITGREQ1:"
+    static let prefix = SecureMessagingReservedNamespace.groupPaymentRequest
     static let maximumDescriptorLength = 2_048
     static let maximumNoteLength = 280
 

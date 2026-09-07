@@ -7134,11 +7134,21 @@ struct ConversationView: View {
             }
         }
         guard composerAccountIsCurrent else { return false }
+        var preprocessingJobs: [LocalMediaPreprocessingJob?] = []
+        do {
+            for attachment in durableAttachments {
+                preprocessingJobs.append(try await stagedMediaPreprocessingJob(for: attachment))
+                guard composerAccountIsCurrent else { return false }
+            }
+        } catch {
+            model.lastError = "That attachment is saved locally but could not be prepared for sending. Please retry."
+            return false
+        }
         let queued: Bool
         if durableAttachments.count == 1, let attachment = durableAttachments.first {
             let caption = text.nilIfBlank
                 ?? (attachment.kind == .document ? attachment.displayName : nil)
-            let preprocessingJob = stagedImagePreprocessingJob(for: attachment)
+            let preprocessingJob = preprocessingJobs[0]
             queued = await model.queueMediaMessage(
                 conversationId: conversation.id,
                 title: recipientDisplayName,
@@ -7168,14 +7178,14 @@ struct ConversationView: View {
                 conversationId: conversation.id,
                 title: recipientDisplayName,
                 recipientId: recipientUserID,
-                attachments: durableAttachments.map {
+                attachments: durableAttachments.enumerated().map { index, attachment in
                     LocalMediaQueueAttachment(
-                        mediaID: $0.id,
-                        mediaData: $0.data,
-                        mediaType: $0.mediaType,
-                        byteCount: $0.byteCount,
-                        localStorageKind: $0.isFileBacked ? .protectedFile : .encryptedBlob,
-                        preprocessingJob: stagedImagePreprocessingJob(for: $0)
+                        mediaID: attachment.id,
+                        mediaData: attachment.data,
+                        mediaType: attachment.mediaType,
+                        byteCount: attachment.byteCount,
+                        localStorageKind: attachment.isFileBacked ? .protectedFile : .encryptedBlob,
+                        preprocessingJob: preprocessingJobs[index]
                     )
                 },
                 rawCaption: submittedDraft,
@@ -7195,22 +7205,28 @@ struct ConversationView: View {
         return queued
     }
 
-    private func stagedImagePreprocessingJob(
+    private func stagedMediaPreprocessingJob(
         for attachment: ChatStagedAttachment
-    ) -> LocalMediaPreprocessingJob? {
-        guard attachment.kind == .image,
-              attachment.isFileBacked,
+    ) async throws -> LocalMediaPreprocessingJob? {
+        guard attachment.isFileBacked,
               let sourceMediaType = attachment.originalMediaType,
               let outputStorageKey = attachment.preprocessingOutputStorageKey
         else { return nil }
+        let source = LocalMediaOriginalSource(
+            storageKey: attachment.id.uuidString.lowercased(),
+            mediaType: sourceMediaType,
+            fileSize: attachment.byteCount,
+            duration: attachment.kind == .video ? attachment.duration : nil
+        )
+        if attachment.kind == .video, let sourceURL = attachment.localFileURL {
+            return try await AdaptiveVideoPreparation.job(
+                sourceURL: sourceURL, source: source, outputStorageKey: outputStorageKey
+            )
+        }
+        guard attachment.kind == .image else { throw SecureMediaAttachmentError.invalidMedia }
         return LocalMediaPreprocessingJob(
             kind: .imageJPEG,
-            sources: [LocalMediaOriginalSource(
-                storageKey: attachment.id.uuidString.lowercased(),
-                mediaType: sourceMediaType,
-                fileSize: attachment.byteCount,
-                duration: nil
-            )],
+            sources: [source],
             outputStorageKey: outputStorageKey,
             outputMediaType: "image/jpeg"
         )
@@ -7799,7 +7815,7 @@ struct ConversationView: View {
                 return true
             }
             let preview = stagedAttachments[index].previewImage
-            stagedAttachments[index] = ChatStagedAttachment(
+            let prepared = await preparingAdaptiveVideo(ChatStagedAttachment(
                 id: item.id,
                 kind: item.isVideo ? .video : .image,
                 localFileURL: permanentURL,
@@ -7810,7 +7826,13 @@ struct ConversationView: View {
                 acceptedAt: acceptedAt,
                 originalMediaType: item.isVideo ? nil : picked.mediaType,
                 preprocessingOutputStorageKey: item.isVideo ? nil : UUID().uuidString.lowercased()
-            )
+            ))
+            guard generation == attachmentLoadGeneration, composerAccountIsCurrent,
+                  let liveIndex = stagedAttachments.firstIndex(where: { $0.id == item.id }) else {
+                await model.discardStagedMediaOriginal(mediaID: item.id)
+                return true
+            }
+            stagedAttachments[liveIndex] = prepared
             persistDraftImmediately()
             if item.isVideo {
                 scheduleStagedVideoPreview(mediaID: item.id, fileURL: permanentURL)
@@ -8129,8 +8151,7 @@ struct ConversationView: View {
                 if generation == attachmentLoadGeneration { isLoadingAttachment = false }
             }
             let prepared = await Task.detached(priority: .userInitiated) {
-                image.jpegData(compressionQuality: 0.9)
-                    .flatMap(AttachmentImageDecoder.secureJPEG(from:))
+                AttachmentImageDecoder.secureJPEG(from: image)
             }.value
             guard generation == attachmentLoadGeneration,
                   stagedAttachments.contains(where: { $0.id == mediaID })
@@ -8176,8 +8197,7 @@ struct ConversationView: View {
         Task { @MainActor in
             defer { isPreparingMediaEdit = false }
             let prepared = await Task.detached(priority: .userInitiated) {
-                image.jpegData(compressionQuality: 0.9)
-                    .flatMap(AttachmentImageDecoder.secureJPEG(from:))
+                AttachmentImageDecoder.secureJPEG(from: image)
             }.value
             guard composerAccountIsCurrent else { return }
             guard let prepared else {
@@ -8260,7 +8280,7 @@ struct ConversationView: View {
                     await model.discardStagedMediaOriginal(mediaID: mediaID)
                     return
                 }
-                let attachment = ChatStagedAttachment(
+                let attachment = await preparingAdaptiveVideo(ChatStagedAttachment(
                     id: mediaID,
                     kind: .video,
                     localFileURL: permanentURL,
@@ -8269,7 +8289,11 @@ struct ConversationView: View {
                     displayName: "Video note",
                     previewImage: nil,
                     acceptedAt: acceptedAt
-                )
+                ))
+                guard generation == attachmentLoadGeneration, composerAccountIsCurrent else {
+                    await model.discardStagedMediaOriginal(mediaID: mediaID)
+                    return
+                }
                 stageAttachment(attachment)
                 guard stagedAttachments.contains(where: { $0.id == mediaID }) else {
                     await model.discardStagedMediaOriginal(mediaID: mediaID)
@@ -8320,7 +8344,7 @@ struct ConversationView: View {
                 throw CocoaError(.fileNoSuchFile)
             }
             editorSession = MediaEditorSession(
-                input: .video(url, mediaType: attachment.mediaType),
+                input: .video(url, mediaType: attachment.originalMediaType ?? attachment.mediaType),
                 replacingAttachmentID: attachment.id,
                 ownsInputFile: ownsInputFile
             )
@@ -8382,11 +8406,11 @@ struct ConversationView: View {
                     moveSource: true
                 ) else { throw AttachmentSelectionError.invalidImage }
                 guard composerAccountIsCurrent,
-                      let liveIndex = stagedAttachments.firstIndex(where: { $0.id == attachmentID }) else {
+                      stagedAttachments.contains(where: { $0.id == attachmentID }) else {
                     await model.discardStagedMediaOriginal(mediaID: editedMediaID)
                     return
                 }
-                stagedAttachments[liveIndex] = ChatStagedAttachment(
+                let prepared = await preparingAdaptiveVideo(ChatStagedAttachment(
                     id: editedMediaID,
                     kind: .video,
                     localFileURL: permanentURL,
@@ -8400,7 +8424,13 @@ struct ConversationView: View {
                     // media gets a new storage UUID. Detach/retry and batch consumption use this
                     // value to avoid re-staging or sending the same provider handoff twice.
                     clientMessageID: existing.clientMessageID
-                )
+                ))
+                guard composerAccountIsCurrent,
+                      let preparedIndex = stagedAttachments.firstIndex(where: { $0.id == attachmentID }) else {
+                    await model.discardStagedMediaOriginal(mediaID: editedMediaID)
+                    return
+                }
+                stagedAttachments[preparedIndex] = prepared
                 scheduleStagedMediaDuration(
                     mediaID: editedMediaID,
                     fileURL: permanentURL,
@@ -8511,7 +8541,7 @@ struct ConversationView: View {
                 retryUnappliedSharedInboxDelivery(delivery)
                 return
             }
-            guard let attachment = preparedSharedItem(
+            guard let attachment = await preparedSharedItem(
                 item,
                 fileURL: permanentURL,
                 acceptedAt: batch.receivedAt
@@ -8569,7 +8599,7 @@ struct ConversationView: View {
         _ item: SharedInboxItem,
         fileURL: URL,
         acceptedAt: Date
-    ) -> ChatStagedAttachment? {
+    ) async -> ChatStagedAttachment? {
         guard item.byteCount > 0 else { return nil }
         if item.mediaType.hasPrefix("image/"),
            SharedInboxPolicy.shouldDecodeSharedImage(byteCount: item.byteCount) {
@@ -8597,7 +8627,7 @@ struct ConversationView: View {
                 : SharedInboxPolicy.fallbackMediaType
         let kind = KitChatMediaKind(mediaType: mediaType)
         guard KitChatMediaLimits.fits(item.byteCount, kind: kind) else { return nil }
-        return ChatStagedAttachment(
+        return await preparingAdaptiveVideo(ChatStagedAttachment(
             id: item.id,
             kind: kind,
             localFileURL: fileURL,
@@ -8607,6 +8637,27 @@ struct ConversationView: View {
             previewImage: nil,
             acceptedAt: acceptedAt,
             clientMessageID: item.id
+        ))
+    }
+
+    /// Reserve an immutable output only for a clip that benefits from a normal chat export.
+    /// The source is already protected; this reads metadata and never encodes on the send path.
+    /// Document-picker attachments do not call this helper, preserving their original bytes.
+    private func preparingAdaptiveVideo(_ attachment: ChatStagedAttachment) async -> ChatStagedAttachment {
+        guard composerAccountIsCurrent, attachment.kind == .video,
+              attachment.originalMediaType == nil, let sourceURL = attachment.localFileURL,
+              let plan = await AdaptiveVideoPreparation.plan(
+                  sourceURL: sourceURL, mediaType: attachment.mediaType, byteCount: attachment.byteCount
+              )
+        else { return attachment }
+        return ChatStagedAttachment(
+            id: attachment.id, kind: .video, localFileURL: sourceURL,
+            byteCount: attachment.byteCount, mediaType: attachment.mediaType,
+            displayName: attachment.displayName, previewImage: attachment.previewImage,
+            duration: plan.duration, acceptedAt: attachment.acceptedAt,
+            clientMessageID: attachment.clientMessageID,
+            originalMediaType: attachment.mediaType,
+            preprocessingOutputStorageKey: UUID().uuidString.lowercased()
         )
     }
 
@@ -9893,9 +9944,28 @@ private struct GroupPaymentRequestCancellationTarget: Identifiable {
 }
 
 enum AttachmentImageDecoder {
+    private static let jpegQualities: [CGFloat] = [0.82, 0.72, 0.62, 0.52, 0.42]
+
     struct PreparedImage {
         let preview: UIImage
         let data: Data
+    }
+
+    /// Camera/editor images already contain decoded pixels. Render once at the transfer size
+    /// to normalize orientation and strip metadata, then encode the final JPEG. Encoding the
+    /// full-resolution image first only to decode and resize it again delays every photo send.
+    static func secureJPEG(from image: UIImage) -> PreparedImage? {
+        let width = image.size.width * image.scale
+        let height = image.size.height * image.scale
+        guard width.isFinite, height.isFinite, width > 0, height > 0 else { return nil }
+        let ratio = min(1, 2_048 / max(width, height))
+        let size = CGSize(width: max(1, floor(width * ratio)), height: max(1, floor(height * ratio)))
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        let preview = UIGraphicsImageRenderer(size: size, format: format).image { _ in
+            image.draw(in: CGRect(origin: .zero, size: size))
+        }
+        return encode(preview: preview)
     }
 
     static func secureJPEG(from data: Data) -> PreparedImage? {
@@ -9909,12 +9979,11 @@ enum AttachmentImageDecoder {
         guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
             return nil
         }
-        let preview = UIImage(cgImage: image)
-        for quality in stride(
-            from: CGFloat(0.9),
-            through: CGFloat(0.5),
-            by: CGFloat(-0.1)
-        ) {
+        return encode(preview: UIImage(cgImage: image))
+    }
+
+    private static func encode(preview: UIImage) -> PreparedImage? {
+        for quality in jpegQualities {
             guard let encoded = preview.jpegData(compressionQuality: quality) else { continue }
             if encoded.count <= KitChatMediaLimits.imageEncodeTargetBytes {
                 return PreparedImage(preview: preview, data: encoded)
@@ -9951,9 +10020,9 @@ enum AttachmentImageDecoder {
         }
         var encoded: Data?
         let targetBytes = min(maximumOutputBytes, KitChatMediaLimits.imageEncodeTargetBytes)
-        // Smaller provider images can already be denser than a 2048 px JPEG. Progressively
-        // reduce dimensions as well as quality so a batch transform never grows beyond the
-        // source size used for its queue-time aggregate and descriptor-budget checks.
+        // The queue reserves the JPEG allowance independently of compressed source size: a
+        // tiny PNG/HEIC can legitimately produce a larger JPEG. Reduce dimensions only when
+        // quality changes cannot fit that allowance, never just to match the source bytes.
         for maximumPixelSize in [2_048, 1_600, 1_280, 1_024, 768, 512, 384, 256] {
             let options: [CFString: Any] = [
                 kCGImageSourceCreateThumbnailFromImageAlways: true,
@@ -9967,11 +10036,7 @@ enum AttachmentImageDecoder {
                 options as CFDictionary
             ) else { continue }
             let preview = UIImage(cgImage: image)
-            for quality in stride(
-                from: CGFloat(0.9),
-                through: CGFloat(0.4),
-                by: CGFloat(-0.1)
-            ) {
+            for quality in jpegQualities {
                 guard let candidate = preview.jpegData(compressionQuality: quality) else { continue }
                 if candidate.count <= targetBytes {
                     encoded = candidate

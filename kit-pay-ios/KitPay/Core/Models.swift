@@ -1,128 +1,10 @@
 import Foundation
 
-struct APIEnvelope<Value: Decodable>: Decodable {
-    let ok: Bool
-    let data: Value?
-    let error: APIErrorPayload?
-    let meta: APIMeta?
 
-    private enum CodingKeys: String, CodingKey {
-        case ok, data, error, meta
-    }
 
-    init(from decoder: Decoder) throws {
-        let values = try decoder.container(keyedBy: CodingKeys.self)
-        ok = try values.decode(Bool.self, forKey: .ok)
-        error = try values.decodeIfPresent(APIErrorPayload.self, forKey: .error)
-        meta = try values.decodeIfPresent(APIMeta.self, forKey: .meta)
 
-        if ok {
-            // Successful envelopes remain strict: a malformed success payload must never be
-            // mistaken for a valid endpoint response.
-            data = try values.decodeIfPresent(Value.self, forKey: .data)
-        } else {
-            // Error envelopes occasionally carry endpoint-specific or empty data. Decode the
-            // structured error independently so challenge retry metadata is not discarded merely
-            // because that irrelevant data does not match `Value`.
-            do {
-                data = try values.decodeIfPresent(Value.self, forKey: .data)
-            } catch {
-                data = nil
-            }
-        }
-    }
-}
 
-struct APIErrorPayload: Decodable, Error {
-    let code: String
-    let message: String
 
-    /// Transport metadata is attached by `APIClient` after decoding the JSON envelope. Keeping
-    /// it on the error lets endpoint retry policies honor rate-limit guidance without discarding
-    /// the backend's stable error code and human-readable message.
-    let httpStatus: Int?
-    let retryAfter: TimeInterval?
-    /// Authentication challenges expose only this bounded, non-secret detail so the client can
-    /// retire a challenge immediately after the server consumes its final attempt.
-    let remainingAttempts: Int?
-
-    init(
-        code: String,
-        message: String,
-        httpStatus: Int? = nil,
-        retryAfter: TimeInterval? = nil,
-        remainingAttempts: Int? = nil
-    ) {
-        self.code = code
-        self.message = message
-        self.httpStatus = httpStatus
-        self.retryAfter = retryAfter
-        self.remainingAttempts = remainingAttempts
-    }
-
-    private enum CodingKeys: String, CodingKey {
-        case code, message, details
-    }
-
-    private struct Details: Decodable {
-        let remainingAttempts: Int?
-
-        enum CodingKeys: String, CodingKey {
-            case remainingAttempts = "remaining_attempts"
-        }
-    }
-
-    init(from decoder: Decoder) throws {
-        let values = try decoder.container(keyedBy: CodingKeys.self)
-        code = try values.decode(String.self, forKey: .code)
-        message = try values.decode(String.self, forKey: .message)
-        httpStatus = nil
-        retryAfter = nil
-        let details: Details?
-        do {
-            details = try values.decodeIfPresent(Details.self, forKey: .details)
-        } catch {
-            // Error details vary across endpoints and are optional metadata. Preserve the stable
-            // code/message even when an older or unrelated endpoint returns another JSON shape.
-            details = nil
-        }
-        if let attempts = details?.remainingAttempts, attempts >= 0, attempts <= 100 {
-            remainingAttempts = attempts
-        } else {
-            remainingAttempts = nil
-        }
-    }
-
-    func attachingHTTP(status: Int, retryAfter: TimeInterval?) -> APIErrorPayload {
-        APIErrorPayload(
-            code: code,
-            message: message,
-            httpStatus: status,
-            retryAfter: retryAfter,
-            remainingAttempts: remainingAttempts
-        )
-    }
-}
-
-struct APIMeta: Decodable {
-    let requestId: String?
-    let serverTime: String?
-    /// Cursor-pagination and idempotency metadata (`ApiResponse::success(..., meta:)`). Strictly
-    /// optional: an absent key or JSON null decodes as nil, but a present key of the wrong type
-    /// fails the whole envelope decode — endpoints that require these fields must fail closed on
-    /// a malformed advertisement, never guess.
-    let nextCursor: String?
-    let hasMore: Bool?
-    let idempotentReplay: Bool?
-
-    enum CodingKeys: String, CodingKey {
-        case requestId = "request_id"
-        case serverTime = "server_time"
-        case nextCursor = "next_cursor"
-        case hasMore = "has_more"
-        case idempotentReplay = "idempotent_replay"
-    }
-}
 
 struct CurrencyDTO: Codable, Hashable {
     let code: String
@@ -152,7 +34,7 @@ enum CustomerPricingContract {
     }
 }
 
-struct CapabilitiesDTO: Decodable {
+struct CapabilitiesDTO: Decodable, MessagingMediaCompositionCapabilities {
     let apiVersion: String?
     let currency: CurrencyDTO
     let features: [String: Bool?]?
@@ -740,111 +622,12 @@ struct KitRealtimeConfiguration: Equatable, Hashable, Sendable {
     }
 }
 
-struct MessagingProtocolCapabilityDTO: Decodable {
-    let ready: Bool?
-    let version: String?
-    let suite: String?
-    let postQuantum: Bool?
-    var richMedia: MessagingRichMediaProtocolCapabilityDTO? = nil
-    /// Media-message v2 is an additive block. A malformed advertisement must disable only the
-    /// multi-attachment path — never the messaging protocol block it rides in.
-    var mediaMessage: MessagingMediaMessageProtocolCapabilityDTO? = nil
-    /// Chunked attachment transport is additive. Its decoder is intentionally isolated so a
-    /// malformed rollout block disables resume without taking ordinary encrypted messaging down.
-    var resumableAttachments: MessagingResumableAttachmentsCapabilityDTO? = nil
-    /// Additive contract for idempotently promoting a locally-created direct thread. Decode
-    /// failures are confined to this feature so a malformed rollout cannot disable messaging.
-    var offlineDirectCreation: MessagingOfflineDirectCreationCapabilityDTO? = nil
 
-    enum CodingKeys: String, CodingKey {
-        case ready, version, suite
-        case postQuantum = "post_quantum"
-        case richMedia = "rich_media"
-        case mediaMessage = "media_message"
-        case resumableAttachments = "resumable_attachments"
-        case offlineDirectCreation = "offline_direct_creation"
-    }
-
-    init(
-        ready: Bool?,
-        version: String?,
-        suite: String?,
-        postQuantum: Bool?,
-        richMedia: MessagingRichMediaProtocolCapabilityDTO? = nil,
-        mediaMessage: MessagingMediaMessageProtocolCapabilityDTO? = nil,
-        resumableAttachments: MessagingResumableAttachmentsCapabilityDTO? = nil,
-        offlineDirectCreation: MessagingOfflineDirectCreationCapabilityDTO? = nil
-    ) {
-        self.ready = ready
-        self.version = version
-        self.suite = suite
-        self.postQuantum = postQuantum
-        self.richMedia = richMedia
-        self.mediaMessage = mediaMessage
-        self.resumableAttachments = resumableAttachments
-        self.offlineDirectCreation = offlineDirectCreation
-    }
-
-    init(from decoder: Decoder) throws {
-        let values = try decoder.container(keyedBy: CodingKeys.self)
-        ready = try values.decodeIfPresent(Bool.self, forKey: .ready)
-        version = try values.decodeIfPresent(String.self, forKey: .version)
-        suite = try values.decodeIfPresent(String.self, forKey: .suite)
-        postQuantum = try values.decodeIfPresent(Bool.self, forKey: .postQuantum)
-        richMedia = try values.decodeIfPresent(
-            MessagingRichMediaProtocolCapabilityDTO.self,
-            forKey: .richMedia
-        )
-        mediaMessage = try? values.decodeIfPresent(
-            MessagingMediaMessageProtocolCapabilityDTO.self,
-            forKey: .mediaMessage
-        )
-        resumableAttachments = try? values.decodeIfPresent(
-            MessagingResumableAttachmentsCapabilityDTO.self,
-            forKey: .resumableAttachments
-        )
-        offlineDirectCreation = try? values.decodeIfPresent(
-            MessagingOfflineDirectCreationCapabilityDTO.self,
-            forKey: .offlineDirectCreation
-        )
-    }
-
-    var supportsReviewedV2: Bool {
-        ready == true
-            && version == SecureMessagingWire.protocolVersion
-            && suite == SecureMessagingWire.protocolSuite
-            && postQuantum == true
-    }
-}
 
 /// Exact backend contract that makes an offline-created direct thread safe to replay. Every
 /// member is affirmative: accepting a partial advertisement could create duplicate server
 /// threads or make the client assume its UUID is canonical when the server did not promise it.
-struct MessagingOfflineDirectCreationCapabilityDTO: Decodable, Equatable {
-    static let reviewedProfile = "kit-direct-conversation-v1"
-    static let reviewedRequestField = "client_conversation_id"
 
-    let profile: String?
-    let ready: Bool?
-    let requestField: String?
-    let canonicalIDOnCreate: Bool?
-    let existingPairWins: Bool?
-
-    enum CodingKeys: String, CodingKey {
-        case profile, ready
-        case requestField = "request_field"
-        case canonicalIDOnCreate = "canonical_id_on_create"
-        case existingPairWins = "existing_pair_wins"
-    }
-
-    var supportsReviewedV1: Bool {
-        profile == Self.reviewedProfile
-            && ready == true
-            && requestField == Self.reviewedRequestField
-            && canonicalIDOnCreate == true
-            && existingPairWins == true
-    }
-}
 
 /// Durable evidence of the last authenticated decision for locally creating a direct thread.
 /// The protected state that carries this receipt is account-bound, and the duplicated owner and
@@ -922,80 +705,9 @@ enum MessagingOfflineDirectCreationCapabilityPolicy {
 /// Fail-closed advertisement for the ciphertext-offset upload protocol. The fixed chunk ceiling
 /// is part of the reviewed wire contract, not a server tuning hint: accepting a larger value
 /// could defeat the client's bounded-memory guarantee.
-struct MessagingResumableAttachmentsCapabilityDTO: Decodable, Equatable, Sendable {
-    let ready: Bool?
-    let profile: String?
-    let maxChunkBytes: Int?
-    let offsetUnit: String?
-    let chunkDigest: String?
-    let fullDigest: String?
 
-    enum CodingKeys: String, CodingKey {
-        case ready, profile
-        case maxChunkBytes = "max_chunk_bytes"
-        case offsetUnit = "offset_unit"
-        case chunkDigest = "chunk_digest"
-        case fullDigest = "full_digest"
-    }
 
-    var validatedMaximumChunkBytes: Int? {
-        guard ready == true,
-              profile == MessagingResumableAttachmentPolicy.profile,
-              maxChunkBytes == MessagingResumableAttachmentPolicy.maximumChunkBytes,
-              offsetUnit == "ciphertext_byte",
-              chunkDigest == "sha256",
-              fullDigest == "sha256"
-        else { return nil }
-        return maxChunkBytes
-    }
-}
 
-struct MessagingRichMediaProtocolCapabilityDTO: Decodable {
-    let ready: Bool?
-    let profile: String?
-    let supportedPlatforms: [String?]?
-    let minimumIOSVersion: String?
-    let minimumCiphertextBytes: Int64?
-    let maximumPlaintextBytes: Int?
-    let maximumCiphertextBytes: Int64?
-    let largeAttachmentCapability: String?
-    let largeAttachmentSupportedPlatforms: [String?]?
-    let largeAttachmentMinimumIOSVersion: String?
-    let mediaTypes: [String?]?
-
-    enum CodingKeys: String, CodingKey {
-        case ready, profile
-        case supportedPlatforms = "supported_platforms"
-        case minimumIOSVersion = "minimum_ios_version"
-        case minimumCiphertextBytes = "minimum_ciphertext_bytes"
-        case maximumPlaintextBytes = "maximum_plaintext_bytes"
-        case maximumCiphertextBytes = "maximum_ciphertext_bytes"
-        case largeAttachmentCapability = "large_attachment_capability"
-        case largeAttachmentSupportedPlatforms = "large_attachment_supported_platforms"
-        case largeAttachmentMinimumIOSVersion = "large_attachment_minimum_ios_version"
-        case mediaTypes = "media_types"
-    }
-
-    var supportsIOSV1: Bool {
-        guard ready == true,
-              profile == MessagingRichMediaCapabilityPolicy.profile,
-              supportedPlatforms?.compactMap({ $0 }).contains("ios") == true,
-              minimumIOSVersion == MessagingRichMediaCapabilityPolicy.minimumIOSRelease,
-              minimumCiphertextBytes == SecureMessagingWire.minimumAttachmentCiphertextBytes,
-              maximumPlaintextBytes == SecureMediaAttachmentCipher.maximumPlaintextBytes,
-              maximumCiphertextBytes == SecureMessagingWire.maximumAttachmentCiphertextBytes,
-              largeAttachmentCapability
-                == MessagingRichMediaCapabilityPolicy.extendedSizeDeviceCapabilityKey,
-              largeAttachmentSupportedPlatforms?.compactMap({ $0 }) == ["ios"],
-              largeAttachmentMinimumIOSVersion
-                == MessagingRichMediaCapabilityPolicy.extendedSizeMinimumIOSRelease,
-              let advertisedMediaTypes = mediaTypes?.compactMap({ $0 })
-        else { return false }
-        return Set(advertisedMediaTypes).isSuperset(
-            of: SecureMessagingWire.allowedAttachmentMediaTypes
-        )
-    }
-}
 
 struct DeviceRegistration: Encodable {
     let installationId: String
@@ -1450,91 +1162,9 @@ enum TOTPEnrollmentErrorPolicy {
     }
 }
 
-struct SessionTokens: Codable, Hashable, Sendable {
-    let accessToken: String
-    let refreshToken: String
-    let tokenType: String
-    let accessExpiresAt: String?
-    let refreshExpiresAt: String?
-    let sessionId: String
-    /// Local account binding written only after an authentication response pairs these
-    /// credentials with a verified user. Older Keychain records and wire responses omit it.
-    let accountId: String?
 
-    enum CodingKeys: String, CodingKey {
-        case accessToken = "access_token"
-        case refreshToken = "refresh_token"
-        case tokenType = "token_type"
-        case accessExpiresAt = "access_expires_at"
-        case refreshExpiresAt = "refresh_expires_at"
-        case sessionId = "session_id"
-        case accountId = "account_id"
-    }
 
-    init(
-        accessToken: String,
-        refreshToken: String,
-        tokenType: String,
-        accessExpiresAt: String?,
-        refreshExpiresAt: String?,
-        sessionId: String,
-        accountId: String? = nil
-    ) {
-        self.accessToken = accessToken
-        self.refreshToken = refreshToken
-        self.tokenType = tokenType
-        self.accessExpiresAt = accessExpiresAt
-        self.refreshExpiresAt = refreshExpiresAt
-        self.sessionId = sessionId
-        self.accountId = accountId
-    }
 
-    func bound(to userID: String) -> SessionTokens? {
-        let normalizedUserID = userID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard SessionCredentialContractPolicy.isValid(self),
-              !normalizedUserID.isEmpty,
-              normalizedUserID.unicodeScalars.count <= 256,
-              accountId.map({
-                  $0.caseInsensitiveCompare(normalizedUserID) == .orderedSame
-              }) != false
-        else { return nil }
-        return SessionTokens(
-            accessToken: accessToken,
-            refreshToken: refreshToken,
-            tokenType: tokenType,
-            accessExpiresAt: accessExpiresAt,
-            refreshExpiresAt: refreshExpiresAt,
-            sessionId: sessionId,
-            accountId: normalizedUserID
-        )
-    }
-}
-
-enum SessionCredentialContractPolicy {
-    private static let maximumCredentialLength = 16_384
-
-    static func isValid(_ session: SessionTokens) -> Bool {
-        guard session.tokenType.caseInsensitiveCompare("Bearer") == .orderedSame,
-              UUID(uuidString: session.sessionId) != nil,
-              isValidCredential(session.accessToken),
-              isValidCredential(session.refreshToken)
-        else { return false }
-        guard let accountID = session.accountId else { return true }
-        let normalized = accountID.trimmingCharacters(in: .whitespacesAndNewlines)
-        return normalized == accountID
-            && !normalized.isEmpty
-            && normalized.unicodeScalars.count <= 256
-    }
-
-    private static func isValidCredential(_ value: String) -> Bool {
-        !value.isEmpty
-            && value.utf8.count <= maximumCredentialLength
-            && value.unicodeScalars.allSatisfy {
-                !CharacterSet.whitespacesAndNewlines.contains($0)
-                    && !CharacterSet.controlCharacters.contains($0)
-            }
-    }
-}
 
 enum SessionAccountBindingPolicy {
     static func matches(_ session: SessionTokens, profile: UserProfile?) -> Bool {
@@ -2321,54 +1951,14 @@ struct BiometricKeyStatusDTO: Decodable, Hashable, Sendable {
 /// This is intentionally separate from KYC. Passing an identity check may unlock regulated
 /// features, but it never grants a public badge by itself. Only one of these exact values, sent by
 /// the authenticated API, may put a blue verification seal on screen.
-enum AccountVerificationDesignation: String, Codable, Hashable, Sendable {
-    case verified
-    case official
-    case officialSupport = "official_support"
 
-    var accessibilityLabel: String {
-        switch self {
-        case .verified:
-            return "Verified account"
-        case .official:
-            return "Official account"
-        case .officialSupport:
-            return "Official Kit Pay support"
-        }
-    }
-}
 
 /// Verification metadata embedded in profile and contact projections.
 ///
 /// Unknown, padded, or differently-cased designations decode without breaking the surrounding
 /// profile, but remain unrecognised and therefore cannot earn a badge. This fail-closed behaviour
 /// also keeps a future server designation safe on older clients.
-struct AccountVerificationDTO: Codable, Hashable, Sendable {
-    let designation: AccountVerificationDesignation?
-    let since: String?
 
-    init(designation: AccountVerificationDesignation?, since: String? = nil) {
-        self.designation = designation
-        self.since = since
-    }
-
-    private enum CodingKeys: String, CodingKey {
-        case designation, since
-    }
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        let rawDesignation = try container.decodeIfPresent(String.self, forKey: .designation)
-        designation = rawDesignation.flatMap(AccountVerificationDesignation.init(rawValue:))
-        since = try container.decodeIfPresent(String.self, forKey: .since)
-    }
-
-    func encode(to encoder: Encoder) throws {
-        var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encodeIfPresent(designation?.rawValue, forKey: .designation)
-        try container.encodeIfPresent(since, forKey: .since)
-    }
-}
 
 /// A small, authenticated identity projection carried beside messaging and calling rosters.
 ///
@@ -2377,48 +1967,7 @@ struct AccountVerificationDTO: Codable, Hashable, Sendable {
 /// the same avatar and verification seal without coupling a public badge to KYC or phone-book
 /// access. Every field stays optional so payloads from servers predating this projection continue
 /// to decode.
-struct AccountIdentityProjection: Codable, Hashable, Sendable {
-    let displayName: String?
-    let avatarURL: String?
-    let verification: AccountVerificationDTO?
 
-    init?(
-        displayName: String?,
-        avatarURL: String?,
-        verification: AccountVerificationDTO?
-    ) {
-        let cleanName = Self.validatedDisplayName(displayName)
-        let cleanAvatarURL = Self.validatedAvatarURL(avatarURL)
-        let cleanVerification = verification?.designation == nil ? nil : verification
-        guard cleanName != nil || cleanAvatarURL != nil || cleanVerification != nil else {
-            return nil
-        }
-        self.displayName = cleanName
-        self.avatarURL = cleanAvatarURL
-        self.verification = cleanVerification
-    }
-
-    static func validatedDisplayName(_ rawValue: String?) -> String? {
-        guard let rawValue else { return nil }
-        let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !value.isEmpty,
-              value.utf8.count <= 512,
-              !value.unicodeScalars.contains(where: { $0.value == 0 })
-        else { return nil }
-        return value
-    }
-
-    static func validatedAvatarURL(_ rawValue: String?) -> String? {
-        ProfileAvatarCache.validatedURL(rawValue)?.absoluteString
-    }
-
-    var isValid: Bool {
-        displayName == Self.validatedDisplayName(displayName)
-            && avatarURL == Self.validatedAvatarURL(avatarURL)
-            && (verification.map({ $0.designation != nil }) ?? true)
-            && (displayName != nil || avatarURL != nil || verification != nil)
-    }
-}
 
 /// A Kit Pay account carries two deliberately separate names.
 ///
@@ -3229,17 +2778,7 @@ enum CustomerTransactionPresentationPolicy {
     }
 }
 
-struct CursorPage: Codable, Hashable, Sendable {
-    let nextCursor: String?
-    let hasMore: Bool?
-    let limit: Int?
 
-    enum CodingKeys: String, CodingKey {
-        case nextCursor = "next_cursor"
-        case hasMore = "has_more"
-        case limit
-    }
-}
 
 /// A wallet-history row has a strict financial core and best-effort presentation/action metadata.
 ///
@@ -4118,9 +3657,15 @@ struct ConversationDraftMediaAttachment: Codable, Hashable, Sendable {
         case (nil, nil):
             return true
         case let (sourceMediaType?, outputStorageKey?):
-            return mediaType == "image/jpeg"
+            let isImage = mediaType == "image/jpeg" && sourceMediaType.hasPrefix("image/")
+            let isVideo = mediaType == sourceMediaType
+                && ["video/mp4", "video/quicktime"].contains(sourceMediaType)
+                && duration != nil
+                && storageKind == .protectedFile
+                && byteCount > 12 * 1_024 * 1_024
+                && KitChatMediaLimits.fits(byteCount, kind: .video)
+            return (isImage || isVideo)
                 && sourceMediaType == sourceMediaType.lowercased()
-                && sourceMediaType.hasPrefix("image/")
                 && sourceMediaType.utf8.count <= 127
                 && sourceMediaType.unicodeScalars.allSatisfy {
                     $0.value >= 0x21 && $0.value <= 0x7e
@@ -4174,19 +3719,7 @@ struct ConversationDraft: Codable, Hashable, Sendable {
 /// donors must match a server candidate against this exact record before re-encrypting plaintext
 /// for another device on the same account. Optional storage on `LocalMessage` keeps older state
 /// files readable; messages that predate this record simply cannot be used as backfill sources.
-struct SecureMessagingRetainedMessageMetadata: Codable, Hashable, Sendable {
-    let clientMessageID: String
-    /// Authenticated sender bound to this metadata when the envelope was decrypted. Optional so
-    /// pre-field local state remains decodable; security-sensitive departed-member recovery must
-    /// require it rather than inferring attribution from the surrounding mutable projection.
-    let senderUserID: String?
-    let senderDeviceID: String
-    let senderEnrollmentEpoch: Int64
-    let senderSignalDeviceID: UInt32
-    let rosterRevision: String
-    let kind: SecureMessagingMessageKind
-    let replyToMessageID: String?
-}
+
 
 /// Device-local ownership of one media item. The media id is minted before upload and never
 /// changes when a server storage key appears, which keeps rendering, retry and cleanup rooted in
@@ -4225,12 +3758,32 @@ struct LocalMediaPreprocessingJob: Codable, Hashable, Sendable {
     enum Kind: String, Codable, Hashable, Sendable {
         case imageJPEG
         case voiceAssembly
+        case video1080p
     }
 
     let kind: Kind
     let sources: [LocalMediaOriginalSource]
     let outputStorageKey: String
     let outputMediaType: String
+    /// A durable export must keep the source's audio presence as well as its complete duration.
+    /// Optional for decoding image/voice jobs written before video optimization existed.
+    let videoSourceHasAudio: Bool?
+    let videoSourceWidth: Double?
+    let videoSourceHeight: Double?
+
+    init(
+        kind: Kind, sources: [LocalMediaOriginalSource], outputStorageKey: String,
+        outputMediaType: String, videoSourceHasAudio: Bool? = nil,
+        videoSourceWidth: Double? = nil, videoSourceHeight: Double? = nil
+    ) {
+        self.kind = kind
+        self.sources = sources
+        self.outputStorageKey = outputStorageKey
+        self.outputMediaType = outputMediaType
+        self.videoSourceHasAudio = videoSourceHasAudio
+        self.videoSourceWidth = videoSourceWidth
+        self.videoSourceHeight = videoSourceHeight
+    }
 
     var isStructurallyValid: Bool {
         guard !sources.isEmpty,
@@ -4254,9 +3807,23 @@ struct LocalMediaPreprocessingJob: Codable, Hashable, Sendable {
             return sources.count == 1
                 && sources[0].mediaType.hasPrefix("image/")
                 && outputMediaType == "image/jpeg"
+                && videoSourceHasAudio == nil
+                && videoSourceWidth == nil && videoSourceHeight == nil
         case .voiceAssembly:
             return sources.allSatisfy { $0.mediaType == "audio/mp4" }
                 && outputMediaType == "audio/mp4"
+                && videoSourceHasAudio == nil
+                && videoSourceWidth == nil && videoSourceHeight == nil
+        case .video1080p:
+            return sources.count == 1
+                && ["video/mp4", "video/quicktime"].contains(sources[0].mediaType)
+                && sources[0].duration != nil
+                && sources[0].fileSize > 12 * 1_024 * 1_024
+                && KitChatMediaLimits.fits(sources[0].fileSize, kind: .video)
+                && outputMediaType == sources[0].mediaType
+                && videoSourceHasAudio != nil
+                && videoSourceWidth.map({ $0.isFinite && $0 > 0 }) == true
+                && videoSourceHeight.map({ $0.isFinite && $0 > 0 }) == true
         }
     }
 }
@@ -4588,6 +4155,28 @@ struct LocalMediaQueueAttachment: Sendable {
     }
 }
 
+enum ImagePreprocessingBudgetPolicy {
+    /// A compact PNG/HEIC can grow when re-encoded as JPEG. Reserve the full JPEG allowance
+    /// while preserving larger current originals, so every intermediate completion order
+    /// fits the aggregate ciphertext and exact encoded-caption budgets checked by the batch.
+    /// Actual item/source byte counts stay unchanged until their protected output commits.
+    static func fits(
+        batch: KitMediaMessageV2OutboundBatch,
+        preprocessingJobs: [LocalMediaPreprocessingJob?]?
+    ) -> Bool {
+        guard let preprocessingJobs else { return true }
+        guard preprocessingJobs.count == batch.items.count else { return false }
+        var reserved = batch
+        for index in reserved.items.indices where preprocessingJobs[index]?.kind == .imageJPEG {
+            reserved.items[index].plaintextByteSize = max(
+                reserved.items[index].plaintextByteSize,
+                KitChatMediaLimits.imageEncodeTargetBytes
+            )
+        }
+        return reserved.isStructurallyValid
+    }
+}
+
 /// Pure state transitions for the local media library. File I/O remains in
 /// `SecureMediaFileCache`; these helpers keep its stable identity and lifecycle metadata in the
 /// same atomic state mutation as the message/outbox projection.
@@ -4647,7 +4236,8 @@ enum LocalMediaRecordPolicy {
     ) -> [LocalMediaRecord]? {
         guard batch.isStructurallyValid,
               localStorageKinds.map({ $0.count == batch.items.count }) ?? true,
-              preprocessingJobs.map({ $0.count == batch.items.count }) ?? true
+              preprocessingJobs.map({ $0.count == batch.items.count }) ?? true,
+              ImagePreprocessingBudgetPolicy.fits(batch: batch, preprocessingJobs: preprocessingJobs)
         else { return nil }
         let records = batch.items.enumerated().compactMap { index, item in
             let job = preprocessingJobs?[index]
@@ -5384,7 +4974,10 @@ enum LocalMediaRecordPolicy {
             kind: expectedJob.kind,
             sources: expectedJob.sources,
             outputStorageKey: canonicalOutput,
-            outputMediaType: expectedJob.outputMediaType
+            outputMediaType: expectedJob.outputMediaType,
+            videoSourceHasAudio: expectedJob.videoSourceHasAudio,
+            videoSourceWidth: expectedJob.videoSourceWidth,
+            videoSourceHeight: expectedJob.videoSourceHeight
         )
         guard replacement.isStructurallyValid else { return false }
         return mutate(&message, attachmentID: attachmentID) { record in
@@ -5413,6 +5006,8 @@ enum LocalMediaRecordPolicy {
         now: Date = Date()
     ) -> Bool {
         guard expectedJob.isStructurallyValid,
+              expectedJob.kind != .imageJPEG
+                  || outputByteCount <= KitChatMediaLimits.imageEncodeTargetBytes,
               KitChatMediaLimits.fits(
                   outputByteCount,
                   kind: KitChatMediaKind(mediaType: expectedJob.outputMediaType)
@@ -6603,6 +6198,9 @@ struct OfflineCommand: Codable, Hashable, Identifiable {
 }
 
 struct PersistedState: Codable {
+    /// Receipt for a private journal atomically committed with the shared Signal ratchet.
+    var messagingBrokerGeneration: UUID?
+    var messagingBrokerTransactionID: UUID?
     var profile: UserProfile?
     /// Owns every locally projected conversation, message, call and outbox command. Keeping this
     /// independently of `profile` lets a deliberate sign-out retain encrypted history for the

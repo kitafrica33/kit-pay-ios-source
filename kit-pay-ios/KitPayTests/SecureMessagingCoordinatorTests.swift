@@ -4,6 +4,153 @@ import XCTest
 final class SecureMessagingCoordinatorTests: XCTestCase {
     private var temporaryDirectory: URL!
 
+    func testEstablishedSyncOverlapsEncryptedPageReadWithEnrollmentVerification() async throws {
+        let fixture = try await makeSyncConversationLoadFixture(
+            events: [], conversationBehavior: .unexpected
+        )
+        try await fixture.coordinator.activate(forUserID: fixture.userID)
+        let overlap = expectation(description: "Page fetch and key verification both started")
+        await fixture.transport.holdSyncAdmissionReads { overlap.fulfill() }
+        let sync = Task { try await fixture.coordinator.sync(forUserID: fixture.userID) }
+        await fulfillment(of: [overlap], timeout: 2)
+        let held = await fixture.store.snapshot()
+        XCTAssertNil(held.secureMessaging?.syncCursor)
+        await fixture.transport.releaseSyncAdmissionReads()
+        _ = try await sync.value
+        let cursors = await fixture.transport.requestedSyncCursors()
+        XCTAssertEqual(cursors, [nil])
+        let committed = await fixture.store.snapshot()
+        XCTAssertEqual(committed.secureMessaging?.syncCursor, fixture.nextCursor)
+    }
+
+    func testSyncDiscardsPrefetchedPageIfCursorAdvancesDuringVerification() async throws {
+        let fixture = try await makeSyncConversationLoadFixture(
+            event: conversationUpdatedSyncEvent(), conversationBehavior: .unexpected
+        )
+        try await fixture.coordinator.activate(forUserID: fixture.userID)
+        let newerCursor = "cursor-advanced-during-verification"
+        let finalCursor = "cursor-after-fresh-read"
+        await fixture.transport.setResponse(
+            try JSONDecoder().decode(MessagingSyncDTO.self, from: JSONSerialization.data(withJSONObject: [
+                "events": [],
+                "page": ["next_cursor": finalCursor, "has_more": false,
+                         "limit": SecureMessagingWire.maximumSyncPage],
+            ])),
+            forCursor: newerCursor
+        )
+        let overlap = expectation(description: "Old page and key verification suspended")
+        await fixture.transport.holdSyncAdmissionReads { overlap.fulfill() }
+        let sync = Task { try await fixture.coordinator.sync(forUserID: fixture.userID) }
+        await fulfillment(of: [overlap], timeout: 2)
+        try await fixture.store.update { $0.secureMessaging?.syncCursor = newerCursor }
+        await fixture.transport.releaseSyncAdmissionReads()
+        _ = try await sync.value
+        let cursors = await fixture.transport.requestedSyncCursors()
+        XCTAssertEqual(cursors, [nil, newerCursor])
+        let conversationReads = await fixture.transport.conversationRequestCount()
+        XCTAssertEqual(conversationReads, 0, "Events from the old cursor must not be applied")
+        let committed = await fixture.store.snapshot()
+        XCTAssertEqual(committed.secureMessaging?.syncCursor, finalCursor)
+    }
+
+    func testEstablishedTextPreparationOverlapsFreshSecurityReadsWithoutCachingRetries() async throws {
+        let fixture = try await makeMediaBatchFlushFixture(mediaMessageEnabled: true)
+        try await fixture.store.update { state in
+            let index = try XCTUnwrap(state.messages.firstIndex { $0.id == fixture.queued.clientMessageID })
+            state.messages[index].body = "A short encrypted message"
+            state.messages[index].pendingMediaBatch = nil
+            state.messages[index].pendingAttachment = nil
+            state.messages[index].attachmentData = nil
+            state.messages[index].localMediaRecords = nil
+        }
+        let snapshot = await fixture.store.snapshot()
+        let command = try XCTUnwrap(snapshot.outbox.first { $0.messageId == fixture.queued.clientMessageID })
+        let readsStarted = expectation(description: "Conversation, enrollment and roster overlap")
+        await fixture.transport.holdFreshSecurityReads { readsStarted.fulfill() }
+        let preparation = Task {
+            try await fixture.coordinator.prepareDeferredMessage(commandID: command.id, forUserID: fixture.userID)
+        }
+        // Each request is held until all three have started. Sequential preparation cannot
+        // satisfy the expectation; this does not assert a device/network millisecond budget.
+        await fulfillment(of: [readsStarted], timeout: 2)
+        await fixture.transport.releaseFreshSecurityReads()
+        _ = await preparation.result
+        let firstCounts = await fixture.transport.freshSecurityReadCounts()
+        XCTAssertEqual(firstCounts.status, 1)
+        XCTAssertEqual(firstCounts.conversation, 1)
+        XCTAssertEqual(firstCounts.roster, 1)
+
+        // This fixture intentionally cannot establish remote Signal sessions. Its queued text
+        // stays unsent, letting another attempt prove that metadata was not cached or reused.
+        _ = try? await fixture.coordinator.prepareDeferredMessage(commandID: command.id, forUserID: fixture.userID)
+        let retryCounts = await fixture.transport.freshSecurityReadCounts()
+        XCTAssertEqual(retryCounts.status, 2)
+        XCTAssertEqual(retryCounts.roster, 2)
+        let retained = await fixture.store.snapshot()
+        XCTAssertNil(retained.outbox.first { $0.id == command.id }?.secureMessageFanout)
+        let uploads = await fixture.transport.uploadCount()
+        let sends = await fixture.transport.sendCount()
+        XCTAssertEqual(uploads, 0)
+        XCTAssertEqual(sends, 0)
+    }
+
+    func testCommittedSyncPageBecomesVisibleBeforeDeliveryAcknowledgementReturns() async throws {
+        let fixture = try await makeSyncConversationLoadFixture(
+            event: conversationUpdatedSyncEvent(),
+            conversationBehavior: .structuredNotFound
+        )
+        let pendingID = "70000000-0000-4000-8000-000000000087"
+        try await fixture.store.update { state in
+            state.secureMessaging?.pendingDeliveryAcknowledgementIDs = [pendingID]
+        }
+        let published = expectation(description: "Committed page is visible")
+        let acknowledgementStarted = expectation(description: "Receipt request is suspended")
+        await fixture.transport.holdDeliveryAcknowledgements {
+            acknowledgementStarted.fulfill()
+        }
+        let sync = Task {
+            try await fixture.coordinator.sync(
+                forUserID: fixture.userID,
+                onPageCommitted: {
+                    let state = await fixture.store.snapshot()
+                    XCTAssertEqual(state.secureMessaging?.syncCursor, fixture.nextCursor)
+                    published.fulfill()
+                }
+            )
+        }
+        // A controlled request boundary, not a physical latency claim. The old publish-after-
+        // sync path could not show this committed page while the receipt response was held.
+        await fulfillment(of: [published, acknowledgementStarted], timeout: 2)
+        let waiting = await fixture.store.snapshot()
+        XCTAssertEqual(waiting.secureMessaging?.pendingDeliveryAcknowledgementIDs, [pendingID])
+        await fixture.transport.releaseDeliveryAcknowledgements()
+        let result = try await sync.value
+        XCTAssertEqual(result.appliedTransitions, 1)
+        let finished = await fixture.store.snapshot()
+        XCTAssertTrue(finished.secureMessaging?.pendingDeliveryAcknowledgementIDs.isEmpty == true)
+    }
+
+    func testRejectedSyncPageNeverPublishesAnEarlyProjection() async throws {
+        let fixture = try await makeSyncConversationLoadFixture(
+            event: conversationUpdatedSyncEvent(),
+            conversationBehavior: .response(syncConversationDTO(type: "channel"))
+        )
+        let publications = MessagingPagePublicationRecorder()
+        do {
+            _ = try await fixture.coordinator.sync(
+                forUserID: fixture.userID,
+                onPageCommitted: { await publications.record() }
+            )
+            XCTFail("Invalid authenticated conversation data must fail closed")
+        } catch {
+            XCTAssertEqual(error as? SecureMessagingExchangeError, .invalidConversation)
+        }
+        let count = await publications.count
+        XCTAssertEqual(count, 0)
+        let state = await fixture.store.snapshot()
+        XCTAssertNil(state.secureMessaging?.syncCursor)
+    }
+
     func testCompletedSyncReturnsWithoutWaitingForHistoricalRepair() async throws {
         let fixture = try await makeSyncConversationLoadFixture(
             events: [], conversationBehavior: .unexpected
@@ -9332,6 +9479,14 @@ private actor SyncConversationLoadTransport: SecureMessagingExchangeTransport {
     private var statusRequests = 0
     private var holdsHistoryDiscovery = false
     private var historyDiscoveryWaiters: [CheckedContinuation<Void, Never>] = []
+    private var deliveryAcknowledgementStarted: (@Sendable () -> Void)?
+    private var holdsDeliveryAcknowledgements = false
+    private var deliveryAcknowledgementWaiters: [CheckedContinuation<Void, Never>] = []
+    private var syncReadBarrier: (@Sendable () -> Void)?
+    private var syncReadKinds: Set<String> = []
+    private var syncReadWaiters: [CheckedContinuation<Void, Never>] = []
+    private var syncCursors: [String?] = []
+    private var cursorResponses: [String: MessagingSyncDTO] = [:]
 
     init(
         status: MessagingKeyStatusDTO,
@@ -9347,6 +9502,42 @@ private actor SyncConversationLoadTransport: SecureMessagingExchangeTransport {
 
     func statusRequestCount() -> Int { statusRequests }
 
+    func requestedSyncCursors() -> [String?] { syncCursors }
+
+    func setResponse(_ response: MessagingSyncDTO, forCursor cursor: String) {
+        cursorResponses[cursor] = response
+    }
+
+    func holdSyncAdmissionReads(onOverlap: @escaping @Sendable () -> Void) {
+        syncReadBarrier = onOverlap
+        syncReadKinds.removeAll()
+    }
+
+    func releaseSyncAdmissionReads() {
+        syncReadBarrier = nil
+        let waiters = syncReadWaiters
+        syncReadWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
+    private func holdSyncReadIfNeeded(_ kind: String) async {
+        guard let onOverlap = syncReadBarrier else { return }
+        if syncReadKinds.insert(kind).inserted, syncReadKinds.count == 2 { onOverlap() }
+        await withCheckedContinuation { syncReadWaiters.append($0) }
+    }
+
+    func holdDeliveryAcknowledgements(onStart: @escaping @Sendable () -> Void) {
+        holdsDeliveryAcknowledgements = true
+        deliveryAcknowledgementStarted = onStart
+    }
+
+    func releaseDeliveryAcknowledgements() {
+        holdsDeliveryAcknowledgements = false
+        let waiters = deliveryAcknowledgementWaiters
+        deliveryAcknowledgementWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
     func holdHistoryDiscovery() { holdsHistoryDiscovery = true }
 
     func releaseHistoryDiscovery() {
@@ -9358,6 +9549,7 @@ private actor SyncConversationLoadTransport: SecureMessagingExchangeTransport {
 
     func messagingKeyStatus() async throws -> MessagingKeyStatusDTO {
         statusRequests += 1
+        await holdSyncReadIfNeeded("status")
         return status
     }
 
@@ -9397,8 +9589,14 @@ private actor SyncConversationLoadTransport: SecureMessagingExchangeTransport {
         cursor: String?,
         limit: Int
     ) async throws -> MessagingSyncDTO {
-        guard cursor == nil, limit == SecureMessagingWire.maximumSyncPage else {
+        syncCursors.append(cursor)
+        await holdSyncReadIfNeeded("page")
+        guard limit == SecureMessagingWire.maximumSyncPage else {
             throw Failure.unexpectedNetworkCall
+        }
+        if let cursor {
+            guard let response = cursorResponses[cursor] else { throw Failure.unexpectedNetworkCall }
+            return response
         }
         return response
     }
@@ -9448,12 +9646,31 @@ private actor SyncConversationLoadTransport: SecureMessagingExchangeTransport {
 
     func acknowledgeMessageDelivery(
         _ request: AcknowledgeMessageDeliveryRequest
-    ) async throws -> MessageDeliveryAcknowledgementDTO { try reject() }
+    ) async throws -> MessageDeliveryAcknowledgementDTO {
+        guard let onStart = deliveryAcknowledgementStarted else { return try reject() }
+        onStart()
+        if holdsDeliveryAcknowledgements {
+            await withCheckedContinuation { deliveryAcknowledgementWaiters.append($0) }
+        }
+        return MessageDeliveryAcknowledgementDTO(
+            deliveryState: "delivered_to_device", deviceId: status.deviceId,
+            acknowledgedCount: request.messageIds.count,
+            newlyAcknowledgedCount: request.messageIds.count,
+            items: request.messageIds.map {
+                MessageDeliveryReceiptDTO(messageId: $0, deliveredToDeviceAt: "2026-08-19T12:00:00Z")
+            }
+        )
+    }
 
     func markMessagingConversationRead(
         conversationId: String,
         request: MarkMessagingConversationReadRequest
     ) async throws -> MessagingReadReceiptDTO { try reject() }
+}
+
+private actor MessagingPagePublicationRecorder {
+    private(set) var count = 0
+    func record() { count += 1 }
 }
 
 private struct DetachedEchoFixture {
@@ -10526,6 +10743,12 @@ private actor MediaBatchFlushTransport: SecureMessagingExchangeTransport {
     private var rosterCalls = 0
     private var uploads: [MediaBatchRecordedUpload] = []
     private var sends = 0
+    private var statusCalls = 0
+    private var conversationCalls = 0
+    private var holdsFreshSecurityReads = false
+    private var freshSecurityReads: Set<String> = []
+    private var freshSecurityReadsStarted: (@Sendable () -> Void)?
+    private var freshSecurityReadWaiters: [CheckedContinuation<Void, Never>] = []
 
     init(
         status: MessagingKeyStatusDTO,
@@ -10546,12 +10769,42 @@ private actor MediaBatchFlushTransport: SecureMessagingExchangeTransport {
     func sendCount() -> Int { sends }
     func rosterCallCount() -> Int { rosterCalls }
 
-    func messagingKeyStatus() async throws -> MessagingKeyStatusDTO { status }
+    func holdFreshSecurityReads(onStart: @escaping @Sendable () -> Void) {
+        holdsFreshSecurityReads = true
+        freshSecurityReadsStarted = onStart
+    }
+
+    func releaseFreshSecurityReads() {
+        holdsFreshSecurityReads = false
+        freshSecurityReadsStarted = nil
+        let waiters = freshSecurityReadWaiters
+        freshSecurityReadWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
+    func freshSecurityReadCounts() -> (status: Int, conversation: Int, roster: Int) {
+        (statusCalls, conversationCalls, rosterCalls)
+    }
+
+    private func waitForFreshSecurityRead(_ name: String) async {
+        guard holdsFreshSecurityReads else { return }
+        freshSecurityReads.insert(name)
+        if freshSecurityReads.count == 3 { freshSecurityReadsStarted?() }
+        await withCheckedContinuation { freshSecurityReadWaiters.append($0) }
+    }
+
+    func messagingKeyStatus() async throws -> MessagingKeyStatusDTO {
+        statusCalls += 1
+        await waitForFreshSecurityRead("status")
+        return status
+    }
 
     func capabilities() async throws -> CapabilitiesDTO { capabilitiesDocument }
 
     func messagingConversation(id: String) async throws -> MessagingConversationDTO {
         guard id == conversation.id else { throw Failure.unexpectedNetworkCall }
+        conversationCalls += 1
+        await waitForFreshSecurityRead("conversation")
         return conversation
     }
 
@@ -10560,6 +10813,7 @@ private actor MediaBatchFlushTransport: SecureMessagingExchangeTransport {
     ) async throws -> MessagingDeviceRosterDTO {
         guard conversationId == conversation.id else { throw Failure.unexpectedNetworkCall }
         rosterCalls += 1
+        await waitForFreshSecurityRead("roster")
         guard rosterCalls == 1 else {
             throw APIErrorPayload(
                 code: "MESSAGING_TEMPORARILY_UNAVAILABLE",

@@ -1,19 +1,10 @@
 import ImageIO
+import Intents
 import UIKit
 import UniformTypeIdentifiers
 
-/// Kit Pay's entry in the system share sheet.
-///
-/// A share extension cannot rely on launching its containing app, and it must never inherit the
-/// app's identity keys or authenticated store. Kit Pay therefore publishes a small, account-bound
-/// list of chat names into the protected app-group container. This controller stages the selected
-/// bytes, lets the customer choose a direct chat or group here, and records that requested route.
-/// The containing app revalidates it and moves the share into the visible composer the next time
-/// Kit Pay becomes active. After queueing, the extension asks iOS to bring Kit Pay forward and
-/// completes only once iOS accepts that request (`KitShareHandoffAttempt` holds the rules); if
-/// iOS declines or never answers, the sheet stays up saying exactly that the share is queued,
-/// with an explicit retry — it never closes optimistically and implies that an unsent file was
-/// delivered.
+/// Direct encrypted sending from the system share sheet. Staging is provisional until the
+/// explicit Send tap journals a recoverable message; completion requires a validated receipt.
 final class ShareViewController: UIViewController {
     private struct PendingShare {
         let batchID: UUID
@@ -23,7 +14,7 @@ final class ShareViewController: UIViewController {
         let warning: String?
     }
 
-    private let store = SharedInboxStore()
+    private let store = DirectShareSendRecord.stagingStore
 
     private let cancelButton = UIButton(type: .system)
     private let titleLabel = UILabel()
@@ -32,6 +23,7 @@ final class ShareViewController: UIViewController {
     private let summaryLabel = UILabel()
     private let messageLabel = UILabel()
     private let previewStrip = UIStackView()
+    private let captionInput = UITextView()
     private let searchBar = UISearchBar()
     private let tableView = UITableView(frame: .zero, style: .insetGrouped)
     private let emptyLabel = UILabel()
@@ -41,9 +33,6 @@ final class ShareViewController: UIViewController {
     private var pendingShare: PendingShare?
     private var destinations: [SharedInboxDestination] = []
     private var filteredDestinations: [SharedInboxDestination] = []
-    /// A destination tap is accepted immediately, even while a large provider file is still
-    /// being copied into the durable app-group outbox. The manifest is committed as soon as that
-    /// copy finishes; a second tap can never create a second batch.
     private var requestedDestination: SharedInboxDestination?
     private var hasRequestedDestination = false
     private var batchIDBeingStaged: UUID?
@@ -52,9 +41,12 @@ final class ShareViewController: UIViewController {
     private var hasFinished = false
     private var isCollecting = false
     private var collectionTask: Task<Void, Never>?
-    private var handoffPhase: KitShareHandoffAttempt.Phase = .queued
-    private var handoffTimeoutWorkItem: DispatchWorkItem?
+    private var sendTask: Task<Void, Never>?
     private var queuedDestination: SharedInboxDestination?
+    private var isPresentingEditor = false
+    private var isCommittingSend = false
+    private var hasLeftShareSheet = false
+    private var sendScope: MessagingProcessBroker.Scope?
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -63,6 +55,7 @@ final class ShareViewController: UIViewController {
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
+        hasLeftShareSheet = false
         guard !hasFinished,
               !hasPublishedBatch,
               !hasPresentedFailure,
@@ -75,9 +68,11 @@ final class ShareViewController: UIViewController {
 
     override func viewDidDisappear(_ animated: Bool) {
         super.viewDidDisappear(animated)
-        // A swipe-to-dismiss before a choice is not a reason to retain plaintext. A published
-        // batch is different: it is a deliberate queue operation and must survive dismissal.
-        if !hasFinished, !hasPublishedBatch {
+        guard !isPresentingEditor else { return }
+        hasLeftShareSheet = true
+        // Dismissal before Send discards staging; an explicitly queued message must survive.
+        sendTask?.cancel()
+        if !hasFinished, !hasPublishedBatch, !isCommittingSend {
             collectionTask?.cancel()
             if let batchIDBeingStaged { store.remove(batchID: batchIDBeingStaged) }
         }
@@ -89,18 +84,27 @@ final class ShareViewController: UIViewController {
         let batchID = UUID()
         batchIDBeingStaged = batchID
 
-        // The app publishes only an opaque account UUID into the app group. Binding the manifest
-        // to it prevents a share staged for one signed-in person from crossing a later sign-out.
-        guard let ownerAccountID = store.activeAccountID() else {
+        let ownerAccountID: String
+        do {
+            let directory = try await MessagingProcessBroker.shared.authorizeShare()
+            ownerAccountID = directory.accountID
+            destinations = directory.destinations
+            filteredDestinations = destinations
+            // A system suggestion selects a current, approved row only. Sending always needs
+            // the customer's explicit Send tap after the share sheet has opened.
+            if let intent = extensionContext?.intent as? INSendMessageIntent {
+                requestedDestination = ShareSuggestions.destination(
+                    conversationIdentifier: intent.conversationIdentifier,
+                    accountID: ownerAccountID, destinations: destinations
+                )
+            }
+        } catch {
             store.remove(batchID: batchID)
             batchIDBeingStaged = nil
             isCollecting = false
-            present(failure: SharedInboxError.signedOut.errorDescription)
+            present(failure: (error as? LocalizedError)?.errorDescription)
             return
         }
-
-        destinations = store.destinations(forAccountID: ownerAccountID)
-        filteredDestinations = destinations
 
         var items: [SharedInboxItem] = []
         var textFragments: [String] = []
@@ -238,11 +242,7 @@ final class ShareViewController: UIViewController {
         )
         pendingShare = pending
         isCollecting = false
-        if hasRequestedDestination {
-            publish(to: requestedDestination)
-        } else {
-            presentPicker(for: pending)
-        }
+        presentPicker(for: pending)
     }
 
     /// The untrusted payload, walked under a hard bound. Every element of `inputItems` — and
@@ -331,6 +331,7 @@ final class ShareViewController: UIViewController {
         maximumAcceptedBytes: Int
     ) async -> LoadedShare {
         let suggestedName = provider.suggestedName
+        let stagingStore = store
         return await withCheckedContinuation { continuation in
             provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier) { item, _ in
                 guard let url = item as? URL, url.isFileURL else {
@@ -347,7 +348,7 @@ final class ShareViewController: UIViewController {
                 }
                 do {
                     let mediaType = UTType(filenameExtension: url.pathExtension)?.preferredMIMEType
-                    let staged = try SharedInboxStore().stage(
+                    let staged = try stagingStore.stage(
                         fileAt: url,
                         suggestedName: suggestedName ?? url.lastPathComponent,
                         mediaType: mediaType,
@@ -386,6 +387,7 @@ final class ShareViewController: UIViewController {
         maximumAcceptedBytes: Int
     ) async -> LoadedShare {
         let suggestedName = provider.suggestedName
+        let stagingStore = store
         let mediaType = UTType(typeIdentifier)?.preferredMIMEType
         return await withCheckedContinuation { continuation in
             // The provider URL is valid only inside this closure. Copying it to a scratch URL also
@@ -399,7 +401,7 @@ final class ShareViewController: UIViewController {
                     // The representation is valid only while this callback is running. Stage it
                     // directly into the protected app-group outbox here: the old scratch-then-
                     // stage path copied every byte twice and doubled the wait for large files.
-                    let staged = try SharedInboxStore().stage(
+                    let staged = try stagingStore.stage(
                         fileAt: url,
                         suggestedName: suggestedName ?? url.lastPathComponent,
                         mediaType: mediaType,
@@ -444,125 +446,218 @@ final class ShareViewController: UIViewController {
         }
     }
 
-    // MARK: Queueing
+    // MARK: Sending
 
-    /// Records the route on the first tap. If provider I/O is still running, the user gets an
-    /// immediate committed-looking progress state while that one background copy finishes; if it
-    /// is already ready, publishing remains the same synchronous, atomic manifest write as before.
-    private func requestPublish(to destination: SharedInboxDestination?) {
+    private func selectDestination(_ destination: SharedInboxDestination) {
         guard !hasFinished, !hasPublishedBatch, !hasRequestedDestination else { return }
-        hasRequestedDestination = true
         requestedDestination = destination
-        if pendingShare != nil {
-            publish(to: destination)
-        } else {
-            presentPreparingQueue(destination: destination)
-        }
+        updateSendButton()
+        tableView.reloadData()
     }
 
-    private func publish(to destination: SharedInboxDestination?) {
-        guard !hasFinished, !hasPublishedBatch, let pendingShare else { return }
-        view.endEditing(true)
-        setControlsEnabled(false)
-
-        guard store.activeAccountID() == pendingShare.ownerAccountID else {
-            store.remove(batchID: pendingShare.batchID)
-            batchIDBeingStaged = nil
-            self.pendingShare = nil
-            present(failure: "Your Kit Pay account changed. Open Kit Pay and share again.")
-            return
-        }
-
-        do {
-            try store.finishBatch(
-                id: pendingShare.batchID,
-                items: pendingShare.items,
-                text: pendingShare.text,
-                ownerAccountID: pendingShare.ownerAccountID,
-                receivedAt: Date(),
-                destination: destination?.request
-            )
-        } catch {
-            store.remove(batchID: pendingShare.batchID)
-            batchIDBeingStaged = nil
-            self.pendingShare = nil
-            present(failure: (error as? LocalizedError)?.errorDescription
-                ?? SharedInboxError.unavailable.errorDescription)
-            return
-        }
-
-        hasPublishedBatch = true
-        self.pendingShare = nil
-        queuedDestination = destination
-        // Do not complete the extension until iOS has accepted the request to open Kit Pay.
-        // Completing first tears down this process and races (usually wins against) the open URL
-        // request, which looks to the customer like the share sheet simply disappeared. The first
-        // attempt is automatic; if iOS declines it, the queued state below offers an explicit
-        // user-initiated retry. The batch is already durable, so "Not now" is also safe.
-        handleHandoff(.attemptRequested(canOpen: canOpenHostApp))
-    }
-
-    // MARK: Hand-off to the containing app
-
-    private var canOpenHostApp: Bool {
-        KitShareHandoffLink.url != nil && extensionContext != nil
-    }
-
-    /// Single funnel for the hand-off attempt: every trigger (automatic post-publish, retry tap,
-    /// open completion, timeout, "Not now") becomes an event, and only the pure phase machine
-    /// decides what happens, so a late or duplicate callback can never double-complete the
-    /// request or dismiss the sheet underneath the customer.
-    private func handleHandoff(_ event: KitShareHandoffAttempt.Event) {
-        if case .openResolved = event {
-            handoffTimeoutWorkItem?.cancel()
-            handoffTimeoutWorkItem = nil
-        }
-        let step = KitShareHandoffAttempt.decide(phase: handoffPhase, event: event)
-        handoffPhase = step.phase
-        switch step.decision {
-        case .ignore:
-            break
-        case .attemptOpen:
-            performHostAppOpen()
-        case .offerManualHandoff:
-            presentQueued(destination: queuedDestination)
-        case .finishExtension:
-            finish()
-        }
-    }
-
-    /// UIKit half of one attempt; every outcome reports back through `handleHandoff`.
-    private func performHostAppOpen() {
-        guard let url = KitShareHandoffLink.url, let extensionContext else {
-            handleHandoff(.openResolved(opened: false))
-            return
-        }
-        presentOpeningHostApp()
-        // The completion handler is contractual, but an extension should never leave a customer
-        // staring at an endless spinner if SpringBoard fails to answer during a transition. A
-        // late acceptance after this fires is ignored by the phase machine.
-        let timeout = DispatchWorkItem { [weak self] in
-            self?.handleHandoff(.openResolved(opened: false))
-        }
-        handoffTimeoutWorkItem?.cancel()
-        handoffTimeoutWorkItem = timeout
-        DispatchQueue.main.asyncAfter(
-            deadline: .now() + KitShareHandoffAttempt.openTimeout,
-            execute: timeout
+    private func updateSendButton() {
+        configureActionButton(
+            title: requestedDestination.map { "Send to \($0.displayName)" } ?? "Select a chat",
+            filled: true
         )
-        extensionContext.open(url) { [weak self] opened in
-            DispatchQueue.main.async {
-                self?.handleHandoff(.openResolved(opened: opened))
+        actionButton.isEnabled = pendingShare != nil && requestedDestination != nil
+            && !hasRequestedDestination
+    }
+
+    @objc private func editAttachments() {
+        guard !hasFinished, !hasPublishedBatch, !isPresentingEditor,
+              let pendingShare else { return }
+        let editable = pendingShare.items.filter(ShareMediaEditor.supportsEditing)
+        guard !editable.isEmpty else { return }
+        if editable.count == 1 { editAttachment(editable[0]); return }
+        let picker = UIAlertController(title: "Edit an attachment", message: nil, preferredStyle: .actionSheet)
+        for item in editable {
+            picker.addAction(UIAlertAction(title: item.displayName, style: .default) { [weak self, weak picker] _ in
+                guard let self else { return }
+                self.isPresentingEditor = true
+                picker?.dismiss(animated: true) { [weak self] in
+                    self?.isPresentingEditor = false
+                    self?.editAttachment(item)
+                }
+            })
+        }
+        picker.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        picker.popoverPresentationController?.sourceView = secondaryActionButton
+        picker.popoverPresentationController?.sourceRect = secondaryActionButton.bounds
+        present(picker, animated: true)
+    }
+
+    private func editAttachment(_ item: SharedInboxItem) {
+        guard let pendingShare, !isPresentingEditor, !hasPublishedBatch else { return }
+        let remaining = SharedInboxPolicy.maximumBatchBytes
+            - pendingShare.items.filter { $0.id != item.id }.reduce(0) { $0 + $1.byteCount }
+        isPresentingEditor = true
+        ShareMediaEditor.present(item: item, batchID: pendingShare.batchID, from: self,
+                                 maximumAcceptedBytes: remaining) { [weak self] result in
+            guard let self else { return }
+            self.isPresentingEditor = false
+            guard !self.hasFinished, !self.hasPublishedBatch,
+                  let current = self.pendingShare, current.batchID == pendingShare.batchID else {
+                if case .success(let replacement?) = result {
+                    self.store.remove(item: replacement, in: pendingShare.batchID)
+                }
+                return
+            }
+            switch result {
+            case .success(let replacement):
+                guard let replacement else { return }
+                guard let index = current.items.firstIndex(where: { $0.id == item.id }) else {
+                    self.store.remove(item: replacement, in: pendingShare.batchID)
+                    return
+                }
+                var items = current.items
+                items[index] = replacement
+                let edited = PendingShare(batchID: current.batchID, ownerAccountID: current.ownerAccountID,
+                                          items: items, text: current.text, warning: current.warning)
+                self.pendingShare = edited
+                self.store.remove(item: item, in: current.batchID)
+                self.refreshEditedPreview(replacement, index: index, batchID: current.batchID)
+                self.presentPicker(for: edited)
+                self.messageLabel.text = "Edit saved. Select your chat and tap Send."
+            case .failure(let error):
+                self.messageLabel.text = (error as? LocalizedError)?.errorDescription
+                self.messageLabel.textColor = .systemOrange
             }
         }
     }
 
-    @objc private func retryHostAppOpen() {
-        handleHandoff(.attemptRequested(canOpen: canOpenHostApp))
+    private func refreshEditedPreview(_ item: SharedInboxItem, index: Int, batchID: UUID) {
+        guard previewStrip.arrangedSubviews.indices.contains(index),
+              let thumbnail = previewStrip.arrangedSubviews[index] as? UIImageView else { return }
+        thumbnail.image = UIImage(systemName: item.mediaType == "application/pdf" ? "doc.richtext" : "checkmark.rectangle")
+        thumbnail.contentMode = .scaleAspectFit
+        thumbnail.tag = 1
+        thumbnail.accessibilityLabel = "Edited \(item.displayName)"
+        let stagingStore = store
+        Task { [weak self] in
+            let image = await Task.detached(priority: .userInitiated) { () -> UIImage? in
+                guard item.mediaType.hasPrefix("image/"),
+                      let url = try? stagingStore.fileURL(for: item, in: batchID),
+                      let source = CGImageSourceCreateWithURL(url as CFURL,
+                          [kCGImageSourceShouldCache: false] as CFDictionary),
+                      let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                          kCGImageSourceCreateThumbnailFromImageAlways: true,
+                          kCGImageSourceCreateThumbnailWithTransform: true,
+                          kCGImageSourceThumbnailMaxPixelSize: 160,
+                      ] as CFDictionary) else { return nil }
+                return UIImage(cgImage: image)
+            }.value
+            guard let self, self.pendingShare?.batchID == batchID,
+                  self.pendingShare?.items.contains(where: { $0.id == item.id }) == true else { return }
+            if let image { thumbnail.image = image; thumbnail.contentMode = .scaleAspectFill }
+        }
     }
 
-    @objc private func finishWithoutOpening() {
-        handleHandoff(.notNowTapped)
+    @objc private func sendTapped() {
+        guard !hasFinished, !isPresentingEditor, sendTask == nil, let stagedShare = pendingShare,
+              let destination = requestedDestination else { return }
+        let text = SharedInboxPolicy.carriedText(captionInput.text)
+        guard text.map({ !SharedInboxPolicy.exceedsTextLimit($0) }) ?? true else {
+            messageLabel.text = SharedInboxError.textTooLong.errorDescription
+            messageLabel.textColor = .systemOrange
+            return
+        }
+        let pendingShare = PendingShare(batchID: stagedShare.batchID, ownerAccountID: stagedShare.ownerAccountID,
+                                        items: stagedShare.items, text: text, warning: stagedShare.warning)
+        self.pendingShare = pendingShare
+        hasRequestedDestination = true
+        queuedDestination = destination
+        presentSending(destination: destination)
+        sendTask = Task { [weak self] in
+            guard let self else { return }
+            defer { self.sendTask = nil }
+            do {
+                if (try? MessagingProcessBroker.shared.scope()) == nil {
+                    let directory = try await MessagingProcessBroker.shared.authorizeShare()
+                    guard directory.accountID == pendingShare.ownerAccountID else {
+                        throw SharedInboxError.signedOut
+                    }
+                }
+                try Task.checkCancellation()
+                let currentScope = try MessagingProcessBroker.shared.scope()
+                let scope = self.sendScope ?? currentScope
+                guard scope == currentScope, scope.accountID == pendingShare.ownerAccountID else {
+                    throw SharedInboxError.signedOut
+                }
+                self.sendScope = scope
+                let inputSHA256 = try DirectShareSendRecord.inputFingerprint(
+                    destination: destination, items: pendingShare.items, text: pendingShare.text
+                )
+                do {
+                    // Every retry verifies this exact intent, even after publication. A same-ID
+                    // receipt for changed content must never turn into success through a UI flag.
+                    // Transfer staging ownership before the actor hop. Dismissal can happen
+                    // after its durable commit but before this MainActor resumes.
+                    self.isCommittingSend = true
+                    do {
+                        try await DirectShareSendCoordinator.shared.enqueue(
+                            id: pendingShare.batchID, ownerAccountID: pendingShare.ownerAccountID,
+                            destination: destination, items: pendingShare.items, text: pendingShare.text,
+                            expectedScope: scope
+                        )
+                        self.hasPublishedBatch = true
+                        self.isCommittingSend = false
+                    } catch {
+                        let ownership = try? MessagingProcessBroker.shared.containsEnqueued(
+                            id: pendingShare.batchID, inputSHA256: inputSHA256, scope: scope
+                        )
+                        self.hasPublishedBatch = ownership == true
+                        // Unreadable storage is still uncertain ownership. Keep staging rather
+                        // than deleting bytes that a successfully replaced journal may own.
+                        self.isCommittingSend = ownership == nil
+                        if ownership == false, self.hasFinished || self.hasLeftShareSheet {
+                            self.store.remove(batchID: pendingShare.batchID)
+                        }
+                        throw error
+                    }
+                }
+                try Task.checkCancellation()
+                try await DirectShareSendCoordinator.shared.send(id: pendingShare.batchID, expectedScope: scope)
+                guard !self.hasFinished, !self.hasLeftShareSheet else { return }
+                self.finish()
+            } catch {
+                guard !self.hasFinished, !self.hasLeftShareSheet else { return }
+                self.hasRequestedDestination = false
+                self.presentRetry(error: error)
+            }
+        }
+    }
+
+    private func presentRetry(error: Error) {
+        spinner.stopAnimating()
+        spinner.isHidden = true
+        statusSymbol.isHidden = false
+        statusSymbol.image = UIImage(systemName: "exclamationmark.circle")
+        statusSymbol.tintColor = .systemOrange
+        titleLabel.text = hasPublishedBatch || isCommittingSend ? "Send not confirmed" : "Could not prepare share"
+        summaryLabel.text = isCommittingSend ? "Your send may have been saved"
+            : (hasPublishedBatch ? "Your send is saved securely" : "Nothing was sent")
+        messageLabel.text = (error as? LocalizedError)?.errorDescription
+            ?? "Check your connection and try again."
+        if isCommittingSend {
+            messageLabel.text = "Kit Pay could not confirm whether this send was saved. Retry to check its status."
+        } else if hasPublishedBatch {
+            messageLabel.text = (messageLabel.text ?? "")
+                + " You can retry here, or close and let Kit Pay retry when you next unlock it."
+        }
+        configureActionButton(title: "Retry send", filled: true)
+        actionButton.isHidden = false
+        actionButton.isEnabled = true
+        configureSecondaryButton(title: "Close")
+        secondaryActionButton.removeTarget(nil, action: nil, for: .allEvents)
+        secondaryActionButton.addTarget(self, action: #selector(closePending), for: .touchUpInside)
+        secondaryActionButton.isHidden = false
+        secondaryActionButton.isEnabled = true
+        cancelButton.isHidden = true
+    }
+
+    @objc private func closePending() {
+        if hasPublishedBatch { finish() } else { cancel() }
     }
 
     /// Small provider previews are independent of durable file extraction and recipient choice.
@@ -598,7 +693,7 @@ final class ShareViewController: UIViewController {
                         group.cancelAll()
                         continue
                     }
-                    if let preview {
+                    if let preview, thumbnails[index].tag == 0 {
                         thumbnails[index].image = preview
                         thumbnails[index].contentMode = .scaleAspectFill
                     }
@@ -627,43 +722,12 @@ final class ShareViewController: UIViewController {
     private func presentPreparingPicker(itemCount: Int) {
         titleLabel.text = "Choose a chat"
         summaryLabel.text = itemCount == 1 ? "Preparing your item…" : "Preparing your items…"
-        messageLabel.text = destinations.isEmpty
-            ? "Your share is being saved securely. You can choose its chat in Kit Pay."
-            : "Choose a chat now, then review and edit your items in Kit Pay before sending."
+        messageLabel.text = "Choose a person or group, then tap Send."
         messageLabel.textColor = .secondaryLabel
         statusSymbol.isHidden = true
         spinner.isHidden = false
         spinner.startAnimating()
-        searchBar.isHidden = destinations.isEmpty
-        tableView.isHidden = destinations.isEmpty
-        emptyLabel.isHidden = !destinations.isEmpty
-        emptyLabel.text = "No recent chats are available here yet.\nYou can choose a chat in Kit Pay."
-        actionButton.isHidden = false
-        configureActionButton(title: "Choose in Kit Pay later", filled: false)
-        actionButton.removeTarget(nil, action: nil, for: .allEvents)
-        actionButton.addTarget(self, action: #selector(queueWithoutDestination), for: .touchUpInside)
-        secondaryActionButton.isHidden = true
-        setControlsEnabled(true)
-        tableView.reloadData()
-    }
-
-    private func presentPreparingQueue(destination: SharedInboxDestination?) {
-        view.endEditing(true)
-        titleLabel.text = destination.map { "Adding to \($0.displayName)" } ?? "Saving in Kit Pay"
-        summaryLabel.text = "Preparing your share…"
-        messageLabel.text = "Your preview will open in Kit Pay when the files are ready."
-        messageLabel.textColor = .secondaryLabel
-        statusSymbol.isHidden = true
-        spinner.isHidden = false
-        spinner.startAnimating()
-        searchBar.isHidden = true
-        tableView.isHidden = true
-        emptyLabel.isHidden = true
-        actionButton.isHidden = true
-        secondaryActionButton.isHidden = true
-        setControlsEnabled(false)
-        cancelButton.isEnabled = true
-        UIAccessibility.post(notification: .screenChanged, argument: titleLabel)
+        configurePickerControls()
     }
 
     private func presentPicker(for pending: PendingShare) {
@@ -672,30 +736,37 @@ final class ShareViewController: UIViewController {
         statusSymbol.isHidden = true
         titleLabel.text = "Choose a chat"
         summaryLabel.text = SharedInboxPolicy.summary(
-            itemCount: pending.items.count,
-            hasText: pending.text != nil
+            itemCount: pending.items.count, hasText: pending.text != nil
         )
-        messageLabel.text = pending.warning ?? (destinations.isEmpty
-            ? "Your share is safe. Open Kit Pay once to refresh your chats, or choose it there later."
-            : "Select a person or group. You will review the share in Kit Pay before sending.")
+        messageLabel.text = pending.warning ?? "Encrypted and sent directly to your chat."
         messageLabel.textColor = pending.warning == nil ? .secondaryLabel : .systemOrange
+        if captionInput.isHidden { captionInput.text = pending.text ?? "" }
+        captionInput.isHidden = false
+        configurePickerControls()
+    }
 
+    private func configurePickerControls() {
         searchBar.isHidden = destinations.isEmpty
         tableView.isHidden = destinations.isEmpty
         emptyLabel.isHidden = !destinations.isEmpty
-        emptyLabel.text = "No recent chats are available here yet.\nYou can choose a chat in Kit Pay."
-        actionButton.isHidden = false
-        configureActionButton(title: "Choose in Kit Pay later", filled: false)
+        emptyLabel.text = "No chats are available yet. Unlock Kit Pay to refresh your chats, then share again."
+        actionButton.isHidden = destinations.isEmpty
         actionButton.removeTarget(nil, action: nil, for: .allEvents)
-        actionButton.addTarget(self, action: #selector(queueWithoutDestination), for: .touchUpInside)
+        actionButton.addTarget(self, action: #selector(sendTapped), for: .touchUpInside)
         secondaryActionButton.isHidden = true
         setControlsEnabled(true)
+        if let pendingShare, pendingShare.items.contains(where: ShareMediaEditor.supportsEditing) {
+            configureSecondaryButton(title: "Edit attachments")
+            secondaryActionButton.removeTarget(nil, action: nil, for: .allEvents)
+            secondaryActionButton.addTarget(self, action: #selector(editAttachments), for: .touchUpInside)
+            secondaryActionButton.isHidden = false
+        }
+        updateSendButton()
         tableView.reloadData()
     }
 
-    /// Progress state while iOS decides whether to bring Kit Pay forward. Cancel is hidden the
-    /// moment the batch is published: cancelling the extension request now would not unpublish it.
-    private func presentOpeningHostApp() {
+    private func presentSending(destination: SharedInboxDestination) {
+        view.endEditing(true)
         cancelButton.isHidden = true
         searchBar.isHidden = true
         tableView.isHidden = true
@@ -703,57 +774,14 @@ final class ShareViewController: UIViewController {
         statusSymbol.isHidden = true
         spinner.isHidden = false
         spinner.startAnimating()
-        titleLabel.text = "Opening Kit Pay"
-        summaryLabel.text = "Queued securely on this iPhone"
-        if let destination = queuedDestination {
-            messageLabel.text = "Your share is ready for \(destination.displayName). Review it in Kit Pay and tap Send."
-        } else {
-            messageLabel.text = "Your share is ready. Choose a person or group in Kit Pay."
-        }
+        titleLabel.text = "Sending to \(destination.displayName)"
+        summaryLabel.text = "Securing your message…"
+        messageLabel.text = "Keep this sheet open until the send completes."
         messageLabel.textColor = .secondaryLabel
         actionButton.isHidden = true
+        captionInput.isEditable = false
         secondaryActionButton.isHidden = true
-    }
-
-    /// The durable-queue state, doubling as the manual hand-off fallback when iOS declines or
-    /// never answers the open request: an explicit retry stays available, and "Not now" simply
-    /// completes because the batch survives in the container either way.
-    private func presentQueued(destination: SharedInboxDestination?) {
-        cancelButton.isHidden = true
-        searchBar.isHidden = true
-        tableView.isHidden = true
-        emptyLabel.isHidden = true
-        spinner.stopAnimating()
-        spinner.isHidden = true
-        statusSymbol.isHidden = false
-        statusSymbol.image = UIImage(systemName: "checkmark.circle.fill")
-        statusSymbol.tintColor = UIColor(red: 0.05, green: 0.56, blue: 0.31, alpha: 1)
-
-        if let destination {
-            titleLabel.text = "Ready for \(destination.displayName)"
-            summaryLabel.text = "Queued securely on this iPhone"
-            messageLabel.text = "Tap Continue to review it in Kit Pay and send. If Kit Pay does not open, tap Not now — your share will be waiting there for 24 hours."
-        } else {
-            titleLabel.text = "Saved in Kit Pay"
-            summaryLabel.text = "Queued securely on this iPhone"
-            messageLabel.text = "Tap Continue to choose a person or group in Kit Pay. If Kit Pay does not open, tap Not now — your share will be waiting there for 24 hours."
-        }
-        messageLabel.textColor = .secondaryLabel
-
-        configureActionButton(title: "Continue in Kit Pay", filled: true)
-        actionButton.removeTarget(nil, action: nil, for: .allEvents)
-        actionButton.addTarget(self, action: #selector(retryHostAppOpen), for: .touchUpInside)
-        actionButton.isHidden = false
-        actionButton.isEnabled = true
-        configureSecondaryButton(title: "Not now")
-        secondaryActionButton.removeTarget(nil, action: nil, for: .allEvents)
-        secondaryActionButton.addTarget(
-            self,
-            action: #selector(finishWithoutOpening),
-            for: .touchUpInside
-        )
-        secondaryActionButton.isHidden = false
-        secondaryActionButton.isEnabled = true
+        setControlsEnabled(false)
         UIAccessibility.post(notification: .screenChanged, argument: titleLabel)
     }
 
@@ -780,16 +808,11 @@ final class ShareViewController: UIViewController {
         secondaryActionButton.isHidden = true
     }
 
-    @objc private func queueWithoutDestination() {
-        requestPublish(to: nil)
-    }
-
     @objc private func finish() {
         guard !hasFinished else { return }
         hasFinished = true
-        handoffPhase = .finished
-        handoffTimeoutWorkItem?.cancel()
-        handoffTimeoutWorkItem = nil
+        sendTask?.cancel()
+        sendTask = nil
         collectionTask?.cancel()
         collectionTask = nil
         extensionContext?.completeRequest(returningItems: nil, completionHandler: nil)
@@ -798,12 +821,11 @@ final class ShareViewController: UIViewController {
     @objc private func cancel() {
         guard !hasFinished else { return }
         hasFinished = true
-        handoffPhase = .finished
-        handoffTimeoutWorkItem?.cancel()
-        handoffTimeoutWorkItem = nil
+        sendTask?.cancel()
+        sendTask = nil
         collectionTask?.cancel()
         collectionTask = nil
-        if !hasPublishedBatch, let batchIDBeingStaged {
+        if !hasPublishedBatch, !isCommittingSend, let batchIDBeingStaged {
             store.remove(batchID: batchIDBeingStaged)
         }
         extensionContext?.cancelRequest(withError: SharedInboxError.empty)
@@ -857,11 +879,20 @@ final class ShareViewController: UIViewController {
         previewStrip.spacing = 8
         previewStrip.distribution = .fillEqually
         previewStrip.isHidden = true
+        captionInput.font = .preferredFont(forTextStyle: .body)
+        captionInput.adjustsFontForContentSizeCategory = true
+        captionInput.backgroundColor = .secondarySystemBackground
+        captionInput.layer.cornerRadius = 10
+        captionInput.textContainerInset = UIEdgeInsets(top: 8, left: 8, bottom: 8, right: 8)
+        captionInput.accessibilityLabel = "Message or caption"
+        captionInput.isHidden = true
+        captionInput.heightAnchor.constraint(equalToConstant: 72).isActive = true
 
         let statusStack = UIStackView(arrangedSubviews: [
             spinner,
             statusSymbol,
             previewStrip,
+            captionInput,
             summaryLabel,
             messageLabel,
         ])
@@ -1018,6 +1049,7 @@ extension ShareViewController: UITableViewDataSource, UITableViewDelegate {
             for: indexPath
         ) as? SharedInboxDestinationCell else { return UITableViewCell() }
         cell.configure(destination)
+        cell.accessoryType = requestedDestination?.id == destination.id ? .checkmark : .none
         return cell
     }
 
@@ -1025,7 +1057,7 @@ extension ShareViewController: UITableViewDataSource, UITableViewDelegate {
         tableView.deselectRow(at: indexPath, animated: true)
         let rows = destinations(in: indexPath.section)
         guard rows.indices.contains(indexPath.row) else { return }
-        requestPublish(to: rows[indexPath.row])
+        selectDestination(rows[indexPath.row])
     }
 
     private func destinations(in section: Int) -> [SharedInboxDestination] {

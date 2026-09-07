@@ -24,8 +24,10 @@ original source/date and get a separate reuse receipt. Invalid or incompatible
 evidence causes a fresh capture only when a store asset update was selected.
 
 The dependency download cache is keyed by runner architecture, Xcode, Podfile and
-package pins. Libsignal checks its pinned archive SHA-256 before extraction;
-SwiftPM validates package binary checksums. The scripts require the reviewed
+package pins. A cache miss can reuse downloads from the same architecture and
+Xcode version, so adding a target does not discard unchanged archives. Libsignal
+checks its pinned archive SHA-256 before extraction; SwiftPM validates package
+binary checksums. The scripts require the reviewed
 package pins and disable automatic resolution for subsequent builds/tests. No
 certificate, provisioning profile, keychain, or signed artifact enters that cache.
 

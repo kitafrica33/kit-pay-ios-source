@@ -97,7 +97,9 @@ class IOSMediaDiagnosticsSourceContractTests(unittest.TestCase):
 
     def test_deferred_upload_carries_scope_captured_before_account_work(self) -> None:
         coordinator = ROOT / "KitPay/Core/SecureMessagingCoordinator.swift"
-        prepare = declaration_body(coordinator, "func prepareDeferredMessage(")
+        entry = declaration_body(coordinator, "func prepareDeferredMessage(")
+        self.assertIn("withIsolatedUnboundScopeIfNeeded", entry)
+        prepare = declaration_body(coordinator, "private func prepareDeferredMessageInCurrentScope(")
         capture = prepare.index(
             "let mediaDiagnosticsProducerScope = await LocalMediaPerformanceMonitor.shared"
         )

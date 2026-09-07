@@ -74,6 +74,7 @@ class MediaMessageV2SourceContract(unittest.TestCase):
         self.v2 = V2_MODELS.read_text(encoding="utf-8")
         self.v1 = V1_MODELS.read_text(encoding="utf-8")
         self.models = MODELS.read_text(encoding="utf-8")
+        self.shared_models = (ROOT / "KitPay/Core/MessagingSharedModels.swift").read_text(encoding="utf-8")
 
     def test_media_first_contact_uses_atomic_provisional_queueing(self) -> None:
         """Single, batch, share, and forward entry points must all reach the same protected
@@ -253,6 +254,7 @@ class MediaMessageV2SourceContract(unittest.TestCase):
     def test_every_player_serializes_against_posters_and_owns_a_verified_alias(self) -> None:
         """Both the gallery and standalone viewer must drain same-content poster decoding before
         allocating a player, then keep their independent hard-link lease through item teardown."""
+        temp_files = (ROOT / "KitPay/Core/ChatMediaTempFiles.swift").read_text(encoding="utf-8")
         views = CHAT_MEDIA_VIEWS.read_text(encoding="utf-8")
         gallery = MEDIA_GALLERY.read_text(encoding="utf-8")
         playback = VIDEO_PLAYBACK.read_text(encoding="utf-8")
@@ -271,8 +273,8 @@ class MediaMessageV2SourceContract(unittest.TestCase):
         self.assertIn("fstat(handle.fileDescriptor, &status)", playback)
         self.assertIn("deviceID: UInt64(bitPattern: Int64(status.st_dev))", playback)
         self.assertIn("fileID: UInt64(status.st_ino)", playback)
-        self.assertIn("private static func makeProtectedPreviewDirectory()", views)
-        self.assertIn("directory.lastPathComponent.hasPrefix(previewDirectoryPrefix)", views)
+        self.assertIn("private static func makeProtectedPreviewDirectory()", temp_files)
+        self.assertIn("directory.lastPathComponent.hasPrefix(previewDirectoryPrefix)", temp_files)
         self.assertIn("@Environment(\\.dismiss) private var dismiss", views)
         self.assertIn('Button("Close", action: onDismiss)', gallery)
 
@@ -453,10 +455,17 @@ class MediaMessageV2SourceContract(unittest.TestCase):
         self.assertIn("path = KitPayTests/MediaMessageV2ContractTests.swift", text)
         self.assertIn("path = KitPayTests/MediaMessageV2WireGlueTests.swift", text)
         self.assertTrue(WIRE_GLUE_TESTS.is_file())
-        # One PBXBuildFile + one Sources-phase mention; one PBXFileReference + one group child
-        # + the PBXBuildFile back-reference.
+        # The media DTOs compile once in each of app and direct share extension. Each target
+        # owns a distinct PBXBuildFile, both referencing the one shared file/group entry.
         self.assertEqual(text.count("A41000000000000000000001"), 2)
-        self.assertEqual(text.count("B41000000000000000000001"), 3)
+        self.assertEqual(text.count("B41000000000000000000001"), 4)
+        shared_build_ids = re.findall(
+            r"([A-F0-9]+) /\* MediaMessageV2Models.swift in Sources \*/ = "
+            r"\{isa = PBXBuildFile; fileRef = B41000000000000000000001", text
+        )
+        self.assertEqual(len(shared_build_ids), 2)
+        for build_id in shared_build_ids:
+            self.assertEqual(text.count(build_id), 2)
         self.assertEqual(text.count("A42000000000000000000001"), 2)
         self.assertEqual(text.count("B42000000000000000000001"), 3)
         self.assertEqual(text.count("A42000000000000000000002"), 2)
@@ -532,7 +541,8 @@ class MediaMessageV2SourceContract(unittest.TestCase):
         # Library selection now publishes non-durable placeholders first. Only a verified
         # protected import replaces the placeholder; trim is an explicit optional action.
         self.assertLess(library_stage.index("stageAttachment("), library_stage.index("withTaskGroup("))
-        self.assertLess(library_import.index("persistStagedMediaOriginal("), library_import.index("stagedAttachments[index] ="))
+        self.assertLess(library_import.index("persistStagedMediaOriginal("), library_import.index("stagedAttachments[liveIndex] = prepared"))
+        self.assertLess(library_import.index("await preparingAdaptiveVideo("), library_import.index("let liveIndex = stagedAttachments.firstIndex"))
         self.assertIn("localFileURL: permanentURL", library_import)
         self.assertNotIn("beginTrimmingStagedVideo(", library_import)
         self.assertIn("url = sourceURL", trim)
@@ -705,7 +715,7 @@ class MediaMessageV2SourceContract(unittest.TestCase):
         precedent) so a malformed advertisement disables only the multi-attachment path, while
         the legacy `rich_media` field keeps its strict decode; and the enablement accessor must
         AND the features key with the coherent block, so either leg failing keeps it off."""
-        dto = "\n".join(function_body(self.models, "struct MessagingProtocolCapabilityDTO"))
+        dto = "\n".join(function_body(self.shared_models, "struct MessagingProtocolCapabilityDTO"))
         self.assertIn('case mediaMessage = "media_message"', dto)
         self.assertIn("mediaMessage = try? values.decodeIfPresent(", dto)
         self.assertIn("richMedia = try values.decodeIfPresent(", dto)

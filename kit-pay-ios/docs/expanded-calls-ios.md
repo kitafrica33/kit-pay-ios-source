@@ -78,3 +78,9 @@ and unlocked phones, both event orders, overlapping external calls, manual holds
 Bluetooth controls, held video recovery, offline cancellation, participant changes,
 and scheduled ringing after app inactivity. Automatic resume and delivery timing
 remain unmeasured on physical devices until those checks are recorded.
+
+Build 85 stopped during Xcode compilation because its synchronous PushKit callback
+read a main-actor admission guard without declaring that boundary. Build 86 keeps
+the registry on the main queue and reads the guard synchronously with
+`MainActor.assumeIsolated`, preserving immediate CallKit reporting and pending-answer
+lease protection. Build 85 ran no native tests and produced no signed archive.

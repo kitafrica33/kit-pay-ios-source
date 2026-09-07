@@ -231,6 +231,49 @@
 		62FAE9BF6DB941B562D8AA3D /* PDFPageSelectionPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 151598F894FB90D5995F913E /* PDFPageSelectionPolicy.swift */; };
 		CE5DA7404EF967B2847F20B3 /* PDFPageSelectionPolicyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1430CDE1C95BCC72D04BFD22 /* PDFPageSelectionPolicyTests.swift */; };
 		089963D8ECA92501CCADF204 /* ChatMediaSelectionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 579CCBE11EFF912A824D3F11 /* ChatMediaSelectionTests.swift */; };
+		AE1A3BE8CEAD75FF1AC0C59B /* DirectShareHTTPTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41A37BD61F4E06760E745FC0 /* DirectShareHTTPTransport.swift */; };
+		C8010747E7373733B24A93C9 /* DirectShareHTTPTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41A37BD61F4E06760E745FC0 /* DirectShareHTTPTransport.swift */; };
+		CE4E67DD2D79ED44D0B52BF9 /* DirectShareSendCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = B8E05D93A4184233DB3435A6 /* DirectShareSendCoordinator.swift */; };
+		9C173D27C12ACD65997B8D74 /* DirectShareSendCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = B8E05D93A4184233DB3435A6 /* DirectShareSendCoordinator.swift */; };
+		4593B01ACBCCBDA40991F30F /* DirectShareSendRecord.swift in Sources */ = {isa = PBXBuildFile; fileRef = 86368387B6DF912B2BDCB4D3 /* DirectShareSendRecord.swift */; };
+		FF99530BEBA158F56139390E /* DirectShareSendRecord.swift in Sources */ = {isa = PBXBuildFile; fileRef = 86368387B6DF912B2BDCB4D3 /* DirectShareSendRecord.swift */; };
+		537B3DE518ABDEC4604BAC36 /* MessagingAPIEndpoint.swift in Sources */ = {isa = PBXBuildFile; fileRef = E0056EEAFA63D2CF2CD52A46 /* MessagingAPIEndpoint.swift */; };
+		E72EA1DD8193E05DEB5986BC /* MessagingAPIEndpoint.swift in Sources */ = {isa = PBXBuildFile; fileRef = E0056EEAFA63D2CF2CD52A46 /* MessagingAPIEndpoint.swift */; };
+		DA5BB1CD73394F98A389AEDA /* MessagingClientIdentity.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A9F3B6FB3AF594CC62AF8C7 /* MessagingClientIdentity.swift */; };
+		2E591A1C71BCE3C7D5BD5362 /* MessagingClientIdentity.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A9F3B6FB3AF594CC62AF8C7 /* MessagingClientIdentity.swift */; };
+		A6642F8CFFC5CDDA9D2CD6A9 /* MessagingProcessBroker.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10542DD8877DA5FB1A9858B6 /* MessagingProcessBroker.swift */; };
+		F16B0C408FF7C86E773747C4 /* MessagingProcessBroker.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10542DD8877DA5FB1A9858B6 /* MessagingProcessBroker.swift */; };
+		A6F40A67D7B42D4933623A32 /* MessagingSharedModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 71EE11608BB24BEF082A75BA /* MessagingSharedModels.swift */; };
+		AFDEDED63FB5B915CB30C659 /* MessagingSharedModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 71EE11608BB24BEF082A75BA /* MessagingSharedModels.swift */; };
+		252401BEB513FA4B8B81B22A /* SecureMessagingSendValidation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 28B31546D351745B24CCF6C1 /* SecureMessagingSendValidation.swift */; };
+		84B3D2C838B511AC30FBA2DF /* SecureMessagingSendValidation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 28B31546D351745B24CCF6C1 /* SecureMessagingSendValidation.swift */; };
+		D76CB224F3BB240DCB1F16DB /* ShareSuggestions.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0A21568F49A7430B035BEADC /* ShareSuggestions.swift */; };
+		0B1624759B6EB50F072D9FE2 /* ShareSuggestions.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0A21568F49A7430B035BEADC /* ShareSuggestions.swift */; };
+		FF86773E8A551AE7F8BE16EC /* KeychainStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000006 /* KeychainStore.swift */; };
+		07010EBDAC78DC620E66514D /* MediaMessageV2Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = B41000000000000000000001 /* MediaMessageV2Models.swift */; };
+		07116C7DB0E21B1B2EF9B3EB /* MessagingAPIModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0000000000000000000001 /* MessagingAPIModels.swift */; };
+		D4A880CCF51AD9608DAA103C /* SecureMessagingCrypto.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC0000000000000000000001 /* SecureMessagingCrypto.swift */; };
+		4E25F511EAD12D67BCA29138 /* SecureMessagingMapper.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC0000000000000000000003 /* SecureMessagingMapper.swift */; };
+		93CFD0A67EEFC9A29B366A8E /* SessionStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000007 /* SessionStore.swift */; };
+		AECEDF98B4449091A31C81D9 /* SignalProtocolStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC0000000000000000000002 /* SignalProtocolStore.swift */; };
+		890168B283D23BB67047CC99 /* AdaptiveVideoPreparation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 16CFB9684513A3B1240D789A /* AdaptiveVideoPreparation.swift */; };
+		6F3D3A9F0A88ACA1C7EE7CD2 /* ShareSuggestionsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 71D3782C99F11749658F4E71 /* ShareSuggestionsTests.swift */; };
+		47F69104DF8AF078C02DD5D2 /* MessagingProcessBrokerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6DBDB2B3F28B99D1432B5848 /* MessagingProcessBrokerTests.swift */; };
+		6051305772B24022BE1F7C44 /* DirectShareSendRecoveryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A65E3FE59D02145CE648EBF5 /* DirectShareSendRecoveryTests.swift */; };
+		833ACF5B3560772E1CB86449 /* KitColor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0BE27110F3C2B36A2D964FE8 /* KitColor.swift */; };
+		0165E938259112B713CE67A7 /* KitColor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0BE27110F3C2B36A2D964FE8 /* KitColor.swift */; };
+		A4EFCBEBDA10D65D3E22E00E /* ChatMediaTempFiles.swift in Sources */ = {isa = PBXBuildFile; fileRef = D187394E7EE6335A873C2382 /* ChatMediaTempFiles.swift */; };
+		EACE4AB3BFFF2F3F2FC46680 /* ChatMediaTempFiles.swift in Sources */ = {isa = PBXBuildFile; fileRef = D187394E7EE6335A873C2382 /* ChatMediaTempFiles.swift */; };
+		FB714101F3B587B5D6466598 /* KitCaptureTemporaryFileStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5C1CFF937006D816E4132A1 /* KitCaptureTemporaryFileStore.swift */; };
+		07835039D6D127F06B09D28A /* KitCaptureTemporaryFileStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5C1CFF937006D816E4132A1 /* KitCaptureTemporaryFileStore.swift */; };
+		5EB53F2FCF203D2839FCA88B /* ChatMediaSharedPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 22FE6E7556FB28E653E255C6 /* ChatMediaSharedPolicy.swift */; };
+		BF56BB19A76A2EE52BC0147E /* ChatMediaSharedPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 22FE6E7556FB28E653E255C6 /* ChatMediaSharedPolicy.swift */; };
+		4FCE98799C12B9EBB5977BDD /* PDFPageSelectionPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 151598F894FB90D5995F913E /* PDFPageSelectionPolicy.swift */; };
+		0B789B16222A47CD5E413115 /* KitPDFPageSelectionView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 07F20DDE0F04A2E484748BFA /* KitPDFPageSelectionView.swift */; };
+		4A94DE5AE57137B152A9E5B0 /* KitMediaEditorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B26000000000000000000003 /* KitMediaEditorView.swift */; };
+		1C1A57D5D285557146A66A14 /* ShareMediaEditor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 07AD3CAF85150698B5A39A7C /* ShareMediaEditor.swift */; };
+		44D5307E425F3373012E0F71 /* AdaptiveVideoPreparationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1D46A9F5622689680E47DEC6 /* AdaptiveVideoPreparationTests.swift */; };
+		D44586D9621568C7C3C8E19A /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = D9E8107DD0C652B5B3C933D0 /* PrivacyInfo.xcprivacy */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -496,6 +539,26 @@
 		151598F894FB90D5995F913E /* PDFPageSelectionPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/PDFPageSelectionPolicy.swift; sourceTree = SOURCE_ROOT; };
 		1430CDE1C95BCC72D04BFD22 /* PDFPageSelectionPolicyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/PDFPageSelectionPolicyTests.swift; sourceTree = SOURCE_ROOT; };
 		579CCBE11EFF912A824D3F11 /* ChatMediaSelectionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/ChatMediaSelectionTests.swift; sourceTree = SOURCE_ROOT; };
+		41A37BD61F4E06760E745FC0 /* DirectShareHTTPTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/DirectShareHTTPTransport.swift; sourceTree = "<group>"; };
+		B8E05D93A4184233DB3435A6 /* DirectShareSendCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/DirectShareSendCoordinator.swift; sourceTree = "<group>"; };
+		86368387B6DF912B2BDCB4D3 /* DirectShareSendRecord.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/DirectShareSendRecord.swift; sourceTree = "<group>"; };
+		E0056EEAFA63D2CF2CD52A46 /* MessagingAPIEndpoint.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/MessagingAPIEndpoint.swift; sourceTree = "<group>"; };
+		8A9F3B6FB3AF594CC62AF8C7 /* MessagingClientIdentity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/MessagingClientIdentity.swift; sourceTree = "<group>"; };
+		10542DD8877DA5FB1A9858B6 /* MessagingProcessBroker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/MessagingProcessBroker.swift; sourceTree = "<group>"; };
+		71EE11608BB24BEF082A75BA /* MessagingSharedModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/MessagingSharedModels.swift; sourceTree = "<group>"; };
+		28B31546D351745B24CCF6C1 /* SecureMessagingSendValidation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/SecureMessagingSendValidation.swift; sourceTree = "<group>"; };
+		0A21568F49A7430B035BEADC /* ShareSuggestions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/ShareSuggestions.swift; sourceTree = "<group>"; };
+		16CFB9684513A3B1240D789A /* AdaptiveVideoPreparation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Messages/AdaptiveVideoPreparation.swift; sourceTree = "<group>"; };
+		71D3782C99F11749658F4E71 /* ShareSuggestionsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/ShareSuggestionsTests.swift; sourceTree = "<group>"; };
+		6DBDB2B3F28B99D1432B5848 /* MessagingProcessBrokerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/MessagingProcessBrokerTests.swift; sourceTree = "<group>"; };
+		A65E3FE59D02145CE648EBF5 /* DirectShareSendRecoveryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/DirectShareSendRecoveryTests.swift; sourceTree = "<group>"; };
+		0BE27110F3C2B36A2D964FE8 /* KitColor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Design/KitColor.swift; sourceTree = "<group>"; };
+		D187394E7EE6335A873C2382 /* ChatMediaTempFiles.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/ChatMediaTempFiles.swift; sourceTree = "<group>"; };
+		E5C1CFF937006D816E4132A1 /* KitCaptureTemporaryFileStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/KitCaptureTemporaryFileStore.swift; sourceTree = "<group>"; };
+		22FE6E7556FB28E653E255C6 /* ChatMediaSharedPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/ChatMediaSharedPolicy.swift; sourceTree = "<group>"; };
+		07AD3CAF85150698B5A39A7C /* ShareMediaEditor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayShare/ShareMediaEditor.swift; sourceTree = "<group>"; };
+		1D46A9F5622689680E47DEC6 /* AdaptiveVideoPreparationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/AdaptiveVideoPreparationTests.swift; sourceTree = "<group>"; };
+		D9E8107DD0C652B5B3C933D0 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = KitPayShare/PrivacyInfo.xcprivacy; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -528,6 +591,25 @@
 		D10000000000000000000002 /* Sources */ = {
 			isa = PBXGroup;
 			children = (
+				1D46A9F5622689680E47DEC6 /* AdaptiveVideoPreparationTests.swift */,
+				07AD3CAF85150698B5A39A7C /* ShareMediaEditor.swift */,
+				22FE6E7556FB28E653E255C6 /* ChatMediaSharedPolicy.swift */,
+				E5C1CFF937006D816E4132A1 /* KitCaptureTemporaryFileStore.swift */,
+				D187394E7EE6335A873C2382 /* ChatMediaTempFiles.swift */,
+				0BE27110F3C2B36A2D964FE8 /* KitColor.swift */,
+				A65E3FE59D02145CE648EBF5 /* DirectShareSendRecoveryTests.swift */,
+				6DBDB2B3F28B99D1432B5848 /* MessagingProcessBrokerTests.swift */,
+				71D3782C99F11749658F4E71 /* ShareSuggestionsTests.swift */,
+				16CFB9684513A3B1240D789A /* AdaptiveVideoPreparation.swift */,
+				0A21568F49A7430B035BEADC /* ShareSuggestions.swift */,
+				28B31546D351745B24CCF6C1 /* SecureMessagingSendValidation.swift */,
+				71EE11608BB24BEF082A75BA /* MessagingSharedModels.swift */,
+				10542DD8877DA5FB1A9858B6 /* MessagingProcessBroker.swift */,
+				8A9F3B6FB3AF594CC62AF8C7 /* MessagingClientIdentity.swift */,
+				E0056EEAFA63D2CF2CD52A46 /* MessagingAPIEndpoint.swift */,
+				86368387B6DF912B2BDCB4D3 /* DirectShareSendRecord.swift */,
+				B8E05D93A4184233DB3435A6 /* DirectShareSendCoordinator.swift */,
+				41A37BD61F4E06760E745FC0 /* DirectShareHTTPTransport.swift */,
 				BCA700000000000000000001, BCA700000000000000000002, BCA700000000000000000003, BCA700000000000000000004, BCA700000000000000000005,
 				B10000000000000000000001, B10000000000000000000002, B10000000000000000000003,
 				BF3100000000000000000001 /* AppReviewDemoContent.swift */,
@@ -834,7 +916,7 @@
 /* Begin PBXResourcesBuildPhase section */
 		C10000000000000000000003 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000011 /* Assets.xcassets in Resources */, A80000000000000000000001 /* PrivacyInfo.xcprivacy in Resources */, A12000000000000000000003 /* knock_brush.mp3 in Resources */, A12000000000000000000004 /* knock_brush.caf in Resources */, A16000000000000000000003 /* AGPL-3.0-only.txt in Resources */, A16000000000000000000004 /* THIRD_PARTY_NOTICES.txt in Resources */,); runOnlyForDeploymentPostprocessing = 0; };
 		C30000000000000000000003 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
-		CSHR0000006 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		CSHR0000006 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (D44586D9621568C7C3C8E19A /* PrivacyInfo.xcprivacy in Resources */, ); runOnlyForDeploymentPostprocessing = 0; };
 		CBRC0000006 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXResourcesBuildPhase section */
 
@@ -843,6 +925,20 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				5EB53F2FCF203D2839FCA88B /* ChatMediaSharedPolicy.swift in Sources */,
+				FB714101F3B587B5D6466598 /* KitCaptureTemporaryFileStore.swift in Sources */,
+				A4EFCBEBDA10D65D3E22E00E /* ChatMediaTempFiles.swift in Sources */,
+				833ACF5B3560772E1CB86449 /* KitColor.swift in Sources */,
+				890168B283D23BB67047CC99 /* AdaptiveVideoPreparation.swift in Sources */,
+				D76CB224F3BB240DCB1F16DB /* ShareSuggestions.swift in Sources */,
+				252401BEB513FA4B8B81B22A /* SecureMessagingSendValidation.swift in Sources */,
+				A6F40A67D7B42D4933623A32 /* MessagingSharedModels.swift in Sources */,
+				A6642F8CFFC5CDDA9D2CD6A9 /* MessagingProcessBroker.swift in Sources */,
+				DA5BB1CD73394F98A389AEDA /* MessagingClientIdentity.swift in Sources */,
+				537B3DE518ABDEC4604BAC36 /* MessagingAPIEndpoint.swift in Sources */,
+				4593B01ACBCCBDA40991F30F /* DirectShareSendRecord.swift in Sources */,
+				CE4E67DD2D79ED44D0B52BF9 /* DirectShareSendCoordinator.swift in Sources */,
+				AE1A3BE8CEAD75FF1AC0C59B /* DirectShareHTTPTransport.swift in Sources */,
 				ACA700000000000000000001, ACA700000000000000000002, ACA700000000000000000003, ACA700000000000000000004, ACA700000000000000000005,
                 ACSHR000001 /* CallScreenSharing.swift in Sources */,
 				A10000000000000000000001, A10000000000000000000002, A10000000000000000000003,
@@ -985,6 +1081,10 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				44D5307E425F3373012E0F71 /* AdaptiveVideoPreparationTests.swift in Sources */,
+				6051305772B24022BE1F7C44 /* DirectShareSendRecoveryTests.swift in Sources */,
+				47F69104DF8AF078C02DD5D2 /* MessagingProcessBrokerTests.swift in Sources */,
+				6F3D3A9F0A88ACA1C7EE7CD2 /* ShareSuggestionsTests.swift in Sources */,
 				ACA700000000000000000006 /* CallSchedulingTests.swift in Sources */,
                 ACSHRT00001 /* CallScreenSharingTests.swift in Sources */,
 				A30000000000000000000001 /* SecureLocalStoreTests.swift in Sources */,
@@ -1062,6 +1162,30 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				1C1A57D5D285557146A66A14 /* ShareMediaEditor.swift in Sources */,
+				4A94DE5AE57137B152A9E5B0 /* KitMediaEditorView.swift in Sources */,
+				0B789B16222A47CD5E413115 /* KitPDFPageSelectionView.swift in Sources */,
+				4FCE98799C12B9EBB5977BDD /* PDFPageSelectionPolicy.swift in Sources */,
+				BF56BB19A76A2EE52BC0147E /* ChatMediaSharedPolicy.swift in Sources */,
+				07835039D6D127F06B09D28A /* KitCaptureTemporaryFileStore.swift in Sources */,
+				EACE4AB3BFFF2F3F2FC46680 /* ChatMediaTempFiles.swift in Sources */,
+				0165E938259112B713CE67A7 /* KitColor.swift in Sources */,
+				AECEDF98B4449091A31C81D9 /* SignalProtocolStore.swift in Sources */,
+				93CFD0A67EEFC9A29B366A8E /* SessionStore.swift in Sources */,
+				4E25F511EAD12D67BCA29138 /* SecureMessagingMapper.swift in Sources */,
+				D4A880CCF51AD9608DAA103C /* SecureMessagingCrypto.swift in Sources */,
+				07116C7DB0E21B1B2EF9B3EB /* MessagingAPIModels.swift in Sources */,
+				07010EBDAC78DC620E66514D /* MediaMessageV2Models.swift in Sources */,
+				FF86773E8A551AE7F8BE16EC /* KeychainStore.swift in Sources */,
+				0B1624759B6EB50F072D9FE2 /* ShareSuggestions.swift in Sources */,
+				84B3D2C838B511AC30FBA2DF /* SecureMessagingSendValidation.swift in Sources */,
+				AFDEDED63FB5B915CB30C659 /* MessagingSharedModels.swift in Sources */,
+				F16B0C408FF7C86E773747C4 /* MessagingProcessBroker.swift in Sources */,
+				2E591A1C71BCE3C7D5BD5362 /* MessagingClientIdentity.swift in Sources */,
+				E72EA1DD8193E05DEB5986BC /* MessagingAPIEndpoint.swift in Sources */,
+				FF99530BEBA158F56139390E /* DirectShareSendRecord.swift in Sources */,
+				9C173D27C12ACD65997B8D74 /* DirectShareSendCoordinator.swift in Sources */,
+				C8010747E7373733B24A93C9 /* DirectShareHTTPTransport.swift in Sources */,
 				ASHR0000001 /* ShareViewController.swift in Sources */,
 				ASHR0000004 /* SharedInbox.swift in Sources */,
 			);
@@ -1103,16 +1227,16 @@
 /* Begin XCBuildConfiguration section */
 		F20000000000000000000001 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {ALWAYS_SEARCH_USER_PATHS = NO; CLANG_ENABLE_MODULES = YES; CLANG_ENABLE_OBJC_ARC = YES; COPY_PHASE_STRIP = NO; DEBUG_INFORMATION_FORMAT = dwarf; ENABLE_TESTABILITY = YES; GCC_C_LANGUAGE_STANDARD = gnu17; GCC_OPTIMIZATION_LEVEL = 0; IPHONEOS_DEPLOYMENT_TARGET = 17.0; ONLY_ACTIVE_ARCH = YES; SDKROOT = iphoneos; SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)"; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; }; name = Debug; };
 		F20000000000000000000002 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {ALWAYS_SEARCH_USER_PATHS = NO; CLANG_ENABLE_MODULES = YES; CLANG_ENABLE_OBJC_ARC = YES; COPY_PHASE_STRIP = NO; DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym"; ENABLE_NS_ASSERTIONS = NO; GCC_C_LANGUAGE_STANDARD = gnu17; IPHONEOS_DEPLOYMENT_TARGET = 17.0; SDKROOT = iphoneos; SWIFT_COMPILATION_MODE = wholemodule; SWIFT_OPTIMIZATION_LEVEL = "-O"; VALIDATE_PRODUCT = YES; }; name = Release; };
-		F20000000000000000000003 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {APS_ENVIRONMENT = development; ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_ENTITLEMENTS = KitPay/KitPay.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 85; DEVELOPMENT_TEAM = AU55CKVJ55; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = KitPay/Info.plist; KIT_CORRESPONDING_SOURCE_URL = ""; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"; MARKETING_VERSION = 1.0.17; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Debug; };
-		F20000000000000000000004 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {APS_ENVIRONMENT = production; ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_ENTITLEMENTS = KitPay/KitPay.entitlements; CODE_SIGN_IDENTITY = "Apple Distribution"; CODE_SIGN_STYLE = Manual; CURRENT_PROJECT_VERSION = 85; DEVELOPMENT_TEAM = "$(KITPAY_APPLE_TEAM_ID)"; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = KitPay/Info.plist; KIT_CORRESPONDING_SOURCE_URL = ""; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"; MARKETING_VERSION = 1.0.17; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios; PRODUCT_NAME = "$(TARGET_NAME)"; PROVISIONING_PROFILE_SPECIFIER = "$(KITPAY_PROFILE_UUID)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Release; };
+		F20000000000000000000003 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {APS_ENVIRONMENT = development; ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_ENTITLEMENTS = KitPay/KitPay.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 86; DEVELOPMENT_TEAM = AU55CKVJ55; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = KitPay/Info.plist; KIT_CORRESPONDING_SOURCE_URL = ""; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"; MARKETING_VERSION = 1.0.17; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Debug; };
+		F20000000000000000000004 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {APS_ENVIRONMENT = production; ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_ENTITLEMENTS = KitPay/KitPay.entitlements; CODE_SIGN_IDENTITY = "Apple Distribution"; CODE_SIGN_STYLE = Manual; CURRENT_PROJECT_VERSION = 86; DEVELOPMENT_TEAM = "$(KITPAY_APPLE_TEAM_ID)"; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = KitPay/Info.plist; KIT_CORRESPONDING_SOURCE_URL = ""; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"; MARKETING_VERSION = 1.0.17; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios; PRODUCT_NAME = "$(TARGET_NAME)"; PROVISIONING_PROFILE_SPECIFIER = "$(KITPAY_PROFILE_UUID)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Release; };
 		F30000000000000000000001 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {BUNDLE_LOADER = "$(TEST_HOST)"; CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = AU55CKVJ55; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks @loader_path/Frameworks"; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios.tests; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_EMIT_LOC_STRINGS = NO; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/KitPay.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/KitPay"; }; name = Debug; };
 		F30000000000000000000002 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {BUNDLE_LOADER = "$(TEST_HOST)"; CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = AU55CKVJ55; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks @loader_path/Frameworks"; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios.tests; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_EMIT_LOC_STRINGS = NO; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/KitPay.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/KitPay"; }; name = Release; };
 		FF1000000000000000000001 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = AU55CKVJ55; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks @loader_path/Frameworks"; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios.uitests; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_EMIT_LOC_STRINGS = NO; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; TEST_TARGET_NAME = KitPay;}; name = Debug; };
 		FF1000000000000000000002 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = AU55CKVJ55; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks @loader_path/Frameworks"; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios.uitests; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_EMIT_LOC_STRINGS = NO; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; TEST_TARGET_NAME = KitPay;}; name = Release; };
-		FSHR0000001 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {APPLICATION_EXTENSION_API_ONLY = YES; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = KitPayShare/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks @executable_path/../../Frameworks"; MARKETING_VERSION = 1.0.17; CURRENT_PROJECT_VERSION = 85; CODE_SIGN_ENTITLEMENTS = KitPayShare/KitPayShare.entitlements; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios.share; PRODUCT_NAME = "$(TARGET_NAME)"; SKIP_INSTALL = YES; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = AU55CKVJ55; }; name = Debug; };
-		FSHR0000002 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {APPLICATION_EXTENSION_API_ONLY = YES; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = KitPayShare/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks @executable_path/../../Frameworks"; MARKETING_VERSION = 1.0.17; CURRENT_PROJECT_VERSION = 85; CODE_SIGN_ENTITLEMENTS = KitPayShare/KitPayShare.entitlements; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios.share; PRODUCT_NAME = "$(TARGET_NAME)"; SKIP_INSTALL = YES; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; CODE_SIGN_IDENTITY = "Apple Distribution"; CODE_SIGN_STYLE = Manual; DEVELOPMENT_TEAM = "$(KITPAY_APPLE_TEAM_ID)"; PROVISIONING_PROFILE_SPECIFIER = "$(KITPAY_SHARE_PROFILE_UUID)"; }; name = Release; };
-		FBRC0000001 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {APPLICATION_EXTENSION_API_ONLY = YES; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = KitPayBroadcast/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks @executable_path/../../Frameworks"; MARKETING_VERSION = 1.0.17; CURRENT_PROJECT_VERSION = 85; CODE_SIGN_ENTITLEMENTS = KitPayBroadcast/KitPayBroadcast.entitlements; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios.broadcast; PRODUCT_NAME = "$(TARGET_NAME)"; SKIP_INSTALL = YES; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = AU55CKVJ55; }; name = Debug; };
-		FBRC0000002 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {APPLICATION_EXTENSION_API_ONLY = YES; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = KitPayBroadcast/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks @executable_path/../../Frameworks"; MARKETING_VERSION = 1.0.17; CURRENT_PROJECT_VERSION = 85; CODE_SIGN_ENTITLEMENTS = KitPayBroadcast/KitPayBroadcast.entitlements; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios.broadcast; PRODUCT_NAME = "$(TARGET_NAME)"; SKIP_INSTALL = YES; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; CODE_SIGN_IDENTITY = "Apple Distribution"; CODE_SIGN_STYLE = Manual; DEVELOPMENT_TEAM = "$(KITPAY_APPLE_TEAM_ID)"; PROVISIONING_PROFILE_SPECIFIER = "$(KITPAY_BROADCAST_PROFILE_UUID)"; }; name = Release; };
+		FSHR0000001 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {OTHER_SWIFT_FLAGS = "$(inherited) -D KIT_SHARE_EXTENSION"; APPLICATION_EXTENSION_API_ONLY = YES; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = KitPayShare/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks @executable_path/../../Frameworks"; MARKETING_VERSION = 1.0.17; CURRENT_PROJECT_VERSION = 86; CODE_SIGN_ENTITLEMENTS = KitPayShare/KitPayShare.entitlements; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios.share; PRODUCT_NAME = "$(TARGET_NAME)"; SKIP_INSTALL = YES; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = AU55CKVJ55; }; name = Debug; };
+		FSHR0000002 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {OTHER_SWIFT_FLAGS = "$(inherited) -D KIT_SHARE_EXTENSION"; APPLICATION_EXTENSION_API_ONLY = YES; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = KitPayShare/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks @executable_path/../../Frameworks"; MARKETING_VERSION = 1.0.17; CURRENT_PROJECT_VERSION = 86; CODE_SIGN_ENTITLEMENTS = KitPayShare/KitPayShare.entitlements; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios.share; PRODUCT_NAME = "$(TARGET_NAME)"; SKIP_INSTALL = YES; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; CODE_SIGN_IDENTITY = "Apple Distribution"; CODE_SIGN_STYLE = Manual; DEVELOPMENT_TEAM = "$(KITPAY_APPLE_TEAM_ID)"; PROVISIONING_PROFILE_SPECIFIER = "$(KITPAY_SHARE_PROFILE_UUID)"; }; name = Release; };
+		FBRC0000001 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {APPLICATION_EXTENSION_API_ONLY = YES; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = KitPayBroadcast/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks @executable_path/../../Frameworks"; MARKETING_VERSION = 1.0.17; CURRENT_PROJECT_VERSION = 86; CODE_SIGN_ENTITLEMENTS = KitPayBroadcast/KitPayBroadcast.entitlements; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios.broadcast; PRODUCT_NAME = "$(TARGET_NAME)"; SKIP_INSTALL = YES; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = AU55CKVJ55; }; name = Debug; };
+		FBRC0000002 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {APPLICATION_EXTENSION_API_ONLY = YES; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = KitPayBroadcast/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks @executable_path/../../Frameworks"; MARKETING_VERSION = 1.0.17; CURRENT_PROJECT_VERSION = 86; CODE_SIGN_ENTITLEMENTS = KitPayBroadcast/KitPayBroadcast.entitlements; PRODUCT_BUNDLE_IDENTIFIER = africa.kit.pay.ios.broadcast; PRODUCT_NAME = "$(TARGET_NAME)"; SKIP_INSTALL = YES; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; CODE_SIGN_IDENTITY = "Apple Distribution"; CODE_SIGN_STYLE = Manual; DEVELOPMENT_TEAM = "$(KITPAY_APPLE_TEAM_ID)"; PROVISIONING_PROFILE_SPECIFIER = "$(KITPAY_BROADCAST_PROFILE_UUID)"; }; name = Release; };
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */

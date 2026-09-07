@@ -359,7 +359,7 @@ enum KitScheduledPaymentMessageAction: String, Equatable, Sendable, CaseIterable
 /// message: `isTrustedProjection` binds the descriptor to its deterministic local id and requires
 /// the absence of a server message id/history record, so a peer cannot forge a payment receipt.
 struct KitScheduledPaymentMessage: Equatable, Sendable {
-    static let prefix = "KITSCHPAY1:"
+    static let prefix = SecureMessagingReservedNamespace.scheduledPayment
     static let maximumDescriptorLength = 2_048
 
     let action: KitScheduledPaymentMessageAction
@@ -689,7 +689,7 @@ enum KitPaymentMessageAction: String, Equatable, Sendable, CaseIterable {
 /// Canonical payment descriptor carried inside the end-to-end encrypted message body.
 /// Its fixed order and strict re-encoding match Android's `KITPAY1` wire contract.
 struct KitPaymentMessage: Equatable, Sendable {
-    static let prefix = "KITPAY1:"
+    static let prefix = SecureMessagingReservedNamespace.payment
     static let maximumDescriptorLength = 1_024
     static let maximumNoteLength = 140
     static let maximumReasonLength = 140

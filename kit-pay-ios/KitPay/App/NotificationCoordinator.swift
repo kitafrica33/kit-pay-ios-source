@@ -3646,6 +3646,7 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
     /// metadata is quarantined until AppModel finishes protected-state/deletion recovery.
     @MainActor
     func prepareForProtectedStateRestore() {
+        try? MessagingProcessBroker.shared.setSharingEnabled(false, accountID: nil)
         registrationEnabled = false
         privacyQuarantineActive = true
         invalidateCallActionOwnership()
@@ -3744,6 +3745,7 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
     /// A later sign-in calls `requestAuthorizationAndRegister()` and obtains fresh credentials.
     @MainActor
     func suspendRegistrationAfterSignOut() {
+        try? MessagingProcessBroker.shared.setSharingEnabled(false, accountID: nil)
         registrationEnabled = false
         privacyQuarantineActive = true
         invalidateCallActionOwnership()
@@ -3769,6 +3771,7 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
     /// invokes this before its first sign-out suspension, then unregisters those tokens remotely.
     @MainActor
     func beginAccountSignOut() {
+        try? MessagingProcessBroker.shared.setSharingEnabled(false, accountID: nil)
         registrationEnabled = false
         privacyQuarantineActive = true
         invalidateCallActionOwnership()
@@ -3810,6 +3813,7 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
     /// Apple credentials stay cached so quarantine is reversible without losing registration.
     @MainActor
     func beginPrivacyQuarantine(targetAccountID: String?) {
+        try? MessagingProcessBroker.shared.setSharingEnabled(false, accountID: nil)
         let targetFingerprint = MessageNotificationContract.accountFingerprint(
             for: targetAccountID
         )
@@ -5141,12 +5145,17 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate,
             || backendCallIds[uuid] != nil
             || quarantinedIncomingCalls[uuid] != nil
             || incomingCalls[uuid] != nil
+        // PKPushRegistry is created on .main. Keep this ownership read synchronous so
+        // every VoIP push reaches CallKit reporting before returning from the callback.
+        let hasPendingAcceptance = MainActor.assumeIsolated {
+            hasPendingCallAcceptance(callID: incoming.callId)
+        }
         let publicationDisposition = incomingCallPublicationGate.begin(
             callUUID: uuid,
             generation: receivedGeneration,
             alreadyTracked: alreadyTracked,
             leaseExpired: incoming.callKitDisposition() == .reportAsUnanswered
-                && !hasPendingCallAcceptance(callID: incoming.callId)
+                && !hasPendingAcceptance
         )
         if publicationDisposition == .authorized {
             // Claim this CallKit report before its asynchronous completion. End/answer-elsewhere

@@ -1331,6 +1331,59 @@ final class ChatMediaPolicyTests: XCTestCase {
     }
 
     @MainActor
+    func testTextNetworkMilestonesPreserveFirstAttemptAndRequireDurableOrderedStages() throws {
+        let monitor = LocalMediaPerformanceMonitor()
+        let scope = monitor.captureProducerScope()
+        let messageID = UUID()
+        let start: UInt64 = 1_000_000_000
+        monitor.beginTextSend(messageID: messageID, atUptimeNanoseconds: start, producerScope: scope)
+        XCTAssertNil(monitor.markTextSendStage(
+            .requestStarted, messageID: messageID,
+            atUptimeNanoseconds: start + 1_000_000, producerScope: scope
+        ))
+        monitor.markTextOutboxCommitted(
+            messageID: messageID, atUptimeNanoseconds: start + 10_000_000, producerScope: scope
+        )
+        XCTAssertNil(monitor.markTextSendStage(
+            .serverAccepted, messageID: messageID,
+            atUptimeNanoseconds: start + 20_000_000, producerScope: scope
+        ))
+        XCTAssertEqual(monitor.markTextSendStage(
+            .encrypted, messageID: messageID,
+            atUptimeNanoseconds: start + 80_000_000, producerScope: scope
+        ), 80)
+        XCTAssertNil(monitor.markTextSendStage(
+            .requestStarted, messageID: messageID,
+            atUptimeNanoseconds: start + 50_000_000, producerScope: scope
+        ))
+        XCTAssertEqual(monitor.markTextSendStage(
+            .requestStarted, messageID: messageID,
+            atUptimeNanoseconds: start + 100_000_000, producerScope: scope
+        ), 100)
+        // An uncertain POST may retry; the new attempt cannot make its timing look faster.
+        XCTAssertNil(monitor.markTextSendStage(
+            .requestStarted, messageID: messageID,
+            atUptimeNanoseconds: start + 900_000_000, producerScope: scope
+        ))
+        XCTAssertEqual(monitor.markTextSendStage(
+            .serverAccepted, messageID: messageID,
+            atUptimeNanoseconds: start + 1_200_000_000, producerScope: scope
+        ), 1_200)
+        XCTAssertNil(monitor.markTextSendStage(
+            .serverAccepted, messageID: messageID,
+            atUptimeNanoseconds: start + 1_500_000_000, producerScope: scope
+        ))
+        let report = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: Data(monitor.exportReport().utf8)
+        ) as? [String: Any])
+        let record = try XCTUnwrap((report["records"] as? [[String: Any]])?.first)
+        XCTAssertEqual(record["actionToEncryptedMilliseconds"] as? Double, 80)
+        XCTAssertEqual(record["actionToSendRequestMilliseconds"] as? Double, 100)
+        XCTAssertEqual(record["actionToServerAcceptedMilliseconds"] as? Double, 1_200)
+        XCTAssertNil(record["recipientVisibleMilliseconds"])
+    }
+
+    @MainActor
     func testTextSendDiagnosticSerializationIsBoundedAndContainsNoMessageIdentity() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
             "kit-text-send-diagnostics-tests-\(UUID().uuidString)",
@@ -1362,6 +1415,18 @@ final class ChatMediaPolicyTests: XCTestCase {
                 atUptimeNanoseconds: start + 11_600_000,
                 producerScope: scope
             )
+            monitor.markTextSendStage(
+                .encrypted, messageID: messageID,
+                atUptimeNanoseconds: start + 80_000_000, producerScope: scope
+            )
+            monitor.markTextSendStage(
+                .requestStarted, messageID: messageID,
+                atUptimeNanoseconds: start + 100_000_000, producerScope: scope
+            )
+            monitor.markTextSendStage(
+                .serverAccepted, messageID: messageID,
+                atUptimeNanoseconds: start + 450_000_000, producerScope: scope
+            )
         }
 
         XCTAssertEqual(monitor.reportRecordCount, 256)
@@ -1384,6 +1449,9 @@ final class ChatMediaPolicyTests: XCTestCase {
         XCTAssertTrue(records.allSatisfy {
             $0["actionToDurableOutboxCommitMilliseconds"] as? Double == 7
                 && $0["actionToVisibleLocalBubbleMilliseconds"] as? Double == 12
+                && $0["actionToEncryptedMilliseconds"] as? Double == 80
+                && $0["actionToSendRequestMilliseconds"] as? Double == 100
+                && $0["actionToServerAcceptedMilliseconds"] as? Double == 450
                 && $0["kind"] == nil
                 && $0["byteCount"] == nil
                 && $0["durationSeconds"] == nil
@@ -1440,6 +1508,12 @@ final class ChatMediaPolicyTests: XCTestCase {
         ))
         XCTAssertEqual(visible.actionToVisibleLocalBubbleMilliseconds, 25)
         XCTAssertEqual(monitor.reportRecordCount, 1)
+        for stage: LocalTextSendStage in [.encrypted, .requestStarted, .serverAccepted] {
+            XCTAssertNil(monitor.markTextSendStage(
+                stage, messageID: messageID,
+                atUptimeNanoseconds: 2_100_000_000, producerScope: staleScope
+            ))
+        }
     }
 
     @MainActor

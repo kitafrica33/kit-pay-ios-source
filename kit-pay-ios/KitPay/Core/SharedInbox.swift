@@ -1149,6 +1149,13 @@ struct SharedInboxStore {
         )
     }
 
+    /// Retires exactly one validated staged item after its replacement has been accepted.
+    /// A stale editor callback never owns the containing batch or any sibling attachment.
+    func remove(item: SharedInboxItem, in batchID: UUID) {
+        guard let url = try? fileURL(for: item, in: batchID) else { return }
+        try? fileManager.removeItem(at: url)
+    }
+
     func removeAll() {
         guard let rootURL else { return }
         try? fileManager.removeItem(at: rootURL)

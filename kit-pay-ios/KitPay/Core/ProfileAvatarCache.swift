@@ -430,12 +430,7 @@ actor ProfileAvatarCache {
     /// HTTPS only, and only where a host is actually present — an avatar URL arrives from the
     /// server but is still untrusted input by the time it reaches a `URLSession`.
     static func validatedURL(_ avatarURL: String?) -> URL? {
-        guard let avatarURL,
-              let url = URL(string: avatarURL.trimmingCharacters(in: .whitespacesAndNewlines)),
-              url.scheme?.caseInsensitiveCompare("https") == .orderedSame,
-              url.host?.isEmpty == false
-        else { return nil }
-        return url
+        MessagingAccountAvatarURLPolicy.validatedURL(avatarURL)
     }
 
     /// The already-decoded photo, if there is one, without an `await`.

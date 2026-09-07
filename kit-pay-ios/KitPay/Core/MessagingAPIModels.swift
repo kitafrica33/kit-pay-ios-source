@@ -16,14 +16,14 @@ enum SecureMessageReservedPrefixPolicy {
     /// dedicated media queue paths, which never route through this check. This check is shared
     /// by every composer, forwarding and notification-reply boundary.
     static func allowsUserAuthoredText(_ text: String) -> Bool {
-        !beginsWithReservedPrefix(text, prefix: KitPaymentMessage.prefix)
-            && !beginsWithReservedPrefix(text, prefix: KitScheduledPaymentMessage.prefix)
+        !beginsWithReservedPrefix(text, prefix: SecureMessagingReservedNamespace.payment)
+            && !beginsWithReservedPrefix(text, prefix: SecureMessagingReservedNamespace.scheduledPayment)
             && !beginsWithReservedPrefix(
                 text,
-                prefix: KitScheduledGroupPaymentOutcomeMessage.prefix
+                prefix: SecureMessagingReservedNamespace.scheduledGroupPayment
             )
-            && !beginsWithReservedPrefix(text, prefix: KitGroupPaymentMessage.prefix)
-            && !beginsWithReservedPrefix(text, prefix: KitGroupPaymentRequestMessage.prefix)
+            && !beginsWithReservedPrefix(text, prefix: SecureMessagingReservedNamespace.groupPayment)
+            && !beginsWithReservedPrefix(text, prefix: SecureMessagingReservedNamespace.groupPaymentRequest)
             && !beginsWithReservedPrefix(text, prefix: KitSystemMessage.prefix)
             && !beginsWithReservedPrefix(text, prefix: KitMessageReaction.prefix)
             && !beginsWithReservedPrefix(text, prefix: KitMessageEdit.prefix)
@@ -2215,7 +2215,7 @@ extension MessagingMediaMessageV2CapabilityPolicy {
     /// devices included. Absent capabilities, absent roster rows, or an empty draft all
     /// refuse; refusal never splits the draft into single sends.
     static func admitsComposition(
-        capabilities: CapabilitiesDTO?,
+        capabilities: (any MessagingMediaCompositionCapabilities)?,
         roster: MessagingDeviceRosterDTO,
         conversationID: String,
         currentDeviceID: String,

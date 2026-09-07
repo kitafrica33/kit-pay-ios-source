@@ -47,6 +47,9 @@ private struct KitPhotoEditorView: View {
     @State private var workingImage: UIImage
     @State private var filter: KitPhotoFilter = .original
     @State private var filteredPreview: UIImage?
+    @State private var filterPreviewTask: Task<Void, Never>?
+    @State private var filterPreviewGeneration: UInt64 = 0
+    @State private var isEditorVisible = true
     @State private var cropAspect: KitCropAspect = .original
     @State private var strokes: [EditorStroke] = []
     @State private var activeStroke: EditorStroke?
@@ -85,6 +88,12 @@ private struct KitPhotoEditorView: View {
         }
         .background(Color.black.ignoresSafeArea())
         .statusBarHidden()
+        .onAppear { isEditorVisible = true }
+        .onDisappear {
+            isEditorVisible = false
+            filterPreviewGeneration &+= 1
+            filterPreviewTask?.cancel()
+        }
         .overlay {
             if isRendering {
                 ZStack {
@@ -602,15 +611,25 @@ private struct KitPhotoEditorView: View {
 
     private func applyFilter(_ candidate: KitPhotoFilter) {
         filter = candidate
+        filterPreviewGeneration &+= 1
+        let generation = filterPreviewGeneration
+        let previous = filterPreviewTask
+        previous?.cancel()
         guard candidate != .original else {
             filteredPreview = nil
             return
         }
         let source = workingImage
-        Task.detached(priority: .userInitiated) {
-            let rendered = candidate.apply(to: source)
+        filterPreviewTask = Task.detached(priority: .userInitiated) {
+            // Cancelling CoreImage work cannot interrupt an active render. Wait for its owner
+            // to finish before starting another, and skip superseded requests before decoding.
+            // Rapid filter taps therefore hold at most one active preview render.
+            if let previous { await previous.value }
+            guard !Task.isCancelled else { return }
+            let rendered = autoreleasepool { candidate.apply(to: source) }
+            guard !Task.isCancelled else { return }
             await MainActor.run {
-                guard filter == candidate else { return }
+                guard isEditorVisible, filter == candidate, filterPreviewGeneration == generation else { return }
                 filteredPreview = rendered
             }
         }
@@ -622,6 +641,8 @@ private struct KitPhotoEditorView: View {
         // under already-rotated annotations. All the filters are pointwise colour effects, so
         // rotating the filtered preview equals filtering the rotated base.
         filteredPreview = filteredPreview?.kitRotatedQuarterTurnClockwise()
+        // An older in-flight filter must not publish unrotated pixels over this new canvas.
+        applyFilter(filter)
         // Rotate every normalized annotation with the pixels: (x, y) -> (1 - y, x).
         strokes = strokes.map { stroke in
             var rotated = stroke
@@ -639,6 +660,7 @@ private struct KitPhotoEditorView: View {
     // MARK: Final render
 
     private func renderAndFinish() {
+        guard !isRendering, isEditorVisible else { return }
         isRendering = true
         // Export from the working image plus the SELECTED filter, never the preview: an
         // in-flight preview task must not decide what the flattened photo looks like.
@@ -647,15 +669,22 @@ private struct KitPhotoEditorView: View {
         let strokesToDraw = strokes
         let overlaysToDraw = overlays
         let aspect = cropAspect
+        let preview = filterPreviewTask
+        preview?.cancel()
+        filterPreviewGeneration &+= 1
         Task.detached(priority: .userInitiated) {
-            let base = selectedFilter.apply(to: working)
-            let flattened = KitPhotoEditorRenderer.render(
-                base: base,
-                strokes: strokesToDraw,
-                overlays: overlaysToDraw,
-                cropAspect: aspect
-            )
+            if let preview { await preview.value }
+            let flattened = autoreleasepool {
+                let base = selectedFilter.apply(to: working)
+                return KitPhotoEditorRenderer.render(
+                    base: base,
+                    strokes: strokesToDraw,
+                    overlays: overlaysToDraw,
+                    cropAspect: aspect
+                )
+            }
             await MainActor.run {
+                guard isEditorVisible else { return }
                 isRendering = false
                 onFinish(.photo(flattened))
             }
@@ -1148,19 +1177,49 @@ private struct KitVideoTrimView: View {
         export.outputFileType = .mp4
         export.timeRange = range
         export.shouldOptimizeForNetworkUse = true
-        export.fileLengthLimit = Int64(
-            Double(SecureMediaAttachmentCipher.maximumPlaintextBytes) * 0.92
-        )
+        // A length cap can return a completed but shortened movie. Export the selected range
+        // completely, then validate duration/audio and the actual byte limit before replacing
+        // the protected original in either the app or the share extension.
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             export.exportAsynchronously { continuation.resume() }
         }
         guard export.status == .completed,
-              (try? KitCaptureTemporaryFileStore.protectFile(at: outputURL)) != nil
+              (try? KitCaptureTemporaryFileStore.protectFile(at: outputURL)) != nil,
+              await validatesTrimmedOutput(outputURL, source: asset, range: range)
         else {
             try? FileManager.default.removeItem(at: outputURL.deletingLastPathComponent())
             return nil
         }
         return outputURL
+    }
+
+    private static func validatesTrimmedOutput(_ output: URL, source: AVAsset, range: CMTimeRange) async -> Bool {
+        guard let size = try? output.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+              KitChatMediaLimits.fits(size, kind: .video),
+              range.duration.seconds.isFinite, range.duration.seconds > 0
+        else { return false }
+        let asset = AVURLAsset(url: output)
+        do {
+            async let playable = asset.load(.isPlayable)
+            async let duration = asset.load(.duration)
+            async let videoTracks = asset.loadTracks(withMediaType: .video)
+            async let audioTracks = asset.loadTracks(withMediaType: .audio)
+            let (isPlayable, loadedDuration, videos, audios) = try await (playable, duration, videoTracks, audioTracks)
+            let tolerance = min(0.25, max(0.1, range.duration.seconds * 0.001))
+            guard isPlayable, let video = videos.first,
+                  loadedDuration.seconds.isFinite,
+                  abs(loadedDuration.seconds - range.duration.seconds) <= tolerance
+            else { return false }
+            let videoRange = try await video.load(.timeRange)
+            guard abs(CMTimeRangeGetEnd(videoRange).seconds - loadedDuration.seconds) <= tolerance else { return false }
+            for audio in try await source.loadTracks(withMediaType: .audio) {
+                let audioRange = try await audio.load(.timeRange)
+                if CMTimeRangeGetIntersection(audioRange, range).duration.seconds > 0, audios.isEmpty {
+                    return false
+                }
+            }
+            return true
+        } catch { return false }
     }
 }
 

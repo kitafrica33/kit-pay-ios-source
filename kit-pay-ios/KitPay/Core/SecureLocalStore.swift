@@ -42,6 +42,7 @@ actor SecureLocalStore {
     }
 
     private let keyAccount: String
+    private let messagingBroker: MessagingProcessBroker?
     private let injectedKeyData: Data?
     private let stateDataLoad: StateDataLoad
     private let stateDataPersist: StateDataPersist
@@ -74,12 +75,15 @@ actor SecureLocalStore {
         stateDataPersist: @escaping StateDataPersist = { data, url in
             try data.write(to: url, options: [.atomic, .completeFileProtectionUnlessOpen])
         },
-        keyDataLoad: KeyDataLoad? = nil
+        keyDataLoad: KeyDataLoad? = nil,
+        messagingBroker: MessagingProcessBroker? = nil
     ) {
         let resolvedKeyDataLoad: KeyDataLoad = keyDataLoad ?? {
             try KeychainStore.data(for: keyAccount)
         }
         self.keyAccount = keyAccount
+        self.messagingBroker = messagingBroker ?? (stateURL == nil && keyData == nil
+            && keyAccount == "kit-pay-local-state-key-v1" ? .shared : nil)
         injectedKeyData = keyData
         self.stateDataLoad = stateDataLoad
         self.stateDataPersist = stateDataPersist
@@ -111,6 +115,7 @@ actor SecureLocalStore {
     }
 
     func snapshot() -> PersistedState {
+        do { try reconcileMessagingBroker() } catch { return .empty }
         guard stateIsReadable,
               !concealsStateForAcceptedDeletion,
               !concealsStateForProtectedStateRecovery
@@ -140,7 +145,9 @@ actor SecureLocalStore {
             stateLoadStatus = loaded.status
         }
         switch stateLoadStatus {
-        case .knownEmpty, .loaded: return .ready
+        case .knownEmpty, .loaded:
+            do { try reconcileMessagingBroker(); return .ready }
+            catch { return .temporarilyUnavailable }
         case .temporarilyUnavailableExistingFile: return .temporarilyUnavailable
         case .invalidExistingFile: return .invalid
         }
@@ -150,8 +157,7 @@ actor SecureLocalStore {
         try requireMutableState()
         var candidate = state
         try mutation(&candidate)
-        try persist(candidate)
-        state = candidate
+        state = try persist(candidate)
     }
 
     func update(
@@ -162,8 +168,7 @@ actor SecureLocalStore {
             try requireMutableState()
             var candidate = state
             try mutation(&candidate)
-            try persist(candidate)
-            state = candidate
+            state = try persist(candidate)
         }
     }
 
@@ -205,8 +210,7 @@ actor SecureLocalStore {
         try requireMutableState()
         var candidate = state
         candidate.messagingOfflineDirectCreationCapabilityReceipt = nil
-        try persist(candidate)
-        state = candidate
+        state = try persist(candidate)
     }
 
     /// Atomically compare-and-swaps the durable capability receipt. The generation check and
@@ -240,8 +244,7 @@ actor SecureLocalStore {
         try requireMutableState()
         var candidate = state
         candidate.messagingOfflineDirectCreationCapabilityReceipt = receipt
-        try persist(candidate)
-        state = candidate
+        state = try persist(candidate)
         return true
     }
 
@@ -315,14 +318,12 @@ actor SecureLocalStore {
         var committedState = nextState
         try committedState.advanceTransactionRevision(after: expectedState ?? .empty)
         candidate.secureMessaging = committedState
-        try persist(candidate)
-        state = candidate
+        state = try persist(candidate)
     }
 
     func replace(_ newState: PersistedState) throws {
         try requireMutableState()
-        try persist(newState)
-        state = newState
+        state = try persist(newState)
     }
 
     func clearFinancialAndSessionProjections(preserveCommunicationHistory: Bool) throws {
@@ -395,8 +396,7 @@ actor SecureLocalStore {
         }
         // Signal identity, prekeys, sessions, and replay markers are account-bound. Never carry
         // them through logout into a later account activation, even though display history stays.
-        try persist(candidate)
-        state = candidate
+        state = try persist(candidate)
     }
 
     /// Removes the projection owned by an account whose deletion was already accepted remotely.
@@ -430,8 +430,7 @@ actor SecureLocalStore {
 
         let candidate = PersistedState.empty
         do {
-            try persist(candidate)
-            state = candidate
+            state = try persist(candidate)
             concealsStateForAcceptedDeletion = false
             return .purged
         } catch {
@@ -507,22 +506,221 @@ actor SecureLocalStore {
             || candidate.pendingProfileAvatarAttachment != nil
     }
 
-    private func persist(_ candidate: PersistedState) throws {
+    /// Each crypto update has one private serialization, just as before. The prepared private
+    /// file becomes state.secure by rename after the shared commit, avoiding a second wallet
+    /// encode/copy. Ordinary wallet writes do not rewrite the shared Signal store.
+    private func persist(_ proposed: PersistedState) throws -> PersistedState {
+        guard let messagingBroker else {
+            try stateDataPersist(try encryptedState(proposed), stateURL)
+            stateLoadStatus = .loaded
+            return proposed
+        }
+        return try messagingBroker.withLock { broker in
+            var candidate = proposed
+            guard let authority = try broker.authorityLocked(),
+                  let accountID = authority.session?.accountId?.lowercased(),
+                  candidate.profile != nil
+            else {
+                try stateDataPersist(try encryptedState(candidate), stateURL)
+                stateLoadStatus = .loaded
+                return candidate
+            }
+            guard candidate.profile?.id.lowercased() == accountID,
+                  candidate.messagingBrokerGeneration == nil || candidate.messagingBrokerGeneration == authority.generation
+            else { throw StoreError.accountChanged }
+            if candidate.messagingBrokerGeneration == nil,
+               candidate.secureMessaging != nil || !candidate.outbox.isEmpty {
+                guard state.messagingBrokerGeneration == nil, authority.allowsLegacyMessagingImport == true else {
+                    throw StoreError.accountChanged
+                }
+            }
+            candidate.messagingBrokerGeneration = authority.generation
+            let baselineCrypto = state.profile?.id.lowercased() == accountID
+                && state.messagingBrokerGeneration == authority.generation ? state.secureMessaging : nil
+            var record = try broker.recordLocked()
+            let initializesRecord = record?.generation != authority.generation || record?.accountID != accountID
+            if initializesRecord {
+                if let record { try broker.preservePrivateReceiptLocked(record) }
+                record = MessagingProcessBroker.Record(
+                    generation: authority.generation, accountID: accountID,
+                    crypto: baselineCrypto,
+                    privateTransactionID: state.messagingBrokerTransactionID
+                )
+            }
+            guard var committed = record else { throw MessagingProcessBroker.Failure.corrupt }
+            let changesCrypto = candidate.secureMessaging != baselineCrypto
+            if changesCrypto {
+                guard committed.crypto == baselineCrypto else {
+                    throw SecureMessagingCryptoError.staleState
+                }
+            } else {
+                candidate.secureMessaging = committed.crypto
+            }
+            // Import direct sends using the same private transaction as removal of their shared
+            // recovery record. A crash can never lose the visible sent bubble or re-encrypt it.
+            DirectShareSendRecord.project(committed.outgoing, into: &candidate)
+            let completedSends = committed.outgoing.filter(\.readyForPrivateImport)
+            guard completedSends.allSatisfy({ send in
+                guard let conversationID = send.conversation?.id, let body = send.body else { return false }
+                return candidate.messages.contains {
+                    $0.id == send.id && $0.senderId.lowercased() == accountID && $0.conversationId == conversationID
+                        && $0.serverMessageId == send.serverMessageID && $0.sentAt == send.sentAt && $0.body == body
+                        && [.sent, .delivered, .read].contains($0.state)
+                }
+            }) else { throw MessagingProcessBroker.Failure.corrupt }
+            let completedIDs = Set(completedSends.map(\.id))
+            if !changesCrypto && completedIDs.isEmpty && !initializesRecord {
+                try stateDataPersist(try encryptedState(candidate), stateURL)
+                stateLoadStatus = .loaded
+                return candidate
+            }
+            let transactionID = UUID()
+            candidate.messagingBrokerTransactionID = transactionID
+            let journal = messagingJournalURL(transactionID)
+            try stateDataPersist(try encryptedState(candidate), journal)
+            try MessagingProcessBroker.synchronizeFile(journal)
+            try MessagingProcessBroker.synchronizeFile(journal.deletingLastPathComponent())
+            committed.crypto = candidate.secureMessaging
+            committed.privateTransactionID = transactionID
+            committed.retiredStagingBatchIDs = Array(completedIDs)
+            let newlyCompleted = try completedSends.map(DirectShareSendRecord.CompletionReceipt.init)
+            committed.completionReceipts = Array(
+                ((committed.completionReceipts ?? []) + newlyCompleted)
+                    .suffix(DirectShareSendRecord.maximumCompletionReceipts)
+            )
+            committed.outgoing.removeAll { completedIDs.contains($0.id) }
+            // A throw may happen AFTER shared replacement (e.g. parent-directory fsync).
+            // Preserve the prepared WAL on uncertainty; deleting it could strand a committed
+            // ratchet with neither its message projection nor its exact recovery state.
+            try broker.saveRecordLocked(committed)
+            // If this move fails or the process dies, the shared receipt makes recovery apply
+            // precisely this journal before another snapshot, inbound decrypt or wallet write.
+            try MessagingProcessBroker.durableMove(journal, to: stateURL)
+            for id in completedIDs { DirectShareSendRecord.stagingStore.remove(batchID: id) }
+            stateLoadStatus = .loaded
+            return candidate
+        }
+    }
+
+    private func encryptedState(_ candidate: PersistedState) throws -> Data {
         let key = try encryptionKey()
         let encoder = JSONEncoder()
-        // The encrypted payload does not need a human-readable date representation. Foundation's
-        // deferred Date encoding preserves the full retry-clock value, whereas ISO-8601 drops
-        // fractional seconds and leaves the live projection different from the durable one.
         encoder.dateEncodingStrategy = .deferredToDate
         encoder.outputFormatting = [.sortedKeys]
         let clear = try encoder.encode(candidate)
-        let sealed = try AES.GCM.seal(clear, using: key)
-        guard let combined = sealed.combined else { throw StoreError.invalidCiphertext }
-        try stateDataPersist(combined, stateURL)
-        stateLoadStatus = .loaded
+        guard let combined = try AES.GCM.seal(clear, using: key).combined else {
+            throw StoreError.invalidCiphertext
+        }
+        return combined
+    }
+
+    private func messagingJournalURL(_ id: UUID) -> URL {
+        stateURL.deletingLastPathComponent().appendingPathComponent(
+            "state.\(id.uuidString.lowercased()).journal"
+        )
+    }
+
+    private func reconcileMessagingBroker() throws {
+        guard let messagingBroker, stateIsReadable,
+              !concealsStateForAcceptedDeletion, !concealsStateForProtectedStateRecovery
+        else { return }
+        try messagingBroker.withLock { broker in
+            // A committed private journal remains authoritative after session revocation. Read
+            // its receipt before checking the live session, otherwise logout could clear older
+            // history and silently discard a transaction that already advanced the ratchet.
+            if let owner = state.profile?.id.lowercased() ?? state.communicationOwnerUserID?.lowercased(),
+               let committedID = try broker.privateReceiptLocked(accountID: owner) {
+                try recoverMessagingJournal(committedID, accountID: owner)
+                try broker.consumePrivateReceiptLocked(accountID: owner)
+            }
+            let existing = try broker.recordLocked()
+            if let existing,
+               existing.accountID == state.profile?.id.lowercased(),
+               let committedID = existing.privateTransactionID {
+                try recoverMessagingJournal(committedID, accountID: existing.accountID)
+                for id in existing.retiredStagingBatchIDs ?? [] {
+                    DirectShareSendRecord.stagingStore.remove(batchID: id)
+                }
+            }
+            if let owner = state.profile?.id.lowercased() ?? state.communicationOwnerUserID?.lowercased() {
+                let confirmed = try broker.retiredHistoryLocked(accountID: owner)
+                if !confirmed.isEmpty {
+                    var recovered = state
+                    DirectShareSendRecord.project(confirmed, into: &recovered)
+                    try stateDataPersist(try encryptedState(recovered), stateURL)
+                    try MessagingProcessBroker.synchronizeFile(stateURL)
+                    try MessagingProcessBroker.synchronizeFile(stateURL.deletingLastPathComponent())
+                    state = recovered
+                    try broker.consumeRetiredHistoryLocked(accountID: owner)
+                }
+            }
+            guard let authority = try broker.authorityLocked(),
+                  let accountID = authority.session?.accountId?.lowercased(),
+                  state.profile?.id.lowercased() == accountID
+            else { return }
+            if state.messagingBrokerGeneration != authority.generation {
+                var rebound = state
+                if rebound.messagingBrokerGeneration != nil || authority.allowsLegacyMessagingImport != true {
+                    // Logout/relogin to the SAME account is still a new messaging authority.
+                    // A crash before the ordinary history-preserving clear must not resurrect
+                    // old private ratchets or queued network commands.
+                    rebound.secureMessaging = nil
+                    rebound.outbox.removeAll()
+                    for index in rebound.messages.indices
+                    where rebound.messages[index].isOutgoing
+                        && [.queued, .encrypting, .sending].contains(rebound.messages[index].state) {
+                        rebound.messages[index].state = .failed
+                        rebound.messages[index].failureReason = CustomerFacingMessagingCopy.deliveryUnconfirmedBeforeSignOut
+                    }
+                }
+                rebound.messagingBrokerGeneration = authority.generation
+                try stateDataPersist(try encryptedState(rebound), stateURL)
+                try MessagingProcessBroker.synchronizeFile(stateURL)
+                try MessagingProcessBroker.synchronizeFile(stateURL.deletingLastPathComponent())
+                state = rebound
+            }
+            guard let record = existing,
+                  record.generation == authority.generation, record.accountID == accountID
+            else {
+                if let existing { try broker.preservePrivateReceiptLocked(existing) }
+                try broker.saveRecordLocked(MessagingProcessBroker.Record(
+                    generation: authority.generation, accountID: accountID,
+                    crypto: state.secureMessaging,
+                    privateTransactionID: state.messagingBrokerTransactionID
+                ))
+                return
+            }
+            if state.secureMessaging != record.crypto { state.secureMessaging = record.crypto }
+            // Keep this cheap when there are no direct shares. Pending projections remain owned
+            // by their journal until the private durable commit consumes completed records.
+            if !record.outgoing.isEmpty {
+                var projected = state
+                DirectShareSendRecord.project(record.outgoing, into: &projected)
+                if projected.messages != state.messages || projected.conversations != state.conversations {
+                    state = projected
+                }
+            }
+        }
+    }
+
+    private func recoverMessagingJournal(_ committedID: UUID, accountID: String) throws {
+        guard state.messagingBrokerTransactionID != committedID else { return }
+        let journal = messagingJournalURL(committedID)
+        let hasJournal = FileManager.default.fileExists(atPath: journal.path)
+        let loaded = Self.loadState(
+            at: hasJournal ? journal : stateURL, injectedKeyData: injectedKeyData,
+            stateDataLoad: stateDataLoad, keyDataLoad: keyDataLoad
+        )
+        guard loaded.status == .loaded,
+              loaded.state.messagingBrokerTransactionID == committedID,
+              loaded.state.profile?.id.lowercased() == accountID
+        else { throw StoreError.invalidCiphertext }
+        if hasJournal { try MessagingProcessBroker.durableMove(journal, to: stateURL) }
+        state = loaded.state
     }
 
     private func requireMutableState() throws {
+        try reconcileMessagingBroker()
         guard !concealsStateForAcceptedDeletion,
               !concealsStateForProtectedStateRecovery,
               stateIsReadable
@@ -613,11 +811,4 @@ enum AcceptedAccountDeletionProjectionPurgeResult: Equatable {
 struct SecureLocalStateProjection {
     let state: PersistedState
     let revision: UInt64
-}
-
-enum StoreError: Error, Equatable {
-    case invalidCiphertext
-    case protectedDataUnavailable
-    case accountChanged
-    case acceptedDeletionCleanupPending
 }
