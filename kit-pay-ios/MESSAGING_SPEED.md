@@ -103,3 +103,9 @@ Build 87 passed its 226 preflight checks but stopped during native compilation w
 expanded active-call view exceeded Swift's expression type-checking limit. Build 88 separates
 that view into smaller expressions while preserving its layout, controls and event handling.
 Build 87 ran no native tests and produced no signed archive.
+
+Build 88 compiled the application, extensions and native test products successfully, then
+stopped at the simulator messaging-entitlement check before running tests. Xcode uses its
+simulator signing prefix and embeds simulated entitlements in the executable. Build 89 corrects
+that validation while retaining the exact private/shared messaging isolation and distribution
+signing requirements. Build 88 produced no signed distribution archive or upload.

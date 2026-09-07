@@ -14,13 +14,13 @@ import unittest
 from unittest.mock import patch
 
 from ios_native_test_fixture import write_native_products
+from ios_simulator_messaging_fixture import write_simulator_products
 
 
 ROOT = Path(__file__).resolve().parents[3]
 SCRIPTS = ROOT / ".github/scripts"
 sys.path.insert(0, str(SCRIPTS))
 import ios_release_readiness as READINESS
-import verify_ios_simulator_messaging as SIMULATOR_SIGNING
 
 
 def step(workflow: str, name: str) -> str:
@@ -133,7 +133,7 @@ if os.environ['KITPAY_CHANGE_PIN'] == '1':
                 self.assertEqual(result.returncode == 0, not mutate, result.stderr)
                 self.assertEqual(json.loads(source.read_text()), payload)
 
-    def execute(self, mode, *, fail_focused=False, fail_contacts=False, unsupported_mode=False):
+    def execute(self, mode, *, fail_focused=False, fail_contacts=False, unsupported_mode=False, fail_signature=False):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             executable = root / "xcodebuild"
@@ -151,19 +151,11 @@ if 'test-without-building' in sys.argv:
                 plan["TestConfigurations"][0]["TestTargets"][0]["UseDestinationArtifacts"] = True
                 generated.write_bytes(plistlib.dumps(plan))
             app = root / "KitPay-quality-derived/Build/Products/Debug-iphonesimulator/KitPay.app"
-            share = app / "PlugIns/KitPayShare.appex"
-            share.mkdir(parents=True, exist_ok=True)
-            for product in (app, share):
-                info_path = product / "Info.plist"
-                info = plistlib.loads(info_path.read_bytes()) if info_path.exists() else {}
-                info["KitMessagingKeychainGroup"] = "KITSIM0001.africa.kit.pay.ios.messaging"
-                info_path.write_bytes(plistlib.dumps(info))
+            write_simulator_products(app)
             (root / "codesign").write_text("""#!/usr/bin/env python3
-import json, os, plistlib, sys
+import json, os, sys
 with open(os.environ['KITPAY_TEST_COMMAND_LOG'], 'a') as f: f.write(json.dumps(['codesign', *sys.argv[1:]])+'\\n')
-shared = 'KITSIM0001.africa.kit.pay.ios.messaging'
-groups = [shared] if sys.argv[-1].endswith('.appex') else ['KITSIM0001.africa.kit.pay.ios', shared]
-sys.stdout.buffer.write(plistlib.dumps({'keychain-access-groups': groups}))
+if os.environ.get('KITPAY_FAIL_SIGNATURE') == '1': sys.exit(75)
 """)
             (root / "codesign").chmod(0o755)
             original = generated.read_bytes()
@@ -190,7 +182,8 @@ elif sys.argv[1:3] == ['simctl', 'privacy'] and os.environ.get('KITPAY_FAIL_CONT
             env = {**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"],
                    "RUNNER_TEMP": str(root), "KITPAY_TEST_DEVICE_ID": "fixture-device",
                    "KITPAY_TEST_COMMAND_LOG": str(log), "KITPAY_FAIL_FOCUSED": "1" if fail_focused else "0",
-                   "KITPAY_FAIL_CONTACTS": "1" if fail_contacts else "0"}
+                   "KITPAY_FAIL_CONTACTS": "1" if fail_contacts else "0",
+                   "KITPAY_FAIL_SIGNATURE": "1" if fail_signature else "0"}
             result = subprocess.run(["bash", str(SCRIPTS / "ios_native_build.sh"), mode],
                                     env=env, text=True, capture_output=True)
             actions = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
@@ -211,24 +204,21 @@ elif sys.argv[1:3] == ['simctl', 'privacy'] and os.environ.get('KITPAY_FAIL_CONT
         self.assertIn("CODE_SIGN_IDENTITY=-", calls[0])
         self.assertIn("ONLY_ACTIVE_ARCH=YES", calls[0])
         self.assertIn("-disableAutomaticPackageResolution", calls[0])
-        self.assertEqual(len(actions), 3)
-        self.assertEqual(sum(action[0] == "codesign" for action in actions), 2)
-        self.assertIn("AppIdentifierPrefix=KITSIM0001.", calls[0])
+        self.assertEqual(len(actions), 2)
+        self.assertEqual(actions[1][:4], ["codesign", "--verify", "--deep", "--strict"])
+        self.assertFalse(any(value.startswith("AppIdentifierPrefix=") for value in calls[0]))
+        self.assertIn('"simulatorMessagingVerified": true', result.stdout)
         self.assertIsNone(registration)
 
-    def test_simulator_group_validation_is_exact_and_preserves_private_group_order(self):
-        shared = "KITSIM0001.africa.kit.pay.ios.messaging"
-        private = "KITSIM0001.africa.kit.pay.ios"
-        info = {"KitMessagingKeychainGroup": shared}
-        SIMULATOR_SIGNING.validate(info, {"keychain-access-groups": [private, shared]}, share=False)
-        SIMULATOR_SIGNING.validate(info, {"keychain-access-groups": [shared]}, share=True)
-        for groups, share in (([shared, private], False), ([shared], False), ([private, shared], True),
-                              (["KITSIM0001.*"], True), ([], True)):
-            with self.subTest(groups=groups, share=share), self.assertRaises(ValueError):
-                SIMULATOR_SIGNING.validate(info, {"keychain-access-groups": groups}, share=share)
-        with self.assertRaises(ValueError):
-            SIMULATOR_SIGNING.validate({"KitMessagingKeychainGroup": "$(AppIdentifierPrefix)africa.kit.pay.ios.messaging"},
-                                       {"keychain-access-groups": [shared]}, share=True)
+    def test_signature_failure_stops_native_build_step(self):
+        result, calls, actions, registration = self.execute("build", fail_signature=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][-1], "build-for-testing")
+        self.assertNotIn('"simulatorMessagingVerified": true', result.stdout)
+        self.assertIsNone(registration)
+
+    def test_share_extension_keeps_its_runtime_isolation_flag(self):
         project = (ROOT / "KitPay.xcodeproj/project.pbxproj").read_text()
         self.assertEqual(project.count('OTHER_SWIFT_FLAGS = "$(inherited) -D KIT_SHARE_EXTENSION";'), 2)
 

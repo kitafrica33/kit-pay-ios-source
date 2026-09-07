@@ -38,6 +38,20 @@ workflow never recompiles them. Certificate import, both extension profiles, and
 all entitlement checks remain mandatory. Physical-device acceptance remains as
 documented in PARITY.md; Simulator evidence does not establish it.
 
+The existing Simulator build step verifies the built app and share extension before
+running tests. Xcode resolves their teamless ad-hoc identity to `FAKETEAMID.` and
+embeds the simulated entitlements in each executable's `__TEXT,__entitlements`
+section; the ordinary code-signature entitlement dictionary can be empty. The
+verifier checks the thin arm64 iOS Simulator executable, bounded Mach-O sections,
+exact bundle/platform metadata, matching application identifiers, and ordered
+app-private plus messaging groups (messaging only for the share extension).
+It separately verifies the original signatures with `codesign --verify --deep --strict`,
+logs the non-secret bundle/platform/group evidence, and never modifies
+or re-signs products. Distribution profile and signed-entitlement checks remain
+unchanged. Build88 compiled all native test products but stopped at the previous
+Simulator verifier before any native test executed; a successful compilation alone
+does not establish test acceptance.
+
 The focused native phase runs chat opening, pull-to-camera, long-history scrolling,
 and call-banner layout before the remaining suite. A failure stops that run early. Each focused check is
 excluded from the remaining phase, so this ordering adds no compilation or test runs.
@@ -73,3 +87,6 @@ Workflow conditions and native command selection are exercised by
 matrix, no automatic triggers, early camera/banner checks, one test compilation,
 artifact-only upload, Linux processing, and real temporary signing-key validation.
 Run all cheap checks with `python3 -m unittest discover -s .github/scripts/tests`.
+`test_ios_simulator_messaging.py` also exercises observed Xcode entitlement values,
+malformed/device binaries, exact group isolation, and signature failures using
+small local fixtures without additional builds or Simulators.
