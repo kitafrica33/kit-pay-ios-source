@@ -94,3 +94,7 @@ foreground-to-background transitions and retry after termination. Simulator chec
 establish real-device/network latency. The reported iPhone 15 testing used TestFlight build 84;
 this combined candidate needs its own physical validation. Keep process-death, simultaneous
 app/share sends, locked sharing, account replacement and uncertain-response retries in that run.
+
+Build 86 stopped during native compilation because the video-trim audio overlap call omitted
+the Apple CoreMedia `otherRange:` argument label. Build 87 corrects that call without changing
+its validation behavior. Build 86 ran no native tests and produced no signed archive.

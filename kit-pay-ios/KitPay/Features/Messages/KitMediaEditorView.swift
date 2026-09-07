@@ -1214,7 +1214,7 @@ private struct KitVideoTrimView: View {
             guard abs(CMTimeRangeGetEnd(videoRange).seconds - loadedDuration.seconds) <= tolerance else { return false }
             for audio in try await source.loadTracks(withMediaType: .audio) {
                 let audioRange = try await audio.load(.timeRange)
-                if CMTimeRangeGetIntersection(audioRange, range).duration.seconds > 0, audios.isEmpty {
+                if CMTimeRangeGetIntersection(audioRange, otherRange: range).duration.seconds > 0, audios.isEmpty {
                     return false
                 }
             }
