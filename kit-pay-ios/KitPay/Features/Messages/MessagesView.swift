@@ -4035,29 +4035,36 @@ struct ConversationView: View {
             guard isGroupConversation, !isMember else { return }
             stopReadOnlyGroupInteractions()
         }
-        .onDisappear {
-            scrollInteraction.endInteraction()
-            incomingSoundPolicy.endVisibility()
-            if !isReadOnlyAppReviewPreview {
-                model.setConversationVisible(conversation.id, visible: false)
-            }
-            // A local viewer/editor covers the chat without abandoning the selection. Keep
-            // provider imports alive across those covers; only leaving the conversation retires
-            // their generation and removes transient placeholders from the retained view state.
-            if !showPhotoPicker && !showCameraCapture && !showVideoNoteCamera
-                && editorSession == nil && pdfPageSession == nil
-                && stagedAttachmentPresentation == nil {
-                attachmentLoadGeneration &+= 1
-                stagedAttachments.removeAll { $0.isPreparing }
-                isLoadingAttachment = false
-            }
-            isComposerFocused = false
-            // An ordinary interruption pauses the draft and keeps it; leaving the chat
-            // must not cost the user what they already said. Discard stays explicit.
-            voiceRecorder.suspend()
-            presence.stopLocalTyping(conversationID: conversation.id)
-            if !isReadOnlyAppReviewPreview, !isSending { persistDraftImmediately() }
+        .onDisappear(perform: handleConversationDisappearance)
+    }
+
+    private var shouldRetireAttachmentImportsOnDisappear: Bool {
+        guard !showPhotoPicker, !showCameraCapture, !showVideoNoteCamera else { return false }
+        guard editorSession == nil else { return false }
+        guard pdfPageSession == nil else { return false }
+        return stagedAttachmentPresentation == nil
+    }
+
+    private func handleConversationDisappearance() {
+        scrollInteraction.endInteraction()
+        incomingSoundPolicy.endVisibility()
+        if !isReadOnlyAppReviewPreview {
+            model.setConversationVisible(conversation.id, visible: false)
         }
+        // A local viewer/editor covers the chat without abandoning the selection. Keep
+        // provider imports alive across those covers; only leaving the conversation retires
+        // their generation and removes transient placeholders from the retained view state.
+        if shouldRetireAttachmentImportsOnDisappear {
+            attachmentLoadGeneration &+= 1
+            stagedAttachments.removeAll { $0.isPreparing }
+            isLoadingAttachment = false
+        }
+        isComposerFocused = false
+        // An ordinary interruption pauses the draft and keeps it; leaving the chat
+        // must not cost the user what they already said. Discard stays explicit.
+        voiceRecorder.suspend()
+        presence.stopLocalTyping(conversationID: conversation.id)
+        if !isReadOnlyAppReviewPreview, !isSending { persistDraftImmediately() }
     }
 
     private func promoteMountedConversationIfNeeded(_ conversations: [Conversation]) {

@@ -1327,10 +1327,11 @@ actor APIClient {
         try Task.checkCancellation()
         // Actor reentrancy during file I/O cannot let the previous account's media borrow a new
         // session or cross a newly-installed read-only fence.
-        guard SessionRefreshPolicy.matchesSessionID(
-            currentSession.sessionId,
-            current: await sessionStore.current()?.sessionId
-        ) else { throw APIClientError.signedOut }
+        guard let revalidatedSession = await sessionStore.current(),
+              SessionRefreshPolicy.matchesSessionID(
+                  currentSession.sessionId,
+                  current: revalidatedSession.sessionId
+              ) else { throw APIClientError.signedOut }
         try requireAppReviewDemoRequestPermission(
             path: path, method: "POST", sessionID: currentSession.sessionId
         )
@@ -1492,10 +1493,11 @@ actor APIClient {
             UIApplication.shared.applicationState == .active
         }
         try Task.checkCancellation()
-        guard SessionRefreshPolicy.matchesSessionID(
-            currentSession.sessionId,
-            current: await sessionStore.current()?.sessionId
-        ) else { throw APIClientError.signedOut }
+        guard let revalidatedSession = await sessionStore.current(),
+              SessionRefreshPolicy.matchesSessionID(
+                  currentSession.sessionId,
+                  current: revalidatedSession.sessionId
+              ) else { throw APIClientError.signedOut }
         try requireAppReviewDemoRequestPermission(
             path: path, method: method, sessionID: currentSession.sessionId
         )

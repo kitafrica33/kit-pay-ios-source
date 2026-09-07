@@ -57,9 +57,13 @@ assumptions while preserving all admission, callback, threshold and lifecycle as
 no jobs or test invocations and does not change the passing UI regression or app implementation.
 Build 82 passed native unit/UI validation in
 [archive run 34067592269](https://github.com/kitafrica33/kit-pay-ios/actions/runs/34067592269).
-The user also reported successful testing of that update. Build 83 adds the messaging and media
-review changes described in [MESSAGING_SPEED.md](MESSAGING_SPEED.md); its native validation
-runs once in the selected archive workflow. Frame geometry is functional evidence only;
+The user also reported successful testing of that update. Build 83's messaging changes stopped
+at native compilation: two session checks passed optional IDs to a nonoptional API, and a chat
+disappearance expression exceeded the compiler's type-checking limit. No native tests, signing
+or upload ran. Build 84 corrects those expressions while preserving logout rejection and staged
+imports across local editors. The messaging and media review changes are described in
+[MESSAGING_SPEED.md](MESSAGING_SPEED.md); native validation runs once in the selected archive
+workflow. Frame geometry is functional evidence only;
 physical responsiveness and delivery latency require device measurements.
 
 Workflow conditions and native command selection are exercised by
