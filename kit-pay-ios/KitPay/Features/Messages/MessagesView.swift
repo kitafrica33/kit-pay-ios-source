@@ -5268,10 +5268,12 @@ struct ConversationView: View {
             if !message.isOutgoing { Spacer(minLength: 44) }
         }
         .contentShape(Rectangle())
-        .onTapGesture {
+        // Normal reading needs no row tap recognizer. Install selection's gesture only
+        // while that mode owns taps; keep media controls and context menus on the bubble.
+        .gesture(isSelectingMessages ? TapGesture().onEnded { _ in
             guard isSelectingMessages else { return }
             toggleMessageSelection(message.id)
-        }
+        } : nil)
         .accessibilityAddTraits(isSelectingMessages && isSelected ? .isSelected : [])
         }
     }

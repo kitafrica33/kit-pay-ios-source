@@ -375,6 +375,72 @@ final class AppStoreScreenshotUITests: XCTestCase {
         XCTAssertTrue(cancelReply.isHittable, "The quoted message must remain cancellable")
         cancelReply.tap()
         XCTAssertFalse(app.buttons["Close camera"].exists)
+
+        // Selection owns row taps only while enabled. Exercise that transition in the same
+        // fixture, then require another real bubble drag after the selection gesture leaves.
+        tap(app.navigationBars.buttons.element(boundBy: 0), in: app, message: "Chat has no back button")
+        require(app.navigationBars["Chats"], in: app, message: "Chats did not return")
+        openFixtureConversation(in: app)
+        let selectionAnchor = timeline.staticTexts["Long history 296"].firstMatch
+        requireHittable(selectionAnchor, in: app, message: "Selection anchor is unavailable")
+        let selectionFrame = selectionAnchor.frame
+        let selectionAppFrame = app.frame
+        XCTAssertTrue(timeline.frame.intersection(selectionAppFrame).contains(selectionFrame))
+        app.coordinate(withNormalizedOffset: .zero)
+            .withOffset(CGVector(dx: selectionFrame.midX - selectionAppFrame.minX,
+                                 dy: selectionFrame.midY - selectionAppFrame.minY))
+            .press(forDuration: 1)
+        tap(app.buttons["Select"], in: app, message: "The message menu must allow selection")
+        require(app.staticTexts["1 selected"], in: app, message: "The long-pressed row must be selected")
+        let secondSelection = timeline.staticTexts["Long history 295"].firstMatch
+        require(secondSelection, in: app, message: "The second selection row is unavailable")
+        let secondSelectionFrame = secondSelection.frame
+        let secondSelectionAppFrame = app.frame
+        XCTAssertTrue(timeline.frame.intersection(secondSelectionAppFrame).contains(secondSelectionFrame))
+        let secondSelectionPoint = app.coordinate(withNormalizedOffset: .zero)
+            .withOffset(CGVector(dx: secondSelectionFrame.midX - secondSelectionAppFrame.minX,
+                                 dy: secondSelectionFrame.midY - secondSelectionAppFrame.minY))
+        secondSelectionPoint.tap()
+        require(app.staticTexts["2 selected"], in: app, message: "Selection mode must accept a row tap")
+        let selectedSecondFrame = secondSelection.frame
+        XCTAssertEqual(selectedSecondFrame.midX, secondSelectionFrame.midX, accuracy: 1,
+                       "Selecting a row must preserve its tap position")
+        XCTAssertEqual(selectedSecondFrame.midY, secondSelectionFrame.midY, accuracy: 1,
+                       "Selecting a row must preserve its reading position")
+        secondSelectionPoint.tap()
+        require(app.staticTexts["1 selected"], in: app, message: "A second tap must deselect the same row")
+        tap(app.buttons["Done"], in: app, message: "Selection mode must close")
+        requireHittable(app.buttons["Open \(fixtureContactName)'s profile"].firstMatch, in: app,
+                       message: "Normal chat controls must return after selection")
+        requireHittable(selectionAnchor, in: app, message: "The scroll anchor must remain visible")
+        let afterSelectionBefore = selectionAnchor.frame
+        let afterSelectionDistance = min(CGFloat(180), timeline.frame.height * 0.3)
+        let afterSelectionEnd = CGPoint(x: afterSelectionBefore.midX,
+                                       y: afterSelectionBefore.midY + afterSelectionDistance)
+        let afterSelectionAppFrame = app.frame
+        XCTAssertTrue(timeline.frame.intersection(afterSelectionAppFrame).contains(afterSelectionEnd))
+        selectionAnchor.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+            .press(forDuration: 0.01, thenDragTo: app.coordinate(withNormalizedOffset: .zero)
+                .withOffset(CGVector(dx: afterSelectionEnd.x - afterSelectionAppFrame.minX,
+                                     dy: afterSelectionEnd.y - afterSelectionAppFrame.minY)),
+                   withVelocity: readingDragVelocity, thenHoldForDuration: stationaryReleaseDuration)
+        let afterSelectionAfter = selectionAnchor.frame
+        let selectionGeometry = "After selection: \(afterSelectionBefore) -> \(afterSelectionAfter)"
+        print("[KitPayLongHistorySelectionGeometry] \(selectionGeometry)")
+        let selectionAttachment = XCTAttachment(string: selectionGeometry)
+        selectionAttachment.name = "long-history-scroll-after-selection"
+        selectionAttachment.lifetime = .keepAlways
+        add(selectionAttachment)
+        if afterSelectionAfter.minY - afterSelectionBefore.minY <= afterSelectionDistance * 0.5 {
+            retainHierarchy(app, named: "long-history-after-selection-drag-failure")
+            capture(app, named: "long-history-after-selection-drag-failure")
+        }
+        XCTAssertGreaterThan(afterSelectionAfter.minY - afterSelectionBefore.minY,
+                             afterSelectionDistance * 0.5,
+                             "Leaving selection must restore scrolling from inside a message bubble")
+        XCTAssertFalse(newest.isHittable, "The post-selection drag must leave the latest position")
+        XCTAssertFalse(app.buttons["Cancel reply"].exists, "A vertical drag must not select a reply")
+        XCTAssertFalse(app.buttons["Close camera"].exists, "A vertical history drag must not open camera")
     }
 
     private func openFixtureConversation(in app: XCUIApplication) {

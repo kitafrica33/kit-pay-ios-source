@@ -261,7 +261,13 @@ final class SwipeToReplyPanCoordinator: NSObject, UIGestureRecognizerDelegate {
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
         guard gestureRecognizer === pan, let scroll = scrollView else { return false }
         if pan.numberOfTouches > 0 { return true } // UIKit enforces the one-touch maximum.
-        return selectRow(at: touch.location(in: scroll), hitView: touch.view)
+        let point = touch.location(in: scroll)
+        let admitted = selectRow(at: point, hitView: touch.view)
+        traceGesture(
+            "receive admitted=\(admitted) x=\(point.x) y=\(point.y)"
+                + " scrollEnabled=\(scroll.isScrollEnabled) scrollPan=\(scroll.panGestureRecognizer.state.rawValue)"
+        )
+        return admitted
     }
 
     func selectRow(at point: CGPoint, hitView: UIView?) -> Bool {
@@ -298,7 +304,12 @@ final class SwipeToReplyPanCoordinator: NSObject, UIGestureRecognizerDelegate {
     func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
         guard gestureRecognizer === pan else { return false }
         let translation = pan.translation(in: scrollView?.window)
-        return shouldBegin(translation: CGSize(width: translation.x, height: translation.y))
+        let admitted = shouldBegin(translation: CGSize(width: translation.x, height: translation.y))
+        traceGesture(
+            "begin admitted=\(admitted) tx=\(translation.x) ty=\(translation.y)"
+                + " scrollPan=\(scrollView?.panGestureRecognizer.state.rawValue ?? -1)"
+        )
+        return admitted
     }
 
     func shouldBegin(translation: CGSize) -> Bool {
@@ -317,7 +328,17 @@ final class SwipeToReplyPanCoordinator: NSObject, UIGestureRecognizerDelegate {
 
     @objc private func panChanged(_ recognizer: UIPanGestureRecognizer) {
         let translation = recognizer.translation(in: scrollView?.window)
+        traceGesture("state=\(recognizer.state.rawValue) tx=\(translation.x) ty=\(translation.y)")
         handle(state: recognizer.state, translation: translation.x)
+    }
+
+    /// Shares the existing numeric, fixture-only camera log. This observes our recognizer;
+    /// it adds no gesture, recognizer dependency, touch delay, or production logging.
+    private func traceGesture(_ message: @autoclosure () -> String) {
+#if DEBUG && APP_STORE_SCREENSHOTS
+        guard AppStoreScreenshotFixture.isActive else { return }
+        NSLog("[KitPayCameraPull] reply %@", message())
+#endif
     }
 
     func handle(state: UIGestureRecognizer.State, translation: CGFloat) {

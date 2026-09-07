@@ -1,0 +1,9 @@
+# Native chat gesture checks
+
+The timeline uses its native scroll pan for vertical reading and bottom-pull camera input. A single directional reply pan on the containing scroll view rejects vertical movement. Message rows install their selection tap gesture only while selection mode is active; normal reading has no selection tap handler. The optional gesture preserves the row's view identity and its media controls and context menu.
+
+`testLongHistoryVerticalBubbleDragsPreserveReadingPosition` exercises both incoming and outgoing bubbles with 60-point-per-second drags and a 0.5-second terminal hold. Its two original drag pairs retain their movement, partial-return, idle-position and jump-to-latest assertions. The same case checks reopening, horizontal replies, the stationary context menu, selection and deselection by row tap, and a further vertical drag after leaving selection. It does not retry missed gestures or measure physical-device latency.
+
+The native workflow compiles once and executes each selected case once from those products. Its existing fixture log includes numeric scroll geometry and reply-recognizer admission, translation and state. Reply tracing adds no recognizer, gesture dependency or touch delay. It requires both the `DEBUG`/`APP_STORE_SCREENSHOTS` compilation flags and the explicitly launched screenshot fixture; production does not emit it.
+
+Build 93's first vertical drag recorded zero movement, with no native scroll-pan callback. The retained screenshot showed no persistent menu or keyboard, and XCTest's synthesized path matched the intended coordinates. Those observations do not identify which interaction prevented native scrolling. Removing the unused selection handler reduces competing gesture work; a passing native run alone does not establish that every intermittent input failure or physical-device delay has been resolved. The unchanged scrolling assertions remain a release gate alongside encrypted-sharing tests.
