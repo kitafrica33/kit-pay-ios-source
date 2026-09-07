@@ -265,6 +265,7 @@ actor SessionStore {
                 authority.sharingGeneration = UUID()
                 authority.requiresBiometricUnlock = nil
                 authority.biometricDomainState = nil
+                authority.biometricCredential = nil
                 authority.allowsLegacyMessagingImport = false
                 try broker.revokeSessionLocked(generation: sharedAuthority?.generation ?? UUID())
                 if let previous = sharedAuthority?.generation {

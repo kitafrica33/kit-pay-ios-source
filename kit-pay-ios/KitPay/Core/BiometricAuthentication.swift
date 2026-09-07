@@ -31,6 +31,72 @@ struct KitBiometricAvailability: Equatable, Sendable {
     let unavailableMessage: String?
 }
 
+struct KitBiometricAuthenticationProof: Sendable {
+    let kind: KitBiometricKind
+    let enrollmentKeyID: String
+    private let sharingConfirmation: KitBiometricSharingConfirmation
+
+    fileprivate init(
+        kind: KitBiometricKind,
+        enrollmentKeyID: String,
+        privateKey: SecKey,
+        context: LAContext
+    ) {
+        self.kind = kind
+        self.enrollmentKeyID = enrollmentKeyID
+        sharingConfirmation = KitBiometricSharingConfirmation(
+            privateKey: privateKey, context: context
+        )
+    }
+
+    /// Call after inserting the sharing guard, before publishing it. This checks that the
+    /// exact key that authenticated is still usable without allowing another prompt.
+    func confirmForSharing() throws {
+        try sharingConfirmation.confirm()
+    }
+}
+
+struct KitBiometricSignedProof: Sendable {
+    let signature: String
+    let authentication: KitBiometricAuthenticationProof
+}
+
+/// The handles leave the actor only after its successful signature, and only one caller can
+/// consume them. Copies of a proof share this one-use confirmation; nothing is persisted.
+private final class KitBiometricSharingConfirmation: @unchecked Sendable {
+    private let lock = NSLock()
+    private let expiresAt = ContinuousClock.now.advanced(by: .seconds(60))
+    private var material: (privateKey: SecKey, context: LAContext)?
+
+    init(privateKey: SecKey, context: LAContext) {
+        material = (privateKey, context)
+    }
+
+    deinit {
+        material?.context.invalidate()
+    }
+
+    func confirm() throws {
+        lock.lock()
+        let captured = material
+        material = nil
+        lock.unlock()
+        guard let captured else { throw KitBiometricError.authenticationFailed }
+        defer { captured.context.invalidate() }
+        try Task.checkCancellation()
+        guard ContinuousClock.now < expiresAt else {
+            throw KitBiometricError.authenticationFailed
+        }
+        captured.context.interactionNotAllowed = true
+        let challenge = Data("kit-pay-biometric-sharing-confirmation:\(UUID().uuidString)".utf8)
+        _ = try KitBiometricAuthenticator.signature(for: challenge, privateKey: captured.privateKey)
+        try Task.checkCancellation()
+        guard ContinuousClock.now < expiresAt else {
+            throw KitBiometricError.authenticationFailed
+        }
+    }
+}
+
 struct KitBiometricEnrollment: Codable, Equatable, Sendable {
     let userID: String
     let installationID: String
@@ -416,6 +482,23 @@ actor KitBiometricAuthenticator {
         )
     }
 
+    /// Missing or unusable key material does not disable an existing enrollment. A metadata
+    /// read/decoding failure is also not evidence that biometric protection was turned off.
+    func isConfigured(
+        forUserID userID: String,
+        installationID: String
+    ) throws -> Bool {
+        do {
+            return KitBiometricEnrollmentPolicy.belongsToCurrentUser(
+                try storedEnrollment(),
+                userID: userID,
+                installationID: installationID
+            )
+        } catch {
+            throw KitBiometricError.storage
+        }
+    }
+
     func isEnabled(
         forUserID userID: String,
         installationID: String
@@ -449,27 +532,57 @@ actor KitBiometricAuthenticator {
         forUserID userID: String,
         installationID: String
     ) async throws -> KitBiometricKind {
-        let kind = try await evaluate(
+        try await enableWithProof(
+            forUserID: userID,
+            installationID: installationID
+        ).kind
+    }
+
+    func enableWithProof(
+        forUserID userID: String,
+        installationID: String
+    ) async throws -> KitBiometricAuthenticationProof {
+        let context = try await evaluate(
             reason: "Enable biometric sign-in and protect Kit Pay payments"
         )
+        var contextRetainedForSharing = false
+        defer { if !contextRetainedForSharing { context.invalidate() } }
+        let kind = Self.kind(for: context.biometryType)
 
         do {
             try removeStoredMaterial()
-            let privateKey = try KeychainStore.createSecureEnclaveP256PrivateKey(
+            let createdPrivateKey = try KeychainStore.createSecureEnclaveP256PrivateKey(
                 applicationTag: privateKeyTag
+            )
+            let createdKeyID = try Self.publicKeyFingerprint(createdPrivateKey)
+            // Attach the context that just authenticated to this new key. There is no
+            // suspension between creation, the identity check, and signing with this handle.
+            let privateKey = try requirePrivateKey(context: context)
+            let enrollmentKeyID = try Self.publicKeyFingerprint(privateKey)
+            guard enrollmentKeyID == createdKeyID else {
+                throw KitBiometricError.keyMissing
+            }
+            let localChallenge = Data(
+                "kit-pay-biometric-enrollment:\(UUID().uuidString)".utf8
+            )
+            _ = try Self.signature(for: localChallenge, privateKey: privateKey)
+            let proof = KitBiometricAuthenticationProof(
+                kind: kind, enrollmentKeyID: enrollmentKeyID,
+                privateKey: privateKey, context: context
             )
             let enrollment = KitBiometricEnrollment(
                 userID: userID,
                 installationID: installationID,
                 kind: kind,
-                publicKeySHA256: try Self.publicKeyFingerprint(privateKey),
+                publicKeySHA256: enrollmentKeyID,
                 enabledAt: Date()
             )
             try KeychainStore.set(
                 JSONEncoder().encode(enrollment),
                 for: enrollmentAccount
             )
-            return kind
+            contextRetainedForSharing = true
+            return proof
         } catch let error as KitBiometricError {
             removeStoredMaterialIgnoringErrors()
             throw error
@@ -495,13 +608,28 @@ actor KitBiometricAuthenticator {
         installationID: String,
         reason: String
     ) throws -> KitBiometricKind {
+        try authenticateWithProof(
+            userID: userID,
+            installationID: installationID,
+            reason: reason
+        ).kind
+    }
+
+    func authenticateWithProof(
+        userID: String,
+        installationID: String,
+        reason: String
+    ) throws -> KitBiometricAuthenticationProof {
         let enrollment = try requireEnrollment(
             userID: userID,
             installationID: installationID
         )
         let context = try Self.authenticationContext(reason: reason)
+        var contextRetainedForSharing = false
+        defer { if !contextRetainedForSharing { context.invalidate() } }
         let privateKey = try requirePrivateKey(context: context)
-        guard try Self.publicKeyFingerprint(privateKey) == enrollment.publicKeySHA256 else {
+        let enrollmentKeyID = try Self.publicKeyFingerprint(privateKey)
+        guard enrollmentKeyID == enrollment.publicKeySHA256 else {
             throw KitBiometricError.keyMissing
         }
 
@@ -512,7 +640,13 @@ actor KitBiometricAuthenticator {
             for: localChallenge,
             privateKey: privateKey
         )
-        return Self.kind(for: context.biometryType)
+        let proof = KitBiometricAuthenticationProof(
+            kind: Self.kind(for: context.biometryType),
+            enrollmentKeyID: enrollmentKeyID,
+            privateKey: privateKey, context: context
+        )
+        contextRetainedForSharing = true
+        return proof
     }
 
     // Kept for current callers; session IDs intentionally do not participate in binding.
@@ -562,20 +696,46 @@ actor KitBiometricAuthenticator {
         installationID: String,
         reason: String
     ) throws -> String {
+        try signWithProof(
+            signingPayload: signingPayload,
+            userID: userID,
+            installationID: installationID,
+            reason: reason
+        ).signature
+    }
+
+    func signWithProof(
+        signingPayload: String,
+        userID: String,
+        installationID: String,
+        reason: String
+    ) throws -> KitBiometricSignedProof {
         let enrollment = try requireEnrollment(
             userID: userID,
             installationID: installationID
         )
         let context = try Self.authenticationContext(reason: reason)
+        var contextRetainedForSharing = false
+        defer { if !contextRetainedForSharing { context.invalidate() } }
         let privateKey = try requirePrivateKey(context: context)
-        guard try Self.publicKeyFingerprint(privateKey) == enrollment.publicKeySHA256 else {
+        let enrollmentKeyID = try Self.publicKeyFingerprint(privateKey)
+        guard enrollmentKeyID == enrollment.publicKeySHA256 else {
             throw KitBiometricError.keyMissing
         }
         let signature = try Self.signature(
             for: KitBiometricP256.signingPayloadData(signingPayload),
             privateKey: privateKey
         )
-        return KitBiometricP256.base64URLEncodedString(signature)
+        let proof = KitBiometricSignedProof(
+            signature: KitBiometricP256.base64URLEncodedString(signature),
+            authentication: KitBiometricAuthenticationProof(
+                kind: Self.kind(for: context.biometryType),
+                enrollmentKeyID: enrollmentKeyID,
+                privateKey: privateKey, context: context
+            )
+        )
+        contextRetainedForSharing = true
+        return proof
     }
 
     func sign(
@@ -722,7 +882,7 @@ actor KitBiometricAuthenticator {
 
     private func evaluate(
         reason: String
-    ) async throws -> KitBiometricKind {
+    ) async throws -> LAContext {
         let context = Self.makeAuthenticationContext(reason: reason)
         var policyError: NSError?
         guard context.canEvaluatePolicy(
@@ -738,7 +898,7 @@ actor KitBiometricAuthenticator {
         } catch {
             throw Self.map(error as NSError)
         }
-        return Self.kind(for: context.biometryType)
+        return context
     }
 
     /// Builds the context that carries the customer-facing explanation into the Secure Enclave
@@ -799,7 +959,7 @@ actor KitBiometricAuthenticator {
         try publicKeyMaterial(privateKey).fingerprint
     }
 
-    private static func signature(for payload: Data, privateKey: SecKey) throws -> Data {
+    fileprivate static func signature(for payload: Data, privateKey: SecKey) throws -> Data {
         var signingError: Unmanaged<CFError>?
         guard let signature = SecKeyCreateSignature(
             privateKey,

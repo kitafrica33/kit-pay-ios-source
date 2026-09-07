@@ -1374,6 +1374,7 @@ final class AppModel: ObservableObject {
         didSet { if isSigningOut { revokeSharedMessagingAccess() } }
     }
     private var directSharingAccountEpoch: UUID?
+    private var biometricSharingApprovalBlockedEpoch: UUID?
     private var directShareResumeTask: Task<Void, Never>?
     private var directShareResumeID: UUID?
     private var shareSuggestionTask: Task<Void, Never>?
@@ -4740,6 +4741,106 @@ final class AppModel: ObservableObject {
             && !acceptedAccountDeletionCleanupBlocked && !unresolvedAccountDeletionAttemptBlocked
             && !protectedLocalStateRecoveryBlocked && appReviewDemoMutationsAllowed
             && secureMessagingAvailable && hasUsableCommunicationPrivacyProjection
+            && biometricSharingApprovalBlockedEpoch != accountEpoch
+    }
+
+    private func biometricOperationContextIsCurrent(
+        userID: String, sessionID: String, accountEpoch expectedEpoch: UUID
+    ) async -> Bool {
+        let session = await sessions.current()
+        // Read the asynchronous session first, then check main-actor ownership so a response
+        // queued before a replacement sign-in cannot pass a partly evaluated guard.
+        return !Task.isCancelled && isSignedIn && !isSigningOut
+            && accountEpoch == expectedEpoch && profile?.id == userID
+            && session?.sessionId == sessionID
+            && session?.accountId?.caseInsensitiveCompare(userID) == .orderedSame
+    }
+
+    /// Only the three fresh private-key biometric paths call this. PIN unlock, background
+    /// restore and ordinary state publication cannot create or renew a sharing credential.
+    /// Optional sharing storage failure must not discard a successful wallet authentication.
+    private func approveSharedMessagingAfterBiometricProof(
+        _ proof: KitBiometricAuthenticationProof,
+        binding: Result<MessagingBiometricBinding, Error>,
+        accountEpoch expectedEpoch: UUID
+    ) async {
+        guard accountEpoch == expectedEpoch, !Task.isCancelled else { return }
+        do {
+            let binding = try binding.get()
+            let approval = Task.detached(priority: .userInitiated) {
+                try MessagingProcessBroker.shared.approveBiometricSharing(
+                    binding: binding, enrollmentKeyID: proof.enrollmentKeyID,
+                    confirmPrivateKey: { try proof.confirmForSharing() }
+                )
+            }
+            try await withTaskCancellationHandler {
+                try await approval.value
+            } onCancel: {
+                approval.cancel()
+            }
+            guard accountEpoch == expectedEpoch, !Task.isCancelled else { return }
+            biometricSharingApprovalBlockedEpoch = nil
+        } catch {
+            guard accountEpoch == expectedEpoch else { return }
+            biometricSharingApprovalBlockedEpoch = expectedEpoch
+            revokeSharedMessagingAccess()
+            biometricErrorMessage = "Secure sharing could not be approved. \(error.localizedDescription)"
+        }
+    }
+
+    private func disableSharedMessagingAfterVerifiedRecovery(
+        binding: Result<MessagingBiometricBinding, Error>, accountEpoch expectedEpoch: UUID
+    ) async {
+        guard accountEpoch == expectedEpoch, !Task.isCancelled else { return }
+        do {
+            let binding = try binding.get()
+            try await Task.detached(priority: .userInitiated) {
+                try MessagingProcessBroker.shared.disableBiometricSharing(binding: binding)
+            }.value
+            guard accountEpoch == expectedEpoch else { return }
+            biometricSharingApprovalBlockedEpoch = nil
+        } catch {
+            guard accountEpoch == expectedEpoch else { return }
+            biometricSharingApprovalBlockedEpoch = expectedEpoch
+            revokeSharedMessagingAccess()
+            biometricErrorMessage = "Secure sharing could not be updated. \(error.localizedDescription)"
+        }
+    }
+
+    /// Call only after the server accepted the PIN for this exact session. A temporarily
+    /// locked-out enrollment is retained; only a terminal, unusable enrollment is retired.
+    private func retireUnavailableBiometricsAfterVerifiedPIN(
+        userID: String, sessionID: String, accountEpoch expectedEpoch: UUID,
+        sharingBinding: Result<MessagingBiometricBinding, Error>
+    ) async {
+        guard biometricPINRecoveryRequiresEnrollmentRemoval,
+              await biometricOperationContextIsCurrent(
+                  userID: userID, sessionID: sessionID, accountEpoch: expectedEpoch
+              )
+        else { return }
+        do {
+            try await biometrics.disable(forUserID: userID, installationID: installationID())
+            guard await biometricOperationContextIsCurrent(
+                userID: userID, sessionID: sessionID, accountEpoch: expectedEpoch
+            ) else { return }
+            _ = try? await APIClientSessionBinding.$sessionID.withValue(sessionID) {
+                try await api.removeBiometricKey()
+            }
+            guard await biometricOperationContextIsCurrent(
+                userID: userID, sessionID: sessionID, accountEpoch: expectedEpoch
+            ) else { return }
+            await disableSharedMessagingAfterVerifiedRecovery(
+                binding: sharingBinding, accountEpoch: expectedEpoch
+            )
+            guard await biometricOperationContextIsCurrent(
+                userID: userID, sessionID: sessionID, accountEpoch: expectedEpoch
+            ) else { return }
+            biometricUnlockEnabled = false
+            homeBiometricState = .notRequired
+        } catch {
+            guard accountEpoch == expectedEpoch else { return }
+            biometricErrorMessage = error.localizedDescription
+        }
     }
 
     private func cancelSharedMessagingPresentationWork(revokeSuggestions: Bool = true) {
@@ -4912,8 +5013,8 @@ final class AppModel: ObservableObject {
         if requiresBiometricSignIn {
             do {
                 // Cold launches can restore the authenticated account while its UI stays locked.
-                // An existing pin permits fresh Face ID inside sharing; this cannot create or
-                // replace a biometric enrollment or enable unprompted extension access.
+                // An existing protected credential permits fresh Face ID inside sharing; this
+                // cannot create or repair approval or enable unprompted extension access.
                 try MessagingProcessBroker.shared.restoreBiometricSharingDestinations(
                     destinations, accountID: accountID
                 )
@@ -6444,12 +6545,14 @@ final class AppModel: ObservableObject {
             biometricErrorMessage = AppReviewDemoMutationPolicy.readOnlyMessage
             return false
         }
-        guard !isConfiguringBiometrics,
+        let expectedForegroundAuthorization = returningSignInBiometricAuthorizationFence.capture()
+        guard let session = await sessions.current(),
+              !isConfiguringBiometrics,
               isSignedIn,
               accountSetupStep == nil,
               sessionAssurance?.grantsFullAccess == true,
               let userID = profile?.id,
-              let session = await sessions.current()
+              session.accountId?.caseInsensitiveCompare(userID) == .orderedSame
         else { return false }
         if enabled == biometricUnlockEnabled { return true }
 
@@ -6459,72 +6562,138 @@ final class AppModel: ObservableObject {
         isConfiguringBiometrics = true
         biometricErrorMessage = nil
         var serverCredentialRemoved = false
+        var sharingProof: KitBiometricAuthenticationProof?
+        let sharingBinding = Result {
+            try MessagingProcessBroker.shared.biometricBinding(
+                accountID: userID, sessionID: expectedSessionID
+            )
+        }
         defer { isConfiguringBiometrics = false }
 
         do {
             if enabled {
                 let availability = await biometrics.availability()
                 biometricKind = availability.kind
+                guard await sessions.current()?.sessionId == expectedSessionID,
+                  !Task.isCancelled, isSignedIn, accountEpoch == expectedAccountEpoch,
+                      profile?.id == userID,
+                      returningSignInBiometricAuthorizationFence.authorizes(expectedForegroundAuthorization)
+                else { throw KitBiometricError.accountChanged }
                 guard availability.isAvailable else {
                     throw KitBiometricError.unavailable
                 }
-                biometricKind = try await biometrics.enable(
+                let proof = try await biometrics.enableWithProof(
                     forUserID: userID,
-                    sessionID: expectedSessionID,
                     installationID: expectedInstallationID
                 )
+                guard await biometricOperationContextIsCurrent(
+                    userID: userID, sessionID: expectedSessionID, accountEpoch: expectedAccountEpoch
+                ), returningSignInBiometricAuthorizationFence.authorizes(expectedForegroundAuthorization)
+                else { throw KitBiometricError.accountChanged }
+                sharingProof = proof
+                biometricKind = proof.kind
                 let publicKeyPEM = try await biometrics.publicKeyPEM(
                     forUserID: userID,
                     sessionID: expectedSessionID,
                     installationID: expectedInstallationID
                 )
-                let registration = try await api.enrollBiometricKey(
-                    publicKeyPEM: publicKeyPEM,
-                    attestation: [
-                        "platform": "ios",
-                        "key_storage": "secure_enclave",
-                        "access_control": "biometry_current_set",
-                    ]
-                )
+                let registration = try await APIClientSessionBinding.$sessionID.withValue(expectedSessionID) {
+                    try await api.enrollBiometricKey(
+                        publicKeyPEM: publicKeyPEM,
+                        attestation: [
+                            "platform": "ios",
+                            "key_storage": "secure_enclave",
+                            "access_control": "biometry_current_set",
+                        ]
+                    )
+                }
                 guard registration.algorithm?.caseInsensitiveCompare("ES256") == .orderedSame else {
                     throw KitBiometricError.storage
                 }
             } else {
-                _ = try await api.removeBiometricKey()
+                _ = try await APIClientSessionBinding.$sessionID.withValue(expectedSessionID) {
+                    try await api.removeBiometricKey()
+                }
                 serverCredentialRemoved = true
+                guard await biometricOperationContextIsCurrent(
+                    userID: userID, sessionID: expectedSessionID, accountEpoch: expectedAccountEpoch
+                ) else { throw KitBiometricError.accountChanged }
                 try await biometrics.disable(
                     forUserID: userID,
                     sessionID: expectedSessionID,
                     installationID: expectedInstallationID
                 )
             }
-            let updatedAssurance = try await api.sessionAssurance()
+            let updatedAssurance = try await APIClientSessionBinding.$sessionID.withValue(expectedSessionID) {
+                try await api.sessionAssurance()
+            }
 
-            guard isSignedIn,
+            guard await sessions.current()?.sessionId == expectedSessionID,
+                  !Task.isCancelled, isSignedIn,
                   accountEpoch == expectedAccountEpoch,
-                  profile?.id == userID,
-                  await sessions.current()?.sessionId == expectedSessionID
+                  profile?.id == userID
             else {
-                await biometrics.removeAnyEnrollment()
                 throw KitBiometricError.accountChanged
             }
+            guard !enabled || returningSignInBiometricAuthorizationFence.authorizes(expectedForegroundAuthorization)
+            else { throw KitBiometricError.cancelled }
+            if let sharingProof, updatedAssurance.grantsFullAccess {
+                await approveSharedMessagingAfterBiometricProof(
+                    sharingProof, binding: sharingBinding, accountEpoch: expectedAccountEpoch
+                )
+                guard await sessions.current()?.sessionId == expectedSessionID,
+                  !Task.isCancelled, isSignedIn,
+                      accountEpoch == expectedAccountEpoch, profile?.id == userID
+                else { throw KitBiometricError.accountChanged }
+            }
+            if !enabled {
+                await disableSharedMessagingAfterVerifiedRecovery(
+                    binding: sharingBinding, accountEpoch: expectedAccountEpoch
+                )
+            }
+            guard await biometricOperationContextIsCurrent(
+                userID: userID, sessionID: expectedSessionID, accountEpoch: expectedAccountEpoch
+            ), !enabled || returningSignInBiometricAuthorizationFence.authorizes(expectedForegroundAuthorization)
+            else { throw KitBiometricError.accountChanged }
             sessionAssurance = updatedAssurance
             biometricUnlockEnabled = enabled
             biometricSignInPermanentlyUnavailable = false
             biometricPINRecoveryRequiresEnrollmentRemoval = false
             biometricAccessState = enabled ? .authorized : .notRequired
             homeBiometricState = enabled ? .locked : .notRequired
+            publishSharedDestinationsIfPossible()
             return true
         } catch {
+            // A late configuration failure cannot remove a replacement sign-in's enrollment.
+            guard await sessions.current()?.sessionId == expectedSessionID,
+                  isSignedIn, accountEpoch == expectedAccountEpoch, profile?.id == userID
+            else { return false }
             if enabled {
-                _ = try? await api.removeBiometricKey()
-                await biometrics.removeAnyEnrollment()
+                _ = try? await APIClientSessionBinding.$sessionID.withValue(expectedSessionID) {
+                    try await api.removeBiometricKey()
+                }
+                guard await sessions.current()?.sessionId == expectedSessionID,
+                  isSignedIn, accountEpoch == expectedAccountEpoch, profile?.id == userID
+                else { return false }
+                try? await biometrics.disable(forUserID: userID, installationID: expectedInstallationID)
             } else if serverCredentialRemoved {
-                await biometrics.removeAnyEnrollment()
+                try? await biometrics.disable(forUserID: userID, installationID: expectedInstallationID)
+                guard await biometricOperationContextIsCurrent(
+                    userID: userID, sessionID: expectedSessionID, accountEpoch: expectedAccountEpoch
+                ) else { return false }
+                await disableSharedMessagingAfterVerifiedRecovery(
+                    binding: sharingBinding, accountEpoch: expectedAccountEpoch
+                )
+                guard await biometricOperationContextIsCurrent(
+                    userID: userID, sessionID: expectedSessionID, accountEpoch: expectedAccountEpoch
+                ) else { return false }
                 biometricUnlockEnabled = false
                 biometricAccessState = .notRequired
                 homeBiometricState = .notRequired
             }
+            guard await sessions.current()?.sessionId == expectedSessionID,
+                  isSignedIn, accountEpoch == expectedAccountEpoch, profile?.id == userID
+            else { return false }
             biometricErrorMessage = error.localizedDescription
             return false
         }
@@ -6541,35 +6710,46 @@ final class AppModel: ObservableObject {
 
     @discardableResult
     func retrySignInWithPIN(_ pin: String) async -> Bool {
-        guard isSignedIn,
+        guard let session = await sessions.current(),
+              isSignedIn,
               accountSetupStep == nil,
               sessionAssurance?.grantsFullAccess == true,
               biometricAccessState != .authorizing,
               isValidPaymentPin(pin),
-              let expectedSessionID = await sessions.current()?.sessionId
+              let expectedUserID = profile?.id,
+              session.accountId?.caseInsensitiveCompare(expectedUserID) == .orderedSame
         else { return false }
+        let expectedSessionID = session.sessionId
         let expectedAccountEpoch = accountEpoch
+        let sharingBinding = Result {
+            try MessagingProcessBroker.shared.biometricBinding(
+                accountID: expectedUserID, sessionID: expectedSessionID
+            )
+        }
         biometricAccessState = .authorizing
         biometricErrorMessage = nil
         do {
-            let result = try await api.unlockSession(pin: pin)
-            guard result.method.caseInsensitiveCompare("pin") == .orderedSame,
+            let result = try await APIClientSessionBinding.$sessionID.withValue(expectedSessionID) {
+                try await api.unlockSession(pin: pin)
+            }
+            guard await sessions.current()?.sessionId == expectedSessionID,
+                  result.method.caseInsensitiveCompare("pin") == .orderedSame,
                   result.sessionAssurance.grantsFullAccess,
                   isSignedIn,
-                  accountEpoch == expectedAccountEpoch,
-                  await sessions.current()?.sessionId == expectedSessionID
+                  accountEpoch == expectedAccountEpoch
             else { throw AccountSetupError.sessionNotUnlocked }
             sessionAssurance = result.sessionAssurance
             biometricAccessState = .authorized
             if selectedTab == MainTabIndex.home { homeBiometricState = .authorized }
             if biometricSignInPermanentlyUnavailable {
                 if biometricPINRecoveryRequiresEnrollmentRemoval {
-                    // A changed or missing key can never authenticate again. Remove only those
-                    // terminal enrollments; a system lockout remains enrolled after PIN recovery.
-                    await biometrics.removeAnyEnrollment()
-                    _ = try? await api.removeBiometricKey()
-                    biometricUnlockEnabled = false
-                    homeBiometricState = .notRequired
+                    await retireUnavailableBiometricsAfterVerifiedPIN(
+                        userID: expectedUserID, sessionID: expectedSessionID,
+                        accountEpoch: expectedAccountEpoch, sharingBinding: sharingBinding
+                    )
+                    guard await biometricOperationContextIsCurrent(
+                        userID: expectedUserID, sessionID: expectedSessionID, accountEpoch: expectedAccountEpoch
+                    ) else { return false }
                 }
                 biometricSignInPermanentlyUnavailable = false
                 biometricPINRecoveryRequiresEnrollmentRemoval = false
@@ -6578,9 +6758,9 @@ final class AppModel: ObservableObject {
             await resumeAuthenticatedSessionIfNeeded()
             return true
         } catch {
-            guard isSignedIn,
-                  accountEpoch == expectedAccountEpoch,
-                  await sessions.current()?.sessionId == expectedSessionID
+            guard await sessions.current()?.sessionId == expectedSessionID,
+                  isSignedIn,
+                  accountEpoch == expectedAccountEpoch
             else { return false }
             biometricAccessState = .locked
             biometricErrorMessage = error.localizedDescription
@@ -8296,10 +8476,10 @@ final class AppModel: ObservableObject {
                 if let biometricError = error as? KitBiometricError,
                    [.biometricSetChanged, .enrollmentMissing, .keyMissing, .notEnrolled,
                     .unavailable, .passcodeNotSet].contains(biometricError) {
-                    await biometrics.removeAnyEnrollment()
-                    biometricUnlockEnabled = false
-                    biometricAccessState = .notRequired
-                    homeBiometricState = .notRequired
+                    biometricAccessState = .locked
+                    homeBiometricState = .locked
+                    biometricSignInPermanentlyUnavailable = true
+                    biometricPINRecoveryRequiresEnrollmentRemoval = true
                 }
             }
             throw error
@@ -8380,37 +8560,48 @@ final class AppModel: ObservableObject {
             context,
             requiresSignedIn: requiresSignedIn
         ) else { return false }
-        let storedEnrollmentEnabled = await biometrics.isEnabled(
-            forUserID: context.userID,
-            sessionID: context.sessionID,
-            installationID: installationID()
-        )
-        guard await sessionOwnershipContextIsCurrent(
-            context,
-            requiresSignedIn: requiresSignedIn
-        ) else { return false }
-        if !storedEnrollmentEnabled {
-            // Remove only material owned by this account. A stale load must never delete an
-            // enrollment created by a replacement sign-in while the actor call was suspended.
-            try? await biometrics.disable(
-                forUserID: context.userID,
-                sessionID: context.sessionID,
-                installationID: installationID()
+        let storedEnrollmentConfigured: Bool
+        do {
+            storedEnrollmentConfigured = try await biometrics.isConfigured(
+                forUserID: context.userID, installationID: installationID()
             )
-            guard await sessionOwnershipContextIsCurrent(
-                context,
-                requiresSignedIn: requiresSignedIn
-            ) else { return false }
+        } catch {
+            guard await sessionOwnershipContextIsCurrent(context, requiresSignedIn: requiresSignedIn)
+            else { return false }
+            // An unreadable enrollment is not evidence that the user disabled biometrics.
+            biometricUnlockEnabled = true
+            biometricAccessState = .locked
+            homeBiometricState = .locked
+            biometricSignInPermanentlyUnavailable = true
+            biometricPINRecoveryRequiresEnrollmentRemoval = true
+            biometricErrorMessage = error.localizedDescription
+            return true
         }
+        let storedEnrollmentUsable = await biometrics.isEnabled(
+            forUserID: context.userID, installationID: installationID()
+        )
+        guard await sessionOwnershipContextIsCurrent(context, requiresSignedIn: requiresSignedIn)
+        else { return false }
+        let sharingStillRequiresBiometrics: Bool
+        do {
+            sharingStillRequiresBiometrics = try MessagingProcessBroker.shared.biometricSharingRequired(
+                accountID: context.userID, sessionID: context.sessionID
+            )
+        } catch {
+            // The broker requirement may be the remaining evidence after a key was invalidated.
+            sharingStillRequiresBiometrics = true
+        }
+        let configured = storedEnrollmentConfigured || sharingStillRequiresBiometrics
         biometricErrorMessage = nil
         biometricKind = availability.kind
-        // An enrolled account remains gated even if LocalAuthentication is temporarily
-        // unavailable. The verified PIN path may recover it; treating this as `.notRequired`
-        // would reveal protected account data without either factor.
-        biometricUnlockEnabled = storedEnrollmentEnabled
-        biometricAccessState = storedEnrollmentEnabled ? .locked : .notRequired
-        homeBiometricState = storedEnrollmentEnabled ? .locked : .notRequired
-        if storedEnrollmentEnabled, !availability.isAvailable {
+        biometricUnlockEnabled = configured
+        biometricAccessState = configured ? .locked : .notRequired
+        homeBiometricState = configured ? .locked : .notRequired
+        if configured, !storedEnrollmentUsable {
+            biometricErrorMessage = KitBiometricError.keyMissing.localizedDescription
+            biometricSignInPermanentlyUnavailable = true
+            biometricPINRecoveryRequiresEnrollmentRemoval = true
+        } else if configured, !availability.isAvailable {
             biometricErrorMessage = availability.unavailableMessage
             biometricSignInPermanentlyUnavailable = true
         }
@@ -8479,17 +8670,22 @@ final class AppModel: ObservableObject {
         }
 
         do {
-            let kind = try await biometrics.authenticate(
+            let sharingBinding = Result {
+                try MessagingProcessBroker.shared.biometricBinding(
+                    accountID: userID, sessionID: expectedSessionID
+                )
+            }
+            let proof = try await biometrics.authenticateWithProof(
                 userID: userID,
-                sessionID: expectedSessionID,
                 installationID: expectedInstallationID,
                 reason: purpose.reason(using: biometricKind)
             )
-            guard biometricAuthenticationGate.owns(operationID),
+            guard await sessions.current()?.sessionId == expectedSessionID,
+                  biometricAuthenticationGate.owns(operationID),
+                  !Task.isCancelled,
                   isSignedIn,
                   accountEpoch == expectedAccountEpoch,
-                  profile?.id == userID,
-                  await sessions.current()?.sessionId == expectedSessionID
+                  profile?.id == userID
             else { throw KitBiometricError.accountChanged }
             if case .returningSignIn = purpose,
                !returningSignInBiometricAuthorizationFence.authorizes(
@@ -8497,7 +8693,27 @@ final class AppModel: ObservableObject {
                ) {
                 return false
             }
-            biometricKind = kind
+            if case .home = purpose,
+               !homeBiometricAuthorizationFence.authorizes(
+                   expectedHomeAuthorization, homeIsSelected: selectedTab == MainTabIndex.home
+               ) { return false }
+            switch purpose {
+            case .returningSignIn, .home:
+                await approveSharedMessagingAfterBiometricProof(
+                    proof, binding: sharingBinding, accountEpoch: expectedAccountEpoch
+                )
+            case .paymentRequest:
+                break
+            }
+            guard await biometricOperationContextIsCurrent(
+                userID: userID, sessionID: expectedSessionID, accountEpoch: expectedAccountEpoch
+            ), biometricAuthenticationGate.owns(operationID)
+            else { throw KitBiometricError.accountChanged }
+            if case .returningSignIn = purpose,
+               !returningSignInBiometricAuthorizationFence.authorizes(expectedReturningSignInAuthorization) {
+                return false
+            }
+            biometricKind = proof.kind
             biometricSignInPermanentlyUnavailable = false
             biometricPINRecoveryRequiresEnrollmentRemoval = false
             switch purpose {
@@ -8518,6 +8734,8 @@ final class AppModel: ObservableObject {
             case .paymentRequest:
                 break
             }
+            if case .paymentRequest = purpose { return true }
+            publishSharedDestinationsIfPossible()
             return true
         } catch {
             guard biometricAuthenticationGate.owns(operationID) else { return false }
@@ -11432,17 +11650,24 @@ final class AppModel: ObservableObject {
             return
         }
         let expectedAccountEpoch = accountEpoch
+        let sharingBinding = Result {
+            try MessagingProcessBroker.shared.biometricBinding(
+                accountID: expectedUserID, sessionID: expectedSessionID
+            )
+        }
 
         isCompletingAccountSetup = true
         defer { isCompletingAccountSetup = false }
         do {
-            let result = try await api.unlockSession(pin: pin)
-            guard result.method.caseInsensitiveCompare("pin") == .orderedSame,
+            let result = try await APIClientSessionBinding.$sessionID.withValue(expectedSessionID) {
+                try await api.unlockSession(pin: pin)
+            }
+            guard await sessions.current()?.sessionId == expectedSessionID,
+                  result.method.caseInsensitiveCompare("pin") == .orderedSame,
                   result.sessionAssurance.grantsFullAccess,
                   isSignedIn,
                   accountEpoch == expectedAccountEpoch,
-                  profile?.id == expectedUserID,
-                  await sessions.current()?.sessionId == expectedSessionID
+                  profile?.id == expectedUserID
             else { throw AccountSetupError.sessionNotUnlocked }
             sessionAssurance = result.sessionAssurance
             guard let currentProfile = profile else { throw AuthUIError.missingUser }
@@ -11452,28 +11677,45 @@ final class AppModel: ObservableObject {
                 assurance: sessionAssurance
             )
             guard accountSetupStep == nil else { throw AccountSetupError.sessionNotUnlocked }
+            let retiredUnavailableEnrollment = biometricPINRecoveryRequiresEnrollmentRemoval
+            if retiredUnavailableEnrollment {
+                await retireUnavailableBiometricsAfterVerifiedPIN(
+                    userID: expectedUserID, sessionID: expectedSessionID,
+                    accountEpoch: expectedAccountEpoch, sharingBinding: sharingBinding
+                )
+                guard await biometricOperationContextIsCurrent(
+                    userID: expectedUserID, sessionID: expectedSessionID, accountEpoch: expectedAccountEpoch
+                ) else { return }
+            }
             biometricAccessState = .authorized
             homeBiometricState = biometricUnlockEnabled ? .authorized : .notRequired
-            if !biometricUnlockEnabled,
+            if !retiredUnavailableEnrollment, !biometricUnlockEnabled,
                result.sessionAssurance.loginUnlock.supportsBiometricSignature {
-                _ = try? await api.removeBiometricKey()
-                if let updatedAssurance = try? await api.sessionAssurance() {
-                    sessionAssurance = updatedAssurance
+                _ = try? await APIClientSessionBinding.$sessionID.withValue(expectedSessionID) {
+                    try await api.removeBiometricKey()
                 }
+                let updatedAssurance = try? await APIClientSessionBinding.$sessionID.withValue(expectedSessionID) {
+                    try await api.sessionAssurance()
+                }
+                guard await biometricOperationContextIsCurrent(
+                    userID: expectedUserID, sessionID: expectedSessionID, accountEpoch: expectedAccountEpoch
+                ) else { return }
+                if let updatedAssurance { sessionAssurance = updatedAssurance }
             }
             biometricSignInPermanentlyUnavailable = false
             biometricPINRecoveryRequiresEnrollmentRemoval = false
             await resumeAuthenticatedSessionIfNeeded()
         } catch {
-            guard isSignedIn,
-                  accountEpoch == expectedAccountEpoch,
-                  await sessions.current()?.sessionId == expectedSessionID
+            guard await sessions.current()?.sessionId == expectedSessionID,
+                  isSignedIn,
+                  accountEpoch == expectedAccountEpoch
             else { return }
             lastError = error.localizedDescription
         }
     }
 
     func unlockSessionWithBiometrics() async {
+        let expectedForegroundAuthorization = returningSignInBiometricAuthorizationFence.capture()
         guard accountSetupStep == .loginUnlock,
               loginUnlockSupportsBiometrics,
               !isCompletingAccountSetup,
@@ -11488,30 +11730,46 @@ final class AppModel: ObservableObject {
         biometricErrorMessage = nil
         defer { isCompletingAccountSetup = false }
         do {
-            let challenge = try await api.createLoginBiometricChallenge()
-            let signature = try await biometrics.sign(
+            let sharingBinding = Result {
+                try MessagingProcessBroker.shared.biometricBinding(
+                    accountID: expectedUserID, sessionID: expectedSessionID
+                )
+            }
+            let challenge = try await APIClientSessionBinding.$sessionID.withValue(expectedSessionID) {
+                try await api.createLoginBiometricChallenge()
+            }
+            guard await sessions.current()?.sessionId == expectedSessionID,
+                  !Task.isCancelled, isSignedIn, accountEpoch == expectedAccountEpoch,
+                  profile?.id == expectedUserID,
+                  returningSignInBiometricAuthorizationFence.authorizes(expectedForegroundAuthorization)
+            else { throw KitBiometricError.accountChanged }
+            let signedProof = try await biometrics.signWithProof(
                 signingPayload: challenge.signingPayload,
                 userID: expectedUserID,
-                sessionID: expectedSessionID,
                 installationID: expectedInstallationID,
                 reason: "Use \(biometricDisplayName) to finish signing in to Kit Pay"
             )
-            guard isSignedIn,
+            guard await sessions.current()?.sessionId == expectedSessionID,
+                  !Task.isCancelled, isSignedIn,
+                  returningSignInBiometricAuthorizationFence.authorizes(expectedForegroundAuthorization),
                   accountEpoch == expectedAccountEpoch,
-                  profile?.id == expectedUserID,
-                  await sessions.current()?.sessionId == expectedSessionID
+                  profile?.id == expectedUserID
             else { throw KitBiometricError.accountChanged }
-            let result = try await api.assertLoginBiometricChallenge(
-                challengeId: challenge.challengeId,
-                nonce: challenge.nonce,
-                signature: signature
-            )
-            guard result.method.caseInsensitiveCompare("biometric_signature") == .orderedSame,
+            let result = try await APIClientSessionBinding.$sessionID.withValue(expectedSessionID) {
+                try await api.assertLoginBiometricChallenge(
+                    challengeId: challenge.challengeId,
+                    nonce: challenge.nonce,
+                    signature: signedProof.signature
+                )
+            }
+            guard await sessions.current()?.sessionId == expectedSessionID,
+                  !Task.isCancelled,
+                  returningSignInBiometricAuthorizationFence.authorizes(expectedForegroundAuthorization),
+                  result.method.caseInsensitiveCompare("biometric_signature") == .orderedSame,
                   result.sessionAssurance.grantsFullAccess,
                   isSignedIn,
                   accountEpoch == expectedAccountEpoch,
-                  profile?.id == expectedUserID,
-                  await sessions.current()?.sessionId == expectedSessionID
+                  profile?.id == expectedUserID
             else { throw AccountSetupError.sessionNotUnlocked }
             sessionAssurance = result.sessionAssurance
             guard let currentProfile = profile else { throw AuthUIError.missingUser }
@@ -11521,15 +11779,24 @@ final class AppModel: ObservableObject {
                 assurance: sessionAssurance
             )
             guard accountSetupStep == nil else { throw AccountSetupError.sessionNotUnlocked }
+            await approveSharedMessagingAfterBiometricProof(
+                signedProof.authentication, binding: sharingBinding, accountEpoch: expectedAccountEpoch
+            )
+            guard await biometricOperationContextIsCurrent(
+                userID: expectedUserID, sessionID: expectedSessionID, accountEpoch: expectedAccountEpoch
+            ), returningSignInBiometricAuthorizationFence.authorizes(expectedForegroundAuthorization),
+               accountSetupStep == nil, sessionAssurance?.grantsFullAccess == true
+            else { throw KitBiometricError.accountChanged }
+            biometricKind = signedProof.authentication.kind
             biometricAccessState = .authorized
             homeBiometricState = .authorized
             biometricSignInPermanentlyUnavailable = false
             biometricPINRecoveryRequiresEnrollmentRemoval = false
             await resumeAuthenticatedSessionIfNeeded()
         } catch {
-            guard isSignedIn,
-                  accountEpoch == expectedAccountEpoch,
-                  await sessions.current()?.sessionId == expectedSessionID
+            guard await sessions.current()?.sessionId == expectedSessionID,
+                  isSignedIn,
+                  accountEpoch == expectedAccountEpoch
             else { return }
             biometricErrorMessage = error.localizedDescription
             if let biometricError = error as? KitBiometricError {
@@ -11538,10 +11805,8 @@ final class AppModel: ObservableObject {
                     biometricPINRecoveryRequiresEnrollmentRemoval = false
                 } else if [.biometricSetChanged, .enrollmentMissing, .keyMissing, .notEnrolled,
                            .unavailable, .passcodeNotSet].contains(biometricError) {
-                    await biometrics.removeAnyEnrollment()
-                    biometricUnlockEnabled = false
-                    biometricAccessState = .notRequired
-                    homeBiometricState = .notRequired
+                    biometricAccessState = .locked
+                    homeBiometricState = .locked
                     biometricSignInPermanentlyUnavailable = true
                     biometricPINRecoveryRequiresEnrollmentRemoval = true
                 }
