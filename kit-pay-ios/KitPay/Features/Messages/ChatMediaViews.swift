@@ -88,6 +88,58 @@ struct ChatStagedAttachment: Identifiable {
         self.clientMessageID = nil
     }
 
+    /// A visible selection is not a durable attachment until its protected original exists.
+    /// This also reserves selection order while independent provider imports finish.
+    init(preparing id: UUID, kind: KitChatMediaKind, displayName: String, acceptedAt: Date) {
+        self.id = id
+        self.kind = kind
+        self.data = nil
+        self.localFileURL = nil
+        self.byteCount = 0
+        self.mediaType = kind == .video ? "video/mp4" : "image/jpeg"
+        self.originalMediaType = nil
+        self.preprocessingOutputStorageKey = nil
+        self.displayName = displayName
+        self.previewImage = nil
+        self.duration = nil
+        self.acceptedAt = acceptedAt
+        self.clientMessageID = nil
+    }
+
+    private init(copying attachment: ChatStagedAttachment, preview: UIImage) {
+        self.id = attachment.id
+        self.kind = attachment.kind
+        self.data = attachment.data
+        self.localFileURL = attachment.localFileURL
+        self.byteCount = attachment.byteCount
+        self.mediaType = attachment.mediaType
+        self.originalMediaType = attachment.originalMediaType
+        self.preprocessingOutputStorageKey = attachment.preprocessingOutputStorageKey
+        self.displayName = attachment.displayName
+        self.previewImage = preview
+        self.duration = attachment.duration
+        self.acceptedAt = attachment.acceptedAt
+        self.clientMessageID = attachment.clientMessageID
+    }
+
+    func replacingPreview(_ preview: UIImage) -> ChatStagedAttachment {
+        ChatStagedAttachment(copying: self, preview: preview)
+    }
+
+    var isPreparing: Bool { byteCount <= 0 || (data == nil && localFileURL == nil) }
+    var needsVideoTrim: Bool { kind == .video && !KitChatMediaLimits.fits(byteCount, kind: .video) && !isPreparing }
+    var editLabel: String? {
+        switch kind {
+        case .image: return "Edit photo"
+        case .video: return "Trim video"
+        case .document where mediaType == "application/pdf": return "Choose pages"
+        default: return nil
+        }
+    }
+    var editSymbol: String {
+        kind == .video ? "scissors" : kind == .document ? "doc.on.doc" : "slider.horizontal.3"
+    }
+
     init(
         id: UUID = UUID(),
         kind: KitChatMediaKind,
@@ -118,7 +170,7 @@ struct ChatStagedAttachment: Identifiable {
     }
 
     var isFileBacked: Bool { localFileURL != nil && data == nil }
-    var byteLabel: String { ChatMediaBytes.label(byteCount) }
+    var byteLabel: String { isPreparing ? "Preparing…" : ChatMediaBytes.label(byteCount) }
 
     /// The encrypted draft persists only attachments whose app-owned bytes already exist. A
     /// camera preview or security-scoped provider URL remains visible while its import runs, but

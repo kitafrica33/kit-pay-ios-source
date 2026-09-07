@@ -1,5 +1,28 @@
 import Foundation
 
+/// Selects transport work without changing the durable encrypted message or its retry identity.
+enum MessagingSendSchedulingPolicy {
+    static let maximumConcurrentMediaPreparations = 2
+    static let maximumImmediateUploadBytes: Int64 = 4 * 1_024 * 1_024
+
+    /// This hint is inherited by authenticated child tasks, never inferred on a worker thread.
+    /// Background recovery defaults to the termination-surviving resumable transport.
+    @TaskLocal static var isForegroundSend = false
+
+    static func usesResumableUpload(
+        ciphertextByteSize: Int64,
+        hasCheckpoint: Bool,
+        advertisedChunkBytes: Int?,
+        isForeground: Bool
+    ) -> Bool {
+        // An existing lease always owns its offsets/object identity, including tiny uploads.
+        if hasCheckpoint { return true }
+        guard advertisedChunkBytes != nil else { return false }
+        return !isForeground || ciphertextByteSize <= 0
+            || ciphertextByteSize > maximumImmediateUploadBytes
+    }
+}
+
 /// Pure, clock-independent decisions for the durable communication outbox.
 ///
 /// Keeping these rules outside `AppModel` makes message retry ordering and terminal-call replay
@@ -15,8 +38,12 @@ enum OutboxPolicy {
         case permanent
     }
 
-    static func readyCommands(_ commands: [OfflineCommand], at now: Date) -> [OfflineCommand] {
-        orderedStreamHeads(commands, at: now)
+    static func readyCommands(
+        _ commands: [OfflineCommand],
+        at now: Date,
+        preparingMediaCommandIDs: Set<UUID> = []
+    ) -> [OfflineCommand] {
+        orderedStreamHeads(commands, at: now, preparingMediaCommandIDs: preparingMediaCommandIDs)
             .filter { $0.nextAttemptAt <= now }
     }
 
@@ -28,8 +55,14 @@ enum OutboxPolicy {
     /// they cannot block the conversation, but the timer and the background task still have to be
     /// armed for them, otherwise a scheduled message would only leave the device the next time
     /// something else happened to wake the outbox.
-    static func nextWakeDate(_ commands: [OfflineCommand], at now: Date = Date()) -> Date? {
-        let runnable = orderedStreamHeads(commands, at: now).lazy.map(\.nextAttemptAt).min()
+    static func nextWakeDate(
+        _ commands: [OfflineCommand],
+        at now: Date = Date(),
+        preparingMediaCommandIDs: Set<UUID> = []
+    ) -> Date? {
+        let runnable = orderedStreamHeads(
+            commands, at: now, preparingMediaCommandIDs: preparingMediaCommandIDs
+        ).lazy.map(\.nextAttemptAt).min()
         let scheduled = commands.lazy
             .filter { $0.kind != .callAttempt && $0.isAwaitingScheduledTime(at: now) }
             .map(\.nextAttemptAt)
@@ -42,18 +75,20 @@ enum OutboxPolicy {
         }
     }
 
-    /// Only the oldest pending message in each conversation may become runnable. A newer message
+    /// Only the oldest transport-ready message in each conversation may become runnable. A newer message
     /// must not overtake an older row merely because the older row is backing off after a
     /// transport failure. Other conversations and call lifecycle commands remain independent.
     ///
-    /// A Send Later item that has not come due is the one exception: it is waiting on the clock
+    /// A Send Later item that has not come due is waiting on the clock
     /// rather than on the network, so holding the conversation's head slot for it would silently
     /// freeze every message typed after it until its send time arrived. Once its minute passes it
     /// takes part in the ordinary ordering again — by `createdAt`, so it still goes out ahead of
-    /// anything composed after it.
+    /// anything composed after it. Local preprocessing and owned unsealed media preparation
+    /// also release this slot; neither has committed a Signal envelope to order yet.
     private static func orderedStreamHeads(
         _ commands: [OfflineCommand],
-        at now: Date
+        at now: Date,
+        preparingMediaCommandIDs: Set<UUID>
     ) -> [OfflineCommand] {
         let ordered = commands
             // `.callAttempt` remains decodable only to migrate older encrypted state. New calls
@@ -64,6 +99,15 @@ enum OutboxPolicy {
             // already durable and visible, but allowing it to claim the stream head would make
             // an image encode or voice assembly freeze every later message in this conversation.
             .filter { $0.awaitingMediaPreprocessing != true }
+            // Upload preparation has not sealed a Signal envelope yet. An owned media worker
+            // may take seconds or minutes; later text must not wait behind those bytes. Once
+            // sealed, the ordinary FIFO and retry barrier applies even if a stale worker ID
+            // remains briefly in the caller's snapshot.
+            .filter {
+                !preparingMediaCommandIDs.contains($0.id)
+                    || $0.kind != .secureMessage
+                    || $0.secureMessageFanout != nil
+            }
             .sorted {
             if $0.createdAt != $1.createdAt { return $0.createdAt < $1.createdAt }
             return $0.id.uuidString < $1.id.uuidString

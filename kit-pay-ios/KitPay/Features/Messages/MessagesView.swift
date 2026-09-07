@@ -1,6 +1,5 @@
 import Contacts
 import ContactsUI
-import CoreTransferable
 import Dispatch
 import ImageIO
 import PhotosUI
@@ -1495,7 +1494,6 @@ struct ConversationView: View {
     @State private var voiceRecorderRegistryConversationID: String
     @State private var draft = ""
     @State private var showPhotoPicker = false
-    @State private var selectedPhotoItems: [PhotosPickerItem] = []
     @State private var stagedAttachments: [ChatStagedAttachment] = []
     @State private var isLoadingAttachment = false
     @State private var attachmentLoadGeneration = 0
@@ -1535,6 +1533,9 @@ struct ConversationView: View {
     @State private var highlightedMessageID: UUID?
     @State private var galleryTarget: ConversationGalleryTarget?
     @State private var editorSession: MediaEditorSession?
+    @State private var pdfPageSession: PDFPageEditorSession?
+    @State private var showsSharedMediaReview = false
+    @State private var isPreparingMediaEdit = false
     @State private var stagedAttachmentPresentation: StagedAttachmentPresentation?
     @State private var reactionPickerTarget: LocalMessage?
     @State private var reactionDetailTarget: LocalMessage?
@@ -1813,16 +1814,26 @@ struct ConversationView: View {
             && recipientMessageQueueAllowed
             && !isSending
             && !isLoadingAttachment
+            && !isPreparingMediaEdit
+            && stagedAttachments.allSatisfy { !$0.isPreparing && !$0.needsVideoTrim }
             && (hasAttachment || !trimmedDraft.isEmpty)
+    }
+
+    private var canAddComposerAttachment: Bool {
+        didRestoreDraft && !isSending && !isLoadingAttachment && !isPreparingMediaEdit
+            && stagedAttachments.count < ConversationAttachmentStagingPolicy.maximumStagedAttachments
     }
 
     private func cameraPullIsAvailable(hasTimelineContent: Bool) -> Bool {
         // The caller already rendered this snapshot. Rebuilding timelineItems here used to
         // filter, parse and sort history on every native pan update, even for ordinary scrolls.
-        hasTimelineContent && !isReadOnlyAppReviewPreview && conversationMessagingAvailable
+        hasTimelineContent && canAddComposerAttachment
+            && !isReadOnlyAppReviewPreview && conversationMessagingAvailable
             && scenePhase == .active
             && !showCameraCapture && !showVideoNoteCamera
-            && galleryTarget == nil && editorSession == nil
+            && galleryTarget == nil && editorSession == nil && pdfPageSession == nil
+            && !showsSharedMediaReview && !isPreparingMediaEdit
+            && !isLoadingAttachment && !isSending
             && !showContactProfile && !showGroupProfile && !showGroupMediaLibrary
             && pendingScrollTargetMessageID == nil
             && ConversationCameraPullPolicy.interactionIsEligible(
@@ -2960,26 +2971,51 @@ struct ConversationView: View {
         .toolbar { conversationToolbar }
     }
 
+    @ViewBuilder
+    private var sharedMediaReviewOverlay: some View {
+        if showsSharedMediaReview {
+            KitStagedMediaReviewView(
+                recipientName: recipientDisplayName,
+                attachments: stagedAttachments,
+                caption: $draft,
+                canSend: canSendMessage,
+                isBusy: isSending || isPreparingMediaEdit,
+                onOpen: openStagedAttachment,
+                onEdit: beginEditingStagedAttachment,
+                onRemove: removeStagedAttachment,
+                onClose: { showsSharedMediaReview = false },
+                onSend: { sendDraft() }
+            )
+        }
+    }
+
+    private var conversationWithSharedReview: some View {
+        ZStack {
+            conversationLayout
+                .allowsHitTesting(!showsSharedMediaReview)
+                .accessibilityHidden(showsSharedMediaReview)
+            sharedMediaReviewOverlay
+        }
+    }
+
     private var conversationMediaPickers: some View {
-        conversationLayout
-        .photosPicker(
-            isPresented: $showPhotoPicker,
-            selection: $selectedPhotoItems,
-            maxSelectionCount: ConversationAttachmentStagingPolicy.maximumStagedAttachments,
-            matching: .any(of: [.images, .videos])
-        )
-        .onChange(of: selectedPhotoItems) { _, items in
-            guard !items.isEmpty else { return }
-            attachmentLoadGeneration &+= 1
-            let generation = attachmentLoadGeneration
-            let acceptedAt = Date()
-            Task {
-                await loadPickedLibraryItems(
-                    items,
-                    generation: generation,
-                    acceptedAt: acceptedAt
-                )
+        conversationWithSharedReview
+        .sheet(isPresented: $showPhotoPicker) {
+            KitChatMediaPicker(
+                selectionLimit: ConversationAttachmentStagingPolicy.maximumStagedAttachments
+                    - stagedAttachments.count
+            ) { items in
+                if !items.isEmpty { isLoadingAttachment = true }
+                showPhotoPicker = false
+                guard !items.isEmpty else { return }
+                attachmentLoadGeneration &+= 1
+                let generation = attachmentLoadGeneration
+                let acceptedAt = Date()
+                Task {
+                    await loadPickedLibraryItems(items, generation: generation, acceptedAt: acceptedAt)
+                }
             }
+            .ignoresSafeArea()
         }
         .fullScreenCover(isPresented: $showCameraCapture) {
             KitCameraView { output in
@@ -3017,6 +3053,15 @@ struct ConversationView: View {
                         mediaID: session.id,
                         acceptedAt: session.acceptedAt
                     )
+                }
+            }
+        }
+        .fullScreenCover(item: $pdfPageSession) { session in
+            KitPDFPageSelectionView(fileURL: session.fileURL, displayName: session.displayName) { output in
+                pdfPageSession = nil
+                if let output { applySelectedPDFPages(output, replacing: session.attachmentID) }
+                if session.ownsInputFile {
+                    ChatMediaTempFiles.removeTemporaryFile(session.fileURL)
                 }
             }
         }
@@ -3924,6 +3969,9 @@ struct ConversationView: View {
         .onChange(of: model.sharedInboxDelivery) { _, _ in
             applySharedInboxDeliveryIfNeeded()
         }
+        .onChange(of: canApplySharedInboxDelivery) { _, available in
+            if available { applySharedInboxDeliveryIfNeeded() }
+        }
         .onChange(of: messages) { previousMessages, updatedMessages in
             if isSelectingMessages {
                 // Messages can vanish underneath a selection (remote deletion, account
@@ -3993,8 +4041,16 @@ struct ConversationView: View {
             if !isReadOnlyAppReviewPreview {
                 model.setConversationVisible(conversation.id, visible: false)
             }
-            attachmentLoadGeneration &+= 1
-            isLoadingAttachment = false
+            // A local viewer/editor covers the chat without abandoning the selection. Keep
+            // provider imports alive across those covers; only leaving the conversation retires
+            // their generation and removes transient placeholders from the retained view state.
+            if !showPhotoPicker && !showCameraCapture && !showVideoNoteCamera
+                && editorSession == nil && pdfPageSession == nil
+                && stagedAttachmentPresentation == nil {
+                attachmentLoadGeneration &+= 1
+                stagedAttachments.removeAll { $0.isPreparing }
+                isLoadingAttachment = false
+            }
             isComposerFocused = false
             // An ordinary interruption pauses the draft and keeps it; leaving the chat
             // must not cost the user what they already said. Discard stays explicit.
@@ -4295,6 +4351,7 @@ struct ConversationView: View {
                     .contentShape(Circle())
             }
             .accessibilityLabel("Shared item options")
+            .disabled(isLoadingAttachment || isPreparingMediaEdit || isSending)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 9)
@@ -4311,6 +4368,7 @@ struct ConversationView: View {
                 } label: {
                     Label("Photo & video library", systemImage: "photo.on.rectangle")
                 }
+                .disabled(!canAddComposerAttachment)
                 if KitCameraView.isCameraAvailable {
                     Button {
                         isComposerFocused = false
@@ -4318,12 +4376,14 @@ struct ConversationView: View {
                     } label: {
                         Label("Camera", systemImage: "camera")
                     }
+                    .disabled(!canAddComposerAttachment)
                     Button {
                         isComposerFocused = false
                         showVideoNoteCamera = true
                     } label: {
                         Label("Video note", systemImage: "video.badge.waveform")
                     }
+                    .disabled(!canAddComposerAttachment)
                 }
                 Button {
                     isComposerFocused = false
@@ -4331,6 +4391,7 @@ struct ConversationView: View {
                 } label: {
                     Label("Document", systemImage: "doc")
                 }
+                .disabled(!canAddComposerAttachment)
                 if !isGroupConversation && isServerAddressableConversation {
                     Button { openSendMoney() } label: {
                         Label("Send money", systemImage: "arrow.up.circle")
@@ -4362,7 +4423,7 @@ struct ConversationView: View {
                     ? "Attachments"
                     : "Attachments and payments"
             )
-            .disabled(!didRestoreDraft || isSending)
+            .disabled(!didRestoreDraft || isSending || isLoadingAttachment || isPreparingMediaEdit)
 
             HStack(alignment: .bottom, spacing: 4) {
                 TextField(
@@ -4424,7 +4485,7 @@ struct ConversationView: View {
                         if isLoadingAttachment || isSending {
                             ProgressView().tint(.white)
                         } else {
-                            Image(systemName: stagedAttachments.isEmpty ? "paperplane.fill" : "lock.fill")
+                            Image(systemName: "paperplane.fill")
                                 .font(.headline.bold())
                         }
                     }
@@ -4626,24 +4687,25 @@ struct ConversationView: View {
                 Text(attachment.displayName)
                     .font(.subheadline.bold())
                     .lineLimit(1)
-                Text(model.isOnline
-                    ? "\(attachment.byteLabel) · End-to-end encrypted before upload."
-                    : "\(attachment.byteLabel) · Will send securely when connected.")
+                Text(attachment.needsVideoTrim
+                    ? "Trim this video to send it"
+                    : attachment.byteLabel)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
             Spacer()
-            if attachment.kind == .video {
+            if let editLabel = attachment.editLabel {
                 Button {
-                    beginTrimmingStagedVideo(attachment)
+                    beginEditingStagedAttachment(attachment)
                 } label: {
-                    Image(systemName: "scissors")
+                    Image(systemName: attachment.editSymbol)
                         .font(.body.weight(.semibold))
                         .foregroundStyle(KitColor.green)
                         .frame(width: 40, height: 40)
                         .contentShape(Circle())
                 }
-                .accessibilityLabel("Trim video")
+                .disabled(attachment.isPreparing || isLoadingAttachment || isPreparingMediaEdit || isSending)
+                .accessibilityLabel(editLabel)
             }
             Button {
                 removeStagedAttachment(attachment.id)
@@ -4664,10 +4726,10 @@ struct ConversationView: View {
                 .allowsHitTesting(false)
         }
         .onAppear {
-            LocalMediaPerformanceMonitor.shared.markVisible(
-                mediaID: attachment.id,
-                producerScope: mediaDiagnosticsProducerScope
-            )
+            markStagedAttachmentPreviewVisible(attachment)
+        }
+        .onChange(of: attachment.previewImage != nil) { _, _ in
+            markStagedAttachmentPreviewVisible(attachment)
         }
     }
 
@@ -4704,25 +4766,26 @@ struct ConversationView: View {
                         .accessibilityLabel("Remove \(attachment.displayName)")
                     }
                     .overlay(alignment: .bottomLeading) {
-                        if attachment.kind == .video {
+                        if let editLabel = attachment.editLabel {
                             Button {
-                                beginTrimmingStagedVideo(attachment)
+                                beginEditingStagedAttachment(attachment)
                             } label: {
-                                Image(systemName: "scissors")
+                                Image(systemName: attachment.editSymbol)
                                     .font(.caption.weight(.bold))
                                     .foregroundStyle(.white)
                                     .frame(width: 24, height: 24)
                                     .background(.black.opacity(0.55), in: Circle())
                             }
                             .padding(3)
-                            .accessibilityLabel("Trim \(attachment.displayName)")
+                            .disabled(attachment.isPreparing || isLoadingAttachment || isPreparingMediaEdit || isSending)
+                            .accessibilityLabel("\(editLabel): \(attachment.displayName)")
                         }
                     }
                     .onAppear {
-                        LocalMediaPerformanceMonitor.shared.markVisible(
-                            mediaID: attachment.id,
-                            producerScope: mediaDiagnosticsProducerScope
-                        )
+                        markStagedAttachmentPreviewVisible(attachment)
+                    }
+                    .onChange(of: attachment.previewImage != nil) { _, _ in
+                        markStagedAttachmentPreviewVisible(attachment)
                     }
                     .accessibilityElement(children: .contain)
                     .accessibilityLabel(attachment.displayName)
@@ -4734,6 +4797,7 @@ struct ConversationView: View {
     }
 
     private func removeStagedAttachment(_ id: UUID) {
+        guard !isSending, !isPreparingMediaEdit else { return }
         let removed = stagedAttachments.first(where: { $0.id == id })
         stagedAttachments.removeAll { $0.id == id }
         if removed != nil {
@@ -4744,13 +4808,22 @@ struct ConversationView: View {
         if stagedAttachments.isEmpty {
             attachmentLoadGeneration &+= 1
             isLoadingAttachment = false
-            selectedPhotoItems = []
         }
+    }
+
+    private func markStagedAttachmentPreviewVisible(_ attachment: ChatStagedAttachment) {
+        // A placeholder proves selection feedback, not that a photo/video thumbnail rendered.
+        guard attachment.previewImage != nil || (attachment.kind != .image && attachment.kind != .video)
+        else { return }
+        LocalMediaPerformanceMonitor.shared.markVisible(
+            mediaID: attachment.id, producerScope: mediaDiagnosticsProducerScope
+        )
     }
 
     /// Opens the sender's in-memory/local attachment directly. No upload state, remote URL, or
     /// recipient capability participates in this path.
     private func openStagedAttachment(_ attachment: ChatStagedAttachment) {
+        guard composerAccountIsCurrent, !attachment.isPreparing, !isPreparingMediaEdit, !isSending else { return }
         switch attachment.kind {
         case .image:
             let image = attachment.previewImage
@@ -4762,9 +4835,6 @@ struct ConversationView: View {
                 }
                 ?? attachment.localFileURL.flatMap {
                     AttachmentImageDecoder.preview(fromFile: $0)
-                }
-                ?? attachment.localFileURL.flatMap {
-                    UIImage(contentsOfFile: $0.path)
                 }
             guard let image else {
                 model.lastError = "That photo could not be opened."
@@ -4849,6 +4919,7 @@ struct ConversationView: View {
     /// inside that span, their current draft wins and remains in this chat.
     @discardableResult
     private func detachAppliedShareFromComposer(_ delivery: SharedInboxDelivery) -> Bool {
+        showsSharedMediaReview = false
         attachmentLoadGeneration &+= 1
         let sharedItemIDs = Set(delivery.batch.items.map(\.id))
         let removedMediaIDs = stagedAttachments.compactMap { attachment in
@@ -4861,7 +4932,6 @@ struct ConversationView: View {
         }
         if stagedAttachments.isEmpty {
             isLoadingAttachment = false
-            selectedPhotoItems = []
         }
 
         var removedSharedText = true
@@ -4884,6 +4954,7 @@ struct ConversationView: View {
     }
 
     private func returnAppliedShareToPicker(_ delivery: SharedInboxDelivery) {
+        guard !isLoadingAttachment, !isPreparingMediaEdit, !isSending else { return }
         guard !model.sharedInboxHasDurablyQueuedContent(delivery.batch) else { return }
         let removedSharedText = detachAppliedShareFromComposer(delivery)
         model.retrySharedInboxDelivery(delivery.id)
@@ -4894,6 +4965,7 @@ struct ConversationView: View {
     }
 
     private func discardAppliedShare(_ delivery: SharedInboxDelivery) {
+        guard !isLoadingAttachment, !isPreparingMediaEdit, !isSending else { return }
         let removedSharedText = detachAppliedShareFromComposer(delivery)
         model.discardSharedInboxDelivery(delivery.id)
         if !removedSharedText {
@@ -6930,15 +7002,17 @@ struct ConversationView: View {
         isComposerFocused = false
         presence.stopLocalTyping(conversationID: conversation.id)
         Task {
-            // Draft persistence is best-effort bookkeeping. The message pipeline has its own
-            // durability, so a failed draft write (for example a brand-new conversation that
-            // has not been persisted yet) must never block the send itself.
-            let draftPersisted = await persistConversationDraft(
-                submittedDraft,
-                conversationId: conversation.id,
-                writeVersion: persistenceVersion,
-                mediaAttachments: submittedDraftMediaAttachments
-            )
+            // Text enters the durable outbox directly. Serially writing the same text into a
+            // draft first delays every Send tap; media still requires its recovery manifest.
+            var draftPersisted = true
+            if !submittedAttachments.isEmpty {
+                draftPersisted = await persistConversationDraft(
+                    submittedDraft,
+                    conversationId: conversation.id,
+                    writeVersion: persistenceVersion,
+                    mediaAttachments: submittedDraftMediaAttachments
+                )
+            }
             guard composerAccountIsCurrent else { isSending = false; return }
             guard submittedAttachments.isEmpty || draftPersisted else {
                 model.lastError = CustomerFacingMessagingCopy.draftSaveFailure
@@ -6973,6 +7047,7 @@ struct ConversationView: View {
                 )
             }
             if allQueued {
+                showsSharedMediaReview = false
                 if textSubmissionAttempt?.clientMessageID == textDiagnosticsMessageID {
                     textSubmissionAttempt = nil
                 }
@@ -6984,6 +7059,10 @@ struct ConversationView: View {
                     appliedSharedDeliveryID = nil
                     appliedSharedOriginalDraft = nil
                 }
+            } else if submittedAttachments.isEmpty, composerAccountIsCurrent {
+                // A failed queue keeps the visible draft and its normal restart recovery.
+                isSending = false
+                persistDraftImmediately()
             }
             isSending = false
         }
@@ -7105,7 +7184,6 @@ struct ConversationView: View {
             stagedAttachments.removeAll { staged in
                 attachments.contains { $0.id == staged.id }
             }
-            if stagedAttachments.isEmpty { selectedPhotoItems = [] }
         }
         return queued
     }
@@ -7598,152 +7676,148 @@ struct ConversationView: View {
 
     @MainActor
     private func loadPickedLibraryItems(
-        _ items: [PhotosPickerItem],
+        _ items: [KitChatPickedItem],
         generation: Int,
         acceptedAt: Date
     ) async {
-        guard generation == attachmentLoadGeneration else { return }
-        isLoadingAttachment = true
-        // A single picked video goes through the same trim editor a camera capture does —
-        // including one still too large to send whole, which trimming is exactly the remedy
-        // for. A mixed or multi selection stages as before; each staged video then carries
-        // its own Trim affordance.
-        if items.count == 1, let only = items.first,
-           only.supportedContentTypes.contains(where: { $0.conforms(to: .movie) }) {
-            await openLibraryVideoInEditor(
-                only,
-                generation: generation,
-                acceptedAt: acceptedAt
-            )
+        guard generation == attachmentLoadGeneration, composerAccountIsCurrent else { return }
+        defer {
+            if generation == attachmentLoadGeneration { isLoadingAttachment = false }
+        }
+        let available = ConversationAttachmentStagingPolicy.maximumStagedAttachments - stagedAttachments.count
+        guard items.count <= available else {
+            model.lastError = "This draft does not have room for all the selected items."
             return
         }
-        var failedCount = 0
+        isLoadingAttachment = true
+        // Reserve visible positions before requesting any original. Provider previews run
+        // independently, so an iCloud download never hides the rest of the selection.
         for item in items {
-            guard generation == attachmentLoadGeneration else { return }
-            let isVideo = item.supportedContentTypes.contains { $0.conforms(to: .movie) }
-            do {
-                if isVideo {
-                    guard let picked = try await item.loadTransferable(
-                        type: PickedLibraryVideo.self
-                    ) else { throw AttachmentSelectionError.invalidImage }
-                    defer { try? FileManager.default.removeItem(at: picked.url) }
-                    guard generation == attachmentLoadGeneration else { return }
-                    guard let size = try picked.url.resourceValues(
-                        forKeys: [.fileSizeKey]
-                    ).fileSize,
-                          KitChatMediaLimits.fits(size, kind: .video)
-                    else {
-                        throw AttachmentSelectionError.fileTooLarge
-                    }
-                    let mediaID = UUID()
-                    let mediaType = libraryVideoMediaType(for: item)
-                    LocalMediaPerformanceMonitor.shared.begin(
-                        mediaID: mediaID,
-                        at: acceptedAt,
-                        producerScope: mediaDiagnosticsProducerScope
-                    )
-                    guard let permanentURL = await persistStagedMediaOriginal(
-                        mediaID: mediaID,
-                        sourceURL: picked.url,
-                        mediaType: mediaType,
-                        byteCount: size,
-                        moveSource: true
-                    ) else { throw AttachmentSelectionError.invalidImage }
-                    guard generation == attachmentLoadGeneration else {
-                        await model.discardStagedMediaOriginal(mediaID: mediaID)
-                        return
-                    }
-                    stageAttachment(ChatStagedAttachment(
-                        id: mediaID,
-                        kind: .video,
-                        localFileURL: permanentURL,
-                        byteCount: size,
-                        mediaType: mediaType,
-                        displayName: "Video",
-                        previewImage: nil,
-                        acceptedAt: acceptedAt
-                    ))
-                    scheduleStagedMediaDuration(
-                        mediaID: mediaID,
-                        fileURL: permanentURL,
-                        mediaType: mediaType
-                    )
-                } else {
-                    guard let picked = try await item.loadTransferable(
-                        type: PickedLibraryImage.self
-                    ) else {
-                        throw AttachmentSelectionError.invalidImage
-                    }
-                    defer { try? FileManager.default.removeItem(at: picked.url) }
-                    guard generation == attachmentLoadGeneration else { return }
-                    guard let size = try picked.url.resourceValues(
-                        forKeys: [.fileSizeKey]
-                    ).fileSize,
-                          SharedInboxPolicy.shouldDecodeSharedImage(byteCount: size),
-                          KitChatMediaLimits.fits(size, kind: .image)
-                    else { throw AttachmentSelectionError.fileTooLarge }
-                    let mediaID = UUID()
-                    let sourceMediaType = libraryImageMediaType(for: item, url: picked.url)
-                    LocalMediaPerformanceMonitor.shared.begin(
-                        mediaID: mediaID,
-                        at: acceptedAt,
-                        producerScope: mediaDiagnosticsProducerScope
-                    )
-                    guard let permanentURL = await persistStagedMediaOriginal(
-                        mediaID: mediaID,
-                        sourceURL: picked.url,
-                        mediaType: sourceMediaType,
-                        byteCount: size,
-                        moveSource: true
-                    ) else { throw AttachmentSelectionError.invalidImage }
-                    guard generation == attachmentLoadGeneration else {
-                        await model.discardStagedMediaOriginal(mediaID: mediaID)
-                        return
-                    }
-                    stageAttachment(ChatStagedAttachment(
-                        id: mediaID,
-                        kind: .image,
-                        localFileURL: permanentURL,
-                        byteCount: size,
-                        mediaType: "image/jpeg",
-                        displayName: "Photo",
-                        previewImage: nil,
-                        acceptedAt: acceptedAt,
-                        originalMediaType: sourceMediaType,
-                        preprocessingOutputStorageKey: UUID().uuidString.lowercased()
-                    ))
-                    scheduleStagedImagePreview(mediaID: mediaID, fileURL: permanentURL)
-                }
-            } catch {
-                failedCount += 1
-                model.lastError = error.localizedDescription
-            }
+            stageAttachment(ChatStagedAttachment(
+                preparing: item.id,
+                kind: item.isVideo ? .video : .image,
+                displayName: item.displayName,
+                acceptedAt: acceptedAt
+            ))
         }
-        guard generation == attachmentLoadGeneration else { return }
-        selectedPhotoItems = []
+        Task { @MainActor in
+            await loadPickedLibraryPreviews(items, generation: generation)
+        }
+        let failedCount = await withTaskGroup(of: Bool.self, returning: Int.self) { group in
+            var nextIndex = 0
+            var failures = 0
+            for _ in 0..<min(2, items.count) {
+                let item = items[nextIndex]
+                nextIndex += 1
+                group.addTask { @MainActor in
+                    await importPickedLibraryItem(item, generation: generation, acceptedAt: acceptedAt)
+                }
+            }
+            while let succeeded = await group.next() {
+                if !succeeded { failures += 1 }
+                guard generation == attachmentLoadGeneration, composerAccountIsCurrent else {
+                    group.cancelAll()
+                    continue
+                }
+                if nextIndex < items.count {
+                    let item = items[nextIndex]
+                    nextIndex += 1
+                    group.addTask { @MainActor in
+                        await importPickedLibraryItem(item, generation: generation, acceptedAt: acceptedAt)
+                    }
+                }
+            }
+            return failures
+        }
+        guard generation == attachmentLoadGeneration, composerAccountIsCurrent else { return }
         isLoadingAttachment = false
-        if failedCount > 0, items.count > 1 {
+        if failedCount > 0 {
             model.lastError = failedCount == items.count
-                ? "The selected items could not be attached."
+                ? "The selected items could not be attached. Please try again."
                 : "\(failedCount) of \(items.count) selected items could not be attached."
         }
     }
 
-    private func libraryVideoMediaType(for item: PhotosPickerItem) -> String {
-        if item.supportedContentTypes.contains(where: { $0.conforms(to: .quickTimeMovie) }) {
-            return "video/quicktime"
-        }
-        return "video/mp4"
-    }
-
-    private func libraryImageMediaType(for item: PhotosPickerItem, url: URL) -> String {
-        for type in item.supportedContentTypes where type.conforms(to: .image) {
-            if let mime = type.preferredMIMEType?.lowercased(), mime.hasPrefix("image/") {
-                return mime
+    @MainActor
+    private func loadPickedLibraryPreviews(_ items: [KitChatPickedItem], generation: Int) async {
+        await withTaskGroup(of: (UUID, UIImage?).self) { group in
+            var nextIndex = 0
+            for _ in 0..<min(2, items.count) {
+                let item = items[nextIndex]
+                nextIndex += 1
+                group.addTask { (item.id, await item.preview()) }
+            }
+            while let (id, preview) = await group.next() {
+                guard generation == attachmentLoadGeneration, composerAccountIsCurrent else {
+                    group.cancelAll()
+                    continue
+                }
+                if let preview,
+                   let index = stagedAttachments.firstIndex(where: { $0.id == id }),
+                   stagedAttachments[index].previewImage == nil {
+                    stagedAttachments[index] = stagedAttachments[index].replacingPreview(preview)
+                }
+                if nextIndex < items.count {
+                    let item = items[nextIndex]
+                    nextIndex += 1
+                    group.addTask { (item.id, await item.preview()) }
+                }
             }
         }
-        return UTType(filenameExtension: url.pathExtension)?.preferredMIMEType?.lowercased()
-            ?? "image/jpeg"
+    }
+
+    @MainActor
+    private func importPickedLibraryItem(
+        _ item: KitChatPickedItem,
+        generation: Int,
+        acceptedAt: Date
+    ) async -> Bool {
+        guard generation == attachmentLoadGeneration, composerAccountIsCurrent,
+              stagedAttachments.contains(where: { $0.id == item.id }) else { return true }
+        do {
+            let picked = try await item.importOriginal()
+            defer { try? FileManager.default.removeItem(at: picked.url) }
+            guard generation == attachmentLoadGeneration, composerAccountIsCurrent,
+                  stagedAttachments.contains(where: { $0.id == item.id }) else { return true }
+            guard let permanentURL = await persistStagedMediaOriginal(
+                mediaID: item.id,
+                sourceURL: picked.url,
+                mediaType: picked.mediaType,
+                byteCount: picked.byteCount,
+                moveSource: true
+            ) else { throw CocoaError(.fileWriteUnknown) }
+            guard generation == attachmentLoadGeneration, composerAccountIsCurrent,
+                  let index = stagedAttachments.firstIndex(where: { $0.id == item.id }) else {
+                await model.discardStagedMediaOriginal(mediaID: item.id)
+                return true
+            }
+            let preview = stagedAttachments[index].previewImage
+            stagedAttachments[index] = ChatStagedAttachment(
+                id: item.id,
+                kind: item.isVideo ? .video : .image,
+                localFileURL: permanentURL,
+                byteCount: picked.byteCount,
+                mediaType: item.isVideo ? picked.mediaType : "image/jpeg",
+                displayName: item.displayName,
+                previewImage: preview,
+                acceptedAt: acceptedAt,
+                originalMediaType: item.isVideo ? nil : picked.mediaType,
+                preprocessingOutputStorageKey: item.isVideo ? nil : UUID().uuidString.lowercased()
+            )
+            persistDraftImmediately()
+            if item.isVideo {
+                scheduleStagedVideoPreview(mediaID: item.id, fileURL: permanentURL)
+                scheduleStagedMediaDuration(mediaID: item.id, fileURL: permanentURL, mediaType: picked.mediaType)
+            } else {
+                scheduleStagedImagePreview(mediaID: item.id, fileURL: permanentURL)
+            }
+            return true
+        } catch {
+            guard generation == attachmentLoadGeneration, composerAccountIsCurrent else { return true }
+            stagedAttachments.removeAll { $0.id == item.id }
+            persistDraftImmediately(removingMediaIDsAfterSuccess: [item.id])
+            return false
+        }
     }
 
     /// Thumbnail decoding is deliberately independent of durable staging and send. A protected
@@ -7754,7 +7828,7 @@ struct ConversationView: View {
             let preview = await Task.detached(priority: .userInitiated) {
                 AttachmentImageDecoder.preview(fromFile: fileURL)
             }.value
-            guard let preview,
+            guard composerAccountIsCurrent, let preview,
                   let index = stagedAttachments.firstIndex(where: {
                       $0.id == mediaID && $0.localFileURL == fileURL
                   })
@@ -7774,6 +7848,114 @@ struct ConversationView: View {
                 originalMediaType: current.originalMediaType,
                 preprocessingOutputStorageKey: current.preprocessingOutputStorageKey
             )
+        }
+    }
+
+    private func scheduleStagedVideoPreview(mediaID: UUID, fileURL: URL) {
+        guard let attachment = stagedAttachments.first(where: { $0.id == mediaID }),
+              attachment.kind == .video else { return }
+        Task { @MainActor in
+            let preview = await ChatVideoPosterGenerator.thumbnail(
+                forKey: mediaID.uuidString.lowercased(),
+                fileURL: fileURL,
+                declaredMediaType: attachment.mediaType,
+                expectedByteCount: attachment.byteCount,
+                protectedOriginalLease: nil,
+                maximumSize: CGSize(width: 640, height: 640)
+            )
+            guard composerAccountIsCurrent, let preview,
+                  let index = stagedAttachments.firstIndex(where: {
+                      $0.id == mediaID && $0.localFileURL == fileURL
+                  }) else { return }
+            stagedAttachments[index] = stagedAttachments[index].replacingPreview(preview)
+        }
+    }
+
+    private func beginEditingStagedAttachment(_ attachment: ChatStagedAttachment) {
+        guard composerAccountIsCurrent, !attachment.isPreparing, !isLoadingAttachment,
+              !isPreparingMediaEdit, !isSending, editorSession == nil, pdfPageSession == nil
+        else { return }
+        switch attachment.kind {
+        case .video:
+            beginTrimmingStagedVideo(attachment)
+        case .image:
+            isPreparingMediaEdit = true
+            Task { @MainActor in
+                defer { isPreparingMediaEdit = false }
+                let image = await Task.detached(priority: .userInitiated) { () -> UIImage? in
+                    if let fileURL = attachment.localFileURL {
+                        return AttachmentImageDecoder.preview(fromFile: fileURL, maximumPixelSize: 2_048)
+                    }
+                    if let data = attachment.data {
+                        return ChatMediaImageDecoder.downsample(data: data, maximumPixelSize: 2_048)
+                    }
+                    return nil
+                }.value
+                guard composerAccountIsCurrent,
+                      stagedAttachments.contains(where: { $0.id == attachment.id }) else { return }
+                guard let image else {
+                    model.lastError = "That photo could not be opened for editing."
+                    return
+                }
+                editorSession = MediaEditorSession(
+                    input: .photo(image), acceptedAt: attachment.acceptedAt,
+                    replacingAttachmentID: attachment.id, ownsInputFile: false
+                )
+            }
+        case .document where attachment.mediaType == "application/pdf":
+            do {
+                let ownsInputFile = attachment.localFileURL == nil
+                let url = try attachment.localFileURL ?? attachment.data.map {
+                    try ChatMediaTempFiles.writeTemporaryFile(
+                        data: $0, mediaType: "application/pdf", suggestedName: attachment.displayName
+                    )
+                }
+                guard let url else { throw CocoaError(.fileNoSuchFile) }
+                pdfPageSession = PDFPageEditorSession(
+                    attachmentID: attachment.id, fileURL: url,
+                    displayName: attachment.displayName, ownsInputFile: ownsInputFile
+                )
+            } catch {
+                model.lastError = "That PDF could not be opened for page selection."
+            }
+        default: break
+        }
+    }
+
+    private func applySelectedPDFPages(_ url: URL, replacing attachmentID: UUID) {
+        isPreparingMediaEdit = true
+        Task { @MainActor in
+            defer {
+                isPreparingMediaEdit = false
+                ChatMediaTempFiles.removeTemporaryFile(url)
+            }
+            guard composerAccountIsCurrent,
+                  let existing = stagedAttachments.first(where: { $0.id == attachmentID }) else { return }
+            do {
+                let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+                guard KitChatMediaLimits.fits(size, kind: .document) else {
+                    throw AttachmentSelectionError.fileTooLarge
+                }
+                let mediaID = UUID()
+                guard let permanentURL = await persistStagedMediaOriginal(
+                    mediaID: mediaID, sourceURL: url, mediaType: "application/pdf",
+                    byteCount: size, moveSource: true
+                ) else { throw CocoaError(.fileWriteUnknown) }
+                guard composerAccountIsCurrent,
+                      let index = stagedAttachments.firstIndex(where: { $0.id == attachmentID }) else {
+                    await model.discardStagedMediaOriginal(mediaID: mediaID)
+                    return
+                }
+                stagedAttachments[index] = ChatStagedAttachment(
+                    id: mediaID, kind: .document, localFileURL: permanentURL, byteCount: size,
+                    mediaType: "application/pdf", displayName: existing.displayName,
+                    previewImage: nil, acceptedAt: existing.acceptedAt,
+                    clientMessageID: existing.clientMessageID
+                )
+                persistDraftImmediately(removingMediaIDsAfterSuccess: [attachmentID])
+            } catch {
+                model.lastError = "The selected pages could not be saved. Your original PDF is still attached."
+            }
         }
     }
 
@@ -7983,11 +8165,14 @@ struct ConversationView: View {
               let index = stagedAttachments.firstIndex(where: { $0.id == attachmentID })
         else { return }
         let existing = stagedAttachments[index]
+        isPreparingMediaEdit = true
         Task { @MainActor in
+            defer { isPreparingMediaEdit = false }
             let prepared = await Task.detached(priority: .userInitiated) {
                 image.jpegData(compressionQuality: 0.9)
                     .flatMap(AttachmentImageDecoder.secureJPEG(from:))
             }.value
+            guard composerAccountIsCurrent else { return }
             guard let prepared else {
                 model.lastError = AttachmentSelectionError.invalidImage.localizedDescription
                 return
@@ -8005,7 +8190,7 @@ struct ConversationView: View {
                 model.lastError = "The edited photo could not be saved securely."
                 return
             }
-            guard let liveIndex = stagedAttachments.firstIndex(where: {
+            guard composerAccountIsCurrent, let liveIndex = stagedAttachments.firstIndex(where: {
                 $0.id == attachmentID
             }) else {
                 await model.discardStagedMediaOriginal(mediaID: editedMediaID)
@@ -8103,87 +8288,6 @@ struct ConversationView: View {
         }
     }
 
-    /// Adopts a picked video into permanent protected storage, publishes it in the composer, and
-    /// only then opens the trim editor over that local original. File-backed on purpose: neither
-    /// initial playback nor staging materializes the whole video in memory or waits for export.
-    @MainActor
-    private func openLibraryVideoInEditor(
-        _ item: PhotosPickerItem,
-        generation: Int,
-        acceptedAt: Date
-    ) async {
-        defer {
-            if generation == attachmentLoadGeneration {
-                selectedPhotoItems = []
-                isLoadingAttachment = false
-            }
-        }
-        do {
-            guard let picked = try await item.loadTransferable(type: PickedLibraryVideo.self)
-            else { throw AttachmentSelectionError.invalidImage }
-            defer { try? FileManager.default.removeItem(at: picked.url) }
-            guard generation == attachmentLoadGeneration else {
-                return
-            }
-            let byteCount = (try? FileManager.default
-                .attributesOfItem(atPath: picked.url.path)[.size] as? Int64) ?? 0
-            guard ConversationAttachmentStagingPolicy.editableVideoSource(byteCount: byteCount)
-            else {
-                throw AttachmentSelectionError.videoSourceTooLarge
-            }
-            let mediaType = libraryVideoMediaType(for: item)
-            let mediaID = UUID()
-            LocalMediaPerformanceMonitor.shared.begin(
-                mediaID: mediaID,
-                at: acceptedAt,
-                producerScope: mediaDiagnosticsProducerScope
-            )
-            guard let permanentURL = await persistStagedMediaOriginal(
-                mediaID: mediaID,
-                sourceURL: picked.url,
-                mediaType: mediaType,
-                byteCount: Int(byteCount),
-                moveSource: true
-            ) else { throw AttachmentSelectionError.invalidImage }
-            guard generation == attachmentLoadGeneration else {
-                await model.discardStagedMediaOriginal(mediaID: mediaID)
-                return
-            }
-            let attachment = ChatStagedAttachment(
-                id: mediaID,
-                kind: .video,
-                localFileURL: permanentURL,
-                byteCount: Int(byteCount),
-                mediaType: mediaType,
-                displayName: "Video",
-                previewImage: nil,
-                acceptedAt: acceptedAt
-            )
-            stageAttachment(attachment)
-            guard stagedAttachments.contains(where: { $0.id == mediaID }) else {
-                await model.discardStagedMediaOriginal(mediaID: mediaID)
-                return
-            }
-            scheduleStagedMediaDuration(
-                mediaID: mediaID,
-                fileURL: permanentURL,
-                mediaType: mediaType
-            )
-            // Give the picker sheet a beat to dismiss before presenting the editor cover,
-            // exactly as handleCameraOutput does between covers.
-            try? await Task.sleep(nanoseconds: 350_000_000)
-            guard generation == attachmentLoadGeneration else {
-                return
-            }
-            guard let staged = stagedAttachments.first(where: { $0.id == mediaID }) else { return }
-            beginTrimmingStagedVideo(staged)
-        } catch {
-            guard generation == attachmentLoadGeneration else { return }
-            model.lastError = (error as? LocalizedError)?.errorDescription
-                ?? "The selected video could not be read."
-        }
-    }
-
     /// Opens the trim editor directly over the permanent protected original. AVFoundation is
     /// read-only here, so copying a large file before the first frame is unnecessary; an edited
     /// export is written separately and replaces the staged identity only after it is durable.
@@ -8238,8 +8342,10 @@ struct ConversationView: View {
             if ownsInputFile { try? FileManager.default.removeItem(at: originalURL) }
             return
         }
+        isPreparingMediaEdit = true
         Task { @MainActor in
             defer {
+                isPreparingMediaEdit = false
                 try? FileManager.default.removeItem(at: url)
                 if ownsInputFile, let originalURL {
                     try? FileManager.default.removeItem(at: originalURL)
@@ -8251,7 +8357,8 @@ struct ConversationView: View {
                 else {
                     throw AttachmentSelectionError.fileTooLarge
                 }
-                guard let index = stagedAttachments.firstIndex(where: { $0.id == attachmentID })
+                guard composerAccountIsCurrent,
+                      let index = stagedAttachments.firstIndex(where: { $0.id == attachmentID })
                 else { return }
                 let existing = stagedAttachments[index]
                 let editedMediaID = UUID()
@@ -8267,7 +8374,12 @@ struct ConversationView: View {
                     byteCount: size,
                     moveSource: true
                 ) else { throw AttachmentSelectionError.invalidImage }
-                stagedAttachments[index] = ChatStagedAttachment(
+                guard composerAccountIsCurrent,
+                      let liveIndex = stagedAttachments.firstIndex(where: { $0.id == attachmentID }) else {
+                    await model.discardStagedMediaOriginal(mediaID: editedMediaID)
+                    return
+                }
+                stagedAttachments[liveIndex] = ChatStagedAttachment(
                     id: editedMediaID,
                     kind: .video,
                     localFileURL: permanentURL,
@@ -8287,6 +8399,7 @@ struct ConversationView: View {
                     fileURL: permanentURL,
                     mediaType: mediaType
                 )
+                scheduleStagedVideoPreview(mediaID: editedMediaID, fileURL: permanentURL)
                 persistDraftImmediately(removingMediaIDsAfterSuccess: [attachmentID])
             } catch {
                 model.lastError = (error as? LocalizedError)?.errorDescription
@@ -8297,19 +8410,29 @@ struct ConversationView: View {
 
     // MARK: Shares from other apps
 
+    private var canApplySharedInboxDelivery: Bool {
+        didRestoreDraft && !isLoadingAttachment && !isPreparingMediaEdit && !isSending
+            && !showPhotoPicker && !showCameraCapture && !showVideoNoteCamera
+            && !showDocumentImporter && editorSession == nil && pdfPageSession == nil
+            && stagedAttachmentPresentation == nil
+    }
+
     /// Places a share this chat was chosen for into the composer.
     ///
     /// The files are staged exactly as if they had been attached here, and any shared link or text
     /// goes into the draft — so the last decision, including whether to send at all, still belongs
     /// to the person who shared. Nothing is sent automatically.
     private func applySharedInboxDeliveryIfNeeded() {
-        guard let delivery = model.sharedInboxDelivery,
+        guard canApplySharedInboxDelivery, let delivery = model.sharedInboxDelivery,
               delivery.conversationID.caseInsensitiveCompare(conversation.id) == .orderedSame,
               appliedSharedDeliveryID != delivery.id,
               !isReadOnlyAppReviewPreview
         else { return }
         appliedSharedDeliveryID = delivery.id
         appliedSharedOriginalDraft = nil
+        // Reserve import ownership synchronously. Another share must never invalidate an
+        // in-progress library selection or strand its pending tiles on a retired generation.
+        isLoadingAttachment = true
         Task { @MainActor in
             await stageSharedInbox(delivery)
         }
@@ -8409,6 +8532,8 @@ struct ConversationView: View {
         appliedSharedOriginalDraft = draft == originalDraft ? nil : originalDraft
         stagedAttachments.append(contentsOf: preparedAttachments)
         persistDraftImmediately()
+        isComposerFocused = false
+        showsSharedMediaReview = true
         for attachment in preparedAttachments {
             if let fileURL = attachment.localFileURL {
                 scheduleStagedMediaDuration(
@@ -8416,6 +8541,9 @@ struct ConversationView: View {
                     fileURL: fileURL,
                     mediaType: attachment.mediaType
                 )
+                if attachment.kind == .video {
+                    scheduleStagedVideoPreview(mediaID: attachment.id, fileURL: fileURL)
+                }
             }
         }
         for attachment in preparedAttachments where attachment.kind == .image {
@@ -9557,47 +9685,12 @@ private struct MessageInfoTarget: Identifiable {
     var id: String { serverMessageID }
 }
 
-/// A library video received as a FILE, not as Data: the picker's copy lands directly in an
-/// editor-owned protected scratch directory, so a heavy video never has to fit in memory just
-/// to reach the trim editor. The receiver (the editor flow) owns and deletes the file.
-private struct PickedLibraryVideo: Transferable {
-    let url: URL
-
-    static var transferRepresentation: some TransferRepresentation {
-        FileRepresentation(importedContentType: .movie) { received in
-            let fileExtension = received.file.pathExtension.isEmpty
-                ? "mov"
-                : received.file.pathExtension.lowercased()
-            let destination = try KitCaptureTemporaryFileStore.makeFileURL(
-                directoryPrefix: KitCaptureTemporaryFileStore.editorDirectoryPrefix,
-                fileName: "library.\(fileExtension)"
-            )
-            try FileManager.default.copyItem(at: received.file, to: destination)
-            try KitCaptureTemporaryFileStore.protectFile(at: destination)
-            return PickedLibraryVideo(url: destination)
-        }
-    }
-}
-
-/// Image counterpart to `PickedLibraryVideo`: the provider original is copied file-to-file into
-/// protected scratch storage. Thumbnailing and JPEG optimization are separate later operations.
-private struct PickedLibraryImage: Transferable {
-    let url: URL
-
-    static var transferRepresentation: some TransferRepresentation {
-        FileRepresentation(importedContentType: .image) { received in
-            let fileExtension = received.file.pathExtension.isEmpty
-                ? "img"
-                : received.file.pathExtension.lowercased()
-            let destination = try KitCaptureTemporaryFileStore.makeFileURL(
-                directoryPrefix: KitCaptureTemporaryFileStore.editorDirectoryPrefix,
-                fileName: "library-image.\(fileExtension)"
-            )
-            try FileManager.default.copyItem(at: received.file, to: destination)
-            try KitCaptureTemporaryFileStore.protectFile(at: destination)
-            return PickedLibraryImage(url: destination)
-        }
-    }
+private struct PDFPageEditorSession: Identifiable {
+    let id = UUID()
+    let attachmentID: UUID
+    let fileURL: URL
+    let displayName: String
+    let ownsInputFile: Bool
 }
 
 private struct MediaEditorSession: Identifiable {
@@ -9823,13 +9916,13 @@ enum AttachmentImageDecoder {
         return nil
     }
 
-    static func preview(fromFile sourceURL: URL) -> UIImage? {
+    static func preview(fromFile sourceURL: URL, maximumPixelSize: Int = 1_024) -> UIImage? {
         guard let source = CGImageSourceCreateWithURL(sourceURL as CFURL, nil) else { return nil }
         let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
             kCGImageSourceShouldCacheImmediately: true,
-            kCGImageSourceThumbnailMaxPixelSize: 1_024,
+            kCGImageSourceThumbnailMaxPixelSize: maximumPixelSize,
         ]
         guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
         else { return nil }

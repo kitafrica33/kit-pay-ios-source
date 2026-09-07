@@ -2,6 +2,145 @@ import XCTest
 @testable import KitPay
 
 final class OutboxPolicyTests: XCTestCase {
+    func testUnsealedUploadDoesNotDelayLaterTextOrAnotherConversation() {
+        let uploading = command(
+            id: "01000000-0000-4000-8000-000000000001",
+            kind: .secureMessage,
+            createdAt: now.addingTimeInterval(-20),
+            nextAttemptAt: now.addingTimeInterval(-20)
+        )
+        let text = command(
+            id: "01000000-0000-4000-8000-000000000002",
+            kind: .secureMessage,
+            createdAt: now.addingTimeInterval(-10),
+            nextAttemptAt: now
+        )
+        var independent = command(
+            id: "01000000-0000-4000-8000-000000000003",
+            kind: .secureMessage,
+            createdAt: now.addingTimeInterval(-5),
+            nextAttemptAt: now
+        )
+        independent.conversationId = "conversation-2"
+        let commands = [uploading, text, independent]
+
+        XCTAssertEqual(OutboxPolicy.readyCommands(
+            commands, at: now, preparingMediaCommandIDs: [uploading.id]
+        ).map(\.id), [text.id, independent.id])
+        XCTAssertEqual(OutboxPolicy.nextWakeDate(
+            commands, at: now, preparingMediaCommandIDs: [uploading.id]
+        ), now)
+        // Releasing the worker reservation immediately returns a finished message to FIFO.
+        XCTAssertEqual(OutboxPolicy.readyCommands(commands, at: now).map(\.id),
+                       [uploading.id, independent.id])
+    }
+
+    func testInFlightMediaAloneDoesNotSpinImmediateWakeTimer() {
+        let uploading = command(
+            id: "02000000-0000-4000-8000-000000000001",
+            kind: .secureMessage, createdAt: now, nextAttemptAt: now
+        )
+        XCTAssertTrue(OutboxPolicy.readyCommands(
+            [uploading], at: now, preparingMediaCommandIDs: [uploading.id]
+        ).isEmpty)
+        XCTAssertNil(OutboxPolicy.nextWakeDate(
+            [uploading], at: now, preparingMediaCommandIDs: [uploading.id]
+        ))
+    }
+
+    func testSealedCiphertextKeepsRetryOrderingEvenWithStaleUploadReservation() {
+        var sealed = command(
+            id: "03000000-0000-4000-8000-000000000001",
+            kind: .secureMessage,
+            createdAt: now.addingTimeInterval(-1),
+            nextAttemptAt: now.addingTimeInterval(30)
+        )
+        sealed.secureMessageFanout = SecureMessagingCommittedFanout(
+            clientMessageID: sealed.messageId!.uuidString.lowercased(),
+            conversationID: sealed.conversationId!,
+            rosterRevision: "unchanged-roster",
+            replyToMessageID: nil,
+            rosterDevices: [],
+            envelopes: []
+        )
+        let text = command(
+            id: "03000000-0000-4000-8000-000000000002",
+            kind: .secureMessage, createdAt: now, nextAttemptAt: now
+        )
+        XCTAssertTrue(OutboxPolicy.readyCommands(
+            [sealed, text], at: now, preparingMediaCommandIDs: [sealed.id]
+        ).isEmpty)
+        XCTAssertEqual(OutboxPolicy.nextWakeDate(
+            [sealed, text], at: now, preparingMediaCommandIDs: [sealed.id]
+        ), sealed.nextAttemptAt)
+    }
+
+    func testMediaReservationCannotHideCallTerminationOrScheduledWake() {
+        let termination = command(
+            id: "04000000-0000-4000-8000-000000000001",
+            kind: .callTermination, createdAt: now, nextAttemptAt: now
+        )
+        var scheduled = command(
+            id: "04000000-0000-4000-8000-000000000002",
+            kind: .secureMessage, createdAt: now, nextAttemptAt: now.addingTimeInterval(60)
+        )
+        scheduled.scheduledAt = scheduled.nextAttemptAt
+        XCTAssertEqual(OutboxPolicy.readyCommands(
+            [termination], at: now, preparingMediaCommandIDs: [termination.id]
+        ).map(\.id), [termination.id])
+        XCTAssertEqual(OutboxPolicy.nextWakeDate(
+            [scheduled], at: now, preparingMediaCommandIDs: [scheduled.id]
+        ), scheduled.scheduledAt)
+    }
+
+    func testSmallForegroundMediaUsesOneRequestWhileLargeAndBackgroundResume() {
+        let limit = MessagingSendSchedulingPolicy.maximumImmediateUploadBytes
+        for size: Int64 in [1, 200_000, limit] {
+            XCTAssertFalse(MessagingSendSchedulingPolicy.usesResumableUpload(
+                ciphertextByteSize: size, hasCheckpoint: false,
+                advertisedChunkBytes: 5 * 1_024 * 1_024, isForeground: true
+            ))
+            XCTAssertTrue(MessagingSendSchedulingPolicy.usesResumableUpload(
+                ciphertextByteSize: size, hasCheckpoint: false,
+                advertisedChunkBytes: 5 * 1_024 * 1_024, isForeground: false
+            ))
+        }
+        for size: Int64 in [-1, 0, limit + 1, 200 * 1_024 * 1_024] {
+            XCTAssertTrue(MessagingSendSchedulingPolicy.usesResumableUpload(
+                ciphertextByteSize: size, hasCheckpoint: false,
+                advertisedChunkBytes: 5 * 1_024 * 1_024, isForeground: true
+            ))
+        }
+    }
+
+    func testExistingUploadCheckpointAlwaysKeepsItsTransportAndObjectIdentity() {
+        for foreground in [true, false] {
+            for advertised: Int? in [nil, 5 * 1_024 * 1_024] {
+                XCTAssertTrue(MessagingSendSchedulingPolicy.usesResumableUpload(
+                    ciphertextByteSize: 32, hasCheckpoint: true,
+                    advertisedChunkBytes: advertised, isForeground: foreground
+                ))
+            }
+        }
+        XCTAssertFalse(MessagingSendSchedulingPolicy.usesResumableUpload(
+            ciphertextByteSize: 200 * 1_024 * 1_024, hasCheckpoint: false,
+            advertisedChunkBytes: nil, isForeground: false
+        ))
+    }
+
+    func testForegroundUploadHintIsScopedAndInheritedByChildWork() async {
+        XCTAssertFalse(MessagingSendSchedulingPolicy.isForegroundSend)
+        await MessagingSendSchedulingPolicy.$isForegroundSend.withValue(true) {
+            let child = Task {
+                await Task.yield()
+                return MessagingSendSchedulingPolicy.isForegroundSend
+            }
+            let inherited = await child.value
+            XCTAssertTrue(inherited)
+        }
+        XCTAssertFalse(MessagingSendSchedulingPolicy.isForegroundSend)
+    }
+
     func testNextWakeDateSchedulesDeferredOfflineMessagesForEncryption() {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         var unsafeMessage = command(

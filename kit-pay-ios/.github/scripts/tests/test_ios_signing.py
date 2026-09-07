@@ -1696,14 +1696,16 @@ class SigningConfigurationTests(unittest.TestCase):
         project = (ROOT / "KitPay.xcodeproj/project.pbxproj").read_text()
         readme = (ROOT / "README.md").read_text()
 
-        self.assertIn("default: 1.0.16", workflow)
+        version = re.search(r'(?s)      marketing_version:.*?        default: ([0-9]+(?:\.[0-9]+){0,2})', workflow)
+        self.assertIsNotNone(version)
+        marketing_version = version.group(1)
         build = re.search(r'(?s)      build_number:.*?        default: "([1-9][0-9]*)"', workflow)
         self.assertIsNotNone(build)
         build_number = build.group(1)
-        self.assertIn(f"v1.0.16-build{build_number}", workflow)
+        self.assertIn(f"v{marketing_version}-build{build_number}", workflow)
         # Six each: Debug and Release of the app and both extensions. iOS refuses to
         # install an app whose extension carries a different version, so they move together.
-        self.assertEqual(project.count("MARKETING_VERSION = 1.0.16;"), 6)
+        self.assertEqual(project.count(f"MARKETING_VERSION = {marketing_version};"), 6)
         self.assertEqual(project.count(f"CURRENT_PROJECT_VERSION = {build_number};"), 6)
         self.assertNotIn("MARKETING_VERSION = 1.0.1;", project)
         self.assertIn("1.0.16-r39", readme)

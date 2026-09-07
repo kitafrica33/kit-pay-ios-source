@@ -4983,16 +4983,21 @@ actor SecureMessagingExchangeCoordinator {
                 else { throw SecureMediaAttachmentError.invalidMedia }
                 let sourceStorageKey = mediaRecords[0].localStorageKey ?? mediaID
                 var uploadingMessage = pendingMessage
-                guard LocalMediaRecordPolicy.markUploading(
-                    &uploadingMessage,
-                    attachmentID: mediaID
-                ) else { throw SecureMediaAttachmentError.invalidMedia }
-                uploadingMessage = try await replaceDeferredMessageProjection(
-                    uploadingMessage,
-                    command: command,
-                    message: pendingMessage,
-                    forUserID: local
-                )
+                // A prior attempt may have committed its spool/offset before suspension. The
+                // complete record identity and exact queued projection were verified above;
+                // resume that same uploading record instead of requiring a second transition.
+                if mediaRecords[0].uploadState != .uploading {
+                    guard LocalMediaRecordPolicy.markUploading(
+                        &uploadingMessage,
+                        attachmentID: mediaID
+                    ) else { throw SecureMediaAttachmentError.invalidMedia }
+                    uploadingMessage = try await replaceDeferredMessageProjection(
+                        uploadingMessage,
+                        command: command,
+                        message: pendingMessage,
+                        forUserID: local
+                    )
+                }
                 ownedMessage = uploadingMessage
                 let uploaded = try await uploadDeferredMediaDescriptor(
                     sourceStorageKey: sourceStorageKey,
@@ -5005,7 +5010,7 @@ actor SecureMessagingExchangeCoordinator {
                     keyMaterial: keyMaterial,
                     capabilities: nil,
                     command: command,
-                    message: uploadingMessage,
+                    message: &ownedMessage,
                     mediaDiagnosticsProducerScope: mediaDiagnosticsProducerScope
                 )
                 uploadingMessage = uploaded.message
@@ -5075,10 +5080,11 @@ actor SecureMessagingExchangeCoordinator {
                 else { throw SecureMessagingExchangeError.invalidAccount }
                 // §7: a capability withdrawn after queue fails the whole message closed before
                 // any upload; a multi-attachment message is never split into fragments.
-                let capabilities = try await transport.capabilities()
-                let roster = try await transport.messagingDeviceRoster(
+                async let capabilitiesRequest = transport.capabilities()
+                async let rosterRequest = transport.messagingDeviceRoster(
                     conversationId: conversationID
                 )
+                let (capabilities, roster) = try await (capabilitiesRequest, rosterRequest)
                 let draftItems = batch.items.map {
                     MessagingMediaMessageV2CapabilityPolicy.DraftItem(
                         mediaType: $0.mediaType,
@@ -5145,6 +5151,7 @@ actor SecureMessagingExchangeCoordinator {
                             )
                             ownedMessage = currentMessage
                         }
+                        ownedMessage = currentMessage
                         let uploaded = try await uploadDeferredMediaDescriptor(
                             sourceStorageKey: item.localStorageKey,
                             fallbackPlaintext: plaintext,
@@ -5156,7 +5163,7 @@ actor SecureMessagingExchangeCoordinator {
                             keyMaterial: keyMaterial,
                             capabilities: capabilities,
                             command: command,
-                            message: currentMessage,
+                            message: &ownedMessage,
                             mediaDiagnosticsProducerScope: mediaDiagnosticsProducerScope
                         )
                         currentMessage = uploaded.message
@@ -5657,7 +5664,7 @@ actor SecureMessagingExchangeCoordinator {
         keyMaterial: Data,
         capabilities suppliedCapabilities: CapabilitiesDTO?,
         command: OfflineCommand,
-        message: LocalMessage,
+        message: inout LocalMessage,
         mediaDiagnosticsProducerScope: LocalMediaDiagnosticProducerScope?
     ) async throws -> (descriptor: KitMediaMessageDescriptor, message: LocalMessage) {
         guard SecureMessagingWirePolicy.isCanonicalUUID(sourceStorageKey),
@@ -5670,6 +5677,10 @@ actor SecureMessagingExchangeCoordinator {
         else { throw SecureMediaAttachmentError.invalidMedia }
 
         var currentMessage = message
+        // Return only this invocation's last self-committed revision even when transport throws.
+        // The caller's exact-projection fence must distinguish a real upload failure after our
+        // own checkpoint from a concurrent replacement, without trusting a fresh lookup by ID.
+        defer { message = currentMessage }
         let existingRecord = (currentMessage.localMediaRecords ?? []).first {
             $0.id == attachmentID
         }
@@ -5696,7 +5707,9 @@ actor SecureMessagingExchangeCoordinator {
                     )
             else { return nil }
             let transport = self.transport
-            return Task.detached(priority: .utility) {
+            // A detached task would drop the account/session task locals while this request is
+            // suspended. Inherit the exact authenticated send scope while overlapping disk work.
+            return Task(priority: .userInitiated) {
                 try await transport.capabilities()
             }
         }()
@@ -5765,7 +5778,12 @@ actor SecureMessagingExchangeCoordinator {
             let record = (currentMessage.localMediaRecords ?? []).first {
                 $0.id == attachmentID
             }
-            if record?.resumableUpload != nil || advertisedChunkBytes != nil {
+            if MessagingSendSchedulingPolicy.usesResumableUpload(
+                ciphertextByteSize: spool.byteSize,
+                hasCheckpoint: record?.resumableUpload != nil,
+                advertisedChunkBytes: advertisedChunkBytes,
+                isForeground: MessagingSendSchedulingPolicy.isForegroundSend
+            ) {
                 guard let readChunk = mediaBlobs.ciphertextChunk else {
                     throw SecureMediaAttachmentError.invalidMedia
                 }
@@ -5842,19 +5860,20 @@ actor SecureMessagingExchangeCoordinator {
                             ), chunk.count == chunkLength
                             else { throw SecureMediaAttachmentError.invalidCiphertext }
                             let offsetBeforeChunk = checkpoint.nextOffset
+                            let chunkSHA256 = SecureMessagingValidation.sha256Hex(chunk)
                             let response = try await transport
                                 .uploadMessagingAttachmentChunkInBackground(
                                 id: checkpoint.uploadID,
                                 offset: offsetBeforeChunk,
                                 chunk: chunk,
-                                chunkSHA256: SecureMessagingValidation.sha256Hex(chunk)
+                                chunkSHA256: chunkSHA256
                             )
                             guard let responseUpload = MessagingResumableAttachmentPolicy
                                 .validatedChunkUpload(
                                     response,
                                     expectedOffset: offsetBeforeChunk,
                                     expectedByteSize: chunk.count,
-                                    expectedSHA256: SecureMessagingValidation.sha256Hex(chunk)
+                                    expectedSHA256: chunkSHA256
                                 )
                             else { throw SecureMediaAttachmentError.serverMetadataMismatch }
                             checkpoint = try Self.validatedResumableCheckpoint(
@@ -5981,6 +6000,9 @@ actor SecureMessagingExchangeCoordinator {
                 }
                 upload = resolvedUpload
             } else {
+                // A new small foreground send needs one authenticated idempotent upload, not
+                // four round trips plus background-session scheduling. Its deterministic spool,
+                // permanent media ID and key remain durable for interruption/relaunch recovery.
                 upload = try await transport.uploadMessagingAttachment(
                     mediaType: mediaType,
                     ciphertextFileURL: spool.fileURL,
@@ -6603,9 +6625,16 @@ actor SecureMessagingExchangeCoordinator {
                 return existing
             }
 
-            let rosterDTO = try await transport.messagingDeviceRoster(
+            // These are independent authenticated reads. Both are fresh for this exact sealing
+            // attempt; no cached authorization or roster survives an upload or a CAS retry.
+            async let rosterRequest = transport.messagingDeviceRoster(
                 conversationId: conversation.id
             )
+            async let freshMediaCapabilities: CapabilitiesDTO? = {
+                guard mediaMessageV2Items != nil else { return nil }
+                return try await transport.capabilities()
+            }()
+            let rosterDTO = try await rosterRequest
             if conversation.isGroup,
                !MessagingGroupCapabilityPolicy.supports(
                    roster: rosterDTO,
@@ -6645,7 +6674,9 @@ actor SecureMessagingExchangeCoordinator {
                 // a rollout or quota withdrawal during upload fails the whole message closed
                 // here, before any ciphertext exists. A stale pre-upload DTO is deliberately
                 // not accepted; a multi-attachment message is never split or downgraded.
-                let freshCapabilities = try await transport.capabilities()
+                guard let freshCapabilities = try await freshMediaCapabilities else {
+                    throw SecureMessagingExchangeError.mediaMessageCapabilityUnavailable
+                }
                 guard MessagingMediaMessageV2CapabilityPolicy.admitsComposition(
                     capabilities: freshCapabilities,
                     roster: rosterDTO,
@@ -7461,7 +7492,11 @@ actor SecureMessagingExchangeCoordinator {
             pageCount += 1
             try await flushDeliveryAcknowledgements(forUserID: userID)
             if !page.hasMore {
-                try? await flushHistoryBackfills(forUserID: userID)
+                // The current page and its delivery receipts are durable. Historical repair
+                // can take many requests; return new messages immediately and let the existing
+                // account/session-fenced continuation drain its persisted tasks independently.
+                // Every later sync re-arms discovery if iOS suspended this process first.
+                scheduleHistoryContinuation(forUserID: userID, delayNanoseconds: 0)
                 return SecureMessagingSyncResult(
                     pages: pageCount,
                     receivedMessages: receivedCount,

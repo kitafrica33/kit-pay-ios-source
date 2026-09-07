@@ -82,6 +82,9 @@ and Apple Liquid Glass.
   `URLSession` for bounded upload chunks. `BGProcessingTask` remains an opportunistic extra wake;
   broader rollout is blocked on the physical-device termination/relaunch matrix documented in
   [LOCAL_FIRST_MEDIA.md](LOCAL_FIRST_MEDIA.md).
+- Outgoing text and media use separate preparation lanes, with immediate selection feedback
+  and an explicit shared-media review/editor. See [MESSAGING_SPEED.md](MESSAGING_SPEED.md) for
+  the preserved recovery guarantees, PDF page selection and device latency targets.
 - Kit Pay → Kit Pay transfers post a canonical encrypted `KITPAY1` event into the 1:1 chat. The
   cross-platform action set is `request|paid|declined|cancelled|transfer|sent|accepted|rejected|
   reversed|expired`; optional `note` precedes optional `rsn`, and older clients show a redacted
@@ -274,9 +277,11 @@ regression. Admission tests supply explicit movement to the same coordinator met
 UIKit delegate instead of setting translation on an idle recognizer without a touch stream.
 Deallocation tests drain temporary UIKit references inside a synchronous autorelease pool before
 checking weak references, while still starting replacement gestures before deferred cancellation.
-All direction, threshold, callback and lifecycle assertions remain required. Build 82 native
-validation is pending. No Simulator check establishes physical touch latency; real iPhones still
-need responsiveness and Instruments checks with long histories and active media.
+All direction, threshold, callback and lifecycle assertions remain required. Build 82 passed
+native validation in [archive run 34067592269](https://github.com/kitafrica33/kit-pay-ios/actions/runs/34067592269).
+The subsequent messaging-speed update retains those checks. No Simulator check establishes
+physical touch latency; real iPhones still need responsiveness and Instruments checks with long
+histories and active media.
 
 Native tests use Xcode's original generated `.xctestrun` unchanged. XCTest owns installation and
 launch. Product identity and plan validation precede the first group; installed identity observation

@@ -55,8 +55,12 @@ Its first group passed 31 of 38 cases; seven new unit-fixture cases failed befor
 signing or upload. Build 82 corrects the fixtures' idle-recognizer input and immediate-deallocation
 assumptions while preserving all admission, callback, threshold and lifecycle assertions. It adds
 no jobs or test invocations and does not change the passing UI regression or app implementation.
-Native validation of build 82 is pending. Frame geometry is functional evidence only; physical
-responsiveness and scrolling hitches require device acceptance.
+Build 82 passed native unit/UI validation in
+[archive run 34067592269](https://github.com/kitafrica33/kit-pay-ios/actions/runs/34067592269).
+The user also reported successful testing of that update. Build 83 adds the messaging and media
+review changes described in [MESSAGING_SPEED.md](MESSAGING_SPEED.md); its native validation
+runs once in the selected archive workflow. Frame geometry is functional evidence only;
+physical responsiveness and delivery latency require device measurements.
 
 Workflow conditions and native command selection are exercised by
 `test_ios_workflow_consolidation.py`. The tests check the target/screenshot-reuse

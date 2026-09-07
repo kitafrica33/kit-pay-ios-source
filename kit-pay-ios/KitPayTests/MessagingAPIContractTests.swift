@@ -494,6 +494,251 @@ final class MessagingAPIContractTests: XCTestCase {
         }
     }
 
+    func testForegroundChunkReattachesExistingBackgroundOffset() async throws {
+        let chunk = Data(repeating: 0x34, count: 128)
+        let context = try hybridUploadContext(chunk: chunk, suffix: "1")
+        let storageRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("hybrid-upload-rejoin-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: storageRoot) }
+        let background = ControlledBackgroundUploadSession()
+        let foreground = ControlledBackgroundUploadSession()
+        let uploader = MessagingBackgroundAttachmentUploader(
+            sessionFactory: { _, queue in background.setDelegateQueue(queue); return background },
+            storageRoot: storageRoot,
+            foregroundSessionFactory: { _, queue in
+                foreground.setDelegateQueue(queue)
+                return foreground
+            }
+        )
+        let backgroundSnapshot = expectation(description: "Background owner inspected")
+        let foregroundSnapshot = expectation(description: "Foreground owner inspected")
+        let resumed = expectation(description: "Existing background task rejoined")
+        background.onEnumeration = { _ in backgroundSnapshot.fulfill() }
+        foreground.onEnumeration = { _ in foregroundSnapshot.fulfill() }
+        let existing = ControlledBackgroundUploadTask()
+        existing.taskDescription = context.taskDescription
+        existing.onResume = { resumed.fulfill() }
+        var request = URLRequest(url: URL(string: "https://example.invalid/chunk")!)
+        request.httpMethod = "PATCH"
+        let transfer = Task {
+            try await uploader.upload(
+                request: request, chunk: chunk, context: context, prefersForeground: true
+            )
+        }
+        await fulfillment(of: [backgroundSnapshot], timeout: 2)
+        background.deliverSnapshot(0, tasks: [existing])
+        await fulfillment(of: [foregroundSnapshot], timeout: 2)
+        foreground.deliverSnapshot(0, tasks: [])
+        await fulfillment(of: [resumed], timeout: 2)
+        XCTAssertEqual(background.creationCount, 0)
+        XCTAssertEqual(foreground.creationCount, 0)
+        background.onDelegateQueue {
+            uploader.urlSession(background, task: existing, didCompleteWithError: URLError(.cancelled))
+        }
+        do {
+            _ = try await transfer.value
+            XCTFail("Controlled cancellation must finish the reattached transfer")
+        } catch {
+            XCTAssertEqual((error as? URLError)?.code, .cancelled)
+        }
+    }
+
+    func testForegroundAndBackgroundTaskIdentifiersCannotMixResponses() async throws {
+        let chunk = Data(repeating: 0x35, count: 128)
+        let backgroundContext = try hybridUploadContext(chunk: chunk, suffix: "1")
+        let foregroundContext = try hybridUploadContext(chunk: chunk, suffix: "2")
+        let storageRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("hybrid-upload-identity-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: storageRoot) }
+        let background = ControlledBackgroundUploadSession()
+        let foreground = ControlledBackgroundUploadSession()
+        let response = HTTPURLResponse(
+            url: URL(string: "https://example.invalid/chunk")!, statusCode: 200,
+            httpVersion: nil, headerFields: [:]
+        )!
+        background.createdTask.setIdentityForTesting(identifier: 1, response: response)
+        foreground.createdTask.setIdentityForTesting(identifier: 1, response: response)
+        let uploader = MessagingBackgroundAttachmentUploader(
+            sessionFactory: { _, queue in background.setDelegateQueue(queue); return background },
+            storageRoot: storageRoot,
+            foregroundSessionFactory: { _, queue in
+                foreground.setDelegateQueue(queue)
+                return foreground
+            }
+        )
+        let backgroundSnapshots = (0 ..< 2).map { expectation(description: "Background snapshot \($0)") }
+        let foregroundSnapshot = expectation(description: "Foreground snapshot")
+        let backgroundStarted = expectation(description: "Background file task started")
+        let foregroundStarted = expectation(description: "Foreground file task started")
+        background.onEnumeration = { backgroundSnapshots[$0].fulfill() }
+        foreground.onEnumeration = { _ in foregroundSnapshot.fulfill() }
+        background.createdTask.onResume = { backgroundStarted.fulfill() }
+        foreground.createdTask.onResume = { foregroundStarted.fulfill() }
+        var request = URLRequest(url: response.url!)
+        request.httpMethod = "PATCH"
+        let backgroundTransfer = Task {
+            try await uploader.upload(request: request, chunk: chunk, context: backgroundContext)
+        }
+        await fulfillment(of: [backgroundSnapshots[0]], timeout: 2)
+        background.deliverSnapshot(0, tasks: [])
+        await fulfillment(of: [backgroundStarted], timeout: 2)
+        let foregroundTransfer = Task {
+            try await uploader.upload(
+                request: request, chunk: chunk, context: foregroundContext, prefersForeground: true
+            )
+        }
+        await fulfillment(of: [backgroundSnapshots[1]], timeout: 2)
+        background.deliverSnapshot(1, tasks: [background.createdTask])
+        await fulfillment(of: [foregroundSnapshot], timeout: 2)
+        foreground.deliverSnapshot(0, tasks: [])
+        await fulfillment(of: [foregroundStarted], timeout: 2)
+        background.onDelegateQueue {
+            uploader.urlSession(background, dataTask: background.createdTask,
+                                didReceive: response, completionHandler: { _ in })
+            uploader.urlSession(foreground, dataTask: foreground.createdTask,
+                                didReceive: response, completionHandler: { _ in })
+            uploader.urlSession(background, dataTask: background.createdTask, didReceive: Data([1]))
+            uploader.urlSession(foreground, dataTask: foreground.createdTask, didReceive: Data([2]))
+            uploader.urlSession(background, task: background.createdTask, didCompleteWithError: nil)
+            uploader.urlSession(foreground, task: foreground.createdTask, didCompleteWithError: nil)
+        }
+        let backgroundResult = try await backgroundTransfer.value
+        let foregroundResult = try await foregroundTransfer.value
+        XCTAssertEqual(backgroundResult.context, backgroundContext)
+        XCTAssertEqual(backgroundResult.body, Data([1]))
+        XCTAssertEqual(foregroundResult.context, foregroundContext)
+        XCTAssertEqual(foregroundResult.body, Data([2]))
+        XCTAssertEqual(background.creationCount, 1)
+        XCTAssertEqual(foreground.creationCount, 1)
+    }
+
+    func testLogoutDuringForegroundOwnershipLookupCannotStartUpload() async throws {
+        let chunk = Data(repeating: 0x36, count: 128)
+        let context = try hybridUploadContext(chunk: chunk, suffix: "3")
+        let storageRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("hybrid-upload-revocation-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: storageRoot) }
+        let background = ControlledBackgroundUploadSession()
+        let foreground = ControlledBackgroundUploadSession()
+        let uploader = MessagingBackgroundAttachmentUploader(
+            sessionFactory: { _, queue in background.setDelegateQueue(queue); return background },
+            storageRoot: storageRoot,
+            foregroundSessionFactory: { _, queue in
+                foreground.setDelegateQueue(queue)
+                return foreground
+            }
+        )
+        let backgroundSnapshots = (0 ..< 2).map { expectation(description: "Background lookup \($0)") }
+        let foregroundSnapshots = (0 ..< 2).map { expectation(description: "Foreground lookup \($0)") }
+        background.onEnumeration = { backgroundSnapshots[$0].fulfill() }
+        foreground.onEnumeration = { foregroundSnapshots[$0].fulfill() }
+        var request = URLRequest(url: URL(string: "https://example.invalid/chunk")!)
+        request.httpMethod = "PATCH"
+        let transfer = Task {
+            try await uploader.upload(
+                request: request, chunk: chunk, context: context, prefersForeground: true
+            )
+        }
+        await fulfillment(of: [backgroundSnapshots[0]], timeout: 2)
+        uploader.cancelTransfers(
+            accountID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            sessionID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        )
+        await fulfillment(of: [backgroundSnapshots[1]], timeout: 2)
+        background.deliverSnapshot(0, tasks: [])
+        await fulfillment(of: [foregroundSnapshots[0]], timeout: 2)
+        background.deliverSnapshot(1, tasks: [])
+        await fulfillment(of: [foregroundSnapshots[1]], timeout: 2)
+        foreground.deliverSnapshot(0, tasks: [])
+        foreground.deliverSnapshot(1, tasks: [])
+        do {
+            _ = try await transfer.value
+            XCTFail("A revoked owner cannot start a foreground upload after enumeration")
+        } catch {
+            guard case APIClientError.signedOut = error else {
+                return XCTFail("Expected signedOut, got \(error)")
+            }
+        }
+        await foreground.drainDelegateQueue()
+        XCTAssertEqual(background.creationCount, 0)
+        XCTAssertEqual(foreground.creationCount, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath:
+            storageRoot.appendingPathComponent(context.attemptID + ".chunk").path
+        ))
+    }
+
+    func testForegroundRetryIgnoresDeadBackgroundOwnersLateCompletion() async throws {
+        let chunk = Data(repeating: 0x37, count: 128)
+        let context = try hybridUploadContext(chunk: chunk, suffix: "4")
+        let storageRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("hybrid-upload-late-owner-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: storageRoot) }
+        let background = ControlledBackgroundUploadSession()
+        let foreground = ControlledBackgroundUploadSession()
+        let response = HTTPURLResponse(
+            url: URL(string: "https://example.invalid/chunk")!, statusCode: 200,
+            httpVersion: nil, headerFields: [:]
+        )!
+        let old = ControlledBackgroundUploadTask()
+        old.taskDescription = context.taskDescription
+        old.setStateForTesting(.completed)
+        foreground.createdTask.setIdentityForTesting(identifier: 1, response: response)
+        let uploader = MessagingBackgroundAttachmentUploader(
+            sessionFactory: { _, queue in background.setDelegateQueue(queue); return background },
+            storageRoot: storageRoot,
+            foregroundSessionFactory: { _, queue in
+                foreground.setDelegateQueue(queue)
+                return foreground
+            }
+        )
+        let backgroundSnapshot = expectation(description: "Dead background owner snapshot")
+        let foregroundSnapshot = expectation(description: "Foreground owner snapshot")
+        let started = expectation(description: "New foreground task started")
+        background.onEnumeration = { _ in backgroundSnapshot.fulfill() }
+        foreground.onEnumeration = { _ in foregroundSnapshot.fulfill() }
+        foreground.createdTask.onResume = { started.fulfill() }
+        var request = URLRequest(url: response.url!)
+        request.httpMethod = "PATCH"
+        let transfer = Task {
+            try await uploader.upload(
+                request: request, chunk: chunk, context: context, prefersForeground: true
+            )
+        }
+        await fulfillment(of: [backgroundSnapshot], timeout: 2)
+        background.deliverSnapshot(0, tasks: [old])
+        await fulfillment(of: [foregroundSnapshot], timeout: 2)
+        foreground.deliverSnapshot(0, tasks: [])
+        await fulfillment(of: [started], timeout: 2)
+        foreground.onDelegateQueue {
+            uploader.urlSession(background, task: old, didCompleteWithError: URLError(.cancelled))
+            XCTAssertTrue(FileManager.default.fileExists(atPath:
+                storageRoot.appendingPathComponent(context.attemptID + ".chunk").path
+            ))
+            uploader.urlSession(foreground, dataTask: foreground.createdTask,
+                                didReceive: response, completionHandler: { _ in })
+            uploader.urlSession(foreground, dataTask: foreground.createdTask, didReceive: Data([3]))
+            uploader.urlSession(foreground, task: foreground.createdTask, didCompleteWithError: nil)
+        }
+        let result = try await transfer.value
+        XCTAssertEqual(result.context, context)
+        XCTAssertEqual(result.body, Data([3]))
+        XCTAssertEqual(old.resumeCount, 0)
+        XCTAssertEqual(foreground.creationCount, 1)
+    }
+
+    private func hybridUploadContext(
+        chunk: Data, suffix: String
+    ) throws -> MessagingBackgroundUploadContext {
+        try XCTUnwrap(MessagingBackgroundUploadContext(
+            accountID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            sessionID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            accessToken: "test-token",
+            uploadID: "cccccccc-cccc-4ccc-8ccc-ccccccccccc" + suffix,
+            byteOffset: 0, byteSize: chunk.count,
+            ciphertextSHA256: SecureMessagingValidation.sha256Hex(chunk)
+        ))
+    }
+
     func testBackgroundEventsCompletionGateRejectsReplacedAndDuplicateCallbacks() {
         var gate = MessagingBackgroundEventsCompletionGate()
         let replaced = gate.install()
@@ -3913,10 +4158,23 @@ private final class ControlledBackgroundUploadTask: URLSessionUploadTask, @unche
     private var descriptionValue: String?
     private var resumes = 0
     private var cancellations = 0
+    private var identifierOverride: Int?
+    private var responseOverride: URLResponse?
+    private var stateOverride: URLSessionTask.State?
     var onResume: (() -> Void)?
 
-    override var taskIdentifier: Int { identifier }
-    override var response: URLResponse? { nil }
+    override var taskIdentifier: Int { lock.withLock { identifierOverride ?? identifier } }
+    override var response: URLResponse? { lock.withLock { responseOverride } }
+    override var state: URLSessionTask.State {
+        if let overridden = lock.withLock({ stateOverride }) { return overridden }
+        return super.state
+    }
+    func setStateForTesting(_ state: URLSessionTask.State) {
+        lock.withLock { stateOverride = state }
+    }
+    func setIdentityForTesting(identifier: Int, response: URLResponse?) {
+        lock.withLock { identifierOverride = identifier; responseOverride = response }
+    }
     override var taskDescription: String? {
         get { lock.withLock { descriptionValue } }
         set { lock.withLock { descriptionValue = newValue } }
@@ -3935,8 +4193,10 @@ private final class ControlledBackgroundUploadSession: URLSession, @unchecked Se
     private let lock = NSLock()
     private var queuedWork: OperationQueue?
     private var snapshots: [@Sendable ([URLSessionTask]) -> Void] = []
+    private var creations = 0
     let createdTask = ControlledBackgroundUploadTask()
     var onEnumeration: ((Int) -> Void)?
+    var creationCount: Int { lock.withLock { creations } }
 
     func setDelegateQueue(_ queue: OperationQueue) { lock.withLock { queuedWork = queue } }
 
@@ -3951,7 +4211,8 @@ private final class ControlledBackgroundUploadSession: URLSession, @unchecked Se
     }
 
     override func uploadTask(with request: URLRequest, fromFile fileURL: URL) -> URLSessionUploadTask {
-        createdTask
+        lock.withLock { creations += 1 }
+        return createdTask
     }
 
     func deliverSnapshot(_ index: Int, tasks: [URLSessionTask]) {

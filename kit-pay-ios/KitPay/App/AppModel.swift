@@ -1296,6 +1296,12 @@ final class AppModel: ObservableObject {
     private var queuedCallEvents: [CallLifecycleEvent] = []
     private var callSystemEventDrainTask: Task<Void, Never>?
     private var outboxWakeTask: Task<Void, Never>?
+    private struct OutboxMediaPreparationFlight {
+        let token: UUID
+        let accountEpoch: UUID
+        let task: Task<Void, Never>
+    }
+    private var outboxMediaPreparations: [UUID: OutboxMediaPreparationFlight] = [:]
     private var communicationReplayTask: Task<Bool, Never>?
     private var mediaPreprocessingTask: Task<Void, Never>?
     private var mediaPreprocessingGeneration: UInt64 = 0
@@ -1813,6 +1819,7 @@ final class AppModel: ObservableObject {
         waitingCallMergeTask?.cancel()
         visibleConversationSyncTask?.cancel()
         outboxWakeTask?.cancel()
+        outboxMediaPreparations.values.forEach { $0.task.cancel() }
         communicationReplayTask?.cancel()
         mediaPreprocessingTask?.cancel()
         ephemeralOutgoingCallTask?.cancel()
@@ -5355,6 +5362,8 @@ final class AppModel: ObservableObject {
         callHistoryBackfillRetryNotBefore = nil
         outboxWakeTask?.cancel()
         outboxWakeTask = nil
+        outboxMediaPreparations.values.forEach { $0.task.cancel() }
+        outboxMediaPreparations.removeAll()
         communicationReplayTask?.cancel()
         communicationReplayTask = nil
         mediaPreprocessingGeneration &+= 1
@@ -9120,7 +9129,9 @@ final class AppModel: ObservableObject {
                 sessionID: context.sessionID,
                 commitAdmission: communicationAdmission
             ) {
-                try await SecureMessagingExchangeCoordinator.shared.activate(forUserID: userID)
+                // sync owns mandatory enrollment reconciliation and delivery acknowledgements.
+                // Activating here as well added a second serial key-status request to each
+                // realtime hint before a received message could become visible.
                 return try await SecureMessagingExchangeCoordinator.shared.sync(
                     forUserID: userID
                 )
@@ -14973,6 +14984,9 @@ final class AppModel: ObservableObject {
                 sessionID: sessionID
             ) else { return }
             await publishLatestState()
+            // Release each completed message immediately; a long video/voice job later in this
+            // preprocessing pass must not delay an image that is already ready to upload.
+            scheduleOutboxWake()
         } catch is CancellationError {
             return
         } catch {
@@ -19138,7 +19152,11 @@ final class AppModel: ObservableObject {
             }
         }
 
-        let commands = OutboxPolicy.readyCommands(state.outbox, at: Date())
+        let commands = OutboxPolicy.readyCommands(
+            state.outbox,
+            at: Date(),
+            preparingMediaCommandIDs: preparingOutboxMediaCommandIDs
+        )
         for command in commands {
             var activeCommand = command
             guard isOnline,
@@ -19214,6 +19232,18 @@ final class AppModel: ObservableObject {
                 }
                 do {
                     if command.secureMessageFanout == nil {
+                        if UIApplication.shared.applicationState == .active,
+                           isUnpreparedOutboxMediaCommand(command) {
+                            startOutboxMediaPreparation(
+                                command,
+                                reportFailures: reportFailures,
+                                accountEpoch: expectedAccountEpoch,
+                                userID: expectedUserID,
+                                sessionID: expectedSessionID,
+                                admission: communicationAdmission
+                            )
+                            continue
+                        }
                         guard ProtectedCommunicationAdmissionGate.shared.permits(
                             communicationAdmission
                         ), !isSubmittingAccountDeletion else { return }
@@ -19237,6 +19267,13 @@ final class AppModel: ObservableObject {
                         }) else { continue }
                         activeCommand = preparedCommand
                     }
+                    // Another preparation worker may have sealed an older stream head. Load
+                    // that durable state before the final privacy/capability admission below.
+                    guard await reloadOutboxStateIfCurrent(
+                        accountEpoch: expectedAccountEpoch,
+                        userID: expectedUserID,
+                        sessionID: expectedSessionID
+                    ) else { return }
                     switch communicationPrivacyDecision(for: activeCommand) {
                     case .allowed:
                         break
@@ -19282,6 +19319,12 @@ final class AppModel: ObservableObject {
                         encounteredMissingMessagingCapability = true
                         continue
                     }
+                    // Never post from a stream-head snapshot captured before awaited work.
+                    guard OutboxPolicy.readyCommands(
+                        state.outbox,
+                        at: Date(),
+                        preparingMediaCommandIDs: preparingOutboxMediaCommandIDs
+                    ).contains(activeCommand) else { continue }
                     guard ProtectedCommunicationAdmissionGate.shared.permits(
                         communicationAdmission
                     ), !isSubmittingAccountDeletion else { return }
@@ -19453,6 +19496,129 @@ final class AppModel: ObservableObject {
                 )
             }
         }
+    }
+
+    private func isUnpreparedOutboxMediaCommand(_ command: OfflineCommand) -> Bool {
+        guard command.kind == .secureMessage,
+              command.secureMessageFanout == nil,
+              let messageID = command.messageId,
+              let message = state.messages.first(where: { $0.id == messageID })
+        else { return false }
+        return message.pendingAttachment != nil || message.pendingMediaBatch != nil
+    }
+
+    /// Active uploads release their unsealed conversation slot. When both workers are busy,
+    /// another ready upload waits for a worker completion rather than spinning a zero-delay
+    /// timer. Text, sealed messages, call termination and existing backoff retain their rules.
+    private var preparingOutboxMediaCommandIDs: Set<UUID> {
+        let flights = outboxMediaPreparations.filter { $0.value.accountEpoch == accountEpoch }
+        var ids = Set(flights.keys)
+        if flights.count >= MessagingSendSchedulingPolicy.maximumConcurrentMediaPreparations {
+            let now = Date()
+            ids.formUnion(state.outbox.lazy.filter {
+                $0.nextAttemptAt <= now && self.isUnpreparedOutboxMediaCommand($0)
+            }.map(\.id))
+        }
+        return ids
+    }
+
+    /// Media preparation performs durable encryption/upload checkpoints independently from the
+    /// short message-post lane. The normal flush still owns every final fanout POST, including
+    /// all privacy/capability checks after this task has finished and every retry thereafter.
+    private func startOutboxMediaPreparation(
+        _ command: OfflineCommand,
+        reportFailures: Bool,
+        accountEpoch expectedAccountEpoch: UUID,
+        userID: String,
+        sessionID: String,
+        admission: ProtectedCommunicationAdmissionLease
+    ) {
+        guard outboxMediaPreparations[command.id]?.accountEpoch != expectedAccountEpoch,
+              outboxMediaPreparations.values.filter({
+                  $0.accountEpoch == expectedAccountEpoch
+              }).count < MessagingSendSchedulingPolicy.maximumConcurrentMediaPreparations
+        else { return }
+        let token = UUID()
+        let task = Task(priority: .userInitiated) { @MainActor [weak self] in
+            guard let self else { return }
+            await self.prepareOutboxMedia(
+                command,
+                reportFailures: reportFailures,
+                accountEpoch: expectedAccountEpoch,
+                userID: userID,
+                sessionID: sessionID,
+                admission: admission
+            )
+            guard self.outboxMediaPreparations[command.id]?.token == token else { return }
+            self.outboxMediaPreparations.removeValue(forKey: command.id)
+            guard self.accountEpoch == expectedAccountEpoch,
+                  ProtectedCommunicationAdmissionGate.shared.permits(admission)
+            else { return }
+            self.scheduleOutboxWake()
+            if self.isOnline { await self.flushOutbox(reportFailures: reportFailures) }
+        }
+        outboxMediaPreparations[command.id]?.task.cancel()
+        outboxMediaPreparations[command.id] = OutboxMediaPreparationFlight(
+            token: token, accountEpoch: expectedAccountEpoch, task: task
+        )
+    }
+
+    private func prepareOutboxMedia(
+        _ command: OfflineCommand,
+        reportFailures: Bool,
+        accountEpoch expectedAccountEpoch: UUID,
+        userID: String,
+        sessionID: String,
+        admission: ProtectedCommunicationAdmissionLease
+    ) async {
+        guard !Task.isCancelled,
+              isOnline,
+              secureMessagingReleasePermitted,
+              !isSubmittingAccountDeletion,
+              ProtectedCommunicationAdmissionGate.shared.permits(admission),
+              await outboxContextIsCurrent(
+                  accountEpoch: expectedAccountEpoch, userID: userID, sessionID: sessionID
+              ),
+              state.outbox.contains(command),
+              communicationPrivacyDecision(for: command) == .allowed,
+              !isGroupMessagingCommand(command) || messagingGroupsEnabled
+        else { return }
+        do {
+            let isForeground = UIApplication.shared.applicationState == .active
+            _ = try await SecureMessagingActivationBinding.withAuthenticatedScope(
+                accountGeneration: expectedAccountEpoch,
+                sessionID: sessionID,
+                commitAdmission: admission
+            ) {
+                try await MessagingSendSchedulingPolicy.$isForegroundSend.withValue(isForeground) {
+                    try await SecureMessagingExchangeCoordinator.shared.prepareDeferredMessage(
+                        commandID: command.id, forUserID: userID
+                    )
+                }
+            }
+        } catch SecureMessagingExchangeError.staleOutboundFanout {
+            // Preparation atomically retires a changed audience; never re-derive recipients.
+            if reportFailures, accountEpoch == expectedAccountEpoch {
+                lastError = SecureMessagingExchangeError.staleOutboundFanout.localizedDescription
+            }
+        } catch is CancellationError {
+            // The exact projection/account fences in the coordinator own cancellation.
+        } catch {
+            guard await reloadOutboxStateIfCurrent(
+                accountEpoch: expectedAccountEpoch, userID: userID, sessionID: sessionID
+            ) else { return }
+            await handleOutboxFailure(
+                command,
+                error: error,
+                reportFailure: reportFailures,
+                accountEpoch: expectedAccountEpoch,
+                userID: userID,
+                sessionID: sessionID
+            )
+        }
+        _ = await reloadOutboxStateIfCurrent(
+            accountEpoch: expectedAccountEpoch, userID: userID, sessionID: sessionID
+        )
     }
 
     /// Raises one payment request that was arranged for this minute.
@@ -21874,7 +22040,9 @@ final class AppModel: ObservableObject {
         for _ in 0 ..< maximumPasses {
             guard !Task.isCancelled else { return }
             let before = state.outbox
-            guard !OutboxPolicy.readyCommands(before, at: Date()).isEmpty else { return }
+            guard !OutboxPolicy.readyCommands(
+                before, at: Date(), preparingMediaCommandIDs: preparingOutboxMediaCommandIDs
+            ).isEmpty else { return }
             await flushOutbox()
             if state.outbox == before { return }
         }
@@ -21918,14 +22086,18 @@ final class AppModel: ObservableObject {
               !acceptedAccountDeletionCleanupBlocked,
               !protectedLocalStateRecoveryBlocked,
               !unresolvedAccountDeletionAttemptBlocked,
-              let wakeDate = OutboxPolicy.nextWakeDate(state.outbox)
+              let wakeDate = OutboxPolicy.nextWakeDate(
+                state.outbox,
+                preparingMediaCommandIDs: preparingOutboxMediaCommandIDs
+              )
         else { return }
 
         let expectedAccountEpoch = accountEpoch
-        outboxWakeTask = Task { @MainActor [weak self] in
+        outboxWakeTask = Task(priority: .userInitiated) { @MainActor [weak self] in
             let delay = max(0, wakeDate.timeIntervalSinceNow)
             do {
-                try await Task.sleep(for: .seconds(delay))
+                if delay > 0 { try await Task.sleep(for: .seconds(delay)) }
+                try Task.checkCancellation()
             } catch {
                 return
             }

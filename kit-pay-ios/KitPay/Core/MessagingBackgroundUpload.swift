@@ -1,8 +1,8 @@
 import CryptoKit
 import Foundation
 
-/// Non-secret, immutable identity attached to every background ciphertext PATCH. The operating
-/// system persists `URLSessionTask.taskDescription` with the task, which lets a relaunched process
+/// Non-secret, immutable identity attached to every ciphertext PATCH. For background uploads,
+/// the operating system persists `URLSessionTask.taskDescription`, letting a relaunched process
 /// prove that it is reattaching to the exact account/session/upload/offset it intended. Raw account
 /// ids, session ids and bearer tokens are deliberately reduced to one-way fingerprints.
 struct MessagingBackgroundUploadContext: Codable, Equatable, Sendable {
@@ -186,11 +186,11 @@ struct MessagingBackgroundEventsCompletionGate: Equatable, Sendable {
     }
 }
 
-/// Owns the one background URLSession reserved for E2EE attachment chunks. Each chunk is staged
-/// as a protected file before `uploadTask(fromFile:)` is created. Both the system task description
-/// and the completion ledger survive process termination; a relaunched coordinator reattaches to
-/// an in-flight task or consumes the durable response and advances the authoritative server
-/// offset exactly once.
+/// Owns foreground and background file uploads for E2EE attachment chunks. Each chunk is staged
+/// as a protected file before `uploadTask(fromFile:)` is created. Background task descriptions
+/// and the completion ledger survive process termination. Foreground tasks remain process-owned;
+/// after interruption, the durable outbox reconciles the server's authoritative offset and the
+/// receipt ledger before retrying. Both transports share one owner for each immutable offset.
 final class MessagingBackgroundAttachmentUploader: NSObject, URLSessionDataDelegate {
     static let shared = MessagingBackgroundAttachmentUploader()
     static let sessionIdentifier = "africa.kit.pay.ios.messaging-media-upload-v1"
@@ -201,7 +201,26 @@ final class MessagingBackgroundAttachmentUploader: NSObject, URLSessionDataDeleg
     >
     typealias SessionFactory = @Sendable (URLSessionDelegate, OperationQueue) -> URLSession
     private let sessionFactory: SessionFactory?
+    private let foregroundSessionFactory: SessionFactory?
     private let storageRootOverride: URL?
+    private var foregroundSession: URLSession?
+
+    /// Task identifiers are unique only inside one session. A foreground task and a restored
+    /// background task may both be task 1; their bodies, failures and ownership must never mix.
+    private struct TaskKey: Hashable {
+        let session: ObjectIdentifier
+        let identifier: Int
+        init(_ task: URLSessionTask, in session: URLSession) {
+            self.session = ObjectIdentifier(session)
+            identifier = task.taskIdentifier
+        }
+    }
+
+    private struct OwnedTask {
+        let session: URLSession
+        let task: URLSessionTask
+        var key: TaskKey { TaskKey(task, in: session) }
+    }
 
     private let delegateQueue: OperationQueue = {
         let queue = OperationQueue()
@@ -227,12 +246,13 @@ final class MessagingBackgroundAttachmentUploader: NSObject, URLSessionDataDeleg
         return URLSession(configuration: configuration, delegate: self, delegateQueue: delegateQueue)
     }()
 
-    private var responseBodies: [Int: Data] = [:]
-    private var forcedErrors: [Int: Error] = [:]
-    private var ignoredDuplicateTaskIDs: Set<Int> = []
-    private var taskContexts: [Int: MessagingBackgroundUploadContext] = [:]
+    private var responseBodies: [TaskKey: Data] = [:]
+    private var forcedErrors: [TaskKey: Error] = [:]
+    private var ignoredDuplicateTaskIDs: Set<TaskKey> = []
+    private var taskContexts: [TaskKey: MessagingBackgroundUploadContext] = [:]
+    private var transferSessionIDs: [String: ObjectIdentifier] = [:]
     private var waiters: [String: [UploadContinuation]] = [:]
-    private var startsInFlight: Set<String> = []
+    private var startsInFlight: [String: UUID] = [:]
     private var revokedBindings: Set<String> = []
     private var backgroundEventsCompletionHandler: (() -> Void)?
     /// Installed by AppModel once protected account state can be restored. iOS may relaunch the
@@ -248,18 +268,71 @@ final class MessagingBackgroundAttachmentUploader: NSObject, URLSessionDataDeleg
 
     private override init() {
         sessionFactory = nil
+        foregroundSessionFactory = nil
         storageRootOverride = nil
         super.init()
     }
 
-    init(sessionFactory: @escaping SessionFactory, storageRoot: URL) {
+    init(
+        sessionFactory: @escaping SessionFactory,
+        storageRoot: URL,
+        foregroundSessionFactory: SessionFactory? = nil
+    ) {
         self.sessionFactory = sessionFactory
+        self.foregroundSessionFactory = foregroundSessionFactory
         storageRootOverride = storageRoot
         super.init()
     }
 
     static func handlesSession(identifier: String) -> Bool {
         identifier == sessionIdentifier
+    }
+
+    private func foregroundUploadSession() -> URLSession {
+        if let foregroundSession { return foregroundSession }
+        let created: URLSession
+        if let foregroundSessionFactory {
+            created = foregroundSessionFactory(self, delegateQueue)
+        } else {
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.networkServiceType = .responsiveData
+            configuration.waitsForConnectivity = false
+            configuration.allowsCellularAccess = true
+            configuration.allowsExpensiveNetworkAccess = true
+            configuration.allowsConstrainedNetworkAccess = true
+            configuration.httpMaximumConnectionsPerHost =
+                MessagingSendSchedulingPolicy.maximumConcurrentMediaPreparations
+            configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+            configuration.urlCache = nil
+            created = URLSession(
+                configuration: configuration, delegate: self, delegateQueue: delegateQueue
+            )
+        }
+        foregroundSession = created
+        return created
+    }
+
+    /// Enumerate both transports before allocating an attempt. A foreground retry always
+    /// rejoins an existing background owner of the same immutable offset, and vice versa.
+    /// Completion runs on the same serialized queue as ledger and task-context mutations.
+    private func getAllUploadTasks(_ completion: @escaping ([OwnedTask]) -> Void) {
+        session.getAllTasks { [weak self] tasks in
+            self?.delegateQueue.addOperation { [weak self] in
+                guard let self else { return }
+                let background = tasks.map { OwnedTask(session: self.session, task: $0) }
+                guard let foreground = self.foregroundSession else {
+                    completion(background)
+                    return
+                }
+                foreground.getAllTasks { [weak self] foregroundTasks in
+                    self?.delegateQueue.addOperation {
+                        completion(background + foregroundTasks.map {
+                            OwnedTask(session: foreground, task: $0)
+                        })
+                    }
+                }
+            }
+        }
     }
 
     /// Reconnect the delegate to tasks restored by iOS and remove crash leftovers that no live
@@ -285,7 +358,7 @@ final class MessagingBackgroundAttachmentUploader: NSObject, URLSessionDataDeleg
                             continue
                         }
                         activeAttemptIDs.insert(context.attemptID)
-                        self.taskContexts[task.taskIdentifier] = context
+                        self.taskContexts[TaskKey(task, in: self.session)] = context
                         task.resume()
                     }
                     // A foreground enqueue may have completed after getAllTasks took its
@@ -331,7 +404,8 @@ final class MessagingBackgroundAttachmentUploader: NSObject, URLSessionDataDeleg
     func upload(
         request: URLRequest,
         chunk: Data,
-        context: MessagingBackgroundUploadContext
+        context: MessagingBackgroundUploadContext,
+        prefersForeground: Bool = false
     ) async throws -> MessagingBackgroundUploadResult {
         guard context.isStructurallyValid,
               chunk.count == context.byteSize,
@@ -350,6 +424,7 @@ final class MessagingBackgroundAttachmentUploader: NSObject, URLSessionDataDeleg
                     request: request,
                     chunk: chunk,
                     context: context,
+                    prefersForeground: prefersForeground,
                     continuation: continuation
                 )
             }
@@ -365,16 +440,15 @@ final class MessagingBackgroundAttachmentUploader: NSObject, URLSessionDataDeleg
             guard let self else { return }
             self.revokedBindings.insert(binding)
             self.removeDurableResults(bindingKey: binding)
-            self.session.getAllTasks { [weak self] tasks in
-                self?.delegateQueue.addOperation { [weak self] in
-                    guard let self else { return }
-                    for task in tasks {
-                        guard let context = MessagingBackgroundUploadContext.decode(
-                            taskDescription: task.taskDescription
-                        ), self.bindingKey(for: context) == binding
-                        else { continue }
-                        task.cancel()
-                    }
+            self.getAllUploadTasks { [weak self] tasks in
+                guard let self else { return }
+                for owned in tasks {
+                    let task = owned.task
+                    guard let context = MessagingBackgroundUploadContext.decode(
+                        taskDescription: task.taskDescription
+                    ), self.bindingKey(for: context) == binding
+                    else { continue }
+                    task.cancel()
                 }
             }
         }
@@ -384,6 +458,7 @@ final class MessagingBackgroundAttachmentUploader: NSObject, URLSessionDataDeleg
         request: URLRequest,
         chunk: Data,
         context: MessagingBackgroundUploadContext,
+        prefersForeground: Bool,
         continuation: UploadContinuation
     ) {
         let binding = bindingKey(for: context)
@@ -400,61 +475,88 @@ final class MessagingBackgroundAttachmentUploader: NSObject, URLSessionDataDeleg
             return
         }
         waiters[context.logicalTransferID, default: []].append(continuation)
-        guard startsInFlight.insert(context.logicalTransferID).inserted else { return }
+        guard startsInFlight[context.logicalTransferID] == nil else { return }
+        let startToken = UUID()
+        startsInFlight[context.logicalTransferID] = startToken
+        let selectedSession = prefersForeground ? foregroundUploadSession() : session
+        transferSessionIDs[context.logicalTransferID] = ObjectIdentifier(selectedSession)
 
-        session.getAllTasks { [weak self] tasks in
-            self?.delegateQueue.addOperation { [weak self] in
-                guard let self else { return }
-                if let result = self.durableResult(for: context) {
-                    if let error = result.transportError() {
-                        self.finishWaiters(
-                            for: context.logicalTransferID,
-                            with: .failure(error)
-                        )
-                    } else {
-                        self.finishWaiters(
-                            for: context.logicalTransferID,
-                            with: .success(result)
-                        )
-                    }
-                    return
-                }
-                let matching = tasks.compactMap { task -> (
-                    URLSessionTask,
-                    MessagingBackgroundUploadContext
-                )? in
-                    guard let taskContext = MessagingBackgroundUploadContext.decode(
-                        taskDescription: task.taskDescription
-                    ), taskContext.describesSameTransfer(as: context)
-                    else { return nil }
-                    return (task, taskContext)
-                }.sorted { $0.0.taskIdentifier < $1.0.taskIdentifier }
-                if let retained = matching.first {
-                    for duplicate in matching.dropFirst() {
-                        self.ignoredDuplicateTaskIDs.insert(duplicate.0.taskIdentifier)
-                        duplicate.0.cancel()
-                    }
-                    self.taskContexts[retained.0.taskIdentifier] = retained.1
-                    self.startsInFlight.remove(context.logicalTransferID)
-                    retained.0.resume()
-                    return
-                }
-                do {
-                    let chunkURL = try self.stageChunk(chunk, context: context)
-                    let task = self.session.uploadTask(with: request, fromFile: chunkURL)
-                    guard let description = context.taskDescription else {
-                        throw APIClientError.invalidResponse
-                    }
-                    task.taskDescription = description
-                    self.taskContexts[task.taskIdentifier] = context
-                    self.startsInFlight.remove(context.logicalTransferID)
-                    task.resume()
-                } catch {
+        getAllUploadTasks { [weak self] tasks in
+            guard let self,
+                  self.startsInFlight[context.logicalTransferID] == startToken
+            else { return }
+            guard !self.revokedBindings.contains(binding) else {
+                self.finishWaiters(
+                    for: context.logicalTransferID, with: .failure(APIClientError.signedOut)
+                )
+                return
+            }
+            if let result = self.durableResult(for: context) {
+                if let error = result.transportError() {
                     self.finishWaiters(
                         for: context.logicalTransferID,
                         with: .failure(error)
                     )
+                } else {
+                    self.finishWaiters(
+                        for: context.logicalTransferID,
+                        with: .success(result)
+                    )
                 }
+                return
+            }
+            let matching = tasks.compactMap { owned -> (
+                OwnedTask,
+                MessagingBackgroundUploadContext
+            )? in
+                guard !self.ignoredDuplicateTaskIDs.contains(owned.key),
+                      let taskContext = MessagingBackgroundUploadContext.decode(
+                    taskDescription: owned.task.taskDescription
+                ), taskContext.describesSameTransfer(as: context)
+                else { return nil }
+                guard owned.task.state != .canceling, owned.task.state != .completed else {
+                    // Its completion may still be queued on this delegate queue. The new exact
+                    // replay owns the waiter/file now; that late callback must not consume it.
+                    self.ignoredDuplicateTaskIDs.insert(owned.key)
+                    return nil
+                }
+                return (owned, taskContext)
+            }.sorted {
+                // Prefer the termination-surviving owner if old versions left duplicates.
+                if ($0.0.session === self.session) != ($1.0.session === self.session) {
+                    return $0.0.session === self.session
+                }
+                return $0.0.task.taskIdentifier < $1.0.task.taskIdentifier
+            }
+            if let retained = matching.first {
+                for duplicate in matching.dropFirst() {
+                    self.ignoredDuplicateTaskIDs.insert(duplicate.0.key)
+                    duplicate.0.task.cancel()
+                }
+                self.taskContexts[retained.0.key] = retained.1
+                self.transferSessionIDs[context.logicalTransferID] =
+                    ObjectIdentifier(retained.0.session)
+                self.startsInFlight.removeValue(forKey: context.logicalTransferID)
+                retained.0.task.resume()
+                return
+            }
+            do {
+                let chunkURL = try self.stageChunk(chunk, context: context)
+                let task = selectedSession.uploadTask(with: request, fromFile: chunkURL)
+                guard let description = context.taskDescription else {
+                    throw APIClientError.invalidResponse
+                }
+                task.taskDescription = description
+                task.priority = prefersForeground ? URLSessionTask.highPriority
+                    : URLSessionTask.defaultPriority
+                self.taskContexts[TaskKey(task, in: selectedSession)] = context
+                self.startsInFlight.removeValue(forKey: context.logicalTransferID)
+                task.resume()
+            } catch {
+                self.finishWaiters(
+                    for: context.logicalTransferID,
+                    with: .failure(error)
+                )
             }
         }
     }
@@ -466,11 +568,11 @@ final class MessagingBackgroundAttachmentUploader: NSObject, URLSessionDataDeleg
         completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
     ) {
         guard response is HTTPURLResponse else {
-            forcedErrors[dataTask.taskIdentifier] = APIClientError.invalidResponse
+            forcedErrors[TaskKey(dataTask, in: session)] = APIClientError.invalidResponse
             completionHandler(.cancel)
             return
         }
-        responseBodies[dataTask.taskIdentifier] = Data()
+        responseBodies[TaskKey(dataTask, in: session)] = Data()
         completionHandler(.allow)
     }
 
@@ -479,14 +581,14 @@ final class MessagingBackgroundAttachmentUploader: NSObject, URLSessionDataDeleg
         dataTask: URLSessionDataTask,
         didReceive data: Data
     ) {
-        var body = responseBodies[dataTask.taskIdentifier] ?? Data()
+        var body = responseBodies[TaskKey(dataTask, in: session)] ?? Data()
         guard body.count <= MessagingBackgroundUploadResult.maximumResponseBytes - data.count else {
-            forcedErrors[dataTask.taskIdentifier] = URLError(.dataLengthExceedsMaximum)
+            forcedErrors[TaskKey(dataTask, in: session)] = URLError(.dataLengthExceedsMaximum)
             dataTask.cancel()
             return
         }
         body.append(data)
-        responseBodies[dataTask.taskIdentifier] = body
+        responseBodies[TaskKey(dataTask, in: session)] = body
     }
 
     func urlSession(
@@ -494,13 +596,14 @@ final class MessagingBackgroundAttachmentUploader: NSObject, URLSessionDataDeleg
         task: URLSessionTask,
         didCompleteWithError error: Error?
     ) {
-        let body = responseBodies.removeValue(forKey: task.taskIdentifier) ?? Data()
-        let forcedError = forcedErrors.removeValue(forKey: task.taskIdentifier)
-        if ignoredDuplicateTaskIDs.remove(task.taskIdentifier) != nil {
-            taskContexts.removeValue(forKey: task.taskIdentifier)
+        let taskKey = TaskKey(task, in: session)
+        let body = responseBodies.removeValue(forKey: taskKey) ?? Data()
+        let forcedError = forcedErrors.removeValue(forKey: taskKey)
+        if ignoredDuplicateTaskIDs.remove(taskKey) != nil {
+            taskContexts.removeValue(forKey: taskKey)
             return
         }
-        guard let context = taskContexts.removeValue(forKey: task.taskIdentifier)
+        guard let context = taskContexts.removeValue(forKey: taskKey)
             ?? MessagingBackgroundUploadContext.decode(taskDescription: task.taskDescription)
         else { return }
         removeChunk(for: context)
@@ -580,19 +683,29 @@ final class MessagingBackgroundAttachmentUploader: NSObject, URLSessionDataDeleg
         didBecomeInvalidWithError error: Error?
     ) {
         let failure = error ?? URLError(.backgroundSessionWasDisconnected)
-        let pending = waiters
-        waiters.removeAll()
-        startsInFlight.removeAll()
-        for continuations in pending.values {
-            for continuation in continuations { continuation.resume(throwing: failure) }
+        let invalidated = ObjectIdentifier(session)
+        let affected = transferSessionIDs.filter { $0.value == invalidated }.map(\.key)
+        for logicalID in affected {
+            finishWaiters(for: logicalID, with: .failure(failure))
         }
+        // A late task callback from an invalidated session must not finish a replacement
+        // attempt's waiter, even when it carries the same immutable transfer description.
+        let retiredKeys = taskContexts.keys.filter { $0.session == invalidated }
+        for key in retiredKeys {
+            ignoredDuplicateTaskIDs.insert(key)
+            taskContexts.removeValue(forKey: key)
+            responseBodies.removeValue(forKey: key)
+            forcedErrors.removeValue(forKey: key)
+        }
+        if foregroundSession === session { foregroundSession = nil }
     }
 
     private func finishWaiters(
         for logicalTransferID: String,
         with result: Result<MessagingBackgroundUploadResult, Error>
     ) {
-        startsInFlight.remove(logicalTransferID)
+        startsInFlight.removeValue(forKey: logicalTransferID)
+        transferSessionIDs.removeValue(forKey: logicalTransferID)
         let continuations = waiters.removeValue(forKey: logicalTransferID) ?? []
         for continuation in continuations {
             switch result {

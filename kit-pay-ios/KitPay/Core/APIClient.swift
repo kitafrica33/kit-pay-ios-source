@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import UIKit
 
 /// Binds every nested authenticated request in an asynchronous operation to the server session
 /// that authorized that operation. Task-local propagation covers coordinator layers without
@@ -1270,7 +1271,7 @@ actor APIClient {
         return try decodeEnvelope(data, response: http)
     }
 
-    /// File-backed multipart transport for the capability-absent compatibility path. The
+    /// File-backed multipart transport for small foreground sends and compatibility servers. The
     /// multipart envelope is assembled on disk and uploaded from a file, so a 200 MiB encrypted
     /// attachment is never mirrored in one or two process-sized `Data` allocations.
     func sendMultipartFile<Response: Decodable>(
@@ -1309,16 +1310,30 @@ actor APIClient {
         )
 
         let boundary = "KitPay-\(UUID().uuidString.lowercased())"
-        let multipartURL = try MultipartFormDataBody.makeFile(
-            boundary: boundary,
-            fields: fields,
-            fileField: fileField,
-            fileName: fileName,
-            fileContentType: fileContentType,
-            sourceURL: fileURL,
-            expectedSourceByteCount: expectedFileByteCount
-        )
+        // File assembly can copy a large attachment. Keep that disk work off the API actor so
+        // text, call signaling and receipt requests can start while a media body is prepared.
+        let multipartURL = try await Task.detached(priority: .userInitiated) {
+            try MultipartFormDataBody.makeFile(
+                boundary: boundary,
+                fields: fields,
+                fileField: fileField,
+                fileName: fileName,
+                fileContentType: fileContentType,
+                sourceURL: fileURL,
+                expectedSourceByteCount: expectedFileByteCount
+            )
+        }.value
         defer { try? FileManager.default.removeItem(at: multipartURL) }
+        try Task.checkCancellation()
+        // Actor reentrancy during file I/O cannot let the previous account's media borrow a new
+        // session or cross a newly-installed read-only fence.
+        guard SessionRefreshPolicy.matchesSessionID(
+            currentSession.sessionId,
+            current: await sessionStore.current()?.sessionId
+        ) else { throw APIClientError.signedOut }
+        try requireAppReviewDemoRequestPermission(
+            path: path, method: "POST", sessionID: currentSession.sessionId
+        )
         var request = URLRequest(url: try endpoint(path, queryItems: []))
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Accept")
@@ -1411,10 +1426,9 @@ actor APIClient {
         return try decodeEnvelope(data, response: http)
     }
 
-    /// Termination-surviving counterpart for resumable E2EE attachment PATCHes. The bounded
-    /// ciphertext chunk is staged under Data Protection and handed to a background URLSession as
-    /// a file upload. Its task identity contains only fingerprints and immutable ciphertext facts;
-    /// relaunch reattaches to that task or consumes its durable response before replaying.
+    /// Durable file transport for resumable E2EE attachment PATCHes. Active foreground sends use
+    /// responsive file uploads; subsequent chunks after backgrounding use the system session.
+    /// Both reattach an existing owner/result before attempting the same immutable offset.
     func sendBackgroundAttachmentChunk<Response: Decodable>(
         path: String,
         method: String,
@@ -1474,10 +1488,22 @@ actor APIClient {
         request.setValue(String(body.count), forHTTPHeaderField: "Content-Length")
         for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
 
+        let prefersForeground = await MainActor.run {
+            UIApplication.shared.applicationState == .active
+        }
+        try Task.checkCancellation()
+        guard SessionRefreshPolicy.matchesSessionID(
+            currentSession.sessionId,
+            current: await sessionStore.current()?.sessionId
+        ) else { throw APIClientError.signedOut }
+        try requireAppReviewDemoRequestPermission(
+            path: path, method: method, sessionID: currentSession.sessionId
+        )
         let result = try await MessagingBackgroundAttachmentUploader.shared.upload(
             request: request,
             chunk: body,
-            context: context
+            context: context,
+            prefersForeground: prefersForeground
         )
         guard result.context.describesSameTransfer(as: context),
               result.context.accountFingerprint == context.accountFingerprint,

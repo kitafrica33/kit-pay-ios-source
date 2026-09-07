@@ -4,6 +4,29 @@ import XCTest
 final class SecureMessagingCoordinatorTests: XCTestCase {
     private var temporaryDirectory: URL!
 
+    func testCompletedSyncReturnsWithoutWaitingForHistoricalRepair() async throws {
+        let fixture = try await makeSyncConversationLoadFixture(
+            events: [], conversationBehavior: .unexpected
+        )
+        await fixture.transport.holdHistoryDiscovery()
+        let returned = expectation(description: "Current messages published before history repair")
+        let sync = Task {
+            let result = try await fixture.coordinator.sync(forUserID: fixture.userID)
+            returned.fulfill()
+            return result
+        }
+        // A controlled network wait, not a performance assertion: the old inline history drain
+        // cannot return until releaseHistoryDiscovery is called below.
+        await fulfillment(of: [returned], timeout: 2)
+        await fixture.transport.releaseHistoryDiscovery()
+        let result = try await sync.value
+        XCTAssertEqual(result.pages, 1)
+        let state = await fixture.store.snapshot()
+        XCTAssertEqual(state.secureMessaging?.syncCursor, fixture.nextCursor)
+        let activations = await fixture.transport.statusRequestCount()
+        XCTAssertEqual(activations, 1)
+    }
+
     func testVisibleConversationPollingMakesRealtimePrimaryWithBoundedRecovery() {
         XCTAssertEqual(KitRealtimePollingPolicy.interval(
             hasRealtimeConfiguration: false,
@@ -4503,6 +4526,186 @@ final class SecureMessagingCoordinatorTests: XCTestCase {
         let restored = await reopened.snapshot()
         XCTAssertNil(restored.messages.first?.pendingAttachment)
         XCTAssertEqual(restored.messages.first?.body, message.body)
+    }
+
+    func testDeferredSpoolFailurePreservesTransientErrorAndResumesAfterRelaunch() async throws {
+        let fixture = try await makeDeferredSpoolFailureFixture()
+        do {
+            _ = try await fixture.coordinator.prepareDeferredMessage(
+                commandID: fixture.command.id,
+                forUserID: fixture.userID
+            )
+            XCTFail("The first upload must expose its retryable connection failure")
+        } catch let error as URLError {
+            XCTAssertEqual(error.code, .networkConnectionLost)
+        }
+
+        let interrupted = await fixture.store.snapshot()
+        let pending = try XCTUnwrap(interrupted.messages.first)
+        let record = try XCTUnwrap(pending.localMediaRecords?.first)
+        XCTAssertEqual(interrupted.outbox, [fixture.command])
+        XCTAssertEqual(pending.id, fixture.command.messageId)
+        XCTAssertNotNil(pending.pendingAttachment)
+        XCTAssertNil(pending.failureReason)
+        XCTAssertEqual(record.uploadState, .uploading)
+        XCTAssertNotNil(record.ciphertextSpoolByteSize)
+        XCTAssertNotNil(record.ciphertextSpoolSHA256)
+        let originalKey = try XCTUnwrap(record.outboundKeyMaterialBase64)
+        let firstAttempts = await fixture.transport.fileUploadAttempts()
+        XCTAssertEqual(firstAttempts.count, 1)
+        let firstSpoolPreparations = await fixture.blobs.preparationCount()
+        XCTAssertEqual(firstSpoolPreparations, 1)
+
+        // Simulate relaunch before AppModel could reset uploading to pending. The durable
+        // record, encryption key and spool must resume as-is, without a second state transition.
+        let reopened = SecureLocalStore(
+            stateURL: temporaryDirectory.appendingPathComponent("state.secure"),
+            keyData: Data(repeating: 0x91, count: 32)
+        )
+        let coordinator = SecureMessagingExchangeCoordinator(
+            transport: fixture.transport,
+            store: reopened,
+            engine: SecureMessagingCryptoEngine(),
+            provisioningPreKeyCount: 1,
+            mediaBlobs: fixture.blobs.access()
+        )
+        do {
+            _ = try await coordinator.prepareDeferredMessage(
+                commandID: fixture.command.id,
+                forUserID: fixture.userID
+            )
+            XCTFail("The second upload must checkpoint before the injected roster outage")
+        } catch let error as APIErrorPayload {
+            XCTAssertEqual(error.code, "MESSAGING_TEMPORARILY_UNAVAILABLE")
+        }
+
+        let resumed = await reopened.snapshot()
+        let uploaded = try XCTUnwrap(resumed.messages.first)
+        let descriptor = try XCTUnwrap(KitMediaMessageDescriptor.parse(uploaded.body))
+        XCTAssertEqual(resumed.messages.count, 1)
+        XCTAssertEqual(resumed.outbox, [fixture.command])
+        XCTAssertEqual(uploaded.id, pending.id)
+        XCTAssertNil(uploaded.pendingAttachment)
+        XCTAssertEqual(descriptor.attachmentID, record.id)
+        XCTAssertEqual(descriptor.keyMaterial?.base64EncodedString(), originalKey)
+        let retriedAttempts = await fixture.transport.fileUploadAttempts()
+        XCTAssertEqual(retriedAttempts.count, 2)
+        XCTAssertEqual(retriedAttempts.first, retriedAttempts.last)
+        let finalSpoolPreparations = await fixture.blobs.preparationCount()
+        XCTAssertEqual(finalSpoolPreparations, 1, "Retry must reuse the verified ciphertext spool")
+    }
+
+    func testDeferredSpoolFailureCannotEscapeForAReplacedCommand() async throws {
+        let fixture = try await makeDeferredSpoolFailureFixture(replacesCommandOnFailure: true)
+        do {
+            _ = try await fixture.coordinator.prepareDeferredMessage(
+                commandID: fixture.command.id,
+                forUserID: fixture.userID
+            )
+            XCTFail("The failure belongs to the obsolete command projection")
+        } catch is CancellationError {
+            // A checkpoint owned by this upload does not authorize failure handling for a
+            // command that changed while the file upload was suspended.
+        }
+
+        var replacement = fixture.command
+        replacement.attemptCount += 1
+        replacement.nextAttemptAt = fixture.command.nextAttemptAt.addingTimeInterval(30)
+        let state = await fixture.store.snapshot()
+        XCTAssertEqual(state.outbox, [replacement])
+        XCTAssertEqual(state.messages.count, 1)
+        XCTAssertEqual(state.messages.first?.id, fixture.command.messageId)
+        XCTAssertEqual(state.messages.first?.state, .queued)
+        XCTAssertNil(state.messages.first?.failureReason)
+        XCTAssertNotNil(state.messages.first?.pendingAttachment)
+        let record = try XCTUnwrap(state.messages.first?.localMediaRecords?.first)
+        XCTAssertEqual(record.uploadState, .uploading)
+        XCTAssertNotNil(record.ciphertextSpoolSHA256)
+        let attempts = await fixture.transport.fileUploadAttempts()
+        XCTAssertEqual(attempts.count, 1)
+    }
+
+    private func makeDeferredSpoolFailureFixture(
+        replacesCommandOnFailure: Bool = false
+    ) async throws -> DeferredSpoolFailureFixture {
+        let userID = "10000000-0000-4000-8000-000000000087"
+        let recipientID = "10000000-0000-4000-8000-000000000088"
+        let conversationID = "30000000-0000-4000-8000-000000000087"
+        let mediaID = UUID(uuidString: "70000000-0000-4000-8000-000000000087")!
+        let media = Data([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0xff, 0xd9])
+        let store = try await makeStore(userID: userID)
+        let engine = SecureMessagingCryptoEngine()
+        let provisioned = try await engine.provision(from: .empty, preKeyCount: 1)
+        let status = enrolledStatus(bundle: provisioned.bundle)
+        let binding = try SecureMessagingMapper.enrollmentBinding(from: status, userID: userID)
+        let enrolled = try await engine.bindEnrollment(binding, to: provisioned.state)
+        try await store.update { state in
+            state.secureMessaging = enrolled
+            state.conversations = [Conversation(
+                id: conversationID,
+                title: "Peer",
+                participantUserIds: [userID, recipientID],
+                unreadCount: 0,
+                updatedAt: Date(timeIntervalSince1970: 1_755_604_800)
+            )]
+        }
+        let blobs = try DeferredCiphertextSpoolBlobStore(
+            directory: temporaryDirectory,
+            userID: userID,
+            storageKey: mediaID.uuidString.lowercased(),
+            plaintext: media
+        )
+        let transport = DeferredImageCheckpointTransport(
+            status: status,
+            conversation: directConversationDTO(
+                id: conversationID,
+                userID: userID,
+                peerID: recipientID,
+                peerName: "Peer"
+            ),
+            capabilitiesDocument: try offlineDirectCreationCapabilities(enabled: false),
+            failFirstFileUpload: true,
+            beforeFileUploadFailure: {
+                guard replacesCommandOnFailure else { return }
+                try await store.update { state in
+                    let index = try XCTUnwrap(state.outbox.firstIndex(where: {
+                        $0.conversationId == conversationID
+                    }))
+                    state.outbox[index].attemptCount += 1
+                    state.outbox[index].nextAttemptAt = state.outbox[index].nextAttemptAt
+                        .addingTimeInterval(30)
+                }
+            }
+        )
+        let coordinator = SecureMessagingExchangeCoordinator(
+            transport: transport,
+            store: store,
+            engine: engine,
+            provisioningPreKeyCount: 1,
+            mediaBlobs: blobs.access()
+        )
+        _ = try await coordinator.queueDeferredImage(
+            forUserID: userID,
+            conversationID: conversationID,
+            expectedRecipientUserID: recipientID,
+            title: "Peer",
+            mediaData: nil,
+            mediaType: "image/jpeg",
+            caption: "Receipt",
+            localStorageKey: mediaID.uuidString.lowercased(),
+            localMediaID: mediaID,
+            plaintextByteSize: media.count,
+            localStorageKind: .protectedFile
+        )
+        let state = await store.snapshot()
+        return DeferredSpoolFailureFixture(
+            userID: userID,
+            command: try XCTUnwrap(state.outbox.first),
+            store: store,
+            coordinator: coordinator,
+            transport: transport,
+            blobs: blobs
+        )
     }
 
     func testDeferredMediaCopyFailureKeepsOriginalPendingBlobReferenced() async throws {
@@ -9126,6 +9329,9 @@ private actor SyncConversationLoadTransport: SecureMessagingExchangeTransport {
     private let response: MessagingSyncDTO
     private let conversationBehavior: ConversationBehavior
     private var conversationRequests = 0
+    private var statusRequests = 0
+    private var holdsHistoryDiscovery = false
+    private var historyDiscoveryWaiters: [CheckedContinuation<Void, Never>] = []
 
     init(
         status: MessagingKeyStatusDTO,
@@ -9139,7 +9345,21 @@ private actor SyncConversationLoadTransport: SecureMessagingExchangeTransport {
 
     func conversationRequestCount() -> Int { conversationRequests }
 
-    func messagingKeyStatus() async throws -> MessagingKeyStatusDTO { status }
+    func statusRequestCount() -> Int { statusRequests }
+
+    func holdHistoryDiscovery() { holdsHistoryDiscovery = true }
+
+    func releaseHistoryDiscovery() {
+        holdsHistoryDiscovery = false
+        let waiters = historyDiscoveryWaiters
+        historyDiscoveryWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
+    func messagingKeyStatus() async throws -> MessagingKeyStatusDTO {
+        statusRequests += 1
+        return status
+    }
 
     func messagingConversation(id: String) async throws -> MessagingConversationDTO {
         conversationRequests += 1
@@ -9167,7 +9387,10 @@ private actor SyncConversationLoadTransport: SecureMessagingExchangeTransport {
     }
 
     func messagingConversations() async throws -> MessagingConversationListDTO {
-        MessagingConversationListDTO(items: [])
+        if holdsHistoryDiscovery {
+            await withCheckedContinuation { historyDiscoveryWaiters.append($0) }
+        }
+        return MessagingConversationListDTO(items: [])
     }
 
     func syncEncryptedMessages(
@@ -9358,19 +9581,35 @@ private actor DeferredImageCheckpointTransport: SecureMessagingExchangeTransport
     let status: MessagingKeyStatusDTO
     let conversation: MessagingConversationDTO
     let clientMediaEcho: ClientMediaEcho
+    let capabilitiesDocument: CapabilitiesDTO?
+    let failFirstFileUpload: Bool
+    let beforeFileUploadFailure: (@Sendable () async throws -> Void)?
     private var uploads = 0
+    private var recordedFileAttempts: [DeferredFileUploadAttempt] = []
 
     init(
         status: MessagingKeyStatusDTO,
         conversation: MessagingConversationDTO,
-        clientMediaEcho: ClientMediaEcho = .correct
+        clientMediaEcho: ClientMediaEcho = .correct,
+        capabilitiesDocument: CapabilitiesDTO? = nil,
+        failFirstFileUpload: Bool = false,
+        beforeFileUploadFailure: (@Sendable () async throws -> Void)? = nil
     ) {
         self.status = status
         self.conversation = conversation
         self.clientMediaEcho = clientMediaEcho
+        self.capabilitiesDocument = capabilitiesDocument
+        self.failFirstFileUpload = failFirstFileUpload
+        self.beforeFileUploadFailure = beforeFileUploadFailure
     }
 
     func uploadCount() -> Int { uploads }
+    func fileUploadAttempts() -> [DeferredFileUploadAttempt] { recordedFileAttempts }
+
+    func capabilities() async throws -> CapabilitiesDTO {
+        guard let capabilitiesDocument else { return try reject() }
+        return capabilitiesDocument
+    }
 
     func messagingKeyStatus() async throws -> MessagingKeyStatusDTO { status }
 
@@ -9383,6 +9622,35 @@ private actor DeferredImageCheckpointTransport: SecureMessagingExchangeTransport
         mediaType: String,
         ciphertext: Data
     ) async throws -> MessagingAttachmentUploadDTO { try reject() }
+
+    func uploadMessagingAttachment(
+        mediaType: String,
+        ciphertextFileURL: URL,
+        ciphertextByteSize: Int64,
+        clientMediaID: String,
+        ciphertextSHA256: String
+    ) async throws -> MessagingAttachmentUploadDTO {
+        let ciphertext = try Data(contentsOf: ciphertextFileURL)
+        guard Int64(ciphertext.count) == ciphertextByteSize,
+              SecureMessagingValidation.sha256Hex(ciphertext) == ciphertextSHA256
+        else { throw Failure.unexpectedNetworkCall }
+        recordedFileAttempts.append(DeferredFileUploadAttempt(
+            fileURL: ciphertextFileURL,
+            clientMediaID: clientMediaID,
+            ciphertext: ciphertext,
+            sha256: ciphertextSHA256
+        ))
+        if failFirstFileUpload, recordedFileAttempts.count == 1 {
+            try await beforeFileUploadFailure?()
+            throw URLError(.networkConnectionLost)
+        }
+        return try await uploadMessagingAttachment(
+            mediaType: mediaType,
+            ciphertext: ciphertext,
+            clientMediaID: clientMediaID,
+            ciphertextSHA256: ciphertextSHA256
+        )
+    }
 
     func uploadMessagingAttachment(
         mediaType: String,
@@ -9929,6 +10197,118 @@ private actor SupersededActivationTransport: SecureMessagingExchangeTransport {
         request: MarkMessagingConversationReadRequest
     ) async throws -> MessagingReadReceiptDTO {
         throw Failure.unexpectedMutation
+    }
+}
+
+private struct DeferredSpoolFailureFixture {
+    let userID: String
+    let command: OfflineCommand
+    let store: SecureLocalStore
+    let coordinator: SecureMessagingExchangeCoordinator
+    let transport: DeferredImageCheckpointTransport
+    let blobs: DeferredCiphertextSpoolBlobStore
+}
+
+private struct DeferredFileUploadAttempt: Equatable, Sendable {
+    let fileURL: URL
+    let clientMediaID: String
+    let ciphertext: Data
+    let sha256: String
+}
+
+/// A real deterministic ciphertext file with an observable preparation count. Inline reads are
+/// unavailable, so these regressions must traverse the file spool and durable checkpoint path.
+private actor DeferredCiphertextSpoolBlobStore {
+    private let userID: String
+    private let storageKey: String
+    private let plaintext: Data
+    private let originalURL: URL
+    private let ciphertextURL: URL
+    private var preparations = 0
+
+    init(directory: URL, userID: String, storageKey: String, plaintext: Data) throws {
+        self.userID = userID
+        self.storageKey = storageKey
+        self.plaintext = plaintext
+        originalURL = directory.appendingPathComponent("\(storageKey).original")
+        ciphertextURL = directory.appendingPathComponent("\(storageKey).ciphertext")
+        try plaintext.write(to: originalURL, options: .atomic)
+    }
+
+    func preparationCount() -> Int { preparations }
+
+    nonisolated func access() -> SecureMediaBlobStoreAccess {
+        SecureMediaBlobStoreAccess(
+            read: { _, _ in nil },
+            byteCount: { [self] key, userID in
+                await original(key: key, userID: userID)?.byteSize
+            },
+            protectedOriginalURL: { [self] key, userID, expectedByteCount in
+                guard let original = await original(key: key, userID: userID),
+                      original.byteSize == expectedByteCount else { return nil }
+                return original.fileURL
+            },
+            duplicateIfAbsent: { _, _, _ in .sourceMissing },
+            removeDuplicate: { _, _, _ in false },
+            remove: { _, _ in },
+            prepareCiphertextSpool: { [self] key, userID, expectedSize, keyMaterial, attachmentID in
+                try await prepare(
+                    key: key,
+                    userID: userID,
+                    expectedSize: expectedSize,
+                    keyMaterial: keyMaterial,
+                    attachmentID: attachmentID
+                )
+            },
+            ciphertextSpool: { [self] key, userID, expectedSize, digest in
+                await load(key: key, userID: userID, expectedSize: expectedSize, digest: digest)
+            }
+        )
+    }
+
+    private func original(key: String, userID: String) -> (fileURL: URL, byteSize: Int)? {
+        guard key == storageKey, userID == self.userID else { return nil }
+        return (originalURL, plaintext.count)
+    }
+
+    private func prepare(
+        key: String,
+        userID: String,
+        expectedSize: Int,
+        keyMaterial: Data,
+        attachmentID: String
+    ) throws -> SecureMediaCiphertextSpool? {
+        guard key == storageKey, userID == self.userID,
+              attachmentID == storageKey, expectedSize == plaintext.count else { return nil }
+        let encrypted = try SecureMediaAttachmentCipher.encrypt(
+            plaintext, keyMaterial: keyMaterial, attachmentID: attachmentID
+        )
+        try encrypted.ciphertext.write(to: ciphertextURL, options: .atomic)
+        preparations += 1
+        return SecureMediaCiphertextSpool(
+            fileURL: ciphertextURL,
+            byteSize: Int64(encrypted.ciphertext.count),
+            sha256Hex: encrypted.sha256Hex,
+            plaintextByteSize: plaintext.count
+        )
+    }
+
+    private func load(
+        key: String,
+        userID: String,
+        expectedSize: Int64,
+        digest: String
+    ) -> SecureMediaCiphertextSpool? {
+        guard key == storageKey, userID == self.userID,
+              let ciphertext = try? Data(contentsOf: ciphertextURL),
+              Int64(ciphertext.count) == expectedSize,
+              SecureMessagingValidation.sha256Hex(ciphertext) == digest else { return nil }
+        return SecureMediaCiphertextSpool(
+            fileURL: ciphertextURL,
+            byteSize: expectedSize,
+            sha256Hex: digest,
+            plaintextByteSize: plaintext.count
+        )
     }
 }
 

@@ -517,22 +517,24 @@ class MediaMessageV2SourceContract(unittest.TestCase):
             encoding="utf-8"
         )
         camera_stage = "\n".join(function_body(messages, "private func stageCapturedVideo("))
+        library_import = "\n".join(
+            function_body(messages, "private func importPickedLibraryItem(")
+        )
         library_stage = "\n".join(
-            function_body(messages, "private func openLibraryVideoInEditor(")
+            function_body(messages, "private func loadPickedLibraryItems(")
         )
         trim = "\n".join(
             function_body(messages, "private func beginTrimmingStagedVideo(")
         )
 
-        for staging_path in (camera_stage, library_stage):
-            self.assertLess(
-                staging_path.index("persistStagedMediaOriginal("),
-                staging_path.index("stageAttachment("),
-            )
-            self.assertLess(
-                staging_path.index("stageAttachment("),
-                staging_path.index("beginTrimmingStagedVideo("),
-            )
+        self.assertLess(camera_stage.index("persistStagedMediaOriginal("), camera_stage.index("stageAttachment("))
+        self.assertLess(camera_stage.index("stageAttachment("), camera_stage.index("beginTrimmingStagedVideo("))
+        # Library selection now publishes non-durable placeholders first. Only a verified
+        # protected import replaces the placeholder; trim is an explicit optional action.
+        self.assertLess(library_stage.index("stageAttachment("), library_stage.index("withTaskGroup("))
+        self.assertLess(library_import.index("persistStagedMediaOriginal("), library_import.index("stagedAttachments[index] ="))
+        self.assertIn("localFileURL: permanentURL", library_import)
+        self.assertNotIn("beginTrimmingStagedVideo(", library_import)
         self.assertIn("url = sourceURL", trim)
         self.assertIn("ownsInputFile = false", trim)
         self.assertNotIn("copyItem(", trim)

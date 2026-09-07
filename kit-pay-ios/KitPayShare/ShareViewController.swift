@@ -31,6 +31,7 @@ final class ShareViewController: UIViewController {
     private let statusSymbol = UIImageView()
     private let summaryLabel = UILabel()
     private let messageLabel = UILabel()
+    private let previewStrip = UIStackView()
     private let searchBar = UISearchBar()
     private let tableView = UITableView(frame: .zero, style: .insetGrouped)
     private let emptyLabel = UILabel()
@@ -150,6 +151,7 @@ final class ShareViewController: UIViewController {
             return
         }
         presentPreparingPicker(itemCount: providers.count)
+        previewSelectedProviders(providers, batchID: batchID)
 
         for provider in providers {
             guard !Task.isCancelled, !hasFinished else {
@@ -563,12 +565,71 @@ final class ShareViewController: UIViewController {
         handleHandoff(.notNowTapped)
     }
 
+    /// Small provider previews are independent of durable file extraction and recipient choice.
+    /// Never decode the full shared video/image simply to draw this strip.
+    private func previewSelectedProviders(_ providers: [NSItemProvider], batchID: UUID) {
+        let selected = Array(providers.filter { isProspectiveAttachment($0) }.prefix(4))
+        var thumbnails: [UIImageView] = []
+        for provider in selected {
+            let thumbnail = UIImageView(image: UIImage(systemName: "doc"))
+            thumbnail.contentMode = .scaleAspectFit
+            thumbnail.tintColor = .secondaryLabel
+            thumbnail.backgroundColor = .secondarySystemBackground
+            thumbnail.layer.cornerRadius = 10
+            thumbnail.clipsToBounds = true
+            thumbnail.isAccessibilityElement = true
+            thumbnail.accessibilityLabel = provider.suggestedName ?? "Shared attachment"
+            thumbnail.heightAnchor.constraint(equalToConstant: 64).isActive = true
+            previewStrip.addArrangedSubview(thumbnail)
+            thumbnails.append(thumbnail)
+        }
+        previewStrip.isHidden = thumbnails.isEmpty
+        // Extension memory is limited. Ask for at most two small provider previews at once,
+        // regardless of how quickly a host can return full-size UIImage representations.
+        Task { @MainActor [weak self] in
+            await withTaskGroup(of: (Int, UIImage?).self) { group in
+                var nextIndex = 0
+                for index in 0..<min(2, selected.count) {
+                    nextIndex += 1
+                    group.addTask { (index, await Self.providerPreview(selected[index])) }
+                }
+                while let (index, preview) = await group.next() {
+                    guard let self, !self.hasFinished, self.batchIDBeingStaged == batchID else {
+                        group.cancelAll()
+                        continue
+                    }
+                    if let preview {
+                        thumbnails[index].image = preview
+                        thumbnails[index].contentMode = .scaleAspectFill
+                    }
+                    if nextIndex < selected.count {
+                        let next = nextIndex
+                        nextIndex += 1
+                        group.addTask { (next, await Self.providerPreview(selected[next])) }
+                    }
+                }
+            }
+        }
+    }
+
+    nonisolated private static func providerPreview(_ provider: NSItemProvider) async -> UIImage? {
+        let image: UIImage? = await withCheckedContinuation { continuation in
+            provider.loadPreviewImage(options: [
+                NSItemProviderPreferredImageSizeKey: NSValue(cgSize: CGSize(width: 128, height: 128)),
+            ]) { value, _ in
+                continuation.resume(returning: value as? UIImage)
+            }
+        }
+        guard let image else { return nil }
+        return image.preparingThumbnail(of: CGSize(width: 160, height: 160))
+    }
+
     private func presentPreparingPicker(itemCount: Int) {
         titleLabel.text = "Choose a chat"
         summaryLabel.text = itemCount == 1 ? "Preparing your item…" : "Preparing your items…"
         messageLabel.text = destinations.isEmpty
             ? "Your share is being saved securely. You can choose its chat in Kit Pay."
-            : "Choose now. Kit Pay will finish saving the share securely in the background."
+            : "Choose a chat now, then review and edit your items in Kit Pay before sending."
         messageLabel.textColor = .secondaryLabel
         statusSymbol.isHidden = true
         spinner.isHidden = false
@@ -590,7 +651,7 @@ final class ShareViewController: UIViewController {
         view.endEditing(true)
         titleLabel.text = destination.map { "Adding to \($0.displayName)" } ?? "Saving in Kit Pay"
         summaryLabel.text = "Preparing your share…"
-        messageLabel.text = "It is being queued securely on this iPhone."
+        messageLabel.text = "Your preview will open in Kit Pay when the files are ready."
         messageLabel.textColor = .secondaryLabel
         statusSymbol.isHidden = true
         spinner.isHidden = false
@@ -792,9 +853,15 @@ final class ShareViewController: UIViewController {
         messageLabel.numberOfLines = 0
         messageLabel.textAlignment = .center
 
+        previewStrip.axis = .horizontal
+        previewStrip.spacing = 8
+        previewStrip.distribution = .fillEqually
+        previewStrip.isHidden = true
+
         let statusStack = UIStackView(arrangedSubviews: [
             spinner,
             statusSymbol,
+            previewStrip,
             summaryLabel,
             messageLabel,
         ])
