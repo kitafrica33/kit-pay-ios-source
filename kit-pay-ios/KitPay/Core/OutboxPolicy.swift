@@ -29,6 +29,62 @@ enum MessagingSendSchedulingPolicy {
 /// deterministic while leaving storage and transport side effects in their existing owners.
 enum OutboxPolicy {
     static let unavailableMessageFailure = CustomerFacingMessagingCopy.legacyConversationFailure
+    static let mediaMessageWaitingReason = "Waiting for multi-attachment support"
+
+    static func mediaCapabilityWaitingReason(for command: OfflineCommand) -> String? {
+        guard command.kind == .secureMessage, command.secureMessageFanout == nil,
+              command.failureDisposition == nil, command.awaitingMediaPreprocessing != true,
+              command.lastFailureReason == mediaMessageWaitingReason
+        else { return nil }
+        return mediaMessageWaitingReason
+    }
+
+    static func isMediaMessageCapabilityUnavailable(_ error: Error) -> Bool {
+        (error as? SecureMessagingExchangeError) == .mediaMessageCapabilityUnavailable
+    }
+
+    /// A cached withdrawal can reject the first attempt cheaply. Once its backoff is due,
+    /// the coordinator must fetch fresh authenticated capabilities so an online chat can
+    /// recover without a foreground transition or an unrelated capability refresh.
+    static func shouldRecheckMediaCapability(for command: OfflineCommand, at now: Date) -> Bool {
+        mediaCapabilityWaitingReason(for: command) != nil
+            && command.attemptCount > 0 && command.nextAttemptAt <= now
+    }
+
+    /// Older queues did not persist a capability wait reason. Classify only unsealed,
+    /// unsent batches; recording why they wait must not change their payload or deadline.
+    static func unmarkedMediaCapabilityWaitingIDs(in state: PersistedState, at now: Date) -> Set<UUID> {
+        guard let ownerID = state.profile?.id else { return [] }
+        return Set(state.outbox.compactMap { command in
+            guard command.kind == .secureMessage, command.secureMessageFanout == nil,
+                  command.failureDisposition == nil, command.lastFailureReason == nil,
+                  command.awaitingMediaPreprocessing != true, !command.isAwaitingScheduledTime(at: now),
+                  let messageID = command.messageId,
+                  state.outbox.filter({ $0.id == command.id || $0.messageId == messageID }).count == 1,
+                  state.messages.filter({ $0.id == messageID }).count == 1,
+                  let message = state.messages.first(where: { $0.id == messageID }),
+                  message.senderId == ownerID, message.conversationId == command.conversationId,
+                  message.isOutgoing, message.state == .queued, message.failureReason == nil,
+                  message.serverMessageId == nil, message.sentAt == nil, message.secureMessagingHistory == nil,
+                  message.pendingMediaBatch?.isStructurallyValid == true
+            else { return nil }
+            return command.id
+        })
+    }
+
+    static func markKnownUnavailableMediaBatches(in state: inout PersistedState, at now: Date) {
+        let waiting = unmarkedMediaCapabilityWaitingIDs(in: state, at: now)
+        for index in state.outbox.indices where waiting.contains(state.outbox[index].id) {
+            state.outbox[index].lastFailureReason = mediaMessageWaitingReason
+        }
+    }
+
+    static func clearMediaCapabilityWaitingReason(for command: OfflineCommand, in state: inout PersistedState) {
+        guard let index = state.outbox.firstIndex(where: { $0.id == command.id }),
+              mediaCapabilityWaitingReason(for: state.outbox[index]) != nil
+        else { return }
+        state.outbox[index].lastFailureReason = nil
+    }
 
     enum FailureDecision: Equatable {
         case retry(after: TimeInterval?)
@@ -64,7 +120,10 @@ enum OutboxPolicy {
             commands, at: now, preparingMediaCommandIDs: preparingMediaCommandIDs
         ).lazy.map(\.nextAttemptAt).min()
         let scheduled = commands.lazy
-            .filter { $0.kind != .callAttempt && $0.isAwaitingScheduledTime(at: now) }
+            .filter {
+                $0.kind != .callAttempt && ($0.isAwaitingScheduledTime(at: now)
+                    || (mediaCapabilityWaitingReason(for: $0) != nil && $0.nextAttemptAt > now))
+            }
             .map(\.nextAttemptAt)
             .min()
         switch (runnable, scheduled) {
@@ -99,6 +158,9 @@ enum OutboxPolicy {
             // already durable and visible, but allowing it to claim the stream head would make
             // an image encode or voice assembly freeze every later message in this conversation.
             .filter { $0.awaitingMediaPreprocessing != true }
+            // Capability-withheld batches have no Signal envelope to order. Preserve their
+            // bounded wake separately while allowing later ready text/media to progress.
+            .filter { mediaCapabilityWaitingReason(for: $0) == nil || $0.nextAttemptAt <= now }
             // Upload preparation has not sealed a Signal envelope yet. An owned media worker
             // may take seconds or minutes; later text must not wait behind those bytes. Once
             // sealed, the ordinary FIFO and retry barrier applies even if a stale worker ID
@@ -211,12 +273,15 @@ enum OutboxPolicy {
         for command: OfflineCommand,
         in state: inout PersistedState,
         at now: Date,
-        retryAfter: TimeInterval? = nil
+        retryAfter: TimeInterval? = nil,
+        waitingForMediaCapability: Bool = false
     ) {
         guard let index = state.outbox.firstIndex(where: { $0.id == command.id }) else { return }
         state.outbox[index].attemptCount += 1
         state.outbox[index].failureDisposition = nil
-        state.outbox[index].lastFailureReason = nil
+        state.outbox[index].lastFailureReason = waitingForMediaCapability
+            && state.outbox[index].kind == .secureMessage && state.outbox[index].secureMessageFanout == nil
+            ? mediaMessageWaitingReason : nil
         let exponentialDelay = min(
             pow(2, Double(state.outbox[index].attemptCount)) * 5,
             maximumBackoffDelay

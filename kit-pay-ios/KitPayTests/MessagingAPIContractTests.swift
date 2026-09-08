@@ -3274,7 +3274,7 @@ final class MessagingAPIContractTests: XCTestCase {
             userID: "20000000-0000-4000-8000-000000000002",
             sessionID: "30000000-0000-4000-8000-000000000002"
         )
-        snapshot.confirm(groups: true, reactions: true, messageEdits: true, for: scope)
+        snapshot.confirm(groups: true, reactions: true, messageEdits: true, mediaMessages: true, for: scope)
 
         for feature in MessagingDeferredFeature.allCases {
             XCTAssertTrue(snapshot.allowsLocalQueue(
@@ -3292,7 +3292,7 @@ final class MessagingAPIContractTests: XCTestCase {
             userID: "20000000-0000-4000-8000-000000000003",
             sessionID: "30000000-0000-4000-8000-000000000003"
         )
-        snapshot.confirm(groups: false, reactions: false, messageEdits: false, for: scope)
+        snapshot.confirm(groups: false, reactions: false, messageEdits: false, mediaMessages: false, for: scope)
 
         for feature in MessagingDeferredFeature.allCases {
             XCTAssertFalse(snapshot.allowsLocalQueue(
@@ -3322,7 +3322,7 @@ final class MessagingAPIContractTests: XCTestCase {
 
         for replacementScope in [replacementAccount, replacementSession] {
             var snapshot = MessagingDeferredFeatureSnapshot()
-            snapshot.confirm(groups: false, reactions: false, messageEdits: false, for: original)
+            snapshot.confirm(groups: false, reactions: false, messageEdits: false, mediaMessages: false, for: original)
             snapshot.bind(to: replacementScope)
             XCTAssertEqual(snapshot.scope, replacementScope)
             for feature in MessagingDeferredFeature.allCases {
@@ -3333,6 +3333,34 @@ final class MessagingAPIContractTests: XCTestCase {
                 ))
             }
         }
+    }
+
+    func testMediaBatchLocalQueueRetainsWithdrawalAndRecoversOnlyForItsScope() {
+        var snapshot = MessagingDeferredFeatureSnapshot()
+        let scope = MessagingDeferredFeatureScope(
+            accountEpoch: UUID(), userID: "sender", sessionID: "session-one"
+        )
+        snapshot.confirm(
+            groups: true, reactions: true, messageEdits: true, mediaMessages: false, for: scope
+        )
+        XCTAssertFalse(snapshot.allowsLocalQueue(.mediaMessages, advertisedCapability: nil, in: scope))
+        XCTAssertTrue(snapshot.allowsLocalQueue(.groups, advertisedCapability: nil, in: scope))
+        XCTAssertTrue(snapshot.allowsLocalQueue(.mediaMessages, advertisedCapability: true, in: scope))
+        snapshot.confirm(
+            groups: false, reactions: false, messageEdits: false, mediaMessages: true, for: scope
+        )
+        XCTAssertTrue(snapshot.allowsLocalQueue(.mediaMessages, advertisedCapability: nil, in: scope))
+        XCTAssertFalse(snapshot.allowsLocalQueue(.groups, advertisedCapability: nil, in: scope))
+        XCTAssertFalse(snapshot.allowsLocalQueue(.mediaMessages, advertisedCapability: false, in: scope))
+        snapshot.confirm(
+            groups: false, reactions: false, messageEdits: false, mediaMessages: false, for: scope
+        )
+        let replacement = MessagingDeferredFeatureScope(
+            accountEpoch: scope.accountEpoch, userID: scope.userID, sessionID: "session-two"
+        )
+        XCTAssertTrue(snapshot.allowsLocalQueue(.mediaMessages, advertisedCapability: nil, in: replacement))
+        snapshot.reset()
+        XCTAssertTrue(snapshot.allowsLocalQueue(.mediaMessages, advertisedCapability: nil, in: scope))
     }
 
     func testConversationDecodesWithoutConversationTypeAndFlagsGroups() throws {

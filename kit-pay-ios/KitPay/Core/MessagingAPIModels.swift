@@ -2023,6 +2023,7 @@ enum MessagingDeferredFeature: CaseIterable, Sendable {
     case groups
     case reactions
     case messageEdits
+    case mediaMessages
 }
 
 struct MessagingDeferredFeatureScope: Equatable, Sendable {
@@ -2045,12 +2046,14 @@ struct MessagingDeferredFeatureSnapshot: Equatable, Sendable {
         let groups: Bool
         let reactions: Bool
         let messageEdits: Bool
+        let mediaMessages: Bool
 
         func value(for feature: MessagingDeferredFeature) -> Bool {
             switch feature {
             case .groups: groups
             case .reactions: reactions
             case .messageEdits: messageEdits
+            case .mediaMessages: mediaMessages
             }
         }
     }
@@ -2070,13 +2073,15 @@ struct MessagingDeferredFeatureSnapshot: Equatable, Sendable {
         groups: Bool,
         reactions: Bool,
         messageEdits: Bool,
+        mediaMessages: Bool,
         for scope: MessagingDeferredFeatureScope
     ) {
         bind(to: scope)
         confirmed = Confirmed(
             groups: groups,
             reactions: reactions,
-            messageEdits: messageEdits
+            messageEdits: messageEdits,
+            mediaMessages: mediaMessages
         )
     }
 

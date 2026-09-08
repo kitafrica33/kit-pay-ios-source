@@ -1497,6 +1497,7 @@ struct ConversationView: View {
     @State private var stagedAttachments: [ChatStagedAttachment] = []
     @State private var isLoadingAttachment = false
     @State private var attachmentLoadGeneration = 0
+    @State private var libraryImportState = KitChatLibraryImportState()
     @State private var isSending = false
     @State private var scheduleRequest: ChatScheduleRequest?
     @State private var textSubmissionAttempt: ConversationTextSubmissionAttempt?
@@ -3010,6 +3011,12 @@ struct ConversationView: View {
                 guard !items.isEmpty else { return }
                 attachmentLoadGeneration &+= 1
                 let generation = attachmentLoadGeneration
+                libraryImportState.begin(
+                    generation: generation,
+                    cancellations: Dictionary(uniqueKeysWithValues: items.map { item in
+                        (item.id, { @Sendable in item.cancelImport() })
+                    })
+                )
                 let acceptedAt = Date()
                 Task {
                     await loadPickedLibraryItems(items, generation: generation, acceptedAt: acceptedAt)
@@ -4054,7 +4061,8 @@ struct ConversationView: View {
         // A local viewer/editor covers the chat without abandoning the selection. Keep
         // provider imports alive across those covers; only leaving the conversation retires
         // their generation and removes transient placeholders from the retained view state.
-        if shouldRetireAttachmentImportsOnDisappear {
+        if !composerAccountIsCurrent || shouldRetireAttachmentImportsOnDisappear {
+            libraryImportState.retire()
             attachmentLoadGeneration &+= 1
             stagedAttachments.removeAll { $0.isPreparing }
             isLoadingAttachment = false
@@ -4807,12 +4815,16 @@ struct ConversationView: View {
         guard !isSending, !isPreparingMediaEdit else { return }
         let removed = stagedAttachments.first(where: { $0.id == id })
         stagedAttachments.removeAll { $0.id == id }
+        if libraryImportState.remove(id), libraryImportState.generation == attachmentLoadGeneration {
+            isLoadingAttachment = libraryImportState.isLoading
+        }
         if removed != nil {
             // Commit the manifest removal before deleting bytes. A crash at either side leaves
             // at worst a bounded cleanup orphan, never a manifest pointing at no media.
             persistDraftImmediately(removingMediaIDsAfterSuccess: [id])
         }
         if stagedAttachments.isEmpty {
+            libraryImportState.retire()
             attachmentLoadGeneration &+= 1
             isLoadingAttachment = false
         }
@@ -5567,7 +5579,7 @@ struct ConversationView: View {
     private func bubbleTimeRow(_ message: LocalMessage) -> some View {
         HStack(spacing: 4) {
             Text(AppPresentationClock.shortTime(message.createdAt))
-            if let status = MessageDeliveryPresentationPolicy.statusLabel(
+            if let status = model.outboxWaitingReason(for: message.id) ?? MessageDeliveryPresentationPolicy.statusLabel(
                 for: message.state,
                 isOutgoing: message.isOutgoing
             ) {
@@ -6111,7 +6123,7 @@ struct ConversationView: View {
                 Text("Edited")
             }
             Text(AppPresentationClock.shortTime(message.createdAt))
-            if let status = MessageDeliveryPresentationPolicy.statusLabel(
+            if let status = model.outboxWaitingReason(for: message.id) ?? MessageDeliveryPresentationPolicy.statusLabel(
                 for: message.state,
                 isOutgoing: message.isOutgoing
             ) {
@@ -7705,10 +7717,13 @@ struct ConversationView: View {
         generation: Int,
         acceptedAt: Date
     ) async {
-        guard generation == attachmentLoadGeneration, composerAccountIsCurrent else { return }
         defer {
-            if generation == attachmentLoadGeneration { isLoadingAttachment = false }
+            if generation == attachmentLoadGeneration {
+                libraryImportState.retire()
+                isLoadingAttachment = false
+            }
         }
+        guard generation == attachmentLoadGeneration, composerAccountIsCurrent else { return }
         let available = ConversationAttachmentStagingPolicy.maximumStagedAttachments - stagedAttachments.count
         guard items.count <= available else {
             model.lastError = "This draft does not have room for all the selected items."
@@ -7797,11 +7812,17 @@ struct ConversationView: View {
         generation: Int,
         acceptedAt: Date
     ) async -> Bool {
+        defer {
+            if generation == attachmentLoadGeneration,
+               libraryImportState.finish(item.id, generation: generation) {
+                isLoadingAttachment = libraryImportState.isLoading
+            }
+        }
         guard generation == attachmentLoadGeneration, composerAccountIsCurrent,
               stagedAttachments.contains(where: { $0.id == item.id }) else { return true }
         do {
             let picked = try await item.importOriginal()
-            defer { try? FileManager.default.removeItem(at: picked.url) }
+            defer { try? FileManager.default.removeItem(at: picked.url.deletingLastPathComponent()) }
             guard generation == attachmentLoadGeneration, composerAccountIsCurrent,
                   stagedAttachments.contains(where: { $0.id == item.id }) else { return true }
             guard let permanentURL = await persistStagedMediaOriginal(
@@ -7844,7 +7865,8 @@ struct ConversationView: View {
             }
             return true
         } catch {
-            guard generation == attachmentLoadGeneration, composerAccountIsCurrent else { return true }
+            guard generation == attachmentLoadGeneration, composerAccountIsCurrent,
+                  stagedAttachments.contains(where: { $0.id == item.id }) else { return true }
             stagedAttachments.removeAll { $0.id == item.id }
             persistDraftImmediately(removingMediaIDsAfterSuccess: [item.id])
             return false

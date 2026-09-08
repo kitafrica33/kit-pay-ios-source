@@ -2,6 +2,219 @@ import XCTest
 @testable import KitPay
 
 final class OutboxPolicyTests: XCTestCase {
+    func testMediaCapabilityFailurePersistsBoundedWaitWithoutFailingMessage() throws {
+        var state = try mediaCapabilityState()
+        let originalMessages = state.messages
+        let originalCommand = state.outbox[0]
+        let error = SecureMessagingExchangeError.mediaMessageCapabilityUnavailable
+        XCTAssertTrue(OutboxPolicy.isMediaMessageCapabilityUnavailable(error))
+        XCTAssertFalse(OutboxPolicy.isMediaMessageCapabilityUnavailable(URLError(.notConnectedToInternet)))
+        var attemptTime = now
+        for expectedDelay: TimeInterval in [10, 20, 40, 80, 120, 120] {
+            OutboxPolicy.scheduleRetry(
+                for: state.outbox[0], in: &state, at: attemptTime,
+                waitingForMediaCapability: OutboxPolicy.isMediaMessageCapabilityUnavailable(error)
+            )
+            XCTAssertEqual(state.outbox[0].nextAttemptAt, attemptTime.addingTimeInterval(expectedDelay))
+            XCTAssertEqual(OutboxPolicy.mediaCapabilityWaitingReason(for: state.outbox[0]),
+                           "Waiting for multi-attachment support")
+            XCTAssertNil(state.outbox[0].failureDisposition)
+            XCTAssertEqual(state.messages, originalMessages)
+            XCTAssertEqual(state.outbox[0].id, originalCommand.id)
+            XCTAssertEqual(state.outbox[0].messageId, originalCommand.messageId)
+            XCTAssertEqual(state.outbox[0].recipientUserIds, originalCommand.recipientUserIds)
+            attemptTime = state.outbox[0].nextAttemptAt
+        }
+        XCTAssertEqual(state.outbox[0].attemptCount, 6)
+        XCTAssertNil(state.messages[0].failureReason)
+        XCTAssertEqual(state.messages[0].state, .queued)
+    }
+
+    func testMediaCapabilityWaitingReasonSurvivesCommandCodableRoundTrip() throws {
+        var state = try mediaCapabilityState()
+        OutboxPolicy.scheduleRetry(for: state.outbox[0], in: &state, at: now, waitingForMediaCapability: true)
+        let restored = try JSONDecoder().decode(OfflineCommand.self, from: JSONEncoder().encode(state.outbox[0]))
+        XCTAssertEqual(restored, state.outbox[0])
+        XCTAssertEqual(OutboxPolicy.mediaCapabilityWaitingReason(for: restored),
+                       OutboxPolicy.mediaMessageWaitingReason)
+        XCTAssertEqual(OutboxPolicy.nextWakeDate([restored], at: now), now.addingTimeInterval(10))
+    }
+
+    func testMediaCapabilityDueRetryRechecksAfterCachedDenial() throws {
+        var state = try mediaCapabilityState()
+        OutboxPolicy.markKnownUnavailableMediaBatches(in: &state, at: now)
+        XCTAssertFalse(OutboxPolicy.shouldRecheckMediaCapability(for: state.outbox[0], at: now))
+        OutboxPolicy.scheduleRetry(for: state.outbox[0], in: &state, at: now, waitingForMediaCapability: true)
+        let waiting = state.outbox[0]
+        XCTAssertFalse(OutboxPolicy.shouldRecheckMediaCapability(
+            for: waiting, at: waiting.nextAttemptAt.addingTimeInterval(-0.001)
+        ))
+        XCTAssertTrue(OutboxPolicy.shouldRecheckMediaCapability(for: waiting, at: waiting.nextAttemptAt))
+        XCTAssertTrue(OutboxPolicy.shouldRecheckMediaCapability(
+            for: waiting, at: waiting.nextAttemptAt.addingTimeInterval(60)
+        ))
+        // A fresh server denial reinstates the marker with the next bounded deadline.
+        OutboxPolicy.clearMediaCapabilityWaitingReason(for: waiting, in: &state)
+        XCTAssertFalse(OutboxPolicy.shouldRecheckMediaCapability(for: state.outbox[0], at: waiting.nextAttemptAt))
+        OutboxPolicy.scheduleRetry(for: state.outbox[0], in: &state,
+            at: waiting.nextAttemptAt, waitingForMediaCapability: true)
+        XCTAssertEqual(state.outbox[0].nextAttemptAt, waiting.nextAttemptAt.addingTimeInterval(20))
+        XCTAssertFalse(OutboxPolicy.shouldRecheckMediaCapability(for: state.outbox[0], at: waiting.nextAttemptAt))
+        XCTAssertTrue(OutboxPolicy.shouldRecheckMediaCapability(for: state.outbox[0], at: state.outbox[0].nextAttemptAt))
+        let due = state.outbox[0].nextAttemptAt
+        state.outbox[0].failureDisposition = .awaitingIdentityRefresh
+        XCTAssertFalse(OutboxPolicy.shouldRecheckMediaCapability(for: state.outbox[0], at: due))
+        state.outbox[0].failureDisposition = nil
+        state.outbox[0].secureMessageFanout = mediaCapabilityFanout(for: state.outbox[0])
+        XCTAssertFalse(OutboxPolicy.shouldRecheckMediaCapability(for: state.outbox[0], at: due))
+    }
+
+    func testMediaCapabilityWaitLetsLaterTextAndSingleAttachmentProgressUntilDeadline() throws {
+        var state = try mediaCapabilityState()
+        OutboxPolicy.scheduleRetry(for: state.outbox[0], in: &state, at: now, waitingForMediaCapability: true)
+        let waiting = state.outbox[0]
+        let text = command(id: "06000000-0000-4000-8000-000000000002", kind: .secureMessage,
+                           createdAt: now.addingTimeInterval(-2), nextAttemptAt: now)
+        let single = command(id: "06000000-0000-4000-8000-000000000003", kind: .secureMessage,
+                             createdAt: now.addingTimeInterval(-1), nextAttemptAt: now)
+        var singleMessage = message(for: single, conversationId: single.conversationId!)
+        singleMessage.pendingAttachment = LocalPendingAttachment(mediaType: "image/jpeg", caption: "single")
+        state.outbox += [text, single]
+        state.messages += [message(for: text, conversationId: text.conversationId!), singleMessage]
+
+        XCTAssertEqual(OutboxPolicy.readyCommands(state.outbox, at: now).map(\.id), [text.id])
+        state.outbox.removeAll { $0.id == text.id }
+        XCTAssertEqual(OutboxPolicy.readyCommands(state.outbox, at: now).map(\.id), [single.id])
+        XCTAssertEqual(OutboxPolicy.readyCommands(state.outbox, at: waiting.nextAttemptAt).map(\.id), [waiting.id])
+        XCTAssertEqual(OutboxPolicy.readyCommands(
+            state.outbox, at: waiting.nextAttemptAt, preparingMediaCommandIDs: [waiting.id]
+        ).map(\.id), [single.id])
+        state.outbox.removeAll { $0.id == single.id }
+        XCTAssertTrue(OutboxPolicy.readyCommands(state.outbox, at: now).isEmpty)
+        XCTAssertEqual(OutboxPolicy.nextWakeDate(state.outbox, at: now), waiting.nextAttemptAt)
+        XCTAssertEqual(OutboxPolicy.readyCommands(state.outbox, at: waiting.nextAttemptAt).map(\.id), [waiting.id])
+    }
+
+    func testMediaCapabilityStaleWaitNeverReleasesSealedCiphertext() throws {
+        var state = try mediaCapabilityState()
+        OutboxPolicy.scheduleRetry(for: state.outbox[0], in: &state, at: now, waitingForMediaCapability: true)
+        state.outbox[0].secureMessageFanout = mediaCapabilityFanout(for: state.outbox[0])
+        let sealed = state.outbox[0]
+        let text = command(id: "06000000-0000-4000-8000-000000000002", kind: .secureMessage,
+                           createdAt: now, nextAttemptAt: now)
+        XCTAssertNil(OutboxPolicy.mediaCapabilityWaitingReason(for: sealed))
+        for reservations: Set<UUID> in [[], [sealed.id]] {
+            XCTAssertTrue(OutboxPolicy.readyCommands(
+                [sealed, text], at: now, preparingMediaCommandIDs: reservations
+            ).isEmpty)
+            XCTAssertEqual(OutboxPolicy.nextWakeDate(
+                [sealed, text], at: now, preparingMediaCommandIDs: reservations
+            ), sealed.nextAttemptAt)
+        }
+        OutboxPolicy.clearMediaCapabilityWaitingReason(for: sealed, in: &state)
+        XCTAssertEqual(state.outbox[0], sealed)
+        OutboxPolicy.scheduleRetry(for: sealed, in: &state, at: now, waitingForMediaCapability: true)
+        XCTAssertNil(state.outbox[0].lastFailureReason)
+        XCTAssertEqual(state.outbox[0].secureMessageFanout, sealed.secureMessageFanout)
+    }
+
+    func testMediaCapabilityReasonClearingPreservesExactBatchAndRetryIdentity() throws {
+        var state = try mediaCapabilityState()
+        state.outbox[0].scheduledAt = now.addingTimeInterval(-60)
+        OutboxPolicy.scheduleRetry(for: state.outbox[0], in: &state, at: now, waitingForMediaCapability: true)
+        let waiting = state.outbox[0]
+        let originalMessages = state.messages
+        var expected = waiting
+        expected.lastFailureReason = nil
+        OutboxPolicy.clearMediaCapabilityWaitingReason(for: waiting, in: &state)
+        XCTAssertEqual(state.outbox, [expected])
+        XCTAssertEqual(state.messages, originalMessages)
+        XCTAssertNil(OutboxPolicy.mediaCapabilityWaitingReason(for: state.outbox[0]))
+        // The caller must use the refreshed whole command for the next guarded mutation.
+        XCTAssertFalse(state.outbox.contains(waiting))
+        XCTAssertTrue(state.outbox.contains(expected))
+    }
+
+    func testMediaCapabilityOrdinaryRetryClearsOnlyCapabilityPresentation() throws {
+        var state = try mediaCapabilityState()
+        OutboxPolicy.scheduleRetry(for: state.outbox[0], in: &state, at: now, waitingForMediaCapability: true)
+        let waiting = state.outbox[0]
+        let originalMessages = state.messages
+        OutboxPolicy.scheduleRetry(for: waiting, in: &state, at: waiting.nextAttemptAt)
+        var expected = waiting
+        expected.attemptCount += 1
+        expected.lastFailureReason = nil
+        expected.nextAttemptAt = waiting.nextAttemptAt.addingTimeInterval(20)
+        XCTAssertEqual(state.outbox, [expected])
+        XCTAssertEqual(state.messages, originalMessages)
+        XCTAssertNil(OutboxPolicy.mediaCapabilityWaitingReason(for: state.outbox[0]))
+    }
+
+    func testMediaCapabilityLegacyClassificationReleasesExistingBackoffWithoutChangingDeadlines() throws {
+        var state = try mediaCapabilityState()
+        state.outbox[0].attemptCount = 7
+        state.outbox[0].nextAttemptAt = now.addingTimeInterval(113)
+        let waiting = state.outbox[0]
+        let originalMessages = state.messages
+        let text = command(id: "06000000-0000-4000-8000-000000000002", kind: .secureMessage,
+                           createdAt: now, nextAttemptAt: now)
+        state.outbox.append(text)
+        XCTAssertTrue(OutboxPolicy.readyCommands(state.outbox, at: now).isEmpty)
+        XCTAssertEqual(OutboxPolicy.unmarkedMediaCapabilityWaitingIDs(in: state, at: now), [waiting.id])
+        OutboxPolicy.markKnownUnavailableMediaBatches(in: &state, at: now)
+        var expected = waiting
+        expected.lastFailureReason = OutboxPolicy.mediaMessageWaitingReason
+        XCTAssertEqual(state.outbox, [expected, text])
+        XCTAssertEqual(state.messages, originalMessages)
+        XCTAssertEqual(OutboxPolicy.readyCommands(state.outbox, at: now).map(\.id), [text.id])
+        XCTAssertEqual(OutboxPolicy.nextWakeDate([state.outbox[0]], at: now), waiting.nextAttemptAt)
+        XCTAssertTrue(OutboxPolicy.unmarkedMediaCapabilityWaitingIDs(in: state, at: now).isEmpty)
+    }
+
+    func testMediaCapabilityLegacyClassificationRejectsUnsafeOrAmbiguousProjections() throws {
+        let original = try mediaCapabilityState()
+        let exclusions: [(inout PersistedState) -> Void] = [
+            { $0.profile = nil },
+            { $0.profile = UserProfile(id: "different-user") },
+            { $0.outbox[0].conversationId = "different-conversation" },
+            { $0.outbox[0].conversationId = nil },
+            { $0.outbox[0].messageId = nil },
+            { $0.outbox[0].failureDisposition = .requiresUserRetry },
+            { $0.outbox[0].failureDisposition = .awaitingSession },
+            { $0.outbox[0].failureDisposition = .awaitingIdentityRefresh },
+            { $0.outbox[0].lastFailureReason = "Other retry condition" },
+            { $0.outbox[0].awaitingMediaPreprocessing = true },
+            { $0.outbox[0].scheduledAt = self.now.addingTimeInterval(60)
+              $0.outbox[0].nextAttemptAt = self.now.addingTimeInterval(60) },
+            { $0.outbox[0].secureMessageFanout = self.mediaCapabilityFanout(for: $0.outbox[0]) },
+            { $0.messages[0].isOutgoing = false },
+            { $0.messages[0].state = .failed },
+            { $0.messages[0].failureReason = "Message failed" },
+            { $0.messages[0].serverMessageId = "accepted-message" },
+            { $0.messages[0].sentAt = self.now },
+            { $0.messages[0].pendingMediaBatch = nil },
+            { $0.messages[0].pendingMediaBatch?.items.removeLast() },
+            { $0.outbox.append($0.outbox[0]) },
+            { $0.messages.append($0.messages[0]) },
+            { state in
+                var duplicate = self.command(id: "06000000-0000-4000-8000-000000000009",
+                    kind: .secureMessage, createdAt: self.now, nextAttemptAt: self.now)
+                duplicate.messageId = state.outbox[0].messageId
+                state.outbox.append(duplicate)
+            },
+        ]
+        for (index, invalidate) in exclusions.enumerated() {
+            var state = original
+            invalidate(&state)
+            let commands = state.outbox, messages = state.messages
+            XCTAssertTrue(OutboxPolicy.unmarkedMediaCapabilityWaitingIDs(in: state, at: now).isEmpty,
+                          "Unsafe projection \(index) was classified")
+            OutboxPolicy.markKnownUnavailableMediaBatches(in: &state, at: now)
+            XCTAssertEqual(state.outbox, commands, "Unsafe projection \(index) was mutated")
+            XCTAssertEqual(state.messages, messages)
+        }
+    }
+
     func testUnsealedUploadDoesNotDelayLaterTextOrAnotherConversation() {
         let uploading = command(
             id: "01000000-0000-4000-8000-000000000001",
@@ -821,6 +1034,40 @@ final class OutboxPolicyTests: XCTestCase {
         )
         XCTAssertEqual(state.calls[0].state, .missed)
         XCTAssertEqual(state.calls[0].endedAt, authoritativeEnd)
+    }
+
+    private func mediaCapabilityState() throws -> PersistedState {
+        let queued = command(id: "06000000-0000-4000-8000-000000000001", kind: .secureMessage,
+                             createdAt: now.addingTimeInterval(-3), nextAttemptAt: now)
+        var batch = try KitMediaMessageV2OutboundBatch.queued(attachments: [
+            .init(attachmentID: "07000000-0000-4000-8000-000000000001", mediaType: "image/jpeg",
+                  plaintextByteSize: 128, localStorageKey: "08000000-0000-4000-8000-000000000001"),
+            .init(attachmentID: "07000000-0000-4000-8000-000000000002", mediaType: "image/jpeg",
+                  plaintextByteSize: 128, localStorageKey: "08000000-0000-4000-8000-000000000002"),
+        ], rawCaption: "original caption", keyMaterialFactory: { Data(repeating: 7, count: 64) })
+        batch.items[0] = try XCTUnwrap(batch.items[0].uploaded(
+            storageKey: "09000000-0000-4000-8000-000000000001", ciphertextByteSize: 192,
+            ciphertextSHA256: String(repeating: "a", count: 64)
+        ))
+        XCTAssertTrue(batch.isStructurallyValid)
+        var pending = message(for: queued, conversationId: queued.conversationId!)
+        pending.body = "original caption"
+        pending.pendingMediaBatch = batch
+        var state = PersistedState.empty
+        state.profile = UserProfile(id: "current-user")
+        state.outbox = [queued]
+        state.messages = [pending]
+        return state
+    }
+
+    private func mediaCapabilityFanout(for command: OfflineCommand) -> SecureMessagingCommittedFanout {
+        SecureMessagingCommittedFanout(
+            clientMessageID: command.messageId!.uuidString.lowercased(),
+            conversationID: command.conversationId!, rosterRevision: "original-roster",
+            replyToMessageID: nil, rosterDevices: [],
+            envelopes: [.init(recipientDeviceID: "original-device", envelopeType: "message",
+                              ciphertext: Data([7, 8, 9]))]
+        )
     }
 
     private func command(

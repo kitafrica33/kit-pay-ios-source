@@ -97,6 +97,207 @@ final class MessagingProcessBrokerTests: XCTestCase {
         try broker.setSharingEnabled(true, accountID: account)
     }
 
+    /// Drives the same publication decision as AppModel, with the real broker underneath it.
+    /// The callbacks below deterministically interleave publication with Security work outside
+    /// the broker lock; no timing sleeps or simulated successful broker responses are used.
+    @discardableResult
+    private func publishDuringApproval(
+        _ broker: MessagingProcessBroker, gate: inout SharedMessagingApprovalPublicationGate,
+        epoch: UUID, accountID: String? = nil, securityEligible: Bool = true,
+        destinations: [SharedInboxDestination]? = nil
+    ) throws -> SharedMessagingApprovalPublicationGate.PublicationDecision {
+        let owner = accountID ?? account
+        let binding = gate.operation.flatMap {
+            try? broker.biometricBinding(accountID: owner, sessionID: $0.binding.sessionID)
+        }
+        let decision = gate.publicationDecision(
+            accountEpoch: epoch, accountID: owner, currentBinding: binding,
+            securityEligible: securityEligible
+        )
+        switch decision {
+        case .deferUntilApprovalFinishes:
+            break
+        case .deny:
+            gate.invalidate()
+            try broker.setSharingEnabled(false, accountID: nil)
+        case .publish:
+            do {
+                try broker.restoreBiometricSharingDestinations(destinations ?? [destination], accountID: owner)
+            } catch {
+                try broker.setSharingEnabled(false, accountID: nil)
+            }
+        }
+        return decision
+    }
+
+    func testUncoordinatedFirstApprovalReproducesPublicationDenialRace() throws {
+        let bio = authenticator(), app = broker(biometrics: bio)
+        try prepare(app)
+        try installUnapprovedBiometricAuthority(app, legacyDomain: Data("legacy92".utf8))
+        var noApprovalCoordination = SharedMessagingApprovalPublicationGate()
+        bio.onCreate = {
+            try self.publishDuringApproval(app, gate: &noApprovalCoordination, epoch: UUID())
+        }
+
+        XCTAssertThrowsError(try approve(app))
+        XCTAssertNil(try app.withLock { try $0.authorityLocked()?.biometricCredential })
+        XCTAssertThrowsError(try app.scope())
+    }
+
+    func testApprovalPublicationDefersMigrationRefreshUntilCredentialCommits() async throws {
+        let bio = authenticator(), app = broker(biometrics: bio)
+        try prepare(app)
+        try installUnapprovedBiometricAuthority(app, legacyDomain: Data("legacy92".utf8))
+        let epoch = UUID(), binding = try app.biometricBinding(accountID: account, sessionID: session)
+        var gate = SharedMessagingApprovalPublicationGate()
+        let operation = try XCTUnwrap(gate.begin(accountEpoch: epoch, binding: binding))
+        let updated = SharedInboxDestination(conversationID: nil, recipientUserID: recipient,
+                                            displayName: "Updated recipient", kind: .contact, memberCount: nil)
+        var deferred = 0
+        bio.onCreate = {
+            for _ in 0..<3 {
+                XCTAssertEqual(try self.publishDuringApproval(
+                    app, gate: &gate, epoch: epoch, destinations: [updated]
+                ), .deferUntilApprovalFinishes)
+                deferred += 1
+            }
+        }
+
+        try approve(app)
+        XCTAssertEqual(deferred, 3)
+        XCTAssertTrue(gate.finish(operation))
+        XCTAssertNil(gate.operation)
+        XCTAssertEqual(try publishDuringApproval(app, gate: &gate, epoch: epoch, destinations: [updated]), .publish)
+        let share = broker()
+        let directory = try await share.authorizeShare()
+        XCTAssertEqual(directory.destinations, [updated])
+        XCTAssertThrowsError(try app.scope(), "Publishing must not grant the main app the extension's lease")
+    }
+
+    func testUncoordinatedCredentialReuseReproducesChangedDirectoryRace() throws {
+        let bio = authenticator(), app = broker(biometrics: bio)
+        try prepare(app, biometric: true)
+        try app.suspendSharingForBiometricLock(accountID: account)
+        let original = try credential(app)
+        var noApprovalCoordination = SharedMessagingApprovalPublicationGate()
+        let updated = SharedInboxDestination(conversationID: nil, recipientUserID: recipient,
+                                            displayName: "Changed while unlocking", kind: .contact, memberCount: nil)
+        bio.onCredentialExists = {
+            try self.publishDuringApproval(app, gate: &noApprovalCoordination,
+                                           epoch: UUID(), destinations: [updated])
+        }
+
+        XCTAssertThrowsError(try approve(app))
+        XCTAssertEqual(try credential(app), original)
+        XCTAssertThrowsError(try app.scope())
+    }
+
+    func testApprovalPublicationDefersChangedDirectoryWhileReusingCredential() async throws {
+        let bio = authenticator(), app = broker(biometrics: bio)
+        try prepare(app, biometric: true)
+        try app.suspendSharingForBiometricLock(accountID: account)
+        let original = try credential(app)
+        let epoch = UUID(), binding = try app.biometricBinding(accountID: account, sessionID: session)
+        var gate = SharedMessagingApprovalPublicationGate()
+        let operation = try XCTUnwrap(gate.begin(accountEpoch: epoch, binding: binding))
+        let updated = SharedInboxDestination(conversationID: nil, recipientUserID: recipient,
+                                            displayName: "Latest chat order", kind: .contact, memberCount: nil)
+        bio.onCredentialExists = {
+            XCTAssertEqual(try self.publishDuringApproval(
+                app, gate: &gate, epoch: epoch, destinations: [updated]
+            ), .deferUntilApprovalFinishes)
+        }
+
+        try approve(app)
+        bio.onCredentialExists = nil
+        XCTAssertEqual(try credential(app), original)
+        XCTAssertEqual(bio.creations, 1, "An unchanged credential must not be recreated")
+        XCTAssertTrue(gate.finish(operation))
+        try publishDuringApproval(app, gate: &gate, epoch: epoch, destinations: [updated])
+        let directory = try await broker().authorizeShare()
+        XCTAssertEqual(directory.destinations, [updated])
+    }
+
+    func testApprovalPublicationNeverDefersSecurityDenialDuringCreation() throws {
+        let bio = authenticator(), app = broker(biometrics: bio)
+        try prepare(app)
+        let epoch = UUID(), binding = try app.biometricBinding(accountID: account, sessionID: session)
+        var gate = SharedMessagingApprovalPublicationGate()
+        let operation = try XCTUnwrap(gate.begin(accountEpoch: epoch, binding: binding))
+        bio.onCreate = {
+            XCTAssertEqual(try self.publishDuringApproval(
+                app, gate: &gate, epoch: epoch, securityEligible: false
+            ), .deny)
+        }
+
+        XCTAssertThrowsError(try approve(app))
+        XCTAssertNil(gate.operation)
+        XCTAssertFalse(gate.finish(operation))
+        XCTAssertNil(try app.withLock { try $0.authorityLocked()?.biometricCredential })
+        XCTAssertThrowsError(try app.scope())
+    }
+
+    func testApprovalPublicationRejectsChangedAccountEpochDuringCreation() throws {
+        let bio = authenticator(), app = broker(biometrics: bio)
+        try prepare(app)
+        var gate = SharedMessagingApprovalPublicationGate()
+        let operation = try XCTUnwrap(gate.begin(
+            accountEpoch: UUID(), binding: app.biometricBinding(accountID: account, sessionID: session)
+        ))
+        bio.onCreate = {
+            XCTAssertEqual(try self.publishDuringApproval(app, gate: &gate, epoch: UUID()), .deny)
+        }
+
+        XCTAssertThrowsError(try approve(app))
+        XCTAssertFalse(gate.finish(operation))
+        XCTAssertNil(gate.operation)
+        XCTAssertThrowsError(try app.scope())
+    }
+
+    func testApprovalPublicationRejectsSameAccountReplacementSession() throws {
+        let bio = authenticator(), app = broker(biometrics: bio)
+        try prepare(app)
+        let epoch = UUID(), binding = try app.biometricBinding(accountID: account, sessionID: session)
+        var gate = SharedMessagingApprovalPublicationGate()
+        let operation = try XCTUnwrap(gate.begin(accountEpoch: epoch, binding: binding))
+        let replacement = tokens("replacement", sessionID: UUID().uuidString.lowercased())
+        bio.onCreate = {
+            try app.withLock { locked in
+                var authority = MessagingProcessBroker.Authority.revoked
+                authority.session = replacement
+                try locked.saveAuthorityLocked(authority)
+            }
+            XCTAssertEqual(try self.publishDuringApproval(app, gate: &gate, epoch: epoch), .deny)
+        }
+
+        XCTAssertThrowsError(try approve(app))
+        XCTAssertFalse(gate.finish(operation))
+        XCTAssertNil(gate.operation)
+        XCTAssertEqual(try app.withLock { try $0.authorityLocked()?.session }, replacement)
+        XCTAssertNil(try app.withLock { try $0.authorityLocked()?.biometricCredential })
+    }
+
+    func testApprovalPublicationCleanupCannotRetireSuccessorOrSurviveCancellation() throws {
+        let app = broker()
+        try prepare(app)
+        let binding = try app.biometricBinding(accountID: account, sessionID: session)
+        var gate = SharedMessagingApprovalPublicationGate()
+        let old = try XCTUnwrap(gate.begin(accountEpoch: UUID(), binding: binding))
+        gate.invalidate()
+        let current = try XCTUnwrap(gate.begin(accountEpoch: UUID(), binding: binding))
+        XCTAssertFalse(gate.finish(old))
+        XCTAssertTrue(gate.owns(current))
+
+        do {
+            defer { gate.finish(current) }
+            try approve(app, confirmPrivateKey: { throw CancellationError() })
+            XCTFail("A cancelled private-key confirmation must not approve sharing")
+        } catch is CancellationError {}
+        XCTAssertNil(gate.operation)
+        XCTAssertNil(try app.withLock { try $0.authorityLocked()?.biometricCredential })
+        XCTAssertThrowsError(try app.scope())
+    }
+
     func testSeparateBrokerInstancesObserveOneCanonicalCryptoStore() throws {
         let app = broker(), share = broker()
         try prepare(app)

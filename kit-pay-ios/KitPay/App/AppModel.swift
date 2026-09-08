@@ -827,6 +827,50 @@ struct BiometricAuthenticationOperationGate {
     }
 }
 
+/// Routine chat projection changes must not rewrite a sharing denial while a fresh private-key
+/// proof is approving that same account/session. Actual security invalidation always wins.
+struct SharedMessagingApprovalPublicationGate {
+    struct Operation: Equatable {
+        let id: UUID
+        let accountEpoch: UUID
+        let binding: MessagingBiometricBinding
+    }
+
+    enum PublicationDecision: Equatable { case publish, deferUntilApprovalFinishes, deny }
+
+    private(set) var operation: Operation?
+
+    mutating func begin(accountEpoch: UUID, binding: MessagingBiometricBinding) -> Operation? {
+        guard operation == nil, binding.isStructurallyValid else { return nil }
+        let next = Operation(id: UUID(), accountEpoch: accountEpoch, binding: binding)
+        operation = next
+        return next
+    }
+
+    func owns(_ candidate: Operation) -> Bool { operation == candidate }
+
+    func publicationDecision(
+        accountEpoch: UUID, accountID: String?, currentBinding: MessagingBiometricBinding?,
+        securityEligible: Bool
+    ) -> PublicationDecision {
+        guard let operation else { return .publish }
+        guard securityEligible, accountEpoch == operation.accountEpoch,
+              accountID?.caseInsensitiveCompare(operation.binding.accountID) == .orderedSame,
+              currentBinding == operation.binding
+        else { return .deny }
+        return .deferUntilApprovalFinishes
+    }
+
+    mutating func invalidate() { operation = nil }
+
+    @discardableResult
+    mutating func finish(_ candidate: Operation) -> Bool {
+        guard owns(candidate) else { return false }
+        operation = nil
+        return true
+    }
+}
+
 /// A returning-sign-in response may unlock local account content only while it belongs to the
 /// foreground lifetime that started it. Entering the background invalidates a suspended
 /// LocalAuthentication response even when the framework delivers success afterward.
@@ -1375,6 +1419,7 @@ final class AppModel: ObservableObject {
     }
     private var directSharingAccountEpoch: UUID?
     private var biometricSharingApprovalBlockedEpoch: UUID?
+    private var sharedMessagingApprovalPublicationGate = SharedMessagingApprovalPublicationGate()
     private var directShareResumeTask: Task<Void, Never>?
     private var directShareResumeID: UUID?
     private var shareSuggestionTask: Task<Void, Never>?
@@ -2126,6 +2171,14 @@ final class AppModel: ObservableObject {
             && messagingDeferredFeatureSnapshot.allowsLocalQueue(
                 .messageEdits,
                 advertisedCapability: capabilities.map { _ in messagingMessageEditsEnabled },
+                in: messagingDeferredFeatureScope
+            )
+    }
+    var messagingMediaMessageLocalQueueEnabled: Bool {
+        secureMessagingLocalQueueAvailable
+            && messagingDeferredFeatureSnapshot.allowsLocalQueue(
+                .mediaMessages,
+                advertisedCapability: capabilities.map(\.enablesMessagingMediaMessageV2),
                 in: messagingDeferredFeatureScope
             )
     }
@@ -4735,13 +4788,16 @@ final class AppModel: ObservableObject {
 
     /// A normal UI lock may be satisfied inside the share sheet. Every other missing authority
     /// revokes sharing altogether, including the extension's temporary biometric lease.
-    private var sharedMessagingAccountEligible: Bool {
+    private var sharedMessagingAccountSecurityEligible: Bool {
         isSignedIn && accountSetupStep == nil && communicationAccessGranted
             && !isSigningOut && !isSubmittingAccountDeletion
             && !acceptedAccountDeletionCleanupBlocked && !unresolvedAccountDeletionAttemptBlocked
             && !protectedLocalStateRecoveryBlocked && appReviewDemoMutationsAllowed
             && secureMessagingAvailable && hasUsableCommunicationPrivacyProjection
-            && biometricSharingApprovalBlockedEpoch != accountEpoch
+    }
+
+    private var sharedMessagingAccountEligible: Bool {
+        sharedMessagingAccountSecurityEligible && biometricSharingApprovalBlockedEpoch != accountEpoch
     }
 
     private func biometricOperationContextIsCurrent(
@@ -4765,8 +4821,23 @@ final class AppModel: ObservableObject {
         accountEpoch expectedEpoch: UUID
     ) async {
         guard accountEpoch == expectedEpoch, !Task.isCancelled else { return }
+        var operation: SharedMessagingApprovalPublicationGate.Operation?
+        var succeeded = false
+        defer {
+            if let operation, sharedMessagingApprovalPublicationGate.finish(operation) {
+                if !succeeded {
+                    // Cancellation and early exits cannot leave publication suppressed or
+                    // sharing enabled by a result this application operation did not accept.
+                    revokeSharedMessagingAccess()
+                }
+            }
+        }
         do {
             let binding = try binding.get()
+            guard let started = sharedMessagingApprovalPublicationGate.begin(
+                accountEpoch: expectedEpoch, binding: binding
+            ) else { throw MessagingProcessBroker.Failure.accountChanged }
+            operation = started
             let approval = Task.detached(priority: .userInitiated) {
                 try MessagingProcessBroker.shared.approveBiometricSharing(
                     binding: binding, enrollmentKeyID: proof.enrollmentKeyID,
@@ -4778,10 +4849,22 @@ final class AppModel: ObservableObject {
             } onCancel: {
                 approval.cancel()
             }
-            guard accountEpoch == expectedEpoch, !Task.isCancelled else { return }
+            guard accountEpoch == expectedEpoch else { return }
+            try Task.checkCancellation()
+            guard sharedMessagingApprovalPublicationGate.owns(started),
+                  sharedMessagingAccountSecurityEligible,
+                  try MessagingProcessBroker.shared.biometricBinding(
+                    accountID: binding.accountID, sessionID: binding.sessionID
+                  ) == binding
+            else { throw MessagingProcessBroker.Failure.accountChanged }
             biometricSharingApprovalBlockedEpoch = nil
+            succeeded = true
+            // The three callers publish once their biometric UI/configuration state is updated.
+            // Publishing here would still see .authorizing (or the pre-enable setting).
         } catch {
             guard accountEpoch == expectedEpoch else { return }
+            if let current = sharedMessagingApprovalPublicationGate.operation,
+               current != operation { return }
             biometricSharingApprovalBlockedEpoch = expectedEpoch
             revokeSharedMessagingAccess()
             biometricErrorMessage = "Secure sharing could not be approved. \(error.localizedDescription)"
@@ -4859,6 +4942,7 @@ final class AppModel: ObservableObject {
     }
 
     private func revokeSharedMessagingAccess() {
+        sharedMessagingApprovalPublicationGate.invalidate()
         // The independent denial marker is written before Keychain mutation. Clearing the
         // directory also fails closed if protected storage has become unavailable.
         try? MessagingProcessBroker.shared.setSharingEnabled(false, accountID: nil)
@@ -4866,10 +4950,36 @@ final class AppModel: ObservableObject {
     }
 
     private func revokeSharedMessagingAccessIfUnavailable() {
+        guard !deferSharedMessagingPublicationDuringApproval() else { return }
         if !sharedMessagingAccountEligible { revokeSharedMessagingAccess() }
     }
 
+    /// A completed wallet/chat refresh is not a new privacy denial. While approval owns this
+    /// exact binding, keep its reservation intact and let the caller publish the latest state
+    /// after approval. Missing authority or any real security gate change still revokes now.
+    private func deferSharedMessagingPublicationDuringApproval() -> Bool {
+        guard let operation = sharedMessagingApprovalPublicationGate.operation else { return false }
+        let currentBinding = (profile?.id).flatMap { accountID in
+            try? MessagingProcessBroker.shared.biometricBinding(
+                accountID: accountID, sessionID: operation.binding.sessionID
+            )
+        }
+        switch sharedMessagingApprovalPublicationGate.publicationDecision(
+            accountEpoch: accountEpoch, accountID: profile?.id, currentBinding: currentBinding,
+            securityEligible: sharedMessagingAccountSecurityEligible
+        ) {
+        case .publish:
+            return false
+        case .deferUntilApprovalFinishes:
+            return true
+        case .deny:
+            revokeSharedMessagingAccess()
+            return true
+        }
+    }
+
     private func updateSharedMessagingLockState() {
+        guard !deferSharedMessagingPublicationDuringApproval() else { return }
         guard sharedMessagingAccountEligible else {
             revokeSharedMessagingAccess()
             return
@@ -4917,6 +5027,7 @@ final class AppModel: ObservableObject {
     /// scoped share-sheet unlock; the ordinary directory is concealed on lock. Each send still
     /// revalidates server membership, device enrollment, privacy and protocol capabilities.
     private func publishSharedDestinationsIfPossible() {
+        guard !deferSharedMessagingPublicationDuringApproval() else { return }
         guard sharedMessagingAccountEligible,
               let rawAccountID = profile?.id,
               let accountID = SharedInboxPolicy.canonicalAccountID(rawAccountID),
@@ -6786,6 +6897,11 @@ final class AppModel: ObservableObject {
         startAutomaticBackupBackgroundTransitionIfNeeded()
         returningSignInBiometricAuthorizationFence.invalidate()
         homeBiometricAuthorizationFence.invalidate()
+        if sharedMessagingApprovalPublicationGate.operation != nil {
+            // A real background transition ends this foreground proof's authority. It is not
+            // one of the routine publication refreshes deferred by the sharing operation.
+            revokeSharedMessagingAccess()
+        }
         guard isSignedIn, accountSetupStep == nil, biometricUnlockEnabled else { return }
         biometricAccessState = .locked
         homeBiometricState = .locked
@@ -11792,6 +11908,7 @@ final class AppModel: ObservableObject {
             homeBiometricState = .authorized
             biometricSignInPermanentlyUnavailable = false
             biometricPINRecoveryRequiresEnrollmentRemoval = false
+            publishSharedDestinationsIfPossible()
             await resumeAuthenticatedSessionIfNeeded()
         } catch {
             guard await sessions.current()?.sessionId == expectedSessionID,
@@ -11927,6 +12044,7 @@ final class AppModel: ObservableObject {
                     groups: messagingGroupsEnabled,
                     reactions: messagingReactionsEnabled,
                     messageEdits: messagingMessageEditsEnabled,
+                    mediaMessages: discovered.enablesMessagingMediaMessageV2,
                     for: expectedDeferredFeatureScope
                 )
             }
@@ -14983,6 +15101,13 @@ final class AppModel: ObservableObject {
             lastError = messagingSendFailureMessage
             return false
         }
+        // Reuse the authenticated capability snapshot before parking files or clearing the
+        // draft. A known withdrawal must not turn Send into an indefinitely queued batch.
+        // Unknown discovery remains local-only; flush still checks the current server/roster.
+        guard messagingMediaMessageLocalQueueEnabled else {
+            lastError = "Sending multiple attachments together is temporarily unavailable. Your selection is saved; send one attachment at a time for now."
+            return false
+        }
         // Group threads queue without a pinned single recipient; per-member privacy and group
         // attestation run authoritatively at flush and on the server, exactly like v1.
         let recipientUserID: String?
@@ -15129,6 +15254,12 @@ final class AppModel: ObservableObject {
         ) else {
             await rollbackParks()
             lastError = "Group messaging is not available right now. You can still read this conversation."
+            return false
+        }
+        guard messagingMediaMessageLocalQueueEnabled else {
+            // Local storage awaits may overlap an authenticated withdrawal. Keep draft-owned
+            // bytes intact; bounded orphan reconciliation owns any uncommitted new parks.
+            lastError = "Sending multiple attachments together is temporarily unavailable. Your selection is saved; send one attachment at a time for now."
             return false
         }
         do {
@@ -19690,6 +19821,21 @@ final class AppModel: ObservableObject {
             }
         }
 
+        // Repair the explanation for batches queued by older builds before their next
+        // backoff expires. This scoped update changes no payload, retry time or schedule.
+        if capabilities?.enablesMessagingMediaMessageV2 == false,
+           !OutboxPolicy.unmarkedMediaCapabilityWaitingIDs(in: state, at: Date()).isEmpty {
+            do {
+                state = try await commitAuthenticatedMutation(
+                    accountEpoch: expectedAccountEpoch,
+                    userID: expectedUserID,
+                    sessionID: expectedSessionID
+                ) { persisted in
+                    OutboxPolicy.markKnownUnavailableMediaBatches(in: &persisted, at: Date())
+                }
+            } catch { return }
+        }
+
         let commands = OutboxPolicy.readyCommands(
             state.outbox,
             at: Date(),
@@ -19786,6 +19932,27 @@ final class AppModel: ObservableObject {
                         guard ProtectedCommunicationAdmissionGate.shared.permits(
                             communicationAdmission
                         ), !isSubmittingAccountDeletion else { return }
+                        if capabilities?.enablesMessagingMediaMessageV2 == false,
+                           !OutboxPolicy.shouldRecheckMediaCapability(for: activeCommand, at: Date()),
+                           let messageID = activeCommand.messageId,
+                           state.messages.first(where: { $0.id == messageID })?.pendingMediaBatch?.isStructurallyValid == true {
+                            throw SecureMessagingExchangeError.mediaMessageCapabilityUnavailable
+                        }
+                        if OutboxPolicy.mediaCapabilityWaitingReason(for: activeCommand) != nil {
+                            let waitingCommand = activeCommand
+                            state = try await commitOutboxMutation(
+                                accountEpoch: expectedAccountEpoch,
+                                userID: expectedUserID,
+                                sessionID: expectedSessionID,
+                                command: waitingCommand
+                            ) { persisted in
+                                OutboxPolicy.clearMediaCapabilityWaitingReason(for: waitingCommand, in: &persisted)
+                            }
+                            guard let refreshed = state.outbox.first(where: {
+                                $0.id == waitingCommand.id && $0.kind == waitingCommand.kind
+                            }) else { throw CancellationError() }
+                            activeCommand = refreshed
+                        }
                         _ = try await SecureMessagingActivationBinding.withAuthenticatedScope(
                             accountGeneration: expectedAccountEpoch,
                             sessionID: expectedSessionID,
@@ -20050,6 +20217,11 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func outboxWaitingReason(for messageID: UUID) -> String? {
+        guard let command = state.outbox.first(where: { $0.messageId == messageID }) else { return nil }
+        return OutboxPolicy.mediaCapabilityWaitingReason(for: command)
+    }
+
     private func isUnpreparedOutboxMediaCommand(_ command: OfflineCommand) -> Bool {
         guard command.kind == .secureMessage,
               command.secureMessageFanout == nil,
@@ -20135,7 +20307,28 @@ final class AppModel: ObservableObject {
               communicationPrivacyDecision(for: command) == .allowed,
               !isGroupMessagingCommand(command) || messagingGroupsEnabled
         else { return }
+        var activeCommand = command
+        let commandID = command.id
         do {
+            if capabilities?.enablesMessagingMediaMessageV2 == false,
+               !OutboxPolicy.shouldRecheckMediaCapability(for: activeCommand, at: Date()),
+               let messageID = command.messageId,
+               state.messages.first(where: { $0.id == messageID })?.pendingMediaBatch?.isStructurallyValid == true {
+                throw SecureMessagingExchangeError.mediaMessageCapabilityUnavailable
+            }
+            if OutboxPolicy.mediaCapabilityWaitingReason(for: activeCommand) != nil {
+                let waitingCommand = activeCommand
+                state = try await commitOutboxMutation(
+                    accountEpoch: expectedAccountEpoch, userID: userID,
+                    sessionID: sessionID, command: waitingCommand
+                ) { persisted in
+                    OutboxPolicy.clearMediaCapabilityWaitingReason(for: waitingCommand, in: &persisted)
+                }
+                guard let refreshed = state.outbox.first(where: {
+                    $0.id == waitingCommand.id && $0.kind == waitingCommand.kind
+                }) else { throw CancellationError() }
+                activeCommand = refreshed
+            }
             let isForeground = UIApplication.shared.applicationState == .active
             _ = try await SecureMessagingActivationBinding.withAuthenticatedScope(
                 accountGeneration: expectedAccountEpoch,
@@ -20144,7 +20337,7 @@ final class AppModel: ObservableObject {
             ) {
                 try await MessagingSendSchedulingPolicy.$isForegroundSend.withValue(isForeground) {
                     try await SecureMessagingExchangeCoordinator.shared.prepareDeferredMessage(
-                        commandID: command.id, forUserID: userID
+                        commandID: commandID, forUserID: userID
                     )
                 }
             }
@@ -20160,7 +20353,7 @@ final class AppModel: ObservableObject {
                 accountEpoch: expectedAccountEpoch, userID: userID, sessionID: sessionID
             ) else { return }
             await handleOutboxFailure(
-                command,
+                activeCommand,
                 error: error,
                 reportFailure: reportFailures,
                 accountEpoch: expectedAccountEpoch,
@@ -22432,6 +22625,7 @@ final class AppModel: ObservableObject {
             sessionID: expectedSessionID
         ) else { return }
         let reason = error.localizedDescription
+        let waitingForMediaCapability = OutboxPolicy.isMediaMessageCapabilityUnavailable(error)
         do {
             switch OutboxPolicy.failureDecision(for: error) {
             case .retry(let retryAfter):
@@ -22446,7 +22640,8 @@ final class AppModel: ObservableObject {
                         for: command,
                         in: &persisted,
                         at: now,
-                        retryAfter: retryAfter
+                        retryAfter: retryAfter,
+                        waitingForMediaCapability: waitingForMediaCapability
                     )
                     if let messageID = command.messageId,
                        let index = persisted.messages.firstIndex(where: { $0.id == messageID }) {

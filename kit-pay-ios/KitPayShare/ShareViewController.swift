@@ -14,6 +14,12 @@ final class ShareViewController: UIViewController {
         let warning: String?
     }
 
+    private struct InitialShareOwner: Equatable {
+        let generation: UUID
+        let accountID: String
+        let sessionID: String
+    }
+
     private let store = DirectShareSendRecord.stagingStore
 
     private let cancelButton = UIButton(type: .system)
@@ -47,6 +53,8 @@ final class ShareViewController: UIViewController {
     private var isCommittingSend = false
     private var hasLeftShareSheet = false
     private var sendScope: MessagingProcessBroker.Scope?
+    private var initialShareOwner: InitialShareOwner?
+    private var hasInitialAuthorizationFailure = false
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -80,13 +88,34 @@ final class ShareViewController: UIViewController {
 
     // MARK: Collecting
 
+    private func authorizeInitialShare() async throws -> MessagingProcessBroker.ApprovedDirectory {
+        if initialShareOwner == nil, let scope = try? MessagingProcessBroker.shared.scope() {
+            initialShareOwner = InitialShareOwner(
+                generation: scope.generation, accountID: scope.accountID, sessionID: scope.sessionID
+            )
+        }
+        let directory = try await MessagingProcessBroker.shared.authorizeShare()
+        try Task.checkCancellation()
+        guard !hasFinished, !hasLeftShareSheet else { throw CancellationError() }
+        let owner = InitialShareOwner(
+            generation: directory.generation, accountID: directory.accountID, sessionID: directory.sessionID
+        )
+        guard initialShareOwner == nil || initialShareOwner == owner else {
+            throw MessagingProcessBroker.Failure.accountChanged
+        }
+        // Fresh authorization may renew sharing permission, but never changes the
+        // account/session that this sheet already captured. No provider has been read yet.
+        initialShareOwner = owner
+        return directory
+    }
+
     private func collectShare() async {
         let batchID = UUID()
         batchIDBeingStaged = batchID
 
         let ownerAccountID: String
         do {
-            let directory = try await MessagingProcessBroker.shared.authorizeShare()
+            let directory = try await authorizeInitialShare()
             ownerAccountID = directory.accountID
             destinations = directory.destinations
             filteredDestinations = destinations
@@ -102,7 +131,9 @@ final class ShareViewController: UIViewController {
             store.remove(batchID: batchID)
             batchIDBeingStaged = nil
             isCollecting = false
-            present(failure: (error as? LocalizedError)?.errorDescription)
+            collectionTask = nil
+            guard !Task.isCancelled, !hasFinished, !hasLeftShareSheet else { return }
+            presentInitialAuthorizationFailure(error)
             return
         }
 
@@ -786,6 +817,7 @@ final class ShareViewController: UIViewController {
     }
 
     private func present(failure: String?) {
+        hasInitialAuthorizationFailure = false
         hasPresentedFailure = true
         spinner.stopAnimating()
         spinner.isHidden = true
@@ -806,6 +838,49 @@ final class ShareViewController: UIViewController {
         actionButton.isHidden = false
         actionButton.isEnabled = true
         secondaryActionButton.isHidden = true
+    }
+
+    private func presentInitialAuthorizationFailure(_ error: Error) {
+        present(failure: (error as? LocalizedError)?.errorDescription)
+        hasInitialAuthorizationFailure = true
+        messageLabel.text = (messageLabel.text ?? "") + " Tap Retry to check sharing access again."
+        configureActionButton(title: "Retry", filled: true)
+        actionButton.removeTarget(nil, action: nil, for: .allEvents)
+        actionButton.addTarget(self, action: #selector(retryInitialAuthorization), for: .touchUpInside)
+        configureSecondaryButton(title: "Close")
+        secondaryActionButton.removeTarget(nil, action: nil, for: .allEvents)
+        secondaryActionButton.addTarget(self, action: #selector(cancel), for: .touchUpInside)
+        secondaryActionButton.isHidden = false
+        secondaryActionButton.isEnabled = true
+        cancelButton.isHidden = true
+    }
+
+    @objc private func retryInitialAuthorization() {
+        guard hasInitialAuthorizationFailure, hasPresentedFailure,
+              !hasFinished, !hasLeftShareSheet, !isCollecting,
+              !hasPublishedBatch, !isCommittingSend, sendTask == nil, pendingShare == nil
+        else { return }
+        hasInitialAuthorizationFailure = false
+        hasPresentedFailure = false
+        destinations = []
+        filteredDestinations = []
+        requestedDestination = nil
+        hasRequestedDestination = false
+        searchBar.text = nil
+        statusSymbol.isHidden = true
+        titleLabel.text = "Unlock sharing"
+        summaryLabel.text = "Checking secure sharing…"
+        messageLabel.text = "Authenticate to choose a chat. Nothing is sent until you tap Send."
+        messageLabel.textColor = .secondaryLabel
+        spinner.isHidden = false
+        spinner.startAnimating()
+        actionButton.isHidden = true
+        secondaryActionButton.isHidden = true
+        setControlsEnabled(false)
+        cancelButton.isHidden = false
+        cancelButton.isEnabled = true
+        isCollecting = true
+        collectionTask = Task { await collectShare() }
     }
 
     @objc private func finish() {

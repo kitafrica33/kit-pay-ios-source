@@ -14,6 +14,13 @@ not guarantees for iCloud originals, large videos, unavailable recipients or slo
 - Two bounded foreground media workers prepare uploads without holding later text behind an
   unsealed attachment. Sealed Signal envelopes retain FIFO and retry ordering; account/session,
   block-list, capability and recipient-roster checks still apply before publication.
+- Multi-attachment sends respect the last authenticated server availability decision before
+  clearing the composer. Existing unsealed batches that cannot pass the capability check show
+  a waiting reason and release later messages during their retry backoff. Their files, caption,
+  message identity and retry deadline are retained. Known server denial avoids upload setup;
+  capability and roster checks run again when preparation can proceed. Recovery retains the
+  existing bounded backoff of at most 120 seconds. Single photos, videos and voice notes do not
+  depend on the multi-attachment feature.
 - New foreground encrypted uploads up to 4 MiB use the existing idempotent single-request
   endpoint. Larger uploads retain resumable checkpoints. A recovered upload retains its existing
   object/offset identity instead of creating a second transfer.
@@ -71,6 +78,11 @@ or attachments. An ordinary biometric UI lock retains those suggestions for shar
 apps; the share sheet still authenticates separately before showing its recipient directory.
 Stale, blocked and concealed recipients are withdrawn; account changes also invalidate
 in-flight donations. iOS controls whether and where these suggestions appear.
+
+Build 95 coordinates main-app Face ID approval with routine destination publication so an
+ordinary refresh cannot invalidate an approval in progress. Real security revocations still
+win. An initial share authorization failure offers Retry, which checks access again before
+reading provider content and never sends automatically. See [direct-share-ios.md](docs/direct-share-ios.md).
 
 ## Validation
 

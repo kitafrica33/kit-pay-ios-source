@@ -275,3 +275,168 @@ final class ChatMediaSelectionTests: XCTestCase {
         }
     }
 }
+
+final class ChatMediaImportCancellationTests: XCTestCase {
+    @MainActor
+    func testRemovingStalledProviderReleasesReadyPhotoAndCannotFinishSuccessor() async throws {
+        let image = UIGraphicsImageRenderer(size: CGSize(width: 16, height: 16)).image { context in
+            UIColor.systemGreen.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 16, height: 16))
+        }
+        let bytes = try XCTUnwrap(image.jpegData(compressionQuality: 0.8))
+        let source = try ChatMediaTempFiles.writeTemporaryFile(data: bytes, mediaType: "image/jpeg")
+        defer { ChatMediaTempFiles.removeTemporaryFile(source) }
+        let ready = KitChatPickedItem(provider: try XCTUnwrap(NSItemProvider(contentsOf: source)))
+        let stalledProvider = NSItemProvider()
+        let callback = PendingChatPhotoProviderCallback()
+        let started = expectation(description: "Cloud provider started")
+        stalledProvider.registerFileRepresentation(
+            forTypeIdentifier: UTType.jpeg.identifier, fileOptions: [], visibility: .all
+        ) { completion in
+            callback.install(completion)
+            started.fulfill()
+            return Progress(totalUnitCount: 1)
+        }
+        let stalled = KitChatPickedItem(provider: stalledProvider)
+        var imports = KitChatLibraryImportState()
+        imports.begin(generation: 1, cancellations: [
+            ready.id: { ready.cancelImport() }, stalled.id: { stalled.cancelImport() },
+        ])
+        let cancelled = expectation(description: "Removed provider waiter released without callback")
+        let stalledTask = Task {
+            do {
+                _ = try await stalled.importOriginal()
+                XCTFail("Removed provider must not produce an attachment")
+            } catch {
+                XCTAssertTrue(error is CancellationError)
+            }
+            cancelled.fulfill()
+        }
+        defer { stalledTask.cancel(); callback.deliver(source) }
+        await fulfillment(of: [started], timeout: 2)
+        let imported = try await ready.importOriginal()
+        defer { try? FileManager.default.removeItem(at: imported.url.deletingLastPathComponent()) }
+        XCTAssertTrue(imports.finish(ready.id, generation: 1))
+        XCTAssertTrue(imports.isLoading)
+        XCTAssertTrue(imports.remove(stalled.id))
+        XCTAssertFalse(imports.isLoading, "The remaining ready photo can send or add another item immediately")
+        XCTAssertEqual(try Data(contentsOf: imported.url), bytes)
+
+        let successor = KitChatProviderRequest<Int>()
+        imports.begin(generation: 2, cancellations: [stalled.id: { successor.cancel() }])
+        await fulfillment(of: [cancelled], timeout: 2)
+        XCTAssertFalse(imports.finish(stalled.id, generation: 1))
+        XCTAssertTrue(imports.isLoading, "A cancelled predecessor cannot clear a successor's busy state")
+        XCTAssertTrue(successor.isPending)
+        imports.retire()
+    }
+
+    func testRemovingOnePendingSelectionKeepsOtherWantedImport() {
+        let removedID = UUID(), keptID = UUID()
+        let removed = KitChatProviderRequest<Int>(), kept = KitChatProviderRequest<Int>()
+        var imports = KitChatLibraryImportState()
+        imports.begin(generation: 1, cancellations: [
+            removedID: { removed.cancel() }, keptID: { kept.cancel() },
+        ])
+        XCTAssertTrue(imports.remove(removedID))
+        XCTAssertFalse(removed.isPending)
+        XCTAssertTrue(kept.isPending)
+        XCTAssertTrue(imports.isLoading)
+        XCTAssertFalse(imports.finish(removedID, generation: 1))
+        XCTAssertTrue(imports.finish(keptID, generation: 1))
+        XCTAssertFalse(imports.isLoading)
+    }
+
+    func testRetiringImportsCancelsAllAndRejectsLateGeneration() {
+        let id = UUID(), secondID = UUID()
+        let old = KitChatProviderRequest<Int>(), second = KitChatProviderRequest<Int>()
+        var imports = KitChatLibraryImportState()
+        imports.begin(generation: 1, cancellations: [id: { old.cancel() }, secondID: { second.cancel() }])
+        imports.retire()
+        XCTAssertFalse(old.isPending)
+        XCTAssertFalse(second.isPending)
+        XCTAssertFalse(imports.isLoading)
+        let successor = KitChatProviderRequest<Int>()
+        imports.begin(generation: 2, cancellations: [id: { successor.cancel() }])
+        XCTAssertFalse(imports.finish(id, generation: 1))
+        XCTAssertTrue(imports.isLoading)
+        XCTAssertTrue(successor.isPending)
+        imports.retire()
+    }
+
+    func testProviderCancelledBeforeRegistrationNeverStartsLoader() async {
+        let request = KitChatProviderRequest<Int>()
+        request.cancel()
+        do {
+            _ = try await request.load {
+                XCTFail("An already removed selection must not start its provider")
+                return Progress(totalUnitCount: 1)
+            }
+            XCTFail("Expected cancellation")
+        } catch { XCTAssertTrue(error is CancellationError) }
+    }
+
+    func testProviderCancellationDuringRegistrationCancelsReturnedProgress() async {
+        let request = KitChatProviderRequest<Int>()
+        let progress = Progress(totalUnitCount: 1)
+        do {
+            _ = try await request.load {
+                request.cancel()
+                return progress
+            }
+            XCTFail("Expected cancellation")
+        } catch { XCTAssertTrue(error is CancellationError) }
+        XCTAssertTrue(progress.isCancelled)
+        XCTAssertFalse(request.finish(.success(1)), "The late callback must discard its output")
+    }
+
+    @MainActor
+    func testTaskCancellationReleasesProviderWithoutCallback() async {
+        let request = KitChatProviderRequest<Int>()
+        let progress = Progress(totalUnitCount: 1)
+        let started = expectation(description: "Provider started")
+        let finished = expectation(description: "Cancellation released waiter")
+        let task = Task {
+            do {
+                _ = try await request.load { started.fulfill(); return progress }
+                XCTFail("Expected cancellation")
+            } catch { XCTAssertTrue(error is CancellationError) }
+            finished.fulfill()
+        }
+        await fulfillment(of: [started], timeout: 2)
+        task.cancel()
+        await fulfillment(of: [finished], timeout: 2)
+        XCTAssertTrue(progress.isCancelled)
+        XCTAssertFalse(request.finish(.success(1)))
+    }
+
+    func testCompletedProviderRejectsDuplicateCallbackWithoutCancellingResult() async throws {
+        let request = KitChatProviderRequest<Int>()
+        let progress = Progress(totalUnitCount: 1)
+        let value = try await request.load {
+            XCTAssertTrue(request.finish(.success(7)))
+            return progress
+        }
+        XCTAssertEqual(value, 7)
+        XCTAssertFalse(request.finish(.success(8)))
+        request.cancel()
+        XCTAssertFalse(progress.isCancelled)
+    }
+}
+
+private final class PendingChatPhotoProviderCallback: @unchecked Sendable {
+    private let lock = NSLock()
+    private var callback: ((URL?, Bool, Error?) -> Void)?
+
+    func install(_ callback: @escaping (URL?, Bool, Error?) -> Void) {
+        lock.withLock { self.callback = callback }
+    }
+
+    func deliver(_ url: URL) {
+        let callback = lock.withLock {
+            defer { self.callback = nil }
+            return self.callback
+        }
+        callback?(url, false, nil)
+    }
+}

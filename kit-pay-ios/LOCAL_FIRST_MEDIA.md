@@ -6,6 +6,13 @@ This document is the release contract for the iOS messaging-media pipeline.
 
 - Capture or selection creates a permanent client media UUID and an app-owned local original
   before the durable message/outbox transaction is committed.
+- In-chat Photos imports belong to individual selections. Removing a stalled iCloud item cancels
+  its waiter immediately and leaves wanted imports running; ready attachments can send or add more
+  items once no wanted import remains. Late provider callbacks cannot restore removed selections,
+  clear a newer import's busy state, or retain abandoned scratch files. Leaving the chat or revoking
+  its account retires pending requests. `ChatMediaImportCancellationTests` includes an actual
+  `NSItemProvider` regression; the focused host gate runs the production cancellation, generation
+  and composer-removal code. Real iCloud timing and picker presentation still need device checks.
 - The sender bubble and sender playback resolve that local original. They never require upload,
   a remote object URL, server processing, delivery, or a download of bytes already on the device.
 - Large originals are file-backed, excluded from backup, and use iOS Data Protection
@@ -18,12 +25,16 @@ This document is the release contract for the iOS messaging-media pipeline.
   media-specific service checks and recipient-device checks run during background preparation,
   and the server authoritatively validates the request before accepting encrypted fanout.
 - A temporary authenticated-capability discovery failure does not make existing group composers,
-  reactions, or edits read-only on an already-enrolled device. Those mutations commit to the same
+  reactions, edits or multi-attachment composition read-only on an already-enrolled device. Those mutations commit to the same
   protected local outbox and wait, unless this account/session last confirmed that the feature was
   withdrawn. That denial survives transient refresh failures but never crosses an account or session
   boundary. The local flush gate requires an authenticated feature projection, the coordinator
   validates the current recipient roster, and the server atomically rechecks its feature gate and
   roster before accepting the encrypted request; stale state therefore remains pending for retry.
+- A known server withdrawal of multi-attachment messages keeps the current selection and caption
+  in the composer with an explanation before parking files or clearing the draft. It does not
+  make a network request on Send. The last authenticated decision remains scoped to the account
+  and session; the upload boundary still requires fresh capability and roster checks.
 - Recipients authenticate and stream-decrypt to an unpublished file, atomically publish the local
   copy, then mark the media `localCached`. Reopening uses that copy without another download.
 - Sent originals are never cache-eviction candidates. Received files use a 512 MiB high-water /
@@ -65,6 +76,12 @@ and authoritative offset are persisted. Relaunch resumes the same IDs and never 
 message. A 404/410 upload lease starts a new server lease while retaining media identity and E2EE
 key material. If a completed server object expires before message acceptance, KITMEDIA1 and
 KITMEDIA2 return to pending from the retained local original and clear only remote-derived state.
+An unavailable multi-attachment capability records a waiting reason on the unsealed outbox
+command. It does not set a message failure, split the batch, discard files or mint a new identity.
+The existing bounded retry deadline remains armed while later ready messages can proceed.
+Once a Signal fanout exists, normal ordering and retry barriers apply even if an old waiting
+reason remains in a snapshot. Older queued batches acquire the explanation without changing
+their deadlines or scheduled delivery time.
 Immediately before sealing, each resumable READY declaration is replayed exactly: a live lease is
 renewed in place, while a retention-swept object receives a fresh empty session and is refilled
 from retained deterministic ciphertext. Ciphertext spools are removed only after that final pass.
