@@ -66,6 +66,13 @@ keyboard, dismissal and draft assertions remain. The remaining suite and signed
 archive did not run for build 96; it was never uploaded. No test is removed or retried
 automatically, and the published build 96 source tag remains immutable.
 
+Build 97 stopped in the shared preflight checks because the workflow's example
+source URL still named build 96. Exact runtime source availability passed, but the
+release-identity check correctly required matching metadata. No native build or
+signed archive ran. Build 98 aligns the example URL, archive default and all six
+app/extension build configurations. It preserves the full validator and native
+test selections and the immutable source 97 release.
+
 Native tests use the original generated `.xctestrun` unchanged. XCTest installs and launches
 its own products; Simulator does not support `UseDestinationArtifacts`. Exact compiled product
 and plan validation precede the first group. After it succeeds, installed-app observation and
