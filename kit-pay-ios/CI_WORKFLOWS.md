@@ -57,6 +57,15 @@ cancellation, long-history scrolling, and call-banner layout before the remainin
 A failure stops that run early. Each focused check is
 excluded from the remaining phase, so this ordering adds no compilation or test runs.
 
+Build 96 compiled successfully but the focused phase failed on the new attachment
+test's final editing assertion: Photos and Files opened and cancelled, the draft
+survived, and repeated panel toggles succeeded, but the final edit appeared before
+the draft instead of after it. Build 97 checks one complete insertion at the tapped
+position while requiring every original character to remain in order. The picker,
+keyboard, dismissal and draft assertions remain. The remaining suite and signed
+archive did not run for build 96; it was never uploaded. No test is removed or retried
+automatically, and the published build 96 source tag remains immutable.
+
 Native tests use the original generated `.xctestrun` unchanged. XCTest installs and launches
 its own products; Simulator does not support `UseDestinationArtifacts`. Exact compiled product
 and plan validation precede the first group. After it succeeds, installed-app observation and

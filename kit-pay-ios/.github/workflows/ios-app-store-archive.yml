@@ -28,7 +28,7 @@ on:
       build_number:
         description: Monotonically increasing integer CFBundleVersion
         required: true
-        default: "96"
+        default: "97"
         type: string
       confirmation:
         description: Type ARCHIVE_KIT_PAY_APP_STORE

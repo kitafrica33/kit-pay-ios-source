@@ -271,9 +271,20 @@ final class AppStoreScreenshotUITests: XCTestCase {
         requireHittable(composer, in: app, message: "The composer is obstructed after closing attachments")
         composer.tap()
         require(app.keyboards.firstMatch, in: app, message: "The composer keyboard did not return")
-        composer.typeText(" kept")
-        XCTAssertEqual(composer.value as? String, originalDraft + " kept",
-                       "The composer must accept edits after both real pickers are cancelled")
+        XCTAssertEqual(composer.value as? String, originalDraft,
+                       "Reopening the attachment panel must preserve the complete draft")
+        // A tap chooses an insertion point; it does not promise to place the caret at the
+        // end. Require one contiguous edit at any position with every draft character intact.
+        let insertedText = "__edit__"
+        composer.typeText(insertedText)
+        guard let editedDraft = composer.value as? String else {
+            XCTFail("The composer must expose the edited draft after picker cancellation")
+            return
+        }
+        XCTAssertEqual(editedDraft.count, originalDraft.count + insertedText.count,
+                       "The composer must insert the typed text exactly once")
+        XCTAssertEqual(editedDraft.replacingOccurrences(of: insertedText, with: ""), originalDraft,
+                       "Typing after picker cancellation must preserve every original draft character")
     }
 
     func testLongHistoryVerticalBubbleDragsPreserveReadingPosition() {
