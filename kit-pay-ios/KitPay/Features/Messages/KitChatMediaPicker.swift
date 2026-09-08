@@ -3,6 +3,15 @@ import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
 
+enum KitChatDocumentPickerPolicy {
+    static func failureMessage(for error: Error) -> String? {
+        let failure = error as NSError
+        guard failure.domain != NSCocoaErrorDomain || failure.code != NSUserCancelledError
+        else { return nil }
+        return "The selected file could not be opened. Please choose it again in Files."
+    }
+}
+
 /// A provider may never call back after cancellation. Resolve the waiter ourselves, and let
 /// a late successful callback dispose of any temporary bytes it no longer owns.
 final class KitChatProviderRequest<Value: Sendable>: @unchecked Sendable {
@@ -210,6 +219,7 @@ struct KitChatMediaPicker: UIViewControllerRepresentable {
         configuration.preferredAssetRepresentationMode = .current
         let picker = PHPickerViewController(configuration: configuration)
         picker.delegate = context.coordinator
+        picker.view.accessibilityIdentifier = "conversation-photo-picker"
         return picker
     }
 

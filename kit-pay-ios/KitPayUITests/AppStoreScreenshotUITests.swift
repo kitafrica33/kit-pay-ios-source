@@ -194,6 +194,88 @@ final class AppStoreScreenshotUITests: XCTestCase {
                        "Keyboard dismissal must not launch the camera")
     }
 
+    func testChatAttachmentMenuOpensPhotosAndFilesAfterKeyboardDismissal() {
+        let app = XCUIApplication()
+        app.launchArguments += [
+            fixtureArgument,
+            "-AppleLanguages", "(en)",
+            "-AppleLocale", "en_UG",
+            "-UIUserInterfaceStyle", "Light",
+        ]
+        app.launch()
+        require(app.staticTexts["Wallet balance"], in: app, message: "Fixture Home did not load")
+        tap(app.buttons["Messages"], in: app, message: "Messages tab is unavailable")
+        openFixtureConversation(in: app)
+
+        let composer = app.descendants(matching: .any)
+            .matching(identifier: "conversation-message-composer").firstMatch
+        let attachmentToggle = app.buttons["conversation-attachment-toggle"]
+        let attachmentMenu = app.descendants(matching: .any)
+            .matching(identifier: "conversation-attachment-menu").firstMatch
+        let photoPicker = app.descendants(matching: .any)
+            .matching(identifier: "conversation-photo-picker").firstMatch
+        let originalDraft = "Attachment preview draft"
+
+        requireHittable(composer, in: app, message: "The real message composer is unavailable")
+        composer.tap()
+        require(app.keyboards.firstMatch, in: app, message: "The composer keyboard did not appear")
+        composer.typeText(originalDraft)
+        XCTAssertEqual(composer.value as? String, originalDraft)
+
+        // Exercise the customer's path with the keyboard still raised. These are real
+        // PHPicker/Files presentations; no fixture callback pretends a picker opened.
+        requireHittable(attachmentToggle, in: app, message: "Attachments cannot open above the keyboard")
+        attachmentToggle.tap()
+        require(attachmentMenu, in: app, message: "The attachment panel did not open")
+        let library = app.buttons["conversation-attach-library"]
+        requireHittable(library, in: app, message: "Photo & video library is not tappable")
+        library.tap()
+        require(photoPicker, in: app, message: "The real photo picker did not present")
+        requireHittable(app.buttons["Cancel"].firstMatch, in: app,
+                       message: "The photo picker cannot be cancelled")
+        app.buttons["Cancel"].firstMatch.tap()
+        requireHittable(attachmentToggle, in: app, message: "Photo cancellation did not restore attachments")
+        XCTAssertFalse(photoPicker.exists, "The photo picker must dismiss before opening another picker")
+        XCTAssertEqual(composer.value as? String, originalDraft, "Photo cancellation must preserve the draft")
+
+        // Reopen immediately after cancellation; a stale presentation flag must not swallow
+        // the next selection or leave the composer behind a dismissed modal.
+        attachmentToggle.tap()
+        require(attachmentMenu, in: app, message: "The attachment panel could not reopen after Photos")
+        let document = app.buttons["conversation-attach-document"]
+        requireHittable(document, in: app, message: "Document is not tappable")
+        document.tap()
+        let filesCancel = app.buttons["Cancel"].firstMatch
+        requireHittable(filesCancel, in: app, message: "The native Files picker did not present")
+        XCTAssertFalse(photoPicker.exists, "Document must open Files, not the previous photo picker")
+        XCTAssertFalse(composer.isHittable, "Files must own presentation while choosing a document")
+        filesCancel.tap()
+        requireHittable(composer, in: app, message: "Files cancellation did not restore the composer")
+        XCTAssertEqual(composer.value as? String, originalDraft, "Files cancellation must preserve the draft")
+
+        // Verify repeated plain + taps remain reversible, then prove actual text editing
+        // still works. No Send is pressed and this synthetic draft never leaves the device.
+        for _ in 0..<2 {
+            requireHittable(attachmentToggle, in: app, message: "Attachments became unavailable after cancellation")
+            attachmentToggle.tap()
+            requireHittable(library, in: app, message: "The attachment panel did not reopen")
+            attachmentToggle.tap()
+            let closed = XCTNSPredicateExpectation(
+                predicate: NSPredicate(format: "exists == false"), object: attachmentMenu
+            )
+            if XCTWaiter.wait(for: [closed], timeout: 10) != .completed {
+                retainHierarchy(app, named: "chat-attachment-menu-dismissal-failure")
+                XCTFail("The + button must close the attachment panel")
+            }
+        }
+        requireHittable(composer, in: app, message: "The composer is obstructed after closing attachments")
+        composer.tap()
+        require(app.keyboards.firstMatch, in: app, message: "The composer keyboard did not return")
+        composer.typeText(" kept")
+        XCTAssertEqual(composer.value as? String, originalDraft + " kept",
+                       "The composer must accept edits after both real pickers are cancelled")
+    }
+
     func testLongHistoryVerticalBubbleDragsPreserveReadingPosition() {
         let app = XCUIApplication()
         app.launchArguments += [

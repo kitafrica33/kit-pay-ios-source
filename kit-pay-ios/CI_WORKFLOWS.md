@@ -52,8 +52,9 @@ unchanged. Build88 compiled all native test products but stopped at the previous
 Simulator verifier before any native test executed; a successful compilation alone
 does not establish test acceptance.
 
-The focused native phase runs chat opening, pull-to-camera, long-history scrolling,
-and call-banner layout before the remaining suite. A failure stops that run early. Each focused check is
+The focused native phase runs chat opening, pull-to-camera, attachment picker opening and
+cancellation, long-history scrolling, and call-banner layout before the remaining suite.
+A failure stops that run early. Each focused check is
 excluded from the remaining phase, so this ordering adds no compilation or test runs.
 
 Native tests use the original generated `.xctestrun` unchanged. XCTest installs and launches

@@ -84,11 +84,27 @@ ordinary refresh cannot invalidate an approval in progress. Real security revoca
 win. An initial share authorization failure offers Retry, which checks access again before
 reading provider content and never sends automatically. See [direct-share-ios.md](docs/direct-share-ios.md).
 
+Inside a chat, **+** opens an inline attachment panel with Photos, Files, camera and payment
+actions. The panel remains responsive during draft restoration or an import and explains
+why an action is temporarily unavailable. Removing a pending Files item releases its busy
+state without removing other ready attachments; late copy completion cannot affect a newer
+selection. Cancelling Photos or Files preserves the typed draft. Files failures are shown
+instead of silently returning to the chat.
+
+Photos and videos selected through Files receive local thumbnails. If a photo preview opens
+before its protected copy finishes, the displayed image remains intact when the URL changes.
+Open document/video viewers retain their own file-provider access until dismissal, so completing
+the import cannot revoke a PDF or QuickLook reader's access. Preview, edit/filter and PDF page
+selection continue to use the existing composer; only Send queues encrypted content.
+
 ## Validation
 
 Focused tests cover upload selection/checkpoint ownership, media/text ordering, account-scoped
 history continuation, pending-preview durability, provider file ownership, and PDF selection,
 export and cancellation. Native tests run in the existing consolidated iOS build workflow.
+The focused UI phase opens the real Photos and Files pickers from **+** with the keyboard
+visible, cancels both, reopens the panel and confirms the original draft remains editable.
+It runs once from the existing test build and is excluded from the remaining phase.
 Keep received-video playback-to-end, relaunch recovery and camera/scroll checks enabled.
 
 Text diagnostics now distinguish Send-to-local-commit, local-bubble display, encryption,

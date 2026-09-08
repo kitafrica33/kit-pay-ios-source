@@ -278,6 +278,9 @@ elif sys.argv[1:3] == ['simctl', 'privacy'] and os.environ.get('KITPAY_FAIL_CONT
         scrolling = "KitPayUITests/AppStoreScreenshotUITests/testLongHistoryVerticalBubbleDragsPreserveReadingPosition"
         self.assertEqual(calls[0].count("-only-testing:" + scrolling), 1)
         self.assertEqual(calls[1].count("-skip-testing:" + scrolling), 1)
+        attachments = "KitPayUITests/AppStoreScreenshotUITests/testChatAttachmentMenuOpensPhotosAndFilesAfterKeyboardDismissal"
+        self.assertEqual(calls[0].count("-only-testing:" + attachments), 1)
+        self.assertEqual(calls[1].count("-skip-testing:" + attachments), 1)
         for test in (
             "testReceivedVideoPlaysToEndAndReplaysAfterParentFileCleanup",
             "testGalleryScrubbingRejectsInvalidTimesAndPreservesPauseIntent",

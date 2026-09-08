@@ -69,7 +69,7 @@ class ChatPickerCancellationTests(unittest.TestCase):
             self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
             result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=20)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn("7 picker cancellation scenarios and 100 completion races passed", result.stdout)
+            self.assertIn("8 picker cancellation scenarios and 100 completion races passed", result.stdout)
 
 
 STUBS = r'''
@@ -78,6 +78,7 @@ struct StagedAttachment { let id: UUID }
     var isSending = false, isPreparingMediaEdit = false, isLoadingAttachment = true
     var attachmentLoadGeneration = 1
     var libraryImportState = KitChatLibraryImportState()
+    var documentImportID: UUID?
     var stagedAttachments: [StagedAttachment] = []
     var removedFromManifest: [UUID] = []
     func persistDraftImmediately(removingMediaIDsAfterSuccess ids: [UUID]) { removedFromManifest += ids }
@@ -180,6 +181,34 @@ final class Started: @unchecked Sendable {
         completed.cancel()
         require(!completedProgress.isCancelled, "completed result was revoked")
 
+        // 8: A Files import has no NSItemProvider cancellation object. Removing just that
+        // pending document must still release Send/+ and invalidate its eventual copy callback.
+        let documentComposer = Composer(), documentID = UUID()
+        documentComposer.documentImportID = documentID
+        documentComposer.stagedAttachments = [.init(id: readyID), .init(id: documentID)]
+        let originalDocumentGeneration = documentComposer.attachmentLoadGeneration
+        documentComposer.removeStagedAttachment(UUID())
+        require(documentComposer.isLoadingAttachment && documentComposer.documentImportID == documentID,
+                "removing an unrelated item released the pending document")
+        documentComposer.removeStagedAttachment(documentID)
+        require(!documentComposer.isLoadingAttachment && documentComposer.documentImportID == nil,
+                "removed Files import left the composer busy")
+        require(documentComposer.stagedAttachments.map(\.id) == [readyID], "Files removal discarded the ready photo")
+        require(documentComposer.removedFromManifest == [documentID], "Files removal changed the wrong draft entry")
+        require(documentComposer.attachmentLoadGeneration != originalDocumentGeneration,
+                "removed document copy kept authority over subsequent imports")
+        let successorDocumentRequest = KitChatProviderRequest<Int>()
+        documentComposer.isLoadingAttachment = true
+        documentComposer.libraryImportState.begin(
+            generation: documentComposer.attachmentLoadGeneration,
+            cancellations: [keptID: { successorDocumentRequest.cancel() }]
+        )
+        documentComposer.removeStagedAttachment(documentID)
+        require(documentComposer.isLoadingAttachment && documentComposer.libraryImportState.isLoading
+                && successorDocumentRequest.isPending,
+                "duplicate document removal cleared the successor's import")
+        documentComposer.libraryImportState.retire()
+
         // Race the real lock/continuation implementation, not a copy of its state machine.
         for _ in 0..<100 {
             let request = KitChatProviderRequest<Int>(), began = Started()
@@ -197,7 +226,7 @@ final class Started: @unchecked Sendable {
             let valid = await result.value
             require(valid, "completion/cancellation race returned invalid result")
         }
-        print("7 picker cancellation scenarios and 100 completion races passed")
+        print("8 picker cancellation scenarios and 100 completion races passed")
     }
 }
 '''

@@ -46,6 +46,7 @@ case "$mode" in
       -only-testing:KitPayTests/ChatMediaPolicyTests/testReceivedVideoPlaysToEndAndReplaysAfterParentFileCleanup \
       -only-testing:KitPayTests/ChatMediaPolicyTests/testGalleryScrubbingRejectsInvalidTimesAndPreservesPauseIntent \
       -only-testing:KitPayUITests/AppStoreScreenshotUITests/testChatBottomPullOpensCameraOnlyAfterADeliberateRelease \
+      -only-testing:KitPayUITests/AppStoreScreenshotUITests/testChatAttachmentMenuOpensPhotosAndFilesAfterKeyboardDismissal \
       -only-testing:KitPayUITests/AppStoreScreenshotUITests/testLongHistoryVerticalBubbleDragsPreserveReadingPosition \
       -only-testing:KitPayUITests/CallLayoutUITests \
       test-without-building
@@ -61,6 +62,7 @@ case "$mode" in
       -skip-testing:KitPayUITests/CallLayoutUITests \
       -skip-testing:KitPayUITests/AppStoreScreenshotUITests/testCaptureAppStoreScreenshots \
       -skip-testing:KitPayUITests/AppStoreScreenshotUITests/testChatBottomPullOpensCameraOnlyAfterADeliberateRelease \
+      -skip-testing:KitPayUITests/AppStoreScreenshotUITests/testChatAttachmentMenuOpensPhotosAndFilesAfterKeyboardDismissal \
       -skip-testing:KitPayUITests/AppStoreScreenshotUITests/testLongHistoryVerticalBubbleDragsPreserveReadingPosition \
       test-without-building
     ;;

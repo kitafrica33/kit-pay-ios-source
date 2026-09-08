@@ -6,6 +6,69 @@ import XCTest
 
 final class ChatMediaSelectionTests: XCTestCase {
     @MainActor
+    func testFilesImagePreviewSurvivesAdoptionOfItsProtectedOriginal() {
+        let image = makeImage()
+        let original = StagedAttachmentPresentation(
+            mediaID: UUID(), kind: .image, image: image,
+            fileURL: URL(fileURLWithPath: "/provider/photo.jpg"),
+            displayName: "photo.jpg", mediaType: "image/jpeg", byteCount: 300,
+            ownsTemporaryFile: false
+        )
+        let protectedURL = URL(fileURLWithPath: "/protected/photo.jpg")
+        let adopted = original.adoptingFileURL(protectedURL)
+        XCTAssertTrue(adopted.image === image, "An open photo must not become an empty full-screen cover")
+        XCTAssertEqual(adopted.id, original.id, "Finishing a copy must not reopen the viewer")
+        XCTAssertEqual(adopted.kind, original.kind)
+        XCTAssertEqual(adopted.fileURL, protectedURL)
+        XCTAssertEqual(adopted.displayName, original.displayName)
+        XCTAssertEqual(adopted.mediaType, original.mediaType)
+        XCTAssertEqual(adopted.byteCount, original.byteCount)
+        XCTAssertFalse(adopted.ownsTemporaryFile, "Closing a preview must preserve the adopted draft file")
+    }
+
+    func testFilesCancellationIsQuietButProviderFailuresAreVisible() {
+        XCTAssertNil(KitChatDocumentPickerPolicy.failureMessage(
+            for: CocoaError(.userCancelled)
+        ))
+        XCTAssertNotNil(KitChatDocumentPickerPolicy.failureMessage(
+            for: CocoaError(.fileReadNoPermission)
+        ))
+        XCTAssertNotNil(KitChatDocumentPickerPolicy.failureMessage(
+            for: NSError(domain: "FileProvider", code: NSUserCancelledError)
+        ), "A provider error sharing Cocoa's numeric cancellation code is still a failure")
+    }
+
+    func testAdoptingFilesDocumentKeepsItsOpenViewerAccessUntilDismissal() {
+        let providerURL = URL(fileURLWithPath: "/provider/document.pdf")
+        let access = StagedAttachmentFileAccess(url: providerURL)
+        let preview = StagedAttachmentPresentation(
+            mediaID: UUID(), kind: .document, image: nil, fileURL: providerURL,
+            displayName: "document.pdf", mediaType: "application/pdf", byteCount: 100,
+            ownsTemporaryFile: false, fileAccess: access
+        )
+        let adopted = preview.adoptingFileURL(URL(fileURLWithPath: "/protected/document.pdf"))
+        XCTAssertTrue(adopted.fileAccess === access,
+                      "A lazy document viewer must retain its provider grant when import finishes")
+        XCTAssertEqual(adopted.fileURL, providerURL, "An open PDF/QuickLook reader keeps its leased input")
+        XCTAssertEqual(adopted.id, preview.id)
+        XCTAssertFalse(adopted.ownsTemporaryFile)
+    }
+
+    func testFilesVideoImportCompletionDoesNotRestartTheActivePlayer() {
+        let providerURL = URL(fileURLWithPath: "/provider/video.mp4")
+        let preview = StagedAttachmentPresentation(
+            mediaID: UUID(), kind: .video, image: nil, fileURL: providerURL,
+            displayName: "video.mp4", mediaType: "video/mp4", byteCount: 100,
+            ownsTemporaryFile: false, fileAccess: StagedAttachmentFileAccess(url: providerURL)
+        )
+        let adopted = preview.adoptingFileURL(URL(fileURLWithPath: "/protected/video.mp4"))
+        XCTAssertEqual(adopted.fileURL, preview.fileURL,
+                       "Import completion must not change the player's task identity or reset playback")
+        XCTAssertEqual(adopted.id, preview.id)
+        XCTAssertTrue(adopted.fileAccess === preview.fileAccess)
+    }
+
+    @MainActor
     func testProviderPreviewNeverMakesAPendingSelectionDurable() throws {
         let id = UUID()
         let acceptedAt = Date(timeIntervalSince1970: 100)

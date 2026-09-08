@@ -1462,10 +1462,31 @@ private struct ChatScheduleRequest: Identifiable {
     var confirmTitle: String { existingItem == nil ? "Schedule" : "Save" }
 }
 
+/// A viewer owns a separate provider grant from the import task: PDF/QuickLook can keep reading
+/// the original URL after the composer has adopted its protected copy.
+final class StagedAttachmentFileAccess {
+    private let lock = NSLock()
+    private var scopedURL: URL?
+
+    init(url: URL) {
+        scopedURL = url.startAccessingSecurityScopedResource() ? url : nil
+    }
+
+    func release() {
+        let url = lock.withLock {
+            defer { scopedURL = nil }
+            return scopedURL
+        }
+        url?.stopAccessingSecurityScopedResource()
+    }
+
+    deinit { release() }
+}
+
 /// A composer attachment opened directly from the bytes the sender just selected. It has no
 /// remote locator by design; video/document data is exposed only through a short-lived protected
 /// temp file that is removed when the presentation closes.
-private struct StagedAttachmentPresentation: Identifiable {
+struct StagedAttachmentPresentation: Identifiable {
     let mediaID: UUID
     var id: UUID { mediaID }
     let kind: KitChatMediaKind
@@ -1475,6 +1496,20 @@ private struct StagedAttachmentPresentation: Identifiable {
     let mediaType: String
     let byteCount: Int
     let ownsTemporaryFile: Bool
+    var fileAccess: StagedAttachmentFileAccess? = nil
+
+    /// Files can finish adopting an original while its preview is already open. Preserve
+    /// decoded images and keep a live file viewer on its leased URL until dismissal; changing
+    /// that URL would restart video playback or strand a lazy PDF/QuickLook reader.
+    func adoptingFileURL(_ url: URL) -> Self {
+        Self(
+            mediaID: mediaID, kind: kind, image: image,
+            fileURL: fileAccess == nil ? url : fileURL,
+            displayName: displayName, mediaType: mediaType, byteCount: byteCount,
+            ownsTemporaryFile: fileAccess == nil ? false : ownsTemporaryFile,
+            fileAccess: fileAccess
+        )
+    }
 }
 
 private enum GroupProfileFollowUp {
@@ -1493,11 +1528,13 @@ struct ConversationView: View {
     private let mediaDiagnosticsProducerScope: LocalMediaDiagnosticProducerScope?
     @State private var voiceRecorderRegistryConversationID: String
     @State private var draft = ""
+    @State private var showsAttachmentMenu = false
     @State private var showPhotoPicker = false
     @State private var stagedAttachments: [ChatStagedAttachment] = []
     @State private var isLoadingAttachment = false
     @State private var attachmentLoadGeneration = 0
     @State private var libraryImportState = KitChatLibraryImportState()
+    @State private var documentImportID: UUID?
     @State private var isSending = false
     @State private var scheduleRequest: ChatScheduleRequest?
     @State private var textSubmissionAttempt: ConversationTextSubmissionAttempt?
@@ -1832,6 +1869,7 @@ struct ConversationView: View {
             && !isReadOnlyAppReviewPreview && conversationMessagingAvailable
             && scenePhase == .active
             && !showCameraCapture && !showVideoNoteCamera
+            && !showsAttachmentMenu && !showPhotoPicker && !showDocumentImporter
             && galleryTarget == nil && editorSession == nil && pdfPageSession == nil
             && !showsSharedMediaReview && !isPreparingMediaEdit
             && !isLoadingAttachment && !isSending
@@ -3108,6 +3146,7 @@ struct ConversationView: View {
                 }
             }
             .onDisappear {
+                presentation.fileAccess?.release()
                 if presentation.ownsTemporaryFile {
                     ChatMediaTempFiles.removeTemporaryFile(presentation.fileURL)
                 }
@@ -3118,8 +3157,16 @@ struct ConversationView: View {
             allowedContentTypes: [.item],
             allowsMultipleSelection: false
         ) { result in
-            if case let .success(urls) = result, let url = urls.first {
-                stageDocument(url, acceptedAt: Date())
+            showDocumentImporter = false
+            guard composerAccountIsCurrent, !isReadOnlyAppReviewPreview,
+                  conversationMessagingAvailable else { return }
+            switch result {
+            case .success(let urls):
+                if let url = urls.first { stageDocument(url, acceptedAt: Date()) }
+            case .failure(let error):
+                if let message = KitChatDocumentPickerPolicy.failureMessage(for: error) {
+                    model.lastError = message
+                }
             }
         }
     }
@@ -4023,7 +4070,10 @@ struct ConversationView: View {
             }
         }
         .onChange(of: scenePhase) { _, phase in
-            if phase != .active { cancelCameraPull() }
+            if phase != .active {
+                cancelCameraPull()
+                showsAttachmentMenu = false
+            }
             guard !isReadOnlyAppReviewPreview else { return }
             if phase == .active {
                 incomingSoundPolicy.beginVisibility(with: messages)
@@ -4042,17 +4092,23 @@ struct ConversationView: View {
             guard isGroupConversation, !isMember else { return }
             stopReadOnlyGroupInteractions()
         }
+        .onChange(of: isComposerFocused) { _, focused in
+            if focused { showsAttachmentMenu = false }
+        }
         .onDisappear(perform: handleConversationDisappearance)
     }
 
     private var shouldRetireAttachmentImportsOnDisappear: Bool {
         guard !showPhotoPicker, !showCameraCapture, !showVideoNoteCamera else { return false }
+        guard !showDocumentImporter else { return false }
         guard editorSession == nil else { return false }
         guard pdfPageSession == nil else { return false }
+        guard galleryTarget == nil else { return false }
         return stagedAttachmentPresentation == nil
     }
 
     private func handleConversationDisappearance() {
+        showsAttachmentMenu = false
         scrollInteraction.endInteraction()
         incomingSoundPolicy.endVisibility()
         if !isReadOnlyAppReviewPreview {
@@ -4063,6 +4119,10 @@ struct ConversationView: View {
         // their generation and removes transient placeholders from the retained view state.
         if !composerAccountIsCurrent || shouldRetireAttachmentImportsOnDisappear {
             libraryImportState.retire()
+            if let documentImportID {
+                stagedAttachments.removeAll { $0.id == documentImportID }
+            }
+            documentImportID = nil
             attachmentLoadGeneration &+= 1
             stagedAttachments.removeAll { $0.isPreparing }
             isLoadingAttachment = false
@@ -4268,6 +4328,7 @@ struct ConversationView: View {
     }
 
     private func stopReadOnlyGroupInteractions() {
+        showsAttachmentMenu = false
         isComposerFocused = false
         voiceRecorder.suspend()
         presence.stopLocalTyping(conversationID: conversation.id)
@@ -4302,6 +4363,7 @@ struct ConversationView: View {
                 editComposerRow
             } else {
                 replyComposerBar
+                if showsAttachmentMenu { composerAttachmentMenu }
                 composerRow
             }
         }
@@ -4374,71 +4436,146 @@ struct ConversationView: View {
         .accessibilityElement(children: .contain)
     }
 
+    private var composerAttachmentStatus: String? {
+        if !didRestoreDraft { return "Restoring your draft…" }
+        if isSending { return "Sending your message…" }
+        if isPreparingMediaEdit { return "Finishing your edit…" }
+        if isLoadingAttachment {
+            return "Adding your selection… You can remove a loading item above."
+        }
+        if stagedAttachments.count >= ConversationAttachmentStagingPolicy.maximumStagedAttachments {
+            return "You can attach up to \(ConversationAttachmentStagingPolicy.maximumStagedAttachments) items. Remove one to add another."
+        }
+        return nil
+    }
+
+    private var composerAttachmentActionsAvailable: Bool {
+        didRestoreDraft && !isSending && !isLoadingAttachment && !isPreparingMediaEdit
+    }
+
+    private var composerAttachmentMenu: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if let status = composerAttachmentStatus {
+                Text(status)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("conversation-attachment-status")
+            }
+            ScrollView {
+                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
+                    composerAttachmentAction(
+                        "Photo & video library", symbol: "photo.on.rectangle",
+                        identifier: "library", enabled: canAddComposerAttachment
+                    ) {
+                        guard canAddComposerAttachment else { return }
+                        showPhotoPicker = true
+                    }
+                    composerAttachmentAction(
+                        "Document", symbol: "doc", identifier: "document",
+                        enabled: canAddComposerAttachment
+                    ) {
+                        guard canAddComposerAttachment else { return }
+                        showDocumentImporter = true
+                    }
+                    if KitCameraView.isCameraAvailable {
+                        composerAttachmentAction(
+                            "Camera", symbol: "camera", identifier: "camera",
+                            enabled: canAddComposerAttachment
+                        ) {
+                            guard canAddComposerAttachment else { return }
+                            showCameraCapture = true
+                        }
+                        composerAttachmentAction(
+                            "Video note", symbol: "video.badge.waveform", identifier: "video-note",
+                            enabled: canAddComposerAttachment
+                        ) {
+                            guard canAddComposerAttachment else { return }
+                            showVideoNoteCamera = true
+                        }
+                    }
+                    if !isGroupConversation && isServerAddressableConversation {
+                        composerAttachmentAction(
+                            "Send money", symbol: "arrow.up.circle", identifier: "send-money",
+                            enabled: composerAttachmentActionsAvailable
+                        ) { openSendMoney() }
+                        composerAttachmentAction(
+                            "Payment request", symbol: "banknote", identifier: "payment-request",
+                            enabled: composerAttachmentActionsAvailable
+                        ) { openPaymentRequest() }
+                    } else {
+                        if canSendGroupPayment {
+                            composerAttachmentAction(
+                                "Pay the group", symbol: "banknote.fill", identifier: "pay-group",
+                                enabled: composerAttachmentActionsAvailable
+                            ) { openGroupPayment() }
+                        }
+                        if canCreateGroupPaymentRequest {
+                            composerAttachmentAction(
+                                "Request from group", symbol: "chart.pie.fill", identifier: "request-group",
+                                enabled: composerAttachmentActionsAvailable
+                            ) { openGroupPaymentRequest() }
+                        }
+                    }
+                }
+            }
+            .frame(maxHeight: KitCameraView.isCameraAvailable ? 200 : 132)
+        }
+        .padding(12)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("conversation-attachment-menu")
+    }
+
+    private func composerAttachmentAction(
+        _ title: String, symbol: String, identifier: String, enabled: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button {
+            guard enabled, composerAccountIsCurrent, conversationMessagingAvailable else { return }
+            showsAttachmentMenu = false
+            isComposerFocused = false
+            cancelCameraPull()
+            action()
+        } label: {
+            Label(title, systemImage: symbol)
+                .font(.subheadline.weight(.medium))
+                .frame(maxWidth: .infinity, minHeight: 52, alignment: .leading)
+                .padding(.horizontal, 10)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(KitColor.green)
+        .background(KitColor.paleGreen.opacity(0.3), in: RoundedRectangle(cornerRadius: 12))
+        .disabled(!enabled)
+        .opacity(enabled ? 1 : 0.5)
+        .accessibilityIdentifier("conversation-attach-\(identifier)")
+    }
+
     private var composerRow: some View {
         HStack(alignment: .bottom, spacing: 8) {
-            Menu {
-                Button {
-                    isComposerFocused = false
-                    showPhotoPicker = true
-                } label: {
-                    Label("Photo & video library", systemImage: "photo.on.rectangle")
-                }
-                .disabled(!canAddComposerAttachment)
-                if KitCameraView.isCameraAvailable {
-                    Button {
-                        isComposerFocused = false
-                        showCameraCapture = true
-                    } label: {
-                        Label("Camera", systemImage: "camera")
-                    }
-                    .disabled(!canAddComposerAttachment)
-                    Button {
-                        isComposerFocused = false
-                        showVideoNoteCamera = true
-                    } label: {
-                        Label("Video note", systemImage: "video.badge.waveform")
-                    }
-                    .disabled(!canAddComposerAttachment)
-                }
-                Button {
-                    isComposerFocused = false
-                    showDocumentImporter = true
-                } label: {
-                    Label("Document", systemImage: "doc")
-                }
-                .disabled(!canAddComposerAttachment)
-                if !isGroupConversation && isServerAddressableConversation {
-                    Button { openSendMoney() } label: {
-                        Label("Send money", systemImage: "arrow.up.circle")
-                    }
-                    Button { openPaymentRequest() } label: {
-                        Label("Payment request", systemImage: "banknote")
-                    }
-                } else {
-                    if canSendGroupPayment {
-                        Button { openGroupPayment() } label: {
-                            Label("Pay the group", systemImage: "banknote.fill")
-                        }
-                    }
-                    if canCreateGroupPaymentRequest {
-                        Button { openGroupPaymentRequest() } label: {
-                            Label("Request from group", systemImage: "chart.pie.fill")
-                        }
-                    }
-                }
+            // Keep this action in the composer's view hierarchy. Opening a picker no longer
+            // competes with dismissing a native menu, and a pending import has visible feedback.
+            Button {
+                guard composerAccountIsCurrent else { return }
+                isComposerFocused = false
+                cancelCameraPull()
+                showsAttachmentMenu.toggle()
             } label: {
-                Image(systemName: "plus")
+                Image(systemName: showsAttachmentMenu ? "xmark" : "plus")
                     .font(.headline.bold())
                     .foregroundStyle(KitColor.green)
-                    .frame(width: 42, height: 42)
+                    .frame(width: 44, height: 44)
                     .background(.ultraThinMaterial, in: Circle())
+                    .contentShape(Circle())
             }
+            .buttonStyle(.plain)
             .accessibilityLabel(
                 isGroupConversation && !canSendGroupPayment && !canCreateGroupPaymentRequest
                     ? "Attachments"
                     : "Attachments and payments"
             )
-            .disabled(!didRestoreDraft || isSending || isLoadingAttachment || isPreparingMediaEdit)
+            .accessibilityValue(showsAttachmentMenu ? "Expanded" : "Collapsed")
+            .accessibilityIdentifier("conversation-attachment-toggle")
 
             HStack(alignment: .bottom, spacing: 4) {
                 TextField(
@@ -4450,6 +4587,7 @@ struct ConversationView: View {
                 )
                 .lineLimit(1...5)
                 .focused($isComposerFocused)
+                .accessibilityIdentifier("conversation-message-composer")
                 .disabled(
                     !didRestoreDraft
                         || !model.secureMessagingLocalQueueAvailable
@@ -4818,6 +4956,11 @@ struct ConversationView: View {
         if libraryImportState.remove(id), libraryImportState.generation == attachmentLoadGeneration {
             isLoadingAttachment = libraryImportState.isLoading
         }
+        if documentImportID == id {
+            documentImportID = nil
+            attachmentLoadGeneration &+= 1
+            isLoadingAttachment = false
+        }
         if removed != nil {
             // Commit the manifest removal before deleting bytes. A crash at either side leaves
             // at worst a bounded cleanup orphan, never a manifest pointing at no media.
@@ -4913,7 +5056,8 @@ struct ConversationView: View {
                 displayName: attachment.displayName,
                 mediaType: attachment.mediaType,
                 byteCount: attachment.byteCount,
-                ownsTemporaryFile: ownsTemporaryFile
+                ownsTemporaryFile: ownsTemporaryFile,
+                fileAccess: StagedAttachmentFileAccess(url: url)
             )
         }
         LocalMediaPerformanceMonitor.shared.markPlayable(
@@ -8692,6 +8836,7 @@ struct ConversationView: View {
     }
 
     private func stageDocument(_ url: URL, acceptedAt: Date) {
+        guard composerAccountIsCurrent, canAddComposerAttachment else { return }
         let secured = url.startAccessingSecurityScopedResource()
         attachmentLoadGeneration &+= 1
         let generation = attachmentLoadGeneration
@@ -8717,6 +8862,7 @@ struct ConversationView: View {
             return
         }
         let mediaID = UUID()
+        documentImportID = mediaID
         let attachmentKind = KitChatMediaKind(mediaType: mediaType)
         // Keep the provider's security-scoped lease alive during the protected copy. The staged
         // row can open that local provider URL immediately and is atomically rebound to the
@@ -8733,13 +8879,17 @@ struct ConversationView: View {
         ))
         guard stagedAttachments.contains(where: { $0.id == mediaID }) else {
             if secured { url.stopAccessingSecurityScopedResource() }
+            documentImportID = nil
             isLoadingAttachment = false
             return
         }
         Task { @MainActor in
             defer {
                 if secured { url.stopAccessingSecurityScopedResource() }
-                if generation == attachmentLoadGeneration { isLoadingAttachment = false }
+                if generation == attachmentLoadGeneration {
+                    documentImportID = nil
+                    isLoadingAttachment = false
+                }
             }
             do {
                 guard let permanentURL = await persistStagedMediaOriginal(
@@ -8776,17 +8926,13 @@ struct ConversationView: View {
                     fileURL: permanentURL,
                     mediaType: mediaType
                 )
-                if stagedAttachmentPresentation?.mediaID == mediaID {
-                    stagedAttachmentPresentation = StagedAttachmentPresentation(
-                        mediaID: mediaID,
-                        kind: attachmentKind,
-                        image: nil,
-                        fileURL: permanentURL,
-                        displayName: durable.displayName,
-                        mediaType: mediaType,
-                        byteCount: size,
-                        ownsTemporaryFile: false
-                    )
+                if attachmentKind == .image {
+                    scheduleStagedImagePreview(mediaID: mediaID, fileURL: permanentURL)
+                } else if attachmentKind == .video {
+                    scheduleStagedVideoPreview(mediaID: mediaID, fileURL: permanentURL)
+                }
+                if let presentation = stagedAttachmentPresentation, presentation.mediaID == mediaID {
+                    stagedAttachmentPresentation = presentation.adoptingFileURL(permanentURL)
                 }
             } catch {
                 guard generation == attachmentLoadGeneration else { return }
