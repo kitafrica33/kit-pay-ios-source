@@ -76,9 +76,11 @@ enum AppReviewDemoMutationError: LocalizedError, Equatable {
 }
 
 /// One fail-closed policy shared by UI guards and the authenticated HTTP boundary. The reviewer
-/// may inspect live GET projections, sign out, and submit an abuse report for the one provisioned
-/// Amina conversation. Every other authenticated write stays blocked even if a stale sheet,
-/// notification action, or background task tries to bypass the visible controls.
+/// may authenticate the existing session, inspect live GET projections, sign out, and submit an
+/// abuse report for the one provisioned Amina conversation. Authentication still requires the
+/// server to verify the PIN or enrolled biometric proof; it never lifts this mutation fence.
+/// Every feature write stays blocked even if a stale sheet, notification action, or background
+/// task tries to bypass the visible controls.
 enum AppReviewDemoMutationPolicy {
     static let readOnlyMessage = "This App Review account is read-only."
 
@@ -121,6 +123,11 @@ enum AppReviewDemoMutationPolicy {
         return (method == "POST" && path == AbuseReportAPIEndpoint.path)
             || (method == "POST" && path == "auth/logout")
             || (method == "POST" && path == "auth/refresh")
+            // These exact routes establish login assurance, not permission to move money or
+            // change an account. Blocking PIN verification here stranded reviewers at login.
+            || (method == "POST" && path == "auth/session-unlock/pin")
+            || (method == "POST" && path == "auth/session-unlock/biometric/challenge")
+            || (method == "POST" && path == "auth/session-unlock/biometric/assert")
             || (method == "DELETE" && path == "devices/current/push-token")
     }
 

@@ -62,6 +62,30 @@ class WorkflowSelectionTests(unittest.TestCase):
             expression = expression.replace("!", " not ").replace("||", " or ")
             self.assertEqual(eval(expression.strip(), {"__builtins__": {}}), expected)
 
+    def test_review_ipad_runs_only_for_app_store_independent_of_screenshots(self):
+        archive = (ROOT / ".github/workflows/ios-app-store-archive.yml").read_text()
+        for name in ("Prepare App Store review iPad", "Verify review account unlock on iPad"):
+            condition = re.search(r"if: \$\{\{ (.+) \}\}", step(archive, name)).group(1)
+            for target in ("testflight", "app-store"):
+                for update in (False, True):
+                    for reused in ("", "false", "true"):
+                        with self.subTest(step=name, target=target, update=update, reused=reused):
+                            expression = condition.replace("inputs.publication_target", repr(target))
+                            expression = expression.replace("inputs.update_screenshots", repr(update))
+                            expression = expression.replace("steps.screenshots.outputs.reused", repr(reused))
+                            expression = expression.replace("&&", " and ").replace("||", " or ")
+                            self.assertEqual(eval(expression, {"__builtins__": {}}), target == "app-store")
+        self.assertLess(archive.index("Run native unit and UI checks from the same build"),
+                        archive.index("Prepare App Store review iPad"))
+        self.assertLess(archive.index("Verify review account unlock on iPad"),
+                        archive.index("Import existing Apple distribution certificate"))
+        self.assertIn('KITPAY_TEST_DEVICE_ID="$KITPAY_REVIEW_IPAD_DEVICE_ID"',
+                      step(archive, "Verify review account unlock on iPad"))
+        retained = step(archive, "Retain native quality evidence")
+        self.assertIn("KitPay-review-ipad.xcresult", retained)
+        self.assertIn("KitPay-review-ipad-simulator-*.json", retained)
+        self.assertIn("${KITPAY_REVIEW_IPAD_DEVICE_ID:-}", step(archive, "Remove owned test simulators"))
+
     def test_screenshot_failure_artifact_runs_only_for_selected_new_images(self):
         archive = (ROOT / ".github/workflows/ios-app-store-archive.yml").read_text()
         condition = re.search(r"if: \$\{\{ (.+) \}\}", step(archive, "Retain native UI failure evidence")).group(1)
@@ -133,7 +157,8 @@ if os.environ['KITPAY_CHANGE_PIN'] == '1':
                 self.assertEqual(result.returncode == 0, not mutate, result.stderr)
                 self.assertEqual(json.loads(source.read_text()), payload)
 
-    def execute(self, mode, *, fail_focused=False, fail_contacts=False, unsupported_mode=False, fail_signature=False):
+    def execute(self, mode, *, fail_focused=False, fail_contacts=False, unsupported_mode=False,
+                fail_signature=False, fail_review_unlock=False, review_device_id="fixture-device"):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             executable = root / "xcodebuild"
@@ -142,6 +167,7 @@ import json, os, sys
 from pathlib import Path
 with open(os.environ['KITPAY_TEST_COMMAND_LOG'], 'a') as f: f.write(json.dumps(['xcodebuild', *sys.argv[1:]])+'\\n')
 if os.environ.get('KITPAY_FAIL_FOCUSED') == '1' and any(a.startswith('-only-testing:KitPayTests/ConversationNativeOpeningTests') for a in sys.argv): sys.exit(65)
+if os.environ.get('KITPAY_FAIL_REVIEW_UNLOCK') == '1' and any(a.startswith('-only-testing:KitPayTests/AppReviewDemoContentTests/') for a in sys.argv): sys.exit(65)
 if 'test-without-building' in sys.argv:
     (Path(os.environ['RUNNER_TEMP']) / 'xctest-installed-apps').write_text('installed by XCTest')
 """)
@@ -183,7 +209,9 @@ elif sys.argv[1:3] == ['simctl', 'privacy'] and os.environ.get('KITPAY_FAIL_CONT
                    "RUNNER_TEMP": str(root), "KITPAY_TEST_DEVICE_ID": "fixture-device",
                    "KITPAY_TEST_COMMAND_LOG": str(log), "KITPAY_FAIL_FOCUSED": "1" if fail_focused else "0",
                    "KITPAY_FAIL_CONTACTS": "1" if fail_contacts else "0",
-                   "KITPAY_FAIL_SIGNATURE": "1" if fail_signature else "0"}
+                   "KITPAY_FAIL_SIGNATURE": "1" if fail_signature else "0",
+                   "KITPAY_FAIL_REVIEW_UNLOCK": "1" if fail_review_unlock else "0",
+                   "KITPAY_REVIEW_IPAD_DEVICE_ID": review_device_id}
             result = subprocess.run(["bash", str(SCRIPTS / "ios_native_build.sh"), mode],
                                     env=env, text=True, capture_output=True)
             actions = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
@@ -301,6 +329,52 @@ elif sys.argv[1:3] == ['simctl', 'privacy'] and os.environ.get('KITPAY_FAIL_CONT
                 self.assertIn("-only-testing:KitPayUITests/AppStoreScreenshotUITests/testCaptureAppStoreScreenshots", calls[0])
                 self.assertNotIn("-only-testing:KitPayUITests/AppStoreScreenshotUITests", calls[0])
                 self.assertEqual(len(actions), 1)
+                self.assertIsNone(registration)
+
+    def test_review_ipad_reuses_products_for_only_the_seven_unlock_regressions(self):
+        result, calls, actions, registration = self.execute("review-ipad")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(len(calls), 1)
+        call = calls[0]
+        self.assertEqual(call[-1], "test-without-building")
+        self.assertTrue(call[call.index("-xctestrun") + 1].endswith("/Original-Xcode-Generated-Plan.xctestrun"))
+        self.assertEqual(call[call.index("-destination") + 1], "platform=iOS Simulator,id=fixture-device,arch=arm64")
+        self.assertTrue(call[call.index("-resultBundlePath") + 1].endswith("/KitPay-review-ipad.xcresult"))
+        for option in ("-workspace", "-project", "-scheme", "build-for-testing", "-resolvePackageDependencies"):
+            self.assertNotIn(option, call)
+        methods = (
+            "testReviewPINUnlockReachesServerAndAdmitsReadOnlyApp",
+            "testReviewPINRejectionPreservesLoginGateAndReadOnlyFence",
+            "testReviewPINUnlockRefreshesExpiredCredentialsWithoutLosingFence",
+            "testReviewBiometricUnlockReachesServerWithoutGrantingMutations",
+            "testReviewBiometricRejectionPreservesSessionWithoutReplayingProof",
+            "testReviewUnlockRejectsReplacedSessionBeforeSending",
+            "testAuthenticatedDemoTransportUnlockExceptionsRequireExactRoutesAndMethods",
+        )
+        self.assertEqual([arg for arg in call if arg.startswith("-only-testing:")],
+                         ["-only-testing:KitPayTests/AppReviewDemoContentTests/" + method for method in methods])
+        self.assertFalse(any(arg.startswith("-skip-testing:") for arg in call))
+        source = (ROOT / "KitPayTests/AppReviewDemoContentTests.swift").read_text()
+        for method in methods:
+            self.assertIn("func " + method + "(", source)
+        self.assertIsNone(registration)
+
+    def test_review_ipad_failure_propagates_without_retry_or_full_suite(self):
+        result, calls, actions, registration = self.execute("review-ipad", fail_review_unlock=True)
+        self.assertEqual(result.returncode, 65)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(actions), 1)
+        self.assertIsNone(registration)
+
+    def test_review_ipad_rejects_invalid_products_and_wrong_device_before_execution(self):
+        for options in ({"unsupported_mode": True}, {"review_device_id": ""},
+                        {"review_device_id": "another-device"}):
+            with self.subTest(options=options):
+                result, calls, actions, registration = self.execute("review-ipad", **options)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(calls, [])
+                self.assertEqual(actions, [])
                 self.assertIsNone(registration)
 
 

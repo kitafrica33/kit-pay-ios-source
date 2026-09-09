@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-mode="${1:?Select build, test, marketing-iphone, or marketing-ipad}"
+mode="${1:?Select build, test, review-ipad, marketing-iphone, or marketing-ipad}"
 : "${KITPAY_TEST_DEVICE_ID:?A prepared Simulator is required}"
 : "${RUNNER_TEMP:?}"
 common=(
@@ -64,6 +64,23 @@ case "$mode" in
       -skip-testing:KitPayUITests/AppStoreScreenshotUITests/testChatBottomPullOpensCameraOnlyAfterADeliberateRelease \
       -skip-testing:KitPayUITests/AppStoreScreenshotUITests/testChatAttachmentMenuOpensPhotosAndFilesAfterKeyboardDismissal \
       -skip-testing:KitPayUITests/AppStoreScreenshotUITests/testLongHistoryVerticalBubbleDragsPreserveReadingPosition \
+      test-without-building
+    ;;
+  review-ipad)
+    : "${KITPAY_REVIEW_IPAD_DEVICE_ID:?A prepared review iPad is required}"
+    test "$KITPAY_TEST_DEVICE_ID" = "$KITPAY_REVIEW_IPAD_DEVICE_ID"
+    # Reuse the iPhone compilation on the clean review iPad. These production
+    # APIClient/account-policy cases need no Contacts or screenshot setup.
+    select_test_run validate
+    xcodebuild "${test_common[@]}" \
+      -resultBundlePath "$RUNNER_TEMP/KitPay-review-ipad.xcresult" \
+      -only-testing:KitPayTests/AppReviewDemoContentTests/testReviewPINUnlockReachesServerAndAdmitsReadOnlyApp \
+      -only-testing:KitPayTests/AppReviewDemoContentTests/testReviewPINRejectionPreservesLoginGateAndReadOnlyFence \
+      -only-testing:KitPayTests/AppReviewDemoContentTests/testReviewPINUnlockRefreshesExpiredCredentialsWithoutLosingFence \
+      -only-testing:KitPayTests/AppReviewDemoContentTests/testReviewBiometricUnlockReachesServerWithoutGrantingMutations \
+      -only-testing:KitPayTests/AppReviewDemoContentTests/testReviewBiometricRejectionPreservesSessionWithoutReplayingProof \
+      -only-testing:KitPayTests/AppReviewDemoContentTests/testReviewUnlockRejectsReplacedSessionBeforeSending \
+      -only-testing:KitPayTests/AppReviewDemoContentTests/testAuthenticatedDemoTransportUnlockExceptionsRequireExactRoutesAndMethods \
       test-without-building
     ;;
   marketing-iphone)

@@ -10,6 +10,7 @@ second diagnostic workflow: essential checks run inside the selected archive job
 | Public source, Apple API access, signing key pair, unused build number | Before archive setup |
 | Pod installation and pinned SwiftPM resolution | Once in the native runner |
 | Native unit, camera gesture, and call-banner UI checks | One fixture build, then tests without rebuilding |
+| Review-account PIN and biometric unlock on iPad | Seven targeted tests from the same compiled products, for App Store archives only |
 | Production compilation | The signed Release device archive |
 | Marketing screenshots | Only an explicitly selected App Store asset update that has no valid reusable set |
 | Signature, profiles, entitlements, IPA identity and hashes | Archive verification and every publishing handoff |
@@ -73,12 +74,31 @@ signed archive ran. Build 98 aligns the example URL, archive default and all six
 app/extension build configurations. It preserves the full validator and native
 test selections and the immutable source 97 release.
 
+Build 98 passed 256 shared checks and all 2,018 selected native cases (2,003 unit
+and 15 UI) in archive run `34218845703`. It was not uploaded. Apple's September 9
+review of build 82 then exposed a separate login bug: the review account's local
+read-only request guard rejected PIN unlock before contacting the backend. Build
+99 allows only the three session-authentication POST routes for PIN unlock and
+biometric challenge/assertion. Financial, profile, enrollment and messaging writes
+remain prohibited. Regression tests exercise the production API client, assurance
+decoding and account-setup transition, including wrong PIN and stale-session cases.
+An explicit invalid-PIN or invalid-biometric-proof response consumes one verification
+attempt; it no longer refreshes credentials and resubmits the same rejected proof.
+An expired access token still refreshes normally before retrying the unlock request.
+
+App Store archives also run those seven regression cases on a clean iPad Air
+11-inch (M3) Simulator, reusing the compiled products and existing dependency setup.
+The pinned runner provides iOS 26.5; Apple's report used iPadOS 26.6. These are
+native transport/policy tests, not proof of a physical-device PIN-screen test.
+TestFlight-only archives do not create the extra iPad or run that device check.
+
 Native tests use the original generated `.xctestrun` unchanged. XCTest installs and launches
 its own products; Simulator does not support `UseDestinationArtifacts`. Exact compiled product
 and plan validation precede the first group. After it succeeds, installed-app observation and
 the Contacts grant prepare real-launch checks in the second group. Marketing uses validate-only
 checks with the same generated plan and its prompt-free fixture. No manual installs, test retries,
-extra compilations or additional Simulators are introduced. The fresh pinned Simulator has one
+extra compilations are introduced. The targeted App Store iPad check described above
+uses its own recorded Simulator; the ordinary test path uses one. Each fresh pinned Simulator has one
 boot sequence with a 600-second initial readiness limit; other simctl operations retain their
 60-second limits.
 

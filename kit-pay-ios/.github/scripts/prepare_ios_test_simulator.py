@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Create and record one clean, pinned Simulator for native validation."""
 
+import argparse
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,10 @@ RUNTIME = {
 DEVICE_TYPE = {
     "identifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro",
     "name": "iPhone 17 Pro",
+}
+REVIEW_IPAD_DEVICE_TYPE = {
+    "identifier": "com.apple.CoreSimulator.SimDeviceType.iPad-Air-11-inch-M3",
+    "name": "iPad Air 11-inch (M3)",
 }
 UUID_PATTERN = r"[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}"
 
@@ -39,7 +44,11 @@ def require_metadata(items, expected, kind):
     return matches[0]
 
 
-def prepare(env=None):
+def prepare(env=None, *, purpose="native"):
+    if purpose not in {"native", "review-ipad"}:
+        raise ValueError("Select native or review-ipad Simulator preparation")
+    is_review_ipad = purpose == "review-ipad"
+    device_type = REVIEW_IPAD_DEVICE_TYPE if is_review_ipad else DEVICE_TYPE
     env = os.environ if env is None else env
     run_id, attempt = (env.get(key, "") for key in ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT"))
     if not all(re.fullmatch(r"[1-9][0-9]*", value) for value in (run_id, attempt)):
@@ -49,7 +58,7 @@ def prepare(env=None):
     runner_temp = Path(env["RUNNER_TEMP"])
     if not runner_temp.is_dir():
         raise ValueError("RUNNER_TEMP must be an existing directory")
-    receipt = runner_temp / f"KitPay-native-simulator-{run_id}-{attempt}.json"
+    receipt = runner_temp / f"KitPay-{purpose}-simulator-{run_id}-{attempt}.json"
     if receipt.exists():
         raise FileExistsError(f"Simulator preparation already has a receipt: {receipt}")
 
@@ -58,22 +67,26 @@ def prepare(env=None):
     if runtime.get("isAvailable") is not True:
         raise ValueError(f"Required runtime {RUNTIME['identifier']} is unavailable")
     device_types = json.loads(simctl("list", "devicetypes", "-j", capture=True))["devicetypes"]
-    require_metadata(device_types, DEVICE_TYPE, "device type")
+    require_metadata(device_types, device_type, "device type")
 
-    name = f"KitPay Native Tests {run_id}-{attempt}"
+    label = "App Review iPad" if is_review_ipad else "Native Tests"
+    name = f"KitPay {label} {run_id}-{attempt}"
     # Reserve writable evidence and environment files before creating anything.
     # Never replace an earlier run/attempt receipt or use a pre-existing device.
     with Path(env["GITHUB_ENV"]).open("a") as github_env, receipt.open("x") as evidence:
-        device_id = simctl("create", name, DEVICE_TYPE["identifier"], RUNTIME["identifier"], capture=True).strip()
+        device_id = simctl("create", name, device_type["identifier"], RUNTIME["identifier"], capture=True).strip()
         if re.fullmatch(UUID_PATTERN, device_id) is None:
             raise ValueError(f"simctl create returned an invalid device UUID: {device_id!r}")
         json.dump({
             "device_id": device_id, "name": name, "run_id": run_id, "run_attempt": attempt,
-            "runtime": RUNTIME, "device_type": DEVICE_TYPE,
+            "runtime": RUNTIME, "device_type": device_type, "purpose": purpose,
         }, evidence, indent=2)
         evidence.write("\n")
         evidence.flush()
-        github_env.write(f"KITPAY_TEST_DEVICE_ID={device_id}\nKITPAY_NATIVE_TEST_DEVICE_ID={device_id}\n")
+        if is_review_ipad:
+            github_env.write(f"KITPAY_REVIEW_IPAD_DEVICE_ID={device_id}\n")
+        else:
+            github_env.write(f"KITPAY_TEST_DEVICE_ID={device_id}\nKITPAY_NATIVE_TEST_DEVICE_ID={device_id}\n")
         github_env.flush()
 
     simctl("boot", device_id)
@@ -82,4 +95,6 @@ def prepare(env=None):
 
 
 if __name__ == "__main__":
-    print(prepare())
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--purpose", choices=("native", "review-ipad"), default="native")
+    print(prepare(purpose=parser.parse_args().purpose))

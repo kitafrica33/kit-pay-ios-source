@@ -1029,10 +1029,24 @@ actor APIClient {
 
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw APIClientError.invalidResponse }
+        // Login proof endpoints use 401 for invalid PINs/signatures as well as expired tokens.
+        // Replaying an explicitly rejected proof spends a second attempt and can lock the user
+        // out early. Only these exact structured rejections skip token refresh; expired session
+        // credentials still follow the ordinary single-flight refresh and one retry below.
+        let rejectedLoginProof = http.statusCode == 401
+            && method == "POST"
+            && (try? decoder.decode(APIEnvelope<EmptyResponse>.self, from: data)).map {
+                !$0.ok && (
+                    (path == "auth/session-unlock/pin" && $0.error?.code == "INVALID_LOGIN_PIN")
+                    || (path == "auth/session-unlock/biometric/assert"
+                        && $0.error?.code == "BIOMETRIC_ASSERTION_INVALID")
+                )
+            } == true
         if http.statusCode == 401,
            authentication.readsCurrentSession,
            currentSession != nil,
-           allowRefresh {
+           allowRefresh,
+           !rejectedLoginProof {
             try await refreshSession(afterRejectedSession: currentSession)
             return try await sendWithMeta(
                 path: path,

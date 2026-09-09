@@ -62,7 +62,9 @@ and Apple Liquid Glass.
   attachments and all unselected history remain on-device. Ambiguous retries keep only an
   account-bound request digest and idempotency key in this device's Keychain; report notes and
   selected plaintext are never persisted there. Reports are never queued offline.
-  The installation-bound App Review account is read-only except for abuse reports against its
+  The installation-bound App Review account remains read-only for feature changes. Its exact
+  PIN and biometric session-unlock routes, session refresh/logout, and push-token cleanup remain
+  available; the server must still verify the authentication proof. Abuse reports are limited to its
   provisioned Amina Demo conversation. That exception requires the exact reviewer/conversation/
   peer tuple, a real two-party direct-conversation row, and a real peer-authored message row for
   message reports. Every other authenticated write remains blocked at the client transport.

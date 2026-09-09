@@ -94,6 +94,62 @@ class PrepareSimulatorTests(unittest.TestCase):
         ])
         self.assertNotIn(PREEXISTING_ID, str(self.calls))
 
+    def test_review_ipad_is_clean_and_preserves_native_device_environment(self):
+        self.receipt = self.root / "KitPay-review-ipad-simulator-33999123456-1.json"
+        self.device_types.append(dict(SIMULATOR.REVIEW_IPAD_DEVICE_TYPE))
+        native_environment = (f"KITPAY_TEST_DEVICE_ID={PREEXISTING_ID}\n"
+                              f"KITPAY_NATIVE_TEST_DEVICE_ID={PREEXISTING_ID}\n")
+        Path(self.env["GITHUB_ENV"]).write_text(native_environment)
+        self.assertEqual(SIMULATOR.prepare(self.env, purpose="review-ipad"), DEVICE_ID)
+        self.assertEqual(self.calls, [
+            ["list", "runtimes", "-j"], ["list", "devicetypes", "-j"],
+            ["create", "KitPay App Review iPad 33999123456-1",
+             "com.apple.CoreSimulator.SimDeviceType.iPad-Air-11-inch-M3",
+             SIMULATOR.RUNTIME["identifier"]],
+            ["boot", DEVICE_ID], ["bootstatus", DEVICE_ID, "-b"],
+        ])
+        receipt, environment = self.before_boot
+        self.assertEqual(receipt["device_type"], SIMULATOR.REVIEW_IPAD_DEVICE_TYPE)
+        self.assertEqual(receipt["runtime"], SIMULATOR.RUNTIME)
+        self.assertEqual(receipt["purpose"], "review-ipad")
+        self.assertEqual(environment, native_environment + f"KITPAY_REVIEW_IPAD_DEVICE_ID={DEVICE_ID}\n")
+        with self.assertRaises(FileExistsError):
+            SIMULATOR.prepare(self.env, purpose="review-ipad")
+        self.assertEqual(sum(call[0] == "create" for call in self.calls), 1)
+
+    def test_review_ipad_rejects_missing_ambiguous_or_different_device_type(self):
+        self.receipt = self.root / "KitPay-review-ipad-simulator-33999123456-1.json"
+        for types in ([SIMULATOR.DEVICE_TYPE], [SIMULATOR.REVIEW_IPAD_DEVICE_TYPE] * 2,
+                      [{**SIMULATOR.REVIEW_IPAD_DEVICE_TYPE, "name": "iPad Air 11-inch (M2)"}]):
+            with self.subTest(types=types):
+                self.device_types = types
+                self.calls.clear()
+                with self.assertRaises(ValueError):
+                    SIMULATOR.prepare(self.env, purpose="review-ipad")
+                self.assert_no_creation()
+
+    def test_review_ipad_boot_failure_retains_its_separate_cleanup_identity(self):
+        self.receipt = self.root / "KitPay-review-ipad-simulator-33999123456-1.json"
+        self.device_types.append(dict(SIMULATOR.REVIEW_IPAD_DEVICE_TYPE))
+        for failure in ("boot", "bootstatus"):
+            with self.subTest(failure=failure):
+                self.failure = failure
+                self.calls.clear()
+                with self.assertRaises(subprocess.CalledProcessError):
+                    SIMULATOR.prepare(self.env, purpose="review-ipad")
+                self.assertEqual(json.loads(self.receipt.read_text())["device_id"], DEVICE_ID)
+                self.assertEqual(Path(self.env["GITHUB_ENV"]).read_text(),
+                                 f"KITPAY_REVIEW_IPAD_DEVICE_ID={DEVICE_ID}\n")
+                self.assertEqual(sum(call[0] == "create" for call in self.calls), 1)
+                self.receipt.unlink()
+                Path(self.env["GITHUB_ENV"]).unlink()
+
+    def test_unknown_purpose_has_no_simulator_commands(self):
+        with self.assertRaises(ValueError):
+            SIMULATOR.prepare(self.env, purpose="unexpected")
+        self.assertEqual(self.calls, [])
+        self.assert_no_creation()
+
     def test_missing_unavailable_and_ambiguous_runtime_rejected_before_create(self):
         cases = [[], [{**SIMULATOR.RUNTIME, "isAvailable": False}], [dict(SIMULATOR.RUNTIME)],
                  [{**SIMULATOR.RUNTIME, "isAvailable": 1}], self.runtimes * 2,

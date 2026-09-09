@@ -28,7 +28,7 @@ on:
       build_number:
         description: Monotonically increasing integer CFBundleVersion
         required: true
-        default: "98"
+        default: "99"
         type: string
       confirmation:
         description: Type ARCHIVE_KIT_PAY_APP_STORE
@@ -37,7 +37,7 @@ on:
       corresponding_source_url:
         description: >-
           Exact public AGPL corresponding-source release URL for this build, for example
-          https://github.com/kitafrica33/kit-pay-ios-source/releases/tag/v1.0.17-build98 .
+          https://github.com/kitafrica33/kit-pay-ios-source/releases/tag/v1.0.17-build99 .
           The archive is rejected unless this tagged release is already publicly available.
         required: true
         type: string
@@ -275,6 +275,15 @@ jobs:
         run: bash .github/scripts/ios_native_build.sh build
       - name: Run native unit and UI checks from the same build
         run: bash .github/scripts/ios_native_build.sh test
+      - name: Prepare App Store review iPad
+        if: ${{ inputs.publication_target == 'app-store' }}
+        run: python3 .github/scripts/prepare_ios_test_simulator.py --purpose review-ipad
+      - name: Verify review account unlock on iPad
+        if: ${{ inputs.publication_target == 'app-store' }}
+        run: |
+          set -euo pipefail
+          KITPAY_TEST_DEVICE_ID="$KITPAY_REVIEW_IPAD_DEVICE_ID" bash .github/scripts/ios_native_build.sh review-ipad
+          xcrun simctl shutdown "$KITPAY_REVIEW_IPAD_DEVICE_ID"
       - name: Capture iPhone 6.5-inch screenshots
         if: ${{ inputs.publication_target == 'app-store' && inputs.update_screenshots && steps.screenshots.outputs.reused != 'true' }}
         env:
@@ -737,8 +746,10 @@ jobs:
           path: |
             ${{ runner.temp }}/KitPay-opening-camera.xcresult
             ${{ runner.temp }}/KitPay-quality.xcresult
+            ${{ runner.temp }}/KitPay-review-ipad.xcresult
             ${{ runner.temp }}/KitPay-camera-pan.log
             ${{ runner.temp }}/KitPay-native-simulator-*.json
+            ${{ runner.temp }}/KitPay-review-ipad-simulator-*.json
             ${{ runner.temp }}/KitPay-test-product-registration-*.json
           if-no-files-found: warn
           retention-days: 30
@@ -764,7 +775,7 @@ jobs:
           IPAD_ID: ${{ steps.devices.outputs.ipad_id }}
         run: |
           set +e
-          for device_id in "$IPHONE_ID" "$IPAD_ID" "${KITPAY_NATIVE_TEST_DEVICE_ID:-}"; do
+          for device_id in "$IPHONE_ID" "$IPAD_ID" "${KITPAY_NATIVE_TEST_DEVICE_ID:-}" "${KITPAY_REVIEW_IPAD_DEVICE_ID:-}"; do
             if [[ "$device_id" =~ ^[0-9A-Fa-f-]{36}$ ]]; then
               xcrun simctl shutdown "$device_id" 2>/dev/null
               xcrun simctl delete "$device_id" 2>/dev/null
