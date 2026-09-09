@@ -686,7 +686,7 @@ final class AppReviewDemoContentTests: XCTestCase {
         ] {
             do {
                 let _: SessionUnlockResultDTO = try await api.send(
-                    path: path, method: method, body: EmptyBody(), boundSessionID: sessionID
+                    path: path, method: method, body: [String: String](), boundSessionID: sessionID
                 )
                 XCTFail("Unexpectedly admitted \(method) \(path)")
             } catch let error as AppReviewDemoMutationError {

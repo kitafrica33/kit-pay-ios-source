@@ -86,6 +86,12 @@ An explicit invalid-PIN or invalid-biometric-proof response consumes one verific
 attempt; it no longer refreshes credentials and resubmits the same rejected proof.
 An expired access token still refreshes normally before retrying the unlock request.
 
+Build 99 passed shared checks but stopped while compiling the new regression tests:
+its route-restriction test referenced an empty request type declared privately in
+another file. Build 100 uses an empty encodable dictionary in that assertion. It
+retains the authentication fix and every selected test. No native test, signed
+archive or Apple upload ran for build 99; its published source remains immutable.
+
 App Store archives also run those seven regression cases on a clean iPad Air
 11-inch (M3) Simulator, reusing the compiled products and existing dependency setup.
 The pinned runner provides iOS 26.5; Apple's report used iPadOS 26.6. These are
