@@ -216,20 +216,31 @@ between lock and unlock, which is Apple's prescribed remedy for `0xdead10cc`.
 ### Tests
 
 - `SharedLockActivityTests` (native, 4 cases): the assertion is open for the whole locked body,
-  it is ended when the body throws, it outlives the file lock (a second descriptor can take
-  `flock(LOCK_EX | LOCK_NB)` only once the assertion's end handler runs), and an uninstalled
+  it is ended when the body throws, the broker's file lock is genuinely held inside that window
+  (a second descriptor cannot take `flock(LOCK_EX | LOCK_NB)` there), and an uninstalled
   provider still returns a balanced handler.
 - `.github/scripts/tests/test_shared_lock_activity.py` (5 cases): the assertion brackets the
   descriptor and the unlock, `flock(` appears in no other source file, the broker imports no
   UIKit, the app installs the provider first, and exactly one target installs one.
-  All five fail against the build 102 source. Whole Linux suite: 274 tests, OK.
+  All five fail against the build 102 source; the defer order they pin is what guarantees the
+  assertion outlives `flock(LOCK_UN)`. Whole Linux suite: 274 tests, OK.
 - `swiftc -parse` under `docker run swift:5.10-noble` on the three edited Swift files: exit 0.
 
 ### Publication
 
-The version stays **1.0.17** and the build goes **102 → 103**: App Store Connect refuses to
+The version stays **1.0.17** and the build goes **102 → 104**: App Store Connect refuses to
 create a 1.0.18 record while the app has never been released and 1.0.17 is still editable
 (`409 ENTITY_ERROR.RELATIONSHIP.INVALID — You cannot create a new version of the App in the
 current state`). The 1.0.17 review submission `7c475370-ad71-4e7e-91ac-1a53fe87ac0b` that had
 build 102 attached was cancelled before review started, so no crashing binary is with Apple;
-the version is `DEVELOPER_REJECTED` and takes build 103 for the new submission.
+the version is `DEVELOPER_REJECTED` and takes the fixed build for the new submission.
+
+Build 103 never shipped. Its archive, run `35398413405`, failed on the macOS stage: the first
+version of `testAssertionOutlivesTheFileLock` probed for the *released* lock from inside the
+assertion's end handler and read it as still held on the test host, which no Linux pre-flight
+could have caught (XCTest cannot run here). Same-process visibility of a released `flock` is
+not a property of the fix, so that half of the case was dropped and the ordering it meant to
+prove is pinned statically instead, by the defer order in the source-contract test. Because a
+published GitHub release's tag is permanently burned, the corrected source could not reuse
+`v1.0.17-build103`, so the build moved to **104**. That is the one extra macOS archive dispatch
+on this task; the TestFlight upload lane was still dispatched exactly once.

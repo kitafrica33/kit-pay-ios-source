@@ -1094,20 +1094,25 @@ final class SharedLockActivityTests: XCTestCase {
         XCTAssertEqual(ended, 1, "a throwing body must not strand the assertion")
     }
 
-    func testAssertionOutlivesTheFileLock() throws {
-        var lockWasFreeWhenAssertionEnded: Bool?
-        var lockWasHeldInsideBody: Bool?
-        SharedLockActivity.install { [weak self] in
-            { lockWasFreeWhenAssertionEnded = self?.fileLockIsFree() }
+    /// The window has to contain the file lock itself, not merely the body: a suspension
+    /// between `flock(LOCK_EX)` and `flock(LOCK_UN)` is what RunningBoard kills with
+    /// 0xdead10cc. This pins the acquisition side, which is observable. The release side —
+    /// that the handler runs only after `flock(fd, LOCK_UN)` — is pinned by the defer order
+    /// in `.github/scripts/tests/test_shared_lock_activity.py`; probing for a *released*
+    /// lock from this same process is not dependable on the test host.
+    func testTheFileLockIsHeldForTheWholeAssertionWindow() throws {
+        var open = 0
+        SharedLockActivity.install {
+            open += 1
+            return { open -= 1 }
         }
+        var observedInsideBody: (Int, Bool)?
         try broker().withLock { _ in
-            lockWasHeldInsideBody = self.fileLockIsFree() == false
+            observedInsideBody = (open, self.fileLockIsFree() == false)
         }
-        XCTAssertEqual(lockWasHeldInsideBody, true, "the probe must detect the held file lock")
-        XCTAssertEqual(
-            lockWasFreeWhenAssertionEnded, true,
-            "the process may only be suspendable again after flock(LOCK_UN)"
-        )
+        XCTAssertEqual(observedInsideBody?.0, 1, "the assertion is open for the locked section")
+        XCTAssertEqual(observedInsideBody?.1, true, "the probe must detect the held file lock")
+        XCTAssertEqual(open, 0, "the assertion is always ended")
     }
 
     func testMissingProviderStillReturnsABalancedHandler() throws {
