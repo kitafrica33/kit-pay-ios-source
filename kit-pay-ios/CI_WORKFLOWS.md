@@ -97,9 +97,15 @@ Build 100 crashed on TestFlight the moment a customer opened a chat: EXC_BAD_ACC
 `swift_getTypeByMangledName` under `ConversationView.conversationLayout`. `ConversationView`
 composed one opaque SwiftUI type across eight stages and an eleven-case timeline switch, and
 the Swift runtime could not decode that type's mangled name within the 1 MB main-thread stack.
-Build 101 erases the stage seams and the timeline row to `AnyView`, which splits one
+Build 102 erases the stage seams and the timeline row to `AnyView`, which splits one
 undecodable type into several shallow ones. `test_conversation_view_type_depth.py` pins both
 shapes, since no Linux stage can compile SwiftUI and no native test can build the screen.
+The fix was first numbered build 101, but that build's corresponding-source tag was burned
+before it could be archived: GitHub now makes every published release immutable, so a release
+created outside a draft cannot take assets, and once such a release has existed its tag can
+never be published again. Publish corresponding source as **draft first, upload the assets,
+then flip `draft` to false** — and if a tag is ever burned, bump the build number, because
+`KitLegalURLPolicy` derives the expected tag from the running build's own version and build.
 
 App Store archives also run those seven regression cases on a clean iPad Air
 11-inch (M3) Simulator, reusing the compiled products and existing dependency setup.

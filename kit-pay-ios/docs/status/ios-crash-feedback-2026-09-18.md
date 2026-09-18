@@ -130,8 +130,17 @@ build and the native suite run in the archive workflow.
 ## 5. Publication
 
 Version stays **1.0.17** — that ASC version record already exists and is `REJECTED`, so it is
-editable and must be reused rather than duplicated. The build number goes **100 → 101**
+editable and must be reused rather than duplicated. The build number goes **100 → 102**
 (`CURRENT_PROJECT_VERSION` in all six configurations, plus the archive workflow's default and
 its corresponding-source example URL).
+
+Build 101 was skipped. The AGPL gate needs a publicly reachable corresponding-source release
+tagged `v<marketing>-build<build>` before the archive runs, and GitHub releases are now
+immutable: the build 101 release was created published, so it refused its assets, and after it
+was deleted the tag `v1.0.17-build101` could never be published again
+(`422 tag_name was used by an immutable release`). `KitLegalURLPolicy.isTrustedCorrespondingSourceURL`
+builds the expected tag from the running build's own version and build number, so a differently
+named tag would have failed the in-app legal screen and `verify_ios_archive.py`. The correct
+order is **create the release as a draft, upload the assets, then publish it**.
 
 <!-- publication evidence appended after the runs -->
