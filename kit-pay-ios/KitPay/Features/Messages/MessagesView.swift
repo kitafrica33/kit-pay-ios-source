@@ -2066,7 +2066,10 @@ struct ConversationView: View {
     }
 
     var body: some View {
-        conversationLifecycle
+        // Erased on purpose: each stage below adds another ModifiedContent layer, and the
+        // unbroken chain is what overflowed the demangler's stack when a chat opened.
+        // See timelineRow(for:...) for the full account. Keep this AnyView.
+        AnyView(conversationLifecycle)
             // A voice note keeps playing after this screen is gone, so the floating bar needs to
             // be able to name it. Only this screen can turn a sender id into "You", a contact, or
             // a neutral fallback, so the resolver travels with the thread.
@@ -2684,6 +2687,131 @@ struct ConversationView: View {
             ?? model.contactVerification(forUserID: userID)
     }
 
+    // MARK: Timeline rows
+
+    /// Builds one timeline row, already erased to `AnyView`.
+    ///
+    /// This switch and the `.message` chain below it used to be written inline in
+    /// `conversationLayout`'s `ForEach`. `ViewBuilder` folds every branch into another
+    /// `_ConditionalContent` layer and carries that branch's whole bubble type inside it, so a
+    /// single row nested roughly sixteen generic levels deep. Composed into the rest of the
+    /// screen — the scroll stack, the shared-media overlay, twenty-two sheets and covers, then
+    /// the delete, task and lifecycle modifiers — the screen's static type grew a mangled name
+    /// the Swift runtime could not decode without exhausting the 1 MB main-thread stack, so
+    /// opening a chat died inside `swift_getTypeByMangledName` with EXC_BAD_ACCESS
+    /// "Thread stack size exceeded due to excessive recursion" (TestFlight 1.0.17 build 100,
+    /// iPhone 15 Plus, iOS 26.6).
+    ///
+    /// Returning `AnyView` explicitly from every branch keeps `_ConditionalContent` out of the
+    /// row altogether: the enclosing screen sees one flat row type, and each bubble's own type is
+    /// decoded separately on its own shallow budget. `ForEach` still identifies rows by
+    /// `ConversationTimelineItem.id`, so erasing here costs no row identity, selection or
+    /// animation. Keep every branch returning `AnyView` — reinlining this switch reintroduces the
+    /// crash.
+    private func timelineRow(
+        for item: ConversationTimelineItem,
+        albumMembership: [UUID: ChatMediaAlbumMembership],
+        messagesByID: [UUID: LocalMessage],
+        suppressedReactionIDs: Set<UUID>,
+        reactionTallies: [String: [MessageReactionTally]],
+        namedSenderMessageIDs: Set<UUID>,
+        correctionDates: [UUID: Date]
+    ) -> AnyView {
+        switch item {
+        case .message(let message):
+            return messageRow(
+                message,
+                albumMembership: albumMembership,
+                messagesByID: messagesByID,
+                suppressedReactionIDs: suppressedReactionIDs,
+                reactionTallies: reactionTallies,
+                namedSenderMessageIDs: namedSenderMessageIDs,
+                correctionDates: correctionDates
+            )
+        case .payment(let message, let descriptor):
+            return AnyView(paymentBubble(message, descriptor: descriptor))
+        case .scheduledPayment(let message, let descriptor):
+            return AnyView(scheduledPaymentReceipt(message, descriptor: descriptor))
+        case .scheduledGroupPaymentOutcome(_, let descriptor):
+            return AnyView(
+                GroupPaymentOutcomeChip(
+                    text: descriptor.action == .failed
+                        ? "Scheduled group payment was not sent. No money moved."
+                        : "Scheduled group payment cancelled."
+                )
+            )
+        case .groupPayment(let message, let descriptor):
+            return AnyView(groupPaymentCard(message, descriptor: descriptor))
+        case .groupPaymentEvent(let message, let descriptor):
+            return AnyView(groupPaymentOutcome(message, descriptor: descriptor))
+        case .groupPaymentRequest(let message, let descriptor):
+            return AnyView(groupPaymentRequestCard(message, descriptor: descriptor))
+        case .groupPaymentRequestEvent(let message, let descriptor):
+            return AnyView(groupPaymentRequestOutcome(message, descriptor: descriptor))
+        case .call(let call):
+            return AnyView(callBubble(call))
+        case .dateSeparator(let separator):
+            return AnyView(dateSeparator(separator))
+        }
+    }
+
+    /// The `.message` half of ``timelineRow(for:albumMembership:messagesByID:suppressedReactionIDs:reactionTallies:namedSenderMessageIDs:correctionDates:)``,
+    /// erased for the same reason and preserving the original branch order exactly.
+    private func messageRow(
+        _ message: LocalMessage,
+        albumMembership: [UUID: ChatMediaAlbumMembership],
+        messagesByID: [UUID: LocalMessage],
+        suppressedReactionIDs: Set<UUID>,
+        reactionTallies: [String: [MessageReactionTally]],
+        namedSenderMessageIDs: Set<UUID>,
+        correctionDates: [UUID: Date]
+    ) -> AnyView {
+        if let systemEvent = KitSystemMessage.parse(message.body) {
+            // Only the coordinator authors system notices (no server message id); an inbound
+            // peer-authored KITSYS1 body is a forgery attempt and renders nothing — never a chip
+            // that impersonates authoritative membership history.
+            guard message.serverMessageId == nil else { return AnyView(EmptyView()) }
+            return AnyView(systemEventChip(systemEvent))
+        }
+        if suppressedReactionIDs.contains(message.id)
+            || SecureMessageReservedPrefixPolicy.beginsWithReservedPrefix(
+                message.body,
+                prefix: KitSystemMessage.prefix
+            ) {
+            // Reaction events render as chips on their target bubble; malformed system wire stays
+            // invisible rather than raw.
+            return AnyView(EmptyView())
+        }
+        if case .leader(let album) = albumMembership[message.id] {
+            return AnyView(
+                albumBubble(
+                    album,
+                    messagesByID: messagesByID,
+                    reactionTallies: reactionTallies,
+                    senderName: namedSenderMessageIDs.contains(message.id)
+                        ? participantDisplayName(for: message.senderId)
+                        : nil
+                )
+            )
+        }
+        // A follower of an album run has no bubble of its own; the leader drew the whole grid.
+        guard albumMembership[message.id] != .follower else { return AnyView(EmptyView()) }
+        return AnyView(
+            bubble(
+                message,
+                reactionTallies: reactionTallies,
+                showsSenderName: namedSenderMessageIDs.contains(message.id),
+                editedAt: correctionDates[message.id]
+            )
+            .onAppear {
+                LocalMediaPerformanceMonitor.shared.markTextBubbleVisible(
+                    messageID: message.id,
+                    producerScope: mediaDiagnosticsProducerScope
+                )
+            }
+        )
+    }
+
     private var conversationLayout: some View {
         // One pass per render for every whole-thread fold (albums, reaction suppression,
         // reaction tallies): computing these per bubble would be quadratic in long threads
@@ -2747,72 +2875,15 @@ struct ConversationView: View {
                             paymentErrorBanner(transferError)
                         }
                         ForEach(renderedTimeline) { item in
-                            switch item {
-                            case .message(let message):
-                                if let systemEvent = KitSystemMessage.parse(message.body) {
-                                    // Only the coordinator authors system notices (no server
-                                    // message id); an inbound peer-authored KITSYS1 body is a
-                                    // forgery attempt and renders nothing — never a chip that
-                                    // impersonates authoritative membership history.
-                                    if message.serverMessageId == nil {
-                                        systemEventChip(systemEvent)
-                                    } else {
-                                        EmptyView()
-                                    }
-                                } else if suppressedReactionIDs.contains(message.id)
-                                    || SecureMessageReservedPrefixPolicy.beginsWithReservedPrefix(
-                                        message.body,
-                                        prefix: KitSystemMessage.prefix
-                                    ) {
-                                    // Reaction events render as chips on their target bubble;
-                                    // malformed system wire stays invisible rather than raw.
-                                    EmptyView()
-                                } else if case .leader(let album) = albumMembership[message.id] {
-                                    albumBubble(
-                                        album,
-                                        messagesByID: messagesByID,
-                                        reactionTallies: hoistedTallies,
-                                        senderName: namedSenderMessageIDs.contains(message.id)
-                                            ? participantDisplayName(for: message.senderId)
-                                            : nil
-                                    )
-                                } else if albumMembership[message.id] != .follower {
-                                    bubble(
-                                        message,
-                                        reactionTallies: hoistedTallies,
-                                        showsSenderName: namedSenderMessageIDs.contains(message.id),
-                                        editedAt: correctionDates[message.id]
-                                    )
-                                    .onAppear {
-                                        LocalMediaPerformanceMonitor.shared.markTextBubbleVisible(
-                                            messageID: message.id,
-                                            producerScope: mediaDiagnosticsProducerScope
-                                        )
-                                    }
-                                }
-                            case .payment(let message, let descriptor):
-                                paymentBubble(message, descriptor: descriptor)
-                            case .scheduledPayment(let message, let descriptor):
-                                scheduledPaymentReceipt(message, descriptor: descriptor)
-                            case .scheduledGroupPaymentOutcome(_, let descriptor):
-                                GroupPaymentOutcomeChip(
-                                    text: descriptor.action == .failed
-                                        ? "Scheduled group payment was not sent. No money moved."
-                                        : "Scheduled group payment cancelled."
-                                )
-                            case .groupPayment(let message, let descriptor):
-                                groupPaymentCard(message, descriptor: descriptor)
-                            case .groupPaymentEvent(let message, let descriptor):
-                                groupPaymentOutcome(message, descriptor: descriptor)
-                            case .groupPaymentRequest(let message, let descriptor):
-                                groupPaymentRequestCard(message, descriptor: descriptor)
-                            case .groupPaymentRequestEvent(let message, let descriptor):
-                                groupPaymentRequestOutcome(message, descriptor: descriptor)
-                            case .call(let call):
-                                callBubble(call)
-                            case .dateSeparator(let separator):
-                                dateSeparator(separator)
-                            }
+                            timelineRow(
+                                for: item,
+                                albumMembership: albumMembership,
+                                messagesByID: messagesByID,
+                                suppressedReactionIDs: suppressedReactionIDs,
+                                reactionTallies: hoistedTallies,
+                                namedSenderMessageIDs: namedSenderMessageIDs,
+                                correctionDates: correctionDates
+                            )
                         }
                         if !scheduledItems.isEmpty {
                             ScheduledSendSection(
@@ -2992,22 +3063,27 @@ struct ConversationView: View {
             }
             .background(chatBackground)
 
-            if isReadOnlyAppReviewPreview {
-                appReviewReadOnlyFooter
-            } else if isSelectingMessages {
-                messageSelectionBar
-            } else if isSearchingMessages {
-                messageSearchBar
-            } else if !conversationMessagingAvailable {
-                groupMessagingReadOnlyFooter
-            } else {
-                composer
-            }
+            conversationFooter
         }
         .navigationTitle("")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar(.hidden, for: .tabBar)
         .toolbar { conversationToolbar }
+    }
+
+    /// The bar under the thread: the review footer, selection bar, search bar, read-only group
+    /// footer, or the composer.
+    ///
+    /// Erased like ``timelineRow(for:albumMembership:messagesByID:suppressedReactionIDs:reactionTallies:namedSenderMessageIDs:correctionDates:)``:
+    /// five `ViewBuilder` branches nested four `_ConditionalContent` layers deep and each one
+    /// carried a whole composer type, directly under the layout the demangler already could not
+    /// afford. Branch order is unchanged.
+    private var conversationFooter: AnyView {
+        if isReadOnlyAppReviewPreview { return AnyView(appReviewReadOnlyFooter) }
+        if isSelectingMessages { return AnyView(messageSelectionBar) }
+        if isSearchingMessages { return AnyView(messageSearchBar) }
+        guard conversationMessagingAvailable else { return AnyView(groupMessagingReadOnlyFooter) }
+        return AnyView(composer)
     }
 
     @ViewBuilder
@@ -3030,7 +3106,7 @@ struct ConversationView: View {
 
     private var conversationWithSharedReview: some View {
         ZStack {
-            conversationLayout
+            AnyView(conversationLayout)
                 .allowsHitTesting(!showsSharedMediaReview)
                 .accessibilityHidden(showsSharedMediaReview)
             sharedMediaReviewOverlay
@@ -3038,7 +3114,10 @@ struct ConversationView: View {
     }
 
     private var conversationMediaPickers: some View {
-        conversationWithSharedReview
+        // Erased on purpose: each stage below adds another ModifiedContent layer, and the
+        // unbroken chain is what overflowed the demangler's stack when a chat opened.
+        // See timelineRow(for:...) for the full account. Keep this AnyView.
+        AnyView(conversationWithSharedReview)
         .sheet(isPresented: $showPhotoPicker) {
             KitChatMediaPicker(
                 selectionLimit: ConversationAttachmentStagingPolicy.maximumStagedAttachments
@@ -3172,7 +3251,10 @@ struct ConversationView: View {
     }
 
     private var conversationSheets: some View {
-        conversationMediaPickers
+        // Erased on purpose: each stage below adds another ModifiedContent layer, and the
+        // unbroken chain is what overflowed the demangler's stack when a chat opened.
+        // See timelineRow(for:...) for the full account. Keep this AnyView.
+        AnyView(conversationMediaPickers)
         .fullScreenCover(isPresented: $showMoneyIdentityVerification) {
             NavigationStack {
                 KYCView()
@@ -3815,7 +3897,10 @@ struct ConversationView: View {
     }
 
     private var conversationDeleteConfirmation: some View {
-        conversationSheets
+        // Erased on purpose: each stage below adds another ModifiedContent layer, and the
+        // unbroken chain is what overflowed the demangler's stack when a chat opened.
+        // See timelineRow(for:...) for the full account. Keep this AnyView.
+        AnyView(conversationSheets)
         .confirmationDialog(
             selectedMessageIDs.count == 1 ? "Delete this message?" : "Delete \(selectedMessageIDs.count) messages?",
             isPresented: $showDeleteMessagesConfirmation,
@@ -3846,7 +3931,7 @@ struct ConversationView: View {
             didRestore: didRestoreDraft,
             isSending: isSending
         )
-        return conversationDeleteConfirmation
+        return AnyView(conversationDeleteConfirmation)
         .task(id: messages.last?.serverMessageId) {
             guard !isReadOnlyAppReviewPreview else { return }
             await model.markConversationRead(conversation.id)
@@ -3939,7 +4024,10 @@ struct ConversationView: View {
     }
 
     private var conversationLifecycle: some View {
-        conversationTasks
+        // Erased on purpose: each stage below adds another ModifiedContent layer, and the
+        // unbroken chain is what overflowed the demangler's stack when a chat opened.
+        // See timelineRow(for:...) for the full account. Keep this AnyView.
+        AnyView(conversationTasks)
         .onAppear {
             promoteMountedConversationIfNeeded(model.state.conversations)
             if !isReadOnlyAppReviewPreview, !didRestoreDraft, !draftRestoreStarted {

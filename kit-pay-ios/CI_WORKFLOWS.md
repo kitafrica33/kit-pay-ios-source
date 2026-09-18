@@ -92,6 +92,15 @@ another file. Build 100 uses an empty encodable dictionary in that assertion. It
 retains the authentication fix and every selected test. No native test, signed
 archive or Apple upload ran for build 99; its published source remains immutable.
 
+Build 100 crashed on TestFlight the moment a customer opened a chat: EXC_BAD_ACCESS
+(SIGSEGV), "Thread stack size exceeded due to excessive recursion", inside
+`swift_getTypeByMangledName` under `ConversationView.conversationLayout`. `ConversationView`
+composed one opaque SwiftUI type across eight stages and an eleven-case timeline switch, and
+the Swift runtime could not decode that type's mangled name within the 1 MB main-thread stack.
+Build 101 erases the stage seams and the timeline row to `AnyView`, which splits one
+undecodable type into several shallow ones. `test_conversation_view_type_depth.py` pins both
+shapes, since no Linux stage can compile SwiftUI and no native test can build the screen.
+
 App Store archives also run those seven regression cases on a clean iPad Air
 11-inch (M3) Simulator, reusing the compiled products and existing dependency setup.
 The pinned runner provides iOS 26.5; Apple's report used iPadOS 26.6. These are
