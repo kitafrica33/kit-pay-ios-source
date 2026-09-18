@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 @main
 struct KitPayApp: App {
@@ -10,6 +11,17 @@ struct KitPayApp: App {
     @State private var callInvitationInbox = CallInvitationInbox()
 
     init() {
+        // Holding the shared store's flock across suspension is fatal: RunningBoard killed
+        // 1.0.17 (102) with 0xdead10cc while a background outbox flush was writing. The app is
+        // the only target that may take a UIKit background task, so it installs the assertion
+        // here, before any store, capture or model work can reach MessagingProcessBroker.
+        SharedLockActivity.install {
+            let identifier = UIApplication.shared.beginBackgroundTask(
+                withName: "africa.kit.pay.shared-store-lock"
+            )
+            guard identifier != .invalid else { return {} }
+            return { UIApplication.shared.endBackgroundTask(identifier) }
+        }
         // Camera/editor outputs are plaintext only while being reviewed or staged. A crash can
         // bypass their normal owner cleanup, so retire those narrowly prefixed scratch folders
         // before any new capture session can reuse the process.

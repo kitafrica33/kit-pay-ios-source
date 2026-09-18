@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import XCTest
 @testable import KitPay
 
@@ -1027,5 +1028,92 @@ private final class BrokerTestBiometrics: MessagingBiometricAuthenticating, @unc
     func removeCredential(_ credential: MessagingBiometricCredential) throws {
         backend.remove(credential)
         lock.withLock { removed.append(credential) }
+    }
+}
+
+/// TestFlight 1.0.17 (102) was killed by RunningBoard with `0xdead10cc` while a background
+/// outbox flush held this broker's `flock`. These cases pin the assertion that keeps the
+/// process awake for exactly as long as the file lock is held.
+final class SharedLockActivityTests: XCTestCase {
+    private var root: URL!
+    private let key = Data(repeating: 0x51, count: 32)
+
+    override func setUpWithError() throws {
+        root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    }
+
+    override func tearDownWithError() throws {
+        SharedLockActivity.install(nil)
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    private func broker() -> MessagingProcessBroker {
+        MessagingProcessBroker(rootURL: root, key: key)
+    }
+
+    /// True only while nothing else in this process holds the broker's file lock: `flock` is
+    /// owned by the open file description, so a second descriptor here still blocks.
+    private func fileLockIsFree() -> Bool {
+        let path = root.appendingPathComponent("MessagingBroker/transaction.lock").path
+        let descriptor = Darwin.open(path, O_CREAT | O_RDWR | O_CLOEXEC, S_IRUSR | S_IWUSR)
+        guard descriptor >= 0 else { return false }
+        defer { Darwin.close(descriptor) }
+        guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else { return false }
+        flock(descriptor, LOCK_UN)
+        return true
+    }
+
+    func testLockedSectionRunsInsideOneActivityAssertion() throws {
+        var begun = 0
+        var ended = 0
+        SharedLockActivity.install {
+            begun += 1
+            return { ended += 1 }
+        }
+        var observedInsideBody: (Int, Int)?
+        try broker().withLock { _ in
+            observedInsideBody = (begun, ended)
+        }
+        XCTAssertEqual(observedInsideBody?.0, 1, "the assertion is taken before the body runs")
+        XCTAssertEqual(observedInsideBody?.1, 0, "the assertion stays open for the whole body")
+        XCTAssertEqual(begun, 1)
+        XCTAssertEqual(ended, 1, "the assertion is always ended")
+    }
+
+    func testAssertionIsEndedWhenTheLockedBodyThrows() {
+        var begun = 0
+        var ended = 0
+        SharedLockActivity.install {
+            begun += 1
+            return { ended += 1 }
+        }
+        struct Failure: Error {}
+        XCTAssertThrowsError(try broker().withLock { _ in throw Failure() })
+        XCTAssertEqual(begun, 1)
+        XCTAssertEqual(ended, 1, "a throwing body must not strand the assertion")
+    }
+
+    func testAssertionOutlivesTheFileLock() throws {
+        var lockWasFreeWhenAssertionEnded: Bool?
+        var lockWasHeldInsideBody: Bool?
+        SharedLockActivity.install { [weak self] in
+            { lockWasFreeWhenAssertionEnded = self?.fileLockIsFree() }
+        }
+        try broker().withLock { _ in
+            lockWasHeldInsideBody = self.fileLockIsFree() == false
+        }
+        XCTAssertEqual(lockWasHeldInsideBody, true, "the probe must detect the held file lock")
+        XCTAssertEqual(
+            lockWasFreeWhenAssertionEnded, true,
+            "the process may only be suspendable again after flock(LOCK_UN)"
+        )
+    }
+
+    func testMissingProviderStillReturnsABalancedHandler() throws {
+        SharedLockActivity.install(nil)
+        XCTAssertNoThrow(try broker().withLock { _ in })
+        let end = SharedLockActivity.begin()
+        end()
     }
 }

@@ -107,6 +107,16 @@ never be published again. Publish corresponding source as **draft first, upload 
 then flip `draft` to false** — and if a tag is ever burned, bump the build number, because
 `KitLegalURLPolicy` derives the expected tag from the running build's own version and build.
 
+Build 103 fixes a second, unrelated crash. Build 102 opened chats correctly but was killed
+by RunningBoard eight minutes into a session: `EXC_CRASH (SIGKILL)`, termination reason
+`RUNNINGBOARD 0xdead10cc`, no faulted thread. That code means the process was suspended while
+holding a file lock in a shared app-group container, and the log's only running work was a
+background outbox flush encoding the persisted state inside `MessagingProcessBroker.withLock`,
+which holds `flock(LOCK_EX)` on the broker's `transaction.lock`. Every locked section now runs
+inside a `SharedLockActivity` assertion; the app backs it with a UIKit background task, and
+extensions keep the no-op default so the broker stays extension-API-safe.
+`test_shared_lock_activity.py` pins the shape and `SharedLockActivityTests` exercises it.
+
 App Store archives also run those seven regression cases on a clean iPad Air
 11-inch (M3) Simulator, reusing the compiled products and existing dependency setup.
 The pinned runner provides iOS 26.5; Apple's report used iPadOS 26.6. These are

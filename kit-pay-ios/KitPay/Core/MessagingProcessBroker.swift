@@ -3,6 +3,49 @@ import Darwin
 import Foundation
 import Security
 
+/// RunningBoard terminates a *suspended* process that still holds a file lock on a file in a
+/// shared app-group container. The report is `EXC_CRASH (SIGKILL)` with termination reason
+/// `RUNNINGBOARD 0xdead10cc`, and no thread is faulted: the crashed thread is the idle main
+/// run loop. TestFlight 1.0.17 (102) died exactly that way after eight minutes, with a
+/// background outbox flush (`AppModel.scheduleOutboxWake` -> `flushOutbox` ->
+/// `SecureLocalStore.persist`) encoding the persisted state inside
+/// `MessagingProcessBroker.withLock`, which holds `flock(LOCK_EX)` on
+/// `<app group>/MessagingBroker/transaction.lock`.
+///
+/// Every locked section therefore runs inside a host activity assertion, so the process cannot
+/// be suspended between `flock(LOCK_EX)` and `flock(LOCK_UN)`. The app target installs a
+/// provider backed by a UIKit background task; app extensions keep the no-op default, which
+/// also keeps this file free of UIKit and usable from `APPLICATION_EXTENSION_API_ONLY` targets.
+enum SharedLockActivity {
+
+    /// Begins one assertion and returns the handler that ends it. Never nil, always balanced.
+    static func begin() -> () -> Void { storage.begin() }
+
+    /// Installed once by the app, before any shared-store work. Passing nil restores the
+    /// no-op default, which only tests do.
+    static func install(_ provider: (() -> () -> Void)?) { storage.install(provider) }
+
+    private static let storage = Storage()
+
+    private final class Storage: @unchecked Sendable {
+        private let lock = NSLock()
+        private var provider: (() -> () -> Void)?
+
+        func install(_ new: (() -> () -> Void)?) {
+            lock.lock()
+            defer { lock.unlock() }
+            provider = new
+        }
+
+        func begin() -> () -> Void {
+            lock.lock()
+            let provider = self.provider
+            lock.unlock()
+            return provider?() ?? {}
+        }
+    }
+}
+
 /// The app and share extension have one Signal store. The wallet store and its key never leave
 /// the application container. No caller may keep this lock while awaiting network or crypto work.
 final class MessagingProcessBroker: @unchecked Sendable {
@@ -219,6 +262,11 @@ final class MessagingProcessBroker: @unchecked Sendable {
     func withLock<T>(_ body: (MessagingProcessBroker) throws -> T) throws -> T {
         processLock.lock()
         defer { processLock.unlock() }
+        // Suspension while this flock is held is fatal (0xdead10cc); see SharedLockActivity.
+        // The assertion is taken before the descriptor is opened and released after the
+        // unlock, so it covers acquisition, the body, and every throwing path out of them.
+        let endSharedLockActivity = SharedLockActivity.begin()
+        defer { endSharedLockActivity() }
         guard let rootURL else { throw Failure.unavailable }
         try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
         try FileManager.default.setAttributes(

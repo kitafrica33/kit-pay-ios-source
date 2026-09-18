@@ -143,4 +143,93 @@ builds the expected tag from the running build's own version and build number, s
 named tag would have failed the in-app legal screen and `verify_ios_archive.py`. The correct
 order is **create the release as a draft, upload the assets, then publish it**.
 
-<!-- publication evidence appended after the runs -->
+### Evidence
+
+| Step | Identifier | Result |
+| --- | --- | --- |
+| App commit on `main` | `f889d1708fbda2369d5beb8c3a2db56914574d11` | pushed, fast-forward |
+| Corresponding source | `kitafrica33/kit-pay-ios-source` tag `v1.0.17-build102`, release 391735392 | published, assets anonymously downloadable, tar.gz SHA-256 `5cde19c1…` |
+| Signed archive run | `ios-app-store-archive.yml` run **35386372231** (`app-store`, `update_screenshots=false`) | success — native suite, iPad review-account unlock, signed IPA |
+| TestFlight upload run | `ios-testflight-upload.yml` run **35393155373** | success, dispatched once |
+| TestFlight build | 1.0.17 (102), ASC build `7d2644de-b342-4f64-91f2-62a3dc1ddd4e` | `VALID`, `IN_BETA_TESTING` internal and external |
+| External distribution | group `Externals` `6ab1c5db-f1b8-477c-88bc-dd7883548fc4` (public link `1kpYk3Dh`) | build added, beta review submitted |
+| App Store version | `fd84e0cc-f53f-4356-bc97-ae6cd22150d5` (1.0.17) | build 102 attached, `releaseType = AFTER_APPROVAL` |
+| Review submission | **7c475370-ad71-4e7e-91ac-1a53fe87ac0b** | `WAITING_FOR_REVIEW`, submitted 2026-09-18T21:02:05Z |
+
+The previous review submission `371935eb-61fa-4ace-a4a3-022a40cfb481` held the rejected build 100
+and had to be cancelled before the version could join a new submission; Apple refuses both
+`submitted` on an `UNRESOLVED_ISSUES` submission and a second submission item for a version that
+is still attached to one. Cancelling it moved it to `COMPLETE` and released the version.
+
+"What's New" could not be set: the app has never been on sale, so ASC answers
+`409 STATE_ERROR — Attribute 'whatsNew' cannot be edited at this time` for a first version. The
+fix wording therefore lives in the TestFlight "What to test" notes on build 102 instead.
+
+## 6. Second crash: build 102 killed by RunningBoard
+
+A second TestFlight crash arrived at 21:28 UTC, `AJLYv-nIkFXNeKKLq-bHyBY`, comment
+"Crushed abruptly, please review", from the same iPhone 15 Plus on iOS 26.6 — this time on
+**1.0.17 (102)**, the build that fixed the chat-open crash. The log is saved at
+`~/kstream-ops/crash/kitpay/crash-AJLYv-nIkFXNeKKLq-bHyBY.crash`.
+
+It is a different fault, not a recurrence:
+
+```
+Exception Type:     EXC_CRASH (SIGKILL)
+Exception Codes:    0x0000000000000000, 0x0000000000000000
+Termination Reason: RUNNINGBOARD 0xdead10cc
+Triggered by Thread: 0
+Launch Time:        2026-09-19 00:15:24   Date/Time: 2026-09-19 00:23:43
+```
+
+Thread 0 is the idle main run loop (`mach_msg2_trap` → `__CFRunLoopRun` → `GSEventRunModal`);
+nothing faulted. `0xdead10cc` is the watchdog code for *terminated for holding a file lock or
+SQLite lock on a file in a shared container while suspended*. The one thread doing application
+work was thread 16:
+
+```
+SecureLocalStore.encryptedState  (SecureLocalStore.swift:610)   JSONEncoder.encode(PersistedState)
+SecureLocalStore.persist         (SecureLocalStore.swift:573/518)
+SecureLocalStore.update          → AppModel.commitAuthenticatedMutation (AppModel.swift:20643)
+AppModel.flushOutbox             (AppModel.swift:20622)
+closure #2 in AppModel.scheduleOutboxWake (AppModel.swift:22849)
+```
+
+`SecureLocalStore.persist` runs its whole transaction inside `messagingBroker.withLock`, and
+`MessagingProcessBroker.withLock` holds `flock(LOCK_EX)` on
+`<group.africa.kit.pay.ios>/MessagingBroker/transaction.lock` — a file in the app-group
+container shared with the share and broadcast extensions. The outbox wake timer fires on its
+own schedule, so backgrounding the app while one of those writes is in flight suspends the
+process mid-lock and the OS kills it. Eight minutes of uptime and no user-visible fault match
+that exactly.
+
+### Fix
+
+`SharedLockActivity` (in `MessagingProcessBroker.swift`, so it stays free of UIKit for the
+`APPLICATION_EXTENSION_API_ONLY` targets) hands out an activity assertion that `withLock`
+begins before opening the lock descriptor and ends after `flock(LOCK_UN)`, on every path
+including throws. `KitPayApp.init` installs the only provider, backed by
+`UIApplication.beginBackgroundTask(withName: "africa.kit.pay.shared-store-lock")`, before any
+other launch work; extensions keep the no-op default. The process therefore cannot be suspended
+between lock and unlock, which is Apple's prescribed remedy for `0xdead10cc`.
+
+### Tests
+
+- `SharedLockActivityTests` (native, 4 cases): the assertion is open for the whole locked body,
+  it is ended when the body throws, it outlives the file lock (a second descriptor can take
+  `flock(LOCK_EX | LOCK_NB)` only once the assertion's end handler runs), and an uninstalled
+  provider still returns a balanced handler.
+- `.github/scripts/tests/test_shared_lock_activity.py` (5 cases): the assertion brackets the
+  descriptor and the unlock, `flock(` appears in no other source file, the broker imports no
+  UIKit, the app installs the provider first, and exactly one target installs one.
+  All five fail against the build 102 source. Whole Linux suite: 274 tests, OK.
+- `swiftc -parse` under `docker run swift:5.10-noble` on the three edited Swift files: exit 0.
+
+### Publication
+
+The version stays **1.0.17** and the build goes **102 → 103**: App Store Connect refuses to
+create a 1.0.18 record while the app has never been released and 1.0.17 is still editable
+(`409 ENTITY_ERROR.RELATIONSHIP.INVALID — You cannot create a new version of the App in the
+current state`). The 1.0.17 review submission `7c475370-ad71-4e7e-91ac-1a53fe87ac0b` that had
+build 102 attached was cancelled before review started, so no crashing binary is with Apple;
+the version is `DEVELOPER_REJECTED` and takes build 103 for the new submission.
