@@ -46,6 +46,50 @@ enum SharedLockActivity {
     }
 }
 
+extension SharedLockActivity {
+
+    /// The reason RunningBoard records against the share extension's assertion.
+    static let expiringActivityReason = "africa.kit.pay.shared-store-lock"
+
+    /// The extension-safe provider. `KitPayShare` compiles this file and takes the same
+    /// `flock(LOCK_EX)` on the app-group lock, but `APPLICATION_EXTENSION_API_ONLY` removes
+    /// `UIApplication.shared`, so it cannot install the app's background-task provider and the
+    /// no-op default leaves it with no cover at all. That is the worse of the two processes to
+    /// leave uncovered: a share sheet is torn down the instant the customer taps Send, while
+    /// `DirectShareSendCoordinator.enqueue` is still journalling the message inside `withLock`.
+    ///
+    /// `ProcessInfo.performExpiringActivity` asserts only for as long as its block runs, so the
+    /// block waits to be released rather than returning; one background thread parked for a
+    /// bounded local write is the price of not being SIGKILLed mid-send.
+    ///
+    /// `perform` and `grantTimeout` exist for `SharedLockActivityTests`, which needs to drive
+    /// the grant, the refusal and the never-scheduled cases deterministically.
+    static func installExpiringActivityProvider(
+        perform: @escaping (String, @escaping (Bool) -> Void) -> Void = { reason, body in
+            ProcessInfo.processInfo.performExpiringActivity(withReason: reason, using: body)
+        },
+        grantTimeout: TimeInterval = 0.1
+    ) {
+        install {
+            let granted = DispatchSemaphore(value: 0)
+            let release = DispatchSemaphore(value: 0)
+            perform(expiringActivityReason) { expired in
+                // `expired` means the assertion was refused, or has just been revoked. There is
+                // nothing left to hold open, and blocking here would only pin a worker thread.
+                granted.signal()
+                guard !expired else { return }
+                release.wait()
+            }
+            // Returning before the activity exists would leave open the very window this
+            // closes. A refusal signals immediately, so only a block the system never schedules
+            // can reach the timeout — and then the locked section proceeds exactly as it did
+            // before this provider existed, which is no worse than the default.
+            _ = granted.wait(timeout: .now() + grantTimeout)
+            return { release.signal() }
+        }
+    }
+}
+
 /// The app and share extension have one Signal store. The wallet store and its key never leave
 /// the application container. No caller may keep this lock while awaiting network or crypto work.
 final class MessagingProcessBroker: @unchecked Sendable {

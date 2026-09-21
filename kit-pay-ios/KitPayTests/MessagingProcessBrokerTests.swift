@@ -1121,4 +1121,116 @@ final class SharedLockActivityTests: XCTestCase {
         let end = SharedLockActivity.begin()
         end()
     }
+
+    // MARK: The share extension's ProcessInfo-backed provider
+    //
+    // KitPayShare compiles the broker and takes the same flock, but
+    // APPLICATION_EXTENSION_API_ONLY removes UIApplication.shared, so it cannot install the
+    // app's background-task provider. Left on the no-op default it holds the app-group lock
+    // with no assertion at all, in the process the system suspends most readily: the sheet is
+    // torn down the instant Send is tapped, while the send is still being journalled.
+
+    /// `performExpiringActivity` asserts for exactly as long as its block runs. A provider that
+    /// let the block return early would assert nothing at all.
+    func testTheExpiringActivityBlockOutlivesTheLockedSection() throws {
+        let state = ActivityProbe()
+        SharedLockActivity.installExpiringActivityProvider(
+            perform: { reason, body in
+                state.record(reason: reason)
+                Thread.detachNewThread {
+                    state.markBlockRunning()
+                    body(false)
+                    state.markBlockFinished()
+                }
+            }
+        )
+        var runningInsideBody = false
+        try broker().withLock { _ in
+            runningInsideBody = state.waitForBlockRunning()
+            XCTAssertFalse(state.blockHasFinished, "the activity must not end mid-section")
+        }
+        XCTAssertTrue(runningInsideBody, "the activity block must be running inside the lock")
+        XCTAssertTrue(state.waitForBlockFinished(), "ending the assertion releases the block")
+        XCTAssertEqual(state.reason, "africa.kit.pay.shared-store-lock")
+    }
+
+    /// RunningBoard refuses or revokes assertions under pressure. That must cost the caller
+    /// nothing: the locked section still has to run, exactly as it did before the provider.
+    func testARefusedExpiringActivityNeitherBlocksNorStrandsTheCaller() throws {
+        let state = ActivityProbe()
+        SharedLockActivity.installExpiringActivityProvider(
+            perform: { reason, body in
+                state.record(reason: reason)
+                body(true)
+                state.markBlockFinished()
+            },
+            grantTimeout: 5
+        )
+        let started = Date()
+        var ranBody = false
+        try broker().withLock { _ in ranBody = true }
+        XCTAssertTrue(ranBody, "a refused assertion must not skip the locked section")
+        XCTAssertLessThan(
+            Date().timeIntervalSince(started), 1,
+            "an expired activity returns immediately instead of waiting to be released"
+        )
+        XCTAssertTrue(state.blockHasFinished, "a refused activity holds no worker thread")
+    }
+
+    /// If the system never schedules the block, the caller waits out the grant timeout once and
+    /// then proceeds unprotected — which is the old behaviour, not a hang.
+    func testAnUnscheduledExpiringActivityReleasesTheCallerAfterTheGrantTimeout() throws {
+        SharedLockActivity.installExpiringActivityProvider(
+            perform: { _, _ in },
+            grantTimeout: 0.05
+        )
+        let started = Date()
+        var ranBody = false
+        try broker().withLock { _ in ranBody = true }
+        let elapsed = Date().timeIntervalSince(started)
+        XCTAssertTrue(ranBody, "the locked section still runs")
+        XCTAssertGreaterThanOrEqual(elapsed, 0.05, "the caller waits for the grant it asked for")
+        XCTAssertLessThan(elapsed, 3, "and never waits on a block that will not arrive")
+    }
+}
+
+/// Test-only recorder. `perform` is called from the locked section and its block runs on
+/// another thread, so every field crosses threads and needs its own lock.
+private final class ActivityProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private let running = DispatchSemaphore(value: 0)
+    private let finished = DispatchSemaphore(value: 0)
+    private var recordedReason: String?
+    private var didFinish = false
+
+    var reason: String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedReason
+    }
+
+    var blockHasFinished: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return didFinish
+    }
+
+    func record(reason: String) {
+        lock.lock()
+        recordedReason = reason
+        lock.unlock()
+    }
+
+    func markBlockRunning() { running.signal() }
+
+    func markBlockFinished() {
+        lock.lock()
+        didFinish = true
+        lock.unlock()
+        finished.signal()
+    }
+
+    func waitForBlockRunning() -> Bool { running.wait(timeout: .now() + 5) == .success }
+
+    func waitForBlockFinished() -> Bool { finished.wait(timeout: .now() + 5) == .success }
 }

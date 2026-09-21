@@ -307,7 +307,7 @@ final class AppStoreScreenshotUITests: XCTestCase {
         XCTAssertTrue(newest.isHittable, "First opening must reveal row 300, not the start of history")
 
         var geometry = ["Synthetic workload: 100 conversations, 2,000 text messages, 300 primary rows.",
-                        "Two functional drag passes and frame geometry; no timing or hitch measurements.",
+                        "Three functional drag passes with frame geometry and per-drag wall clock.",
                         "Simulator results do not establish physical-device latency."]
         // Build 78 retained native momentum after the requested stationary hold. Use a
         // low input velocity so the partial return leaves room for UIKit's deceleration;
@@ -316,11 +316,18 @@ final class AppStoreScreenshotUITests: XCTestCase {
         let stationaryReleaseDuration: TimeInterval = 0.5
         // Preserve first-pass and repeated-state coverage independently of XCTest's
         // metric collector, which raised an internal exception in both builds 76 and 77.
-        for _ in 0..<2 {
+        // Three passes, not two. The pass that failed on build 104 was the one taken straight
+        // after *Jump to latest message*, where the screen had just republished and the main
+        // thread was still folding the whole 2 000-message thread; see
+        // docs/status/ios-chat-scroll-2026-09-21.md. That pass is the
+        // cheap one to repeat, and repeating it is what turns an intermittent freeze into a
+        // reliable signal: a drag that finds the main thread busy moves the timeline 0.0 points.
+        for pass in 0..<3 {
             // Restore the starting position before the repeated drag pair.
             let jump = app.buttons["Jump to latest message"]
             if jump.exists { jump.tap() }
             XCTAssertTrue(newest.isHittable, "Each drag pair starts at the newest row")
+            let passStart = Date()
             let viewport = timeline.frame.insetBy(dx: 2, dy: 20)
             // Short, plain-text bubbles keep these anchors visible on the screenshot iPhone.
             // Row 296 is outgoing; row 295 is incoming, so both bubble gesture owners are used.
@@ -337,13 +344,18 @@ final class AppStoreScreenshotUITests: XCTestCase {
                     .withOffset(CGVector(dx: olderDestination.x, dy: olderDestination.y)),
                        withVelocity: readingDragVelocity, thenHoldForDuration: stationaryReleaseDuration)
             let outgoingAfter = outgoing.frame
+            // Wall clock per drag, so a run that merely got slower is distinguishable from one
+            // that froze, and so the before/after numbers in the report are measured.
+            let olderSeconds = Date().timeIntervalSince(passStart)
+            print("[KitPayLongHistoryGeometry] Pass \(pass) older drag took \(olderSeconds)s")
             print("[KitPayLongHistoryGeometry] Outgoing before/after: \(outgoingBefore) -> \(outgoingAfter)")
             if outgoingAfter.minY - outgoingBefore.minY <= distance * 0.5 {
                 retainHierarchy(app, named: "long-history-vertical-drag-failure")
                 capture(app, named: "long-history-vertical-drag-failure")
             }
             XCTAssertGreaterThan(outgoingAfter.minY - outgoingBefore.minY, distance * 0.5,
-                                 "Dragging down from inside a bubble must reveal older messages")
+                                 "Dragging down from inside a bubble must reveal older messages "
+                                    + "(pass \(pass), \(olderSeconds)s)")
             XCTAssertFalse(newest.isHittable, "Reading older messages must leave the latest position")
 
             let incoming = timeline.staticTexts["Long history 295"].firstMatch
@@ -380,6 +392,7 @@ final class AppStoreScreenshotUITests: XCTestCase {
             XCTAssertTrue(jump.isHittable, "The user must retain an explicit way back to latest")
             XCTAssertEqual(incoming.frame.minY, incomingAfter.minY, accuracy: 4,
                            "Idle layout updates must not pull the reader away from history")
+            geometry.append("Pass \(pass) older drag: \(olderSeconds)s")
             geometry.append("Outgoing before/after: \(outgoingBefore) -> \(outgoingAfter)")
             geometry.append("Incoming before/after: \(incomingBefore) -> \(incomingAfter)")
         }

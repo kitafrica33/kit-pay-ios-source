@@ -1,12 +1,12 @@
-# Kit Pay iOS 1.0.17 (104) corresponding source
+# Kit Pay iOS 1.0.17 (105) corresponding source
 
 This archive is the complete corresponding source offered for the Kit Pay iOS binary with:
 
 - bundle identifier: `africa.kit.pay.ios`
 - marketing version: `1.0.17`
-- build number: `104`
-- Kit Pay source commit: `bfc514ce56019c13d8c0503842e5424de9a50b05`
-- Kit Pay source tree: `d428d23424edac2ae48db3b75ca7ff065b651de3`
+- build number: `105`
+- Kit Pay source commit: `de64a12077abe37efb906bc03bcf6fd63fb210cb`
+- Kit Pay source tree: `20d7b8499bb9ba9b7ffe1d23e78a4b4950ba1cd3`
 - LibSignal source commit: `b5121d07c72f9e631f178d907ca892587f64f9e2`
 - LibSignal source tree: `4ce005a0bf17a445ab14052f8e0c414aa3ddccb9`
 - LiveKit Swift SDK source commit: `8867edc5ac936053d1dd41e44c8d823ac29b82f3`
@@ -30,7 +30,13 @@ licenses and exact revisions are also listed in
 `kit-pay-ios/KitPay/Resources/Legal/THIRD_PARTY_NOTICES.txt`.
 
 Build prerequisites and commands are documented in `kit-pay-ios/README.md`,
-`kit-pay-ios/CI_WORKFLOWS.md`, and `kit-pay-ios/.github/workflows/ios-app-store-archive.yml`.
-The selected archive workflow runs native tests before producing a fresh fixture-free signed
-Release archive. Existing App Store screenshots are retained for this release.
+`kit-pay-ios/CI_WORKFLOWS.md`, `kit-pay-ios/codemagic.yaml`, and
+`kit-pay-ios/.github/workflows/ios-app-store-archive.yml`.
+This build was archived by the `ios-testflight` workflow in `kit-pay-ios/codemagic.yaml`,
+which resolves the same pinned pods and Swift packages, signs the app together with its share
+and broadcast extensions, and produces a fixture-free signed Release archive. It is a TestFlight
+build: no App Store screenshots were captured or changed for it, and existing store assets are
+untouched. The native test suites that gate this change are `kit-pay-ios/.github/scripts/tests`
+(source and release validators, runnable on Linux) and the Xcode test plans described in
+`kit-pay-ios/CI_WORKFLOWS.md`.
 Apple signing credentials are intentionally not part of corresponding source.

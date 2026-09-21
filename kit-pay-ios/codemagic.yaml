@@ -1,0 +1,411 @@
+# Codemagic CI — Kit Pay iOS.
+#
+# Why this file exists: the kitafrica33 GitHub organisation cannot run GitHub
+# Actions (every dispatch dies `startup_failure` at the account level), so
+# `.github/workflows/ios-ci.yml` and the archive/upload lanes cannot run.
+# Codemagic needs neither GitHub Actions nor a local Mac: it clones this
+# repository itself and reads this file.
+#
+# Secrets live in the account-level Codemagic variable group `appstore`
+# (marked secure, so they are masked in build logs) and are never committed.
+# Kit Pay is under the SAME Apple team as KStream (AU55CKVJ55), so the same
+# App Store Connect API key 6R4AY536H9 signs both.
+
+workflows:
+
+  # ---------------------------------------------------------------------------
+  # ios-testflight — the release lane. It archives the app scheme for a real
+  # device, signs it with the Apple Distribution certificate of team AU55CKVJ55
+  # (the one KStream already uses — same team, same certificate), and uploads the
+  # IPA to App Store Connect. Internal TestFlight testers hold "access to all
+  # builds", so the upload IS the internal release; no beta group is named here
+  # and NOTHING is ever submitted to App Store review from this file.
+  #
+  # Three properties of this repository make the lane what it is:
+  #
+  #   * the IPA carries THREE signed bundles — the app, the share extension and
+  #     the broadcast (screen sharing) extension — and all three share the
+  #     app group `group.africa.kit.pay.ios`, so all three bundle ids need an
+  #     App Store profile before the archive starts;
+  #   * the marketing version is FROZEN at 1.0.17. App Store Connect refuses to
+  #     create a second version record while the app has never been on sale
+  #     (409 ENTITY_ERROR.RELATIONSHIP.INVALID), so a release is a new BUILD under
+  #     the existing version, never a version bump. The build number is read live
+  #     from App Store Connect and incremented, so the lane cannot collide with a
+  #     build that already exists;
+  #   * Kit Pay is AGPL-3.0-only and the binary offers its own corresponding
+  #     source. `KitLegalURLPolicy` rebuilds the release URL from the running
+  #     build's own version and build number, so the tag name is not negotiable
+  #     and the release must already be PUBLIC before the archive runs. The lane
+  #     checks that anonymously and refuses to build otherwise — the same gate the
+  #     GitHub archive workflow applies in its preflight job.
+  #
+  # Start it deliberately (there is no trigger and the repository is connected
+  # without a webhook):
+  #   python3 ~/kstream-ops/store/cm.py start ios-testflight \
+  #     --app 6ab10ba0243b6347a3cffa75 --branch main
+  ios-testflight:
+    name: Kit Pay iOS -> TestFlight (internal)
+    instance_type: mac_mini_m2
+    # The free plan caps one build at 60 minutes and billing is deliberately OFF.
+    # A successful run is around half of this; the cap exists to end a wedged
+    # build rather than to accommodate one.
+    max_build_duration: 55
+    cache:
+      # Only verified downloads: the Podfile rehashes the pinned libsignal FFI
+      # archive before use and the SPM clones are re-checked against the reviewed
+      # Package.resolved on every run. Never cache built products.
+      cache_paths:
+        - ~/Library/Caches/CocoaPods
+        - ~/Library/Caches/org.signal.libsignal
+        - ~/Library/Caches/org.swift.swiftpm
+    environment:
+      groups:
+        # App-level secure variables (Codemagic groups are per application, not
+        # per account): APP_STORE_CONNECT_ISSUER_ID, APP_STORE_CONNECT_KEY_IDENTIFIER,
+        # APP_STORE_CONNECT_PRIVATE_KEY — App Store Connect API key 6R4AY536H9 —
+        # and CERTIFICATE_PRIVATE_KEY, the private key of the EXISTING Apple
+        # Distribution certificate, so `fetch-signing-files --create` reuses that
+        # certificate instead of burning one of the team's few certificate slots.
+        - appstore
+      xcode: 26.6
+      cocoapods: default
+      vars:
+        APP_APPLE_ID: "6802582070"
+        APPLE_TEAM_ID: AU55CKVJ55
+        IOS_BUNDLE_ID: africa.kit.pay.ios
+        IOS_SHARE_BUNDLE_ID: africa.kit.pay.ios.share
+        IOS_BROADCAST_BUNDLE_ID: africa.kit.pay.ios.broadcast
+        IOS_APP_GROUP: group.africa.kit.pay.ios
+        # Frozen: see the header. Keep in step with MARKETING_VERSION in the
+        # Xcode project.
+        MARKETING_VERSION: 1.0.17
+        # Never go below the highest build the App Store has already seen, even
+        # if App Store Connect answers oddly for a moment.
+        BUILD_NUMBER_FLOOR: "105"
+    scripts:
+      - name: Machine facts
+        script: |
+          set -e
+          echo "host   : $(hostname)"
+          echo "commit : $(git -C "$CM_BUILD_DIR" rev-parse HEAD)"
+          xcodebuild -version
+          # The GitHub archive lane pins Xcode 26.6 (17F113). Assert the minor
+          # version, print the build version: a different patch build is worth
+          # seeing in the log but is not worth failing a release for.
+          test "$(xcodebuild -version | head -1)" = 'Xcode 26.6'
+          df -h / | tail -1
+      - name: Resolve pinned native dependencies once
+        script: |
+          set -e
+          # .github/scripts expect RUNNER_TEMP; give them one that survives the
+          # whole build. The script refuses to run on a dirty tree and then
+          # verifies that nothing but the CocoaPods-generated project and the
+          # resolved package file changed.
+          mkdir -p "$HOME/rt"
+          echo "RUNNER_TEMP=$HOME/rt" >> "$CM_ENV"
+          export RUNNER_TEMP="$HOME/rt"
+          cd "$CM_BUILD_DIR"
+          bash .github/scripts/install_ios_dependencies.sh
+      - name: Build number, read live from App Store Connect
+        script: |
+          set -e
+          latest="$(app-store-connect get-latest-testflight-build-number "$APP_APPLE_ID" --platform IOS 2>/dev/null || echo 0)"
+          [ -n "$latest" ] || latest=0
+          n=$latest
+          floor=$((BUILD_NUMBER_FLOOR - 1))
+          # An `if`, not `[ ] && …`: under `set -e` a false AND-list is itself the
+          # failing command and would end the build the day the floor is met.
+          if [ "$floor" -gt "$n" ]; then n=$floor; fi
+          n=$((n + 1))
+          url="https://github.com/kitafrica33/kit-pay-ios-source/releases/tag/v${MARKETING_VERSION}-build${n}"
+          echo "build number: $n (App Store Connect's latest was $latest, floor $BUILD_NUMBER_FLOOR)"
+          echo "BUILD_NUMBER=$n" >> "$CM_ENV"
+          echo "KIT_CORRESPONDING_SOURCE_URL=$url" >> "$CM_ENV"
+      - name: AGPL corresponding source must already be public
+        script: |
+          set -e
+          # Anonymous on purpose: the binary tells its user this URL and the user
+          # has no credentials. A private or missing release is a licence defect,
+          # so it stops the build here rather than after twenty minutes of
+          # compiling. If this fails, publish the tag and re-run:
+          #   v${MARKETING_VERSION}-build${BUILD_NUMBER} in kitafrica33/kit-pay-ios-source
+          echo "corresponding source: $KIT_CORRESPONDING_SOURCE_URL"
+          curl --disable --fail --silent --show-error --location \
+            --proto '=https' --proto-redir '=https' \
+            --connect-timeout 10 --max-time 60 --retry 2 \
+            --header 'Authorization:' --header 'Cookie:' \
+            --output /dev/null "$KIT_CORRESPONDING_SOURCE_URL"
+      - name: Code signing for all three signed bundles
+        script: |
+          set -e
+          cd "$CM_BUILD_DIR"
+          keychain initialize
+          # --strict-match-identifier matters twice over: the bundle-id filter is
+          # a PREFIX match, so without it "africa.kit.pay.ios" also drags in
+          # .share and .broadcast and --create mints junk profiles for them.
+          for bundle in "$IOS_BUNDLE_ID" "$IOS_SHARE_BUNDLE_ID" "$IOS_BROADCAST_BUNDLE_ID"; do
+            app-store-connect fetch-signing-files "$bundle" \
+              --type IOS_APP_STORE --strict-match-identifier --create
+          done
+          keychain add-certificates
+          # Only the app project: the default pattern would also rewrite
+          # Pods.xcodeproj, which signs nothing.
+          xcode-project use-profiles --project KitPay.xcodeproj
+          # The project's Release configurations name the profile through
+          # $(KITPAY_PROFILE_UUID) and friends, which only the GitHub lane sets.
+          # use-profiles must have replaced every one of them with a real profile;
+          # if it did not, the archive would silently try to sign with an empty
+          # specifier.
+          if grep -qF 'PROVISIONING_PROFILE_SPECIFIER = "$(KITPAY_' KitPay.xcodeproj/project.pbxproj; then
+            echo 'use-profiles did not configure every signed target' >&2
+            exit 1
+          fi
+          /usr/bin/plutil -replace manageAppVersionAndBuildNumber -bool NO "$HOME/export_options.plist"
+          /usr/bin/plutil -p "$HOME/export_options.plist"
+      - name: Build the signed IPA
+        script: |
+          set -e
+          export RUNNER_TEMP="$HOME/rt"
+          cd "$CM_BUILD_DIR"
+          # The same xcodebuild settings the GitHub archive lane passes. The
+          # version and build number are command-line settings, so the checked-in
+          # project values never decide what ships, and the corresponding-source
+          # URL is compiled into Info.plist as KitCorrespondingSourceURL.
+          xcode-project build-ipa \
+            --workspace KitPay.xcworkspace \
+            --scheme KitPay \
+            --archive-flags="-destination generic/platform=iOS -clonedSourcePackagesDirPath $RUNNER_TEMP/KitPayPackages -disableAutomaticPackageResolution -onlyUsePackageVersionsFromResolvedFile" \
+            --archive-xcargs="COMPILER_INDEX_STORE_ENABLE=NO SWIFT_ENABLE_EXPLICIT_MODULES=NO KITPAY_APPLE_TEAM_ID=$APPLE_TEAM_ID MARKETING_VERSION=$MARKETING_VERSION CURRENT_PROJECT_VERSION=$BUILD_NUMBER KIT_CORRESPONDING_SOURCE_URL=$KIT_CORRESPONDING_SOURCE_URL"
+      - name: Prove the IPA before it is published
+        script: |
+          set -e
+          cd "$CM_BUILD_DIR"
+          ipa="$(find build/ios/ipa -maxdepth 1 -name '*.ipa' -print -quit)"
+          test -s "$ipa"
+          root="$HOME/ipa-check"; rm -rf "$root"; mkdir -p "$root"
+          ditto -x -k "$ipa" "$root"
+          app="$(find "$root/Payload" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          test -d "$app"
+          read_key() { /usr/bin/plutil -extract "$2" raw -o - "$1/Info.plist"; }
+          test "$(read_key "$app" CFBundleIdentifier)" = "$IOS_BUNDLE_ID"
+          test "$(read_key "$app" CFBundleShortVersionString)" = "$MARKETING_VERSION"
+          test "$(read_key "$app" CFBundleVersion)" = "$BUILD_NUMBER"
+          # The offer of source is a licence obligation, not a nicety: a build
+          # that ships an unresolved $(KIT_CORRESPONDING_SOURCE_URL) tells its
+          # users nothing.
+          test "$(read_key "$app" KitCorrespondingSourceURL)" = "$KIT_CORRESPONDING_SOURCE_URL"
+          test -d "$app/PlugIns"
+          appex_count="$(find "$app/PlugIns" -maxdepth 1 -type d -name '*.appex' | wc -l | tr -d ' ')"
+          test "$appex_count" = '2'
+          for bundle in "$app" "$app"/PlugIns/*.appex; do
+            id="$(read_key "$bundle" CFBundleIdentifier)"
+            case "$id" in
+              "$IOS_BUNDLE_ID"|"$IOS_SHARE_BUNDLE_ID"|"$IOS_BROADCAST_BUNDLE_ID") ;;
+              *) echo "unexpected signed bundle $id" >&2; exit 1 ;;
+            esac
+            # Every one of the three shares the app group; the share extension
+            # reaching it under a background-task assertion is the whole point of
+            # the 0xdead10cc fix.
+            ent="$(codesign -d --entitlements :- --xml "$bundle" 2>/dev/null \
+              || codesign -d --entitlements - "$bundle" 2>/dev/null || true)"
+            printf '%s' "$ent" | grep -q "$IOS_APP_GROUP" || {
+              echo "$id does not carry $IOS_APP_GROUP" >&2; exit 1; }
+            # A diagnostic, not a gate: Apple re-verifies the signature on upload
+            # and an extracted payload is not the shape codesign likes best. It is
+            # not worth throwing a good archive away over.
+            codesign --verify --strict "$bundle" || echo "WARNING: codesign --verify complained about $id"
+            echo "signed ok: $id"
+          done
+    artifacts:
+      - build/ios/ipa/*.ipa
+      - build/ios/xcarchive/*.xcarchive/dSYMs/**/*
+    publishing:
+      app_store_connect:
+        api_key: $APP_STORE_CONNECT_PRIVATE_KEY
+        key_id: $APP_STORE_CONNECT_KEY_IDENTIFIER
+        issuer_id: $APP_STORE_CONNECT_ISSUER_ID
+        # The upload is the release. `submit_to_testflight` would hold the Mac
+        # open for the whole of Apple's processing — borrowed minutes spent
+        # watching a progress bar — and TestFlight beta review is only ever
+        # reached through an EXTERNAL group, which this lane deliberately never
+        # names. Internal testers have access to every build as soon as it
+        # finishes processing, and processing is watched from Linux for free.
+        submit_to_testflight: false
+        # Owner rule: TestFlight only. An App Store submission is a separate,
+        # deliberate act and 1.0.17 is already in review.
+        submit_to_app_store: false
+      email:
+        recipients:
+          - info@kit.africa
+        notify:
+          success: true
+          failure: true
+
+  # ---------------------------------------------------------------------------
+  # ui-verify — one short, unattended verification of the chat-scroll fix
+  # (docs/status/ios-chat-scroll-2026-09-21.md). It archives nothing, publishes nothing and holds nothing open:
+  # it prepares the machine, builds for testing, runs the chat suites three
+  # times in the order that produced the failure, and exits. Written to spend
+  # the fewest borrowed Mac minutes that can settle the question — the budget is
+  # free minutes only, billing stays OFF, so `max_build_duration` is deliberately
+  # far below the 60-minute ceiling and will end the build rather than overrun.
+  #
+  # Unlike mac-session-60 the preparation runs in the FOREGROUND: nobody is
+  # driving this machine, so a failed `pod install` must fail the build loudly
+  # instead of leaving a green session with an empty log.
+  ui-verify:
+    name: Kit Pay chat-scroll verification (no session, no publish)
+    instance_type: mac_mini_m2
+    max_build_duration: 30
+    cache:
+      cache_paths:
+        - ~/Library/Caches/CocoaPods
+        - ~/Library/Caches/org.signal.libsignal
+        - ~/Library/Caches/org.swift.swiftpm
+        - $HOME/rt/KitPayPackages
+    environment:
+      xcode: 26.6
+      cocoapods: default
+    scripts:
+      - name: Machine facts
+        script: |
+          set -e
+          echo "host      : $(hostname)"
+          echo "xcode     : $(xcodebuild -version | tr '\n' ' ')"
+          git -C "$CM_BUILD_DIR" rev-parse HEAD
+          df -h / | tail -1
+      - name: Prepare dependencies and simulator
+        script: |
+          set -e
+          mkdir -p "$HOME/rt"
+          export RUNNER_TEMP="$HOME/rt"
+          cd "$CM_BUILD_DIR"
+          bash .github/scripts/install_ios_dependencies.sh
+          DEVICE_ID="$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin)["devices"]; print(next(x["udid"] for v in d.values() for x in v if x.get("isAvailable") and x["name"].startswith("iPhone")))')"
+          echo "KITPAY_TEST_DEVICE_ID=$DEVICE_ID" > "$HOME/device.env"
+          xcrun simctl boot "$DEVICE_ID" || true
+          xcrun simctl bootstatus "$DEVICE_ID" -b || true
+          xcrun simctl privacy "$DEVICE_ID" grant contacts africa.kit.pay.ios || true
+      - name: Build for testing
+        script: |
+          set -e
+          export RUNNER_TEMP="$HOME/rt"
+          . "$HOME/device.env"
+          export KITPAY_TEST_DEVICE_ID
+          cd "$CM_BUILD_DIR"
+          bash .github/scripts/ios_native_build.sh build
+      - name: Chat scroll, three times in the failing order
+        script: |
+          export RUNNER_TEMP="$HOME/rt"
+          . "$HOME/device.env"
+          export KITPAY_TEST_DEVICE_ID
+          cd "$CM_BUILD_DIR"
+          set +e
+          bash .github/scripts/ios_native_build.sh chat-scroll
+          status=$?
+          set -e
+          # Result bundles are directories and are only worth carrying home when
+          # something failed; the geometry and budget prints are in this log either
+          # way. Packed here rather than in a later step because a later step does
+          # not run after a failure, which is exactly when the bundle is wanted.
+          if [ "$status" -ne 0 ]; then
+            cd "$HOME/rt"
+            tar -czf "$HOME/rt/chat-scroll-xcresults.tgz" KitPay-chat-scroll-*.xcresult || true
+          fi
+          exit "$status"
+    artifacts:
+      - $HOME/rt/chat-scroll-xcresults.tgz
+      - $HOME/rt/KitPay-chat-scroll-pan.log
+
+  # ---------------------------------------------------------------------------
+  # mac-session-60 — NOT a release lane. It archives nothing and publishes
+  # nothing. It holds one `mac_mini_m2` open so a scripted VNC/SSH client can
+  # drive Xcode, the Simulator and `xctrace` on a real Apple machine, because
+  # this project is CocoaPods + SPM + SwiftUI and none of it can be built,
+  # simulated or profiled on Linux.
+  #
+  # Remote access is NOT configurable from this file — there is no codemagic.yaml
+  # key for it. It is the per-build `sshAccessEnabled: true` field on
+  # `POST /builds` (see ~/kstream-ops/store/xcode-cloud-session-plan.md). Started
+  # without it, this workflow just prepares the machine and idles until the cap.
+  #
+  # 60 minutes is the FREE-plan ceiling for a single build (metered allows 120).
+  # Codemagic billing is deliberately OFF, so this must stay at 60 and the work
+  # is split across sessions rather than lengthened.
+  #
+  # The expensive preparation (pod install, SPM resolution, build-for-testing,
+  # simulator boot) runs in the BACKGROUND from the second script step, so the
+  # machine is reachable over SSH about two minutes in instead of twenty-five,
+  # and a failed preparation cannot end the build and take the session with it.
+  mac-session-60:
+    name: Kit Pay Mac session (VNC/SSH, 60 min)
+    instance_type: mac_mini_m2
+    max_build_duration: 60
+    # Only verified downloads are cached: the Podfile rehashes the pinned
+    # libsignal FFI archive before use, and the SPM clones are re-checked against
+    # the reviewed Package.resolved on every run. Never cache built products.
+    cache:
+      cache_paths:
+        - ~/Library/Caches/CocoaPods
+        - ~/Library/Caches/org.signal.libsignal
+        - ~/Library/Caches/org.swift.swiftpm
+        - $HOME/rt/KitPayPackages
+    environment:
+      xcode: 26.6
+      cocoapods: default
+      vars:
+        # 52 minutes, eight short of the cap, so the hold ends before the
+        # machine is killed and the "session over" banner actually prints.
+        SESSION_HOLD_SECONDS: 3120
+    scripts:
+      - name: Machine facts
+        script: |
+          set -e
+          echo "host      : $(hostname)"
+          echo "xcode     : $(xcodebuild -version | tr '\n' ' ')"
+          echo "pod       : $(pod --version 2>/dev/null || echo none)"
+          echo "checkout  : $CM_BUILD_DIR"
+          git -C "$CM_BUILD_DIR" rev-parse HEAD
+          df -h / | tail -1
+          xcrun simctl list devices available | grep -c . || true
+      - name: Start preparation in the background
+        script: |
+          set -e
+          # RUNNER_TEMP is what .github/scripts expect; give them one.
+          mkdir -p "$HOME/rt"
+          cat > "$HOME/prep.sh" <<'PREP'
+          #!/bin/bash
+          set -x
+          export RUNNER_TEMP="$HOME/rt"
+          cd "$CM_BUILD_DIR"
+          echo "=== pod install ==="
+          bash .github/scripts/install_ios_dependencies.sh || echo "PREP_FAIL deps"
+          echo "=== simulator ==="
+          DEVICE_ID="$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin)["devices"]; print(next(x["udid"] for v in d.values() for x in v if x.get("isAvailable") and x["name"].startswith("iPhone")))')"
+          echo "KITPAY_TEST_DEVICE_ID=$DEVICE_ID" > "$HOME/device.env"
+          xcrun simctl boot "$DEVICE_ID" || true
+          xcrun simctl bootstatus "$DEVICE_ID" -b || true
+          xcrun simctl privacy "$DEVICE_ID" grant contacts africa.kit.pay.ios || true
+          export KITPAY_TEST_DEVICE_ID="$DEVICE_ID"
+          echo "=== build-for-testing ==="
+          bash .github/scripts/ios_native_build.sh build || echo "PREP_FAIL build"
+          echo "=== PREP_DONE ==="
+          PREP
+          chmod +x "$HOME/prep.sh"
+          nohup "$HOME/prep.sh" > "$HOME/prep.log" 2>&1 &
+          echo "preparation started; tail -f ~/prep.log"
+          sleep 5
+          tail -5 "$HOME/prep.log" || true
+      - name: Hold the machine open
+        script: |
+          set -e
+          echo "=============================================================="
+          echo " KIT PAY SESSION OPEN — ${SESSION_HOLD_SECONDS}s"
+          echo " checkout   : $CM_BUILD_DIR"
+          echo " prep log   : \$HOME/prep.log   (waits for PREP_DONE)"
+          echo " device id  : \$HOME/device.env"
+          echo " workspace  : $CM_BUILD_DIR/KitPay.xcworkspace"
+          echo "=============================================================="
+          sleep "$SESSION_HOLD_SECONDS"
+          echo "session hold finished"

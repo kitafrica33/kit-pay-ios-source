@@ -1,0 +1,13 @@
+Chat scrolling is fixed. On a long conversation the timeline used to ignore a
+finger completely - the drag did nothing at all - because every render folded
+the whole message history on the main thread. The fold is now computed once per
+state change, so scrolling, flicking and dragging in a 2,000-message thread
+answer immediately. Please open your longest chats, tap "Jump to latest
+message", and drag straight away.
+
+Sharing is steadier. Sharing a photo, video, file or link into Kit Pay from
+another app keeps a background assertion while it writes to the shared
+container, so iOS no longer ends the share the moment the sheet is put aside.
+Please share from Photos, Files and Safari, and try switching away mid-share.
+
+Everything else should be unchanged. Please report anything that is not.

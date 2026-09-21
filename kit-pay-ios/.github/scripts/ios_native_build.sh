@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-mode="${1:?Select build, test, review-ipad, marketing-iphone, or marketing-ipad}"
+mode="${1:?Select build, test, chat-scroll, review-ipad, marketing-iphone, or marketing-ipad}"
 : "${KITPAY_TEST_DEVICE_ID:?A prepared Simulator is required}"
 : "${RUNNER_TEMP:?}"
 common=(
@@ -65,6 +65,35 @@ case "$mode" in
       -skip-testing:KitPayUITests/AppStoreScreenshotUITests/testChatAttachmentMenuOpensPhotosAndFilesAfterKeyboardDismissal \
       -skip-testing:KitPayUITests/AppStoreScreenshotUITests/testLongHistoryVerticalBubbleDragsPreserveReadingPosition \
       test-without-building
+    ;;
+  chat-scroll)
+    # Verification lane for the chat-scroll dead stop; see
+    # docs/status/ios-chat-scroll-2026-09-21.md. It runs the chat suites in the
+    # order that produced the failure — attachment menu, camera pull, then the long-history drag,
+    # which is how XCTest orders them alphabetically inside the class — and it runs that order
+    # three times, because the freeze was intermittent and a single green pass proves nothing.
+    # Nothing is archived or published; this exists to spend the fewest possible borrowed Mac
+    # minutes on a decision.
+    select_test_run prepare
+    xcrun simctl spawn "$KITPAY_TEST_DEVICE_ID" log stream \
+      --style compact --level debug \
+      --predicate 'eventMessage CONTAINS "[KitPayCameraPull]"' \
+      > "$RUNNER_TEMP/KitPay-chat-scroll-pan.log" 2>&1 &
+    camera_log_pid=$!
+    trap 'kill "$camera_log_pid" 2>/dev/null || true' EXIT
+    for attempt in 1 2 3; do
+      echo "=== chat-scroll attempt $attempt of 3 ==="
+      xcodebuild "${test_common[@]}" \
+        -resultBundlePath "$RUNNER_TEMP/KitPay-chat-scroll-$attempt.xcresult" \
+        -only-testing:KitPayTests/ConversationProjectionCacheTests \
+        -only-testing:KitPayTests/ConversationProjectionPerformanceTests \
+        -only-testing:KitPayTests/ConversationNativeOpeningTests \
+        -only-testing:KitPayTests/SwipeToReplyNativeGestureTests \
+        -only-testing:KitPayUITests/AppStoreScreenshotUITests/testChatAttachmentMenuOpensPhotosAndFilesAfterKeyboardDismissal \
+        -only-testing:KitPayUITests/AppStoreScreenshotUITests/testChatBottomPullOpensCameraOnlyAfterADeliberateRelease \
+        -only-testing:KitPayUITests/AppStoreScreenshotUITests/testLongHistoryVerticalBubbleDragsPreserveReadingPosition \
+        test-without-building
+    done
     ;;
   review-ipad)
     : "${KITPAY_REVIEW_IPAD_DEVICE_ID:?A prepared review iPad is required}"

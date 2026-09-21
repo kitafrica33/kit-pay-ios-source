@@ -58,6 +58,12 @@ final class ShareViewController: UIViewController {
 
     override func viewDidLoad() {
         super.viewDidLoad()
+        // This process holds the app-group flock too, and it is suspended far more readily than
+        // the app: the sheet is dismissed the moment Send is tapped, while the send is still
+        // being journalled inside MessagingProcessBroker.withLock. Extensions cannot take a
+        // UIKit background task, so they assert through ProcessInfo instead. Installed before
+        // anything that can reach the broker.
+        SharedLockActivity.installExpiringActivityProvider()
         buildInterface()
     }
 

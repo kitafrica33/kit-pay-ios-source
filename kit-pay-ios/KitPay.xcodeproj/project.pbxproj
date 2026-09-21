@@ -244,6 +244,7 @@
 		E5252FDA1A722941B5477909 /* MessagingBiometricCredential.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9ED74605807B72419E6C265A /* MessagingBiometricCredential.swift */; };
 		C499FAAC49CD42E69A52F198 /* MessagingBiometricCredential.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9ED74605807B72419E6C265A /* MessagingBiometricCredential.swift */; };
 		A6642F8CFFC5CDDA9D2CD6A9 /* MessagingProcessBroker.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10542DD8877DA5FB1A9858B6 /* MessagingProcessBroker.swift */; };
+		C0DE000000000000000000A1 /* ConversationProjectionCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE000000000000000000F1 /* ConversationProjectionCache.swift */; };
 		F16B0C408FF7C86E773747C4 /* MessagingProcessBroker.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10542DD8877DA5FB1A9858B6 /* MessagingProcessBroker.swift */; };
 		A6F40A67D7B42D4933623A32 /* MessagingSharedModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 71EE11608BB24BEF082A75BA /* MessagingSharedModels.swift */; };
 		AFDEDED63FB5B915CB30C659 /* MessagingSharedModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 71EE11608BB24BEF082A75BA /* MessagingSharedModels.swift */; };
@@ -261,6 +262,8 @@
 		890168B283D23BB67047CC99 /* AdaptiveVideoPreparation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 16CFB9684513A3B1240D789A /* AdaptiveVideoPreparation.swift */; };
 		6F3D3A9F0A88ACA1C7EE7CD2 /* ShareSuggestionsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 71D3782C99F11749658F4E71 /* ShareSuggestionsTests.swift */; };
 		47F69104DF8AF078C02DD5D2 /* MessagingProcessBrokerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6DBDB2B3F28B99D1432B5848 /* MessagingProcessBrokerTests.swift */; };
+		C0DE000000000000000000B1 /* ConversationProjectionCacheTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE000000000000000000F2 /* ConversationProjectionCacheTests.swift */; };
+		C0DE000000000000000000B2 /* ConversationProjectionPerformanceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE000000000000000000F3 /* ConversationProjectionPerformanceTests.swift */; };
 		6051305772B24022BE1F7C44 /* DirectShareSendRecoveryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A65E3FE59D02145CE648EBF5 /* DirectShareSendRecoveryTests.swift */; };
 		833ACF5B3560772E1CB86449 /* KitColor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0BE27110F3C2B36A2D964FE8 /* KitColor.swift */; };
 		0165E938259112B713CE67A7 /* KitColor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0BE27110F3C2B36A2D964FE8 /* KitColor.swift */; };
@@ -548,12 +551,15 @@
 		8A9F3B6FB3AF594CC62AF8C7 /* MessagingClientIdentity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/MessagingClientIdentity.swift; sourceTree = "<group>"; };
 		9ED74605807B72419E6C265A /* MessagingBiometricCredential.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/MessagingBiometricCredential.swift; sourceTree = "<group>"; };
 		10542DD8877DA5FB1A9858B6 /* MessagingProcessBroker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/MessagingProcessBroker.swift; sourceTree = "<group>"; };
+		C0DE000000000000000000F1 /* ConversationProjectionCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/ConversationProjectionCache.swift; sourceTree = "<group>"; };
 		71EE11608BB24BEF082A75BA /* MessagingSharedModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/MessagingSharedModels.swift; sourceTree = "<group>"; };
 		28B31546D351745B24CCF6C1 /* SecureMessagingSendValidation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/SecureMessagingSendValidation.swift; sourceTree = "<group>"; };
 		0A21568F49A7430B035BEADC /* ShareSuggestions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/ShareSuggestions.swift; sourceTree = "<group>"; };
 		16CFB9684513A3B1240D789A /* AdaptiveVideoPreparation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Features/Messages/AdaptiveVideoPreparation.swift; sourceTree = "<group>"; };
 		71D3782C99F11749658F4E71 /* ShareSuggestionsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/ShareSuggestionsTests.swift; sourceTree = "<group>"; };
 		6DBDB2B3F28B99D1432B5848 /* MessagingProcessBrokerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/MessagingProcessBrokerTests.swift; sourceTree = "<group>"; };
+		C0DE000000000000000000F2 /* ConversationProjectionCacheTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/ConversationProjectionCacheTests.swift; sourceTree = "<group>"; };
+		C0DE000000000000000000F3 /* ConversationProjectionPerformanceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/ConversationProjectionPerformanceTests.swift; sourceTree = "<group>"; };
 		A65E3FE59D02145CE648EBF5 /* DirectShareSendRecoveryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPayTests/DirectShareSendRecoveryTests.swift; sourceTree = "<group>"; };
 		0BE27110F3C2B36A2D964FE8 /* KitColor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Design/KitColor.swift; sourceTree = "<group>"; };
 		D187394E7EE6335A873C2382 /* ChatMediaTempFiles.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPay/Core/ChatMediaTempFiles.swift; sourceTree = "<group>"; };
@@ -602,12 +608,15 @@
 				0BE27110F3C2B36A2D964FE8 /* KitColor.swift */,
 				A65E3FE59D02145CE648EBF5 /* DirectShareSendRecoveryTests.swift */,
 				6DBDB2B3F28B99D1432B5848 /* MessagingProcessBrokerTests.swift */,
+				C0DE000000000000000000F2 /* ConversationProjectionCacheTests.swift */,
+				C0DE000000000000000000F3 /* ConversationProjectionPerformanceTests.swift */,
 				71D3782C99F11749658F4E71 /* ShareSuggestionsTests.swift */,
 				16CFB9684513A3B1240D789A /* AdaptiveVideoPreparation.swift */,
 				0A21568F49A7430B035BEADC /* ShareSuggestions.swift */,
 				28B31546D351745B24CCF6C1 /* SecureMessagingSendValidation.swift */,
 				71EE11608BB24BEF082A75BA /* MessagingSharedModels.swift */,
 				10542DD8877DA5FB1A9858B6 /* MessagingProcessBroker.swift */,
+				C0DE000000000000000000F1 /* ConversationProjectionCache.swift */,
 				9ED74605807B72419E6C265A /* MessagingBiometricCredential.swift */,
 				8A9F3B6FB3AF594CC62AF8C7 /* MessagingClientIdentity.swift */,
 				E0056EEAFA63D2CF2CD52A46 /* MessagingAPIEndpoint.swift */,
@@ -938,6 +947,7 @@
 				252401BEB513FA4B8B81B22A /* SecureMessagingSendValidation.swift in Sources */,
 				A6F40A67D7B42D4933623A32 /* MessagingSharedModels.swift in Sources */,
 				A6642F8CFFC5CDDA9D2CD6A9 /* MessagingProcessBroker.swift in Sources */,
+				C0DE000000000000000000A1 /* ConversationProjectionCache.swift in Sources */,
 				E5252FDA1A722941B5477909 /* MessagingBiometricCredential.swift in Sources */,
 				DA5BB1CD73394F98A389AEDA /* MessagingClientIdentity.swift in Sources */,
 				537B3DE518ABDEC4604BAC36 /* MessagingAPIEndpoint.swift in Sources */,
@@ -1089,6 +1099,8 @@
 				44D5307E425F3373012E0F71 /* AdaptiveVideoPreparationTests.swift in Sources */,
 				6051305772B24022BE1F7C44 /* DirectShareSendRecoveryTests.swift in Sources */,
 				47F69104DF8AF078C02DD5D2 /* MessagingProcessBrokerTests.swift in Sources */,
+				C0DE000000000000000000B1 /* ConversationProjectionCacheTests.swift in Sources */,
+				C0DE000000000000000000B2 /* ConversationProjectionPerformanceTests.swift in Sources */,
 				6F3D3A9F0A88ACA1C7EE7CD2 /* ShareSuggestionsTests.swift in Sources */,
 				ACA700000000000000000006 /* CallSchedulingTests.swift in Sources */,
                 ACSHRT00001 /* CallScreenSharingTests.swift in Sources */,

@@ -1183,7 +1183,16 @@ enum OutboxContextRevalidator {
 
 @MainActor
 final class AppModel: ObservableObject {
-    @Published private(set) var state: PersistedState = .empty
+    @Published private(set) var state: PersistedState = .empty {
+        didSet { stateGeneration &+= 1 }
+    }
+    /// Counter bumped by every publish of `state`, whatever route published it.
+    ///
+    /// Screens that fold the whole projection — the conversation timeline folds every message the
+    /// account holds — key their memo on this, so the fold costs once per publish instead of once
+    /// per read. Deliberately not `@Published`: it moves in lockstep with `state`, which already
+    /// drives the render, and a second publisher would only double the invalidations.
+    private(set) var stateGeneration: UInt64 = 0
     /// Revision of the projection currently published in `state`. Every publish must go through
     /// `publishLatestState()`, which drops projections older than this — a snapshot captured
     /// before a suspension point must never roll back a newer publish (that was the root cause

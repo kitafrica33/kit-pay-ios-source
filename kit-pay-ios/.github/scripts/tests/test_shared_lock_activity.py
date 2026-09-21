@@ -25,6 +25,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[3]
 BROKER = ROOT / "KitPay/Core/MessagingProcessBroker.swift"
 APP = ROOT / "KitPay/App/KitPayApp.swift"
 SOURCE_ROOT = ROOT / "KitPay"
+SHARE = ROOT / "KitPayShare/ShareViewController.swift"
 
 
 class SharedLockActivityContractTests(unittest.TestCase):
@@ -89,16 +90,86 @@ class SharedLockActivityContractTests(unittest.TestCase):
             "the app's assertion is a UIKit background task, begun and ended",
         )
 
-    def test_only_the_app_installs_a_provider(self) -> None:
-        installers = [
+    def test_each_target_installs_exactly_one_provider_of_its_own_kind(self) -> None:
+        """The app's UIKit provider and the extension's ProcessInfo provider, and no third.
+
+        `SharedLockActivity.install` replaces the provider process-wide, so a second installer
+        inside one target would silently retire the first. Two targets are two processes.
+        """
+        installers = sorted(
             path
-            for path in SOURCE_ROOT.rglob("*.swift")
+            for path in list(SOURCE_ROOT.rglob("*.swift")) + [SHARE]
             if "SharedLockActivity.install" in path.read_text(encoding="utf-8")
-        ]
+        )
         self.assertEqual(
             installers,
-            [APP],
-            "exactly one target may own the assertion provider",
+            sorted([APP, SHARE]),
+            "one installer in the app, one in the share extension, and nowhere else",
+        )
+        self.assertIn(
+            "static func installExpiringActivityProvider",
+            self.broker,
+            "the extension-safe provider ships beside the lock, not in the extension",
+        )
+
+    def test_the_share_extension_installs_an_extension_safe_assertion(self) -> None:
+        """KitPayShare compiles the broker and takes the same flock, so it needs the same cover.
+
+        The extension is suspended far more aggressively than the app: the share sheet is torn
+        down the moment the customer taps Send, and `DirectShareSendCoordinator.enqueue` journals
+        the message inside `withLock` on the way out. With the no-op default provider that window
+        is exactly the 0xdead10cc that killed 1.0.17 (102) — in the one process that cannot call
+        `UIApplication.shared.beginBackgroundTask` at all.
+        """
+        share = SHARE.read_text(encoding="utf-8")
+        did_load = share.split("override func viewDidLoad() {", 1)
+        self.assertEqual(len(did_load), 2, "ShareViewController.viewDidLoad is missing")
+        did_load = did_load[1]
+        install = did_load.find("SharedLockActivity.installExpiringActivityProvider()")
+        self.assertNotEqual(
+            install, -1, "the share extension must install an assertion provider at load"
+        )
+        self.assertLess(
+            install,
+            did_load.find("buildInterface()"),
+            "the assertion must be installed before any work that can reach the broker",
+        )
+        self.assertNotIn(
+            "UIApplication.shared",
+            share,
+            "APPLICATION_EXTENSION_API_ONLY removes UIApplication.shared",
+        )
+
+    def test_the_extension_provider_holds_its_activity_for_the_whole_locked_section(self) -> None:
+        """`performExpiringActivity` asserts only while its block runs, so the block must wait.
+
+        A provider that returned as soon as the activity started would assert nothing: the
+        block would finish before `flock(LOCK_EX)` was even taken.
+        """
+        body = self.broker.split("static func installExpiringActivityProvider", 1)
+        self.assertEqual(len(body), 2, "the extension-safe provider is missing")
+        body = body[1]
+        self.assertIn(
+            "performExpiringActivity", body, "extensions assert through ProcessInfo, not UIKit"
+        )
+        wait = body.find("release.wait()")
+        signal = body.find("return { release.signal() }")
+        self.assertNotEqual(wait, -1, "the activity block must outlive the locked section")
+        self.assertNotEqual(signal, -1, "ending the assertion must release the activity block")
+        self.assertLess(wait, signal, "the block waits; the returned handler releases it")
+
+    def test_a_refused_activity_never_blocks_the_locked_section(self) -> None:
+        """An expired or refused assertion must not stall the caller or pin a worker thread."""
+        body = self.broker.split("static func installExpiringActivityProvider", 1)[1]
+        self.assertIn(
+            "guard !expired else { return }",
+            body,
+            "an expired activity returns instead of waiting to be released",
+        )
+        self.assertIn(
+            "granted.wait(timeout:",
+            body,
+            "a block that is never scheduled must not hold the caller for ever",
         )
 
 

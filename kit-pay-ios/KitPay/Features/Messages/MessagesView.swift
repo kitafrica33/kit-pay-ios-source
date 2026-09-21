@@ -1623,6 +1623,12 @@ struct ConversationView: View {
     @State private var groupPaymentRequestComposer: GroupPaymentRequestComposerTarget?
     @State private var groupPaymentRequestContribution: GroupPaymentRequestContributionTarget?
     @State private var groupPaymentRequestCancellation: GroupPaymentRequestCancellationTarget?
+    /// Memo for `correctedProjection`. The screen reads the fold from about fifteen places in a
+    /// single `body`, and the fold walks every message the account holds; recomputing it per read
+    /// is what starved touch handling on long threads
+    /// (docs/status/ios-chat-scroll-2026-09-21.md).
+    @State private var timelineProjectionCache =
+        ConversationProjectionCache<(messages: [LocalMessage], editedAt: [UUID: Date])>()
     @StateObject private var voiceRecorder: VoiceNoteRecorder
     private let stagedVoicePlayer = VoiceNotePlayer.shared
     @FocusState private var isComposerFocused: Bool
@@ -1656,11 +1662,38 @@ struct ConversationView: View {
     /// preview all read from this, so none of them can go on showing wording its author has
     /// already withdrawn. The correction rows themselves are dropped — they are instructions
     /// about a message, never messages.
+    ///
+    /// Folded once per published state generation rather than once per read. The fold is O(every
+    /// message the account holds) — filter, apply corrections, sort, copy — and the screen reads
+    /// it from about fifteen places in one `body`, including inside every visible bubble's
+    /// context menu. On the 2 000-message long-history fixture that made the main thread too slow
+    /// to service a drag: the first pan sample arrived 644 ms after touch-down against 106 ms on
+    /// a short thread, and under load the whole drag elapsed before either pan recognizer reached
+    /// its slop, so the timeline moved exactly 0.0 points; see
+    /// `docs/status/ios-chat-scroll-2026-09-21.md`. Handing back the *same*
+    /// array also keeps `onChange(of: messages)` comparisons O(1), because `Array ==`
+    /// short-circuits when both sides share one buffer.
     private var correctedProjection: (messages: [LocalMessage], editedAt: [UUID: Date]) {
         // A Send Later message is shown in its own section under the timeline, not inline: it has
         // not happened yet, and a bubble sitting among sent messages would read as if it had.
         let waiting = scheduledMessageIDs
         let conversationID = currentConversation.id
+        return timelineProjectionCache.projection(
+            for: ConversationProjectionKey(
+                stateGeneration: model.stateGeneration,
+                conversationID: conversationID,
+                scheduledMessageIDs: waiting
+            )
+        ) {
+            correctedProjectionFold(conversationID: conversationID, waiting: waiting)
+        }
+    }
+
+    /// The fold itself, unchanged; `correctedProjection` decides when it runs.
+    private func correctedProjectionFold(
+        conversationID: String,
+        waiting: Set<UUID>
+    ) -> (messages: [LocalMessage], editedAt: [UUID: Date]) {
         let visible = model.state.messages.filter {
             $0.conversationId == conversationID && !waiting.contains($0.id)
         }

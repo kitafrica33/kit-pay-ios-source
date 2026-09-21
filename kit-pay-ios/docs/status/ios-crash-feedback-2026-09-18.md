@@ -244,3 +244,20 @@ prove is pinned statically instead, by the defer order in the source-contract te
 published GitHub release's tag is permanently burned, the corrected source could not reuse
 `v1.0.17-build103`, so the build moved to **104**. That is the one extra macOS archive dispatch
 on this task; the TestFlight upload lane was still dispatched exactly once.
+
+### Evidence
+
+| Step | Identifier | Result |
+| --- | --- | --- |
+| App commit on `main` | `bfc514ce56019c13d8c0503842e5424de9a50b05` | pushed, fast-forward from `869afd8b` |
+| Corresponding source | `kitafrica33/kit-pay-ios-source` tag `v1.0.17-build104`, release 391820449 | draft → assets → published; anonymous page 200; tar.gz 7 136 436 B, SHA-256 `1d18e49e…`; `kit-pay-ios/` tree `d428d234…` equals the app commit's tree |
+| Signed archive run | `ios-app-store-archive.yml` run **35401810294** (`app-store`, `update_screenshots=false`) | success (run 35398413405 for build 103 had failed on the native tests) |
+| TestFlight upload run | `ios-testflight-upload.yml` run **35421767063** | success, dispatched once |
+| TestFlight build | 1.0.17 (104), ASC build `a5f77f99-c580-4099-83cc-25c27ea9341d` | `VALID`, `IN_BETA_TESTING` internal and external |
+| "What to test" | `betaBuildLocalizations/83952ec8-5559-4f63-8951-13c7db100919` (en-US) | ASCII notes describing the background-kill fix and what to exercise |
+| External distribution | group `Externals` `6ab1c5db-f1b8-477c-88bc-dd7883548fc4` (public link `1kpYk3Dh`) | build 104 listed in the group; `betaAppReviewSubmissions` created |
+| App Store version | `fd84e0cc-f53f-4356-bc97-ae6cd22150d5` (1.0.17) | build 104 attached, `releaseType = AFTER_APPROVAL` |
+| Review submission | **194badc0-4f1b-4731-84b9-a8cc50950aa3** | `WAITING_FOR_REVIEW`, submitted 2026-09-19T04:44:05Z; version `WAITING_FOR_REVIEW` |
+
+No further TestFlight feedback arrived after the 21:28 UTC crash report: the newest
+`betaFeedbackCrashSubmissions` entry is still `AJLYv-nIkFXNeKKLq-bHyBY`.
