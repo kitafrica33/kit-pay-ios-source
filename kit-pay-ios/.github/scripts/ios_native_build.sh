@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-mode="${1:?Select build, test, chat-scroll, review-ipad, marketing-iphone, or marketing-ipad}"
+mode="${1:?Select build, test, chat-scroll, chat-media, review-ipad, marketing-iphone, or marketing-ipad}"
 : "${KITPAY_TEST_DEVICE_ID:?A prepared Simulator is required}"
 : "${RUNNER_TEMP:?}"
 common=(
@@ -94,6 +94,35 @@ case "$mode" in
         -only-testing:KitPayUITests/AppStoreScreenshotUITests/testLongHistoryVerticalBubbleDragsPreserveReadingPosition \
         test-without-building
     done
+    ;;
+  chat-media)
+    # Verification lane for the owner's 1.0.17 build 105 report; see
+    # docs/status/ios-chat-media-2026-09-21.md. Four items, one Mac run:
+    #
+    #   1. sharing must not depend on the app's lock state,
+    #   2. a thread of mixed media must scroll,
+    #   3. media must swipe left and right,
+    #   4. Home and the pay screen must verify once, behind a blur.
+    #
+    # The pure policies behind all four already run on Linux before any Mac minute is
+    # spent. What only a Mac can answer is whether they are *wired in*, which is what the
+    # two UI tests on the 320-message mixed-media thread are for. Once, not three times:
+    # unlike the intermittent freeze that chat-scroll was built for, these are structural
+    # -- a dead-end tap and a second Face ID prompt fail every single run.
+    select_test_run prepare
+    xcodebuild "${test_common[@]}" \
+      -resultBundlePath "$RUNNER_TEMP/KitPay-chat-media.xcresult" \
+      -only-testing:KitPayTests/ChatMediaDisplayBucketTests \
+      -only-testing:KitPayTests/ChatWaveformShapeTests \
+      -only-testing:KitPayTests/ConversationLayoutCacheTests \
+      -only-testing:KitPayTests/ForegroundVerificationPolicyTests \
+      -only-testing:KitPayTests/ShareAuthorizationPolicyTests \
+      -only-testing:KitPayTests/MessagingProcessBrokerTests \
+      -only-testing:KitPayTests/ConversationProjectionCacheTests \
+      -only-testing:KitPayUITests/AppStoreScreenshotUITests/testMixedMediaThreadScrollsAndRecordsSwipeWallClock \
+      -only-testing:KitPayUITests/AppStoreScreenshotUITests/testMediaGallerySwipesThroughTheConversationsMediaInOrder \
+      -only-testing:KitPayUITests/AppStoreScreenshotUITests/testLongHistoryVerticalBubbleDragsPreserveReadingPosition \
+      test-without-building
     ;;
   review-ipad)
     : "${KITPAY_REVIEW_IPAD_DEVICE_ID:?A prepared review iPad is required}"

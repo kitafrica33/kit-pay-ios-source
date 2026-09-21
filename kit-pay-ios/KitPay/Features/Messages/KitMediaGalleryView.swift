@@ -64,6 +64,9 @@ struct KitMediaGalleryView: View {
 
     @StateObject private var loader = GalleryPageLoader()
     @State private var selection: Int
+    /// Per-item VoiceOver labels, keyed by `KitGalleryItem.id`. Empty until the first render has
+    /// gone out; pages fall back to "Photo"/"Video" until then.
+    @State private var itemLabels: [String: String] = [:]
     @State private var chromeVisible = true
     @State private var currentPageIsZoomed = false
     @State private var dismissDrag: CGFloat = 0
@@ -104,6 +107,17 @@ struct KitMediaGalleryView: View {
         items.indices.contains(selection) ? items[selection] : nil
     }
 
+    private func loadItemLabels() async {
+        let snapshot = items
+        let labels = await Task.detached(priority: .userInitiated) {
+            var built: [String: String] = [:]
+            built.reserveCapacity(snapshot.count)
+            for item in snapshot { built[item.id] = Self.fullLabel(for: item) }
+            return built
+        }.value
+        itemLabels = labels
+    }
+
     var body: some View {
         ZStack {
             Color.black
@@ -127,6 +141,7 @@ struct KitMediaGalleryView: View {
         .task {
             loader.configure(loadData)
             preload(around: selection)
+            await loadItemLabels()
         }
         .onChange(of: selection) { _, newValue in
             currentPageIsZoomed = false
@@ -146,8 +161,12 @@ struct KitMediaGalleryView: View {
 
     private var pager: some View {
         TabView(selection: $selection) {
-            ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
-                page(for: item, index: index)
+            // `items` is a `let`: the gallery is handed a fixed list at presentation time. Indexing
+            // the range directly avoids rebuilding an `Array` of `(offset, element)` pairs on every
+            // render of a pager that is not lazy, and makes the `ForEach` identity the same `Int`
+            // as the `.tag`, so selection can never disagree with identity mid-swipe.
+            ForEach(items.indices, id: \.self) { index in
+                page(for: items[index], index: index)
                     .tag(index)
             }
         }
@@ -215,14 +234,33 @@ struct KitMediaGalleryView: View {
         }
     }
 
+    /// Shows the thumbnail the chat already decoded for this item, immediately, with the spinner
+    /// over it — instead of a black page with a spinner on it.
+    ///
+    /// Swiping left and right through a conversation's media only preloads the current page's two
+    /// neighbours (loading more would mean holding several full-resolution decodes at once), so on
+    /// build 105 the third swipe in a row always landed on an empty page. The bubble, album cell
+    /// or video poster has already paid for a thumbnail under this exact key; reusing it costs one
+    /// cache lookup and no decode.
     private func loadingPage(for item: KitGalleryItem) -> some View {
-        VStack(spacing: 12) {
-            ProgressView()
-                .tint(.white)
-                .controlSize(.large)
-            Text(byteLabel(for: item) ?? "Loading…")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.white.opacity(0.75))
+        ZStack {
+            if let preview = ChatMediaThumbnailStore.shared.bestCachedThumbnail(
+                forKey: item.thumbnailKey
+            ) {
+                Image(uiImage: preview)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .accessibilityHidden(true)
+            }
+            VStack(spacing: 12) {
+                ProgressView()
+                    .tint(.white)
+                    .controlSize(.large)
+                Text(byteLabel(for: item) ?? "Loading…")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.white.opacity(0.75))
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .contentShape(Rectangle())
@@ -440,9 +478,23 @@ struct KitMediaGalleryView: View {
         item.createdAt.formatted(date: .abbreviated, time: .shortened)
     }
 
+    /// Built once per presentation, not per render.
+    ///
+    /// A `.page` `TabView` is not lazy: it materialises a view for *every* item, so this ran for
+    /// all of a conversation's photos and videos on every render — and `Date.formatted` builds a
+    /// format style and walks the calendar every call. On a thread with a hundred pictures that is
+    /// milliseconds of date formatting per frame, on the main thread, while a finger is paging.
     private func accessibilityLabel(for item: KitGalleryItem) -> String {
-        let kind = KitChatMediaKind(mediaType: item.mediaType) == .video ? "Video" : "Photo"
-        return "\(kind) from \(item.senderName), \(dateLabel(for: item))"
+        itemLabels[item.id] ?? Self.kindLabel(for: item)
+    }
+
+    private static func kindLabel(for item: KitGalleryItem) -> String {
+        KitChatMediaKind(mediaType: item.mediaType) == .video ? "Video" : "Photo"
+    }
+
+    private static func fullLabel(for item: KitGalleryItem) -> String {
+        let date = item.createdAt.formatted(date: .abbreviated, time: .shortened)
+        return "\(kindLabel(for: item)) from \(item.senderName), \(date)"
     }
 
     // MARK: Share

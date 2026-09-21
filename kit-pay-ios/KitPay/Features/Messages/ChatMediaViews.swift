@@ -404,6 +404,17 @@ struct PendingSecureMediaMessageView: View {
     }
     let message: LocalMessage
     let attachment: LocalPendingAttachment
+    /// Opens this row in the conversation's media gallery, where the next photo is a swipe away.
+    /// `galleryItemsFold` has always counted queued photos and videos among the gallery's items,
+    /// but nothing routed a *tap* on one here, so a queued photo opened a standalone viewer with
+    /// nowhere to swipe to -- the same dead end the album cells had. Optional so the media
+    /// library, which is already a gallery, keeps its own presentation.
+    ///
+    /// It returns whether the gallery took the tap. A row the conversation's fold does not hold
+    /// -- a queued photo whose local media record has not landed yet -- must still open
+    /// *something*, so a refused hand-off falls back to the standalone presentation rather than
+    /// silently swallowing the tap.
+    var openGallery: ((UUID) -> Bool)? = nil
     let mediaDiagnosticsProducerScope = LocalMediaPerformanceMonitor.shared
         .captureProducerScope()
     /// Bytes plus the MIME facts of the same authoritative identity resolution. Loaded by
@@ -413,9 +424,33 @@ struct PendingSecureMediaMessageView: View {
     @State private var isLoading = false
     @State private var errorMessage: String?
     @State private var presentedMedia: PendingMediaPresentation?
+    /// Pixels decoded by this bubble's own `.task`; `body` only ever reads the shared cache.
+    @State private var decodedThumbnail: UIImage?
 
     private var kind: KitChatMediaKind {
         KitChatMediaKind(mediaType: attachment.mediaType)
+    }
+
+    /// The queued preview is 224 x 168 under `scaledToFill`. Build 105 decoded the queued
+    /// original at 2 048 px *inside `body`*, uncached: 16.8 MB of pixels, on the main thread,
+    /// every render, for a bubble that can draw 672 px.
+    private var maxPixel: CGFloat { CGFloat(ChatMediaDisplayBucket.albumItemEdge) }
+
+    /// Content-bound enough to be a cache key: a queued row that is replaced changes either its
+    /// locally minted storage key or its type/size under the same message.
+    private var thumbnailKey: String {
+        if let storageKey = attachment.localStorageKey, !storageKey.isEmpty { return storageKey }
+        return "pending:\(message.id.uuidString):\(attachment.mediaType):\(attachment.byteCount ?? -1)"
+    }
+
+    private var thumbnail: UIImage? {
+        // Identity gate unchanged: the local original must have re-resolved before any pixels
+        // are shown, cached ones included.
+        guard loaded != nil else { return nil }
+        return ChatMediaThumbnailStore.shared.cachedThumbnail(
+            forKey: thumbnailKey,
+            maxPixel: maxPixel
+        ) ?? decodedThumbnail
     }
 
     private var sizeLabel: String? {
@@ -509,22 +544,10 @@ struct PendingSecureMediaMessageView: View {
     private var pendingContent: some View {
         if let loaded,
            KitChatMediaKind(mediaType: loaded.mediaType) == .image,
-           let image = loaded.downsampledImage(maximumPixelSize: 2_048) {
+           let image = thumbnail {
             Button {
-                LocalMediaPerformanceMonitor.shared.markPlayable(
-                    mediaID: mediaID,
-                    producerScope: mediaDiagnosticsProducerScope
-                )
-                presentedMedia = PendingMediaPresentation(
-                    kind: .image,
-                    image: image,
-                    fileURL: nil,
-                    displayName: title,
-                    mediaType: loaded.mediaType,
-                    byteCount: loaded.byteCount,
-                    ownsTemporaryFile: false,
-                    protectedOriginalLease: nil
-                )
+                if let openGallery, openGallery(message.id) { return }
+                Task { await presentQueuedPhoto(loaded) }
             } label: {
                 Image(uiImage: image)
                     .resizable()
@@ -536,6 +559,15 @@ struct PendingSecureMediaMessageView: View {
             .accessibilityLabel("End-to-end encrypted photo queued to send")
         } else {
             Button {
+                // A queued video belongs in the gallery with the photos around it; documents and
+                // audio have no gallery page, so they keep opening in place. A *photo* reaches
+                // this row whenever its local original has not resolved or its thumbnail has not
+                // decoded yet -- which on a fast scroll is most of the photos on screen -- and
+                // build 105 sent every one of those taps to the standalone viewer. Same picture,
+                // same tap, but nowhere to swipe: route it to the gallery too.
+                if kind == .image || kind == .video, let openGallery, openGallery(message.id) {
+                    return
+                }
                 Task { await openLocalOriginal() }
             } label: {
                 HStack(spacing: 11) {
@@ -610,14 +642,54 @@ struct PendingSecureMediaMessageView: View {
             return
         }
         loaded = fresh
-        if markPlayableWhenLoaded,
-           KitChatMediaKind(mediaType: fresh.mediaType) == .image,
-           fresh.downsampledImage(maximumPixelSize: 256) != nil {
+        guard KitChatMediaKind(mediaType: fresh.mediaType) == .image else { return }
+        // One decode, off the main thread, at the size the queued bubble draws. It doubles as
+        // the "can this actually be rendered?" proof the playable mark used to pay for
+        // separately.
+        if let localFileURL = fresh.localFileURL {
+            decodedThumbnail = await ChatMediaThumbnailStore.shared.decodedThumbnail(
+                forKey: thumbnailKey,
+                maxPixel: maxPixel,
+                fromFileURL: localFileURL
+            )
+        } else {
+            decodedThumbnail = await ChatMediaThumbnailStore.shared.decodedThumbnail(
+                forKey: thumbnailKey,
+                maxPixel: maxPixel,
+                from: fresh.data
+            )
+        }
+        if markPlayableWhenLoaded, thumbnail != nil {
             LocalMediaPerformanceMonitor.shared.markPlayable(
                 mediaID: mediaID,
                 producerScope: mediaDiagnosticsProducerScope
             )
         }
+    }
+
+    /// A tap presents the queued photo full-screen. The bubble's thumbnail is sized for a
+    /// 224-point bubble, so the presentation decodes its own full-resolution copy — off the main
+    /// thread, from the same resolved item the bubble is drawing.
+    private func presentQueuedPhoto(_ item: SecureMediaLoadPolicy.LoadedItem) async {
+        guard mediaAccountIsCurrent else { return }
+        let full = await Task.detached(priority: .userInitiated) {
+            item.downsampledImage(maximumPixelSize: ChatMediaDisplayBucket.maximumEdge)
+        }.value
+        guard let full, mediaAccountIsCurrent else { return }
+        LocalMediaPerformanceMonitor.shared.markPlayable(
+            mediaID: mediaID,
+            producerScope: mediaDiagnosticsProducerScope
+        )
+        presentedMedia = PendingMediaPresentation(
+            kind: .image,
+            image: full,
+            fileURL: nil,
+            displayName: title,
+            mediaType: item.mediaType,
+            byteCount: item.byteCount,
+            ownsTemporaryFile: false,
+            protectedOriginalLease: nil
+        )
     }
 
     private func openLocalOriginal() async {
@@ -684,7 +756,14 @@ struct PendingSecureMediaMessageView: View {
         guard mediaAccountIsCurrent, let loaded else { return }
         switch KitChatMediaKind(mediaType: loaded.mediaType) {
         case .image:
-            guard let image = loaded.downsampledImage(maximumPixelSize: 4_096) else {
+            // Off the main thread: a 4 096 px ImageIO pass inside a tap handler is a visible
+            // stall on a large photo, and this one runs on the same actor as the timeline.
+            let item = loaded
+            let full = await Task.detached(priority: .userInitiated) {
+                item.downsampledImage(maximumPixelSize: ChatMediaDisplayBucket.maximumEdge)
+            }.value
+            guard mediaAccountIsCurrent else { return }
+            guard let image = full else {
                 errorMessage = "Local copy unavailable"
                 return
             }
@@ -764,6 +843,11 @@ struct PendingSecureMediaMessageView: View {
 /// status/retry row belong to the enclosing bubble, not to any item.
 struct SecureMediaBatchMessageView: View {
     let message: LocalMessage
+    /// When set, photo/video taps open the shared conversation gallery at this exact item
+    /// instead of a standalone single-item viewer — so a customer can swipe left and right
+    /// through the whole conversation from inside a multi-attachment bubble. Build 105 had no
+    /// such hook: tapping one of several photos sent together opened a dead end.
+    var openGallery: ((UUID, Int?) -> Bool)? = nil
 
     var body: some View {
         if let batch = message.pendingMediaBatch, batch.isStructurallyValid {
@@ -814,7 +898,8 @@ struct SecureMediaBatchMessageView: View {
                     contentKey: item.contentKey,
                     mediaType: item.mediaType,
                     plaintextByteSize: item.plaintextByteSize,
-                    isPending: isPending
+                    isPending: isPending,
+                    openGallery: openGallery
                 )
             }
         }
@@ -845,18 +930,40 @@ struct SecureMediaBatchItemView: View {
     let mediaType: String
     let plaintextByteSize: Int
     let isPending: Bool
+    /// Opens the conversation gallery at `(message.id, itemIndex)`. `itemIndex` is the index
+    /// into the descriptor's item list, which is exactly the index the gallery's own fold uses,
+    /// so item 3 of an album lands on item 3 even when the album mixes in documents.
+    var openGallery: ((UUID, Int?) -> Bool)? = nil
     let mediaDiagnosticsProducerScope = LocalMediaPerformanceMonitor.shared
         .captureProducerScope()
 
     @StateObject private var loader = SecureMediaLoader()
     @State private var retryGeneration = 0
     @State private var showsImageViewer = false
+    /// Pixels decoded by this cell's own `.task`; `body` only ever reads the shared cache.
+    @State private var decodedThumbnail: UIImage?
+    /// Full-resolution pixels for the standalone viewer, decoded only when a tap opens it.
+    @State private var viewerImage: UIImage?
     @State private var playbackURL: URL?
     @State private var documentURL: URL?
     @State private var localPresentation: SecureMediaLoadPolicy.LocalFileItem?
     @State private var ownsPresentationURL = false
 
     private var kind: KitChatMediaKind { KitChatMediaKind(mediaType: mediaType) }
+
+    /// The cell is 224 x 168 under `scaledToFill`. Build 105 decoded the whole attachment at
+    /// 1 024 px *inside `body`*, with no cache at all: an eight-item album re-ran eight ImageIO
+    /// passes on the main thread for every render the scroll produced.
+    private var maxPixel: CGFloat { CGFloat(ChatMediaDisplayBucket.albumItemEdge) }
+
+    private var thumbnail: UIImage? {
+        // Identity gate unchanged: no current resolution, no pixels — cached ones included.
+        guard loader.loaded != nil else { return nil }
+        return ChatMediaThumbnailStore.shared.cachedThumbnail(
+            forKey: contentKey,
+            maxPixel: maxPixel
+        ) ?? decodedThumbnail
+    }
 
     private var voiceNoteID: UUID {
         UUID(uuidString: attachmentID) ?? message.id
@@ -893,9 +1000,23 @@ struct SecureMediaBatchItemView: View {
                     conversationId: message.conversationId,
                     itemIndex: itemIndex
                 )
-                if kind == .image,
-                   loader.loaded?.downsampledImage(maximumPixelSize: 256) != nil,
-                   let id = UUID(uuidString: attachmentID) {
+                guard kind == .image, let loaded = loader.loaded else { return }
+                // Decoded off the main thread, into the shared cache, at the size this cell can
+                // actually draw.
+                if let localFileURL = loaded.localFileURL {
+                    decodedThumbnail = await ChatMediaThumbnailStore.shared.decodedThumbnail(
+                        forKey: contentKey,
+                        maxPixel: maxPixel,
+                        fromFileURL: localFileURL
+                    )
+                } else {
+                    decodedThumbnail = await ChatMediaThumbnailStore.shared.decodedThumbnail(
+                        forKey: contentKey,
+                        maxPixel: maxPixel,
+                        from: loaded.data
+                    )
+                }
+                if thumbnail != nil, let id = UUID(uuidString: attachmentID) {
                     LocalMediaPerformanceMonitor.shared.markPlayable(
                         mediaID: id,
                         producerScope: mediaDiagnosticsProducerScope
@@ -918,7 +1039,7 @@ struct SecureMediaBatchItemView: View {
 
     @ViewBuilder
     private var imageCell: some View {
-        if let image = loader.loaded?.downsampledImage(maximumPixelSize: 1_024) {
+        if let image = thumbnail {
             Image(uiImage: image)
                 .resizable()
                 .scaledToFill()
@@ -926,6 +1047,10 @@ struct SecureMediaBatchItemView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
                 .contentShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
                 .onTapGesture {
+                    // The gallery re-resolves the row from the persisted descriptor itself, so
+                    // handing it the identity keeps the "never render unproven bytes" rule while
+                    // giving the customer the swipeable pager.
+                    if let openGallery, openGallery(message.id, itemIndex) { return }
                     // A tap presents full-screen: re-prove the row first, and show only the
                     // freshly resolved bytes — the rendered thumbnail is not authority.
                     Task {
@@ -935,15 +1060,29 @@ struct SecureMediaBatchItemView: View {
                                   messageID: message.id,
                                   conversationId: message.conversationId,
                                   itemIndex: itemIndex
-                              ), fresh.downsampledImage(maximumPixelSize: 256) != nil else { return }
+                              ) else { return }
+                        // Full-screen pixels, off the main thread. The cell thumbnail is sized
+                        // for a 224-point cell and must not be stretched across the screen.
+                        let full = await Task.detached(priority: .userInitiated) {
+                            fresh.downsampledImage(
+                                maximumPixelSize: ChatMediaDisplayBucket.maximumEdge
+                            )
+                        }.value
+                        guard let full else { return }
+                        viewerImage = full
                         showsImageViewer = true
                     }
                 }
                 .accessibilityElement(children: .combine)
                 .accessibilityLabel("End-to-end encrypted photo, \(accessibilityPosition)")
                 .accessibilityAddTraits(.isButton)
-                .fullScreenCover(isPresented: $showsImageViewer) {
-                    MediaImageViewer(image: image)
+                .fullScreenCover(
+                    isPresented: $showsImageViewer,
+                    onDismiss: { viewerImage = nil }
+                ) {
+                    if let viewerImage {
+                        MediaImageViewer(image: viewerImage)
+                    }
                 }
         } else {
             Button { retryGeneration &+= 1 } label: {
@@ -986,6 +1125,7 @@ struct SecureMediaBatchItemView: View {
 
     private var fileRow: some View {
         Button {
+            if kind == .video, let openGallery, openGallery(message.id, itemIndex) { return }
             Task { await refreshThenPresent() }
         } label: {
             row(
@@ -1226,23 +1366,27 @@ struct SecureImageMessageView: View {
     @StateObject private var loader = SecureMediaLoader()
     @State private var retryGeneration = 0
     @State private var showsViewer = false
+    /// Pixels decoded by this bubble's own `.task`. `body` prefers the shared cache and falls
+    /// back to this, so a freshly decoded photo shows before the cache is consulted again.
+    @State private var decoded: UIImage?
+    /// Full-resolution pixels for the standalone viewer, decoded only when a tap opens it.
+    @State private var viewerImage: UIImage?
+
+    /// The bubble is `maxWidth: 248, maxHeight: 300` under `scaledToFill`, so 300 points is
+    /// everything it can draw. Build 105 asked for 1 024 points — 3 072 px, 37.7 MB decoded,
+    /// against a 64 MB cache — so a thread with three photos in it could not hold its own
+    /// thumbnails and every scroll pass re-decoded what it had just evicted.
+    private var maxPixel: CGFloat { CGFloat(ChatMediaDisplayBucket.photoBubbleEdge) }
 
     private var image: UIImage? {
-        // The loader resolves the current persisted row first. Protected originals and receiver
-        // cache files downsample directly from disk; legacy inline blobs keep the data path.
-        guard let loaded = loader.loaded else { return nil }
-        if let localFileURL = loaded.localFileURL {
-            return ChatMediaThumbnailStore.shared.thumbnail(
-                forKey: descriptor.storageKey,
-                maxPixel: 1_024,
-                fromFileURL: localFileURL
-            )
-        }
-        return ChatMediaThumbnailStore.shared.thumbnail(
+        // Identity gate unchanged: the loader must have resolved the current persisted row
+        // before any pixels are shown, cached ones included. The decode itself now happens in
+        // `.task`, off the main thread — `body` only ever does a cache lookup.
+        guard loader.loaded != nil else { return nil }
+        return ChatMediaThumbnailStore.shared.cachedThumbnail(
             forKey: descriptor.storageKey,
-            maxPixel: 1_024,
-            from: loaded.data
-        )
+            maxPixel: maxPixel
+        ) ?? decoded
     }
 
     var body: some View {
@@ -1268,9 +1412,19 @@ struct SecureImageMessageView: View {
                                       messageID: message.id,
                                       conversationId: message.conversationId,
                                       itemIndex: nil
-                                      ), fresh.downsampledImage(maximumPixelSize: 256) != nil else {
+                                      ) else {
                                     return
                                 }
+                                // Full-screen pixels, decoded off the main thread. The bubble's
+                                // thumbnail is sized for a 300-point bubble and must not be
+                                // stretched across the whole screen.
+                                let full = await Task.detached(priority: .userInitiated) {
+                                    fresh.downsampledImage(
+                                        maximumPixelSize: ChatMediaDisplayBucket.maximumEdge
+                                    )
+                                }.value
+                                guard let full else { return }
+                                viewerImage = full
                                 showsViewer = true
                             }
                         }
@@ -1307,6 +1461,20 @@ struct SecureImageMessageView: View {
                 conversationId: message.conversationId,
                 itemIndex: nil
             )
+            guard let loaded = loader.loaded else { return }
+            if let localFileURL = loaded.localFileURL {
+                decoded = await ChatMediaThumbnailStore.shared.decodedThumbnail(
+                    forKey: descriptor.storageKey,
+                    maxPixel: maxPixel,
+                    fromFileURL: localFileURL
+                )
+            } else {
+                decoded = await ChatMediaThumbnailStore.shared.decodedThumbnail(
+                    forKey: descriptor.storageKey,
+                    maxPixel: maxPixel,
+                    from: loaded.data
+                )
+            }
             if image != nil, let id = UUID(uuidString: descriptor.attachmentID) {
                 LocalMediaPerformanceMonitor.shared.markPlayable(
                     mediaID: id,
@@ -1314,9 +1482,9 @@ struct SecureImageMessageView: View {
                 )
             }
         }
-        .fullScreenCover(isPresented: $showsViewer) {
-            if let image {
-                MediaImageViewer(image: image)
+        .fullScreenCover(isPresented: $showsViewer, onDismiss: { viewerImage = nil }) {
+            if let viewerImage {
+                MediaImageViewer(image: viewerImage)
             }
         }
     }
@@ -1593,33 +1761,30 @@ struct VoiceNoteBubbleView: View {
     }
 }
 
-/// Deterministic bars per message with a played-progress tint.
+/// Deterministic bars per message with a played-progress tint. The shape itself lives in
+/// `ChatWaveformShape`, so drawing a frame allocates nothing.
 struct VoiceNoteWaveform: View {
     let progress: Double
     let accent: Color
     let seed: UUID
 
-    private var heights: [CGFloat] {
-        // Cheap deterministic pseudo-noise from the UUID bytes.
-        var bytes = [UInt8]()
-        withUnsafeBytes(of: seed.uuid) { bytes.append(contentsOf: $0) }
-        return (0..<26).map { index in
-            let byte = bytes[index % bytes.count] &+ UInt8(truncatingIfNeeded: index &* 37)
-            return 6 + CGFloat(byte % 16)
-        }
-    }
-
     var body: some View {
-        let bars = heights
         HStack(alignment: .center, spacing: 2.4) {
-            ForEach(bars.indices, id: \.self) { index in
+            ForEach(0..<ChatWaveformShape.barCount, id: \.self) { index in
                 Capsule()
                     .fill(
-                        Double(index) / Double(bars.count) <= progress && progress > 0
+                        ChatWaveformShape.isPlayed(
+                            index: index,
+                            count: ChatWaveformShape.barCount,
+                            progress: progress
+                        )
                             ? accent
                             : accent.opacity(0.38)
                     )
-                    .frame(width: 2.6, height: bars[index])
+                    .frame(
+                        width: 2.6,
+                        height: CGFloat(ChatWaveformShape.height(seed: seed, at: index))
+                    )
             }
         }
         .accessibilityHidden(true)

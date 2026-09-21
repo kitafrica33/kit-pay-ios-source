@@ -1518,6 +1518,24 @@ private enum GroupProfileFollowUp {
     case leaveCompleted
 }
 
+/// Everything `ConversationView.conversationLayout` derives from one thread snapshot, held
+/// together so `ConversationLayoutCache` memoises them as one unit.
+///
+/// They genuinely are one derivation: `messagesByID` exists only when the membership found
+/// albums, and `namedSenderMessageIDs` is built by asking whether each row renders, which needs
+/// both the membership and the suppressed reactions. Memoising them separately would mean
+/// recomputing the inputs of the last one to build it.
+struct ConversationLayoutDerivation {
+    let timeline: [ConversationTimelineItem]
+    let albumMembership: [UUID: ChatMediaAlbumMembership]
+    let messagesByID: [UUID: LocalMessage]
+    let suppressedReactionIDs: Set<UUID>
+    let reactionTallies: [String: [MessageReactionTally]]
+    let namedSenderMessageIDs: Set<UUID>
+    /// Every photo/video in the thread, in order, as the full-screen gallery pages through them.
+    let galleryItems: [KitGalleryItem]
+}
+
 struct ConversationView: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.scenePhase) private var scenePhase
@@ -1629,6 +1647,11 @@ struct ConversationView: View {
     /// (docs/status/ios-chat-scroll-2026-09-21.md).
     @State private var timelineProjectionCache =
         ConversationProjectionCache<(messages: [LocalMessage], editedAt: [UUID: Date])>()
+    /// Memo for the six whole-thread folds that turn the projection into rows. The projection
+    /// memo stopped the *fold of the thread* running fifteen times per render; these six still
+    /// ran once per render each, and a render happens for every scroll-driven state change
+    /// (docs/status/ios-chat-media-2026-09-21.md).
+    @State private var timelineLayoutCache = ConversationLayoutCache<ConversationLayoutDerivation>()
     @StateObject private var voiceRecorder: VoiceNoteRecorder
     private let stagedVoicePlayer = VoiceNotePlayer.shared
     @FocusState private var isComposerFocused: Bool
@@ -1770,8 +1793,12 @@ struct ConversationView: View {
         return "\(model.isOnline):\(model.financialAccessGranted):\(scheduledPaymentsEnabled):\(conversation.id.lowercased()):\(terminal)"
     }
 
+    /// Read from eight places outside `conversationLayout` — scheduled-payment reconciliation, a
+    /// `.task(id:)`, the jump-to-latest anchor — so this must be the memo, not a fresh fold. On
+    /// the 2 000-message fixture each fold allocates a separator/call-row array over the whole
+    /// thread.
     private var timelineItems: [ConversationTimelineItem] {
-        makeTimelineItems(messages: messages)
+        conversationLayoutDerivation(for: messages).timeline
     }
 
     private func makeTimelineItems(messages: [LocalMessage]) -> [ConversationTimelineItem] {
@@ -2596,12 +2623,11 @@ struct ConversationView: View {
 
     // MARK: Reactions
 
-    /// Aggregated tallies keyed by the target's lowercase server message id.
+    /// Aggregated tallies keyed by the target's lowercase server message id. Read by the
+    /// reaction detail sheet and by two bubble helpers, so it reads the same memo the timeline
+    /// does rather than re-aggregating the whole thread per bubble.
     private var reactionTallies: [String: [MessageReactionTally]] {
-        MessageReactionAggregationPolicy.tallies(
-            in: messages,
-            currentUserID: model.profile?.id
-        )
+        conversationLayoutDerivation(for: messages).reactionTallies
     }
 
     /// How far the chip row rides up into the bubble it belongs to. The row reclaims the same
@@ -2845,45 +2871,89 @@ struct ConversationView: View {
         )
     }
 
+    /// The six whole-thread folds, memoised together.
+    ///
+    /// They are one derivation rather than six memos because they are read together, built from
+    /// the same snapshot, and two of them feed the others: `messagesByID` exists only when there
+    /// are albums, and `namedSenderMessageIDs` asks whether each row renders, which needs both
+    /// the album membership and the suppressed reactions. The fold bodies below are the build-105
+    /// ones verbatim; only how often they run has changed.
+    private func conversationLayoutDerivation(
+        for timelineSnapshot: [LocalMessage]
+    ) -> ConversationLayoutDerivation {
+        let key = ConversationLayoutKey(
+            projection: ConversationProjectionKey(
+                stateGeneration: model.stateGeneration,
+                conversationID: currentConversation.id,
+                scheduledMessageIDs: scheduledMessageIDs
+            ),
+            isSelectingMessages: isSelectingMessages,
+            isGroupConversation: isGroupConversation,
+            currentUserID: model.profile?.id,
+            // Date separators say "Today"; they stop being true at midnight without any state
+            // publish to notice it.
+            separatorDay: AppPresentationClock.calendar.startOfDay(for: AppPresentationClock.now),
+            localeIdentifier: AppPresentationClock.locale.identifier
+        )
+        return timelineLayoutCache.derivation(for: key) {
+            let timeline = makeTimelineItems(messages: timelineSnapshot)
+            let albumMembership: [UUID: ChatMediaAlbumMembership] =
+                isSelectingMessages ? [:] : ChatMediaAlbumPolicy.membership(for: timelineSnapshot)
+            // Album cells share this render's corrected rows. Text-only histories need no index.
+            // Keep the first duplicate, matching the previous first(where:) lookup semantics.
+            let messagesByID: [UUID: LocalMessage] = albumMembership.isEmpty ? [:] : Dictionary(
+                timelineSnapshot.lazy.map { ($0.id, $0) },
+                uniquingKeysWith: { first, _ in first }
+            )
+            let suppressedReactionIDs = MessageReactionAggregationPolicy.suppressedMessageIDs(
+                in: timelineSnapshot
+            )
+            let tallies = MessageReactionAggregationPolicy.tallies(
+                in: timelineSnapshot,
+                currentUserID: model.profile?.id
+            )
+            // A sender's name heads a run of their messages rather than labelling every one of
+            // them. Rows that render nothing are excluded, so a silent event by another member
+            // cannot make the same person be introduced twice in a row.
+            let namedSenderMessageIDs = ConversationSenderRunPolicy.namedMessageIDs(
+                in: timeline,
+                isGroup: isGroupConversation,
+                isRendered: { message in
+                    rendersAsBubble(
+                        message,
+                        albumMembership: albumMembership,
+                        suppressedReactionIDs: suppressedReactionIDs
+                    )
+                }
+            )
+            return ConversationLayoutDerivation(
+                timeline: timeline,
+                albumMembership: albumMembership,
+                messagesByID: messagesByID,
+                suppressedReactionIDs: suppressedReactionIDs,
+                reactionTallies: tallies,
+                namedSenderMessageIDs: namedSenderMessageIDs,
+                galleryItems: galleryItemsFold(messages: timelineSnapshot)
+            )
+        }
+    }
+
     private var conversationLayout: some View {
-        // One pass per render for every whole-thread fold (albums, reaction suppression,
-        // reaction tallies): computing these per bubble would be quadratic in long threads
-        // and re-trigger on every keystroke.
+        // One pass per *published state*, not per render, for every whole-thread fold (timeline
+        // items, albums, reaction suppression, reaction tallies, sender runs): computing these
+        // per bubble would be quadratic in long threads, and computing them per render put six
+        // O(thread) passes between a finger and the pixels it is dragging.
         let projection = correctedProjection
-        let timelineSnapshot = projection.messages
-        let renderedTimeline = makeTimelineItems(messages: timelineSnapshot)
+        let correctionDates = projection.editedAt
+        let layout = conversationLayoutDerivation(for: projection.messages)
+        let renderedTimeline = layout.timeline
         let hasTimelineContent = !renderedTimeline.isEmpty
         let cameraAvailable = cameraPullIsAvailable(hasTimelineContent: hasTimelineContent)
-        let correctionDates = projection.editedAt
-        let albumMembership: [UUID: ChatMediaAlbumMembership] =
-            isSelectingMessages ? [:] : ChatMediaAlbumPolicy.membership(for: timelineSnapshot)
-        // Album cells share this render's corrected rows. Text-only histories need no index.
-        // Keep the first duplicate, matching the previous first(where:) lookup semantics.
-        let messagesByID: [UUID: LocalMessage] = albumMembership.isEmpty ? [:] : Dictionary(
-            timelineSnapshot.lazy.map { ($0.id, $0) },
-            uniquingKeysWith: { first, _ in first }
-        )
-        let suppressedReactionIDs = MessageReactionAggregationPolicy.suppressedMessageIDs(
-            in: timelineSnapshot
-        )
-        let hoistedTallies = MessageReactionAggregationPolicy.tallies(
-            in: timelineSnapshot,
-            currentUserID: model.profile?.id
-        )
-        // A sender's name heads a run of their messages rather than labelling every one of them.
-        // Rows that render nothing are excluded, so a silent event by another member cannot make
-        // the same person be introduced twice in a row.
-        let namedSenderMessageIDs = ConversationSenderRunPolicy.namedMessageIDs(
-            in: renderedTimeline,
-            isGroup: isGroupConversation,
-            isRendered: { message in
-                rendersAsBubble(
-                    message,
-                    albumMembership: albumMembership,
-                    suppressedReactionIDs: suppressedReactionIDs
-                )
-            }
-        )
+        let albumMembership = layout.albumMembership
+        let messagesByID = layout.messagesByID
+        let suppressedReactionIDs = layout.suppressedReactionIDs
+        let hoistedTallies = layout.reactionTallies
+        let namedSenderMessageIDs = layout.namedSenderMessageIDs
         return VStack(spacing: 0) {
             ScrollViewReader { scrollProxy in
                 ScrollView {
@@ -5661,7 +5731,16 @@ struct ConversationView: View {
     /// identity-resolved loader, so the sender's gallery never waits for a remote object.
     /// Family bodies that fail both strict parses contribute nothing; no entry carries
     /// descriptor text.
+    /// The memoised entries. Read once per presentation *and again every time the presenting
+    /// screen re-renders*, because `.fullScreenCover`'s content closure captures this view — so
+    /// on build 105 every state publish re-parsed the whole thread's wire bodies while the
+    /// gallery was open and the customer was swiping through it.
     private var galleryItems: [KitGalleryItem] {
+        conversationLayoutDerivation(for: messages).galleryItems
+    }
+
+    /// The fold itself, unchanged; `galleryItems` decides when it runs.
+    private func galleryItemsFold(messages: [LocalMessage]) -> [KitGalleryItem] {
         messages.flatMap { message -> [KitGalleryItem] in
             let senderName = message.isOutgoing
                 ? "You"
@@ -5744,14 +5823,19 @@ struct ConversationView: View {
     }
 
     private func openGallery(at messageID: UUID) {
-        openGalleryItem(at: messageID, itemIndex: nil)
+        _ = openGalleryItem(at: messageID, itemIndex: nil)
     }
 
-    private func openGalleryItem(at messageID: UUID, itemIndex: Int?) {
+    /// Returns whether the conversation's gallery actually holds this row. A bubble that is
+    /// refused keeps its own presentation rather than swallowing the tap: the fold needs a
+    /// matching local media record, and a photo queued a moment ago may not have one yet.
+    @discardableResult
+    private func openGalleryItem(at messageID: UUID, itemIndex: Int?) -> Bool {
         guard galleryItems.contains(where: {
             $0.messageID == messageID && (itemIndex == nil || $0.itemIndex == itemIndex)
-        }) else { return }
+        }) else { return false }
         galleryTarget = ConversationGalleryTarget(messageID: messageID, itemIndex: itemIndex)
+        return true
     }
 
     @ViewBuilder
@@ -5794,7 +5878,11 @@ struct ConversationView: View {
             VStack(alignment: message.isOutgoing ? .trailing : .leading, spacing: 5) {
                 quotedBlock(for: message)
                 if let pending = message.pendingAttachment {
-                    PendingSecureMediaMessageView(message: message, attachment: pending)
+                    PendingSecureMediaMessageView(
+                        message: message,
+                        attachment: pending,
+                        openGallery: { openGalleryItem(at: $0, itemIndex: nil) }
+                    )
                     if KitChatMediaKind(mediaType: pending.mediaType) != .document,
                        let caption = pending.caption, !caption.isEmpty {
                         Text(caption)
@@ -5804,7 +5892,10 @@ struct ConversationView: View {
                 // stack inside it in display order, the shared caption renders once below them,
                 // and the one status/retry row in `messageMetadata` speaks for the batch.
                 } else if let batch = message.pendingMediaBatch {
-                    SecureMediaBatchMessageView(message: message)
+                    SecureMediaBatchMessageView(
+                        message: message,
+                        openGallery: { openGalleryItem(at: $0, itemIndex: $1) }
+                    )
                     // Structural gate before the caption: a corrupt persisted batch renders
                     // only the damaged placeholder above, never its unvalidated caption bytes.
                     // A caption that passes is canonical — non-nil is the whole test, and its
@@ -5814,7 +5905,10 @@ struct ConversationView: View {
                             .foregroundStyle(message.isOutgoing ? .white : KitColor.primaryText)
                     }
                 } else if let mediaBatch = KitMediaMessageV2Descriptor.parse(message.body) {
-                    SecureMediaBatchMessageView(message: message)
+                    SecureMediaBatchMessageView(
+                        message: message,
+                        openGallery: { openGalleryItem(at: $0, itemIndex: $1) }
+                    )
                     if let caption = mediaBatch.caption {
                         Text(caption)
                             .foregroundStyle(message.isOutgoing ? .white : KitColor.primaryText)

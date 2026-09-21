@@ -1233,6 +1233,13 @@ final class AppModel: ObservableObject {
         didSet { updateSharedMessagingLockState() }
     }
     @Published private(set) var homeBiometricState: KitBiometricGateState = .notRequired
+    /// Incremented every time the app enters the background: a trip through the background ends
+    /// a foreground session's biometric proof. Nothing else moves it.
+    @Published private(set) var foregroundEpoch: UInt64 = 0
+    /// The last successful local-authentication proof, and the foreground session, account epoch
+    /// and user it belongs to. One proof per foreground session serves Home and the pay screen
+    /// both -- see `ForegroundVerificationPolicy`.
+    @Published private(set) var foregroundVerification: ForegroundVerificationPolicy.Verification?
     @Published private(set) var isConfiguringBiometrics = false
     @Published private(set) var biometricErrorMessage: String?
     @Published private(set) var isRefreshingRegisteredDevices = false
@@ -2085,10 +2092,43 @@ final class AppModel: ObservableObject {
             && biometricUnlockEnabled
             && biometricAccessState != .authorized
     }
+    /// Whether this foreground session has already been verified by the customer's face or
+    /// fingerprint. Home and the pay screen share it: the owner asked to verify once.
+    var foregroundSessionVerified: Bool {
+        ForegroundVerificationPolicy.isVerified(
+            foregroundVerification,
+            foregroundEpoch: foregroundEpoch,
+            accountEpoch: accountEpoch,
+            userID: profile?.id
+        )
+    }
+
     var homeAccessGranted: Bool {
         !biometricUnlockEnabled
             || homeBiometricState == .notRequired
             || homeBiometricState == .authorized
+            || foregroundSessionVerified
+    }
+
+    /// Records a proof against the current foreground session, account epoch and user.
+    ///
+    /// Deliberately refuses to record anything while signed out or mid-setup: a proof with no
+    /// account behind it could otherwise be carried into the next sign-in by a stale epoch.
+    private func recordForegroundVerification() {
+        guard isSignedIn, let userID = profile?.id, !userID.isEmpty else { return }
+        foregroundVerification = ForegroundVerificationPolicy.Verification(
+            foregroundEpoch: foregroundEpoch,
+            accountEpoch: accountEpoch,
+            userID: userID
+        )
+    }
+
+    /// Ends the current foreground session's proof. The epoch only ever moves forward, so a
+    /// local-authentication response that arrives after a background trip cannot re-authorise
+    /// the session it was started in.
+    private func endForegroundVerification() {
+        foregroundEpoch &+= 1
+        foregroundVerification = nil
     }
     /// While a working biometric enrollment exists, biometrics are the only unlock method the UI
     /// offers; a transient failure (cancel, lockout) keeps this true so the PIN is never
@@ -3896,6 +3936,9 @@ final class AppModel: ObservableObject {
         biometricUnlockEnabled = false
         biometricAccessState = .notRequired
         homeBiometricState = .notRequired
+        // The account epoch already voids it; clearing the value keeps nothing about the
+        // departed account in memory.
+        foregroundVerification = nil
         locallyTerminatedCallIds.removeAll()
         pendingCallAnswers.removeAll()
         await publishLatestState()
@@ -4805,8 +4848,17 @@ final class AppModel: ObservableObject {
             && secureMessagingAvailable && hasUsableCommunicationPrivacyProjection
     }
 
+    /// Deliberately *not* gated on `biometricSharingApprovalBlockedEpoch` any more.
+    ///
+    /// That latch is what made build 105's share sheet fail for the rest of the account's
+    /// lifetime: one failed biometric sharing approval (a Face ID re-enrolment, a cancelled
+    /// prompt, a Keychain hiccup) set it, and from then on every refresh revoked sharing while
+    /// the only thing that could clear it was another successful approval. Sharing no longer
+    /// has a biometric prerequisite at all (owner directive, 2026-09-21 — biometrics guard
+    /// payments, not chats), so a failed approval is now only a wallet-unlock problem. The
+    /// latch is still recorded and still surfaces its error message.
     private var sharedMessagingAccountEligible: Bool {
-        sharedMessagingAccountSecurityEligible && biometricSharingApprovalBlockedEpoch != accountEpoch
+        sharedMessagingAccountSecurityEligible
     }
 
     private func biometricOperationContextIsCurrent(
@@ -5946,6 +5998,9 @@ final class AppModel: ObservableObject {
         biometricUnlockEnabled = false
         biometricAccessState = .notRequired
         homeBiometricState = .notRequired
+        // The account epoch already voids it; clearing the value keeps nothing about the
+        // departed account in memory.
+        foregroundVerification = nil
         biometricErrorMessage = nil
         biometricSignInPermanentlyUnavailable = false
         biometricPINRecoveryRequiresEnrollmentRemoval = false
@@ -6860,6 +6915,9 @@ final class AppModel: ObservableObject {
             else { throw AccountSetupError.sessionNotUnlocked }
             sessionAssurance = result.sessionAssurance
             biometricAccessState = .authorized
+            // The PIN is the app's own documented recovery path for an unusable Face ID; it
+            // verifies the foreground session on exactly the same terms.
+            recordForegroundVerification()
             if selectedTab == MainTabIndex.home { homeBiometricState = .authorized }
             if biometricSignInPermanentlyUnavailable {
                 if biometricPINRecoveryRequiresEnrollmentRemoval {
@@ -6906,6 +6964,8 @@ final class AppModel: ObservableObject {
         startAutomaticBackupBackgroundTransitionIfNeeded()
         returningSignInBiometricAuthorizationFence.invalidate()
         homeBiometricAuthorizationFence.invalidate()
+        // The one place a verification expires. Leaving the Home *tab* is not leaving the app.
+        endForegroundVerification()
         if sharedMessagingApprovalPublicationGate.operation != nil {
             // A real background transition ends this foreground proof's authority. It is not
             // one of the routine publication refreshes deferred by the sharing operation.
@@ -7076,6 +7136,12 @@ final class AppModel: ObservableObject {
             return
         }
         guard homeBiometricState != .authorized else { return }
+        // Already proved this foreground session -- at app unlock, on the pay screen, or on an
+        // earlier visit to this tab. Opening Home must not ask a second time.
+        guard !foregroundSessionVerified else {
+            homeBiometricState = .authorized
+            return
+        }
         _ = await authenticateBiometrically(for: .home)
     }
 
@@ -7085,6 +7151,9 @@ final class AppModel: ObservableObject {
             homeBiometricState = .notRequired
             return
         }
+        // Build 105 locked Home here unconditionally, so Messages-and-back was a second Face ID.
+        // A verified foreground session survives a tab switch; only the background ends it.
+        guard !foregroundSessionVerified else { return }
         homeBiometricState = .locked
     }
 
@@ -7095,6 +7164,10 @@ final class AppModel: ObservableObject {
               !requiresBiometricSignIn
         else { return false }
         guard biometricUnlockEnabled else { return true }
+        // One verification per foreground session, shared with Home. Biometrics still gate the
+        // payment -- the proof is simply the one the customer has already given, and it expires
+        // the moment the app goes to the background.
+        guard !foregroundSessionVerified else { return true }
         return await authenticateBiometrically(for: .paymentRequest)
     }
 
@@ -8841,6 +8914,9 @@ final class AppModel: ObservableObject {
             biometricKind = proof.kind
             biometricSignInPermanentlyUnavailable = false
             biometricPINRecoveryRequiresEnrollmentRemoval = false
+            // One proof, whatever asked for it: the face that unlocked the app is the face the
+            // wallet and the pay screen were going to ask for a moment later.
+            recordForegroundVerification()
             switch purpose {
             case .returningSignIn:
                 biometricAccessState = .authorized

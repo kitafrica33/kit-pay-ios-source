@@ -786,7 +786,7 @@ final class ShareViewController: UIViewController {
         searchBar.isHidden = destinations.isEmpty
         tableView.isHidden = destinations.isEmpty
         emptyLabel.isHidden = !destinations.isEmpty
-        emptyLabel.text = "No chats are available yet. Unlock Kit Pay to refresh your chats, then share again."
+        emptyLabel.text = "No chats are available yet. Open Kit Pay once to refresh your chats, then share again."
         actionButton.isHidden = destinations.isEmpty
         actionButton.removeTarget(nil, action: nil, for: .allEvents)
         actionButton.addTarget(self, action: #selector(sendTapped), for: .touchUpInside)
@@ -846,10 +846,17 @@ final class ShareViewController: UIViewController {
         secondaryActionButton.isHidden = true
     }
 
+    /// Offers Retry only where retrying can actually change the answer. Build 105 offered it
+    /// for every refusal, including the one it could never clear, so the customer tapped
+    /// "Retry" against a permanent failure — and the sentence it appended ("Unlock Kit Pay and
+    /// share again") described a lock that no longer gates sharing at all.
     private func presentInitialAuthorizationFailure(_ error: Error) {
         present(failure: (error as? LocalizedError)?.errorDescription)
+        let refusal = (error as? MessagingProcessBroker.Failure)?.shareRefusal
+        let allowsRetry = refusal.map(ShareAuthorizationPolicy.allowsRetry) ?? true
+        guard allowsRetry else { return }
         hasInitialAuthorizationFailure = true
-        messageLabel.text = (messageLabel.text ?? "") + " Tap Retry to check sharing access again."
+        messageLabel.text = (messageLabel.text ?? "") + " Tap Retry to check again."
         configureActionButton(title: "Retry", filled: true)
         actionButton.removeTarget(nil, action: nil, for: .allEvents)
         actionButton.addTarget(self, action: #selector(retryInitialAuthorization), for: .touchUpInside)
@@ -874,9 +881,9 @@ final class ShareViewController: UIViewController {
         hasRequestedDestination = false
         searchBar.text = nil
         statusSymbol.isHidden = true
-        titleLabel.text = "Unlock sharing"
-        summaryLabel.text = "Checking secure sharing…"
-        messageLabel.text = "Authenticate to choose a chat. Nothing is sent until you tap Send."
+        titleLabel.text = "Checking sharing"
+        summaryLabel.text = "Looking for your chats…"
+        messageLabel.text = "Nothing is sent until you tap Send."
         messageLabel.textColor = .secondaryLabel
         spinner.isHidden = false
         spinner.startAnimating()

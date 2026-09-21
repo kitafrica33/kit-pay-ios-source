@@ -298,6 +298,11 @@ final class ChatMediaThumbnailStore: ObservableObject {
 
     private let cache = NSCache<NSString, UIImage>()
 
+    /// One decode per cache key at a time. Photo bubbles, album cells and the media gallery can
+    /// all come on screen for the same attachment within a frame or two of each other; without
+    /// this they each start their own ImageIO pass over the same bytes.
+    private var inFlightDecodes: [NSString: Task<UIImage?, Never>] = [:]
+
     private init() {
         cache.totalCostLimit = Self.totalCostLimitBytes
     }
@@ -306,6 +311,20 @@ final class ChatMediaThumbnailStore: ObservableObject {
 
     func cachedThumbnail(forKey key: String, maxPixel: CGFloat) -> UIImage? {
         cache.object(forKey: Self.cacheKey(key, maxPixel: maxPixel))
+    }
+
+    /// The best thumbnail already held for a key, at whatever size some other surface decoded it.
+    ///
+    /// The full-screen gallery uses this to put the photo the customer just tapped on screen
+    /// *immediately* while its own full-resolution decode runs: the bubble, the album cell or the
+    /// video poster has already paid for a thumbnail, and showing a slightly soft photo beats
+    /// showing a spinner on every swipe. Probing the rungs costs eleven O(1) cache lookups and
+    /// needs no index of its own, so `NSCache`'s silent eviction cannot make it lie.
+    func bestCachedThumbnail(forKey key: String) -> UIImage? {
+        for rung in ChatMediaDisplayBucket.ladder.reversed() {
+            if let image = cache.object(forKey: "\(key)#\(rung)" as NSString) { return image }
+        }
+        return nil
     }
 
     func store(_ image: UIImage, forKey key: String, maxPixel: CGFloat) {
@@ -318,48 +337,57 @@ final class ChatMediaThumbnailStore: ObservableObject {
 
     func removeAll() {
         cache.removeAllObjects()
+        for task in inFlightDecodes.values { task.cancel() }
+        inFlightDecodes.removeAll()
     }
 
-    // MARK: Image thumbnails (synchronous downscaled decode)
+    // MARK: Image thumbnails (asynchronous, off the main thread)
 
-    /// Returns the cached thumbnail if present; otherwise decodes a downscaled thumbnail straight
-    /// from the compressed bytes (never inflating the full-size image), caches, and returns it.
-    /// The data closure is only evaluated on a cache miss.
-    func thumbnail(
-        forKey key: String,
-        maxPixel: CGFloat,
-        from data: @autoclosure () -> Data?
-    ) -> UIImage? {
-        if let cached = cachedThumbnail(forKey: key, maxPixel: maxPixel) {
-            return cached
-        }
-        guard let bytes = data(),
-              let image = ChatMediaImageDecoder.downsample(
-                  data: bytes,
-                  maximumPixelSize: Int(Self.pixelSize(forMaxPixel: maxPixel))
-              )
-        else { return nil }
-        store(image, forKey: key, maxPixel: maxPixel)
-        return image
-    }
-
-    /// File-backed counterpart for a sender original or persisted receiver cache. ImageIO reads
-    /// and downsamples from the URL directly, so an album cell never materializes the complete
-    /// compressed photo merely to draw a thumbnail.
-    func thumbnail(
+    /// The decoding counterpart of `cachedThumbnail(forKey:maxPixel:)`, for every surface that is
+    /// drawn while a finger is on the screen.
+    ///
+    /// ImageIO has no async entry point, so a `body` that decodes is a `body` that blocks the
+    /// main thread for the whole decode — which is exactly what made a mixed-media thread stutter
+    /// on build 105. Callers read the cache synchronously in `body` and call this from a `.task`;
+    /// the pixels land in the cache and the next render picks them up.
+    func decodedThumbnail(
         forKey key: String,
         maxPixel: CGFloat,
         fromFileURL url: URL
-    ) -> UIImage? {
-        if let cached = cachedThumbnail(forKey: key, maxPixel: maxPixel) {
-            return cached
+    ) async -> UIImage? {
+        await decoded(forKey: key, maxPixel: maxPixel) { pixels in
+            ChatMediaImageDecoder.downsample(fileURL: url, maximumPixelSize: pixels)
         }
-        guard let image = ChatMediaImageDecoder.downsample(
-            fileURL: url,
-            maximumPixelSize: Int(Self.pixelSize(forMaxPixel: maxPixel))
-        ) else {
-            return nil
+    }
+
+    /// Inline/legacy blob counterpart. The bytes are captured once, not per decode attempt.
+    func decodedThumbnail(
+        forKey key: String,
+        maxPixel: CGFloat,
+        from data: Data?
+    ) async -> UIImage? {
+        guard let data else { return nil }
+        return await decoded(forKey: key, maxPixel: maxPixel) { pixels in
+            ChatMediaImageDecoder.downsample(data: data, maximumPixelSize: pixels)
         }
+    }
+
+    private func decoded(
+        forKey key: String,
+        maxPixel: CGFloat,
+        using decode: @escaping @Sendable (Int) -> UIImage?
+    ) async -> UIImage? {
+        if let cached = cachedThumbnail(forKey: key, maxPixel: maxPixel) { return cached }
+        let entry = Self.cacheKey(key, maxPixel: maxPixel)
+        if let existing = inFlightDecodes[entry] { return await existing.value }
+        let pixels = Self.pixelSize(forMaxPixel: maxPixel)
+        // Detached, not a child task: scrolling a bubble off screen cancels its `.task`, and the
+        // next row to ask for the same photo would otherwise inherit the cancellation.
+        let task = Task.detached(priority: .userInitiated) { decode(pixels) }
+        inFlightDecodes[entry] = task
+        let image = await task.value
+        inFlightDecodes.removeValue(forKey: entry)
+        guard let image else { return nil }
         store(image, forKey: key, maxPixel: maxPixel)
         return image
     }
@@ -378,7 +406,7 @@ final class ChatMediaThumbnailStore: ObservableObject {
         if let cached = cachedThumbnail(forKey: key, maxPixel: maxPixel) {
             return cached
         }
-        let pixelEdge = Self.pixelSize(forMaxPixel: maxPixel)
+        let pixelEdge = CGFloat(Self.pixelSize(forMaxPixel: maxPixel))
         guard let image = await ChatVideoPosterGenerator.thumbnail(
             forKey: key,
             data: data,
@@ -403,7 +431,7 @@ final class ChatMediaThumbnailStore: ObservableObject {
         if let cached = cachedThumbnail(forKey: key, maxPixel: maxPixel) {
             return cached
         }
-        let pixelEdge = Self.pixelSize(forMaxPixel: maxPixel)
+        let pixelEdge = CGFloat(Self.pixelSize(forMaxPixel: maxPixel))
         guard let image = await ChatVideoPosterGenerator.thumbnail(
             forKey: key,
             fileURL: url,
@@ -418,8 +446,11 @@ final class ChatMediaThumbnailStore: ObservableObject {
 
     // MARK: Internals
 
+    /// Keyed by the *rung*, not by the caller's point size. Two surfaces that draw the same photo
+    /// at similar sizes — a photo bubble and an album cell, or the same album on two screen
+    /// widths — then share one decoded entry instead of fragmenting a fixed byte budget.
     private static func cacheKey(_ key: String, maxPixel: CGFloat) -> NSString {
-        "\(key)#\(Int(maxPixel.rounded(.up)))" as NSString
+        "\(key)#\(pixelSize(forMaxPixel: maxPixel))" as NSString
     }
 
     private static func cost(of image: UIImage) -> Int {
@@ -427,10 +458,14 @@ final class ChatMediaThumbnailStore: ObservableObject {
         return cgImage.width * cgImage.height * 4
     }
 
-    /// Requested pixel edge for a point size: display scale, capped at 3x.
-    private static func pixelSize(forMaxPixel maxPixel: CGFloat) -> CGFloat {
-        let scale = min(max(UIScreen.main.scale, 1), 3)
-        return (maxPixel * scale).rounded(.up)
+    /// Requested pixel edge for a point size: display scale capped at 3x, quantised up to a
+    /// `ChatMediaDisplayBucket` rung so the request can never exceed what the surface draws by
+    /// more than the gap between two rungs.
+    static func pixelSize(forMaxPixel maxPixel: CGFloat) -> Int {
+        ChatMediaDisplayBucket.pixels(
+            forDisplayEdge: Double(maxPixel),
+            scale: Double(UIScreen.main.scale)
+        )
     }
 
 }

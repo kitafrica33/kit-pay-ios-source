@@ -1,13 +1,30 @@
-Chat scrolling is fixed. On a long conversation the timeline used to ignore a
-finger completely - the drag did nothing at all - because every render folded
-the whole message history on the main thread. The fold is now computed once per
-state change, so scrolling, flicking and dragging in a 2,000-message thread
-answer immediately. Please open your longest chats, tap "Jump to latest
-message", and drag straight away.
+Build 106 answers the four items of the 21 September device report.
 
-Sharing is steadier. Sharing a photo, video, file or link into Kit Pay from
-another app keeps a background assertion while it writes to the shared
-container, so iOS no longer ends the share the moment the sheet is put aside.
-Please share from Photos, Files and Safari, and try switching away mid-share.
+1. Sharing into Kit Pay works again. On build 105 a signed-in phone could not
+share anything: the sheet ended in "Nothing was sent. Sharing is locked or your
+account changed." Sharing no longer depends on Face ID or on the app being
+unlocked - biometric verification is for payments only - and a phone left in
+that refused state heals on the first launch of this build, with nothing to
+reset. Please share a photo, a video, a file and a link into Kit Pay from
+Photos, Files and Safari, including straight after a cold launch without
+unlocking anything, and while switching away mid-share.
+
+2. Scrolling a chat full of media. Photo, video, voice-note and document rows
+no longer decode anything while they are being drawn, and every bubble now asks
+for the size it actually shows instead of up to twelve times that. Please open
+your busiest thread and flick hard in both directions, over photos, voice notes
+and documents, then scroll back over rows you have already passed.
+
+3. Swiping left and right through media. Tap a photo in a chat - a single one,
+one inside a multi-photo message, or one that is still uploading - and swipe.
+Every photo and video in that conversation is now in the same gallery, in the
+order they were sent. Please swipe through several, rotate the phone, pinch to
+zoom and close.
+
+4. Verifying with Face ID. On the pay screen and on the home screen Kit Pay now
+asks once each time you come back to the app, not repeatedly, and what is
+underneath stays blurred until it succeeds. Cancel the prompt: the screen must
+stay blurred, with a Retry button, and nothing should flash into view before or
+after.
 
 Everything else should be unchanged. Please report anything that is not.

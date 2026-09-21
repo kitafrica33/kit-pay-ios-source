@@ -52,15 +52,19 @@ final class MessagingProcessBrokerTests: XCTestCase {
             confirmPrivateKey: confirmPrivateKey
         )
     }
-    private func credential(_ broker: MessagingProcessBroker) throws -> MessagingBiometricCredential {
-        try broker.withLock { try XCTUnwrap($0.authorityLocked()?.biometricCredential) }
-    }
-    private func assertShareFails(
-        _ broker: MessagingProcessBroker, _ message: String,
+    /// Names the refusal instead of merely asserting a throw. Build 105 collapsed six
+    /// conditions into one message, which is why its report could not be acted on.
+    private func assertShareRefusal(
+        _ broker: MessagingProcessBroker, _ expected: ShareAuthorizationPolicy.Refusal,
         file: StaticString = #filePath, line: UInt = #line
     ) async {
-        do { _ = try await broker.authorizeShare(); XCTFail(message, file: file, line: line) }
-        catch {}
+        do {
+            _ = try await broker.authorizeShare()
+            XCTFail("expected \(expected)", file: file, line: line)
+        } catch {
+            XCTAssertEqual((error as? MessagingProcessBroker.Failure)?.shareRefusal, expected,
+                           file: file, line: line)
+        }
     }
     private func installUnapprovedBiometricAuthority(
         _ broker: MessagingProcessBroker, legacyDomain: Data? = nil
@@ -98,207 +102,6 @@ final class MessagingProcessBrokerTests: XCTestCase {
         try broker.setSharingEnabled(true, accountID: account)
     }
 
-    /// Drives the same publication decision as AppModel, with the real broker underneath it.
-    /// The callbacks below deterministically interleave publication with Security work outside
-    /// the broker lock; no timing sleeps or simulated successful broker responses are used.
-    @discardableResult
-    private func publishDuringApproval(
-        _ broker: MessagingProcessBroker, gate: inout SharedMessagingApprovalPublicationGate,
-        epoch: UUID, accountID: String? = nil, securityEligible: Bool = true,
-        destinations: [SharedInboxDestination]? = nil
-    ) throws -> SharedMessagingApprovalPublicationGate.PublicationDecision {
-        let owner = accountID ?? account
-        let binding = gate.operation.flatMap {
-            try? broker.biometricBinding(accountID: owner, sessionID: $0.binding.sessionID)
-        }
-        let decision = gate.publicationDecision(
-            accountEpoch: epoch, accountID: owner, currentBinding: binding,
-            securityEligible: securityEligible
-        )
-        switch decision {
-        case .deferUntilApprovalFinishes:
-            break
-        case .deny:
-            gate.invalidate()
-            try broker.setSharingEnabled(false, accountID: nil)
-        case .publish:
-            do {
-                try broker.restoreBiometricSharingDestinations(destinations ?? [destination], accountID: owner)
-            } catch {
-                try broker.setSharingEnabled(false, accountID: nil)
-            }
-        }
-        return decision
-    }
-
-    func testUncoordinatedFirstApprovalReproducesPublicationDenialRace() throws {
-        let bio = authenticator(), app = broker(biometrics: bio)
-        try prepare(app)
-        try installUnapprovedBiometricAuthority(app, legacyDomain: Data("legacy92".utf8))
-        var noApprovalCoordination = SharedMessagingApprovalPublicationGate()
-        bio.onCreate = {
-            try self.publishDuringApproval(app, gate: &noApprovalCoordination, epoch: UUID())
-        }
-
-        XCTAssertThrowsError(try approve(app))
-        XCTAssertNil(try app.withLock { try $0.authorityLocked()?.biometricCredential })
-        XCTAssertThrowsError(try app.scope())
-    }
-
-    func testApprovalPublicationDefersMigrationRefreshUntilCredentialCommits() async throws {
-        let bio = authenticator(), app = broker(biometrics: bio)
-        try prepare(app)
-        try installUnapprovedBiometricAuthority(app, legacyDomain: Data("legacy92".utf8))
-        let epoch = UUID(), binding = try app.biometricBinding(accountID: account, sessionID: session)
-        var gate = SharedMessagingApprovalPublicationGate()
-        let operation = try XCTUnwrap(gate.begin(accountEpoch: epoch, binding: binding))
-        let updated = SharedInboxDestination(conversationID: nil, recipientUserID: recipient,
-                                            displayName: "Updated recipient", kind: .contact, memberCount: nil)
-        var deferred = 0
-        bio.onCreate = {
-            for _ in 0..<3 {
-                XCTAssertEqual(try self.publishDuringApproval(
-                    app, gate: &gate, epoch: epoch, destinations: [updated]
-                ), .deferUntilApprovalFinishes)
-                deferred += 1
-            }
-        }
-
-        try approve(app)
-        XCTAssertEqual(deferred, 3)
-        XCTAssertTrue(gate.finish(operation))
-        XCTAssertNil(gate.operation)
-        XCTAssertEqual(try publishDuringApproval(app, gate: &gate, epoch: epoch, destinations: [updated]), .publish)
-        let share = broker()
-        let directory = try await share.authorizeShare()
-        XCTAssertEqual(directory.destinations, [updated])
-        XCTAssertThrowsError(try app.scope(), "Publishing must not grant the main app the extension's lease")
-    }
-
-    func testUncoordinatedCredentialReuseReproducesChangedDirectoryRace() throws {
-        let bio = authenticator(), app = broker(biometrics: bio)
-        try prepare(app, biometric: true)
-        try app.suspendSharingForBiometricLock(accountID: account)
-        let original = try credential(app)
-        var noApprovalCoordination = SharedMessagingApprovalPublicationGate()
-        let updated = SharedInboxDestination(conversationID: nil, recipientUserID: recipient,
-                                            displayName: "Changed while unlocking", kind: .contact, memberCount: nil)
-        bio.onCredentialExists = {
-            try self.publishDuringApproval(app, gate: &noApprovalCoordination,
-                                           epoch: UUID(), destinations: [updated])
-        }
-
-        XCTAssertThrowsError(try approve(app))
-        XCTAssertEqual(try credential(app), original)
-        XCTAssertThrowsError(try app.scope())
-    }
-
-    func testApprovalPublicationDefersChangedDirectoryWhileReusingCredential() async throws {
-        let bio = authenticator(), app = broker(biometrics: bio)
-        try prepare(app, biometric: true)
-        try app.suspendSharingForBiometricLock(accountID: account)
-        let original = try credential(app)
-        let epoch = UUID(), binding = try app.biometricBinding(accountID: account, sessionID: session)
-        var gate = SharedMessagingApprovalPublicationGate()
-        let operation = try XCTUnwrap(gate.begin(accountEpoch: epoch, binding: binding))
-        let updated = SharedInboxDestination(conversationID: nil, recipientUserID: recipient,
-                                            displayName: "Latest chat order", kind: .contact, memberCount: nil)
-        bio.onCredentialExists = {
-            XCTAssertEqual(try self.publishDuringApproval(
-                app, gate: &gate, epoch: epoch, destinations: [updated]
-            ), .deferUntilApprovalFinishes)
-        }
-
-        try approve(app)
-        bio.onCredentialExists = nil
-        XCTAssertEqual(try credential(app), original)
-        XCTAssertEqual(bio.creations, 1, "An unchanged credential must not be recreated")
-        XCTAssertTrue(gate.finish(operation))
-        try publishDuringApproval(app, gate: &gate, epoch: epoch, destinations: [updated])
-        let directory = try await broker().authorizeShare()
-        XCTAssertEqual(directory.destinations, [updated])
-    }
-
-    func testApprovalPublicationNeverDefersSecurityDenialDuringCreation() throws {
-        let bio = authenticator(), app = broker(biometrics: bio)
-        try prepare(app)
-        let epoch = UUID(), binding = try app.biometricBinding(accountID: account, sessionID: session)
-        var gate = SharedMessagingApprovalPublicationGate()
-        let operation = try XCTUnwrap(gate.begin(accountEpoch: epoch, binding: binding))
-        bio.onCreate = {
-            XCTAssertEqual(try self.publishDuringApproval(
-                app, gate: &gate, epoch: epoch, securityEligible: false
-            ), .deny)
-        }
-
-        XCTAssertThrowsError(try approve(app))
-        XCTAssertNil(gate.operation)
-        XCTAssertFalse(gate.finish(operation))
-        XCTAssertNil(try app.withLock { try $0.authorityLocked()?.biometricCredential })
-        XCTAssertThrowsError(try app.scope())
-    }
-
-    func testApprovalPublicationRejectsChangedAccountEpochDuringCreation() throws {
-        let bio = authenticator(), app = broker(biometrics: bio)
-        try prepare(app)
-        var gate = SharedMessagingApprovalPublicationGate()
-        let operation = try XCTUnwrap(gate.begin(
-            accountEpoch: UUID(), binding: app.biometricBinding(accountID: account, sessionID: session)
-        ))
-        bio.onCreate = {
-            XCTAssertEqual(try self.publishDuringApproval(app, gate: &gate, epoch: UUID()), .deny)
-        }
-
-        XCTAssertThrowsError(try approve(app))
-        XCTAssertFalse(gate.finish(operation))
-        XCTAssertNil(gate.operation)
-        XCTAssertThrowsError(try app.scope())
-    }
-
-    func testApprovalPublicationRejectsSameAccountReplacementSession() throws {
-        let bio = authenticator(), app = broker(biometrics: bio)
-        try prepare(app)
-        let epoch = UUID(), binding = try app.biometricBinding(accountID: account, sessionID: session)
-        var gate = SharedMessagingApprovalPublicationGate()
-        let operation = try XCTUnwrap(gate.begin(accountEpoch: epoch, binding: binding))
-        let replacement = tokens("replacement", sessionID: UUID().uuidString.lowercased())
-        bio.onCreate = {
-            try app.withLock { locked in
-                var authority = MessagingProcessBroker.Authority.revoked
-                authority.session = replacement
-                try locked.saveAuthorityLocked(authority)
-            }
-            XCTAssertEqual(try self.publishDuringApproval(app, gate: &gate, epoch: epoch), .deny)
-        }
-
-        XCTAssertThrowsError(try approve(app))
-        XCTAssertFalse(gate.finish(operation))
-        XCTAssertNil(gate.operation)
-        XCTAssertEqual(try app.withLock { try $0.authorityLocked()?.session }, replacement)
-        XCTAssertNil(try app.withLock { try $0.authorityLocked()?.biometricCredential })
-    }
-
-    func testApprovalPublicationCleanupCannotRetireSuccessorOrSurviveCancellation() throws {
-        let app = broker()
-        try prepare(app)
-        let binding = try app.biometricBinding(accountID: account, sessionID: session)
-        var gate = SharedMessagingApprovalPublicationGate()
-        let old = try XCTUnwrap(gate.begin(accountEpoch: UUID(), binding: binding))
-        gate.invalidate()
-        let current = try XCTUnwrap(gate.begin(accountEpoch: UUID(), binding: binding))
-        XCTAssertFalse(gate.finish(old))
-        XCTAssertTrue(gate.owns(current))
-
-        do {
-            defer { gate.finish(current) }
-            try approve(app, confirmPrivateKey: { throw CancellationError() })
-            XCTFail("A cancelled private-key confirmation must not approve sharing")
-        } catch is CancellationError {}
-        XCTAssertNil(gate.operation)
-        XCTAssertNil(try app.withLock { try $0.authorityLocked()?.biometricCredential })
-        XCTAssertThrowsError(try app.scope())
-    }
-
     func testSeparateBrokerInstancesObserveOneCanonicalCryptoStore() throws {
         let app = broker(), share = broker()
         try prepare(app)
@@ -315,106 +118,199 @@ final class MessagingProcessBrokerTests: XCTestCase {
         XCTAssertEqual(try share.snapshot(scope: scope).crypto?.syncCursor, "extension-advanced")
     }
 
-    func testBiometricLockKeepsOnlyEncryptedDirectoryAndAuthenticatesLocally() async throws {
-        let bio = authenticator(), app = broker()
+    // MARK: The 1.0.17 (105) share-sheet defect
+    //
+    // The owner's signed-in handset refused every share with one sentence:
+    //
+    //     Nothing was sent. Sharing is locked or your account changed.
+    //     Unlock Kit Pay and share again. Tap Retry to check sharing access again.
+    //
+    // Sharing had been made a consequence of the app's *screen* lock: publication demanded a
+    // `.biometryCurrentSet` Keychain credential, the share sheet demanded a process-local
+    // unlock lease it could never hold, and a failure at either point wrote a hard denial that
+    // also deleted the published recipients — so the only way back was the publication that
+    // was failing. Biometrics are a payment control (owner directive, 2026-09-21). These cases
+    // hold that line against the real broker and a real app-group directory.
+
+    /// The reported defect, reproduced from a signed-in fixture with the app "locked", then
+    /// shown to share. The extension's authenticator is handed in so the test fails if the
+    /// broker so much as asks it a question.
+    func testSignedInLockedAppStillShares() async throws {
+        let app = broker()
         try prepare(app, biometric: true)
-        try app.suspendSharingForBiometricLock(accountID: account)
-        let share = broker(biometrics: bio)
-        XCTAssertThrowsError(try share.scope())
-        let result = try await share.authorizeShare()
-        XCTAssertEqual(result.destinations, [destination])
-        XCTAssertEqual(bio.authentications, 1)
+        try app.suspendSharingForBiometricLock(accountID: account)   // the app's UI lock
+        let extensionBiometrics = authenticator(domain: "share-extension-domain")
+        let share = broker(biometrics: extensionBiometrics)
+        let directory = try await share.authorizeShare()
+        XCTAssertEqual(directory.destinations, [destination])
+        XCTAssertEqual(directory.accountID, account)
+        XCTAssertEqual(extensionBiometrics.authentications, 0,
+                       "the share sheet must never wait on Face ID")
         XCTAssertEqual(try share.approvedDestinations(scope: share.scope()), [destination])
-        XCTAssertThrowsError(try app.scope(), "The sibling process must not inherit the share lease")
+    }
+
+    /// The recipients stay encrypted at rest whether the app is locked or not: removing the
+    /// lock gate removed a gate, not the encryption.
+    func testPublishedRecipientsRemainEncryptedAtRest() throws {
+        let app = broker()
+        try prepare(app, biometric: true)
         let encrypted = try Data(contentsOf: root.appendingPathComponent("destinations.secure"))
         XCTAssertNil(encrypted.range(of: Data(destination.displayName.utf8)))
+        XCTAssertNil(encrypted.range(of: Data(recipient.utf8)))
     }
 
-    func testLeaseExpiresAtFiveMinutesAndCannotBeReusedAcrossRestart() async throws {
-        let clock = BrokerTestClock(), app = broker(clock: clock)
-        try prepare(app, biometric: true)
-        try app.suspendSharingForBiometricLock(accountID: account)
-        _ = try await app.authorizeShare()
-        let scope = try app.scope()
-        clock.value = 299
-        _ = try app.snapshot(scope: scope)
-        clock.value = 300
-        XCTAssertThrowsError(try app.snapshot(scope: scope))
-        XCTAssertThrowsError(try broker().scope())
-    }
-
-    func testInvalidatedGuardCannotAuthenticateOrSilentlyRepair() async throws {
-        let bio = authenticator(), app = broker(biometrics: bio)
-        try prepare(app, biometric: true)
-        try app.suspendSharingForBiometricLock(accountID: account)
-        let original = try credential(app)
-        guardBackend.invalidate(original)
-        await assertShareFails(app, "An invalidated OS guard must reject sharing")
-        XCTAssertThrowsError(try app.scope())
-        try app.publishApprovedDestinations(
-            [destination], accountID: account, requiresBiometricUnlock: true
-        )
-        try app.restoreBiometricSharingDestinations([destination], accountID: account)
-        await assertShareFails(app, "Directory publication and restore must not repair a guard")
-        XCTAssertEqual(try credential(app), original)
-        XCTAssertEqual(bio.creations, 1)
-        XCTAssertFalse(guardBackend.isAvailable(original))
-        XCTAssertThrowsError(try app.scope())
-    }
-
-    func testHardDenialWinsEvenWhenKeychainUpdateFails() async throws {
-        let failWrites = BrokerTestClock(), bio = authenticator()
-        let app = broker(biometrics: bio, check: { _ in
-            if failWrites.value > 0 { throw CocoaError(.fileWriteNoPermission) }
-        })
-        try prepare(app, biometric: true)
-        _ = try await app.authorizeShare()
-        let scope = try app.scope()
-        failWrites.value = 1
-        XCTAssertThrowsError(try app.setSharingEnabled(false, accountID: account))
-        XCTAssertThrowsError(try app.snapshot(scope: scope))
-        XCTAssertThrowsError(try broker().scope())
-        do { _ = try await app.authorizeShare(); XCTFail("Hard denial must block another biometric prompt") }
-        catch { XCTAssertEqual(bio.authentications, 1) }
-    }
-
-    func testHardDenialDuringAuthenticationCannotInstallLease() async throws {
-        let bio = authenticator(), app = broker(biometrics: bio)
-        try prepare(app, biometric: true)
-        try app.suspendSharingForBiometricLock(accountID: account)
-        bio.onAuthenticate = { try app.setSharingEnabled(false, accountID: self.account) }
-        do { _ = try await app.authorizeShare(); XCTFail("Revoked authentication result must be discarded") }
-        catch { XCTAssertThrowsError(try app.scope()) }
-    }
-
-    func testSessionReplacementDuringAuthenticationCannotInstallLease() async throws {
-        let bio = authenticator(), app = broker(biometrics: bio)
-        try prepare(app, biometric: true)
-        try app.suspendSharingForBiometricLock(accountID: account)
-        let sessionStore = SessionStore(account: "authentication-replacement", messagingBroker: app)
-        let replacement = tokens("replacement", sessionID: UUID().uuidString.lowercased())
-        bio.onAuthenticate = { try await sessionStore.save(replacement) }
-        do { _ = try await app.authorizeShare(); XCTFail("Account/session generation changed") }
-        catch { XCTAssertThrowsError(try app.scope()) }
-        XCTAssertNil(try app.withLock { try $0.authorityLocked()?.biometricCredential })
-    }
-
-    func testBackgroundRestoreRequiresExistingCredentialAndStillRequiresAuthentication() async throws {
-        let bio = authenticator(), app = broker(biometrics: bio)
+    /// A handset upgrading from 105 still carries that build's wreckage: an authority that
+    /// claims `requiresBiometricUnlock`, no credential to satisfy it, and a `.biometric`
+    /// denial marker. It must share anyway, with no repair step the customer has to find.
+    func testLegacyBuild105ContainerSharesWithoutAnyRepair() async throws {
+        let app = broker()
         try prepare(app)
-        try app.setSharingEnabled(false, accountID: account)
-        XCTAssertThrowsError(try app.restoreBiometricSharingDestinations([destination], accountID: account))
-        XCTAssertEqual(bio.creations, 0)
-        try approve(app)
-        try app.publishApprovedDestinations([destination], accountID: account, requiresBiometricUnlock: true)
-        try app.setSharingEnabled(true, accountID: account)
-        try app.setSharingEnabled(false, accountID: account)
+        try installUnapprovedBiometricAuthority(app)
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: root.appendingPathComponent("sharing.denied").path))
+        let share = broker()
+        let afterLegacyContainer = try await share.authorizeShare().destinations
+        XCTAssertEqual(afterLegacyContainer, [destination])
+    }
+
+    /// Ordinary publication migrates the legacy fields away rather than honouring them, so the
+    /// next launch is not still carrying a requirement nothing can satisfy.
+    func testPublicationRetiresLegacyBiometricAuthorityFields() throws {
+        let app = broker()
+        try prepare(app)
+        try installUnapprovedBiometricAuthority(app)
+        try app.publishApprovedDestinations([destination], accountID: account,
+                                            requiresBiometricUnlock: true)
+        let authority = try app.withLock { try XCTUnwrap($0.authorityLocked()) }
+        XCTAssertNil(authority.requiresBiometricUnlock)
+        XCTAssertNil(authority.biometricCredential)
+        XCTAssertNil(authority.biometricDomainState)
+        XCTAssertFalse(try app.biometricSharingRequired(accountID: account, sessionID: session))
+    }
+
+    /// The app's lock observer used to write the `.biometric` denial. It now clears one, and
+    /// still may not touch a real revocation.
+    func testLockStateClearsALegacyBiometricDenialButNeverAHardOne() async throws {
+        let app = broker()
+        try prepare(app)
+        try installUnapprovedBiometricAuthority(app)
+        try app.suspendSharingForBiometricLock(accountID: account)
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: root.appendingPathComponent("sharing.denied").path))
+        try app.setSharingEnabled(false, accountID: nil)          // a real revocation
+        try app.suspendSharingForBiometricLock(accountID: account)
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: root.appendingPathComponent("sharing.denied").path))
+        await assertShareRefusal(broker(), .revoked)
+    }
+
+    /// A cold launch that restores the account while the UI stays locked publishes and enables
+    /// sharing like any other launch; it used to publish and then deny.
+    func testLockedColdLaunchRestorePublishesAndEnablesSharing() async throws {
+        let app = broker()
+        try app.withLock { locked in
+            var authority = MessagingProcessBroker.Authority.revoked
+            authority.session = tokens()
+            try locked.saveAuthorityLocked(authority)
+            try locked.saveRecordLocked(.init(generation: authority.generation, accountID: account,
+                                              crypto: .empty))
+        }
         try app.restoreBiometricSharingDestinations([destination], accountID: account)
-        XCTAssertThrowsError(try app.scope())
-        _ = try await app.authorizeShare()
-        _ = try app.scope()
-        XCTAssertEqual(bio.authentications, 1)
-        XCTAssertEqual(bio.creations, 1)
+        let afterRestore = try await broker().authorizeShare().destinations
+        XCTAssertEqual(afterRestore, [destination])
+        XCTAssertTrue(try app.withLock { try XCTUnwrap($0.authorityLocked()).sharingEnabled })
+    }
+
+    /// Switching the app lock off is a settings change, not a sharing revocation. Build 105
+    /// hard-denied here, which deleted the directory and left nothing able to restore it.
+    func testTurningTheAppLockOffKeepsSharingAlive() async throws {
+        let app = broker()
+        try prepare(app, biometric: true)
+        let binding = try app.biometricBinding(accountID: account, sessionID: session)
+        try app.disableBiometricSharing(binding: binding)
+        let afterLockOff = try await broker().authorizeShare().destinations
+        XCTAssertEqual(afterLockOff, [destination])
+    }
+
+    /// A biometric approval can no longer deny anything either — but it still requires the
+    /// caller's fresh private-key proof, so a rejected proof is still an error.
+    func testApprovalKeepsItsProofContractAndCannotDenySharing() async throws {
+        let app = broker()
+        try prepare(app)
+        struct ProofRejected: Error {}
+        let binding = try app.biometricBinding(accountID: account, sessionID: session)
+        XCTAssertThrowsError(try app.approveBiometricSharing(
+            binding: binding, enrollmentKeyID: enrollmentKeyID,
+            confirmPrivateKey: { throw ProofRejected() }
+        ))
+        let afterRejectedProof = try await broker().authorizeShare().destinations
+        XCTAssertEqual(afterRejectedProof, [destination],
+                       "a failed wallet proof must not take the share sheet away")
+        try approve(app)
+        let afterProof = try await broker().authorizeShare().destinations
+        XCTAssertEqual(afterProof, [destination])
+    }
+
+    // MARK: The refusals that survive
+
+    /// Signing out is still a revocation: the marker and the deletion of the directory happen
+    /// in the same locked section.
+    func testRevocationStillClosesSharingAndRemovesTheDirectory() async throws {
+        let app = broker()
+        try prepare(app)
+        try app.setSharingEnabled(false, accountID: nil)
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: root.appendingPathComponent("destinations.secure").path))
+        await assertShareRefusal(broker(), .revoked)
+    }
+
+    /// An empty container is "signed out", not "locked or your account changed".
+    func testEmptyContainerRefusesAsSignedOut() async throws {
+        await assertShareRefusal(broker(), .signedOut)
+    }
+
+    /// Signed in but nothing published yet: recoverable by opening the app, and said so.
+    func testUnpublishedAccountRefusesAsNotPrepared() async throws {
+        let app = broker()
+        try app.withLock { locked in
+            var authority = MessagingProcessBroker.Authority.revoked
+            authority.session = tokens()
+            try locked.saveAuthorityLocked(authority)
+            try locked.saveRecordLocked(.init(generation: authority.generation, accountID: account,
+                                              crypto: .empty))
+        }
+        await assertShareRefusal(broker(), .notPrepared)
+    }
+
+    /// "Account changed" now means exactly that, and only that.
+    func testReplacedSessionStillFailsClosedForTheCapturedScope() throws {
+        let app = broker()
+        try prepare(app)
+        let captured = try app.scope()
+        try app.withLock { locked in
+            var next = MessagingProcessBroker.Authority.revoked
+            next.session = tokens("second-login", sessionID: "40000000-0000-4000-8000-000000000004")
+            try locked.saveAuthorityLocked(next)
+            try locked.saveRecordLocked(.init(generation: next.generation, accountID: account,
+                                              crypto: .empty))
+        }
+        XCTAssertThrowsError(try broker().snapshot(scope: captured)) { error in
+            XCTAssertEqual((error as? MessagingProcessBroker.Failure)?.shareRefusal, .sessionReplaced)
+        }
+    }
+
+    /// No refusal this broker can produce may repeat the sentence the owner was shown.
+    func testNoRefusalRepeatsTheReportedSentence() throws {
+        let reported = "Sharing is locked or your account changed. Unlock Kit Pay and share again."
+        var failures: [MessagingProcessBroker.Failure] = [
+            .unavailable, .corrupt, .accountChanged, .staleState, .queueFull,
+        ]
+        failures += ShareAuthorizationPolicy.Refusal.allCases.map { .shareRefused($0) }
+        for failure in failures {
+            let message = try XCTUnwrap(failure.errorDescription)
+            XCTAssertNotEqual(message, reported)
+            XCTAssertFalse(message.lowercased().contains("is locked"), message)
+        }
     }
 
     func testDurableRevocationFencesOldTokensWithoutKeychainTombstone() throws {
@@ -462,432 +358,6 @@ final class MessagingProcessBrokerTests: XCTestCase {
         }
         do { try await sessionStore.save(tokens("replacement")); XCTFail("Injected replacement failure") } catch {}
         XCTAssertNil(try broker().withLock { try $0.authorityLocked()?.session })
-    }
-
-    func testIdenticalBiometricBackgroundRestoreDoesNotInvalidateActiveShareLease() async throws {
-        let app = broker(), share = broker()
-        try prepare(app, biometric: true)
-        try app.suspendSharingForBiometricLock(accountID: account)
-        _ = try await share.authorizeShare()
-        let scope = try share.scope()
-        try app.restoreBiometricSharingDestinations([destination], accountID: account)
-        XCTAssertEqual(try share.scope(), scope)
-    }
-
-    func testDifferentProcessDomainsUseSameGuardAndSeparateAuthentication() async throws {
-        let appBio = authenticator(domain: "app-opaque-domain")
-        let shareBio = authenticator(domain: "extension-opaque-domain")
-        let app = broker(biometrics: appBio), share = broker(biometrics: shareBio)
-        try prepare(app, biometric: true)
-        XCTAssertNotEqual(appBio.processLocalDomain, shareBio.processLocalDomain)
-        XCTAssertEqual(try credential(app), try credential(share))
-        try app.suspendSharingForBiometricLock(accountID: account)
-
-        let authorized = try await share.authorizeShare()
-        XCTAssertEqual(authorized.destinations, [destination])
-        XCTAssertEqual(appBio.authentications, 0)
-        XCTAssertEqual(shareBio.authentications, 1)
-        XCTAssertEqual(appBio.creations, 1)
-        XCTAssertEqual(shareBio.creations, 0)
-        XCTAssertThrowsError(try app.scope(), "The app must not inherit the extension's proof")
-
-        _ = try await app.authorizeShare()
-        XCTAssertEqual(appBio.authentications, 1)
-        XCTAssertEqual(try app.scope(), try share.scope())
-    }
-
-    func testMissingGuardCannotAuthenticateOrBeRecreatedBySharePaths() async throws {
-        let appBio = authenticator(), shareBio = authenticator()
-        let app = broker(biometrics: appBio), share = broker(biometrics: shareBio)
-        try prepare(app, biometric: true)
-        try app.suspendSharingForBiometricLock(accountID: account)
-        let original = try credential(app)
-        guardBackend.remove(original)
-
-        await assertShareFails(share, "A missing protected item must reject sharing")
-        XCTAssertThrowsError(try share.scope())
-        try app.publishApprovedDestinations([destination], accountID: account, requiresBiometricUnlock: true)
-        try app.restoreBiometricSharingDestinations([destination], accountID: account)
-        await assertShareFails(share, "Refreshing the directory must not recreate a deleted guard")
-        XCTAssertEqual(try credential(app), original)
-        XCTAssertEqual(appBio.creations, 1)
-        XCTAssertEqual(shareBio.creations, 0)
-        XCTAssertFalse(guardBackend.isAvailable(original))
-        XCTAssertThrowsError(try share.scope())
-    }
-
-    func testGuardRemovedAfterProtectedReadCannotInstallLease() async throws {
-        let bio = authenticator(), app = broker(biometrics: bio)
-        try prepare(app, biometric: true)
-        try app.suspendSharingForBiometricLock(accountID: account)
-        let original = try credential(app), backend = try XCTUnwrap(guardBackend)
-        bio.onAuthenticate = { backend.remove(original) }
-
-        await assertShareFails(app, "An old successful read cannot authorize a now-missing guard")
-        XCTAssertEqual(bio.authentications, 1)
-        XCTAssertThrowsError(try app.scope())
-        XCTAssertThrowsError(try broker().scope())
-    }
-
-    func testGuardInvalidatedAfterProtectedReadCannotInstallLease() async throws {
-        let bio = authenticator(), app = broker(biometrics: bio)
-        try prepare(app, biometric: true)
-        try app.suspendSharingForBiometricLock(accountID: account)
-        let original = try credential(app), backend = try XCTUnwrap(guardBackend)
-        bio.onAuthenticate = { backend.invalidate(original) }
-
-        await assertShareFails(app, "Known guard invalidation after a valid OS read must reject the result")
-        XCTAssertEqual(bio.authentications, 1)
-        XCTAssertThrowsError(try app.scope())
-    }
-
-    func testPublicationRestoreAndAuthorizationCannotCreateFirstCredential() async throws {
-        let bio = authenticator(), app = broker(biometrics: bio)
-        try prepare(app)
-        try installUnapprovedBiometricAuthority(app)
-
-        XCTAssertThrowsError(try app.publishApprovedDestinations(
-            [destination], accountID: account, requiresBiometricUnlock: true
-        ))
-        XCTAssertThrowsError(try app.restoreBiometricSharingDestinations([destination], accountID: account))
-        await assertShareFails(app, "Only explicit main-app proof may create the first credential")
-        XCTAssertEqual(bio.creations, 0)
-        XCTAssertEqual(bio.authentications, 0)
-        XCTAssertNil(try app.withLock { try $0.authorityLocked()?.biometricCredential })
-        XCTAssertThrowsError(try app.scope())
-    }
-
-    func testLegacyDomainOnlyAuthorityRequiresExplicitMainProofMigration() async throws {
-        let bio = authenticator(domain: "extension-domain"), app = broker(biometrics: bio)
-        let legacy = Data("build-92-app-domain".utf8)
-        try prepare(app)
-        try installUnapprovedBiometricAuthority(app, legacyDomain: legacy)
-        XCTAssertEqual(try app.withLock { try $0.authorityLocked()?.biometricDomainState }, legacy)
-        XCTAssertThrowsError(try app.publishApprovedDestinations(
-            [destination], accountID: account, requiresBiometricUnlock: true
-        ))
-        XCTAssertThrowsError(try app.restoreBiometricSharingDestinations([destination], accountID: account))
-        await assertShareFails(app, "Legacy opaque domain metadata is not a sharing credential")
-        XCTAssertEqual(bio.creations, 0)
-
-        try approve(app)
-        XCTAssertEqual(bio.creations, 1)
-        XCTAssertNil(try app.withLock { try $0.authorityLocked()?.biometricDomainState })
-        XCTAssertTrue(try credential(app).isStructurallyValid)
-        XCTAssertThrowsError(try app.scope(), "Migration itself must leave sharing denied")
-        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("destinations.secure").path))
-        try app.restoreBiometricSharingDestinations([destination], accountID: account)
-        XCTAssertThrowsError(try app.scope())
-        _ = try await app.authorizeShare()
-        XCTAssertEqual(bio.authentications, 1)
-        _ = try app.scope()
-    }
-
-    func testStaleOrMismatchedBindingCannotCreateCredential() throws {
-        let bio = authenticator(), app = broker(biometrics: bio)
-        try prepare(app)
-        let current = try app.biometricBinding(accountID: account, sessionID: session)
-        let mismatches = [
-            MessagingBiometricBinding(generation: UUID(), accountID: account, sessionID: session),
-            MessagingBiometricBinding(generation: current.generation, accountID: recipient, sessionID: session),
-            MessagingBiometricBinding(generation: current.generation, accountID: account, sessionID: recipient),
-        ]
-        for binding in mismatches {
-            XCTAssertThrowsError(try app.approveBiometricSharing(
-                binding: binding, enrollmentKeyID: enrollmentKeyID, confirmPrivateKey: {}
-            ))
-        }
-        XCTAssertThrowsError(try app.biometricBinding(accountID: recipient, sessionID: session))
-        XCTAssertThrowsError(try app.biometricBinding(accountID: account, sessionID: recipient))
-        XCTAssertEqual(bio.creations, 0)
-        XCTAssertNil(try app.withLock { try $0.authorityLocked()?.biometricCredential })
-    }
-
-    func testInvalidEnrollmentKeyCannotCreateCredential() throws {
-        let bio = authenticator(), app = broker(biometrics: bio)
-        try prepare(app)
-        for invalidKey in ["", String(repeating: "a", count: 63), String(repeating: "A", count: 64),
-                           String(repeating: "g", count: 64), String(repeating: "a", count: 65)] {
-            XCTAssertThrowsError(try approve(app, enrollmentKeyID: invalidKey))
-        }
-        XCTAssertEqual(bio.creations, 0)
-    }
-
-    func testExplicitMainProofRepairReplacesGuardAndFencesOldShareLease() async throws {
-        let appBio = authenticator(), app = broker(biometrics: appBio), share = broker()
-        try prepare(app, biometric: true)
-        try app.suspendSharingForBiometricLock(accountID: account)
-        _ = try await share.authorizeShare()
-        let oldScope = try share.scope(), original = try credential(app)
-        guardBackend.invalidate(original)
-
-        try approve(app)
-        let replacement = try credential(app)
-        XCTAssertNotEqual(replacement.id, original.id)
-        XCTAssertTrue(guardBackend.isAvailable(replacement))
-        XCTAssertEqual(appBio.creations, 2)
-        XCTAssertThrowsError(try share.snapshot(scope: oldScope))
-        XCTAssertThrowsError(try share.scope())
-        await assertShareFails(share, "Repair must not clear durable denial or publish a directory")
-
-        try app.restoreBiometricSharingDestinations([destination], accountID: account)
-        _ = try await share.authorizeShare()
-        XCTAssertNotEqual(try share.scope(), oldScope)
-        XCTAssertEqual(try share.approvedDestinations(scope: share.scope()), [destination])
-        XCTAssertEqual(appBio.authentications, 0)
-    }
-
-    func testRepairDuringAuthenticationRejectsProofForRetiredCredential() async throws {
-        let shareBio = authenticator(), app = broker(), share = broker(biometrics: shareBio)
-        try prepare(app, biometric: true)
-        try app.suspendSharingForBiometricLock(accountID: account)
-        let original = try credential(app)
-        shareBio.onAuthenticate = {
-            try self.approve(app, enrollmentKeyID: String(repeating: "b", count: 64))
-            try app.restoreBiometricSharingDestinations([self.destination], accountID: self.account)
-        }
-
-        await assertShareFails(share, "An old credential's proof cannot grant a lease after repair")
-        XCTAssertNotEqual(try credential(app), original)
-        XCTAssertThrowsError(try share.scope())
-        shareBio.onAuthenticate = nil
-        _ = try await share.authorizeShare()
-        _ = try share.scope()
-        XCTAssertEqual(shareBio.authentications, 2)
-    }
-
-    func testSessionReplacementDuringGuardCreationRemovesUncommittedGuard() throws {
-        let bio = authenticator(), app = broker(biometrics: bio)
-        try prepare(app)
-        let replacement = tokens("new-session", sessionID: UUID().uuidString.lowercased())
-        bio.onCreate = {
-            try app.withLock { locked in
-                var next = MessagingProcessBroker.Authority.revoked
-                next.session = replacement
-                try locked.saveAuthorityLocked(next)
-                try locked.saveRecordLocked(.init(generation: next.generation, accountID: self.account, crypto: .empty))
-            }
-        }
-
-        XCTAssertThrowsError(try approve(app))
-        let staged = try XCTUnwrap(bio.createdCredentials.last)
-        XCTAssertFalse(guardBackend.isAvailable(staged))
-        XCTAssertTrue(bio.removedCredentials.contains(staged))
-        XCTAssertNil(try app.withLock { try $0.authorityLocked()?.biometricCredential })
-        XCTAssertEqual(try app.withLock { try $0.authorityLocked()?.session }, replacement)
-        XCTAssertThrowsError(try app.scope())
-    }
-
-    func testLogoutDuringGuardCreationRemovesUncommittedGuard() throws {
-        let bio = authenticator(), app = broker(biometrics: bio)
-        try prepare(app)
-        let binding = try app.biometricBinding(accountID: account, sessionID: session)
-        bio.onCreate = {
-            try app.withLock { try $0.revokeSessionLocked(generation: binding.generation) }
-        }
-
-        XCTAssertThrowsError(try approve(app))
-        let staged = try XCTUnwrap(bio.createdCredentials.last)
-        XCTAssertFalse(guardBackend.isAvailable(staged))
-        XCTAssertTrue(bio.removedCredentials.contains(staged))
-        XCTAssertNil(try app.withLock { try $0.authorityLocked()?.session })
-        XCTAssertThrowsError(try broker().scope())
-    }
-
-    func testRepeatedHardDenialDuringGuardCreationRejectsApproval() throws {
-        let bio = authenticator(), app = broker(biometrics: bio)
-        try prepare(app)
-        bio.onCreate = {
-            XCTAssertEqual(try app.withLock { try $0.authorityLocked()?.sharingEnabled }, false)
-            // Approval has already reserved a hard denial. This fresh denial must still fence it.
-            try app.setSharingEnabled(false, accountID: self.account)
-        }
-
-        XCTAssertThrowsError(try approve(app))
-        let staged = try XCTUnwrap(bio.createdCredentials.last)
-        XCTAssertFalse(guardBackend.isAvailable(staged))
-        XCTAssertTrue(bio.removedCredentials.contains(staged))
-        XCTAssertNil(try app.withLock { try $0.authorityLocked()?.biometricCredential })
-        XCTAssertThrowsError(try app.scope())
-    }
-
-    func testPrivateKeyConfirmationFailureRemovesUncommittedGuardAndKeepsDenial() async throws {
-        let bio = authenticator(), app = broker(biometrics: bio)
-        try prepare(app)
-        XCTAssertThrowsError(try approve(app, confirmPrivateKey: {
-            XCTAssertEqual(bio.creations, 1, "Confirmation must run after current-set ACL insertion")
-            throw MessagingBiometricCredentialError.invalidatedCredential
-        }))
-        let staged = try XCTUnwrap(bio.createdCredentials.last)
-        XCTAssertFalse(guardBackend.isAvailable(staged))
-        XCTAssertTrue(bio.removedCredentials.contains(staged))
-        XCTAssertNil(try app.withLock { try $0.authorityLocked()?.biometricCredential })
-        XCTAssertThrowsError(try app.scope())
-        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("destinations.secure").path))
-        await assertShareFails(app, "Enrollment changes during insertion must preserve durable denial")
-        XCTAssertEqual(bio.authentications, 0)
-    }
-
-    func testDenialDuringPrivateKeyConfirmationRejectsNewGuard() throws {
-        let bio = authenticator(), app = broker(biometrics: bio)
-        try prepare(app)
-        XCTAssertThrowsError(try approve(app, confirmPrivateKey: {
-            try app.setSharingEnabled(false, accountID: self.account)
-        }))
-        let staged = try XCTUnwrap(bio.createdCredentials.last)
-        XCTAssertFalse(guardBackend.isAvailable(staged))
-        XCTAssertTrue(bio.removedCredentials.contains(staged))
-        XCTAssertNil(try app.withLock { try $0.authorityLocked()?.biometricCredential })
-        XCTAssertThrowsError(try app.scope())
-    }
-
-    func testAuthorityWriteFailureAfterCreationKeepsGuardAndDurableDenial() async throws {
-        let failWrites = BrokerTestClock(), bio = authenticator()
-        let app = broker(biometrics: bio, check: { authority in
-            if failWrites.value > 0, authority.biometricCredential != nil {
-                throw CocoaError(.fileWriteNoPermission)
-            }
-        })
-        try prepare(app)
-        failWrites.value = 1
-        XCTAssertThrowsError(try approve(app))
-        let staged = try XCTUnwrap(bio.createdCredentials.last)
-        // An uncertain authority write may have published the descriptor; do not destroy its guard.
-        XCTAssertTrue(guardBackend.isAvailable(staged))
-        XCTAssertFalse(bio.removedCredentials.contains(staged))
-        XCTAssertEqual(try app.withLock { try $0.authorityLocked()?.sharingEnabled }, false)
-        XCTAssertThrowsError(try app.scope())
-        XCTAssertThrowsError(try broker().scope())
-        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("destinations.secure").path))
-        await assertShareFails(app, "An uncertain authority write must leave sharing durably denied")
-        XCTAssertEqual(bio.authentications, 0)
-    }
-
-    func testReusingCredentialConfirmsPrivateKeyWithoutRotatingLease() async throws {
-        let bio = authenticator(), app = broker(biometrics: bio), share = broker()
-        try prepare(app, biometric: true)
-        try app.suspendSharingForBiometricLock(accountID: account)
-        _ = try await share.authorizeShare()
-        let original = try credential(app), scope = try share.scope()
-        var confirmations = 0
-        try approve(app, confirmPrivateKey: { confirmations += 1 })
-        XCTAssertEqual(confirmations, 1)
-        XCTAssertEqual(bio.creations, 1)
-        XCTAssertEqual(try credential(app), original)
-        XCTAssertEqual(try share.scope(), scope)
-    }
-
-    func testCredentialReuseRechecksDenialAfterMetadataProbe() throws {
-        let bio = authenticator(), app = broker(biometrics: bio)
-        try prepare(app, biometric: true)
-        bio.onCredentialExists = { try app.setSharingEnabled(false, accountID: self.account) }
-        XCTAssertThrowsError(try approve(app))
-        XCTAssertEqual(bio.creations, 1)
-        XCTAssertThrowsError(try app.scope())
-    }
-
-    func testCredentialReuseRechecksDenialAfterPrivateKeyConfirmation() throws {
-        let bio = authenticator(), app = broker(biometrics: bio)
-        try prepare(app, biometric: true)
-        XCTAssertThrowsError(try approve(app, confirmPrivateKey: {
-            try app.setSharingEnabled(false, accountID: self.account)
-        }))
-        XCTAssertEqual(bio.creations, 1)
-        XCTAssertThrowsError(try app.scope())
-    }
-
-    func testOrdinaryPublicationCannotDisableExistingBiometricRequirement() async throws {
-        let app = broker()
-        try prepare(app, biometric: true)
-        try app.suspendSharingForBiometricLock(accountID: account)
-        let original = try credential(app)
-        XCTAssertThrowsError(try app.publishApprovedDestinations(
-            [destination], accountID: account, requiresBiometricUnlock: false
-        ))
-        XCTAssertEqual(try credential(app), original)
-        XCTAssertEqual(try app.withLock { try $0.authorityLocked()?.requiresBiometricUnlock }, true)
-        XCTAssertThrowsError(try app.scope())
-        _ = try await app.authorizeShare()
-        _ = try app.scope()
-    }
-
-    func testOrdinaryPublicationCannotDisableLegacyBiometricRequirement() async throws {
-        let bio = authenticator(), app = broker(biometrics: bio)
-        let legacy = Data("legacy-required-enrollment".utf8)
-        try prepare(app)
-        try installUnapprovedBiometricAuthority(app, legacyDomain: legacy)
-        XCTAssertThrowsError(try app.publishApprovedDestinations(
-            [destination], accountID: account, requiresBiometricUnlock: false
-        ))
-        XCTAssertEqual(try app.withLock { try $0.authorityLocked()?.requiresBiometricUnlock }, true)
-        XCTAssertEqual(try app.withLock { try $0.authorityLocked()?.biometricDomainState }, legacy)
-        await assertShareFails(app, "A background publication must not bypass legacy biometric approval")
-        XCTAssertEqual(bio.creations, 0)
-        XCTAssertEqual(bio.authentications, 0)
-        XCTAssertThrowsError(try app.scope())
-    }
-
-    func testExplicitBoundDisableClearsCredentialButRequiresFreshPublication() async throws {
-        let app = broker(), shareBio = authenticator(), share = broker(biometrics: shareBio)
-        try prepare(app, biometric: true)
-        try app.suspendSharingForBiometricLock(accountID: account)
-        _ = try await share.authorizeShare()
-        let oldScope = try share.scope()
-        let binding = try app.biometricBinding(accountID: account, sessionID: session)
-
-        // Models an explicitly verified settings change or server-verified PIN recovery.
-        try app.disableBiometricSharing(binding: binding)
-        XCTAssertNil(try app.withLock { try $0.authorityLocked()?.biometricCredential })
-        XCTAssertNil(try app.withLock { try $0.authorityLocked()?.biometricDomainState })
-        XCTAssertEqual(try app.withLock { try $0.authorityLocked()?.requiresBiometricUnlock }, false)
-        XCTAssertThrowsError(try share.snapshot(scope: oldScope))
-        XCTAssertThrowsError(try share.scope())
-        await assertShareFails(share, "Disabling the biometric setting must not itself publish sharing access")
-        XCTAssertEqual(shareBio.authentications, 1)
-
-        try app.publishApprovedDestinations([destination], accountID: account, requiresBiometricUnlock: false)
-        try app.setSharingEnabled(true, accountID: account)
-        _ = try await share.authorizeShare()
-        XCTAssertNotEqual(try share.scope(), oldScope)
-        XCTAssertEqual(shareBio.authentications, 1)
-    }
-
-    func testStaleBindingCannotDisableSuccessorSessionBiometrics() async throws {
-        let app = broker()
-        try prepare(app, biometric: true)
-        let stale = try app.biometricBinding(accountID: account, sessionID: session)
-        let replacement = tokens("successor", sessionID: UUID().uuidString.lowercased())
-        let sessionStore = SessionStore(account: "disable-successor", messagingBroker: app)
-        try await sessionStore.save(replacement)
-        XCTAssertNil(try app.withLock { try $0.authorityLocked()?.biometricCredential })
-        let binding = try app.biometricBinding(accountID: account, sessionID: replacement.sessionId)
-        try app.approveBiometricSharing(
-            binding: binding, enrollmentKeyID: enrollmentKeyID, confirmPrivateKey: {}
-        )
-        let successorCredential = try credential(app)
-
-        XCTAssertThrowsError(try app.disableBiometricSharing(binding: stale))
-        XCTAssertEqual(try credential(app), successorCredential)
-        XCTAssertEqual(try app.withLock { try $0.authorityLocked()?.requiresBiometricUnlock }, true)
-        XCTAssertEqual(try app.withLock { try $0.authorityLocked()?.session }, replacement)
-    }
-
-    func testExplicitDisableWriteFailureKeepsDurableDenial() async throws {
-        let failWrites = BrokerTestClock(), bio = authenticator()
-        let app = broker(biometrics: bio, check: { _ in
-            if failWrites.value > 0 { throw CocoaError(.fileWriteNoPermission) }
-        })
-        try prepare(app, biometric: true)
-        let oldScope = try app.scope()
-        let binding = try app.biometricBinding(accountID: account, sessionID: session)
-        failWrites.value = 1
-
-        XCTAssertThrowsError(try app.disableBiometricSharing(binding: binding))
-        XCTAssertThrowsError(try app.snapshot(scope: oldScope))
-        XCTAssertThrowsError(try broker().scope())
-        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("destinations.secure").path))
-        await assertShareFails(app, "A failed settings write must preserve durable denial")
-        XCTAssertEqual(bio.authentications, 0)
     }
 
     func testConcurrentRefreshesShareNonceAndAdoptOnlyNewerCredentials() async throws {

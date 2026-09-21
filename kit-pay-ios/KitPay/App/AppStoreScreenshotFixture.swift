@@ -2,11 +2,19 @@ import Foundation
 
 #if DEBUG && APP_STORE_SCREENSHOTS
 
+// Inside the guard on purpose: test_fixture_screenshots.py pins the first three lines of this
+// file so the fixture can never reach a release build, and UIKit is needed only to synthesise
+// the mixed-media thread's real JPEG bytes -- which is fixture-only work by definition.
+#if canImport(UIKit)
+    import UIKit
+#endif
+
 /// Synthetic App Store artwork data. This code is present only in the dedicated Debug screenshot
 /// build and still requires an explicit launch argument, so an ordinary Debug run cannot enter it.
 enum AppStoreScreenshotFixture {
     static let launchArgument = "--kit-app-store-screenshot-fixture-v1"
     static let longHistoryLaunchArgument = "--kit-chat-long-history-scroll-fixture-v1"
+    static let mixedMediaLaunchArgument = "--kit-chat-mixed-media-scroll-fixture-v1"
     static let compiledFixtureMarker = "KITPAY_APP_STORE_SCREENSHOT_FIXTURE_V1"
     static let presentationNow = timestamp("2026-08-24T09:41:00Z")
 
@@ -155,6 +163,9 @@ enum AppStoreScreenshotFixture {
         if isActive && ProcessInfo.processInfo.arguments.contains(longHistoryLaunchArgument) {
             populateLongHistory(in: &fixture)
         }
+        if isActive && ProcessInfo.processInfo.arguments.contains(mixedMediaLaunchArgument) {
+            populateMixedMediaThread(in: &fixture)
+        }
         return fixture
     }
 
@@ -212,6 +223,271 @@ enum AppStoreScreenshotFixture {
         fixture.conversations = workloadConversations
         fixture.messages = workloadMessages
         fixture.calls = []
+    }
+
+    // MARK: - Mixed-media scrolling workload
+
+    /// 320 messages of every kind the chat can draw, in one thread.
+    ///
+    /// Owner report against 1.0.17 build 105: *"still some lagging between chats ... scrolling
+    /// through chat messages lags"*. `populateLongHistory` above could not show it: 2,000 plain
+    /// text rows are cheap, and the cost the owner was feeling lives in the media rows -- image
+    /// decode, poster generation, waveforms, size formatting -- none of which a text thread
+    /// exercises at all.
+    ///
+    /// So this seeds the thread the report describes: photos, videos, documents, audio files and
+    /// voice notes interleaved with text, at real sizes. The photos carry **real JPEG bytes**,
+    /// synthesised once and shared, because a decode is the whole point -- a fixture that fed the
+    /// bubbles a 1 x 1 pixel would measure nothing. Sharing the bytes costs the fixture nothing
+    /// and costs the *app* nothing either: every bubble's thumbnail cache key is minted from its
+    /// own message id, so all 96 photo rows still pay for a full decode exactly as they would
+    /// from 96 different originals.
+    ///
+    /// Everything is local. No network, no uploads, no descriptor round-trip: `pendingAttachment`
+    /// plus inline `attachmentData` is the legacy single-attachment path that `SecureMediaLoadPolicy`
+    /// resolves entirely from persisted state, so the workload is identical on a Mac with no
+    /// connectivity and reproducible run to run.
+    private static func populateMixedMediaThread(in fixture: inout PersistedState) {
+        let peerID = aminaID
+        let conversationID = primaryConversationID
+        let newestDate = presentationNow
+        let photos = syntheticPhotos()
+
+        var messages: [LocalMessage] = []
+        messages.reserveCapacity(rowCountForMixedMedia)
+
+        for row in 1 ... rowCountForMixedMedia {
+            let date = newestDate.addingTimeInterval(-Double((rowCountForMixedMedia - row) * 45))
+            let outgoing = row.isMultiple(of: 3)
+            let id = UUID(uuidString: String(format: "34000000-0000-4000-8000-%012d", row))!
+            let recordID = String(format: "35000000-0000-4000-8000-%012d", row)
+            var message = LocalMessage(
+                id: id,
+                serverMessageId: String(format: "36000000-0000-4000-8000-%012d", row),
+                conversationId: conversationID,
+                senderId: outgoing ? ownerID : peerID,
+                body: "",
+                createdAt: date,
+                sentAt: date,
+                state: outgoing ? .read : .received,
+                failureReason: nil,
+                isOutgoing: outgoing
+            )
+
+            switch row % 10 {
+            case 1:
+                message.body = String(format: "Quick one about the shop float, line %03d", row)
+            case 2:
+                message.body = """
+                Longer note \(row). The stall opens at six, the float is ready, and the \
+                supplier wants the balance by Friday. I have put the receipts in this \
+                thread so we can both find them later without digging through e-mail.
+                """
+            case 3, 8:
+                // Landscape photo. `photo(_:at:)` is nil only on a platform with no UIKit, where
+                // there is nothing to profile anyway -- never an out-of-range crash in a fixture.
+                guard let photo = photo(photos, at: row) else { break }
+                message.attachmentData = photo
+                message.pendingAttachment = LocalPendingAttachment(
+                    mediaType: "image/jpeg",
+                    caption: row % 8 == 0 ? "Stock count \(row)" : nil,
+                    localStorageKey: nil,
+                    byteCount: photo.count
+                )
+                message.localMediaRecords = [mediaRecord(
+                    id: recordID, messageID: id, conversationID: conversationID,
+                    outgoing: outgoing, mediaType: "image/jpeg", fileSize: photo.count,
+                    duration: nil, date: date
+                )]
+            case 4:
+                // Portrait photo with a caption, the tallest bubble in the thread.
+                guard let photo = photo(photos, at: row + 1) else { break }
+                message.attachmentData = photo
+                message.pendingAttachment = LocalPendingAttachment(
+                    mediaType: "image/jpeg",
+                    caption: "Delivery note \(row) -- please check the third line",
+                    localStorageKey: nil,
+                    byteCount: photo.count
+                )
+                message.localMediaRecords = [mediaRecord(
+                    id: recordID, messageID: id, conversationID: conversationID,
+                    outgoing: outgoing, mediaType: "image/jpeg", fileSize: photo.count,
+                    duration: nil, date: date
+                )]
+            case 5:
+                // Video: a poster row plus a size label, and a gallery stop between photos.
+                let bytes = 12_400_000 + row * 9_137
+                message.pendingAttachment = LocalPendingAttachment(
+                    mediaType: "video/mp4",
+                    caption: nil,
+                    localStorageKey: String(
+                        format: "37000000-0000-4000-8000-%012d", row
+                    ),
+                    byteCount: bytes
+                )
+                message.localMediaRecords = [mediaRecord(
+                    id: recordID, messageID: id, conversationID: conversationID,
+                    outgoing: outgoing, mediaType: "video/mp4", fileSize: bytes,
+                    duration: 18 + Double(row % 40), date: date
+                )]
+            case 6:
+                // Voice note: audio/mp4 is the one MIME that reads as a microphone recording.
+                let bytes = 96_000 + row * 311
+                message.pendingAttachment = LocalPendingAttachment(
+                    mediaType: "audio/mp4",
+                    caption: nil,
+                    localStorageKey: String(
+                        format: "38000000-0000-4000-8000-%012d", row
+                    ),
+                    byteCount: bytes
+                )
+                message.localMediaRecords = [mediaRecord(
+                    id: recordID, messageID: id, conversationID: conversationID,
+                    outgoing: outgoing, mediaType: "audio/mp4", fileSize: bytes,
+                    duration: 4 + Double(row % 55), date: date
+                )]
+            case 7:
+                // An imported audio file, which is a different bubble from a voice note.
+                let bytes = 3_200_000 + row * 1_013
+                message.pendingAttachment = LocalPendingAttachment(
+                    mediaType: "audio/mpeg",
+                    caption: "Radio advert cut \(row)",
+                    localStorageKey: String(
+                        format: "39000000-0000-4000-8000-%012d", row
+                    ),
+                    byteCount: bytes
+                )
+                message.localMediaRecords = [mediaRecord(
+                    id: recordID, messageID: id, conversationID: conversationID,
+                    outgoing: outgoing, mediaType: "audio/mpeg", fileSize: bytes,
+                    duration: 30 + Double(row % 90), date: date
+                )]
+            case 9:
+                let bytes = 240_000 + row * 907
+                message.pendingAttachment = LocalPendingAttachment(
+                    mediaType: "application/pdf",
+                    caption: "Invoice-\(2_600 + row).pdf",
+                    localStorageKey: String(
+                        format: "3a000000-0000-4000-8000-%012d", row
+                    ),
+                    byteCount: bytes
+                )
+                message.localMediaRecords = [mediaRecord(
+                    id: recordID, messageID: id, conversationID: conversationID,
+                    outgoing: outgoing, mediaType: "application/pdf", fileSize: bytes,
+                    duration: nil, date: date
+                )]
+            default:
+                message.body = "Noted \(row)"
+                if row > 10 {
+                    message.replyToServerMessageID = String(
+                        format: "36000000-0000-4000-8000-%012d", row - 4
+                    )
+                }
+            }
+            messages.append(message)
+        }
+
+        fixture.contacts = [contact(peerID, "Amina Demo", "+256 700 000 001", "amina_demo")]
+        fixture.conversations = [Conversation(
+            id: conversationID,
+            title: "Amina Demo",
+            participantUserIds: [ownerID, peerID],
+            unreadCount: 0,
+            updatedAt: newestDate
+        )]
+        fixture.messages = messages
+        fixture.calls = []
+    }
+
+    /// Hundreds, as the report asked for, and an exact multiple of the ten-kind cycle so every
+    /// kind appears the same number of times run to run.
+    static let rowCountForMixedMedia = 320
+
+    private static func photo(_ photos: [Data], at row: Int) -> Data? {
+        guard !photos.isEmpty else { return nil }
+        return photos[row % photos.count]
+    }
+
+    private static func mediaRecord(
+        id: String,
+        messageID: UUID,
+        conversationID: String,
+        outgoing: Bool,
+        mediaType: String,
+        fileSize: Int,
+        duration: TimeInterval?,
+        date: Date
+    ) -> LocalMediaRecord {
+        LocalMediaRecord(
+            id: id,
+            messageID: messageID,
+            conversationID: conversationID,
+            direction: outgoing ? .sent : .received,
+            mediaType: mediaType,
+            fileSize: fileSize,
+            duration: duration,
+            outboundKeyMaterialBase64: nil,
+            localStorageKind: .encryptedState,
+            localStorageKey: nil,
+            remoteEncryptedObjectID: nil,
+            processingState: .ready,
+            uploadState: .notRequired,
+            downloadState: .notRequired,
+            encryptionState: .decrypted,
+            availabilityState: .localOriginal,
+            createdAt: date,
+            updatedAt: date
+        )
+    }
+
+    /// Six real JPEGs at phone-camera proportions.
+    ///
+    /// Gradients and bands rather than noise on purpose: a photograph compresses, and a fixture
+    /// of random pixels would be several times larger than anything a customer ever sends, which
+    /// would make the decode look worse than it is. Sizes are the three aspect ratios the bubble
+    /// actually has to lay out -- landscape, portrait and square.
+    private static func syntheticPhotos() -> [Data] {
+        #if canImport(UIKit)
+            let sizes: [CGSize] = [
+                CGSize(width: 2_016, height: 1_512),
+                CGSize(width: 1_512, height: 2_016),
+                CGSize(width: 1_600, height: 1_600),
+                CGSize(width: 2_016, height: 1_134),
+                CGSize(width: 1_170, height: 2_080),
+                CGSize(width: 1_800, height: 1_350),
+            ]
+            return sizes.enumerated().compactMap { index, size in
+                let format = UIGraphicsImageRendererFormat()
+                format.scale = 1
+                format.opaque = true
+                let renderer = UIGraphicsImageRenderer(size: size, format: format)
+                let image = renderer.image { context in
+                    let hue = CGFloat(index) / CGFloat(sizes.count)
+                    UIColor(hue: hue, saturation: 0.45, brightness: 0.92, alpha: 1)
+                        .setFill()
+                    context.fill(CGRect(origin: .zero, size: size))
+                    for band in 0 ..< 24 {
+                        let fraction = CGFloat(band) / 24
+                        UIColor(
+                            hue: (hue + fraction * 0.3).truncatingRemainder(dividingBy: 1),
+                            saturation: 0.5,
+                            brightness: 0.35 + fraction * 0.5,
+                            alpha: 1
+                        ).setFill()
+                        context.fill(CGRect(
+                            x: 0,
+                            y: size.height * fraction,
+                            width: size.width,
+                            height: size.height / 24
+                        ))
+                    }
+                }
+                return image.jpegData(compressionQuality: 0.85)
+            }
+        #else
+            return []
+        #endif
     }
 
     static var communicationPreferences: CommunicationPreferencesDTO {

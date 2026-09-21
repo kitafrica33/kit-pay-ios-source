@@ -432,5 +432,52 @@ class ReadinessTests(unittest.TestCase):
                 READINESS.verify_app_and_unused_build(invalid, "africa.kit.pay.ios", "1.0.16", "62")
 
 
+class XCTestAutoclosureTests(unittest.TestCase):
+    """`XCTAssert…` takes its arguments as autoclosures, and an autoclosure cannot `await`.
+
+    Xcode says `'async' call in an autoclosure that does not support concurrency` — but only
+    on a Mac, half way through a paid build. The rule is mechanical, so it belongs on Linux:
+    a Codemagic run that dies on it costs ten minutes of the free macOS budget, which is what
+    it cost on 2026-09-21. Evaluate the awaited value into a `let` and assert on the value.
+    """
+
+    SUITES = ("KitPayTests", "KitPayUITests")
+    CALL = re.compile(r"\bXCT[A-Za-z]+\(")
+
+    def offenders(self, source: str):
+        """Yield (index, call) for every XCTest call whose argument list contains `await`."""
+        for match in self.CALL.finditer(source):
+            depth, i = 1, match.end()
+            while i < len(source) and depth:
+                if source[i] == "(":
+                    depth += 1
+                elif source[i] == ")":
+                    depth -= 1
+                i += 1
+            arguments = source[match.end():i - 1]
+            if re.search(r"(?<![A-Za-z0-9_.])await(?![A-Za-z0-9_])", arguments):
+                yield match.start(), match.group(0) + arguments.split("\n")[0]
+
+    def test_no_xctest_argument_awaits_anywhere_in_the_test_targets(self):
+        for suite in self.SUITES:
+            for path in sorted((ROOT / suite).glob("*.swift")):
+                source = path.read_text()
+                for index, call in self.offenders(source):
+                    line = source.count("\n", 0, index) + 1
+                    self.fail(f"{suite}/{path.name}:{line} awaits inside an XCTest "
+                              f"autoclosure — hoist it into a `let` first: {call.strip()[:110]}")
+
+    def test_the_rule_catches_the_call_that_broke_the_build(self):
+        broken = ("XCTAssertEqual(try await broker().authorizeShare().destinations, "
+                  "[destination],\n    \"message\")\n")
+        self.assertEqual([call for _, call in self.offenders(broken)][0].split("\n")[0],
+                         "XCTAssertEqual(try await broker().authorizeShare().destinations, "
+                         "[destination],")
+        fixed = ("let shared = try await broker().authorizeShare().destinations\n"
+                 "XCTAssertEqual(shared, [destination])\n")
+        self.assertEqual(list(self.offenders(fixed)), [])
+        self.assertEqual(list(self.offenders('XCTAssertEqual(name, "awaited")\n')), [])
+
+
 if __name__ == "__main__":
     unittest.main()

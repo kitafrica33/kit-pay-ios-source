@@ -66,3 +66,75 @@ final class ConversationProjectionCache<Value> {
         value = nil
     }
 }
+
+/// What one conversation *layout* derivation was computed from.
+///
+/// `ConversationProjectionKey` answers "are these the same messages?". This answers "would the
+/// six whole-thread folds that turn those messages into rows produce the same rows?" — which
+/// needs three more things the projection does not care about: whether the screen is in
+/// selection mode (albums are broken up for it), who "you" are (reaction tallies mark your own),
+/// whether this is a group (only groups head a run with a sender's name), and the calendar day,
+/// because date separators say "Today" and stop being true at midnight.
+struct ConversationLayoutKey: Equatable {
+    let projection: ConversationProjectionKey
+    let isSelectingMessages: Bool
+    let isGroupConversation: Bool
+    let currentUserID: String?
+    /// Start of the day the separators were worded against.
+    let separatorDay: Date
+    /// Separator wording is localised; a locale change does not publish app state.
+    let localeIdentifier: String
+
+    init(
+        projection: ConversationProjectionKey,
+        isSelectingMessages: Bool,
+        isGroupConversation: Bool,
+        currentUserID: String?,
+        separatorDay: Date,
+        localeIdentifier: String
+    ) {
+        self.projection = projection
+        self.isSelectingMessages = isSelectingMessages
+        self.isGroupConversation = isGroupConversation
+        self.currentUserID = currentUserID
+        self.separatorDay = separatorDay
+        self.localeIdentifier = localeIdentifier
+    }
+}
+
+/// Holds the last layout derivation together with the key it was built from.
+///
+/// Deliberately a second type rather than a generic parameter on `ConversationProjectionCache`:
+/// that cache's shape is pinned by its own gates, and the two are read at different points in
+/// `body` for different reasons. What they share is the contract — fold only when the key
+/// changes, hand back the *same* value otherwise, and never answer a changed key.
+///
+/// The derivations this holds are the six whole-thread folds `ConversationView.conversationLayout`
+/// ran on every render after the projection memo landed: the timeline items (date separators and
+/// call rows), album membership, the id index albums read, suppressed reaction rows, reaction
+/// tallies, and which messages head a sender run. Each is O(every message in the thread), each
+/// allocates, and all six ran while a finger was on the screen.
+final class ConversationLayoutCache<Value> {
+    private var key: ConversationLayoutKey?
+    private var value: Value?
+    /// How many times `build` actually ran. Tests assert on this; the app never reads it.
+    private(set) var buildCount = 0
+
+    init() {}
+
+    /// The derivation for `key`, folding only when this is not the key already held.
+    func derivation(for key: ConversationLayoutKey, build: () -> Value) -> Value {
+        if let value, self.key == key { return value }
+        let built = build()
+        self.key = key
+        value = built
+        buildCount += 1
+        return built
+    }
+
+    /// Drops the memo without waiting for a key change.
+    func invalidate() {
+        key = nil
+        value = nil
+    }
+}

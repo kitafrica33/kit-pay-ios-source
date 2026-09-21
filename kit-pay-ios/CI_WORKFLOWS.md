@@ -162,3 +162,25 @@ Run all cheap checks with `python3 -m unittest discover -s .github/scripts/tests
 `test_ios_simulator_messaging.py` also exercises observed Xcode entitlement values,
 malformed/device binaries, exact group isolation, and signature failures using
 small local fixtures without additional builds or Simulators.
+
+## Codemagic: the `ios-testflight` lane
+
+Archiving and publication no longer need a GitHub runner or a borrowed Mac.
+`codemagic.yaml`'s `ios-testflight` workflow (`mac_mini_m2`, `max_build_duration: 55`)
+does the whole release on a hosted machine: it asserts the Xcode version, runs
+`.github/scripts/install_ios_dependencies.sh` before touching signing, reads the next
+build number live from App Store Connect (`get-latest-testflight-build-number`), refuses
+to compile unless the AGPL corresponding-source tag for that exact build number is
+anonymously reachable, fetches App Store profiles for all three signed bundles, builds
+the IPA with `xcode-project build-ipa`, re-checks the shipped `Info.plist`, extension
+bundle ids and app-group entitlement out of the artefact, and uploads.
+
+`submit_to_testflight` stays `false`: the upload itself makes the build available to the
+internal group, and waiting for Apple's processing on a paid-by-the-minute Mac buys
+nothing that Linux cannot watch for free. `submit_to_app_store` stays `false` in every
+case. Apple credentials live in the per-application `appstore` variable group, including
+a `CERTIFICATE_PRIVATE_KEY` so that `--create` reuses the team's distribution certificate
+instead of consuming a slot.
+
+First use: 1.0.17 (105), build `6ab1326c87be3300700dce00`, 13 min 38 s, `VALID` in App
+Store Connect. See [docs/status/ios-testflight-2026-09-21.md](docs/status/ios-testflight-2026-09-21.md).

@@ -101,6 +101,17 @@ class SharedApprovalPublicationTests(unittest.TestCase):
 
 
 STUBS = r'''
+#if os(Linux)
+    // swift-corelibs-Foundation has no NSLocking.withLock, so the fixture below would not
+    // build under a stock Linux toolchain. Darwin has had it since macOS 13.
+    extension NSLocking {
+        func withLock<R>(_ body: () throws -> R) rethrows -> R {
+            lock()
+            defer { unlock() }
+            return try body()
+        }
+    }
+#endif
 final class ApprovalBarrier: @unchecked Sendable {
     private let condition = NSCondition()
     private var started = false, released = false

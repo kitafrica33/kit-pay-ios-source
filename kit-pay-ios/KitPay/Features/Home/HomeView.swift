@@ -44,11 +44,43 @@ struct HomeView: View {
     @State private var modal: HomeModal?
     @State private var cover: HomeCover?
 
+    /// Home draws its content behind the gate, blurred, instead of replacing it.
+    ///
+    /// The owner asked for exactly this: *"the background has to be blurred until verified
+    /// successfully"*. The content is in the hierarchy from the very first frame and the blur is
+    /// a function of `homeAccessGranted`, which starts false -- so there is no frame in which a
+    /// balance is legible before the gate appears, and no swap between two different screens.
+    /// Only the reveal is animated (see `ForegroundVerificationPolicy.animationDuration`);
+    /// locking is instantaneous, because an animated lock is a flash of a clear balance.
+    ///
+    /// The blur is not the only protection. Under it the content is redacted for privacy, so the
+    /// digits are replaced rather than merely softened, and it takes no touches and is hidden
+    /// from VoiceOver.
     var body: some View {
-        Group {
-            if model.homeAccessGranted {
-                homeContent
-            } else {
+        let isUnlocked = model.homeAccessGranted
+        return ZStack {
+            homeContent
+                .blur(radius: ForegroundVerificationPolicy.blurRadius(isVerified: isUnlocked))
+                .redacted(
+                    reason: ForegroundVerificationPolicy.contentIsRedacted(isVerified: isUnlocked)
+                        ? .privacy
+                        : []
+                )
+                .allowsHitTesting(
+                    ForegroundVerificationPolicy.contentIsInteractive(isVerified: isUnlocked)
+                )
+                .accessibilityHidden(!isUnlocked)
+                .animation(
+                    .easeOut(
+                        duration: ForegroundVerificationPolicy.animationDuration(
+                            wasVerified: false,
+                            isVerified: isUnlocked
+                        )
+                    ),
+                    value: isUnlocked
+                )
+
+            if !isUnlocked {
                 KitBiometricGateView(
                     symbolName: model.biometricSymbolName,
                     title: "Wallet locked",
@@ -56,8 +88,10 @@ struct HomeView: View {
                     errorMessage: model.biometricErrorMessage,
                     isAuthorizing: model.homeBiometricState == .authorizing,
                     buttonTitle: "Open Home",
-                    authenticate: { await model.homeDidBecomeActive() }
+                    authenticate: { await model.homeDidBecomeActive() },
+                    backdrop: .blurredContent
                 )
+                .transition(.opacity)
             }
         }
     }

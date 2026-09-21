@@ -318,6 +318,67 @@ workflows:
       - $HOME/rt/chat-scroll-xcresults.tgz
       - $HOME/rt/KitPay-chat-scroll-pan.log
 
+  ui-verify-media:
+    name: Kit Pay chat media and verify-once (no session, no publish)
+    instance_type: mac_mini_m2
+    max_build_duration: 40
+    cache:
+      cache_paths:
+        - ~/Library/Caches/CocoaPods
+        - ~/Library/Caches/org.signal.libsignal
+        - ~/Library/Caches/org.swift.swiftpm
+        - $HOME/rt/KitPayPackages
+    environment:
+      xcode: 26.6
+      cocoapods: default
+    scripts:
+      - name: Machine facts
+        script: |
+          set -e
+          echo "host      : $(hostname)"
+          echo "xcode     : $(xcodebuild -version | tr '\n' ' ')"
+          git -C "$CM_BUILD_DIR" rev-parse HEAD
+          df -h / | tail -1
+      - name: Prepare dependencies and simulator
+        script: |
+          set -e
+          mkdir -p "$HOME/rt"
+          export RUNNER_TEMP="$HOME/rt"
+          cd "$CM_BUILD_DIR"
+          bash .github/scripts/install_ios_dependencies.sh
+          DEVICE_ID="$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin)["devices"]; print(next(x["udid"] for v in d.values() for x in v if x.get("isAvailable") and x["name"].startswith("iPhone")))')"
+          echo "KITPAY_TEST_DEVICE_ID=$DEVICE_ID" > "$HOME/device.env"
+          xcrun simctl boot "$DEVICE_ID" || true
+          xcrun simctl bootstatus "$DEVICE_ID" -b || true
+          xcrun simctl privacy "$DEVICE_ID" grant contacts africa.kit.pay.ios || true
+      - name: Build for testing
+        script: |
+          set -e
+          export RUNNER_TEMP="$HOME/rt"
+          . "$HOME/device.env"
+          export KITPAY_TEST_DEVICE_ID
+          cd "$CM_BUILD_DIR"
+          bash .github/scripts/ios_native_build.sh build
+      - name: Chat media, gallery swipe and verify-once
+        script: |
+          export RUNNER_TEMP="$HOME/rt"
+          . "$HOME/device.env"
+          export KITPAY_TEST_DEVICE_ID
+          cd "$CM_BUILD_DIR"
+          set +e
+          bash .github/scripts/ios_native_build.sh chat-media
+          status=$?
+          set -e
+          # The result bundle carries the per-swipe wall clock this run exists to measure,
+          # so it comes home whether the run passed or failed. It is packed here rather
+          # than in a later step because a later step does not run after a failure, which
+          # is exactly when it is wanted.
+          cd "$HOME/rt"
+          tar -czf "$HOME/rt/chat-media-xcresults.tgz" KitPay-chat-media.xcresult || true
+          exit "$status"
+    artifacts:
+      - $HOME/rt/chat-media-xcresults.tgz
+
   # ---------------------------------------------------------------------------
   # mac-session-60 — NOT a release lane. It archives nothing and publishes
   # nothing. It holds one `mac_mini_m2` open so a scripted VNC/SSH client can

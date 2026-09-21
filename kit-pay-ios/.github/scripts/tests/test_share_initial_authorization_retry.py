@@ -91,7 +91,9 @@ class InitialShareAuthorizationRetryTests(unittest.TestCase):
         isCollecting = false
     }
 """
-        generated = SWIFT_STUBS + "\n".join(host_method(method) for method in methods + [collection]) + SWIFT_CASES
+        policy = (ROOT / "KitPay/Core/ShareAuthorizationPolicy.swift").read_text()
+        generated = (SWIFT_STUBS.replace("// POLICY", policy)
+                     + "\n".join(host_method(method) for method in methods + [collection]) + SWIFT_CASES)
         with tempfile.TemporaryDirectory(prefix="kit-share-initial-retry-") as directory:
             root = Path(directory)
             swift = root / "main.swift"
@@ -107,6 +109,8 @@ class InitialShareAuthorizationRetryTests(unittest.TestCase):
 
 SWIFT_STUBS = r'''
 import Foundation
+
+// POLICY
 
 enum Color { case secondaryLabel, systemRed }
 enum Event { case allEvents, touchUpInside }
@@ -148,15 +152,30 @@ enum SharedInboxError: LocalizedError {
     }
     enum Failure: LocalizedError {
         case accountChanged
-        var errorDescription: String? { "Sharing is locked or your account changed. Unlock Kit Pay and share again." }
+        case shareRefused(ShareAuthorizationPolicy.Refusal)
+        var errorDescription: String? {
+            switch self {
+            case .accountChanged: ShareAuthorizationPolicy.message(for: .sessionReplaced)
+            case let .shareRefused(refusal): ShareAuthorizationPolicy.message(for: refusal)
+            }
+        }
+        var shareRefusal: ShareAuthorizationPolicy.Refusal? {
+            switch self {
+            case .accountChanged: .sessionReplaced
+            case let .shareRefused(refusal): refusal
+            }
+        }
     }
     var scopeValue: Scope?, reply: ApprovedDirectory?, calls = 0, suspended = false
     var continuation: CheckedContinuation<ApprovedDirectory, Error>?
-    func scope() throws -> Scope { guard let scopeValue else { throw Failure.accountChanged }; return scopeValue }
+    func scope() throws -> Scope {
+        guard let scopeValue else { throw Failure.shareRefused(.signedOut) }
+        return scopeValue
+    }
     func authorizeShare() async throws -> ApprovedDirectory {
         calls += 1
         if suspended { return try await withCheckedThrowingContinuation { continuation = $0 } }
-        guard let reply else { throw Failure.accountChanged }
+        guard let reply else { throw Failure.shareRefused(.notPrepared) }
         return reply
     }
     func reset(scope: Scope? = nil) {
@@ -245,7 +264,14 @@ SWIFT_CASES = r'''
             let task = mismatched.collectionTask!
             await task.value
             require(mismatched.providerReads == 0 && mismatched.pendingShare == nil, "changed owner was accepted")
-            require(mismatched.hasInitialAuthorizationFailure, "changed owner did not fail closed")
+            require(mismatched.hasPresentedFailure, "changed owner did not fail closed")
+            // A replaced account is the one refusal that rereading the container cannot fix,
+            // so the sheet offers Close alone. Build 105 offered "Retry" for every refusal.
+            require(!mismatched.hasInitialAuthorizationFailure, "changed owner offered a pointless retry")
+            require(mismatched.actionButton.title == "Close" && mismatched.actionButton.actions == ["cancel"],
+                    "changed owner did not fall back to Close")
+            require(mismatched.messageLabel.text?.contains("different Kit Pay account") == true,
+                    "changed owner did not say what changed")
         }
 
         // 7–8: Cancellation or dismissal during suspended approval cannot read providers or reopen UI.

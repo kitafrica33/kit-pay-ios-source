@@ -1210,6 +1210,20 @@ struct BiometricSignInView: View {
 }
 
 struct KitBiometricGateView: View {
+    /// What the gate draws behind itself.
+    ///
+    /// `.opaque` replaces the screen, which is right at sign-in when there is nothing of the
+    /// customer's to conceal. `.blurredContent` is drawn over the customer's own screen while
+    /// that screen is blurred and redacted beneath it -- the owner's 1.0.17 build 105 report
+    /// asked for exactly this on Home and the pay screen: *"the background has to be blurred
+    /// until verified successfully"*. The material is a second line of defence: even if the
+    /// blur beneath were ever to render at radius zero for a frame, nothing legible shows
+    /// through it.
+    enum Backdrop {
+        case opaque
+        case blurredContent
+    }
+
     let symbolName: String
     let title: String
     let message: String
@@ -1219,10 +1233,18 @@ struct KitBiometricGateView: View {
     let authenticate: () async -> Void
     var secondaryTitle: String? = nil
     var secondaryAction: (() async -> Void)? = nil
+    var backdrop: Backdrop = .opaque
 
     var body: some View {
         ZStack {
-            KitAuthBackground()
+            switch backdrop {
+            case .opaque:
+                KitAuthBackground()
+            case .blurredContent:
+                Rectangle()
+                    .fill(.ultraThinMaterial)
+                    .ignoresSafeArea()
+            }
 
             VStack(spacing: 0) {
                 Spacer(minLength: 24)

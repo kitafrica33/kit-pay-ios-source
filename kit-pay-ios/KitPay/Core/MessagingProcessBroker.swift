@@ -228,13 +228,6 @@ final class MessagingProcessBroker: @unchecked Sendable {
         let id: UUID
     }
 
-    private struct ShareLease {
-        let scope: Scope
-        let denial: SharingDenial?
-        let biometricCredential: MessagingBiometricCredential?
-        let expiresAtUptime: TimeInterval
-    }
-
     private struct SessionRevocation: Codable {
         let generation: UUID
     }
@@ -247,17 +240,33 @@ final class MessagingProcessBroker: @unchecked Sendable {
     enum Failure: LocalizedError {
         case unavailable, corrupt, accountChanged, staleState, queueFull
         case authenticationRequired, biometricApprovalRequired
+        /// One case per `ShareAuthorizationPolicy.Refusal`, so a refusal the customer reads is
+        /// the refusal the container actually produced. Build 105 collapsed all of these into
+        /// `.accountChanged` ("Sharing is locked or your account changed"), which is why a
+        /// signed-in handset could not be told apart from a signed-out one.
+        case shareRefused(ShareAuthorizationPolicy.Refusal)
 
         var errorDescription: String? {
             switch self {
+            case let .shareRefused(refusal):
+                ShareAuthorizationPolicy.message(for: refusal)
             case .authenticationRequired:
                 "Authenticate with Face ID or Touch ID to share securely."
             case .biometricApprovalRequired:
                 "Unlock Kit Pay with Face ID or Touch ID once to approve secure sharing, then share again."
             case .accountChanged:
-                "Sharing is locked or your account changed. Unlock Kit Pay and share again."
+                "This share belongs to a different Kit Pay account. Close this and share again."
             default:
                 "Kit Pay could not prepare the secure share. Please try again."
+            }
+        }
+
+        /// The refusal reason the share sheet should act on, if this failure is one.
+        var shareRefusal: ShareAuthorizationPolicy.Refusal? {
+            switch self {
+            case let .shareRefused(refusal): refusal
+            case .accountChanged: .sessionReplaced
+            default: nil
             }
         }
     }
@@ -269,8 +278,9 @@ final class MessagingProcessBroker: @unchecked Sendable {
     private var cachedAuthority: (stamp: String, value: Authority)?
     private var cachedRecord: (stamp: String, value: Record)?
     private var cachedKey: SymmetricKey?
-    private var shareLease: ShareLease?
     private let biometrics: any MessagingBiometricAuthenticating
+    /// Unused since the share lease was removed; retained so existing test fixtures that
+    /// inject a fake clock keep compiling.
     private let uptime: @Sendable () -> TimeInterval
     private let authorityWriteCheck: ((Authority) throws -> Void)?
     private let recordCommitCheck: (() throws -> Void)?
@@ -425,28 +435,39 @@ final class MessagingProcessBroker: @unchecked Sendable {
         }
     }
 
+    /// The single sharing gate, for the app and the extension alike.
+    ///
+    /// It asks `ShareAuthorizationPolicy` and nothing else. In particular it no longer consults
+    /// `requiresBiometricUnlock`, a biometric credential or a process-local unlock lease: those
+    /// three inputs are what made a signed-in handset refuse every share in build 105, and the
+    /// owner's directive is that biometrics guard payments, never chats.
+    ///
+    /// A *published recipient directory for this exact scope* is the app's standing permission.
+    /// `denySharingLocked` deletes that directory in the same locked section that writes the
+    /// hard denial, so "directory present and not hard-denied" means precisely "the app
+    /// published this session's recipients and has not revoked them since".
     func requireScopeLocked(_ scope: Scope, requiresSharing: Bool = true) throws -> Authority {
-        guard let authority = try authorityLocked(),
-              try scopeLocked(authority) == scope
-        else { throw Failure.accountChanged }
+        guard let authority = try authorityLocked() else {
+            throw Failure.shareRefused(.signedOut)
+        }
+        guard try scopeLocked(authority) == scope else { throw Failure.accountChanged }
         guard requiresSharing else { return authority }
         let denial = try sharingDenialLocked()
-        guard denial?.reason != .hard else { throw Failure.accountChanged }
-        let leaseValid = shareLease.map {
-            $0.scope == scope && $0.denial == denial
-                && $0.biometricCredential == authority.biometricCredential
-                && uptime() < $0.expiresAtUptime
-        } ?? false
-        if denial?.reason == .biometric || !authority.sharingEnabled {
-            guard authority.requiresBiometricUnlock == true, leaseValid else {
-                throw Failure.authenticationRequired
-            }
+        if let refusal = ShareAuthorizationPolicy.decide(
+            ShareAuthorizationPolicy.Input(
+                hasAuthority: true,
+                hasSession: true,
+                // A legacy `.biometric` marker is no longer a denial at all: it was only ever
+                // the app's UI lock, and it never removed the directory.
+                isHardDenied: denial?.reason == .hard,
+                // `sharingEnabled` is only ever set true against a matching directory, so the
+                // common path answers without decrypting `destinations.secure` again.
+                hasMatchingDirectory: authority.sharingEnabled
+                    || (try? requireDirectoryLocked(scope)) != nil
+            )
+        ) {
+            throw Failure.shareRefused(refusal)
         }
-#if KIT_SHARE_EXTENSION
-        if authority.requiresBiometricUnlock == true, !leaseValid {
-            throw Failure.authenticationRequired
-        }
-#endif
         return authority
     }
 
@@ -490,16 +511,10 @@ final class MessagingProcessBroker: @unchecked Sendable {
         }
     }
 
-    private func requireBiometricCredentialLocked(_ authority: Authority) throws -> MessagingBiometricCredential {
-        guard authority.biometricDomainState == nil,
-              let credential = authority.biometricCredential
-        else { throw Failure.biometricApprovalRequired }
-        guard credential.isStructurallyValid,
-              credential.binding == (try biometricBindingLocked(authority))
-        else { throw Failure.corrupt }
-        return credential
-    }
-
+    /// Always `false` now. Sharing no longer has a biometric prerequisite of any kind, so
+    /// there is nothing for the caller to go and approve. Retained (rather than deleted) so
+    /// the settings flow that asks "does sharing still need Face ID?" keeps compiling and
+    /// simply learns that it does not.
     func biometricSharingRequired(accountID: String, sessionID: String) throws -> Bool {
         try withLock { broker in
             guard let authority = try broker.authorityLocked() else { throw Failure.accountChanged }
@@ -507,13 +522,14 @@ final class MessagingProcessBroker: @unchecked Sendable {
             guard binding.accountID == SharedInboxPolicy.canonicalAccountID(accountID),
                   binding.sessionID == SharedInboxPolicy.canonicalAccountID(sessionID)
             else { throw Failure.accountChanged }
-            return authority.requiresBiometricUnlock == true
-                || authority.biometricCredential != nil || authority.biometricDomainState != nil
+            return false
         }
     }
 
-    /// Only an explicitly verified settings disable or server-verified PIN recovery may call
-    /// this. Missing/unavailable private keys and ordinary publication cannot downgrade sharing.
+    /// Turning the biometric app lock off used to hard-deny sharing and delete the published
+    /// recipients — which is precisely the deadlock build 105 shipped, because the only way
+    /// back was a successful approval that could no longer happen. It now clears the retired
+    /// credential and leaves sharing exactly as it was: the customer is still signed in.
     func disableBiometricSharing(binding: MessagingBiometricBinding) throws {
 #if KIT_SHARE_EXTENSION
         throw Failure.biometricApprovalRequired
@@ -522,12 +538,12 @@ final class MessagingProcessBroker: @unchecked Sendable {
             guard var authority = try broker.authorityLocked(),
                   try broker.biometricBindingLocked(authority) == binding
             else { throw Failure.accountChanged }
-            try broker.denySharingLocked()
             let retired = authority.biometricCredential
-            authority.requiresBiometricUnlock = false
+            guard authority.requiresBiometricUnlock != nil || retired != nil
+                || authority.biometricDomainState != nil else { return nil }
+            authority.requiresBiometricUnlock = nil
             authority.biometricCredential = nil
             authority.biometricDomainState = nil
-            authority.sharingEnabled = false
             authority.sharingGeneration = UUID()
             try broker.saveAuthorityLocked(authority)
             return retired
@@ -539,9 +555,11 @@ final class MessagingProcessBroker: @unchecked Sendable {
 #endif
     }
 
-    /// Main-app callers must have just used their existing private, current-set Secure Enclave
-    /// key. This only prepares messaging authorization; it never clears privacy/logout denial,
-    /// publishes a directory, unlocks the wallet, or grants a share-process lease.
+    /// Keeps the caller's fresh-proof contract (the private current-set key must still work)
+    /// but stores nothing and denies nothing. There is no sharing credential to create any
+    /// more: the share sheet authorises on the published directory alone, so an approval that
+    /// fails — a re-enrolment, a Keychain hiccup, a cancelled prompt — can no longer take a
+    /// signed-in customer's share sheet away. Any legacy credential is retired here.
     func approveBiometricSharing(
         binding: MessagingBiometricBinding, enrollmentKeyID: String,
         confirmPrivateKey: () throws -> Void
@@ -553,85 +571,14 @@ final class MessagingProcessBroker: @unchecked Sendable {
               MessagingBiometricCredential.isValidEnrollmentKeyID(enrollmentKeyID)
         else { throw Failure.corrupt }
         try Task.checkCancellation()
-        let original = try withLock { broker -> (Scope, SharingDenial?, Authority) in
+        try withLock { broker in
             guard let authority = try broker.authorityLocked(),
                   try broker.biometricBindingLocked(authority) == binding
             else { throw Failure.accountChanged }
-            return (try broker.scopeLocked(authority), try broker.sharingDenialLocked(), authority)
         }
-        let previous = original.2.biometricCredential
-        // Security may block on its daemon even for a noninteractive metadata read. Keep it
-        // outside the cross-process lock; an inconclusive error never causes replacement.
-        let canReuse: Bool
-        if let previous, previous.isStructurallyValid, previous.binding == binding,
-           previous.enrollmentKeyID == enrollmentKeyID {
-            canReuse = try biometrics.credentialExists(previous)
-                && original.2.requiresBiometricUnlock == true
-                && original.2.biometricDomainState == nil
-        } else {
-            canReuse = false
-        }
-        if canReuse { try confirmPrivateKey() }
+        try confirmPrivateKey()
         try Task.checkCancellation()
-        let reservation = try withLock { broker -> (Scope, SharingDenial?)? in
-            guard var authority = try broker.authorityLocked(),
-                  try broker.scopeLocked(authority) == original.0,
-                  try broker.sharingDenialLocked() == original.1,
-                  authority.biometricCredential == previous,
-                  authority.requiresBiometricUnlock == original.2.requiresBiometricUnlock,
-                  authority.biometricDomainState == original.2.biometricDomainState
-            else { throw Failure.accountChanged }
-            if canReuse, authority.requiresBiometricUnlock == true,
-               authority.biometricDomainState == nil {
-                return nil
-            }
-            // Fence all old leases before a repair or migration. A failed/uncertain credential
-            // or authority write leaves this durable denial intact for the next fresh approval.
-            try broker.denySharingLocked()
-            authority.sharingEnabled = false
-            authority.sharingGeneration = UUID()
-            try broker.saveAuthorityLocked(authority)
-            return (try broker.scopeLocked(authority), try broker.sharingDenialLocked())
-        }
-        guard let reservation else { return }
-        try Task.checkCancellation()
-        let credential = try biometrics.createCredential(
-            binding: binding, enrollmentKeyID: enrollmentKeyID
-        )
-        var commitAttempted = false
-        do {
-            try Task.checkCancellation()
-            guard credential.isStructurallyValid, credential.binding == binding,
-                  credential.enrollmentKeyID == enrollmentKeyID
-            else { throw Failure.corrupt }
-            // The guard's ACL was bound on insertion. Prove the original private current-set
-            // key still works AFTER that insertion, without another prompt, before accepting
-            // the guard. This closes an enrollment change between initial proof and creation.
-            try confirmPrivateKey()
-            try Task.checkCancellation()
-            try withLock { broker in
-                guard var authority = try broker.authorityLocked(),
-                      try broker.scopeLocked(authority) == reservation.0,
-                      try broker.sharingDenialLocked() == reservation.1,
-                      authority.biometricCredential == previous,
-                      authority.requiresBiometricUnlock == original.2.requiresBiometricUnlock,
-                      authority.biometricDomainState == original.2.biometricDomainState
-                else { throw Failure.accountChanged }
-                authority.biometricCredential = credential
-                authority.biometricDomainState = nil
-                authority.requiresBiometricUnlock = true
-                authority.sharingEnabled = false
-                authority.sharingGeneration = UUID()
-                commitAttempted = true
-                try broker.saveAuthorityLocked(authority)
-            }
-        } catch {
-            // A known precommit rejection leaves this UUID unreferenced. An uncertain write
-            // may have published it, so retain that guard and the durable denial in that case.
-            if !commitAttempted { try? biometrics.removeCredential(credential) }
-            throw error
-        }
-        if let previous, previous != credential { try? biometrics.removeCredential(previous) }
+        try disableBiometricSharing(binding: binding)
 #endif
     }
 
@@ -649,18 +596,26 @@ final class MessagingProcessBroker: @unchecked Sendable {
             guard var authority = try broker.authorityLocked(),
                   authority.session?.accountId?.lowercased() == accountID
             else { throw Failure.accountChanged }
-            if requiresBiometricUnlock {
-                _ = try broker.requireBiometricCredentialLocked(authority)
-            } else if authority.requiresBiometricUnlock == true
-                || authority.biometricDomainState != nil || authority.biometricCredential != nil {
-                throw Failure.biometricApprovalRequired
-            }
-            if authority.requiresBiometricUnlock != requiresBiometricUnlock {
-                authority.requiresBiometricUnlock = requiresBiometricUnlock
+            // `requiresBiometricUnlock` is accepted and ignored. Publishing used to demand a
+            // live `.biometryCurrentSet` Keychain credential whenever the customer had the
+            // app's Face ID unlock switched on; a re-enrolment, a new session id or a first
+            // launch after a token refresh left no such credential, publication threw, the
+            // caller revoked sharing, and the extension answered "Sharing is locked or your
+            // account changed" until something re-approved it. Chats are not a money action:
+            // there is nothing here to approve. Clearing the legacy fields is the migration.
+            _ = requiresBiometricUnlock
+            if authority.requiresBiometricUnlock != nil || authority.biometricDomainState != nil
+                || authority.biometricCredential != nil {
+                let retired = authority.biometricCredential
+                authority.requiresBiometricUnlock = nil
                 authority.biometricDomainState = nil
+                authority.biometricCredential = nil
                 authority.sharingGeneration = UUID()
-                broker.shareLease = nil
                 try broker.saveAuthorityLocked(authority)
+                if let retired {
+                    let biometrics = broker.biometrics
+                    Task.detached(priority: .utility) { try? biometrics.removeCredential(retired) }
+                }
             }
             let scope = try broker.scopeLocked(authority)
             let directory = ApprovedDirectory(
@@ -682,111 +637,71 @@ final class MessagingProcessBroker: @unchecked Sendable {
         }
     }
 
-    /// A fresh biometric authentication grants only this process five minutes of messaging
-    /// access. No reusable lease, biometric secret or wallet-unlock bit is persisted or exported.
+    /// What the share sheet calls before it renders a single recipient.
+    ///
+    /// It is deliberately synchronous work behind an `async` face: there is no authentication
+    /// to await any more. Biometrics are a payment control (owner directive, 2026-09-21), and
+    /// an extension that waited on Face ID could not share while the phone was in a pocket,
+    /// while the app was locked, or at all once the `.biometryCurrentSet` credential had been
+    /// invalidated by a re-enrolment or a session-id change — which is how build 105 came to
+    /// refuse every share on a signed-in handset.
+    ///
+    /// The decision is `ShareAuthorizationPolicy`'s, evaluated once inside the lock so the
+    /// directory the caller receives is the one the decision was made against.
     func authorizeShare() async throws -> ApprovedDirectory {
-        let challenge = try withLock { broker -> (Scope, SharingDenial?, MessagingBiometricCredential?) in
-            guard let authority = try broker.authorityLocked() else { throw Failure.accountChanged }
-            let scope = try broker.scopeLocked(authority)
-            let denial = try broker.sharingDenialLocked()
-            guard denial?.reason != .hard,
-                  authority.sharingEnabled || denial?.reason == .biometric
-            else { throw Failure.accountChanged }
-            _ = try broker.requireDirectoryLocked(scope)
-            if authority.requiresBiometricUnlock == true {
-                return (scope, denial, try broker.requireBiometricCredentialLocked(authority))
-            }
-            guard denial == nil, authority.sharingEnabled else { throw Failure.accountChanged }
-            return (scope, denial, nil)
-        }
-        if let credential = challenge.2 {
-            try await biometrics.authenticate(credential: credential)
-            let biometrics = self.biometrics
-            let stillPresent = try await Task.detached(priority: .userInitiated) {
-                try Task.checkCancellation()
-                return try biometrics.credentialExists(credential)
-            }.value
-            guard stillPresent else { throw MessagingBiometricCredentialError.missingCredential }
-        }
         try Task.checkCancellation()
         return try withLock { broker in
-            guard let authority = try broker.authorityLocked(),
-                  try broker.scopeLocked(authority) == challenge.0,
-                  try broker.sharingDenialLocked() == challenge.1,
-                  authority.biometricCredential == challenge.2,
-                  (authority.requiresBiometricUnlock == true) == (challenge.2 != nil)
-            else { throw Failure.accountChanged }
-            broker.shareLease = ShareLease(
-                scope: challenge.0, denial: challenge.1, biometricCredential: challenge.2,
-                expiresAtUptime: broker.uptime() + 5 * 60
-            )
-            _ = try broker.requireScopeLocked(challenge.0)
-            return try broker.requireDirectoryLocked(challenge.0)
+            guard let authority = try broker.authorityLocked() else {
+                throw Failure.shareRefused(.signedOut)
+            }
+            let scope: Scope
+            do {
+                scope = try broker.scopeLocked(authority)
+            } catch {
+                // No canonical account/session on the authority: nobody is signed in here.
+                throw Failure.shareRefused(.signedOut)
+            }
+            let denial = try broker.sharingDenialLocked()
+            let directory = try? broker.requireDirectoryLocked(scope)
+            if let refusal = ShareAuthorizationPolicy.decide(
+                ShareAuthorizationPolicy.Input(
+                    hasAuthority: true,
+                    hasSession: true,
+                    isHardDenied: denial?.reason == .hard,
+                    hasMatchingDirectory: directory != nil
+                )
+            ) {
+                throw Failure.shareRefused(refusal)
+            }
+            guard let directory else { throw Failure.shareRefused(.notPrepared) }
+            return directory
         }
     }
 
+    /// Kept only so the app's lock-state observer keeps its shape. Locking Kit Pay behind
+    /// Face ID is a *screen* control: it must not take the share sheet away from a signed-in
+    /// account (owner directive, 2026-09-21 — biometrics are a payment control). Instead of
+    /// writing a `.biometric` denial this now *clears* a legacy one, which is what un-bricks a
+    /// handset that upgraded from build 105 while suspended.
     func suspendSharingForBiometricLock(accountID: String) throws {
         try withLock { broker in
-            guard var authority = try broker.authorityLocked(),
-                  authority.session?.accountId?.lowercased() == accountID,
-                  authority.requiresBiometricUnlock == true,
-                  let rootURL = broker.rootURL
-            else { try broker.denySharingLocked(); throw Failure.accountChanged }
-            _ = try broker.requireBiometricCredentialLocked(authority)
-            // A biometric UI lock cannot downgrade a durable privacy/logout denial.
-            if let old = try broker.sharingDenialLocked() {
-                guard old.reason == .biometric else { throw Failure.accountChanged }
-                return
-            }
-            broker.shareLease = nil
-            try Self.durableWrite(
-                try JSONEncoder().encode(SharingDenial(reason: .biometric, id: UUID())),
-                to: rootURL.appendingPathComponent("sharing.denied")
-            )
-            authority.sharingEnabled = false
-            authority.sharingGeneration = UUID()
-            try broker.saveAuthorityLocked(authority)
+            try broker.clearBiometricDenialLocked()
         }
     }
 
-    /// Background restore may temporarily hard-deny sharing while refreshing privacy/device
-    /// ownership. The app may call this only AFTER every non-biometric gate is restored. It
-    /// cannot create/repair a credential or unlock the app: the extension authenticates fresh.
+    /// Now exactly the same job as ``publishApprovedDestinations(_:accountID:requiresBiometricUnlock:)``
+    /// followed by an enable. It used to be the "app is locked" variant: it published the
+    /// recipients but deliberately left sharing disabled behind a `.biometric` denial and
+    /// demanded a live biometric credential first. Both are gone — a locked app must still be
+    /// able to hand the share sheet its chats. Retained as a name so the caller and its
+    /// regression tests keep their shape.
     func restoreBiometricSharingDestinations(
         _ destinations: [SharedInboxDestination], accountID: String
     ) throws {
-        guard destinations.count <= SharedInboxPolicy.maximumDestinations,
-              Set(destinations.map(\.id)).count == destinations.count,
-              destinations.allSatisfy(SharedInboxPolicy.isValidDestination)
-        else { throw Failure.corrupt }
-        try withLock { broker in
-            guard var authority = try broker.authorityLocked(),
-                  authority.session?.accountId?.lowercased() == accountID,
-                  authority.requiresBiometricUnlock == true,
-                  let rootURL = broker.rootURL
-            else { throw Failure.accountChanged }
-            _ = try broker.requireBiometricCredentialLocked(authority)
-            let scope = try broker.scopeLocked(authority)
-            if !authority.sharingEnabled, try broker.sharingDenialLocked()?.reason == .biometric,
-               let existing = try broker.directoryLocked(),
-               existing.generation == scope.generation, existing.accountID == scope.accountID,
-               existing.sessionID == scope.sessionID, existing.destinations == destinations {
-                return
-            }
-            try broker.saveEncryptedLocked(
-                ApprovedDirectory(generation: scope.generation, accountID: scope.accountID,
-                                  sessionID: scope.sessionID, destinations: destinations),
-                name: "destinations.secure"
-            )
-            authority.sharingEnabled = false
-            authority.sharingGeneration = UUID()
-            try broker.saveAuthorityLocked(authority)
-            broker.shareLease = nil
-            try Self.durableWrite(
-                try JSONEncoder().encode(SharingDenial(reason: .biometric, id: UUID())),
-                to: rootURL.appendingPathComponent("sharing.denied")
-            )
-        }
+        try publishApprovedDestinations(
+            destinations, accountID: accountID, requiresBiometricUnlock: false
+        )
+        try setSharingEnabled(true, accountID: accountID)
     }
 
     func setSharingEnabled(_ enabled: Bool, accountID: String?) throws {
@@ -800,16 +715,13 @@ final class MessagingProcessBroker: @unchecked Sendable {
                       directory.generation == authority.generation, directory.accountID == accountID,
                       directory.sessionID == authority.session?.sessionId.lowercased()
                 else { throw Failure.accountChanged }
-                if authority.requiresBiometricUnlock == true {
-                    _ = try broker.requireBiometricCredentialLocked(authority)
-                }
+                // No biometric credential check: sharing is not gated on the app's lock state.
             }
             let denied = try broker.sharingDenialLocked() != nil
             guard authority.sharingEnabled != enabled || (enabled && denied) else { return }
             authority.sharingEnabled = enabled
             authority.sharingGeneration = UUID()
             try broker.saveAuthorityLocked(authority)
-            broker.shareLease = nil
             if enabled { try broker.removeFileLocked("sharing.denied") }
         }
     }
@@ -817,7 +729,6 @@ final class MessagingProcessBroker: @unchecked Sendable {
     /// Written first: a failed Keychain mutation cannot turn a privacy/logout denial into an
     /// extension-authenticable biometric lock or leave an existing process-local lease usable.
     func denySharingLocked() throws {
-        shareLease = nil
         guard let rootURL else { throw Failure.unavailable }
         // Even repeated privacy denials must invalidate an in-flight biometric approval.
         try Self.durableWrite(
@@ -898,6 +809,14 @@ final class MessagingProcessBroker: @unchecked Sendable {
         for id in record.retiredStagingBatchIDs ?? [] { DirectShareSendRecord.stagingStore.remove(batchID: id) }
         try removeFileLocked("messaging.secure")
         cachedRecord = nil
+    }
+
+    /// A `.biometric` marker was never a security decision — it was the app's screen lock
+    /// leaking into the share sheet. Build 105 handsets can still carry one, so every entry
+    /// point that used to write one now removes it instead. A `hard` denial is untouched.
+    private func clearBiometricDenialLocked() throws {
+        guard try sharingDenialLocked()?.reason == .biometric else { return }
+        try removeFileLocked("sharing.denied")
     }
 
     private func sharingDenialLocked() throws -> SharingDenial? {

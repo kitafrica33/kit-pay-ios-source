@@ -549,6 +549,572 @@ final class AppStoreScreenshotUITests: XCTestCase {
         XCTAssertFalse(app.buttons["Close camera"].exists, "A vertical history drag must not open camera")
     }
 
+    // MARK: - Owner report, 1.0.17 build 105: chat media
+
+    /// Scrolling a thread of 320 mixed-media messages, timed.
+    ///
+    /// Owner report: *"still some lagging between chats ... scrolling through chat messages
+    /// lags"*. `testLongHistoryVerticalBubbleDragsPreserveReadingPosition` above cannot see it —
+    /// 2,000 plain text rows never touch the image decoder. This one opens the thread the report
+    /// describes (96 photos with real JPEG bytes, 32 videos, 32 voice notes, 32 audio files, 32
+    /// documents, 96 text rows) and records the wall clock of every swipe.
+    ///
+    /// The assertions here are functional, and the ceiling is deliberately loose: a simulator on
+    /// shared CI hardware cannot establish a 60 Hz claim, and pretending otherwise would make the
+    /// suite flaky *and* the report dishonest. The hitch rate and the first-move latency in
+    /// `docs/status/ios-chat-media-2026-09-21.md` are measured on a device with Instruments. What
+    /// this test is for is the regression: a build where a `body` decodes again does not merely
+    /// get slower here, it stops moving, and the movement assertions catch that.
+    func testMixedMediaThreadScrollsAndRecordsSwipeWallClock() {
+        let app = XCUIApplication()
+        app.launchArguments += [
+            fixtureArgument,
+            "--kit-chat-mixed-media-scroll-fixture-v1",
+            "-AppleLanguages", "(en)",
+            "-AppleLocale", "en_UG",
+            "-UIUserInterfaceStyle", "Light",
+        ]
+        app.launch()
+        require(app.staticTexts["Wallet balance"], in: app, message: "Mixed-media fixture did not load")
+        tap(app.buttons["Messages"], in: app, message: "Messages tab is unavailable")
+        openFixtureConversation(in: app)
+
+        let timeline = app.scrollViews["conversation-timeline"]
+        require(timeline, in: app, message: "Mixed-media timeline did not appear")
+        let newest = timeline.staticTexts["Noted 320"].firstMatch
+        require(newest, in: app, message: "Mixed-media fixture has no newest row")
+        XCTAssertTrue(newest.isHittable, "Opening must reveal the newest row, not the start of history")
+
+        // The first photo bubble has to resolve its local original and decode off the main
+        // thread before anything is on screen to scroll past.
+        let anyPhoto = app.buttons["End-to-end encrypted photo queued to send"].firstMatch
+        XCTAssertTrue(
+            anyPhoto.waitForExistence(timeout: 20),
+            "No photo bubble ever rendered; the mixed-media fixture carries 96 of them"
+        )
+
+        // Warm-up, deliberately untimed, and *downwards* — older messages are above.
+        //
+        // Two traps, both paid for in a real run. (1) A chat opens pinned to its newest message,
+        // and a deliberate upward pull from a pinned timeline is this product's camera gesture;
+        // `testChatBottomPullOpensCameraOnlyAfterADeliberateRelease` asserts exactly that. Run
+        // 6ab15f28 swiped up: the camera opened over the thread at t = 24.9 s, iOS raised its
+        // Camera and Microphone prompts, and every later "timed" swipe was synthesized into a
+        // camera preview while the timeline sat untouched at 100 %. Reading history is
+        // `swipeDown`. (2) XCUITest dismisses an interrupting alert *inside* whatever
+        // interaction is running when it notices: pass 1 of run 6ab15445 measured 9.5 s, of
+        // which the app's share was none — it was SpringBoard tapping "Allow" twice. Absorb any
+        // prompt, and the first cold decode, before the clock starts.
+        let closeCamera = app.buttons["Close camera"]
+        for _ in 0 ..< 3 { timeline.swipeDown(velocity: .default) }
+        XCTAssertFalse(
+            XCUIApplication(bundleIdentifier: "com.apple.springboard").alerts.firstMatch.exists,
+            "A system permission alert is still on screen; the timings would measure SpringBoard"
+        )
+        XCTAssertFalse(closeCamera.exists, "Reading history must never open the camera")
+
+        var report = [
+            "Synthetic workload: 1 conversation, \(320) messages.",
+            "96 photos (real JPEG bytes), 32 videos, 32 voice notes, 32 audio files,",
+            "32 documents, 96 text rows.",
+            "Debug build, Simulator, shared CI hardware, after three untimed warm-up swipes.",
+            "Each figure is one XCUITest swipe end to end: finding the scroll view, checking",
+            "for interrupting elements, synthesizing the drag, and then waiting for the app to",
+            "go idle -- which includes the scroll's own deceleration. It is an upper bound on a",
+            "gesture, not a frame time, and it does not establish physical-device latency.",
+            "See docs/status/ios-chat-media-2026-09-21.md.",
+        ]
+        var slowest: TimeInterval = 0
+
+        for pass in 0 ..< 12 {
+            let start = Date()
+            timeline.swipeDown(velocity: .default)
+            let seconds = Date().timeIntervalSince(start)
+            slowest = max(slowest, seconds)
+            report.append("Pass \(pass) into history: \(seconds)s")
+            print("[KitPayMixedMediaGeometry] Pass \(pass) into history \(seconds)s")
+        }
+        XCTAssertFalse(newest.isHittable, "Twelve swipes through media must leave the newest row")
+        XCTAssertFalse(closeCamera.exists, "Reading history must never open the camera")
+        let jump = Self.jumpToLatest(in: app)
+        if !Self.waitUntilHittable(jump) {
+            capture(app, named: "mixed-media-no-jump-to-latest")
+            print(app.debugDescription)
+        }
+        XCTAssertTrue(jump.isHittable, "A reader deep in media history needs the way back")
+
+        // Back towards the newest row — ten passes against the twelve that came down, and a
+        // stop the moment the newest row is on screen. Both guards exist for the same reason:
+        // an upward swipe on a re-pinned timeline is the camera pull, not a scroll, and the
+        // last stretch back to the bottom belongs to "Jump to latest" anyway.
+        var returnPasses = 0
+        for pass in 0 ..< 10 {
+            if newest.isHittable { break }
+            let start = Date()
+            timeline.swipeUp(velocity: .default)
+            let seconds = Date().timeIntervalSince(start)
+            slowest = max(slowest, seconds)
+            returnPasses += 1
+            report.append("Pass \(pass) back towards the newest row: \(seconds)s")
+            print("[KitPayMixedMediaGeometry] Pass \(pass) back \(seconds)s")
+        }
+        report.append("Return passes taken: \(returnPasses)")
+        XCTAssertGreaterThan(
+            returnPasses, 0, "Twelve swipes into history must leave somewhere to come back from"
+        )
+        XCTAssertFalse(closeCamera.exists, "Coming back must not open the camera")
+
+        report.append("Slowest single swipe: \(slowest)s")
+        let attachment = XCTAttachment(string: report.joined(separator: "\n"))
+        attachment.name = "mixed-media-scroll-wall-clock"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+
+        // A loose ceiling on purpose, and a considered one. Twenty-two timed passes over this
+        // thread on run 6ab1666b -- the first run that was measuring the timeline at all rather
+        // than a camera preview opened by its own warm-up -- ran from 2.78 s to 4.08 s, mean
+        // 3.25 s, on a Debug build on a shared CI Mac, with XCUITest's wait-for-idle and the
+        // scroll's own deceleration inside every figure. Claiming 60 Hz from that would be a
+        // lie in either direction. What this number is for is the regression: build 105 decoded
+        // a 37.7 MB thumbnail inside `body` for every photo that came on screen, against a
+        // 64 MB cache that could therefore hold one of them, and a return to that does not cost
+        // a second a swipe -- it costs tens of seconds, because every pass re-decodes what the
+        // pass before it evicted.
+        XCTAssertLessThan(
+            slowest, 8,
+            "A single swipe took \(slowest)s; something is decoding on the main thread again"
+        )
+
+        if !newest.isHittable {
+            XCTAssertTrue(
+                Self.waitUntilHittable(jump),
+                "Jump to latest vanished before the reader reached the newest row"
+            )
+            tap(jump, in: app, message: "Jump to latest is unavailable")
+        }
+        XCTAssertTrue(newest.isHittable, "The reader must end on the newest row")
+        capture(app, named: "mixed-media-thread")
+    }
+
+    /// Opening media from the thread and swiping left and right through the whole conversation.
+    ///
+    /// Owner report: *"test swiping left and right on media in a chat"*. On build 105 this could
+    /// not be tested from a queued photo or from an album cell at all, because neither opened the
+    /// gallery — each opened a standalone viewer with nowhere to swipe to. The fold had always
+    /// counted those items among the conversation's media; nothing routed a tap to them.
+    func testMediaGallerySwipesThroughTheConversationsMediaInOrder() {
+        let app = XCUIApplication()
+        app.launchArguments += [
+            fixtureArgument,
+            "--kit-chat-mixed-media-scroll-fixture-v1",
+            "-AppleLanguages", "(en)",
+            "-AppleLocale", "en_UG",
+            "-UIUserInterfaceStyle", "Light",
+        ]
+        app.launch()
+        require(app.staticTexts["Wallet balance"], in: app, message: "Mixed-media fixture did not load")
+        tap(app.buttons["Messages"], in: app, message: "Messages tab is unavailable")
+        openFixtureConversation(in: app)
+
+        let timeline = app.scrollViews["conversation-timeline"]
+        require(timeline, in: app, message: "Mixed-media timeline did not appear")
+        let queued = app.buttons.matching(
+            NSPredicate(format: "label == %@", "End-to-end encrypted photo queued to send")
+        )
+        XCTAssertTrue(queued.firstMatch.waitForExistence(timeout: 20),
+                      "No photo bubble to open the gallery from")
+
+        // Open from the middle of the thread, not from its end. A gallery opened on the last
+        // item has nowhere to walk to, and stepping back from it is the one thing a reader never
+        // does. Older messages are above: `swipeDown` reads history (`swipeUp` on a pinned
+        // timeline is the camera gesture).
+        for _ in 0 ..< 12 { timeline.swipeDown(velocity: .default) }
+        XCTAssertFalse(app.buttons["Close camera"].exists,
+                       "Reading history must never open the camera")
+        guard let photo = Self.firstHittable(queued, scrolling: timeline) else {
+            capture(app, named: "gallery-no-hittable-queued-photo")
+            XCTFail("No queued photo bubble came on screen in the mixed-media thread")
+            return
+        }
+        photo.tap()
+
+        let counter = Self.galleryCounter(app)
+        XCTAssertTrue(
+            counter.waitForExistence(timeout: 10),
+            "Tapping a queued photo must open the conversation gallery, not a dead-end viewer"
+        )
+        guard let opening = Self.galleryPosition(counter.label) else {
+            XCTFail("Gallery counter is unreadable: \(counter.label)")
+            return
+        }
+        XCTAssertGreaterThan(
+            opening.total, 100,
+            "The gallery must hold the conversation's media (96 photos + 32 videos), not one item"
+        )
+
+        // The walk needs headroom: ten turns forward, and a single deliberate drag is allowed
+        // to cross one page boundary. Whichever queued photo came on screen first, step back
+        // until there is room -- this test is about order and completeness, not about where in
+        // the conversation the reader happened to start.
+        var start = opening
+        var headroomSteps = 0
+        while start.index + 20 > start.total, headroomSteps < 40 {
+            headroomSteps += 1
+            guard let back = Self.turnGalleryPage(app, forward: false, from: start),
+                  back.index < start.index
+            else {
+                capture(app, named: "gallery-headroom-failure")
+                XCTFail("""
+                Could not step back from item \(start.index) of \(start.total); \
+                the counter now reads "\(Self.galleryCounter(app).label)"
+                """)
+                return
+            }
+            start = back
+        }
+        XCTAssertLessThanOrEqual(
+            start.index + 20, start.total,
+            "Could not find headroom for the walk; the gallery is stuck at item \(start.index)"
+        )
+
+        // What each visited item *is* comes from the gallery's own per-item label ("Photo from
+        // You, 24 Aug 2026 at 09:41"), which is the page's accessibility container — not an
+        // Image, which is why run 6ab1666b walked all ten pages correctly and still reported
+        // that it had seen no media at all.
+        let pages = app.descendants(matching: .any).matching(
+            NSPredicate(format: "label BEGINSWITH %@ OR label BEGINSWITH %@",
+                        "Photo from", "Video from")
+        )
+        let pageCount = pages.count
+        print("[KitPayGallery] labelled pages in the tree: \(pageCount) of \(opening.total)")
+        if pageCount == 0 {
+            capture(app, named: "gallery-unlabelled-pages")
+            print(app.debugDescription)
+        }
+
+        var visited = [start.index]
+        var kinds = Set<String>()
+        kinds.formUnion(Self.mediaKinds(from: pages, pageCount: pageCount, at: start.index))
+
+        // Forward. The gallery's own counter is the order oracle: every turn moves on, in
+        // order, and never skips a page. Where a synthesised drag leaves a scroll view is not
+        // part of the product's contract -- run 6ab16c17 carried two items in one gesture and
+        // failed a test that had assumed exactly one -- so the walk reads the position the
+        // pager settled on and holds it to what a reader would demand of it.
+        var current = start
+        for _ in 0 ..< 10 {
+            guard let position = Self.turnGalleryPage(app, forward: true, from: current) else {
+                capture(app, named: "gallery-forward-swipe-failure")
+                XCTFail("""
+                Swiping left did not move on from item \(current.index) of \(current.total); \
+                the counter still reads "\(Self.galleryCounter(app).label)"
+                """)
+                return
+            }
+            XCTAssertGreaterThan(
+                position.index, current.index,
+                "Swiping left must walk forward through the conversation's media"
+            )
+            XCTAssertLessThanOrEqual(
+                position.index - current.index, 2,
+                "One swipe jumped item \(current.index) -> \(position.index): media went past unseen"
+            )
+            XCTAssertEqual(
+                position.total, start.total,
+                "The gallery lost media mid-walk: \(start.total) -> \(position.total)"
+            )
+            visited.append(position.index)
+            current = position
+            kinds.formUnion(
+                Self.mediaKinds(from: pages, pageCount: pageCount, at: position.index)
+            )
+        }
+        print("[KitPayGallery] forward walk: \(visited)")
+        XCTAssertEqual(
+            visited, visited.sorted(),
+            "Swiping left must walk the conversation's media in order: \(visited)"
+        )
+        XCTAssertGreaterThanOrEqual(
+            current.index - start.index, 10,
+            "Ten swipes left must carry the reader ten items on: \(visited)"
+        )
+        XCTAssertTrue(
+            kinds.contains("Photo") && kinds.contains("Video"),
+            """
+            Eleven pages of a mixed thread must include both photos and videos; \
+            saw \(kinds) across \(pageCount) labelled pages
+            """
+        )
+        capture(app, named: "gallery-mixed-media")
+
+        // Rotation must not lose the reader's place.
+        XCUIDevice.shared.orientation = .landscapeLeft
+        XCTAssertNotNil(
+            Self.waitForGalleryPosition(app, expecting: current.index),
+            "Rotating must keep the gallery on item \(current.index)"
+        )
+        capture(app, named: "gallery-landscape")
+        XCUIDevice.shared.orientation = .portrait
+        XCTAssertNotNil(
+            Self.waitForGalleryPosition(app, expecting: current.index),
+            "Rotating back must keep the gallery on item \(current.index)"
+        )
+
+        // Zoom, then back out. A zoomed page must still be a page.
+        //
+        // The gallery zooms by pinch *and* by double tap (1x <-> 2.5x, anchored at the tap
+        // point, `ZoomableImageView`). A synthesized pinch cannot zoom *in* on a page that
+        // already fills the screen — its touch points have nowhere to travel to — which is
+        // where run 6ab17461 stopped: "Invalid scale 2.40 greater than maximum possible scale
+        // 0.84". The double tap is the product's own affordance and has no such limit. A video
+        // page does not zoom and its centre is the play button, so step onto a photo first.
+        if Self.currentPageLabel(app).hasPrefix("Video from"),
+           let next = Self.turnGalleryPage(app, forward: true, from: current) {
+            current = next
+        }
+        if Self.currentPageLabel(app).hasPrefix("Photo from") {
+            let anchor = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.34))
+            anchor.doubleTap()
+            XCTAssertNotNil(
+                Self.waitForGalleryPosition(app, expecting: current.index),
+                "Zooming must not move the gallery off its item"
+            )
+            capture(app, named: "gallery-zoomed")
+            anchor.doubleTap()
+            XCTAssertNotNil(
+                Self.waitForGalleryPosition(app, expecting: current.index),
+                "Coming back out of a zoom must not move the gallery off its item"
+            )
+        }
+
+        // Back the way we came.
+        var walkedBack = [current.index]
+        for _ in 0 ..< 10 {
+            guard let position = Self.turnGalleryPage(app, forward: false, from: current) else {
+                capture(app, named: "gallery-backward-swipe-failure")
+                XCTFail("""
+                Swiping right did not move back from item \(current.index); \
+                the counter still reads "\(Self.galleryCounter(app).label)"
+                """)
+                return
+            }
+            XCTAssertLessThan(
+                position.index, current.index,
+                "Swiping right must walk back through the conversation's media"
+            )
+            XCTAssertLessThanOrEqual(
+                current.index - position.index, 2,
+                "One swipe jumped item \(current.index) -> \(position.index): media went past unseen"
+            )
+            walkedBack.append(position.index)
+            current = position
+        }
+        print("[KitPayGallery] walk back: \(walkedBack)")
+        XCTAssertEqual(
+            walkedBack, walkedBack.sorted(by: >),
+            "Swiping right must walk back in order: \(walkedBack)"
+        )
+        XCTAssertGreaterThanOrEqual(
+            (walkedBack.first ?? 0) - current.index, 10,
+            "Ten swipes right must carry the reader ten items back: \(walkedBack)"
+        )
+
+        tap(app.buttons["Close media viewer"], in: app, message: "Gallery has no close button")
+        require(
+            app.scrollViews["conversation-timeline"],
+            in: app,
+            message: "Closing the gallery must return to the conversation"
+        )
+    }
+
+    /// The button's accessibility label is *not* constant: `MessagesView` swaps in
+    /// "N new messages, jump to latest" whenever the thread has unseen incoming rows, which the
+    /// mixed-media fixture does. Matching only the quiet label made the run of 2026-09-21 fail
+    /// with a control that was on screen the whole time.
+    private static func jumpToLatest(in app: XCUIApplication) -> XCUIElement {
+        app.buttons.matching(
+            NSPredicate(format: "label == %@ OR label ENDSWITH %@",
+                        "Jump to latest message", "jump to latest")
+        ).firstMatch
+    }
+
+    /// `isHittable` read once, immediately after a swipe returns, is a race the app loses
+    /// honestly: the scroll view is still decelerating, the reading position it reports hops
+    /// through the main queue, and the button itself fades and scales in over 0.2 s. Poll.
+    @discardableResult
+    private static func waitUntilHittable(
+        _ element: XCUIElement, timeout: TimeInterval = 10
+    ) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if element.exists, element.isHittable { return true }
+            usleep(120_000)
+        }
+        return element.exists && element.isHittable
+    }
+
+    /// A row that merely `exists` in a lazy timeline can sit hundreds of points outside the
+    /// viewport — the failing tap of 2026-09-21 reported a frame at y = -343 — and XCUITest's
+    /// own "scroll to visible" cannot reach it, because the stack only builds what it shows.
+    /// Scroll the timeline until one of the matches is genuinely on screen, and tap that one.
+    ///
+    /// It scrolls *into history* (`swipeDown`): an upward pull on a timeline that is still
+    /// pinned to its newest message is the product's camera gesture, and the camera then covers
+    /// the thread for the rest of the test.
+    private static func firstHittable(
+        _ query: XCUIElementQuery, scrolling timeline: XCUIElement, attempts: Int = 10
+    ) -> XCUIElement? {
+        for _ in 0 ... attempts {
+            for element in query.allElementsBoundByIndex where element.isHittable {
+                return element
+            }
+            timeline.swipeDown(velocity: .default)
+        }
+        return query.allElementsBoundByIndex.first { $0.isHittable }
+    }
+
+    private static func galleryPosition(_ label: String) -> (index: Int, total: Int)? {
+        // "Item 7 of 128"
+        let parts = label.split(separator: " ")
+        guard parts.count == 4,
+              let index = Int(parts[1]),
+              let total = Int(parts[3])
+        else { return nil }
+        return (index, total)
+    }
+
+    /// "Item 7 of 128" — the gallery's own position readout, and the order oracle for every
+    /// swipe in `testMediaGallerySwipesThroughTheConversationsMediaInOrder`.
+    private static func galleryCounter(_ app: XCUIApplication) -> XCUIElement {
+        app.staticTexts.matching(
+            NSPredicate(format: "label BEGINSWITH %@", "Item ")
+        ).firstMatch
+    }
+
+    /// The counter lives in the gallery chrome, and a tap on a page toggles that chrome away.
+    /// A swipe the pager does not consume is delivered to the page's own tap gesture instead —
+    /// so a page turn that fails can also hide the only element that would have reported it,
+    /// and the poll below would blame the pager for a missing label. Bring the chrome back.
+    @discardableResult
+    private static func restoreGalleryChrome(_ app: XCUIApplication) -> Bool {
+        guard !galleryCounter(app).exists else { return true }
+        app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+        return galleryCounter(app).waitForExistence(timeout: 2)
+    }
+
+    /// One page turn, as a finger that puts the page where it wants it and then lets go.
+    ///
+    /// `XCUIElement.swipeLeft/Right` is a flick: short, fast, and easy for a page that is still
+    /// settling — or for a video page's controls — to swallow. Run 6ab15f28 lost its second
+    /// step-back to exactly that, with no diagnosis possible from "nothing moved". Dragging
+    /// 84 % of the width turned the page, but the finger lifted with the synthesiser's release
+    /// velocity still on it and run 6ab16c17 carried two pages in one gesture (item 96 -> 98).
+    ///
+    /// So: 70 % of the width — past the pager's commit threshold on distance alone, and short
+    /// of the next boundary — dragged slowly and then *held*, which is what
+    /// `thenHoldForDuration` exists for, the same release this file's reading drags use. The
+    /// finger lifts with no velocity, and the pager settles on the neighbour it is showing.
+    private static func pageGallery(_ app: XCUIApplication, forward: Bool) {
+        let from = app.coordinate(
+            withNormalizedOffset: CGVector(dx: forward ? 0.85 : 0.15, dy: 0.5)
+        )
+        let to = app.coordinate(
+            withNormalizedOffset: CGVector(dx: forward ? 0.15 : 0.85, dy: 0.5)
+        )
+        from.press(forDuration: 0.05, thenDragTo: to,
+                   withVelocity: XCUIGestureVelocity(rawValue: 320), thenHoldForDuration: 0.3)
+    }
+
+    /// The label of the page the reader is on — "Photo from You, 24 Aug 2026 at 09:41" — or
+    /// "" when the pager is holding more than one labelled page, because then which of them the
+    /// reader is looking at is not something the tree can be asked.
+    private static func currentPageLabel(_ app: XCUIApplication) -> String {
+        let pages = app.descendants(matching: .any).matching(
+            NSPredicate(format: "label BEGINSWITH %@ OR label BEGINSWITH %@",
+                        "Photo from", "Video from")
+        )
+        guard pages.count == 1 else { return "" }
+        return pages.firstMatch.label
+    }
+
+    /// Turn one page and report where the gallery settled, or `nil` if it never moved.
+    ///
+    /// The counter is polled until two consecutive readings agree, so a reading taken while
+    /// the pager is still animating is never mistaken for the destination.
+    private static func turnGalleryPage(
+        _ app: XCUIApplication,
+        forward: Bool,
+        from current: (index: Int, total: Int),
+        timeout: TimeInterval = 6
+    ) -> (index: Int, total: Int)? {
+        pageGallery(app, forward: forward)
+        let deadline = Date().addingTimeInterval(timeout)
+        var restoreAttempts = 0
+        var settling: (index: Int, total: Int)?
+        while Date() < deadline {
+            let counter = galleryCounter(app)
+            if counter.exists, let position = galleryPosition(counter.label) {
+                if position.index != current.index {
+                    if let previous = settling, previous.index == position.index { return position }
+                    settling = position
+                }
+            } else if restoreAttempts == 0 {
+                restoreAttempts += 1
+                restoreGalleryChrome(app)
+                continue
+            }
+            usleep(120_000)
+        }
+        return settling
+    }
+
+    /// The pager animates, so the counter is polled rather than read once.
+    private static func waitForGalleryPosition(
+        _ app: XCUIApplication,
+        expecting index: Int,
+        timeout: TimeInterval = 5
+    ) -> (index: Int, total: Int)? {
+        let deadline = Date().addingTimeInterval(timeout)
+        var last: (index: Int, total: Int)?
+        var restoreAttempts = 0
+        while Date() < deadline {
+            let counter = galleryCounter(app)
+            if counter.exists, let position = galleryPosition(counter.label) {
+                last = position
+                if position.index == index { return position }
+            } else if restoreAttempts == 0 {
+                restoreAttempts += 1
+                restoreGalleryChrome(app)
+                continue
+            }
+            usleep(120_000)
+        }
+        return last?.index == index ? last : nil
+    }
+
+    /// "Photo from You, 24 Aug 2026 at 09:41" -> "Photo", for the item the reader is on.
+    ///
+    /// How many of a pager's pages are in the accessibility tree at once is not something a
+    /// test gets to assume, and the two possibilities want different queries. A
+    /// `UIPageViewController` normally holds the visible page and its immediate neighbours, in
+    /// which case reading every match is a handful of element resolutions; a materialised list
+    /// would instead hold all of them, in item order, where the page for item N is match N - 1
+    /// and reading them all would cost a tree walk per swipe. Ask the query how many there are,
+    /// once, and take the cheap route either way.
+    private static func mediaKinds(
+        from pages: XCUIElementQuery, pageCount: Int, at index: Int
+    ) -> Set<String> {
+        let labels: [String] = pageCount <= 8
+            ? pages.allElementsBoundByIndex.map(\.label)
+            : [pages.element(boundBy: max(0, index - 1)).label]
+        var kinds: Set<String> = []
+        for label in labels {
+            if label.hasPrefix("Photo from") { kinds.insert("Photo") }
+            if label.hasPrefix("Video from") { kinds.insert("Video") }
+        }
+        return kinds
+    }
+
     private func openFixtureConversation(in app: XCUIApplication) {
         require(app.navigationBars["Chats"], in: app, message: "Chats did not open")
         let lists = app.scrollViews.matching(identifier: "conversation-list")

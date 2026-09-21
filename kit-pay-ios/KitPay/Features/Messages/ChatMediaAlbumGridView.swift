@@ -198,13 +198,18 @@ private struct ChatMediaAlbumGridCell: View {
     /// content-bound storage key, and it is only consulted after that row re-resolves.
     @State private var loaded: SecureMediaLoadPolicy.LoadedItem?
     @State private var videoPoster: UIImage?
-    @State private var fileImageThumbnail: UIImage?
+    /// Pixels decoded by this cell's own `.task`, for both the protected-file and the inline
+    /// path; `body` only ever reads the shared cache.
+    @State private var decodedThumbnail: UIImage?
 
     private var kind: KitChatMediaKind {
         KitChatMediaKind(mediaType: loaded?.mediaType ?? item.mediaType)
     }
 
     /// The requested thumbnail bucket is the cell's larger edge so scaledToFill never upscales.
+    /// `ChatMediaThumbnailStore` quantises it to a `ChatMediaDisplayBucket` rung, so two albums
+    /// holding the same photo at slightly different cell sizes share one decoded entry instead
+    /// of fragmenting a fixed byte budget into per-layout copies.
     private var maxPixel: CGFloat { max(size.width, size.height) }
 
     private var thumbnail: UIImage? {
@@ -217,17 +222,12 @@ private struct ChatMediaAlbumGridCell: View {
                 maxPixel: maxPixel
             ) ?? videoPoster
         case .image:
-            if loaded.localFileURL != nil {
-                return ChatMediaThumbnailStore.shared.cachedThumbnail(
-                    forKey: item.thumbnailKey,
-                    maxPixel: maxPixel
-                ) ?? fileImageThumbnail
-            }
-            return ChatMediaThumbnailStore.shared.thumbnail(
+            // Never decodes here: `body` runs while a finger is on the screen, and ImageIO has
+            // no async entry point. The inline path used to decode on a cache miss.
+            return ChatMediaThumbnailStore.shared.cachedThumbnail(
                 forKey: item.thumbnailKey,
-                maxPixel: maxPixel,
-                from: loaded.data
-            )
+                maxPixel: maxPixel
+            ) ?? decodedThumbnail
         default:
             return nil
         }
@@ -300,19 +300,19 @@ private struct ChatMediaAlbumGridCell: View {
             case .image:
                 let thumb: UIImage?
                 if let localFileURL = loaded.localFileURL {
-                    thumb = ChatMediaThumbnailStore.shared.thumbnail(
+                    thumb = await ChatMediaThumbnailStore.shared.decodedThumbnail(
                         forKey: item.thumbnailKey,
                         maxPixel: maxPixel,
                         fromFileURL: localFileURL
                     )
-                    fileImageThumbnail = thumb
                 } else {
-                    thumb = ChatMediaThumbnailStore.shared.thumbnail(
+                    thumb = await ChatMediaThumbnailStore.shared.decodedThumbnail(
                         forKey: item.thumbnailKey,
                         maxPixel: maxPixel,
                         from: loaded.data
                     )
                 }
+                decodedThumbnail = thumb
                 if let thumb, thumb.size.height > 0 {
                     onImageAspectRatio?(thumb.size.width / thumb.size.height)
                 }
